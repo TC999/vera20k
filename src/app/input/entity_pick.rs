@@ -10,6 +10,7 @@
 
 use crate::app::types::HoverTargetKind;
 use crate::map::entities::EntityCategory;
+use crate::map::terrain::TacticalBridgeLookup;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::entity_store::EntityStore;
 use crate::sim::intern::InternedId;
@@ -19,8 +20,6 @@ use crate::sim::vision::FogState;
 /// `dx*dx + 0.5*dy*dy < 200` with 0.5 Y-weight compensating for isometric projection.
 /// Max horizontal reach: sqrt(200) ≈ 14px, max vertical reach: sqrt(400) = 20px.
 const PICK_DISTANCE_THRESHOLD: f32 = 200.0;
-type TacticalBridgeInverseMap =
-    std::collections::BTreeMap<(u16, u16), crate::map::terrain::TacticalBridgeCell>;
 /// The simulation's house table, as the picker needs it: owner → player state.
 type HouseStates = std::collections::BTreeMap<InternedId, crate::sim::house_state::HouseState>;
 
@@ -66,7 +65,7 @@ pub(crate) fn pick_enemy_target_stable_id(
     ignore_visibility: bool,
     rules: Option<&RuleSet>,
     height_map: &std::collections::BTreeMap<(u16, u16), u8>,
-    bridge_height_map: Option<&TacticalBridgeInverseMap>,
+    bridge_cells: Option<&dyn TacticalBridgeLookup>,
 ) -> Option<u64> {
     hover_target_at_point(
         sim,
@@ -76,7 +75,7 @@ pub(crate) fn pick_enemy_target_stable_id(
         ignore_visibility,
         rules,
         height_map,
-        bridge_height_map,
+        bridge_cells,
     )
     .and_then(|hover| match hover.kind {
         HoverTargetKind::EnemyUnit | HoverTargetKind::EnemyStructure => Some(hover.stable_id),
@@ -92,7 +91,7 @@ pub(crate) fn pick_any_target_stable_id(
     ignore_visibility: bool,
     rules: Option<&RuleSet>,
     height_map: &std::collections::BTreeMap<(u16, u16), u8>,
-    bridge_height_map: Option<&TacticalBridgeInverseMap>,
+    bridge_cells: Option<&dyn TacticalBridgeLookup>,
 ) -> Option<u64> {
     // Use empty owner so everything is considered "enemy" in hover logic.
     hover_target_at_point(
@@ -103,7 +102,7 @@ pub(crate) fn pick_any_target_stable_id(
         ignore_visibility,
         rules,
         height_map,
-        bridge_height_map,
+        bridge_cells,
     )
     .filter(|hover| hover.kind != HoverTargetKind::HiddenEnemy)
     .map(|hover| hover.stable_id)
@@ -117,7 +116,7 @@ pub(crate) fn hover_target_at_point(
     ignore_visibility: bool,
     rules: Option<&RuleSet>,
     height_map: &std::collections::BTreeMap<(u16, u16), u8>,
-    bridge_height_map: Option<&TacticalBridgeInverseMap>,
+    bridge_cells: Option<&dyn TacticalBridgeLookup>,
 ) -> Option<HoverTargetKindWithId> {
     let local_owner_id: InternedId = sim.interner.get(local_owner).unwrap_or_default();
     let mut best: Option<(u64, f32)> = None;
@@ -143,7 +142,7 @@ pub(crate) fn hover_target_at_point(
                 entity.position.ry,
                 foundation,
                 height_map,
-                bridge_height_map,
+                bridge_cells,
             ) {
                 continue;
             }
@@ -220,6 +219,7 @@ fn decode_hover_kind_with_id(encoded: u64) -> HoverTargetKindWithId {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn compute_click_selection_snapshot(
     entities: &EntityStore,
     encounter_order: &[u64],
@@ -233,7 +233,7 @@ pub(crate) fn compute_click_selection_snapshot(
     rules: Option<&RuleSet>,
     houses: Option<&HouseStates>,
     height_map: &std::collections::BTreeMap<(u16, u16), u8>,
-    bridge_height_map: Option<&TacticalBridgeInverseMap>,
+    bridge_cells: Option<&dyn TacticalBridgeLookup>,
     interner: Option<&crate::sim::intern::StringInterner>,
 ) -> Option<SelectionMutation> {
     compute_click_selection_snapshot_with_playfield(
@@ -249,7 +249,7 @@ pub(crate) fn compute_click_selection_snapshot(
         rules,
         houses,
         height_map,
-        bridge_height_map,
+        bridge_cells,
         interner,
         false,
     )
@@ -268,7 +268,7 @@ pub(crate) fn compute_click_selection_snapshot_with_playfield(
     rules: Option<&RuleSet>,
     houses: Option<&HouseStates>,
     height_map: &std::collections::BTreeMap<(u16, u16), u8>,
-    bridge_height_map: Option<&TacticalBridgeInverseMap>,
+    bridge_cells: Option<&dyn TacticalBridgeLookup>,
     interner: Option<&crate::sim::intern::StringInterner>,
     require_playfield_membership: bool,
 ) -> Option<SelectionMutation> {
@@ -283,7 +283,7 @@ pub(crate) fn compute_click_selection_snapshot_with_playfield(
         rules,
         houses,
         height_map,
-        bridge_height_map,
+        bridge_cells,
         interner,
     ) else {
         // Non-shift click clears selection; shift-click with no hit keeps it.
@@ -301,7 +301,12 @@ pub(crate) fn compute_click_selection_snapshot_with_playfield(
 
     let picked = entities.get(picked_sid)?;
     let type_str = interner.map_or("", |i| i.resolve(picked.type_ref()));
-    let admitted = static_selection_gate(picked, type_str, rules, require_playfield_membership);
+    // With no selection, DisplayDetermineAction69261B ->692762..692778
+    // refuses ACTION_SELECT for retained Techno+3D4. A nonempty selection
+    // delegates to WhatActionOnObject; its source/target and modifier gates
+    // differ. Don't apply this leaf to that path or forced/type selection.
+    let admitted = (!current_selection.is_empty() || !picked.is_mission_only())
+        && static_selection_gate(picked, type_str, rules, require_playfield_membership);
     // A shift-click adds when the selection it is joining is the local player's,
     // whatever was clicked. The native ACTION_SELECT arm asks
     // `HouseClass__IsHumanPlayer(CurrentObjects[0]->Owner)` — 0x004ABD42 loads
@@ -335,9 +340,7 @@ pub(crate) fn compute_click_selection_snapshot_with_playfield(
     // both production call sites always pass a resolved owner and interner.
     let owner_is_local = |entity: &crate::sim::game_entity::GameEntity| -> bool {
         match (local_owner, interner) {
-            (Some(owner), Some(names)) => {
-                names.resolve(entity.owner()).eq_ignore_ascii_case(owner)
-            }
+            (Some(owner), Some(names)) => names.resolve(entity.owner()).eq_ignore_ascii_case(owner),
             _ => true,
         }
     };
@@ -413,7 +416,8 @@ pub(crate) fn band_rect_contains_drawn_object(
         if !entity.lifecycle.object_alive || entity.lifecycle.in_limbo {
             return false;
         }
-        let (sx, sy) = crate::app::presentation::instances::interpolated_screen_position_entity(entity);
+        let (sx, sy) =
+            crate::app::presentation::instances::interpolated_screen_position_entity(entity);
         if !(sx >= min_x && sx <= max_x && sy >= min_y && sy <= max_y) {
             return false;
         }
@@ -465,6 +469,7 @@ fn is_drawn_for_local_owner(
 /// A rectangle that caught something but nothing eligible — a box over an enemy
 /// patrol, say — returns an empty list, because the native clear runs before the
 /// per-object filter does.
+#[cfg(test)]
 pub(crate) fn compute_box_selection_snapshot(
     entities: &EntityStore,
     preflight_order: &[u64],
@@ -571,6 +576,7 @@ pub(crate) fn compute_box_selection_snapshot_with_playfield(
 /// and expand each selected type through its deploy/undeploy links. Screen
 /// escalation happens in the same invocation when no visible unselected match
 /// exists, including the all-visible-already-selected case.
+#[cfg(test)]
 pub(crate) fn compute_type_select_tap(
     entities: &EntityStore,
     screen_order: &[u64],
@@ -769,6 +775,7 @@ fn type_select_final_admissions(
 /// Exact-type group mutation used while TypeSelect is held over one picked
 /// object. Link types and the dynamic CanBeSelectedNow virtual are deliberately
 /// absent from this path.
+#[cfg(test)]
 pub(crate) fn compute_type_select_click_mutation(
     entities: &EntityStore,
     scope_order: &[u64],
@@ -844,6 +851,7 @@ pub(crate) fn compute_type_select_click_mutation_with_playfield(
 /// Held TypeSelect bandbox: anchors inside the rectangle contribute their own
 /// exact type IDs; those IDs are then expanded over the current screen/map
 /// scope without deploy-link or dynamic-gate expansion.
+#[cfg(test)]
 pub(crate) fn compute_type_select_box_mutation(
     entities: &EntityStore,
     screen_order: &[u64],
@@ -898,7 +906,8 @@ pub(crate) fn compute_type_select_box_mutation_with_playfield(
         let Some(entity) = entities.get(id) else {
             continue;
         };
-        let (sx, sy) = crate::app::presentation::instances::interpolated_screen_position_entity(entity);
+        let (sx, sy) =
+            crate::app::presentation::instances::interpolated_screen_position_entity(entity);
         if !entity.lifecycle.object_alive || sx < min_x || sx > max_x || sy < min_y || sy > max_y {
             continue;
         }
@@ -978,7 +987,8 @@ fn entities_in_rect(
             let entity = entities.get(*entity)?;
             // Rectangle first, the way the native walk does it: the per-object
             // filter only runs for objects the box actually covers.
-            let (sx, sy) = crate::app::presentation::instances::interpolated_screen_position_entity(entity);
+            let (sx, sy) =
+                crate::app::presentation::instances::interpolated_screen_position_entity(entity);
             if !(sx >= min_x && sx <= max_x && sy >= min_y && sy <= max_y) {
                 return None;
             }
@@ -1018,15 +1028,15 @@ fn entities_in_rect(
 /// refused the moment it drives clear of the factory footprint, exactly as the
 /// native cell lookup behaves.
 ///
-/// Two native clauses are approximated rather than reproduced, because VERA has
-/// no matching state:
-/// * The native enslaved test reads a slave-owner pointer that every slave
-///   carries. VERA's nearest state is the slave-harvester component, which only
-///   the Slave Miner's slaves own; a mind-controlled unit is a different field
-///   in the original and is deliberately not tested here.
-/// * The native bunker test reads one link field. VERA splits the link into an
-///   approach marker and an installed link, and only the installed link is
-///   treated as linked.
+/// The enslaved test reads the slave-owner pointer (`TechnoClass+0x2DC`,
+/// `SlaveLink::owner`), which a freed slave no longer carries; a
+/// mind-controlled unit is a different field in the original and is
+/// deliberately not tested here.
+///
+/// One native clause is approximated rather than reproduced, because VERA has
+/// no matching state: the native bunker test reads one link field. VERA splits
+/// the link into an approach marker and an installed link, and only the
+/// installed link is treated as linked.
 ///
 /// The powered-down clause reads byte `+0x1C8`, and it is NOT a deploy-transition
 /// flag. An exhaustive instruction search finds exactly three writers —
@@ -1053,7 +1063,7 @@ fn can_be_selected_now(
     if entity.category == EntityCategory::Structure {
         return false;
     }
-    if entity.slave_harvester.is_some() {
+    if entity.slave.owner().is_some() {
         return false;
     }
     if entity.bunker_link.installed_in().is_some() {
@@ -1125,11 +1135,15 @@ fn click_hits_foundation(
     entity_ry: u16,
     foundation: &str,
     height_map: &std::collections::BTreeMap<(u16, u16), u8>,
-    bridge_height_map: Option<&TacticalBridgeInverseMap>,
+    bridge_cells: Option<&dyn TacticalBridgeLookup>,
 ) -> bool {
     let (fw, fh) = crate::rules::foundation::foundation_dimensions(foundation);
-    let (click_rx, click_ry) =
-        crate::app::match_runtime::sim_tick::world_point_to_cell(world_x, world_y, height_map, bridge_height_map);
+    let (click_rx, click_ry) = crate::app::match_runtime::sim_tick::world_point_to_cell(
+        world_x,
+        world_y,
+        height_map,
+        bridge_cells,
+    );
     let crx = click_rx as i32;
     let cry = click_ry as i32;
     let brx = entity_rx as i32;
@@ -1148,7 +1162,7 @@ pub(crate) fn pick_entity_at_point(
     rules: Option<&RuleSet>,
     _houses: Option<&HouseStates>,
     height_map: &std::collections::BTreeMap<(u16, u16), u8>,
-    bridge_height_map: Option<&TacticalBridgeInverseMap>,
+    bridge_cells: Option<&dyn TacticalBridgeLookup>,
     interner: Option<&crate::sim::intern::StringInterner>,
 ) -> Option<u64> {
     // Elliptical pick distance: dx² + 0.5*dy² < 200, with the 0.5 Y-weight
@@ -1161,7 +1175,7 @@ pub(crate) fn pick_entity_at_point(
             world_x,
             world_y,
             height_map,
-            bridge_height_map,
+            bridge_cells,
         );
         if !fog.is_cell_revealed(owner_id, rx, ry) || fog.is_cell_gap_covered(owner_id, rx, ry) {
             return None;
@@ -1199,15 +1213,12 @@ pub(crate) fn pick_entity_at_point(
                 .cloak
                 .as_ref()
                 .is_some_and(|cloak| cloak.is_fully_cloaked())
-            && !fog_state.has_sensor_for_house(
-                owner_id,
-                entity.position.rx,
-                entity.position.ry,
-            )
+            && !fog_state.has_sensor_for_house(owner_id, entity.position.rx, entity.position.ry)
         {
             continue;
         }
-        let (sx, sy) = crate::app::presentation::instances::interpolated_screen_position_entity(entity);
+        let (sx, sy) =
+            crate::app::presentation::instances::interpolated_screen_position_entity(entity);
         let distance = pick_distance_sq(sx - world_x, sy - world_y) as i32;
         if distance < PICK_DISTANCE_THRESHOLD as i32
             && best.is_none_or(|(_, best_distance)| distance < best_distance)
@@ -1241,7 +1252,7 @@ pub(crate) fn pick_entity_at_point(
             entity.position.ry,
             foundation,
             height_map,
-            bridge_height_map,
+            bridge_cells,
         )
         .then_some(entity.stable_id())
     })
@@ -1259,11 +1270,10 @@ fn static_selection_gate(
     require_playfield_membership: bool,
 ) -> bool {
     entity.lifecycle.object_alive
+        // `0x006F32D3`: no Health — a crashing aircraft falls alive at 0.
+        && entity.health.current > 0
         && !entity.lifecycle.in_limbo
-        && !entity
-            .teleport_state
-            .as_ref()
-            .is_some_and(|teleport| teleport.warp_out_active())
+        && !entity.is_warped_out()
         // `TechnoClass::Select @ 0x006F32D0` requires the stored +0x3D5
         // membership byte. The app supplies the live MapClass authority gate;
         // headless selection fixtures leave it disabled.
@@ -1307,10 +1317,7 @@ mod tests {
             0,
             0,
             owner,
-            Health {
-                current: 1000,
-                max: 1000,
-            },
+            Health { current: 1000 },
             type_ref,
             EntityCategory::Structure,
             0,
@@ -1391,10 +1398,7 @@ mod tests {
             0,
             0,
             owner,
-            Health {
-                current: 100,
-                max: 100,
-            },
+            Health { current: 100 },
             type_ref,
             category,
             0,
@@ -1420,15 +1424,7 @@ mod tests {
         let mut interner = StringInterner::new();
         let owner = interner.intern("Americans");
         let type_ref = interner.intern("GI");
-        let mut entity = item83_entity(
-            1,
-            5,
-            5,
-            owner,
-            type_ref,
-            EntityCategory::Infantry,
-            false,
-        );
+        let mut entity = item83_entity(1, 5, 5, owner, type_ref, EntityCategory::Infantry, false);
         let entities = EntityStore::new();
 
         assert!(
@@ -1806,8 +1802,9 @@ mod tests {
             EntityCategory::Unit,
             false,
         ));
-        let (x, y) =
-            crate::app::presentation::instances::interpolated_screen_position_entity(entities.get(1).unwrap());
+        let (x, y) = crate::app::presentation::instances::interpolated_screen_position_entity(
+            entities.get(1).unwrap(),
+        );
 
         let mutation = compute_type_select_box_mutation(
             &entities,
@@ -1831,6 +1828,45 @@ mod tests {
             [2],
             "enemy anchor contributes only its type; the batch admits only the local match"
         );
+    }
+
+    #[test]
+    fn mission_only_empty_selection_click_matches_native_flag_gate() {
+        let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../../tools/spatial_oracle/aircraft_mission_only.json"
+        ))
+        .unwrap();
+        let mut interner = StringInterner::new();
+        let owner = interner.intern("Americans");
+        let type_ref = interner.intern("PLANE");
+        for row in rows {
+            let mut entities = EntityStore::new();
+            let mut plane =
+                item83_entity(1, 10, 10, owner, type_ref, EntityCategory::Aircraft, false);
+            if row["mission_only"].as_bool().unwrap() {
+                plane.mark_mission_only();
+            }
+            let (x, y) = crate::render::locomotor_visual::screen_position(&plane);
+            entities.insert(plane);
+            let result = compute_click_selection_snapshot(
+                &entities,
+                &[1],
+                &[],
+                None,
+                Some("Americans"),
+                x,
+                y,
+                30.0,
+                false,
+                None,
+                None,
+                &std::collections::BTreeMap::new(),
+                None,
+                Some(&interner),
+            )
+            .unwrap();
+            assert_eq!(!result.select.is_empty(), row["click_action"] == 7, "{row}");
+        }
     }
 
     #[test]
@@ -2225,5 +2261,20 @@ mod tests {
             static_selection_gate(&entity, "MTNK", None, false),
             "headless fixtures without MapClass authority preserve prior admission"
         );
+    }
+
+    /// `TechnoClass::IsLocalPlayerSelectableObject @ 0x006F32D0` refuses an
+    /// object with no Health first (`0x006F32D3`): a crashing aircraft is
+    /// alive at Health 0 and cannot be picked or banded.
+    #[test]
+    fn an_object_without_health_is_not_selectable() {
+        let mut entity = GameEntity::test_default(1, "ORCA", "Americans", 5, 5);
+        entity.lifecycle.object_alive = true;
+        entity.lifecycle.in_limbo = false;
+        entity.in_playfield = true;
+        assert!(static_selection_gate(&entity, "ORCA", None, true));
+        entity.health.current = 0;
+        entity.crashing = true;
+        assert!(!static_selection_gate(&entity, "ORCA", None, true));
     }
 }

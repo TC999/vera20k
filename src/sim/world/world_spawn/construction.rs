@@ -7,10 +7,10 @@
 use super::{GeneratedTechnoInitError, object_uses_voxel};
 use crate::map::entities::EntityCategory;
 use crate::rules::locomotor_type::LocomotorKind;
-use crate::rules::object_type::{FactoryType, ObjectCategory, ObjectType};
+use crate::rules::object_type::{FactoryType, ObjectType};
 use crate::rules::ruleset::RuleSet;
 use crate::sim::animation::{Animation, SequenceKind};
-use crate::sim::components::{BridgeOccupancy, HarvestOverlay, Health, VoxelAnimation};
+use crate::sim::components::{HarvestOverlay, Health, VoxelAnimation};
 use crate::sim::game_entity::{GameEntity, TechnoConstructorInit};
 use crate::sim::miner::{Miner, MinerConfig, miner_kind_for_object};
 use crate::sim::movement::locomotor::{LocomotorState, MovementLayer};
@@ -18,7 +18,7 @@ use crate::sim::vision::MAX_SIGHT_RANGE;
 use crate::sim::world::Simulation;
 
 /// Existing initialization differences are explicit here. In particular map
-/// import currently omits Ship state, finite aircraft ammo and Fly Idle setup.
+/// import currently omits Ship state and Fly Idle setup.
 /// This is a Rust compatibility policy, not a claim of native equivalence.
 #[derive(Clone, Copy)]
 pub(super) enum ComponentOrigin {
@@ -46,24 +46,22 @@ impl Simulation {
             return Ok(None);
         };
         let health = Health {
-            current: obj.strength.max(1) as u16,
-            max: obj.strength.max(1) as u16,
+            // Native class constructors copy signed type Strength unchanged.
+            // Original copy slices: object_health corpus / constructors.
+            current: obj.strength,
         };
-        let category = match obj.category {
-            ObjectCategory::Infantry => EntityCategory::Infantry,
-            ObjectCategory::Vehicle => EntityCategory::Unit,
-            ObjectCategory::Aircraft => EntityCategory::Aircraft,
-            ObjectCategory::Building => EntityCategory::Structure,
-        };
+        let category = EntityCategory::from(obj.category);
         let uses_voxel = object_uses_voxel(type_id, obj, rules);
         let sight_range = (obj.sight.max(0) as u16).min(MAX_SIGHT_RANGE);
         let stable_id = self.allocate_stable_id();
         let owner_iid = self.interner.intern(owner);
         let type_iid = self.interner.intern(type_id);
         let techno_ctor_random_word = self.resolve_techno_constructor_word(init, None)?;
+        let native_unique_id = self.next_native_runtime_id();
 
         let mut ge = GameEntity::new_at_frame_from_constructor_word(
             stable_id,
+            native_unique_id,
             rx,
             ry,
             z,
@@ -91,7 +89,7 @@ impl Simulation {
         origin: ComponentOrigin,
     ) {
         let category = ge.category;
-        let facing = ge.facing;
+        let initial = ge.body_facing.destination();
         let uses_voxel = ge.is_voxel;
         // InitManagers6F3F40 classifies the owner after construction; it does
         // not manufacture either discovery-history byte. The launch-owned
@@ -101,18 +99,37 @@ impl Simulation {
             ge.debug_log = Some(crate::sim::debug_event_log::DebugEventLog::new());
         }
 
-        stamp_scoring_flags(ge, obj);
+        stamp_scoring_flags(ge, obj, rules);
         ge.sight_is_zero = obj.is_some_and(|object| object.sight == 0);
-        if let Some(obj) = obj.filter(|obj| obj.has_turret) {
-            let initial = crate::sim::movement::turret::body_facing_to_turret(facing);
-            let rot_byte = obj.turret_rot.clamp(0, 0xFF) as u8;
-            ge.barrel_facing = Some(crate::sim::movement::FacingClass::new(initial, rot_byte));
+        // The class constructor's one `+0x388` rate write (`Set_ROT`): `ROT=`
+        // for a unit (`0x00735579`), an aircraft (`0x00413FE7`) and a building
+        // (`BuildingClass::Init`, `0x00442CA5`, without testing `Turret=`: a
+        // turretless building's `+0x388` is the body Mission_Attack aims and
+        // ReceiveDamage's retaliation turns); 127 for infantry (`0x00517BC5`).
+        if let Some(obj) = obj {
+            ge.set_body_facing_rot(obj.turret_rot);
+        }
+        // `+0x3A0`: a turreted unit's turret and every aircraft's Secondary. A
+        // building aims its `+0x388`.
+        if let Some(obj) = obj.filter(|obj| {
+            (obj.has_turret && category != EntityCategory::Structure)
+                || category == EntityCategory::Aircraft
+        }) {
+            let mut secondary = crate::sim::movement::FacingClass::new(initial, obj.turret_rot);
+            if category == EntityCategory::Aircraft {
+                // Aircraft413FD2..414015 supplies ROT to BOTH controllers;
+                // Unlimbo414310 -> Foot4D7170 -> Techno6F6DAA snaps Primary;
+                // Aircraft414417 snaps Secondary. Both timers retain this frame.
+                let frame = self.session.binary_frame;
+                ge.body_facing.snap(initial, frame);
+                secondary.snap(initial, frame);
+            }
+            ge.barrel_facing = Some(secondary);
         }
         if uses_voxel {
             ge.voxel_animation = Some(VoxelAnimation::new(1, 1));
         }
         if category == EntityCategory::Infantry {
-            ge.animation = Some(Animation::new(SequenceKind::Stand));
             ge.sub_cell = Some(match origin {
                 ComponentOrigin::Authored { sub_cell, .. } => sub_cell,
                 ComponentOrigin::Runtime => {
@@ -146,12 +163,13 @@ impl Simulation {
         if category == EntityCategory::Structure && obj.bunker {
             ge.bunker_runtime = Some(crate::sim::docking::bunker_install::BunkerRuntime::idle());
         }
-        ge.zfudge_bridge = obj.zfudge_bridge;
-        ge.too_big_to_fit_under_bridge = obj.too_big_to_fit_under_bridge;
+        // BuildingClass::Init_Managers, from the constructor (`0x0043BB29`):
+        // no Buildup SHP clears the AI sale byte (`0x00442CBC`).
+        ge.ai_sellable = category == EntityCategory::Structure
+            && rules.is_some_and(|rules| rules.has_buildup(&obj.id));
         if should_construct_locomotor(category, obj) {
             ge.locomotor = Some(LocomotorState::from_object_type(
                 obj,
-                rules.map_or(1500, |rules| rules.general.flight_level),
                 self.session.binary_frame,
             ));
             if matches!(origin, ComponentOrigin::Runtime)
@@ -162,13 +180,25 @@ impl Simulation {
                 ge.ship_locomotion = Some(Default::default());
             }
         }
-        // Aircraft ammo: set up ammo tracking for aircraft with finite Ammo=.
-        if matches!(origin, ComponentOrigin::Runtime)
-            && obj.ammo >= 0
-            && category == EntityCategory::Aircraft
+        // Retain the signed native count even for Ammo=-1. Mission_Attack's
+        // pending-release consumer can decrement a negative count as well.
+        if category == EntityCategory::Aircraft {
+            ge.aircraft_ammo = Some(crate::sim::docking::aircraft_dock::AircraftAmmo::from_type(
+                obj,
+            ));
+        }
+        // InitManagers6F40FC..6F414E: a weapon-0 Parasite warhead owns its
+        // ParasiteClass (Foot+69C) from construction, not from the first shot.
+        if let Some(rules) = rules
+            && crate::sim::combat::parasite::type_allocates_parasite(
+                rules,
+                obj,
+                category,
+                ge.veterancy(),
+            )
         {
-            ge.aircraft_ammo = Some(crate::sim::docking::aircraft_dock::AircraftAmmo::new(
-                obj.ammo,
+            ge.parasite = Some(Box::new(
+                crate::sim::combat::parasite::ParasiteState::constructed(self.session.binary_frame),
             ));
         }
         // Initialize aircraft mission for Fly-locomotor aircraft.
@@ -190,7 +220,6 @@ impl Simulation {
             ge.harvest_overlay = Some(HarvestOverlay {
                 frame: 0,
                 visible: false,
-                elapsed_frames: 0,
             });
         }
         // Passenger cargo for transports and garrisonable buildings.
@@ -212,6 +241,7 @@ impl Simulation {
         // after this parent enters the limbo store and before its Unlimbo.
         if let Some(rules) = rules {
             ge.capture_manager = crate::sim::capture_manager::init_capture_manager(obj, rules);
+            ge.temporal = crate::sim::temporal::init_temporal(obj, rules);
             ge.spawn_manager = crate::sim::spawn_manager::init_spawn_manager(
                 obj,
                 rules,
@@ -224,26 +254,32 @@ impl Simulation {
 
 fn install_authored_bridge(ge: &mut GameEntity, origin: ComponentOrigin) {
     if let ComponentOrigin::Authored {
-        bridge_deck: Some(deck_level),
+        bridge_deck: Some(_),
         ..
     } = origin
     {
         if let Some(loco) = &mut ge.locomotor {
             loco.layer = MovementLayer::Bridge;
         }
-        ge.bridge_occupancy = Some(BridgeOccupancy { deck_level });
         ge.on_bridge = true;
     }
 }
 
-/// Copy the rules-derived scoring flags onto a freshly built entity.
+/// Copy the rules-derived scoring and house-count flags onto a freshly built
+/// entity.
 ///
 /// Every spawn path calls this, so a type that must not appear on the score
-/// screen is honored no matter how the object came into the world. The flag is
-/// copied rather than looked up later because the score bookkeeping runs in the
-/// lifecycle authority, which deliberately holds no `RuleSet` borrow.
-fn stamp_scoring_flags(ge: &mut GameEntity, obj: Option<&crate::rules::object_type::ObjectType>) {
+/// screen is honored no matter how the object came into the world. The flags
+/// are copied rather than looked up later because the score bookkeeping and
+/// the house counts run in the lifecycle authority, which deliberately holds
+/// no `RuleSet` borrow.
+fn stamp_scoring_flags(
+    ge: &mut GameEntity,
+    obj: Option<&crate::rules::object_type::ObjectType>,
+    rules: Option<&RuleSet>,
+) {
     ge.dont_score = obj.is_some_and(|o| o.dont_score);
+    ge.tracking_facts = crate::sim::house_tracking::TrackingFacts::of(ge.category, obj, rules);
 }
 
 fn stamp_building_cell_profile(

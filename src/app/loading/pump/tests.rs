@@ -135,7 +135,6 @@ fn receipt_for(
         active_correlation: startup.correlation,
         prior_receipt: None,
         screen_is_loading: true,
-        spawn_pick_active: false,
     }
     .acknowledge()
     .expect("valid test startup must acknowledge")
@@ -147,12 +146,8 @@ fn test_audio() -> crate::app::audio_runtime::AppAudioRuntime {
         last_theme_poll_ms: None,
         music_player: None,
         sfx_player: None,
-        sound_registry: Default::default(),
-        audio_indices: Vec::new(),
-        audio_indices_enabled: false,
         launcher_audio_available: true,
         theme_startup_suppressed: false,
-        eva_registry: Default::default(),
     }
 }
 
@@ -172,17 +167,15 @@ fn begin_loading_plays_loading_theme_and_polls_theme_through_the_lease() {
           [LOADING]\nName=Loading\nSound=loading\nRepeat=yes\n",
     )
     .expect("write thememd.ini");
-    let mut process_assets = crate::app::process_assets::ProcessAssets::from_startup(
-        Some(AssetManager::from_loose_root_for_test(&dir)),
-        None,
-        None,
-        None,
+    let mut process_assets = crate::app::process_assets::ProcessAssets::new(
+        crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+        false,
     );
+    process_assets.return_from_loading(AssetManager::from_loose_root_for_test(&dir));
     let mut audio = test_audio();
     let session = LoadingSession::from_request(LoadingRequest::unverified_legacy_skirmish(
         test_launch_session(LaunchCountry::America),
         unverified_seed(1),
-        SkirmishSettings::default(),
     ));
 
     let mut slot = None;
@@ -229,12 +222,11 @@ fn loading_replacement_and_terminal_retirement_preserve_cache_and_admission_orde
     let dir = std::env::temp_dir().join(format!("vera20k-loading-owner-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("sentinel.bin"), b"first winner").unwrap();
-    let mut assets = crate::app::process_assets::ProcessAssets::from_startup(
-        Some(AssetManager::from_loose_root_for_test(&dir)),
-        None,
-        None,
-        None,
+    let mut assets = crate::app::process_assets::ProcessAssets::new(
+        crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+        false,
     );
+    assets.return_from_loading(AssetManager::from_loose_root_for_test(&dir));
     let original = assets
         .manager()
         .unwrap()
@@ -252,10 +244,7 @@ fn loading_replacement_and_terminal_retirement_preserve_cache_and_admission_orde
             &mut startup,
             &mut assets,
             &mut audio,
-            LoadingSession::from_request(LoadingRequest::accepted_skirmish(
-                prepared.clone(),
-                SkirmishSettings::default(),
-            )),
+            LoadingSession::from_request(LoadingRequest::accepted_skirmish(prepared.clone())),
             500,
         );
         let cached = loading_asset_manager(slot.as_ref().unwrap())
@@ -270,7 +259,6 @@ fn loading_replacement_and_terminal_retirement_preserve_cache_and_admission_orde
                 first.clone(),
                 Some(&crate::sim::world::Simulation::with_seed(7)),
                 true,
-                false
             )
             .is_err()
     );
@@ -283,7 +271,6 @@ fn loading_replacement_and_terminal_retirement_preserve_cache_and_admission_orde
             replacement.clone(),
             Some(&crate::sim::world::Simulation::with_seed(8)),
             true,
-            false,
         )
         .unwrap();
     assert_eq!(startup.startup(), Some(&replacement));
@@ -295,10 +282,7 @@ fn loading_replacement_and_terminal_retirement_preserve_cache_and_admission_orde
             &mut startup,
             &mut assets,
             &mut audio,
-            LoadingSession::from_request(LoadingRequest::accepted_skirmish(
-                attempt.clone(),
-                SkirmishSettings::default(),
-            )),
+            LoadingSession::from_request(LoadingRequest::accepted_skirmish(attempt.clone())),
             600,
         );
         if consumed_during_preparation {
@@ -326,7 +310,6 @@ fn loading_replacement_and_terminal_retirement_preserve_cache_and_admission_orde
                     attempt,
                     Some(&crate::sim::world::Simulation::with_seed(9)),
                     true,
-                    false
                 )
                 .is_err()
         );
@@ -343,10 +326,7 @@ fn loading_replacement_and_terminal_retirement_preserve_cache_and_admission_orde
         &mut startup,
         &mut assets,
         &mut audio,
-        LoadingSession::from_request(LoadingRequest::generic_map_load(
-            "auto",
-            SkirmishSettings::default(),
-        )),
+        LoadingSession::from_request(LoadingRequest::generic_map_load("auto")),
         700,
     );
     let before_fallback_install = startup.clone();
@@ -386,18 +366,28 @@ fn loading_preparation_consumes_real_source_and_returns_lease_on_initial_and_adm
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let map_path = dir.join("mp01t4.map");
-    let map_bytes = AssetManager::new(&ra2_dir)
-        .unwrap()
+    let retail_assets = AssetManager::new(
+        &ra2_dir,
+        crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+    )
+    .unwrap();
+    for name in ["rulesmd.ini", "artmd.ini", "soundmd.ini", "evamd.ini"] {
+        std::fs::write(
+            dir.join(name),
+            retail_assets.get_ref(name).expect("retail INI"),
+        )
+        .unwrap();
+    }
+    let map_bytes = retail_assets
         .get("Fight.MAP")
         .expect("retail Fight.MAP fixture");
     std::fs::write(&map_path, map_bytes).unwrap();
     std::fs::write(dir.join("sentinel.bin"), b"keep this cache").unwrap();
-    let mut assets = crate::app::process_assets::ProcessAssets::from_startup(
-        Some(AssetManager::from_loose_root_for_test(&dir)),
-        None,
-        None,
-        None,
+    let mut assets = crate::app::process_assets::ProcessAssets::new(
+        crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+        false,
     );
+    assets.return_from_loading(AssetManager::from_loose_root_for_test(&dir));
     let original = assets
         .manager()
         .unwrap()
@@ -405,16 +395,12 @@ fn loading_preparation_consumes_real_source_and_returns_lease_on_initial_and_adm
         .unwrap();
     let mut launch = test_launch_session(LaunchCountry::America);
     launch.selected_map_file = Some(map_path.to_string_lossy().into_owned());
-    let request = LoadingRequest::unverified_legacy_skirmish(
-        launch,
-        unverified_seed(7),
-        SkirmishSettings::default(),
-    );
+    let request = LoadingRequest::unverified_legacy_skirmish(launch, unverified_seed(7));
     let mut session = LoadingSession::from_request(request);
     session.job.asset_manager = assets.lease_for_loading();
     let session =
         prepare_loading_session(&mut assets, session, true, Some(ra2_dir.clone())).unwrap();
-    assert!(!session.first_frame_presented);
+    assert_eq!(session.next_frame, NextLoadingFrame::Blank);
     assert_eq!(
         session.native.as_ref().unwrap().progress.current_value(),
         0.0
@@ -437,10 +423,7 @@ fn loading_preparation_consumes_real_source_and_returns_lease_on_initial_and_adm
             "absent.map",
         ),
     ] {
-        let mut session = LoadingSession::from_request(LoadingRequest::generic_map_load(
-            selected,
-            SkirmishSettings::default(),
-        ));
+        let mut session = LoadingSession::from_request(LoadingRequest::generic_map_load(selected));
         session.job.asset_manager = assets.lease_for_loading();
         let err = prepare_loading_session(&mut assets, session, false, Some(ra2_dir.clone()))
             .err()
@@ -464,7 +447,6 @@ fn loading_side_comes_from_first_launch_node_country() {
     let session = LoadingSession::from_request(LoadingRequest::unverified_legacy_skirmish(
         test_launch_session(LaunchCountry::Korea),
         unverified_seed(1),
-        SkirmishSettings::default(),
     ));
 
     assert_eq!(
@@ -480,7 +462,6 @@ fn loading_progress_row_snapshots_the_launch_player_name() {
     let session = LoadingSession::from_request(LoadingRequest::unverified_legacy_skirmish(
         launch,
         unverified_seed(22),
-        SkirmishSettings::default(),
     ));
 
     assert_eq!(
@@ -497,7 +478,6 @@ fn loading_session_preserves_selected_map_filename() {
     let session = LoadingSession::from_request(LoadingRequest::unverified_legacy_skirmish(
         test_launch_session(LaunchCountry::Yuri),
         unverified_seed(2),
-        SkirmishSettings::default(),
     ));
 
     assert_eq!(session.stage.request().selected_map_file(), "mp01t4.map");
@@ -516,7 +496,6 @@ fn loading_session_selects_native_progress_cadence_from_map_kind() {
     let selected = LoadingSession::from_request(LoadingRequest::unverified_legacy_skirmish(
         test_launch_session(LaunchCountry::America),
         unverified_seed(20),
-        SkirmishSettings::default(),
     ));
     assert_eq!(
         selected
@@ -531,7 +510,6 @@ fn loading_session_selects_native_progress_cadence_from_map_kind() {
     let random = LoadingSession::from_request(LoadingRequest::unverified_legacy_skirmish(
         random_map,
         unverified_seed(21),
-        SkirmishSettings::default(),
     ));
     assert_eq!(
         random.native.as_ref().map(|native| native.progress_cadence),
@@ -576,16 +554,13 @@ fn gsi_04_12_generated_prefix_uses_accepted_staging_once() {
         .collect();
     let initial = crate::app::loading::init::MapLoadInitial::from_test_map_source(
         regenerated_map,
-        crate::app::frontend::list_maps::LoadedMapSource::Generated {
+        crate::map::source::LoadedMapSource::Generated {
             seed_name: selected.to_ascii_lowercase(),
         },
     );
-    let request = LoadingRequest::unverified_legacy_skirmish(
-        launch.clone(),
-        unverified_seed(0x1212),
-        SkirmishSettings::default(),
-    )
-    .with_accepted_random_map(Some(accepted));
+    let request =
+        LoadingRequest::unverified_legacy_skirmish(launch.clone(), unverified_seed(0x1212))
+            .with_accepted_random_map(Some(accepted));
 
     let prepared = request.prepare_initial(initial).unwrap();
     let context = &prepared.context;
@@ -730,15 +705,17 @@ fn load_descriptor_source_family_format_matrix() {
         (Some(-7), -7, false),
     ];
     for source in [
-        crate::app::frontend::list_maps::LoadedMapSource::Loose {
+        crate::map::source::LoadedMapSource::Loose {
             path: std::path::PathBuf::from("mp01t4.map"),
             payload_len: 17,
+            source_sha256: crate::util::sha256::sha256_hex(b"synthetic map fixture"),
         },
-        crate::app::frontend::list_maps::LoadedMapSource::Mix {
+        crate::map::source::LoadedMapSource::Mix {
             logical_name: "mp01t4.map".to_string(),
             source_archive: "mapsmd03.mix".to_string(),
             entry_id: 0x1234,
             payload_len: 19,
+            source_sha256: crate::util::sha256::sha256_hex(b"synthetic map fixture"),
         },
     ] {
         for (format, expected_signed, expected_pack_gate) in signed_formats {
@@ -751,7 +728,6 @@ fn load_descriptor_source_family_format_matrix() {
             let request = LoadingRequest::unverified_legacy_skirmish(
                 test_launch_session(LaunchCountry::America),
                 unverified_seed(0x1A2B_3C4D),
-                SkirmishSettings::default(),
             );
             let prepared = request
                 .prepare_initial(initial)
@@ -797,17 +773,13 @@ fn load_descriptor_source_family_format_matrix() {
         let accepted = accepted_random_map_with_starts(&selected, 0x2345, &starts, &starts);
         let mut map = prefix_test_map(&starts);
         map.basic.new_ini_format = Some(4);
-        let source = crate::app::frontend::list_maps::LoadedMapSource::Generated {
+        let source = crate::map::source::LoadedMapSource::Generated {
             seed_name: selected.to_ascii_lowercase(),
         };
         let initial =
             crate::app::loading::init::MapLoadInitial::from_test_map_source(map, source.clone());
-        let request = LoadingRequest::unverified_legacy_skirmish(
-            launch,
-            unverified_seed(0x2345),
-            SkirmishSettings::default(),
-        )
-        .with_accepted_random_map(Some(accepted));
+        let request = LoadingRequest::unverified_legacy_skirmish(launch, unverified_seed(0x2345))
+            .with_accepted_random_map(Some(accepted));
         let prepared = request
             .prepare_initial(initial)
             .expect("accepted Battle/FFA generated context");
@@ -834,9 +806,10 @@ fn accepted_and_resolved_legacy_share_one_stock_cursor_shape() {
     use crate::app::loading::fresh_scenario::{FreshScenarioFamily, FreshStartupProvenance};
 
     let starts = [(0, 20, 24), (1, 42, 46)];
-    let source = crate::app::frontend::list_maps::LoadedMapSource::Loose {
+    let source = crate::map::source::LoadedMapSource::Loose {
         path: std::path::PathBuf::from("mp01t4.map"),
         payload_len: 23,
+        source_sha256: crate::util::sha256::sha256_hex(b"synthetic map fixture"),
     };
     let mut map = prefix_test_map(&starts);
     map.basic.new_ini_format = Some(4);
@@ -850,12 +823,9 @@ fn accepted_and_resolved_legacy_share_one_stock_cursor_shape() {
     let mut next = 1;
     let prepared = prepared_startup(&mut next, seed);
     let legacy_session = prepared.session.launch_session().clone();
-    let accepted = LoadingRequest::accepted_skirmish(prepared, SkirmishSettings::default());
-    let resolved_legacy = LoadingRequest::unverified_legacy_skirmish(
-        legacy_session,
-        unverified_seed(seed),
-        SkirmishSettings::default(),
-    );
+    let accepted = LoadingRequest::accepted_skirmish(prepared);
+    let resolved_legacy =
+        LoadingRequest::unverified_legacy_skirmish(legacy_session, unverified_seed(seed));
     let accepted = accepted.prepare_initial(initial).unwrap();
     let resolved_legacy = resolved_legacy.prepare_initial(legacy_initial).unwrap();
     let accepted_context = &accepted.context;
@@ -905,7 +875,7 @@ fn accepted_and_resolved_legacy_share_one_stock_cursor_shape() {
 fn generic_manual_and_unresolved_legacy_reject_before_receipt_or_staging() {
     let selected = "Rejected.SED";
     let starts = [(0, 20, 24), (1, 42, 46)];
-    let source = crate::app::frontend::list_maps::LoadedMapSource::Generated {
+    let source = crate::map::source::LoadedMapSource::Generated {
         seed_name: selected.to_string(),
     };
     let initial = crate::app::loading::init::MapLoadInitial::from_test_map_source(
@@ -913,8 +883,8 @@ fn generic_manual_and_unresolved_legacy_reject_before_receipt_or_staging() {
         source,
     );
     let accepted = accepted_random_map_with_starts(selected, 0x4567, &starts, &starts);
-    let mut generic = LoadingRequest::generic_map_load(selected, SkirmishSettings::default())
-        .with_accepted_random_map(Some(accepted));
+    let mut generic =
+        LoadingRequest::generic_map_load(selected).with_accepted_random_map(Some(accepted));
     let generic_err = generic.admit_context(&initial).unwrap_err();
     assert!(format!("{generic_err:#}").contains("Generic startup"));
     assert!(generic.accepted_rmg_start_staging.is_some());
@@ -923,30 +893,25 @@ fn generic_manual_and_unresolved_legacy_reject_before_receipt_or_staging() {
     let mut unresolved_session = test_launch_session(LaunchCountry::America);
     unresolved_session.selected_map_file = Some(selected.to_string());
     unresolved_session.local.country_random = true;
-    let mut unresolved = LoadingRequest::unverified_legacy_skirmish(
-        unresolved_session,
-        unverified_seed(0x4567),
-        SkirmishSettings::default(),
-    )
-    .with_accepted_random_map(Some(accepted));
+    let mut unresolved =
+        LoadingRequest::unverified_legacy_skirmish(unresolved_session, unverified_seed(0x4567))
+            .with_accepted_random_map(Some(accepted));
     let unresolved_err = unresolved.admit_context(&initial).unwrap_err();
     assert!(format!("{unresolved_err:#}").contains("local slot still has a random country"));
     assert!(unresolved.accepted_rmg_start_staging.is_some());
 
     let authored = crate::app::loading::init::MapLoadInitial::from_test_map_source(
         prefix_test_map(&starts),
-        crate::app::frontend::list_maps::LoadedMapSource::Loose {
+        crate::map::source::LoadedMapSource::Loose {
             path: std::path::PathBuf::from("manual.map"),
             payload_len: 1,
+            source_sha256: crate::util::sha256::sha256_hex(b"synthetic map fixture"),
         },
     );
     let mut manual_session = test_launch_session(LaunchCountry::America);
     manual_session.selected_map_file = Some(" auto ".to_string());
-    let mut manual = LoadingRequest::unverified_legacy_skirmish(
-        manual_session,
-        unverified_seed(0x4567),
-        SkirmishSettings::default(),
-    );
+    let mut manual =
+        LoadingRequest::unverified_legacy_skirmish(manual_session, unverified_seed(0x4567));
     let manual_err = manual.admit_context(&authored).unwrap_err();
     assert!(format!("{manual_err:#}").contains("no exact selected map record"));
 }
@@ -1043,16 +1008,12 @@ fn gsi_04_12_generated_prefix_rejects_presentation_only_preview() {
     launch.selected_map_file = Some(selected.to_string());
     let initial = crate::app::loading::init::MapLoadInitial::from_test_map_source(
         prefix_test_map(&starts),
-        crate::app::frontend::list_maps::LoadedMapSource::Generated {
+        crate::map::source::LoadedMapSource::Generated {
             seed_name: selected.to_string(),
         },
     );
-    let mut request = LoadingRequest::unverified_legacy_skirmish(
-        launch,
-        unverified_seed(0x1313),
-        SkirmishSettings::default(),
-    )
-    .with_random_map_preview(Some(generated_preview_with_starts(0x1313, &starts)));
+    let mut request = LoadingRequest::unverified_legacy_skirmish(launch, unverified_seed(0x1313))
+        .with_random_map_preview(Some(generated_preview_with_starts(0x1313, &starts)));
 
     let err = request.admit_context(&initial).unwrap_err();
     assert!(
@@ -1070,16 +1031,12 @@ fn generated_prefix_rejects_mismatched_source_name() {
     let accepted = accepted_random_map_with_starts(selected, 0x1414, &starts, &starts);
     let initial = crate::app::loading::init::MapLoadInitial::from_test_map_source(
         prefix_test_map(&starts),
-        crate::app::frontend::list_maps::LoadedMapSource::Generated {
+        crate::map::source::LoadedMapSource::Generated {
             seed_name: "Other.Sed".to_string(),
         },
     );
-    let mut request = LoadingRequest::unverified_legacy_skirmish(
-        launch,
-        unverified_seed(0x1414),
-        SkirmishSettings::default(),
-    )
-    .with_accepted_random_map(Some(accepted));
+    let mut request = LoadingRequest::unverified_legacy_skirmish(launch, unverified_seed(0x1414))
+        .with_accepted_random_map(Some(accepted));
 
     let err = request.admit_context(&initial).unwrap_err();
     assert!(
@@ -1102,16 +1059,12 @@ fn generated_prefix_rejects_cooperative_mode() {
     let accepted = accepted_random_map_with_starts(selected, 0x1515, &starts, &starts);
     let initial = crate::app::loading::init::MapLoadInitial::from_test_map_source(
         prefix_test_map(&starts),
-        crate::app::frontend::list_maps::LoadedMapSource::Generated {
+        crate::map::source::LoadedMapSource::Generated {
             seed_name: selected.to_string(),
         },
     );
-    let mut request = LoadingRequest::unverified_legacy_skirmish(
-        launch,
-        unverified_seed(0x1515),
-        SkirmishSettings::default(),
-    )
-    .with_accepted_random_map(Some(accepted));
+    let mut request = LoadingRequest::unverified_legacy_skirmish(launch, unverified_seed(0x1515))
+        .with_accepted_random_map(Some(accepted));
 
     let err = request.admit_context(&initial).unwrap_err();
     assert!(
@@ -1134,16 +1087,12 @@ fn generated_prefix_rejects_a_spoofed_stock_row_before_consuming_staging() {
     let accepted = accepted_random_map_with_starts(selected, 0x1516, &starts, &starts);
     let initial = crate::app::loading::init::MapLoadInitial::from_test_map_source(
         prefix_test_map(&starts),
-        crate::app::frontend::list_maps::LoadedMapSource::Generated {
+        crate::map::source::LoadedMapSource::Generated {
             seed_name: selected.to_string(),
         },
     );
-    let mut request = LoadingRequest::unverified_legacy_skirmish(
-        launch,
-        unverified_seed(0x1516),
-        SkirmishSettings::default(),
-    )
-    .with_accepted_random_map(Some(accepted));
+    let mut request = LoadingRequest::unverified_legacy_skirmish(launch, unverified_seed(0x1516))
+        .with_accepted_random_map(Some(accepted));
 
     let err = request.admit_context(&initial).unwrap_err();
     assert!(format!("{err:#}").contains("not the validated active-retail stock row"));
@@ -1155,15 +1104,17 @@ fn authored_prefix_rejects_random_map_staging_for_loose_and_mix_sources() {
     let selected = "mp01t4.map";
     let starts = [(0, 20, 24), (1, 42, 46)];
     let sources = [
-        crate::app::frontend::list_maps::LoadedMapSource::Loose {
+        crate::map::source::LoadedMapSource::Loose {
             path: std::path::PathBuf::from(selected),
             payload_len: 1,
+            source_sha256: crate::util::sha256::sha256_hex(b"synthetic map fixture"),
         },
-        crate::app::frontend::list_maps::LoadedMapSource::Mix {
+        crate::map::source::LoadedMapSource::Mix {
             logical_name: selected.to_string(),
             source_archive: "mapsmd03.mix".to_string(),
             entry_id: 7,
             payload_len: 1,
+            source_sha256: crate::util::sha256::sha256_hex(b"synthetic map fixture"),
         },
     ];
     for source in sources {
@@ -1174,12 +1125,9 @@ fn authored_prefix_rejects_random_map_staging_for_loose_and_mix_sources() {
             prefix_test_map(&starts),
             source,
         );
-        let mut request = LoadingRequest::unverified_legacy_skirmish(
-            launch,
-            unverified_seed(0x1616),
-            SkirmishSettings::default(),
-        )
-        .with_accepted_random_map(Some(accepted));
+        let mut request =
+            LoadingRequest::unverified_legacy_skirmish(launch, unverified_seed(0x1616))
+                .with_accepted_random_map(Some(accepted));
 
         let err = request.admit_context(&initial).unwrap_err();
         assert!(
@@ -1195,15 +1143,11 @@ fn stock_prefix_rejects_legacy_fallback_source() {
     let launch = test_launch_session(LaunchCountry::America);
     let initial = crate::app::loading::init::MapLoadInitial::from_test_map_source(
         prefix_test_map(&starts),
-        crate::app::frontend::list_maps::LoadedMapSource::LegacyFallback {
+        crate::map::source::LoadedMapSource::LegacyFallback {
             label: "fixture".to_string(),
         },
     );
-    let mut request = LoadingRequest::unverified_legacy_skirmish(
-        launch,
-        unverified_seed(0x1717),
-        SkirmishSettings::default(),
-    );
+    let mut request = LoadingRequest::unverified_legacy_skirmish(launch, unverified_seed(0x1717));
 
     let err = request.admit_context(&initial).unwrap_err();
     assert!(
@@ -1212,10 +1156,7 @@ fn stock_prefix_rejects_legacy_fallback_source() {
     );
 
     let mut next = 1;
-    let mut accepted = LoadingRequest::accepted_skirmish(
-        prepared_startup(&mut next, 0x1717),
-        SkirmishSettings::default(),
-    );
+    let mut accepted = LoadingRequest::accepted_skirmish(prepared_startup(&mut next, 0x1717));
     let accepted_err = accepted.admit_context(&initial).unwrap_err();
     assert!(
         format!("{accepted_err:#}")
@@ -1303,12 +1244,9 @@ fn gsi_04_12_stock_ffa_preview_can_only_supply_loading_fallback_pixels() {
         stages_run: Vec::new(),
         unfilled_start_slots: 0,
     };
-    let _request = LoadingRequest::unverified_legacy_skirmish(
-        launch.clone(),
-        unverified_seed(0x4567),
-        SkirmishSettings::default(),
-    )
-    .with_random_map_preview(Some(generated));
+    let _request =
+        LoadingRequest::unverified_legacy_skirmish(launch.clone(), unverified_seed(0x4567))
+            .with_random_map_preview(Some(generated));
     let assignments = selected_map_start_assignments(&launch, None);
     assert!(
         assignments.is_empty(),
@@ -1364,10 +1302,7 @@ fn random_map_progress_uses_native_integer_halving_and_raw_200_terminal() {
 
 #[test]
 fn loading_session_falls_back_without_native_session_only_outside_parity_path() {
-    let session = LoadingSession::from_request(LoadingRequest::generic_map_load(
-        "auto",
-        SkirmishSettings::default(),
-    ));
+    let session = LoadingSession::from_request(LoadingRequest::generic_map_load("auto"));
 
     assert!(session.native.is_none());
     assert!(session.stage.request().skirmish_launch_session().is_none());
@@ -1379,7 +1314,6 @@ fn loading_session_starts_at_initial_map_selection_phase() {
     let session = LoadingSession::from_request(LoadingRequest::unverified_legacy_skirmish(
         test_launch_session(LaunchCountry::America),
         unverified_seed(3),
-        SkirmishSettings::default(),
     ));
 
     assert!(matches!(session.stage, LoadingStage::Selected(_)));
@@ -1413,14 +1347,15 @@ fn loading_request_moves_exact_startup_authority_once() {
     let correlation = crate::match_bootstrap::allocate_match_correlation(&mut next).unwrap();
     let mut clock = Clock;
     let prepared = crate::match_bootstrap::prepare_match_startup(correlation, accepted, &mut clock);
-    let request = LoadingRequest::accepted_skirmish(prepared.clone(), SkirmishSettings::default());
+    let request = LoadingRequest::accepted_skirmish(prepared.clone());
 
     assert_eq!(request.startup().accepted(), Some(&prepared));
     let initial = MapLoadInitial::from_test_map_source(
         prefix_test_map(&[(0, 20, 24), (1, 42, 46)]),
-        crate::app::frontend::list_maps::LoadedMapSource::Loose {
+        crate::map::source::LoadedMapSource::Loose {
             path: PathBuf::from("mp01t4.map"),
             payload_len: 1,
+            source_sha256: crate::util::sha256::sha256_hex(b"synthetic map fixture"),
         },
     );
     let loaded = request.prepare_initial(initial).unwrap();
@@ -1443,7 +1378,7 @@ fn replacing_loading_startup_retires_prior_admission() {
     authority.begin(Some(prior.correlation));
     let simulation = crate::sim::world::Simulation::with_seed(u64::from(prior.seed.value));
     authority
-        .acknowledge(prior.clone(), Some(&simulation), true, false)
+        .acknowledge(prior.clone(), Some(&simulation), true)
         .unwrap();
     assert_eq!(authority.receipt(), Some(&receipt_for(&prior)));
     assert!(authority.admits_exact_step());
@@ -1455,19 +1390,19 @@ fn replacing_loading_startup_retires_prior_admission() {
     let baseline = authority.clone();
     assert!(
         authority
-            .acknowledge(prior, Some(&simulation), true, false)
+            .acknowledge(prior, Some(&simulation), true)
             .is_err()
     );
     assert_eq!(authority, baseline, "stale completion cannot install");
     let simulation = crate::sim::world::Simulation::with_seed(u64::from(replacement.seed.value));
     authority
-        .acknowledge(replacement.clone(), Some(&simulation), true, false)
+        .acknowledge(replacement.clone(), Some(&simulation), true)
         .unwrap();
     assert_eq!(authority.startup(), Some(&replacement));
     let accepted = authority.clone();
     assert!(
         authority
-            .acknowledge(replacement, Some(&simulation), true, false)
+            .acknowledge(replacement, Some(&simulation), true)
             .is_err()
     );
     assert_eq!(
@@ -1489,14 +1424,10 @@ fn rejected_startup_observation_does_not_publish_partial_admission() {
     authority.begin(Some(prepared.correlation));
     let baseline = authority.clone();
     let simulation = crate::sim::world::Simulation::with_seed(u64::from(prepared.seed.value));
-    for (sim, loading, spawn) in [
-        (None, true, false),
-        (Some(&simulation), false, false),
-        (Some(&simulation), true, true),
-    ] {
+    for (sim, loading) in [(None, true), (Some(&simulation), false)] {
         assert!(
             authority
-                .acknowledge(prepared.clone(), sim, loading, spawn)
+                .acknowledge(prepared.clone(), sim, loading)
                 .is_err()
         );
         assert_eq!(authority, baseline);
@@ -1679,5 +1610,114 @@ fn selected_generic_progress_uses_no_native_loader_metadata() {
     assert_eq!(phase.runtime_color_scheme_count, 0);
     for raw in [8, 6, 8, 12, 100, 200] {
         phase.sink.milestone(raw);
+    }
+}
+
+/// Startup absence and a lost loading lease both rebuild from the retained
+/// launch policy, never the harness argv. Distinct MAPSMD entries make a policy
+/// reset observable through production archive loading and lookup.
+#[test]
+fn absent_and_lost_loading_managers_preserve_media_policy() {
+    use crate::assets::asset_manager::MediaArchiveMode;
+    use crate::map::source::test_support::{TestDirectory, make_new_format_mix_bytes};
+
+    let dir = TestDirectory::new("media-recovery-Cd-path");
+    let empty = make_new_format_mix_bytes(&[]);
+    for name in [
+        "ra2md.mix",
+        "ra2.mix",
+        "cachemd.mix",
+        "cache.mix",
+        "localmd.mix",
+        "local.mix",
+        "conqmd.mix",
+        "conquer.mix",
+        "cameomd.mix",
+        "cameo.mix",
+        "multimd.mix",
+        "movmd03.mix",
+    ] {
+        dir.write(name, &empty);
+    }
+    dir.write(
+        "mapsmd03.mix",
+        &make_new_format_mix_bytes(&[("stock.bin", b"stock")]),
+    );
+    dir.write(
+        "mapsmd01.mix",
+        &make_new_format_mix_bytes(&[("wildcard.bin", b"wildcard")]),
+    );
+    dir.write("rulesmd.ini", b"[General]\nBuildSpeed=.7\n");
+    dir.write("artmd.ini", b"[Test]\n");
+    dir.write(
+        "soundmd.ini",
+        b"[SoundList]\n0=StartupCue\n[StartupCue]\nSounds=cue\n",
+    );
+    dir.write(
+        "evamd.ini",
+        b"[DialogList]\n0=EVA_Test\n[EVA_Test]\nAllied=cue\n",
+    );
+    // Valid empty v1 index is enough to distinguish disabled from selected.
+    dir.write("audio.idx", &[0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0]);
+    dir.write("audio.bag", b"retained bag");
+    for (mode, audio_enabled) in [
+        (MediaArchiveMode::STOCK_DIGITAL, false),
+        (MediaArchiveMode::CdWildcard, true),
+    ] {
+        let mut owner = crate::app::process_assets::ProcessAssets::new(mode, audio_enabled);
+        let mut original_sounds = None;
+        let mut session = LoadingSession::from_request(LoadingRequest::unverified_legacy_skirmish(
+            test_launch_session(LaunchCountry::America),
+            unverified_seed(1),
+        ));
+        for lost_lease in [false, true] {
+            if lost_lease {
+                session.job.retire(&mut owner);
+                // Exercise the actual leased-but-lost recovery branch.
+                drop(owner.lease_for_loading().unwrap());
+                assert!(owner.is_leased());
+                session = LoadingSession::from_request(LoadingRequest::unverified_legacy_skirmish(
+                    test_launch_session(LaunchCountry::America),
+                    unverified_seed(1),
+                ));
+            }
+            ensure_session_job_asset_manager(&mut owner, &mut session, Some(dir.path().to_owned()))
+                .expect("production archive reconstruction");
+            let sounds = owner
+                .native_rules()
+                .expect("recovery creates Rules before preparation")
+                .fixed_sounds();
+            if let Some(original) = &original_sounds {
+                assert!(
+                    std::sync::Arc::ptr_eq(original, sounds),
+                    "lost manager must not replace catalog or Rules"
+                );
+            } else {
+                original_sounds = Some(std::sync::Arc::clone(sounds));
+            }
+            let catalog = owner.audio_catalog().unwrap();
+            assert!(
+                std::ptr::eq(catalog.sounds(), sounds.as_ref()),
+                "playback and Rules share the allocation"
+            );
+            assert!(catalog.sounds().get("StartupCue").is_some());
+            assert_eq!(catalog.index().is_some(), audio_enabled);
+            assert_eq!(
+                catalog
+                    .eva()
+                    .get("EVA_Test", crate::rules::sound_ini::EvaSide::Allied),
+                Some("cue")
+            );
+            let manager = session.job.asset_manager.as_ref().unwrap();
+            assert_eq!(manager.get_ref("stock.bin"), Some(b"stock".as_slice()));
+            assert_eq!(
+                manager.contains("wildcard.bin"),
+                mode == MediaArchiveMode::CdWildcard
+            );
+            assert_eq!(owner.media_archive_mode(), mode);
+            assert!(!owner.is_leased());
+        }
+        session.job.retire(&mut owner);
+        assert!(owner.is_available());
     }
 }

@@ -34,7 +34,7 @@ fn infantry_rules(crawls: bool) -> RuleSet {
         if crawls { "yes" } else { "no" }
     ));
     let art = ArtRegistry::from_ini(&art_ini);
-    rules.merge_art_data(&art);
+    rules.install_art_data(art);
     rules
 }
 
@@ -46,10 +46,7 @@ fn prone_mover() -> GameEntity {
         0,
         64,
         test_intern("Americans"),
-        Health {
-            current: 100,
-            max: 100,
-        },
+        Health { current: 100 },
         test_intern("E1"),
         EntityCategory::Infantry,
         0,
@@ -90,7 +87,6 @@ fn advance_prone_mover(crawls: bool) -> SimFixed {
     let mut occupancy = OccupancyGrid::new();
     let mut sounds = Vec::new();
     let mut lifecycle_requests = Vec::new();
-    let mut next_occupancy_enter_order = crate::sim::world::EnterOrderCounter::new();
     let terrain_costs: BTreeMap<SpeedType, TerrainCostGrid> = BTreeMap::new();
 
     tick_movement_with_grids(
@@ -102,7 +98,6 @@ fn advance_prone_mover(crawls: bool) -> SimFixed {
         &mut occupancy,
         &mut crate::sim::occupancy::CellOccupationGrid::new(),
         &mut crate::sim::occupancy::RawCellOccupationGrid::new(),
-        &mut next_occupancy_enter_order,
         &mut rng,
         0,
         0, // binary_frame (test)
@@ -120,25 +115,29 @@ fn advance_prone_mover(crawls: bool) -> SimFixed {
     );
 
     assert!(lifecycle_requests.is_empty());
+    // Foot speed comes from live E1 Speed=4 (10 leptons/frame), not the stale
+    // 165-leptons/second request stamp. The Infantry override is local; the
+    // Foot owner's GetCurrentSpeed stays unadjusted.
+    assert_eq!(
+        crate::sim::movement::owner_current_speed(
+            entities.get(1).unwrap(),
+            rules.object("E1"),
+            rules.general.veteran_speed,
+        ),
+        10
+    );
 
     entities.get(1).expect("entity exists").position.sub_x
 }
 
-fn expected_sub_x_after_one_frame(frame_budget: i32) -> SimFixed {
-    SimFixed::from_num(128 + frame_budget)
-}
-
 #[test]
 fn crawls_yes_prone_movement_uses_ceiling_two_thirds_speed() {
-    // ceil(11 * 2/3) = 8 leptons for this frame.
-    assert_eq!(advance_prone_mover(true), expected_sub_x_after_one_frame(8));
+    // Infantry521D80: 10 - trunc(10/3) = 7, then the eastward paid Walk step.
+    assert_eq!(advance_prone_mover(true), SimFixed::from_num(135));
 }
 
 #[test]
 fn crawls_no_prone_movement_uses_speed_plus_half() {
-    // 11 + floor(11/2) = 16 leptons for this frame.
-    assert_eq!(
-        advance_prone_mover(false),
-        expected_sub_x_after_one_frame(16)
-    );
+    // Infantry521DBC: 10 + trunc(10/2) = 15.
+    assert_eq!(advance_prone_mover(false), SimFixed::from_num(143));
 }

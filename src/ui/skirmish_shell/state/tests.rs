@@ -3,8 +3,10 @@
 use super::combos::apply_combo_selection as apply_combo_selection_for_test;
 use super::*;
 use crate::app::loading::init::MapMenuEntry;
-use crate::map::briefing::BriefingSection;
 use crate::map::preview::PreviewSection;
+use crate::map::skirmish_scenarios::{
+    SkirmishScenarioKind, SkirmishScenarioRecord, SkirmishScenarioSource,
+};
 use crate::map::waypoints::Waypoint;
 use crate::rules::ini_parser::IniFile;
 use crate::skirmish_launch::{
@@ -12,15 +14,11 @@ use crate::skirmish_launch::{
     SkirmishLaunchOptions,
 };
 use crate::skirmish_modes::stock_skirmish_modes;
-use crate::map::skirmish_scenarios::{
-    SkirmishScenarioKind, SkirmishScenarioRecord, SkirmishScenarioSource,
-};
-use crate::ui::skirmish_shell::layout::TRACKBAR_THUMB_W;
+use crate::ui::shell::trackbar::{THUMB_W, TrackbarHold, TrackbarRange};
+use crate::ui::skirmish_shell::layout::compute_choose_map_modal_layout;
 use crate::ui::skirmish_shell::{
     COMBO_DROPDOWN_ROW_H, COMBO_DROPDOWN_SCROLLBAR_BUTTON_H, COMBO_DROPDOWN_SCROLLBAR_W,
-    COMBO_FACE_H, ChooseMapListboxId, RectPx, checkbox_text_rect,
-    compute_fixed_800_choose_map_modal_layout, compute_layout, trackbar_pixel_offset,
-    trackbar_thumb_rect,
+    COMBO_FACE_H, RectPx, checkbox_text_rect, compute_layout,
 };
 
 fn test_map_entry(name: &str) -> MapMenuEntry {
@@ -32,7 +30,6 @@ fn test_map_entry_with_starts(name: &str, start_count: usize) -> MapMenuEntry {
         file_name: name.to_string(),
         display_name: name.to_string(),
         author: None,
-        briefing: BriefingSection::default(),
         preview: PreviewSection::default(),
         multiplayer_start_waypoints: (0..start_count)
             .map(|idx| Waypoint {
@@ -129,7 +126,8 @@ fn choose_map_modal_open_filters_and_highlights_current_record() {
         test_scenario_record(2, "team", "teamgame"),
     ];
 
-    let modal = ChooseMapModalState::open(1, Some(1), &modes, &records);
+    let layout = compute_choose_map_modal_layout(800, 600);
+    let modal = ChooseMapModalState::open(1, Some(1), &modes, &records, &layout);
 
     assert_eq!(modal.selected_mode_id, 1);
     assert_eq!(modal.filtered_record_indices, vec![0, 1]);
@@ -146,9 +144,10 @@ fn choose_map_modal_select_mode_rebuilds_map_list_by_filter() {
         test_scenario_record(1, "team", "teamgame"),
         test_scenario_record(2, "duel", "duel"),
     ];
-    let mut modal = ChooseMapModalState::open(1, Some(0), &modes, &records);
+    let layout = compute_choose_map_modal_layout(800, 600);
+    let mut modal = ChooseMapModalState::open(1, Some(0), &modes, &records, &layout);
 
-    assert!(modal.select_mode(9, &modes, &records));
+    assert!(modal.select_mode(9, &modes, &records, &layout));
 
     assert_eq!(modal.selected_mode_id, 9);
     assert_eq!(modal.filtered_record_indices, vec![1]);
@@ -163,9 +162,10 @@ fn choose_map_modal_cancel_restores_saved_selection_accept_uses_highlight() {
         test_scenario_record(0, "first", "standard"),
         test_scenario_record(1, "second", "standard"),
     ];
-    let mut modal = ChooseMapModalState::open(1, Some(0), &modes, &records);
+    let layout = compute_choose_map_modal_layout(800, 600);
+    let mut modal = ChooseMapModalState::open(1, Some(0), &modes, &records, &layout);
 
-    assert!(modal.select_map_filtered_row(1));
+    modal.highlighted_filtered_index = Some(1);
 
     assert_eq!(
         modal.accept_selection(),
@@ -187,13 +187,14 @@ fn choose_map_modal_cancel_restores_saved_selection_accept_uses_highlight() {
 fn choose_map_modal_random_map_command_is_mode_gated_and_single_record() {
     let modes = stock_skirmish_modes();
     let mut records = vec![test_scenario_record(0, "battle", "standard")];
-    let mut modal = ChooseMapModalState::open(1, Some(0), &modes, &records);
+    let layout = compute_choose_map_modal_layout(800, 600);
+    let mut modal = ChooseMapModalState::open(1, Some(0), &modes, &records, &layout);
 
     let first_random = modal
-        .create_random_map(&mut records, &modes, "Random Map", 4)
+        .create_random_map(&mut records, &modes, "Random Map", 4, &layout)
         .expect("battle allows random maps");
     let second_random = modal
-        .create_random_map(&mut records, &modes, "Random Map", 4)
+        .create_random_map(&mut records, &modes, "Random Map", 4, &layout)
         .expect("battle still allows random maps");
 
     assert_eq!(first_random, second_random);
@@ -204,34 +205,12 @@ fn choose_map_modal_random_map_command_is_mode_gated_and_single_record() {
     );
     assert_eq!(modal.selected_record_index(), Some(first_random));
 
-    assert!(modal.select_mode(9, &modes, &records));
+    assert!(modal.select_mode(9, &modes, &records, &layout));
     assert_eq!(
-        modal.create_random_map(&mut records, &modes, "Nope", 4),
+        modal.create_random_map(&mut records, &modes, "Nope", 4, &layout),
         None
     );
     assert_eq!(records.len(), 2);
-}
-
-#[test]
-fn choose_map_modal_scrolls_mode_and_map_listboxes_independently() {
-    let modes = stock_skirmish_modes();
-    let records = (0..20)
-        .map(|idx| test_scenario_record(idx, &format!("map{idx}"), "standard"))
-        .collect::<Vec<_>>();
-    let mut modal = ChooseMapModalState::open(1, Some(0), &modes, &records);
-
-    assert!(modal.scroll_listbox_by_rows(ChooseMapListboxId::Map0x553, 20, 11, 4));
-    assert_eq!(modal.map_top_index, 4);
-    assert_eq!(modal.mode_top_index, 0);
-
-    assert!(modal.scroll_listbox_by_rows(ChooseMapListboxId::Map0x553, 20, 11, 100));
-    assert_eq!(modal.map_top_index, 9);
-
-    assert!(modal.scroll_listbox_by_rows(ChooseMapListboxId::Map0x553, 20, 11, -100));
-    assert_eq!(modal.map_top_index, 0);
-
-    assert!(!modal.set_top_index_clamped(ChooseMapListboxId::Mode0x6eb, modes.len(), 11, 5));
-    assert_eq!(modal.mode_top_index, 0);
 }
 
 #[test]
@@ -267,44 +246,88 @@ fn owner_draw_button_hit_test_returns_control_identity() {
     );
 }
 
-#[test]
-fn trackbar_mouse_y_gate_rejects_top_four_pixels() {
-    let rect = RectPx::new(404, 286, 128, 21);
+/// The first window row a press lands on (`y > bottom - 18`, `0x0061E505`).
+fn first_admitted_row(rect: RectPx) -> i32 {
+    rect.y + rect.h - 17
+}
 
-    assert!(!trackbar_mouse_allowed_y(rect, rect.y));
-    assert!(!trackbar_mouse_allowed_y(rect, rect.y + 3));
-    assert!(trackbar_mouse_allowed_y(rect, rect.y + 4));
-    assert!(!trackbar_mouse_allowed_y(rect, rect.y + rect.h));
+/// A Skirmish state with the slider ranges retail Rules gives through the
+/// production reader, or `None` without the retail INIs.
+fn retail_ranges_shell() -> Option<SkirmishShellState> {
+    let rules = crate::rules::retail_ini_fixture::retail_ini("rulesmd.ini")?;
+    let mut shell = SkirmishShellState::default();
+    shell.trackbar_bounds = SkirmishTrackbarBounds::from_multiplayer_dialog_settings(&rules);
+    Some(shell)
+}
+
+/// The screen x of the Credits thumb's left edge.
+fn credits_thumb_x(shell: &SkirmishShellState, rect: RectPx) -> i32 {
+    let range = shell
+        .trackbar_bounds
+        .range(SkirmishTrackbarId::Credits0x511);
+    rect.x + range.thumb_left(shell.starting_credits, rect.w)
+}
+
+/// The original instructions' Credits samples for the runtime window
+/// (`tools/storage_oracle/launcher_trackbar.py`): `(x, position)` pairs.
+fn native_credits_pointers() -> Vec<(i32, i32)> {
+    let golden: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../tools/storage_oracle/launcher_trackbar.json"
+    ))
+    .unwrap();
+    let geometry = golden["geometries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["width"] == 129 && g["maximum"] == 5000)
+        .expect("runtime Credits fixture");
+    geometry["pointers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["x"].as_i64().unwrap() as i32,
+                p["position"].as_i64().unwrap() as i32,
+            )
+        })
+        .collect()
 }
 
 #[test]
-fn trackbar_thumb_hit_uses_exclusive_twelve_pixel_interval() {
-    let rect = RectPx::new(404, 286, 128, 21);
-    let thumb_x = rect.x + 1 + 10;
-    let y = rect.y + 4;
-
-    assert!(trackbar_thumb_hit(rect, 10, thumb_x, y));
-    assert!(trackbar_thumb_hit(rect, 10, thumb_x + 11, y));
-    assert!(!trackbar_thumb_hit(rect, 10, thumb_x + 12, y));
-}
-
-#[test]
-fn trackbar_mouse_x_clamps_below_and_above_range() {
-    let rect = RectPx::new(404, 286, 128, 21);
-
-    assert_eq!(trackbar_mouse_value(rect, rect.x - 100, 0, 6, 1), 0);
-    assert_eq!(trackbar_mouse_value(rect, rect.x + 1000, 0, 6, 1), 6);
-}
-
-#[test]
-fn trackbar_mouse_value_snaps_credits_and_unit_count() {
-    let rect = RectPx::new(404, 314, 128, 21);
-
-    assert_eq!(
-        trackbar_mouse_value(rect, rect.x + 39, 5000, 10000, 100),
-        7400
-    );
-    assert_eq!(trackbar_mouse_value(rect, rect.x + 39, 0, 10, 1), 5);
+fn credits_presses_and_drags_follow_the_native_pointer_partition() {
+    let Some(retail) = retail_ranges_shell() else {
+        return;
+    };
+    // The native samples ran with retail Rules' Credits range.
+    let range = retail
+        .trackbar_bounds
+        .range(SkirmishTrackbarId::Credits0x511);
+    assert_eq!(range, TrackbarRange::new(5000, 10000, 100));
+    let layout = compute_layout(800, 600);
+    let rect = layout.trackbars.credits;
+    let y = first_admitted_row(rect);
+    let thumb = credits_thumb_x(&retail, rect) - rect.x;
+    let samples = native_credits_pointers();
+    for &(x, position) in &samples {
+        let mut shell = retail.clone();
+        let before = shell.starting_credits;
+        handle_option_mouse_down(&mut shell, &layout, &[], rect.x + x, y);
+        if !(0..rect.w).contains(&x) {
+            assert_eq!(shell.starting_credits, before, "x={x} is off the window");
+        } else if (thumb..thumb + THUMB_W).contains(&x) {
+            assert_eq!(shell.starting_credits, before, "x={x} grabs the thumb");
+        } else {
+            assert_eq!(shell.starting_credits, range.min + position, "x={x}");
+        }
+    }
+    // A grabbed thumb follows the pointer anywhere along the row.
+    let mut shell = retail;
+    handle_option_mouse_down(&mut shell, &layout, &[], rect.x + thumb, y);
+    for &(x, position) in &samples {
+        handle_option_mouse_move(&mut shell, &layout, &[], rect.x + x, y);
+        assert_eq!(shell.starting_credits, range.min + position, "drag x={x}");
+    }
 }
 
 #[test]
@@ -601,7 +624,8 @@ fn skirmish_status_help_includes_flag_and_right_panel_static_targets() {
 fn hovered_shell_control_blocks_parent_targets_when_modal_owns_input() {
     let layout = compute_layout(800, 600);
     let mut shell = SkirmishShellState::default();
-    shell.choose_map_modal = Some(ChooseMapModalState::open(1, None, &[], &[]));
+    let chooser = compute_choose_map_modal_layout(800, 600);
+    shell.choose_map_modal = Some(ChooseMapModalState::open(1, None, &[], &[], &chooser));
 
     assert_eq!(
         hovered_shell_control(
@@ -742,16 +766,15 @@ fn status_help_color_row_uses_item_specific_stt_with_generic_miss_fallback() {
 
 #[test]
 fn hovered_choose_map_modal_control_resolves_0x6b_status_targets() {
-    let layout = compute_fixed_800_choose_map_modal_layout(800, 600);
+    let layout = compute_choose_map_modal_layout(800, 600);
     let modes = stock_skirmish_modes();
     let records = vec![test_scenario_record(0, "arena", "standard")];
-    let modal = ChooseMapModalState::open(1, Some(0), &modes, &records);
+    let modal = ChooseMapModalState::open(1, Some(0), &modes, &records, &layout);
 
     assert_eq!(
         hovered_choose_map_modal_control(
             &layout,
             &modal,
-            modes.len(),
             layout.use_map_button.x,
             layout.use_map_button.y
         ),
@@ -760,20 +783,13 @@ fn hovered_choose_map_modal_control_resolves_0x6b_status_targets() {
         ))
     );
     assert_eq!(
-        hovered_choose_map_modal_control(
-            &layout,
-            &modal,
-            modes.len(),
-            layout.preview.x,
-            layout.preview.y
-        ),
+        hovered_choose_map_modal_control(&layout, &modal, layout.preview.x, layout.preview.y),
         Some(ChooseMapHoverTarget::Preview0x468)
     );
     assert_eq!(
         hovered_choose_map_modal_control(
             &layout,
             &modal,
-            modes.len(),
             layout.status_help.x,
             layout.status_help.y
         ),
@@ -783,17 +799,15 @@ fn hovered_choose_map_modal_control_resolves_0x6b_status_targets() {
         hovered_choose_map_modal_control(
             &layout,
             &modal,
-            modes.len(),
             layout.mode_list.x + 1,
             layout.mode_list.y + 1
         ),
-        Some(ChooseMapHoverTarget::ModeListRow0x6eb { mode_index: 0 })
+        Some(ChooseMapHoverTarget::ModeListRow0x6eb { mode_id: 1 })
     );
     assert_eq!(
         hovered_choose_map_modal_control(
             &layout,
             &modal,
-            modes.len(),
             layout.map_list.x + 1,
             layout.map_list.y + 1
         ),
@@ -863,43 +877,89 @@ fn checkbox_icon_click_toggles_but_label_click_does_not() {
 }
 
 #[test]
-fn trackbar_top_edge_does_not_change_value() {
+fn a_press_above_the_admitted_strip_only_holds_the_mouse() {
     let layout = compute_layout(800, 600);
-    let mut shell = SkirmishShellState::default();
     let rect = layout.trackbars.credits;
-
-    handle_option_mouse_down(&mut shell, &layout, &[], rect.x, rect.y);
-    assert_eq!(
-        shell.starting_credits,
-        SkirmishLaunchOptions::default().starting_credits
-    );
-    assert!(shell.pending_trackbar_hscrolls().is_empty());
-    assert!(shell.drain_pending_ui_sounds().is_empty());
+    for y in [rect.y, first_admitted_row(rect) - 1] {
+        let mut shell = SkirmishShellState::default();
+        handle_option_mouse_down(&mut shell, &layout, &[], rect.x + 39, y);
+        handle_option_mouse_move(&mut shell, &layout, &[], rect.x, first_admitted_row(rect));
+        assert_eq!(shell.starting_credits, CREDITS_MAX, "y={y}");
+        assert_eq!(
+            shell.trackbar_hold,
+            Some(TrackbarHold {
+                id: SkirmishTrackbarId::Credits0x511,
+                dragging: false,
+            })
+        );
+        assert!(shell.drain_pending_ui_sounds().is_empty());
+    }
 }
 
 #[test]
 fn trackbar_outside_thumb_click_remaps_value_and_keeps_capture() {
     let layout = compute_layout(800, 600);
-    let mut shell = SkirmishShellState::default();
+    let Some(mut shell) = retail_ranges_shell() else {
+        return;
+    };
     let rect = layout.trackbars.credits;
 
-    handle_option_mouse_down(&mut shell, &layout, &[], rect.x + 39, rect.y + 4);
+    handle_option_mouse_down(
+        &mut shell,
+        &layout,
+        &[],
+        rect.x + 39,
+        first_admitted_row(rect),
+    );
     assert_eq!(shell.starting_credits, 7400);
     assert_eq!(
-        shell.trackbar_drag,
-        Some(TrackbarDragState {
+        shell.trackbar_hold,
+        Some(TrackbarHold {
             id: SkirmishTrackbarId::Credits0x511,
-            dragging_thumb: false,
+            dragging: false,
         })
-    );
-    assert_eq!(
-        shell.drain_pending_trackbar_hscrolls(),
-        vec![(0x511, 7400, 0x1ce8_0005)]
     );
     assert_eq!(
         shell.drain_pending_ui_sounds(),
         vec![SkirmishShellUiSound::GenericClick]
     );
+}
+
+#[test]
+fn a_zero_money_increment_slides_credits_in_ones() {
+    // Every message turns a zero step into 1 (`0x0061DB94..0x0061DBAD`).
+    let ini = IniFile::from_str("[MultiplayerDialogSettings]\nMoneyIncrement=0\n");
+    let mut shell = SkirmishShellState::default();
+    shell.trackbar_bounds = SkirmishTrackbarBounds::from_multiplayer_dialog_settings(&ini);
+    let layout = compute_layout(800, 600);
+    let rect = layout.trackbars.credits;
+    handle_option_mouse_down(
+        &mut shell,
+        &layout,
+        &[],
+        rect.x + 39,
+        first_admitted_row(rect),
+    );
+    let range = shell
+        .trackbar_bounds
+        .range(SkirmishTrackbarId::Credits0x511);
+    assert_eq!(range.step, 1);
+    assert_eq!(shell.starting_credits, range.value_at(39, rect.w));
+    assert_eq!(shell.credits(), shell.starting_credits);
+}
+
+#[test]
+fn the_game_starts_with_the_credits_the_slider_reads_back() {
+    // `TBM_GETPOS` (`0x0061E4AD`) rounds down to MoneyIncrement; the thumb
+    // keeps the saved value.
+    let Some(mut shell) = retail_ranges_shell() else {
+        return;
+    };
+    shell.starting_credits = 7549;
+    assert_eq!(shell.credits(), 7500);
+    let maps = [test_map_entry("first.mmx")];
+    let session = launch_session(&shell, &maps, &stock_skirmish_modes()).expect("session");
+    assert_eq!(session.options.starting_credits, 7500);
 }
 
 #[test]
@@ -907,83 +967,65 @@ fn trackbar_thumb_hit_starts_drag() {
     let layout = compute_layout(800, 600);
     let mut shell = SkirmishShellState::default();
     let rect = layout.trackbars.credits;
-    let pixel_offset = trackbar_pixel_offset(
-        shell.starting_credits,
-        CREDITS_MIN,
-        CREDITS_MAX,
-        CREDITS_STEP,
-        rect,
-    );
-    let thumb = trackbar_thumb_rect(rect, pixel_offset);
+    let thumb_x = credits_thumb_x(&shell, rect);
+    let y = first_admitted_row(rect);
 
-    handle_option_mouse_down(&mut shell, &layout, &[], thumb.x, thumb.y + 4);
+    handle_option_mouse_down(&mut shell, &layout, &[], thumb_x, y);
     assert_eq!(
-        shell.trackbar_drag,
-        Some(TrackbarDragState {
+        shell.trackbar_hold,
+        Some(TrackbarHold {
             id: SkirmishTrackbarId::Credits0x511,
-            dragging_thumb: true,
+            dragging: true,
         })
     );
-    assert!(shell.pending_trackbar_hscrolls().is_empty());
     assert!(shell.drain_pending_ui_sounds().is_empty());
 }
 
 #[test]
 fn trackbar_mouse_move_updates_while_capture_active() {
     let layout = compute_layout(800, 600);
-    let mut shell = SkirmishShellState::default();
+    let Some(mut shell) = retail_ranges_shell() else {
+        return;
+    };
     let rect = layout.trackbars.credits;
-    let pixel_offset = trackbar_pixel_offset(
-        shell.starting_credits,
-        CREDITS_MIN,
-        CREDITS_MAX,
-        CREDITS_STEP,
-        rect,
-    );
-    let thumb = trackbar_thumb_rect(rect, pixel_offset);
+    let thumb_x = credits_thumb_x(&shell, rect);
+    let y = first_admitted_row(rect);
 
-    handle_option_mouse_down(&mut shell, &layout, &[], thumb.x, thumb.y + 4);
-    handle_option_mouse_move(&mut shell, &layout, &[], rect.x - 100, rect.y + 4);
-    assert_eq!(shell.starting_credits, CREDITS_MIN);
-    assert_eq!(
-        shell.drain_pending_trackbar_hscrolls(),
-        vec![(0x511, CREDITS_MIN, 0x1388_0005)]
-    );
+    handle_option_mouse_down(&mut shell, &layout, &[], thumb_x, y);
+    handle_option_mouse_move(&mut shell, &layout, &[], rect.x - 100, y);
+    assert_eq!(shell.starting_credits, 5000);
     assert_eq!(
         shell.drain_pending_ui_sounds(),
         vec![SkirmishShellUiSound::GenericClick]
     );
 
     handle_option_mouse_up(&mut shell);
-    handle_option_mouse_move(&mut shell, &layout, &[], rect.x + 1000, rect.y + 4);
-    assert_eq!(shell.starting_credits, CREDITS_MIN);
-    assert_eq!(shell.trackbar_drag, None);
-    assert!(shell.pending_trackbar_hscrolls().is_empty());
+    handle_option_mouse_move(&mut shell, &layout, &[], rect.x + 1000, y);
+    assert_eq!(shell.starting_credits, 5000);
+    assert_eq!(shell.trackbar_hold, None);
     assert!(shell.drain_pending_ui_sounds().is_empty());
 }
 
 #[test]
 fn trackbar_rail_click_jumps_once_and_does_not_track_cursor() {
     let layout = compute_layout(800, 600);
-    let mut shell = SkirmishShellState::default();
+    let Some(mut shell) = retail_ranges_shell() else {
+        return;
+    };
     let rect = layout.trackbars.credits;
 
-    handle_option_mouse_down(&mut shell, &layout, &[], 443, 318);
-    // A rail click installs a drag-anchor but is NOT a thumb grab, so the
+    handle_option_mouse_down(&mut shell, &layout, &[], 443, 319);
+    // A rail click captures the pointer but is NOT a thumb grab, so the
     // following move must not retrack the value to the cursor.
-    handle_option_mouse_move(&mut shell, &layout, &[], 470, 318);
+    handle_option_mouse_move(&mut shell, &layout, &[], 470, 319);
 
     assert_eq!(shell.starting_credits, 7400);
     assert_eq!(
-        shell.trackbar_drag,
-        Some(TrackbarDragState {
+        shell.trackbar_hold,
+        Some(TrackbarHold {
             id: SkirmishTrackbarId::Credits0x511,
-            dragging_thumb: false,
+            dragging: false,
         })
-    );
-    assert_eq!(
-        shell.drain_pending_trackbar_hscrolls(),
-        vec![(0x511, 7400, 0x1ce8_0005)]
     );
     assert_eq!(
         shell.drain_pending_ui_sounds(),
@@ -991,10 +1033,9 @@ fn trackbar_rail_click_jumps_once_and_does_not_track_cursor() {
     );
 
     handle_option_mouse_up(&mut shell);
-    handle_option_mouse_move(&mut shell, &layout, &[], rect.x - 100, rect.y + 4);
+    handle_option_mouse_move(&mut shell, &layout, &[], rect.x - 100, 319);
     assert_eq!(shell.starting_credits, 7400);
-    assert_eq!(shell.trackbar_drag, None);
-    assert!(shell.pending_trackbar_hscrolls().is_empty());
+    assert_eq!(shell.trackbar_hold, None);
     assert!(shell.drain_pending_ui_sounds().is_empty());
 }
 
@@ -1003,24 +1044,17 @@ fn trackbar_repeated_drag_same_value_is_silent() {
     let layout = compute_layout(800, 600);
     let mut shell = SkirmishShellState::default();
     let rect = layout.trackbars.credits;
-    let pixel_offset = trackbar_pixel_offset(
-        shell.starting_credits,
-        CREDITS_MIN,
-        CREDITS_MAX,
-        CREDITS_STEP,
-        rect,
-    );
-    let thumb = trackbar_thumb_rect(rect, pixel_offset);
+    let thumb_x = credits_thumb_x(&shell, rect);
+    let y = first_admitted_row(rect);
 
-    let max_value_x = thumb.x + TRACKBAR_THUMB_W / 2;
-    handle_option_mouse_down(&mut shell, &layout, &[], max_value_x, thumb.y + 4);
-    handle_option_mouse_move(&mut shell, &layout, &[], max_value_x, thumb.y + 4);
+    let max_value_x = thumb_x + THUMB_W / 2;
+    handle_option_mouse_down(&mut shell, &layout, &[], max_value_x, y);
+    handle_option_mouse_move(&mut shell, &layout, &[], max_value_x, y);
 
     assert_eq!(
         shell.starting_credits,
         SkirmishLaunchOptions::default().starting_credits
     );
-    assert!(shell.pending_trackbar_hscrolls().is_empty());
     assert!(shell.drain_pending_ui_sounds().is_empty());
 }
 
@@ -1028,15 +1062,6 @@ fn trackbar_repeated_drag_same_value_is_silent() {
 fn game_speed_visual_position_inverts_stored_value() {
     assert_eq!(game_speed_visual_position(1), 5);
     assert_eq!(game_speed_from_visual_position(5), 1);
-}
-
-#[test]
-fn launch_settings_preserves_current_load_contract() {
-    let shell = SkirmishShellState::default();
-    let settings = launch_settings(&shell);
-    assert_eq!(settings.selected_map_idx, shell.selected_map_idx);
-    assert_eq!(settings.starting_credits, shell.starting_credits);
-    assert_eq!(settings.short_game, shell.short_game);
 }
 
 #[test]
@@ -1270,12 +1295,9 @@ fn raw_pack_retains_sparse_ai_house_slots_before_compaction() {
     shell.opponents[1].row_type = SkirmishAiRowType::Normal;
     shell.opponents[4].row_type = SkirmishAiRowType::Hard;
     let maps = [test_map_entry("map.mmx")];
-    let packed = pack_launch_session_without_start_validation(
-        &shell,
-        &maps,
-        &stock_skirmish_modes(),
-    )
-    .expect("sparse raw AI slots pack before gameplay compaction");
+    let packed =
+        pack_launch_session_without_start_validation(&shell, &maps, &stock_skirmish_modes())
+            .expect("sparse raw AI slots pack before gameplay compaction");
 
     assert_eq!(packed.opponents.len(), 2);
     assert_eq!(
@@ -2461,4 +2483,73 @@ fn player_name_programmatic_seed_is_not_subject_to_edit_limit() {
     let edit = PlayerNameEditState::with_name("Commander");
     assert_eq!(edit.text, "Commander");
     assert_eq!(edit.caret, "Commander".chars().count());
+}
+
+/// The help table lookup `0x006040B0` executed for `dialog`'s `control`
+/// (`tools/storage_oracle/shell_help_keys.py`).
+fn native_help_key(dialog: u64, control: u64) -> Option<String> {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../tools/storage_oracle/shell_help_keys.json"
+    ))
+    .unwrap();
+    let case = fixture["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| case["dialog_id"] == dialog && case["control_id"] == control)
+        .unwrap_or_else(|| panic!("no help case for {dialog:#x}/{control:#x}"));
+    case["help"].as_str().map(str::to_owned)
+}
+
+#[test]
+fn random_map_setup_help_keys_match_the_native_table() {
+    use crate::ui::skirmish_shell::RandomMapSetupControl as C;
+    for (control, id) in [
+        (C::MapType0x405, 0x405),
+        (C::Time0x3ea, 0x3EA),
+        (C::Theater0x407, 0x407),
+        (C::Size0x406, 0x406),
+        (C::Resources0x408, 0x408),
+        (C::Players0x3eb, 0x3EB),
+        (C::Randomize0x621, 0x621),
+        (C::Generate0x620, 0x620),
+        (C::Ok0x6c5, 0x6C5),
+        (C::Load0x6c2, 0x6C2),
+        (C::Save0x6c3, 0x6C3),
+        (C::Delete0x6c4, 0x6C4),
+        (C::Cancel0x5c0, 0x5C0),
+    ] {
+        assert_eq!(
+            Some(status_help_key_for_random_map_setup(control).to_owned()),
+            native_help_key(0x105, id),
+            "{id:#x}"
+        );
+    }
+}
+
+#[test]
+fn choose_map_help_keys_match_the_native_table() {
+    for (target, id) in [
+        (ChooseMapHoverTarget::ModeList0x6eb, 0x6EB),
+        (ChooseMapHoverTarget::MapList0x553, 0x553),
+        (ChooseMapHoverTarget::Preview0x468, 0x468),
+        (
+            ChooseMapHoverTarget::Button(ChooseMapModalButton::UseMap0x6c5),
+            0x6C5,
+        ),
+        (
+            ChooseMapHoverTarget::Button(ChooseMapModalButton::CreateRandomMap0x583),
+            0x583,
+        ),
+        (
+            ChooseMapHoverTarget::Button(ChooseMapModalButton::Cancel0x5c0),
+            0x5C0,
+        ),
+    ] {
+        assert_eq!(
+            status_help_key_for_choose_map_hover(target).map(str::to_owned),
+            native_help_key(0x6B, id),
+            "{id:#x}"
+        );
+    }
 }

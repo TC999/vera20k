@@ -8,9 +8,9 @@
 //! - Part of sim/ — depends on rules/, sim/power_system, sim/components.
 //! - sim/ NEVER depends on render/, ui/, sidebar/, audio/, net/.
 
+pub mod cell_grid;
 #[cfg(test)]
 mod cell_receiver_tests;
-pub mod cell_grid;
 pub mod force_shield;
 pub mod genetic_converter;
 pub mod invulnerability;
@@ -26,6 +26,95 @@ use crate::rules::superweapon_type::SuperWeaponKind;
 use crate::sim::intern::InternedId;
 use crate::sim::timer::CdTimer;
 use crate::sim::world::{SimSoundEvent, Simulation};
+
+/// Leptons `SuperClass::Launch` raises an invoke animation above its cell.
+const INVOKE_ANIM_Z_LIFT_LEPTONS: i32 = 5;
+
+/// `AnimClass` draw flags of the superweapon cell animations.
+const INVOKE_ANIM_DRAW_FLAGS: u32 = 0x600;
+
+/// Construct a superweapon animation at a cell's centre coordinate.
+///
+/// `SuperClass::Launch @ 0x006CC390` builds all three the same way: Iron
+/// Curtain (`Rules+0x348`, `0x006CCF09`), Force Shield (`Rules+0x34C`,
+/// `0x006CD130`) and the Genetic Mutator's `IonBlast=` (`Rules+0x298`,
+/// `0x006CD8A5`) each call `AnimClass::AnimClass @ 0x00421EA0` with
+/// `(type, &coord, delay 0, loopCount 1, drawFlags 0x600, zAdjust 0, reverse 0)`.
+/// `LightningStorm::GroundStrike @ 0x0053A300` passes the same row for its bolt
+/// (`0x0053A387`).
+///
+/// The two differ in Z. Read at `0x006CCE76..0x006CCF09` for Iron Curtain: the
+/// invoke `coord` is the target cell's own coordinate (`vtable+0x48`), raised
+/// by the bridge height global (`0x00B0C07C`) when the cell carries flag
+/// `0x100`, then `+5` leptons. The bolt takes
+/// `CellClass::Get_Center_Coords @ 0x00480A30`, which is the ground with no
+/// bridge term. `on_bridge_deck` selects between them: `true` is an invoke
+/// row (deck-aware, `+5` leptons), `false` the bolt.
+///
+/// A real `AnimClass` plays the art type's `Report=` from `AnimClass::Start`
+/// (retail `[IRONBLST] Report=IronCurtainBlast`) and follows its `Rate=` and
+/// `Translucent=`. The store does not build native `Middle @ 0x00424F00`
+/// (particles, `Scorch=`, `Crater=`).
+///
+/// RESIDUAL: the cell's own Z is taken as `level * 104`; on a ramp cell
+/// native's cell coordinate carries the sloped height at the centre.
+pub(super) fn spawn_cell_anim(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    anim_name: &str,
+    rx: u16,
+    ry: u16,
+    on_bridge_deck: bool,
+) {
+    if anim_name.trim().is_empty() {
+        return;
+    }
+    let level = sim.resolved_terrain.as_ref().map_or(0, |terrain| {
+        let flagged = on_bridge_deck
+            && terrain.native_cell_flags(terrain.native_cell_identity((rx as i16, ry as i16)))
+                & 0x100
+                != 0;
+        terrain.cell(rx, ry).map_or(0, |cell| {
+            if flagged {
+                cell.bridge_deck_level_if_any().unwrap_or(cell.level)
+            } else {
+                cell.level
+            }
+        })
+    });
+    let type_name = sim.interner.intern(&anim_name.trim().to_ascii_uppercase());
+    let descriptor = crate::sim::components::AnimClassSpawnDescriptor {
+        delay: 0,
+        loop_count: 1,
+        draw_flags: INVOKE_ANIM_DRAW_FLAGS,
+        z_adjust: 0,
+        reverse: false,
+        ..crate::sim::components::AnimClassSpawnDescriptor::new(
+            type_name,
+            rx,
+            ry,
+            crate::util::lepton::CELL_CENTER_LEPTON,
+            crate::util::lepton::CELL_CENTER_LEPTON,
+            level,
+        )
+    };
+    let mut world = crate::sim::anim_class::AnimWorldCoord::from_cell_sub_z(
+        rx,
+        ry,
+        crate::util::lepton::CELL_CENTER_LEPTON,
+        crate::util::lepton::CELL_CENTER_LEPTON,
+        level,
+    );
+    if on_bridge_deck {
+        // The invoke rows add 5 leptons (`0x006CCE76..0x006CCF09`); the bolt's
+        // `Get_Center_Coords` does not.
+        world.z = world.z.wrapping_add(INVOKE_ANIM_Z_LIFT_LEPTONS);
+    }
+    if let Err(error) = sim.spawn_anim_at_world(rules, descriptor, world) {
+        // An art type that never bound draws nothing natively either.
+        log::debug!("superweapon invoke anim [{anim_name}] did not construct: {error}");
+    }
+}
 
 /// Per-house, per-superweapon-type runtime state.
 ///
@@ -65,6 +154,11 @@ impl SuperWeaponInstance {
         self.charge_duration = timer.duration();
     }
 
+    /// The charge timer's remaining frames (`SuperClass+0x30`/`+0x38`).
+    pub(crate) fn charge_remaining(&self, current_frame: i32) -> i32 {
+        self.charge_timer().remaining(current_frame)
+    }
+
     /// Create a new inactive instance.
     pub fn new(type_id: InternedId, owner: InternedId) -> Self {
         Self {
@@ -91,7 +185,8 @@ impl SuperWeaponInstance {
         self.ready_tick = -1;
     }
 
-    /// Deactivate (revoke) this SW when the granting building is lost.
+    /// Deactivate (revoke) this SW when the granting building is lost. The
+    /// entry stays; a later grant activates it again.
     pub fn deactivate(&mut self) {
         self.is_active = false;
         self.is_ready = false;
@@ -182,10 +277,7 @@ pub fn superweapon_views_for_owner(
         views.push(SuperWeaponView {
             type_id: inst.type_id,
             display_name: type_id_str.to_string(),
-            progress: inst.charge_progress(
-                sim.session.binary_frame,
-                sw_type.recharge_time_frames,
-            ),
+            progress: inst.charge_progress(sim.session.binary_frame, sw_type.recharge_time_frames),
             is_ready: inst.is_ready,
             is_online: !inst.is_suspended,
             sidebar_image: sw_type.sidebar_image.clone(),
@@ -279,16 +371,21 @@ pub fn tick_active_superweapon_effects(
     lightning_storm::process(sim, rules, overlay_registry);
 }
 
-/// Compatibility entry point for focused subsystem tests.
-pub fn tick_superweapons(sim: &mut Simulation, rules: &RuleSet) {
-    tick_superweapon_instances(sim, rules);
-    tick_active_superweapon_effects(sim, rules, None);
-}
-
 /// Refresh superweapon grants for a specific owner by scanning their buildings.
 ///
-/// Call when a building is completed, sold, or destroyed. Activates new grants
-/// and deactivates revoked ones.
+/// Call when a building is completed, sold, or destroyed. Grants each weapon
+/// the owner's buildings provide and the owner does not hold, including one
+/// revoked earlier, and revokes each one no building provides.
+///
+/// gamemd: the grant pass `HouseClass @ 0x0050B1D0` (Ghidra label
+/// `HouseClass__AI_ResumeProduction`, called from `BuildingClass::Unlimbo`
+/// and `HouseClass::Update`) calls `SuperClass::Grant @ 0x006CB560` for each
+/// weapon whose present flag `+0x6D` is clear. The revoke pass
+/// `HouseClass @ 0x0050AF10` (label `HouseClass__AI_ManageProduction`) calls
+/// `SuperClass @ 0x006CB7B0` (label `SuperClass__Deactivate`), which clears
+/// `+0x6D` and the charged flag `+0x6F`. Grant returns early only while
+/// `+0x6D` is set, and otherwise restarts the recharge timer at the full
+/// recharge time.
 pub fn refresh_super_weapons_for_owner(sim: &mut Simulation, rules: &RuleSet, owner: InternedId) {
     use std::collections::BTreeSet;
 
@@ -331,18 +428,20 @@ pub fn refresh_super_weapons_for_owner(sim: &mut Simulation, rules: &RuleSet, ow
 
     let weapons = sim.super_weapons.entry(owner).or_default();
 
-    // Activate new grants.
+    // Grant each weapon the owner does not hold: a new one, or one revoked
+    // when its building was lost.
     for &sw_iid in &granted {
-        if !weapons.contains_key(&sw_iid) {
-            let sw_str = sim.interner.resolve(sw_iid).to_string();
-            let recharge = rules
-                .super_weapon(&sw_str)
-                .map_or(4500, |sw| sw.recharge_time_frames);
-            let mut inst = SuperWeaponInstance::new(sw_iid, owner);
-            inst.activate(recharge, sim.session.binary_frame);
-            log::info!("SuperWeapon '{}' granted to '{}'", sw_str, owner_str);
-            weapons.insert(sw_iid, inst);
+        if weapons.get(&sw_iid).is_some_and(|inst| inst.is_active) {
+            continue;
         }
+        let sw_str = sim.interner.resolve(sw_iid).to_string();
+        let recharge = rules
+            .super_weapon(&sw_str)
+            .map_or(4500, |sw| sw.recharge_time_frames);
+        let mut inst = SuperWeaponInstance::new(sw_iid, owner);
+        inst.activate(recharge, sim.session.binary_frame);
+        log::info!("SuperWeapon '{}' granted to '{}'", sw_str, owner_str);
+        weapons.insert(sw_iid, inst);
     }
 
     // Deactivate revoked (building destroyed, no other provides it).
@@ -415,7 +514,10 @@ mod frame_tests {
         let sw = sim.interner.intern("NukeSpecial");
         let mut instance = SuperWeaponInstance::new(sw, owner);
         instance.activate(10, sim.session.binary_frame);
-        sim.super_weapons.entry(owner).or_default().insert(sw, instance);
+        sim.super_weapons
+            .entry(owner)
+            .or_default()
+            .insert(sw, instance);
         sim.super_weapons_initialized = true;
         let ready = |sim: &Simulation| {
             sim.sound_events
@@ -441,5 +543,56 @@ mod frame_tests {
 
         tick_superweapon_instances(&mut sim, &rules);
         assert_eq!(ready(&sim), 1, "a ready weapon is not re-announced");
+    }
+
+    /// `SuperClass::Grant @ 0x006CB560` returns early only while the present
+    /// flag `+0x6D` is set, and the revoke at `0x006CB7B0` clears it: a house
+    /// that sells its only superweapon building and builds another gets the
+    /// weapon back, charging from the full recharge time.
+    #[test]
+    fn a_rebuilt_superweapon_building_grants_its_weapon_again() {
+        use crate::rules::ini_parser::IniFile;
+        let ini = IniFile::from_str(
+            "[SuperWeaponTypes]\n1=NukeSpecial\n[NukeSpecial]\nType=MultiMissile\n\
+             RechargeTime=1\nIsPowered=no\n\
+             [InfantryTypes]\n[VehicleTypes]\n[AircraftTypes]\n\
+             [BuildingTypes]\n1=NAMISL\n\
+             [NAMISL]\nStrength=1000\nCost=100\nTechLevel=1\nOwner=Americans\n\
+             SuperWeapon=NukeSpecial\n",
+        );
+        let mut rules = RuleSet::from_ini(&ini).expect("superweapon grant rules should parse");
+        rules.set_buildup_control_for_test("NAMISL", [0, 25, 2]);
+        let mut sim = Simulation::new();
+        let owner = sim.interner.intern("Americans");
+        let nuke = sim.interner.intern("NukeSpecial");
+        let weapon = |sim: &Simulation| {
+            let inst = &sim.super_weapons[&owner][&nuke];
+            (
+                inst.is_active,
+                inst.is_ready,
+                inst.charge_start_tick,
+                inst.charge_duration,
+            )
+        };
+
+        let first = sim
+            .spawn_object("NAMISL", "Americans", 10, 10, 0, &rules)
+            .expect("first silo spawns");
+        refresh_super_weapons_for_owner(&mut sim, &rules, owner);
+        assert_eq!(weapon(&sim), (true, false, 0, 900));
+
+        assert!(crate::sim::production::sell_building_now_for_test(
+            &mut sim, &rules, first
+        ));
+        assert!(
+            !sim.super_weapons[&owner][&nuke].is_active,
+            "the sale revokes"
+        );
+
+        sim.session.binary_frame = 300;
+        sim.spawn_object("NAMISL", "Americans", 20, 20, 0, &rules)
+            .expect("second silo spawns");
+        refresh_super_weapons_for_owner(&mut sim, &rules, owner);
+        assert_eq!(weapon(&sim), (true, false, 300, 900));
     }
 }

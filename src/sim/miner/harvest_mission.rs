@@ -14,21 +14,25 @@
 //! `MinerSnapshot::state`, runs the FSM step, and commits the cursor + the
 //! dispatch delay back through the mission component.
 //!
-//! Cadence (verified against the native handler): the harvesting and dock
-//! states plus the productive search paths return `DISPATCH_NEXT_FRAME`
-//! (per-frame); the return/finding-home state, the idle state, the search
-//! state's archive-consume and still-driving returns, and every cursor
-//! outside the native switch exit through the default epilogue
+//! Cadence (native rows: tools/spatial_oracle/harvest_field.json and
+//! refinery_dock.json): the harvesting and dock states, the full search
+//! state and the search that finds the miner's own cell return
+//! `DISPATCH_NEXT_FRAME` (per-frame); the return/finding-home state, the
+//! idle state, the search state's archive and scan-hit drives and its
+//! still-driving returns, and every cursor outside the native switch exit
+//! through the default epilogue
 //! (`ftol([Harvest] Rate × 900)` + `RandomRanged(0,2)` on the scenario
 //! stream, ~14-16 frames stock); the no-ore transition into idle returns the
 //! fixed 105-frame wait with no RNG draw. The Mission_Deploy state-4 dock
 //! exit installs the same Rate epilogue at its own site.
 //!
-//! Structural residuals (native returns with no Rust dispatch equivalent):
+//! The slave-host preamble (`0x0073E5E9`): a Slave Miner on Harvest runs
+//! HandleReturnedSlaves (`sim::slave_manager`) and the shared Rate epilogue
+//! instead of the harvester states.
+//!
+//! Structural residual (a native return with no Rust dispatch equivalent):
 //! the 450-frame non-harvester hold — dispatch is gated on Miner-component
-//! presence, so a non-harvester never reaches the handler; and the
-//! slave-host preamble's Rate epilogue — Slave hosts are dispatched by
-//! `slave_miner.rs`, never through this handler.
+//! presence, so a non-harvester never reaches the handler.
 //!
 //! Guard hand-offs (`UnitClass::Mission_Harvest @ 0x0073E5E0`): the preamble
 //! queues Guard when the house owns no instance of any `Dock=` type, and
@@ -62,12 +66,10 @@
 
 use crate::map::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
-use crate::sim::pathfinding::PathGrid;
 use crate::sim::world::Simulation;
 
 use super::miner_system::{
-    MinerSnapshot, ResourceQueryAuthority, build_miner_snapshot, commit_miner_snapshot,
-    process_miner_with_resource_authority,
+    MinerSnapshot, build_miner_snapshot, commit_miner_snapshot, process_miner,
 };
 use super::{MinerKind, MinerState};
 
@@ -80,50 +82,8 @@ pub(crate) fn dispatch_harvest_for_object(
     sim: &mut Simulation,
     rules: &RuleSet,
     config: &super::MinerConfig,
-    path_grid: Option<&PathGrid>,
     overlay_registry: Option<&OverlayTypeRegistry>,
     id: u64,
-) {
-    dispatch_harvest_for_object_with_resource_authority(
-        sim,
-        rules,
-        config,
-        path_grid,
-        overlay_registry,
-        id,
-        ResourceQueryAuthority::OverlayGrid,
-    );
-}
-
-#[cfg(test)]
-pub(crate) fn dispatch_harvest_for_object_with_resource_authority_for_tests(
-    sim: &mut Simulation,
-    rules: &RuleSet,
-    config: &super::MinerConfig,
-    path_grid: Option<&PathGrid>,
-    overlay_registry: Option<&OverlayTypeRegistry>,
-    id: u64,
-    resource_authority: ResourceQueryAuthority,
-) {
-    dispatch_harvest_for_object_with_resource_authority(
-        sim,
-        rules,
-        config,
-        path_grid,
-        overlay_registry,
-        id,
-        resource_authority,
-    );
-}
-
-fn dispatch_harvest_for_object_with_resource_authority(
-    sim: &mut Simulation,
-    rules: &RuleSet,
-    config: &super::MinerConfig,
-    path_grid: Option<&PathGrid>,
-    overlay_registry: Option<&OverlayTypeRegistry>,
-    id: u64,
-    resource_authority: ResourceQueryAuthority,
 ) {
     let now = sim.session.binary_frame;
     {
@@ -137,6 +97,29 @@ fn dispatch_harvest_for_object_with_resource_authority(
             return;
         };
         if miner.kind == MinerKind::Slave {
+            // `UnitClass::Mission_Harvest @ 0x0073E5E0`'s prologue
+            // (`0x0073E5E9..0x0073E612`): a ResourceDestination=,
+            // ResourceGatherer= type holding a slave manager runs
+            // HandleReturnedSlaves, then the shared Rate epilogue
+            // (`0x0073EF77`).
+            let slave_master = entity.slave_manager.is_some()
+                && sim
+                    .object_type(entity.type_ref(), rules)
+                    .is_some_and(|object| object.resource_destination && object.resource_gatherer);
+            let due = entity.mission.current().known()
+                == Some(crate::sim::mission::MissionType::Harvest)
+                && entity.mission.dispatch_timer().due(now);
+            if slave_master && due {
+                sim.handle_returned_slaves(id, rules);
+                let delay = sim.mission_rate_epilogue_for(
+                    rules,
+                    id,
+                    crate::sim::mission::MissionType::Harvest,
+                );
+                if let Some(entity) = sim.substrate.entities.get_mut(id) {
+                    entity.mission.write_dispatch_epilogue(now as i32, delay);
+                }
+            }
             return;
         }
         // The native dispatcher routes on the committed mission id, so a miner
@@ -177,6 +160,15 @@ fn dispatch_harvest_for_object_with_resource_authority(
         if current == Some(crate::sim::mission::MissionType::Enter) && entity.dock_state.is_some() {
             return;
         }
+        // A harvester's refinery dock runs as the native Enter and Unload
+        // missions (`refinery_dock`), dispatched from the Foot handler host.
+        if matches!(
+            current,
+            Some(crate::sim::mission::MissionType::Enter)
+                | Some(crate::sim::mission::MissionType::Unload)
+        ) {
+            return;
+        }
         // Native Mission_Dispatch gate: run the handler only when the
         // dispatch timer is due (verified host shape). The strength>0 gate is
         // the bracket's IsAlive guard upstream.
@@ -187,26 +179,16 @@ fn dispatch_harvest_for_object_with_resource_authority(
     let Some(mut snap) = build_miner_snapshot(sim, rules, id) else {
         return;
     };
-    harvest_mission_step_with_resource_authority(
-        sim,
-        rules,
-        config,
-        path_grid,
-        overlay_registry,
-        &mut snap,
-        resource_authority,
-    );
+    harvest_mission_step(sim, rules, config, overlay_registry, &mut snap);
     commit_miner_snapshot(sim, &snap, now);
 }
 
-fn harvest_mission_step_with_resource_authority(
+fn harvest_mission_step(
     sim: &mut Simulation,
     rules: &RuleSet,
     config: &super::MinerConfig,
-    path_grid: Option<&PathGrid>,
     overlay_registry: Option<&OverlayTypeRegistry>,
     snap: &mut MinerSnapshot,
-    resource_authority: ResourceQueryAuthority,
 ) {
     // Cursor sanity (debug-only, never hashed): the working cursor must have
     // decoded from the entity's handler state — pins the cursor round-trip the
@@ -223,13 +205,5 @@ fn harvest_mission_step_with_resource_authority(
         );
     }
 
-    process_miner_with_resource_authority(
-        sim,
-        rules,
-        config,
-        path_grid,
-        overlay_registry,
-        snap,
-        resource_authority,
-    );
+    process_miner(sim, rules, config, overlay_registry, snap);
 }

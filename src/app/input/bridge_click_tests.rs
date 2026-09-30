@@ -11,12 +11,15 @@ use crate::map::terrain::TacticalBridgeCell;
 use crate::sim::command::{Command, CommandEnvelope};
 use crate::sim::world::Simulation;
 
+#[path = "bridge_live_click_tests.rs"]
+mod live_flags;
+
 fn click_cell(
     point: (f32, f32),
     camera: (f32, f32),
     zoom: f32,
     heights: &BTreeMap<(u16, u16), u8>,
-    bridges: &BTreeMap<(u16, u16), TacticalBridgeCell>,
+    bridges: &dyn crate::map::terrain::TacticalBridgeLookup,
 ) -> (u16, u16) {
     // Only the test's forward view transform is local. Its inverse and the
     // world -> cell resolution are the same owners used by tactical orders.
@@ -39,7 +42,6 @@ fn ordinary_move(
             target_rx: goal.0,
             target_ry: goal.1,
             queue: false,
-            group_id: None,
         },
     );
     // The active ordinary-click path calls this in context_order::finish_order.
@@ -94,10 +96,7 @@ fn commandable_movers() -> (Simulation, crate::sim::intern::InternedId, [u64; 2]
             0,
             0,
             owner,
-            Health {
-                current: 100,
-                max: 100,
-            },
+            Health { current: 100 },
             type_ref,
             category,
             0,
@@ -262,7 +261,6 @@ fn spawn_retail_mover(
             start.1,
             0,
             &resources.rules,
-            &resources.height_map,
         )
         .expect("retail mover spawns at the authored approach");
     sim.resolve_type_handles(&resources.rules);
@@ -277,19 +275,20 @@ fn follow_clicked_goal(
     expected: (u16, u16),
     expected_on_bridge: bool,
 ) {
-    let bridges = scenario
-        .runtime
-        .view()
-        .resolved_terrain()
-        .expect("retail terrain")
-        .build_tactical_bridge_inverse_map();
+    let bridges = crate::app::match_runtime::sim_tick::tactical_bridge_cells(scenario.sim())
+        .expect("retail terrain");
     // Noninteger camera coordinates and zoom exercise the production adapter.
     let goal = click_cell(
         point,
         (-100.25, 1800.5),
         1.25,
-        &scenario.runtime.resources.height_map,
-        &bridges,
+        &scenario
+            .sim()
+            .resolved_terrain
+            .as_ref()
+            .unwrap()
+            .build_height_map(),
+        bridges,
     );
     assert_eq!(goal, expected, "retail click {point:?}");
     let facts = scenario
@@ -423,14 +422,7 @@ fn retail_hills_ground_click_keeps_gi_beneath_bridge() {
 fn advance_input_fixture(sim: &mut Simulation, rules: &crate::rules::ruleset::RuleSet) {
     let due = sim.take_due_commands();
     let grid = sim.path_grid_snapshot();
-    let result = sim.advance_tick(
-        &due,
-        Some(rules),
-        &BTreeMap::new(),
-        grid.as_deref(),
-        None,
-        67,
-    );
+    let result = sim.advance_tick(&due, Some(rules), grid.as_deref(), None, 67);
     assert!(
         result.frame_committed,
         "ordinary scheduled frame failed: {result:?}"
@@ -542,7 +534,6 @@ fn direct_simulation_walk_move_is_an_already_resolved_destination() {
             target_rx: 9,
             target_ry: 5,
             queue: false,
-            group_id: None,
         },
     ));
     advance_input_fixture(&mut sim, &rules);

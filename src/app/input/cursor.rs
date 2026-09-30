@@ -98,8 +98,13 @@ pub(crate) fn current_cursor_feedback_kind(state: &AppState) -> Option<CursorFee
             state.match_state.input.cursor_x,
             state.match_state.input.cursor_y,
         );
-        let valid = crate::app::input::commands::own_building_under_point(state, wx, wy).is_some()
-            || (!repair && crate::app::input::commands::sell_wall_under_cursor_is_eligible(state));
+        let valid = if repair {
+            crate::app::input::commands::own_repairable_building_under_point(state, wx, wy)
+                .is_some()
+        } else {
+            crate::app::input::commands::own_sellable_building_under_point(state, wx, wy).is_some()
+                || crate::app::input::commands::sell_wall_under_cursor_is_eligible(state)
+        };
         return Some(if repair {
             CursorFeedbackKind::RepairMode(valid)
         } else {
@@ -154,12 +159,7 @@ pub(crate) fn current_cursor_feedback_kind(state: &AppState) -> Option<CursorFee
         state.match_state.sandbox_full_visibility,
         state.rules(),
         &state.height_map(),
-        Some(
-            &state
-                .match_state
-                .match_presentation
-                .tactical_bridge_inverse_map,
-        ),
+        crate::app::match_runtime::sim_tick::tactical_bridge_cells(sim),
     );
     // gamemd's DetermineAction resolves ONE object for the whole selection and
     // shows that object's action, for the cell branch as well as the object
@@ -185,6 +185,12 @@ pub(crate) fn current_cursor_feedback_kind(state: &AppState) -> Option<CursorFee
     // `Primary=`/`Secondary=` is the wrong test for a `TurretCount>0` type —
     // it hid the force-fire cursor for the Prism Tank and the Gattling Cannon.
     if modifier == crate::app::input::context_order::OrderModifier::ForceFire {
+        if let Some(kind) = hover
+            .as_ref()
+            .and_then(|hover| forced_bomb_feedback(sim, &selected, best_id, hover, state.rules()))
+        {
+            return Some(kind);
+        }
         let best_is_armed = best_id.is_some_and(|id| {
             sim.entities().get(id).is_some_and(|e| {
                 let type_str = sim.interner.resolve(e.type_ref());
@@ -209,7 +215,6 @@ pub(crate) fn current_cursor_feedback_kind(state: &AppState) -> Option<CursorFee
             best_id,
             hover,
             state.rules(),
-            sim.path_grid(),
             state.overlay_registry(),
         );
         return Some(kind);
@@ -393,14 +398,12 @@ fn what_action_on_cell(
                         resolved_terrain: sim.resolved_terrain.as_ref(),
                         terrain_costs,
                         bypass_grid: false,
-                        mode:
-                            crate::sim::pathfinding::cell_entry::TerrainEntryMode::RuntimeTransition,
                         is_infantry: entity.category
                             == crate::map::entities::EntityCategory::Infantry,
                         mover_is_crusher: crate::sim::movement::bump_crush::CrushCapability::of(
                             entity,
                         )
-                        .can_crush_units(),
+                        .wall_arm_crusher(),
                     },
                 )
                 .is_clear()
@@ -440,7 +443,6 @@ fn capability_cursor_for_hover(
     best_id: Option<u64>,
     hover: &crate::app::input::entity_pick::HoverTargetKindWithId,
     rules: Option<&crate::rules::ruleset::RuleSet>,
-    path_grid: Option<&crate::sim::pathfinding::PathGrid>,
     overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
 ) -> CursorFeedbackKind {
     use crate::map::entities::EntityCategory;
@@ -499,7 +501,15 @@ fn capability_cursor_for_hover(
     }
 
     // The caller already resolved the single object whose action drives the
-    // cursor for the whole selection, matching gamemd's DetermineAction.
+    // cursor for the whole selection, matching gamemd's DetermineAction. A
+    // single selected object over itself takes the self action (4,
+    // `TechnoClass::What_Action_OnObject`), never IvanBomb.
+    let single_self = selected.len() == 1 && selected[0] == hover.stable_id;
+    let best_is_ivan = !single_self
+        && best_id
+            .and_then(|id| sim.entities().get(id))
+            .and_then(|e| rules.and_then(|r| r.object(sim.interner.resolve(e.type_ref()))))
+            .is_some_and(|obj| obj.ivan);
     if let Some(best_id) = best_id {
         if let (Some(sel_entity), Some(sel_obj)) = (
             sim.entities().get(best_id),
@@ -507,6 +517,18 @@ fn capability_cursor_for_hover(
                 .get(best_id)
                 .and_then(|e| rules.and_then(|r| r.object(sim.interner.resolve(e.type_ref())))),
         ) {
+            // `InfantryClass::What_Action_OnObject @ 0x0051E3B0`, right after
+            // the base action (0x0051E462..0x0051E49B): an Engineer of the
+            // local player over any object carrying a bomb that player sees
+            // (`+0x38`, `+0x68`) — own, allied or enemy — offers DisarmBomb.
+            if sel_entity.category == EntityCategory::Infantry
+                && sel_obj.engineer
+                && hovered_entity.is_some_and(|e| e.bomb.is_some())
+                && sim.bomb_seen_by(hover.stable_id, sel_entity.owner())
+            {
+                return CursorFeedbackKind::DisarmBomb;
+            }
+
             // 2. C4 plant: SEAL / Tanya / Psi-Corp Trooper hovering an enemy
             //    structure with CanC4=yes, not InvisibleInGame, not iron-curtained.
             //    SabotageCursor flag remains in the data model (parsed in
@@ -555,7 +577,7 @@ fn capability_cursor_for_hover(
                 // 5. Engineer on damaged friendly building → repair.
                 if matches!(hover.kind, HoverTargetKind::FriendlyStructure) {
                     if let Some(he) = hovered_entity {
-                        if he.health.current < he.health.max {
+                        if hovered_obj.is_some_and(|obj| he.health.current < obj.strength) {
                             return CursorFeedbackKind::EngineerRepair;
                         }
                     }
@@ -578,7 +600,6 @@ fn capability_cursor_for_hover(
                         rules,
                         best_id,
                         hover.stable_id,
-                        path_grid,
                     ) {
                         return CursorFeedbackKind::Enter;
                     }
@@ -586,29 +607,39 @@ fn capability_cursor_for_hover(
             }
 
             // 7. AttackCursorOnFriendlies — treat friendly targets as attack targets.
-            if sel_obj.attack_cursor_on_friendlies {
-                if matches!(
+            //    Not over the lone selected object itself, which takes its self
+            //    action first.
+            if sel_obj.attack_cursor_on_friendlies
+                && !single_self
+                && matches!(
                     hover.kind,
                     HoverTargetKind::FriendlyUnit | HoverTargetKind::FriendlyStructure
-                ) {
-                    let in_range = resolved_unit_in_range(
-                        sim,
-                        best_id,
-                        hover.stable_id,
-                        rules,
-                        sim.resolved_terrain.as_ref(),
-                        overlay_registry,
-                    );
-                    return if in_range {
-                        if hover.kind == HoverTargetKind::FriendlyUnit {
-                            CursorFeedbackKind::EnemyUnit
-                        } else {
-                            CursorFeedbackKind::EnemyStructure
-                        }
+                )
+            {
+                let in_range = resolved_unit_in_range(
+                    sim,
+                    best_id,
+                    hover.stable_id,
+                    rules,
+                    sim.resolved_terrain.as_ref(),
+                    overlay_registry,
+                );
+                let kind = if in_range {
+                    if hover.kind == HoverTargetKind::FriendlyUnit {
+                        CursorFeedbackKind::EnemyUnit
                     } else {
-                        CursorFeedbackKind::EnemyOutOfRange
-                    };
-                }
+                        CursorFeedbackKind::EnemyStructure
+                    }
+                } else {
+                    CursorFeedbackKind::EnemyOutOfRange
+                };
+                return ivan_attack_feedback(
+                    kind,
+                    best_is_ivan,
+                    || click_refused(sim, rules, Some(best_id), hover.stable_id, overlay_registry),
+                    hovered_entity,
+                    hovered_obj,
+                );
             }
 
             // 8. Harvester docking — selected miner hovering own/ally refinery.
@@ -629,7 +660,7 @@ fn capability_cursor_for_hover(
             // building shows the enter/dock cursor (the click issues
             // RepairAtDepot; see `input::context_order`).
             if sel_entity.category == EntityCategory::Unit
-                && sel_entity.health.current < sel_entity.health.max
+                && sel_entity.health.current < sel_obj.strength
                 && matches!(hover.kind, HoverTargetKind::FriendlyStructure)
                 && hovered_obj.map_or(false, |o| o.unit_repair)
             {
@@ -665,7 +696,7 @@ fn capability_cursor_for_hover(
                     overlay_registry,
                 )
             });
-            if in_range {
+            let kind = if in_range {
                 if hover.kind == HoverTargetKind::EnemyUnit {
                     CursorFeedbackKind::EnemyUnit
                 } else {
@@ -673,10 +704,118 @@ fn capability_cursor_for_hover(
                 }
             } else {
                 CursorFeedbackKind::EnemyOutOfRange
-            }
+            };
+            ivan_attack_feedback(
+                kind,
+                best_is_ivan,
+                || click_refused(sim, rules, best_id, hover.stable_id, overlay_registry),
+                hovered_entity,
+                hovered_obj,
+            )
         }
         HoverTargetKind::HiddenEnemy => CursorFeedbackKind::Invalid,
     }
+}
+
+/// `InfantryClass::What_Action_OnObject` (`0x0051EB24..0x0051EB7E`) for a
+/// Crazy Ivan (`Ivan=`) whose action is Attack ([`ivan_bomb_action`]).
+/// Unforced, the base action stays Attack only while the Ivan's GetFireError
+/// for the target is not ILLEGAL (`refused`, [`click_refused`]), and a bombed
+/// target is ILLEGAL to him at any distance (`0x006FCBAD`). An ILLEGAL action
+/// falls back to None over another house's object and to Select over his own
+/// (`TechnoClass::What_Action_OnObject`, `0x0070056C..0x007005E9`).
+///
+/// RESIDUAL: VERA shows Select for both; over another house's object retail
+/// shows the plain arrow of None.
+fn ivan_attack_feedback(
+    kind: CursorFeedbackKind,
+    selector_is_ivan: bool,
+    refused: impl FnOnce() -> bool,
+    target: Option<&crate::sim::game_entity::GameEntity>,
+    target_obj: Option<&crate::rules::object_type::ObjectType>,
+) -> CursorFeedbackKind {
+    let attack = matches!(
+        kind,
+        CursorFeedbackKind::EnemyUnit
+            | CursorFeedbackKind::EnemyStructure
+            | CursorFeedbackKind::EnemyOutOfRange
+    );
+    if !selector_is_ivan || !attack {
+        return kind;
+    }
+    if refused() {
+        return CursorFeedbackKind::FriendlyUnit;
+    }
+    ivan_bomb_action(target, target_obj)
+}
+
+/// The Crazy Ivan's arm itself (`0x0051EB24`): IvanBomb on a `Bombable=`
+/// target without a bomb (`+0x38`), NoIvanBomb (NoMove's row) otherwise.
+fn ivan_bomb_action(
+    target: Option<&crate::sim::game_entity::GameEntity>,
+    target_obj: Option<&crate::rules::object_type::ObjectType>,
+) -> CursorFeedbackKind {
+    if target.is_some_and(|target| target.bomb.is_some()) {
+        CursorFeedbackKind::Invalid
+    } else if target_obj.is_some_and(|obj| obj.bombable) {
+        CursorFeedbackKind::IvanBomb
+    } else {
+        CursorFeedbackKind::Invalid
+    }
+}
+
+/// Whether `actor`'s GetFireError for `target` is ILLEGAL, which ends its
+/// unforced Attack action ([`crate::sim::world::Simulation::selected_weapon_fire_error`]).
+fn click_refused(
+    sim: &crate::sim::world::Simulation,
+    rules: Option<&crate::rules::ruleset::RuleSet>,
+    actor: Option<u64>,
+    target: u64,
+    overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
+) -> bool {
+    rules.zip(actor).is_some_and(|(rules, actor)| {
+        sim.selected_weapon_fire_error(
+            rules,
+            actor,
+            crate::sim::combat::TargetKind::Entity(target),
+            overlay_registry,
+        ) == crate::sim::combat::fire_error::FireError::Illegal
+    })
+}
+
+/// The bomb actions under force-fire. `InfantryClass::What_Action_OnObject`
+/// checks DisarmBomb right after the base action (`0x0051E462`; only the
+/// ToggleSelect return precedes it), so it wins over the forced Attack; a
+/// Crazy Ivan's forced Attack becomes IvanBomb or NoIvanBomb (`0x0051EB24`).
+/// A single selected object over itself keeps its self action.
+fn forced_bomb_feedback(
+    sim: &crate::sim::world::Simulation,
+    selected: &[u64],
+    best_id: Option<u64>,
+    hover: &crate::app::input::entity_pick::HoverTargetKindWithId,
+    rules: Option<&crate::rules::ruleset::RuleSet>,
+) -> Option<CursorFeedbackKind> {
+    use crate::map::entities::EntityCategory;
+    let rules = rules?;
+    let best = best_id.and_then(|id| sim.entities().get(id))?;
+    let best_obj = rules.object(sim.interner.resolve(best.type_ref()))?;
+    let target = sim.entities().get(hover.stable_id)?;
+    if best.category == EntityCategory::Infantry
+        && best_obj.engineer
+        && target.bomb.is_some()
+        && sim.bomb_seen_by(hover.stable_id, best.owner())
+    {
+        return Some(CursorFeedbackKind::DisarmBomb);
+    }
+    if selected.len() == 1 && selected[0] == hover.stable_id {
+        return None;
+    }
+    best_obj.ivan.then(|| {
+        ivan_bomb_action(
+            Some(target),
+            rules.object(sim.interner.resolve(target.type_ref())),
+        )
+    })
 }
 
 /// Does the object that owns the cursor have a weapon that reaches the target?
@@ -719,6 +858,9 @@ fn resolved_unit_in_range(
     let Some(obj) = rules.object(sim.interner.resolve(entity.type_ref())) else {
         return false;
     };
+    // Height predicates execute native map queries. Keep their shared fallback
+    // identity local to this input probe, across source/range and both slots.
+    let cells = terrain.map(crate::map::resolved_terrain::NativeCellQuery::isolated);
     for slot in [obj.primary.as_ref(), obj.secondary.as_ref()] {
         let weapon = match slot.and_then(|w| rules.weapon(w)) {
             Some(w) => w,
@@ -727,18 +869,19 @@ fn resolved_unit_in_range(
         if weapon.range <= crate::util::fixed_math::SIM_ZERO {
             continue;
         }
-        let in_range = if let Some(t) = terrain {
+        let in_range = if let Some(cells) = cells.as_ref() {
             let entity_target = combat::TargetKind::Entity(target_id);
-            let Some(src) = combat::in_range::fire_source_coords(
+            let Some(src) = combat::in_range::fire_source_coords_in_query(
                 entity,
                 &entity_target,
                 weapon,
                 sim.entities(),
-                t,
+                cells,
+                (rules, &sim.interner),
             ) else {
                 continue;
             };
-            combat::in_range::compute_in_range(
+            combat::in_range::compute_in_range_in_query(
                 entity,
                 src,
                 &entity_target,
@@ -746,7 +889,7 @@ fn resolved_unit_in_range(
                 rules,
                 &sim.interner,
                 sim.entities(),
-                t,
+                cells,
                 &combat::line_of_fire::LineOfFireInputs {
                     overlay_grid: sim.overlay_grid.as_ref(),
                     overlay_registry,
@@ -778,7 +921,7 @@ fn resolved_unit_in_range(
 /// gamemd's resolver takes a cell *or* an object: with a cell it measures to the
 /// cell centre at ground level, with an object to that object's own world point.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ActionDistanceTarget {
+pub(crate) enum ActionDistanceTarget {
     /// Cell centre, in cell coordinates.
     CellCentre(u16, u16),
     /// A specific object's world point.
@@ -794,9 +937,12 @@ fn entity_world_leptons(
     entity: &crate::sim::game_entity::GameEntity,
     terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
 ) -> (i64, i64, i64) {
-    let z = terrain
-        .and_then(|t| combat::in_range::effective_z_leptons(entity, t))
-        .unwrap_or(0);
+    let z = terrain.map_or(0, |t| {
+        i64::from(crate::sim::movement::ground_pose::object_world_z_leptons(
+            entity,
+            Some(t),
+        ))
+    });
     (
         entity.position.rx as i64 * LEPTONS_PER_CELL + entity.position.sub_x.to_num::<i64>(),
         entity.position.ry as i64 * LEPTONS_PER_CELL + entity.position.sub_y.to_num::<i64>(),
@@ -835,7 +981,7 @@ fn isqrt_u64(value: u64) -> u64 {
 /// away, while an equal score replaces only on a strictly smaller distance.
 /// Distance is 3-D Euclidean in leptons — to the cell centre when a cell was
 /// supplied, otherwise to the target object's own world point.
-fn select_best_for_action(
+pub(crate) fn select_best_for_action(
     sim: &crate::sim::world::Simulation,
     selected: &[u64],
     target: ActionDistanceTarget,
@@ -946,6 +1092,11 @@ pub(crate) fn cursor_id_for_feedback(kind: CursorFeedbackKind) -> Option<CursorI
         CursorFeedbackKind::Enter => Some(CursorId::Enter),
         CursorFeedbackKind::EngineerRepair => Some(CursorId::EngineerRepair),
         CursorFeedbackKind::Demolish => Some(CursorId::Demolish),
+        // `DisplayClass::SetCursorFromAction @ 0x004AAE90`: action 0x35 ->
+        // row 0x26, action 0x39 -> row 0x3B (action 0x36 NoIvanBomb shares
+        // NoMove's row 0x13, so it is `Invalid`).
+        CursorFeedbackKind::IvanBomb => Some(CursorId::IvanBomb),
+        CursorFeedbackKind::DisarmBomb => Some(CursorId::Disarm),
         CursorFeedbackKind::Deploy => Some(CursorId::Deploy),
         CursorFeedbackKind::RepairMode(valid) => Some(if valid {
             CursorId::Repair
@@ -1180,7 +1331,6 @@ mod tests {
     use crate::rules::ini_parser::IniFile;
     use crate::rules::ruleset::RuleSet;
     use crate::sim::world::Simulation;
-    use std::collections::BTreeMap;
 
     fn cursor_contract_rules() -> RuleSet {
         let ini = IniFile::from_str(
@@ -1204,7 +1354,7 @@ mod tests {
              CanC4=yes\n\
              [GAREFN]\n\
              Strength=1000\n\
-             Refinery=yes\n",
+             Refinery=yes\nDockUnload=yes\n",
         );
         RuleSet::from_ini(&ini).expect("cursor contract rules")
     }
@@ -1218,22 +1368,21 @@ mod tests {
     #[test]
     fn seal_hovering_enemy_building_shows_demolish() {
         // 1. Load the narrow stock-shaped contract consumed by this cursor path.
-        let mut rules = cursor_contract_rules();
+        let rules = cursor_contract_rules();
 
         // 2. Build a Simulation. resolve_type_handles is required by the
         //    c4 tick path even though we don't tick here — keeps the sim in a
         //    consistent state with what the runtime would see.
         let mut sim = Simulation::new();
         sim.resolve_type_handles(&rules);
-        let height_map: BTreeMap<(u16, u16), u8> = BTreeMap::new();
 
         // 3. Spawn a SEAL and an enemy Power Plant via the same path the
         //    barracks uses on production completion.
         let seal_id = sim
-            .spawn_object("GHOST", "Americans", 5, 5, 0, &rules, &height_map)
+            .spawn_object("GHOST", "Americans", 5, 5, 0, &rules)
             .expect("SEAL spawned");
         let bld_id = sim
-            .spawn_object("NAPOWR", "Soviets", 10, 10, 0, &rules, &height_map)
+            .spawn_object("NAPOWR", "Soviets", 10, 10, 0, &rules)
             .expect("Power Plant spawned");
 
         // 4. Mark the SEAL as selected (mirrors clicking it in-game).
@@ -1255,7 +1404,6 @@ mod tests {
             Some(seal_id),
             &hover,
             Some(&rules),
-            None,
             None,
         );
 
@@ -1283,17 +1431,16 @@ mod tests {
     /// for any harvester targeting a same-owner refinery.
     #[test]
     fn chrono_miner_hovering_own_refinery_shows_enter() {
-        let mut rules = cursor_contract_rules();
+        let rules = cursor_contract_rules();
 
         let mut sim = Simulation::new();
         sim.resolve_type_handles(&rules);
-        let height_map: BTreeMap<(u16, u16), u8> = BTreeMap::new();
 
         let miner_id = sim
-            .spawn_object("CMIN", "Americans", 5, 5, 0, &rules, &height_map)
+            .spawn_object("CMIN", "Americans", 5, 5, 0, &rules)
             .expect("Chrono Miner spawned");
         let refinery_id = sim
-            .spawn_object("GAREFN", "Americans", 10, 10, 0, &rules, &height_map)
+            .spawn_object("GAREFN", "Americans", 10, 10, 0, &rules)
             .expect("Refinery spawned");
 
         if let Some(e) = sim.entities_mut().get_mut(miner_id) {
@@ -1311,7 +1458,6 @@ mod tests {
             Some(miner_id),
             &hover,
             Some(&rules),
-            None,
             None,
         );
         assert_eq!(
@@ -1399,67 +1545,6 @@ mod tests {
         RuleSet::from_ini(&ini).expect("cell action rules")
     }
 
-    /// A minimal flat clear land cell for the cursor fixtures.
-    fn flat_land_cell(rx: u16, ry: u16) -> crate::map::resolved_terrain::ResolvedTerrainCell {
-        use crate::map::resolved_terrain::ResolvedTerrainCell;
-        use crate::rules::terrain_rules::TerrainClass;
-        ResolvedTerrainCell {
-            rx,
-            ry,
-            source_tile_index: 0,
-            source_sub_tile: 0,
-            final_tile_index: 0,
-            final_sub_tile: 0,
-            is_wood_bridge_repair_tile: false,
-            level: 0,
-            filled_clear: false,
-            tileset_index: Some(0),
-            land_type: 0,
-            yr_cell_land_type: 0,
-            slope_type: 0,
-            template_height: 0,
-            render_offset_x: 0,
-            render_offset_y: 0,
-            terrain_class: TerrainClass::Clear,
-            speed_costs: Default::default(),
-            is_water: false,
-            is_cliff_like: false,
-            is_rough: false,
-            is_road: false,
-            accepts_smudge: false,
-            allows_tiberium: false,
-            height_in_pixels: 0,
-            variant: 0,
-            has_ramp: false,
-            canonical_ramp: None,
-            ground_walk_blocked: false,
-            terrain_object_blocks: false,
-            terrain_object_occupation: None,
-            overlay_blocks: false,
-            overlay_zone_type: None,
-            outside_playfield: false,
-            zone_type: 0,
-            base_ground_walk_blocked: false,
-            base_build_blocked: false,
-            base_land_type: 0,
-            base_yr_cell_land_type: 0,
-            base_terrain_class: Default::default(),
-            base_speed_costs: Default::default(),
-            build_blocked: false,
-            has_bridge_deck: false,
-            bridge_walkable: false,
-            bridge_transition: false,
-            bridge_deck_level: 0,
-            bridge_layer: None,
-            bridge_facts: Default::default(),
-            tube_index: None,
-            radar_left: [0, 0, 0],
-            radar_right: [0, 0, 0],
-            has_damaged_data: false,
-            bridgehead_anchor_class_at_load: None,
-        }
-    }
-
     /// A tank that actually carries a locomotor, and therefore a SpeedType.
     ///
     /// `cell_action_rules` declares no `Speed=`, so its MTNK spawns with
@@ -1490,9 +1575,8 @@ mod tests {
         let rules = RuleSet::from_ini(&ini).expect("track tank rules");
         let mut sim = Simulation::new();
         sim.resolve_type_handles(&rules);
-        let heights: BTreeMap<(u16, u16), u8> = BTreeMap::new();
         let tank = sim
-            .spawn_object("MTNK", "Americans", 2, 2, 0, &rules, &heights)
+            .spawn_object("MTNK", "Americans", 2, 2, 0, &rules)
             .expect("tank spawned");
         assert!(
             sim.entities()
@@ -1505,14 +1589,111 @@ mod tests {
     }
 
     fn sim_with_tank() -> (Simulation, RuleSet, u64) {
-        let mut rules = cell_action_rules();
+        let rules = cell_action_rules();
         let mut sim = Simulation::new();
         sim.resolve_type_handles(&rules);
-        let height_map: BTreeMap<(u16, u16), u8> = BTreeMap::new();
         let tank = sim
-            .spawn_object("MTNK", "Americans", 2, 2, 0, &rules, &height_map)
+            .spawn_object("MTNK", "Americans", 2, 2, 0, &rules)
             .expect("tank spawned");
         (sim, rules, tank)
+    }
+
+    #[test]
+    fn attack_cursor_missing_cell_queries_preserve_simulation_dummy_and_hash() {
+        use crate::map::resolved_terrain::ResolvedTerrainGrid;
+        use crate::sim::combat::{TargetKind, in_range, line_of_fire::LineOfFireInputs};
+
+        let (mut sim, rules, actor_id) = sim_with_tank();
+        let target_id = sim
+            .spawn_object("MTNK", "Soviets", 3, 2, 0, &rules)
+            .expect("enemy target");
+        // Both live objects deliberately miss this allocated map. Their exact
+        // Z and marked state force source +54 and target +50/+54 to read the
+        // native fallback Cell rather than bypassing the query as limbo objects.
+        for id in [actor_id, target_id] {
+            let entity = sim.entities_mut().get_mut(id).unwrap();
+            entity.position.exact_z_leptons = Some(900);
+            entity.lifecycle.cell_marked = true;
+        }
+        let mut retained_cell = crate::map::resolved_terrain::test_flat_cell(0, 0);
+        // A bridge anchor retaining Dummy makes its requested coordinate a
+        // deterministic future input. World hashing intentionally omits that
+        // transient coordinate when no Bullet or bridge anchor retains it.
+        retained_cell.bridge_facts.native_anchor =
+            Some(crate::map::cell_index::NativeCellIdentity::Dummy);
+        sim.install_resolved_terrain_for_new_map(ResolvedTerrainGrid::from_cells(
+            1,
+            1,
+            vec![retained_cell],
+        ));
+        let dummy = sim.effective_shared_cell_dummy();
+        dummy.stamp_coord(111, -222);
+        dummy.set_level_slope(2, 1);
+        dummy.test_set_land_type(4);
+        dummy.test_set_retained_bridge_flags(0x1180);
+        let initial = dummy.snapshot();
+        let initial_hash = sim.state_hash();
+        let hover = HoverTargetKindWithId {
+            kind: HoverTargetKind::EnemyUnit,
+            stable_id: target_id,
+        };
+        for _ in 0..3 {
+            assert_eq!(
+                capability_cursor_for_hover(
+                    &sim,
+                    &[actor_id],
+                    Some(actor_id),
+                    &hover,
+                    Some(&rules),
+                    None,
+                ),
+                CursorFeedbackKind::EnemyUnit,
+            );
+            assert_eq!(
+                dummy.snapshot(),
+                initial,
+                "cursor must not stamp canonical Dummy"
+            );
+            assert_eq!(dummy.land_type(), 4);
+            assert_eq!(
+                sim.state_hash(),
+                initial_hash,
+                "input probing must not change simulation"
+            );
+        }
+
+        // The ordinary simulation wrappers must still perform these same
+        // lookups canonically. This also proves the fixture really reaches
+        // missing-cell source and target reads instead of an early return.
+        let terrain = sim.resolved_terrain.as_ref().unwrap();
+        let actor = sim.entities().get(actor_id).unwrap();
+        let target = TargetKind::Entity(target_id);
+        let weapon = rules.weapon("105mm").unwrap();
+        let source = in_range::fire_source_coords(
+            actor,
+            &target,
+            weapon,
+            sim.entities(),
+            terrain,
+            (&rules, &sim.interner),
+        )
+        .unwrap();
+        assert_eq!(dummy.snapshot().coord, (2, 2));
+        assert!(in_range::compute_in_range(
+            actor,
+            source,
+            &target,
+            weapon,
+            &rules,
+            &sim.interner,
+            sim.entities(),
+            terrain,
+            &LineOfFireInputs::terrain_only(),
+        ));
+        // InRange's final source-cell bridge query6F7601 follows the
+        // target height/ground queries, restoring the source's Dummy XY.
+        assert_eq!(dummy.snapshot().coord, (2, 2));
+        assert_ne!(sim.state_hash(), initial_hash);
     }
 
     /// gamemd answers action 2 (no-move) for a cell its occupancy probe rejects,
@@ -1647,7 +1828,7 @@ mod tests {
         let mut cells = Vec::new();
         for ry in 0..SIZE {
             for rx in 0..SIZE {
-                cells.push(flat_land_cell(rx, ry));
+                cells.push(crate::map::resolved_terrain::test_flat_cell(rx, ry));
             }
         }
         let mut terrain =
@@ -1743,16 +1924,15 @@ mod tests {
     /// which is closer.
     #[test]
     fn secondary_only_unit_outranks_a_closer_unarmed_unit() {
-        let mut rules = cell_action_rules();
+        let rules = cell_action_rules();
         let mut sim = Simulation::new();
         sim.resolve_type_handles(&rules);
-        let height_map: BTreeMap<(u16, u16), u8> = BTreeMap::new();
 
         let truck = sim
-            .spawn_object("TRUCKA", "Americans", 9, 10, 0, &rules, &height_map)
+            .spawn_object("TRUCKA", "Americans", 9, 10, 0, &rules)
             .expect("unarmed truck");
         let arty = sim
-            .spawn_object("SREF", "Americans", 2, 2, 0, &rules, &height_map)
+            .spawn_object("SREF", "Americans", 2, 2, 0, &rules)
             .expect("secondary-only unit");
 
         let best = select_best_for_action(
@@ -1773,16 +1953,15 @@ mod tests {
     /// cell-index tie-break cannot separate them; the sub-cell offset can.
     #[test]
     fn tie_break_uses_lepton_distance_to_the_cell_centre() {
-        let mut rules = cell_action_rules();
+        let rules = cell_action_rules();
         let mut sim = Simulation::new();
         sim.resolve_type_handles(&rules);
-        let height_map: BTreeMap<(u16, u16), u8> = BTreeMap::new();
 
         let near = sim
-            .spawn_object("MTNK", "Americans", 8, 10, 0, &rules, &height_map)
+            .spawn_object("MTNK", "Americans", 8, 10, 0, &rules)
             .expect("near tank");
         let far = sim
-            .spawn_object("MTNK", "Americans", 12, 10, 0, &rules, &height_map)
+            .spawn_object("MTNK", "Americans", 12, 10, 0, &rules)
             .expect("far tank");
         // Nudge the far tank's sub-cell offset toward the target so that both
         // sit two cell indices away but the far one is closer in leptons.
@@ -1800,6 +1979,156 @@ mod tests {
             best,
             Some(far),
             "sub-cell position decides the tie, not the cell index",
+        );
+    }
+
+    /// Stock Crazy Ivan, Engineer and a heavy tank, with their weapons.
+    fn bomb_cursor_rules() -> RuleSet {
+        RuleSet::from_ini(&IniFile::from_str(
+            "[InfantryTypes]\n\
+             0=IVAN\n\
+             1=ENGINEER\n\
+             [VehicleTypes]\n\
+             0=HTNK\n\
+             [Warheads]\n\
+             0=IvanBomb\n\
+             1=BombDisarm\n\
+             2=AP\n\
+             [CombatDamage]\n\
+             IvanTimedDelay=450\n\
+             [IVAN]\n\
+             Strength=125\n\
+             Primary=IvanBomber\n\
+             Ivan=yes\n\
+             AttackCursorOnFriendlies=yes\n\
+             [ENGINEER]\n\
+             Strength=75\n\
+             Primary=DefuseKit\n\
+             Engineer=yes\n\
+             BombSight=4\n\
+             [HTNK]\n\
+             Strength=900\n\
+             Primary=120mm\n\
+             [IvanBomber]\n\
+             Range=1.5\n\
+             Projectile=Invisible\n\
+             Warhead=IvanBomb\n\
+             [DefuseKit]\n\
+             Range=1.5\n\
+             Projectile=InvisibleAll\n\
+             Warhead=BombDisarm\n\
+             [120mm]\n\
+             Range=5.75\n\
+             Projectile=Invisible\n\
+             Warhead=AP\n\
+             [Invisible]\n\
+             Inviso=yes\n\
+             [InvisibleAll]\n\
+             Inviso=yes\n\
+             [IvanBomb]\n\
+             IvanBomb=yes\n\
+             [BombDisarm]\n\
+             BombDisarm=yes\n\
+             [AP]\n\
+             Verses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
+        ))
+        .expect("bomb cursor rules")
+    }
+
+    fn bomb_hover(
+        sim: &Simulation,
+        rules: &RuleSet,
+        actor: u64,
+        kind: HoverTargetKind,
+        target: u64,
+    ) -> CursorFeedbackKind {
+        let hover = HoverTargetKindWithId {
+            kind,
+            stable_id: target,
+        };
+        capability_cursor_for_hover(sim, &[actor], Some(actor), &hover, Some(rules), None)
+    }
+
+    /// `InfantryClass::What_Action_OnObject`: a Crazy Ivan offers IvanBomb on
+    /// any target without a bomb — enemy or, by AttackCursorOnFriendlies, own —
+    /// and falls back to Select on one that carries a bomb, whose GetFireError
+    /// is ILLEGAL near or far; an Engineer offers DisarmBomb on any bombed
+    /// object its player sees, own or enemy, and nothing on an unseen one.
+    #[test]
+    fn crazy_ivan_and_engineer_bomb_cursors() {
+        let rules = bomb_cursor_rules();
+        let mut sim = Simulation::new();
+        sim.resolve_type_handles(&rules);
+        for house in ["Americans", "Soviets"] {
+            let id = sim.interner.intern(house);
+            sim.session.house_order.push(id);
+        }
+        let mut spawn = |kind: &str, owner: &str, rx: u16| {
+            sim.spawn_object(kind, owner, rx, 5, 0, &rules)
+                .expect("spawned")
+        };
+        let ivan = spawn("IVAN", "Americans", 5);
+        let engineer = spawn("ENGINEER", "Americans", 7);
+        let own_tank = spawn("HTNK", "Americans", 9);
+        let enemy_tank = spawn("HTNK", "Soviets", 11);
+        let enemy_ivan = spawn("IVAN", "Soviets", 20);
+        let far_tank = spawn("HTNK", "Soviets", 22);
+
+        use HoverTargetKind::{EnemyUnit, FriendlyUnit};
+        assert_eq!(
+            bomb_hover(&sim, &rules, ivan, EnemyUnit, enemy_tank),
+            CursorFeedbackKind::IvanBomb
+        );
+        assert_eq!(
+            bomb_hover(&sim, &rules, ivan, FriendlyUnit, own_tank),
+            CursorFeedbackKind::IvanBomb,
+            "AttackCursorOnFriendlies"
+        );
+        assert_eq!(
+            bomb_hover(&sim, &rules, engineer, FriendlyUnit, own_tank),
+            CursorFeedbackKind::FriendlyUnit,
+            "no bomb, no DisarmBomb"
+        );
+
+        // The Ivan plants on the enemy tank and on the own tank; a Soviet Ivan
+        // plants on a Soviet tank nobody American stands near.
+        sim.bomb_attach(ivan, Some(enemy_tank), &rules);
+        sim.bomb_attach(ivan, Some(own_tank), &rules);
+        sim.bomb_attach(enemy_ivan, Some(far_tank), &rules);
+        sim.bomb_list_update(&rules);
+        sim.bomb_list_update(&rules);
+
+        assert_eq!(
+            bomb_hover(&sim, &rules, ivan, EnemyUnit, enemy_tank),
+            CursorFeedbackKind::FriendlyUnit,
+            "a bombed target falls back to Select"
+        );
+        assert_eq!(
+            bomb_hover(&sim, &rules, engineer, EnemyUnit, enemy_tank),
+            CursorFeedbackKind::DisarmBomb
+        );
+        assert_eq!(
+            bomb_hover(&sim, &rules, engineer, FriendlyUnit, own_tank),
+            CursorFeedbackKind::DisarmBomb,
+            "own units are defused too"
+        );
+        assert_ne!(
+            bomb_hover(&sim, &rules, engineer, EnemyUnit, far_tank),
+            CursorFeedbackKind::DisarmBomb,
+            "a bomb the player does not see"
+        );
+    }
+
+    #[test]
+    fn bomb_cursor_rows() {
+        use super::cursor_id_for_feedback;
+        assert_eq!(
+            cursor_id_for_feedback(CursorFeedbackKind::IvanBomb),
+            Some(CursorId::IvanBomb)
+        );
+        assert_eq!(
+            cursor_id_for_feedback(CursorFeedbackKind::DisarmBomb),
+            Some(CursorId::Disarm)
         );
     }
 }
@@ -1917,60 +2246,55 @@ mod cursor_animation_tests {
         );
     }
 
-    /// RESIDUAL - gamemd address 0x00587410,
-    /// `MapClass::FindBridgeConnection_Predicate`, branch selection.
-    ///
-    /// The overlay branch is ported: step 3 above gates the engineer Enter
-    /// cursor on `bridge_hut_has_collapsed_span`, so a hut whose span carries
-    /// no collapsed anchor no longer offers a repair cursor.
-    ///
-    /// Trigger, corrected 2026-08-19: NOT "a partially damaged span". The
-    /// native picks its branch from whichever of the four 5x5 cases matched
-    /// LAST, and a cell whose iso-tile sits in a bridge tileset window is a
-    /// tileset match whose overlay is never read (the body is an if /
-    /// else-if chain testing `cell+0x38` before `cell+0x44`). A repair hut
-    /// sits beside ramp and bridgehead iso-tiles, so the tileset branch is
-    /// plausibly the ordinary case rather than a corner - though whether it
-    /// wins the last-match race on stock maps is UNCHECKED. Whenever it does,
-    /// gamemd walks `BridgeRecord`s at tolerance 3 and VERA walks overlays.
-    ///
-    /// Effect and DIRECTION: unbounded, and it can point either way. Where
-    /// the record branch would return true and the overlay walk finds no
-    /// anchor, VERA withholds a cursor gamemd shows - the opposite of the
-    /// over-eager cursor this fix removed. The repair itself is unaffected:
-    /// `context_order.rs` and the world-order path accept the order on the
-    /// hut flag alone, so a player who clicks anyway still repairs. What is
-    /// lost is the affordance, and a player reading the cursor concludes the
-    /// bridge cannot be repaired.
-    ///
-    /// Frequency: every mouse-over of a repair hut with an engineer selected
-    /// on a bridged map - the same cadence as the defect it replaces, not
-    /// narrower.
-    ///
-    /// Also unported, verified separately and NOT part of the branch problem
-    /// above: at 0x0051E3B0 the BridgeRepairHut arm RETURNS unconditionally.
-    /// `read_memory 0x0051E520` decodes the tail after the
-    /// `CALL 0x00587410` at 0x0051E54C as
-    /// `NEG AL; SBB EAX,EAX; AND AL,0xFD; ADD EAX,0x20; RET 0x8` - 0x1D when
-    /// the predicate holds, 0x20 when it does not, with no path past it. gamemd
-    /// therefore never reaches a later cursor case for a hut, while
-    /// `capability_cursor_for_hover` falls through to the capturable and
-    /// friendly-structure cases below.
-    ///
-    /// Trigger: every engineer hover over a repair hut. Effect today is nil -
-    /// `CABHUT` carries no `Capturable=` in `ini/rulesmd.ini`, so the case
-    /// immediately below does not fire - but nothing constrains the cases after
-    /// it, and a modded or future hut type would diverge silently.
-    ///
-    /// Blocker: the three geometry tables are data this crate has no reader
-    /// for; the tolerance-3 record hop needs `FindBridgeRecord`'s semantics
-    /// ported first; and settling the direction needs a live check of what a
-    /// stock hut's 5x5 actually contains.
-    #[test]
-    #[ignore = "gamemd 0x00587410 picks overlay-vs-record branch by last 5x5 match; VERA always walks overlays"]
-    fn bridge_hut_repair_cursor_always_takes_the_overlay_branch() {
-        panic!(
-            "unimplemented: branch selection + record branch of FindBridgeConnection_Predicate 0x00587410"
-        );
-    }
+    // RESIDUAL - gamemd address 0x00587410,
+    // `MapClass::FindBridgeConnection_Predicate`, branch selection.
+    //
+    // The overlay branch is ported: step 3 above gates the engineer Enter
+    // cursor on `bridge_hut_has_collapsed_span`, so a hut whose span carries
+    // no collapsed anchor no longer offers a repair cursor.
+    //
+    // Trigger, corrected 2026-08-19: NOT "a partially damaged span". The
+    // native picks its branch from whichever of the four 5x5 cases matched
+    // LAST, and a cell whose iso-tile sits in a bridge tileset window is a
+    // tileset match whose overlay is never read (the body is an if /
+    // else-if chain testing `cell+0x38` before `cell+0x44`). A repair hut
+    // sits beside ramp and bridgehead iso-tiles, so the tileset branch is
+    // plausibly the ordinary case rather than a corner - though whether it
+    // wins the last-match race on stock maps is UNCHECKED. Whenever it does,
+    // gamemd walks `BridgeRecord`s at tolerance 3 and VERA walks overlays.
+    //
+    // Effect and DIRECTION: unbounded, and it can point either way. Where
+    // the record branch would return true and the overlay walk finds no
+    // anchor, VERA withholds a cursor gamemd shows - the opposite of the
+    // over-eager cursor this fix removed. The repair itself is unaffected:
+    // `context_order.rs` and the world-order path accept the order on the
+    // hut flag alone, so a player who clicks anyway still repairs. What is
+    // lost is the affordance, and a player reading the cursor concludes the
+    // bridge cannot be repaired.
+    //
+    // Frequency: every mouse-over of a repair hut with an engineer selected
+    // on a bridged map - the same cadence as the defect it replaces, not
+    // narrower.
+    //
+    // Also unported, verified separately and NOT part of the branch problem
+    // above: at 0x0051E3B0 the BridgeRepairHut arm RETURNS unconditionally.
+    // `read_memory 0x0051E520` decodes the tail after the
+    // `CALL 0x00587410` at 0x0051E54C as
+    // `NEG AL; SBB EAX,EAX; AND AL,0xFD; ADD EAX,0x20; RET 0x8` - 0x1D when
+    // the predicate holds, 0x20 when it does not, with no path past it. gamemd
+    // therefore never reaches a later cursor case for a hut, while
+    // `capability_cursor_for_hover` falls through to the capturable and
+    // friendly-structure cases below.
+    //
+    // Trigger: every engineer hover over a repair hut. Effect today is nil -
+    // `CABHUT` carries no `Capturable=` in `ini/rulesmd.ini`, so the case
+    // immediately below does not fire - but nothing constrains the cases after
+    // it, and a modded or future hut type would diverge silently.
+    //
+    // Blocker: the three geometry tables are data this crate has no reader
+    // for; the tolerance-3 record hop needs `FindBridgeRecord`'s semantics
+    // ported first; and settling the direction needs a live check of what a
+    // stock hut's 5x5 actually contains.
+    // Residual (formerly an ignored placeholder test): gamemd 0x00587410 picks overlay-vs-record branch by last 5x5 match; VERA always walks overlays.
+    // Unimplemented: branch selection + record branch of FindBridgeConnection_Predicate 0x00587410.
 }

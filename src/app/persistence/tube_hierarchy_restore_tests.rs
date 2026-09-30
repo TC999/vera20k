@@ -60,7 +60,7 @@ fn tube_hierarchy_restore_prepares_detached_dummy_then_publishes_terminal_fields
     assert_eq!(bridges.endpoint_records().len(), 1);
     let make_sim = || {
         let mut sim = load_fixture_simulation(false);
-        sim.overlay_grid = Some(OverlayGrid::new_with_retained_wall_plane(32, 32));
+        sim.overlay_grid = Some(OverlayGrid::new(32, 32));
         sim.install_resolved_terrain_for_new_map(template.clone());
         sim.bridge_state = Some(bridges.clone());
         assert!(sim.rebuild_dynamic_navigation(&rules));
@@ -141,7 +141,7 @@ fn tube_hierarchy_restore_prepares_detached_dummy_then_publishes_terminal_fields
         before,
         "rejected candidate must not write any retained field"
     );
-    let (candidate, map_restore) = PreparedLoad::prepare_candidate(
+    let prepared = PreparedLoad::prepare_candidate(
         &bytes,
         Some(&current),
         Some(LOAD_FIXTURE_MAP_HASH),
@@ -151,10 +151,10 @@ fn tube_hierarchy_restore_prepares_detached_dummy_then_publishes_terminal_fields
     )
     .unwrap();
     assert!(
-        !connected(&candidate),
+        !connected(&prepared.simulation),
         "native Resize Tube=-1 must affect the prepared hierarchy"
     );
-    let prepared_dummy = candidate.effective_shared_cell_dummy();
+    let prepared_dummy = prepared.simulation.effective_shared_cell_dummy();
     assert!(!prepared_dummy.same_identity(&live));
     assert_eq!(prepared_dummy.raw_tube_index(), -1);
     assert_ne!(
@@ -167,11 +167,7 @@ fn tube_hierarchy_restore_prepares_detached_dummy_then_publishes_terminal_fields
         prepared_dummy.overlay_identity_state(),
     );
     let mut runtime = crate::sim::runtime::SimRuntime::from_simulation(current);
-    PreparedLoad {
-        simulation: candidate,
-        map_restore,
-    }
-    .commit_into(&mut runtime);
+    prepared.commit_into(&mut runtime);
     assert!(
         runtime
             .simulation

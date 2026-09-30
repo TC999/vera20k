@@ -79,7 +79,6 @@ fn native_tube_hierarchy_pairs_match_original_executable() {
         let record = BridgeEndpointRecord {
             endpoint_a: coord(&case["a"]),
             endpoint_b: coord(&case["b"]),
-            group_id: 0,
             active: true,
             bridge_kind: BridgeRecordKind::Low,
         };
@@ -193,8 +192,7 @@ fn tube_hierarchy_generated_records_connect_full_and_local_precheck() {
     );
     let zone_grid = super::super::zone_map::ZoneGrid::build_with_native_bridge_geometry(
         &path,
-        &std::collections::BTreeMap::new(),
-        Some(&terrain),
+        &terrain,
         records,
         width,
         height,

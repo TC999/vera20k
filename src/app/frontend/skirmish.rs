@@ -1,4 +1,4 @@
-//! Skirmish opening seeding, deployable building detection, and overlay atlas construction.
+//! Launch house colours, deployable building detection, and overlay atlas construction.
 //!
 //! Split from `loading::init_helpers` for file-size limits.
 
@@ -12,7 +12,6 @@ use crate::map::overlay::OverlayEntry;
 use crate::map::overlay_types::{
     OverlayTypeRegistry, is_bridge_overlay_index, is_high_bridge_index,
 };
-use crate::map::waypoints;
 use crate::render::batch::BatchRenderer;
 use crate::render::bridge_atlas::{self, BridgeAtlas};
 use crate::render::bridge_railing_atlas::{self, BridgeRailingAtlas, BridgeRailingTileBases};
@@ -25,109 +24,8 @@ use crate::rules::house_colors::HouseColorIndex;
 use crate::rules::ini_parser::IniFile;
 use crate::rules::ruleset::RuleSet;
 use crate::rules::tiberium_type::TiberiumTypeRegistry;
-use crate::sim::house_state::determine_waypoint_edge;
 use crate::sim::scenario_bootstrap::normalized_launch_slots;
-use crate::sim::world::Simulation;
 use crate::skirmish_launch::SkirmishLaunchSession;
-use crate::ui::main_menu::{SkirmishSettings, StartPosition};
-
-pub(crate) fn seed_skirmish_opening_if_needed(
-    sim: &mut Simulation,
-    map_data: &MapFile,
-    house_roster: &HouseRoster,
-    rules: &RuleSet,
-    height_map: &BTreeMap<(u16, u16), u8>,
-    overlay_registry: &OverlayTypeRegistry,
-    settings: &SkirmishSettings,
-) -> Option<String> {
-    // Seed MCVs whenever multiplayer start waypoints exist, even if the map
-    // has pre-placed entities (e.g., oil derricks on Dustbowl). The waypoint
-    // check is sufficient to distinguish multiplayer maps from campaign missions.
-    let mut starts = waypoints::multiplayer_start_waypoints(&map_data.waypoints);
-    if starts.len() < 2 {
-        return None;
-    }
-    let houses = skirmish_house_candidates(house_roster);
-    if houses.is_empty() {
-        return None;
-    }
-
-    // If the player chose a specific start position, swap that waypoint to index 0
-    // so the local player spawns there.
-    if let StartPosition::Position(pos) = settings.start_position {
-        let idx: usize = pos as usize;
-        if idx < starts.len() && idx != 0 {
-            starts.swap(0, idx);
-        }
-    }
-
-    // Reorder houses so the player's chosen side is first (becomes local owner).
-    let selected_side = settings.player_country.side();
-    let houses = reorder_houses_for_side(houses, selected_side);
-
-    let credits: i32 = settings.starting_credits;
-    let pairings = starts.into_iter().zip(houses.into_iter());
-    let mut spawned_mcvs: u32 = 0;
-    let mut local_owner: Option<String> = None;
-    for (start, house) in pairings.take(2) {
-        if let Some(h) = crate::sim::house_state::house_state_for_owner_mut(
-            &mut sim.houses,
-            &house.name,
-            &sim.interner,
-        ) {
-            h.credits = credits;
-        }
-        let mcv_type: &str = skirmish_mcv_type_for_house(house, rules);
-        if sim
-            .spawn_object_with_overlay_registry(
-                mcv_type,
-                &house.name,
-                start.rx,
-                start.ry,
-                64,
-                rules,
-                height_map,
-                overlay_registry,
-            )
-            .is_some()
-        {
-            spawned_mcvs += 1;
-            if local_owner.is_none() {
-                local_owner = Some(house.name.clone());
-            }
-            let waypoint_edge = sim
-                .playfield_bounds
-                .map(|bounds| determine_waypoint_edge((start.rx, start.ry), bounds));
-            if let Some(h) = crate::sim::house_state::house_state_for_owner_mut(
-                &mut sim.houses,
-                &house.name,
-                &sim.interner,
-            ) {
-                h.base_center = Some((start.rx, start.ry));
-                if let Some(waypoint_edge) = waypoint_edge {
-                    h.waypoint_edge = waypoint_edge;
-                }
-            }
-        } else {
-            log::warn!(
-                "Failed to seed opening MCV '{}' for {} at waypoint {} ({},{})",
-                mcv_type,
-                house.name,
-                start.index,
-                start.rx,
-                start.ry
-            );
-        }
-    }
-    if spawned_mcvs > 0 {
-        log::info!(
-            "Seeded {} skirmish opening MCV(s) with {} credits each",
-            spawned_mcvs,
-            credits
-        );
-    }
-    local_owner
-}
 
 pub(crate) fn house_color_map_for_launch_session(
     session: &SkirmishLaunchSession,
@@ -162,6 +60,7 @@ mod tests {
     use crate::sim::mission::MissionType;
     use crate::sim::rng::SimRng;
     use crate::sim::scenario_bootstrap::*;
+    use crate::sim::world::Simulation;
     use crate::skirmish_launch::{
         AiDifficulty, LaunchCountry, LaunchStartPosition, LaunchTeam, SkirmishAiSlot,
         SkirmishLaunchMode, SkirmishLaunchOptions, SkirmishLocalSlot,
@@ -277,7 +176,6 @@ mod tests {
             &map,
             &roster_with_neutral_and_playable(),
             &test_standard_launch_rules(),
-            &test_height_map(),
             &terrain,
             &launch_descriptor(&session),
         );
@@ -409,7 +307,6 @@ mod tests {
                 local_height: 64,
             },
             basic: crate::map::basic::BasicSection::default(),
-            briefing: crate::map::briefing::BriefingSection::default(),
             preview: crate::map::preview::PreviewSection::default(),
             cells: Vec::new(),
             iso_map_pack_lookups: Vec::new(),
@@ -545,10 +442,6 @@ mod tests {
         ]
     }
 
-    fn test_height_map() -> BTreeMap<(u16, u16), u8> {
-        BTreeMap::new()
-    }
-
     fn entity_position_for_owner(sim: &Simulation, owner: &str) -> Option<(u16, u16)> {
         sim.entities().values().find_map(|entity| {
             (sim.interner.resolve(entity.owner) == owner)
@@ -557,76 +450,24 @@ mod tests {
     }
 
     fn test_terrain(width: u16, height: u16) -> ResolvedTerrainGrid {
-        let mut cells = Vec::with_capacity(width as usize * height as usize);
-        for ry in 0..height {
-            for rx in 0..width {
-                cells.push(test_terrain_cell(rx, ry, Some(100)));
-            }
-        }
-        ResolvedTerrainGrid::from_cells(width, height, cells)
+        crate::map::resolved_terrain::test_grid(width, height, |rx, ry| {
+            test_terrain_cell(rx, ry, Some(100))
+        })
     }
 
     fn test_terrain_cell(rx: u16, ry: u16, track_cost: Option<u8>) -> ResolvedTerrainCell {
         ResolvedTerrainCell {
-            rx,
-            ry,
-            source_tile_index: 0,
-            source_sub_tile: 0,
-            final_tile_index: 0,
-            final_sub_tile: 0,
-            is_wood_bridge_repair_tile: false,
-            level: 0,
-            filled_clear: false,
-            tileset_index: Some(0),
-            land_type: 0,
-            yr_cell_land_type: 0,
-            slope_type: 0,
-            template_height: 0,
-            render_offset_x: 0,
-            render_offset_y: 0,
-            terrain_class: TerrainClass::Clear,
             speed_costs: SpeedCostProfile {
                 track: track_cost,
                 ..Default::default()
             },
-            is_water: false,
-            is_cliff_like: false,
-            is_rough: false,
-            is_road: false,
-            accepts_smudge: false,
-            allows_tiberium: false,
-            height_in_pixels: 0,
-            variant: 0,
-            has_ramp: false,
-            canonical_ramp: None,
-            ground_walk_blocked: false,
-            terrain_object_blocks: false,
-            terrain_object_occupation: None,
-            overlay_blocks: false,
-            overlay_zone_type: None,
-            outside_playfield: false,
             zone_type: zone_class::GROUND,
-            base_ground_walk_blocked: false,
-            base_build_blocked: false,
-            base_land_type: 0,
-            base_yr_cell_land_type: 0,
             base_terrain_class: TerrainClass::Clear,
             base_speed_costs: SpeedCostProfile {
                 track: track_cost,
                 ..Default::default()
             },
-            build_blocked: false,
-            has_bridge_deck: false,
-            bridge_walkable: false,
-            bridge_transition: false,
-            bridge_deck_level: 0,
-            bridge_layer: None,
-            bridge_facts: crate::map::bridge_facts::BridgeCellFacts::default(),
-            tube_index: None,
-            radar_left: [0, 0, 0],
-            radar_right: [0, 0, 0],
-            has_damaged_data: false,
-            bridgehead_anchor_class_at_load: None,
+            ..crate::map::resolved_terrain::test_flat_cell(rx, ry)
         }
     }
 
@@ -639,7 +480,7 @@ mod tests {
                     country: None,
                     side: None,
                     player_control: None,
-                    iq: None,
+                    iq: 0,
                     allies: Vec::new(),
                     base_plan: Default::default(),
                 },
@@ -649,7 +490,7 @@ mod tests {
                     country: Some("Americans".to_string()),
                     side: Some("Allies".to_string()),
                     player_control: Some(true),
-                    iq: None,
+                    iq: 0,
                     allies: Vec::new(),
                     base_plan: Default::default(),
                 },
@@ -1021,6 +862,9 @@ mod tests {
                 seed: 9,
                 ..Default::default()
             });
+        // This synthetic fixture omits the production native Rules prefix.
+        sim.native_unique_ids =
+            Some(crate::sim::native_identity::NativeUniqueIdCursor::for_synthetic_simulation());
         let mut expected_rng = sim.scenario_rng.clone();
         let _ = expected_rng.next_range_u32_inclusive(0, 0xffff);
 
@@ -1029,7 +873,6 @@ mod tests {
             &map,
             &roster_with_neutral_and_playable(),
             &test_standard_launch_rules(),
-            &test_height_map(),
             &terrain,
             &launch_descriptor(&session),
             &projection,
@@ -1100,7 +943,7 @@ mod tests {
              [GACNST]\nStrength=1000\nUndeploysInto=AMCV\n",
         ))
         .expect("structure fixture rules");
-        rules.merge_art_data(&ArtRegistry::from_ini(&IniFile::from_str(
+        rules.install_art_data(ArtRegistry::from_ini(&IniFile::from_str(
             "[GACNST]\nFoundation=4x4\n",
         )));
         assert_eq!(
@@ -1134,9 +977,10 @@ mod tests {
                 recruitable_a: true,
                 recruitable_b: true,
                 structure_upgrades: [None, None, None],
+                structure_ai_sellable: false,
+                structure_ai_repairable: false,
             }],
             Some(&rules),
-            &BTreeMap::new(),
         );
 
         assert_eq!(spawned, 1);
@@ -1144,7 +988,7 @@ mod tests {
             .interner
             .get("Player")
             .expect("pre-created player house");
-        assert_eq!(sim.houses[&player].owned_building_count, 1);
+        assert_eq!(sim.houses[&player].tracking.buildings(), 1);
         assert_eq!(
             sim.substrate.base_reservations.raw_mask(None, 28, 38),
             1,
@@ -1202,7 +1046,7 @@ mod tests {
 
         let credits = |owner: &str| {
             crate::sim::house_state::house_state_for_owner(&sim.houses, owner, &sim.interner)
-                .map(|house| house.credits)
+                .map(|house| house.economy.credits)
         };
         assert_eq!(credits("Player"), Some(10_000));
         assert_eq!(credits("Computer1"), Some(50_000), "Hard: +400%");
@@ -1231,16 +1075,16 @@ mod tests {
         let mut rules = test_standard_launch_rules();
         populate_launch_houses(&mut sim, &normalized_launch_slots(&session), &rules);
         let ai = sim.interner.get("Computer1").expect("AI house");
-        sim.houses.get_mut(&ai).expect("AI house").credits = 12_345;
+        sim.houses.get_mut(&ai).expect("AI house").economy.credits = 12_345;
 
         rules.general.multiplayer_ai_cm = Vec::new();
         apply_skirmish_ai_opening_credits(&mut sim, &rules);
-        assert_eq!(sim.houses[&ai].credits, 12_345);
+        assert_eq!(sim.houses[&ai].economy.credits, 12_345);
 
         // 7 * 0.01 * 12345 = 864.15... -> 864 under chop.
         rules.general.multiplayer_ai_cm = vec![7, 0, 0];
         apply_skirmish_ai_opening_credits(&mut sim, &rules);
-        assert_eq!(sim.houses[&ai].credits, 12_345 + 864);
+        assert_eq!(sim.houses[&ai].economy.credits, 12_345 + 864);
     }
 
     #[test]
@@ -1451,7 +1295,6 @@ mod tests {
             &map,
             &roster_with_neutral_and_playable(),
             &rules,
-            &test_height_map(),
             &terrain,
             &launch_descriptor(&session),
         );
@@ -1541,6 +1384,9 @@ mod tests {
             ..Default::default()
         };
         let mut sim = bootstrap_rng.into_simulation(&descriptor);
+        // This synthetic fixture omits the production native Rules prefix.
+        sim.native_unique_ids =
+            Some(crate::sim::native_identity::NativeUniqueIdCursor::for_synthetic_simulation());
         let mut expected_rng = SimRng::new(u64::from(launch_seed));
         for _ in 0..8 {
             let _ = expected_rng
@@ -1557,7 +1403,6 @@ mod tests {
             &map,
             &roster_with_neutral_and_playable(),
             &rules,
-            &test_height_map(),
             &terrain,
             &launch_descriptor(&session),
             &projection,
@@ -1716,7 +1561,6 @@ mod tests {
             &map,
             &roster_with_neutral_and_playable(),
             &rules,
-            &test_height_map(),
             &terrain,
             &launch_descriptor(&session),
         );
@@ -1763,7 +1607,6 @@ mod tests {
                 &map,
                 &roster,
                 &rules,
-                &test_height_map(),
                 &terrain,
                 &launch_descriptor(&session),
             );
@@ -1837,7 +1680,7 @@ mod tests {
                 country: Some("Russians".to_string()),
                 side: Some("Soviet".to_string()),
                 player_control: Some(true),
-                iq: None,
+                iq: 0,
                 allies: Vec::new(),
                 base_plan: Default::default(),
             }],
@@ -1935,7 +1778,6 @@ mod tests {
             &map,
             &roster_with_neutral_and_playable(),
             &rules,
-            &test_height_map(),
             &terrain,
             &launch_descriptor(&session),
         );
@@ -1998,7 +1840,6 @@ mod tests {
             &map,
             &roster_with_neutral_and_playable(),
             &rules,
-            &test_height_map(),
             &terrain,
             &launch_descriptor(&session),
         );
@@ -2011,7 +1852,7 @@ mod tests {
         // is the 2.0f accumulator, not just the rank projection — a unit
         // seeded only in the projection would demote on its first kill.
         assert!(sim.entities().values().all(|entity| {
-            entity.veterancy == 200 && entity.veterancy_raw.bits() == 0x4000_0000
+            entity.veterancy() == 200 && entity.veterancy_raw.bits() == 0x4000_0000
         }));
         assert!(sim.entities().values().all(|entity| {
             let expected = if sim.interner.resolve(entity.owner) == "Player" {
@@ -2039,7 +1880,6 @@ mod tests {
             &map,
             &roster_with_neutral_and_playable(),
             &rules,
-            &test_height_map(),
             &terrain,
             &launch_descriptor(&session),
         );
@@ -2068,7 +1908,6 @@ mod tests {
             &map,
             &roster_with_neutral_and_playable(),
             &rules,
-            &test_height_map(),
             &terrain,
             &launch_descriptor(&session),
         );
@@ -2096,16 +1935,8 @@ mod tests {
             &rules,
             &launch_descriptor(&session),
         );
-        sim.spawn_object(
-            "AMCV",
-            "Neutral",
-            45,
-            45,
-            STARTING_MCV_FACING,
-            &rules,
-            &test_height_map(),
-        )
-        .expect("blocker");
+        sim.spawn_object("AMCV", "Neutral", 45, 45, STARTING_MCV_FACING, &rules)
+            .expect("blocker");
         let mut expected_rng = sim.scenario_rng.clone();
         // gamemd-derived: TechnoClass::TechnoClass @ 0x006F2B90 consumes and
         // stores one raw Scenario word at 0x006F3254 before placement.
@@ -2121,7 +1952,6 @@ mod tests {
             &map,
             &roster_with_neutral_and_playable(),
             &rules,
-            &test_height_map(),
             &terrain,
             &launch_descriptor(&session),
         );
@@ -2173,16 +2003,8 @@ mod tests {
             &rules,
             &descriptor,
         );
-        sim.spawn_object(
-            "AMCV",
-            "Neutral",
-            100,
-            75,
-            STARTING_MCV_FACING,
-            &rules,
-            &test_height_map(),
-        )
-        .expect("authored start blocker");
+        sim.spawn_object("AMCV", "Neutral", 100, 75, STARTING_MCV_FACING, &rules)
+            .expect("authored start blocker");
         let mut expected_rng = sim.scenario_rng.clone();
         // TechnoClass::TechnoClass @ 0x006F2B90 consumes its raw Scenario
         // word at 0x006F3254 before Try_Unlimbo chooses a fallback spoke.
@@ -2199,7 +2021,6 @@ mod tests {
             &map,
             &roster_with_neutral_and_playable(),
             &rules,
-            &test_height_map(),
             &terrain,
             &descriptor,
         );
@@ -2329,16 +2150,8 @@ mod tests {
             }
         }
 
-        let spawned = seed_starting_extra_units(
-            &mut sim,
-            slots,
-            &rules,
-            &test_height_map(),
-            &terrain,
-            bounds,
-            1,
-            false,
-        );
+        let spawned =
+            seed_starting_extra_units(&mut sim, slots, &rules, &terrain, bounds, 1, false);
 
         assert_eq!(spawned, 0);
         assert!(sim.entities().is_empty());
@@ -2364,7 +2177,6 @@ mod tests {
             &map,
             &roster_with_neutral_and_playable(),
             &rules,
-            &test_height_map(),
             &terrain,
             &launch_descriptor(&session),
         );
@@ -2390,7 +2202,7 @@ mod tests {
         // Computer1 has no infantry, stops at 3xHTNK = 300 and is credited 34.
         let credits = |owner: &str| {
             crate::sim::house_state::house_state_for_owner(&sim.houses, owner, &sim.interner)
-                .map(|house| house.credits)
+                .map(|house| house.economy.credits)
         };
         assert_eq!(credits("Player"), Some(10_000));
         assert_eq!(credits("Computer1"), Some(10_034));
@@ -2424,7 +2236,6 @@ mod tests {
             &map,
             &roster_with_neutral_and_playable(),
             &rules,
-            &test_height_map(),
             &terrain,
             &launch_descriptor(&session),
         );
@@ -2433,7 +2244,7 @@ mod tests {
         assert_eq!(sim.entities().len(), 8);
         let credits = |owner: &str| {
             crate::sim::house_state::house_state_for_owner(&sim.houses, owner, &sim.interner)
-                .map(|house| house.credits)
+                .map(|house| house.economy.credits)
         };
         assert_eq!(credits("Player"), Some(10_000));
         assert_eq!(credits("Computer1"), Some(10_000));
@@ -2459,7 +2270,6 @@ mod tests {
             &map,
             &roster_with_neutral_and_playable(),
             &rules,
-            &test_height_map(),
             &terrain,
             &launch_descriptor(&session),
         );
@@ -2469,7 +2279,7 @@ mod tests {
 
         let credits = |owner: &str| {
             crate::sim::house_state::house_state_for_owner(&sim.houses, owner, &sim.interner)
-                .map(|house| house.credits)
+                .map(|house| house.economy.credits)
         };
         assert_eq!(credits("Player"), Some(10_000));
         assert_eq!(credits("Computer1"), Some((10_000 + 34) * 5));
@@ -2518,7 +2328,6 @@ mod tests {
             &map,
             &roster_with_neutral_and_playable(),
             &test_standard_launch_rules(),
-            &test_height_map(),
             &terrain,
             &launch_descriptor(&session),
         );
@@ -2710,64 +2519,6 @@ mod tests {
     }
 }
 
-pub(crate) fn skirmish_house_candidates(
-    house_roster: &HouseRoster,
-) -> Vec<&crate::map::houses::HouseDefinition> {
-    // First pass: prefer houses without explicit PlayerControl=no.
-    let preferred: Vec<&crate::map::houses::HouseDefinition> = house_roster
-        .houses
-        .iter()
-        .filter(|house| {
-            is_playable_faction_name(&house.name) && house.player_control != Some(false)
-        })
-        .collect();
-    if preferred.len() >= 2 {
-        return preferred;
-    }
-    // Second pass: include all playable factions (even PlayerControl=no)
-    // so skirmish maps can seed at least 2 MCVs for AI opponents.
-    house_roster
-        .houses
-        .iter()
-        .filter(|house| is_playable_faction_name(&house.name))
-        .collect()
-}
-
-/// Reorder house candidates so the player's chosen side appears first.
-///
-/// Matches houses by their Side= field (Allies/Soviet). If no exact match,
-/// falls back to original order.
-fn reorder_houses_for_side<'a>(
-    houses: Vec<&'a crate::map::houses::HouseDefinition>,
-    side: crate::ui::main_menu::SkirmishSide,
-) -> Vec<&'a crate::map::houses::HouseDefinition> {
-    use crate::ui::main_menu::SkirmishSide;
-
-    let target_side: &str = match side {
-        SkirmishSide::Allied => "ALLIES",
-        SkirmishSide::Soviet => "SOVIET",
-    };
-
-    // Find index of a house matching the player's chosen side.
-    let matching_idx = houses.iter().position(|h| {
-        h.side
-            .as_deref()
-            .is_some_and(|s| s.to_ascii_uppercase().contains(target_side))
-    });
-
-    let Some(idx) = matching_idx else {
-        return houses;
-    };
-    if idx == 0 {
-        return houses;
-    }
-
-    // Swap the matching house to position 0 (local player slot).
-    let mut reordered = houses;
-    reordered.swap(0, idx);
-    reordered
-}
-
 /// Returns true for faction names that represent real players (not neutral/civilian).
 fn is_playable_faction_name(name: &str) -> bool {
     let up = name.to_ascii_uppercase();
@@ -2777,85 +2528,27 @@ fn is_playable_faction_name(name: &str) -> bool {
     )
 }
 
-pub(crate) fn skirmish_mcv_type_for_house(
-    house: &crate::map::houses::HouseDefinition,
-    rules: &RuleSet,
-) -> &'static str {
-    let mut candidates = Vec::new();
-    if let Some(country) = house.country.as_deref() {
-        let upper = country.to_ascii_uppercase();
-        if upper.contains("YURI") {
-            candidates.push("PCV");
-        } else if upper.contains("RUSS")
-            || upper.contains("CONFED")
-            || upper.contains("IRAQ")
-            || upper.contains("CUBA")
-            || upper.contains("LIBYA")
-        {
-            candidates.push("SMCV");
-        } else {
-            candidates.push("AMCV");
-        }
-    }
-    if let Some(side) = house.side.as_deref() {
-        let upper = side.to_ascii_uppercase();
-        if upper.contains("YURI") {
-            candidates.push("PCV");
-        } else if upper.contains("SOV") {
-            candidates.push("SMCV");
-        } else if upper.contains("ALL") {
-            candidates.push("AMCV");
-        }
-    }
-    candidates.extend(["AMCV", "SMCV", "PCV"]);
-    candidates
-        .into_iter()
-        .find(|id| rules.object(id).is_some())
-        .unwrap_or("AMCV")
-}
-
 /// Collect building type IDs that can be spawned at runtime and need atlas pre-loading.
 ///
 /// Scans all objects with `DeploysInto=` set in rules.ini to find deploy targets
-/// (e.g., AMCV→GACNST). Data-driven — no hardcoded MCV/ConYard type pairs.
-pub fn deployable_building_types<'a>(
-    entities: &crate::sim::entity_store::EntityStore,
-    rules: Option<&'a RuleSet>,
-    interner: Option<&crate::sim::intern::StringInterner>,
-) -> Vec<&'a str> {
+/// (e.g., AMCV→GACNST). Data-driven — no hardcoded MCV/ConYard type pairs. It
+/// covers every object type in the rules, since units with DeploysInto can
+/// appear via production or scripted events even without being on the map yet.
+pub fn deployable_building_types(rules: Option<&RuleSet>) -> Vec<&str> {
     let Some(rules) = rules else {
         return Vec::new();
     };
     let mut result: Vec<&str> = Vec::new();
-
-    // Collect deploy targets for any units currently on the map.
-    for entity in entities.values() {
-        let type_str = interner.map_or("", |i| i.resolve(entity.type_ref()));
-        if let Some(obj) = rules.object(type_str) {
-            if let Some(ref target_id) = obj.deploys_into {
-                if let Some(target_obj) = rules.object(target_id) {
-                    let id_str: &str = &target_obj.id;
-                    if !result.iter().any(|r| r.eq_ignore_ascii_case(id_str)) {
-                        result.push(id_str);
-                    }
-                }
-            }
-        }
-    }
-
-    // Also include deploy targets from ALL objects in rules — units with DeploysInto
-    // can appear via production or scripted events even without being on the map yet.
     for obj in rules.all_objects() {
-        if let Some(ref target_id) = obj.deploys_into {
-            if let Some(target_obj) = rules.object(target_id) {
-                let id_str: &str = &target_obj.id;
-                if !result.iter().any(|r| r.eq_ignore_ascii_case(id_str)) {
-                    result.push(id_str);
-                }
-            }
+        if let Some(target_id) = &obj.deploys_into
+            && let Some(target_obj) = rules.object(target_id)
+            && !result
+                .iter()
+                .any(|r| r.eq_ignore_ascii_case(&target_obj.id))
+        {
+            result.push(&target_obj.id);
         }
     }
-
     result
 }
 

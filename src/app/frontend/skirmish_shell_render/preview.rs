@@ -105,10 +105,10 @@ pub(super) fn selected_preview_texture_is_current(
 }
 
 pub(super) fn is_random_map_sentinel_file_name(file_name: &str) -> bool {
-    Path::new(file_name)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.eq_ignore_ascii_case(RANDMAP_SENTINEL_FILE_NAME))
+    // Map names can carry the game's own `\` separators, so split on both `\`
+    // and `/` on every host (`Path::file_name` only knows the host's).
+    let name = file_name.rsplit(['\\', '/']).next().unwrap_or(file_name);
+    name.eq_ignore_ascii_case(RANDMAP_SENTINEL_FILE_NAME)
 }
 
 pub(super) fn is_random_map_sentinel_entry(entry: &MapMenuEntry) -> bool {
@@ -162,7 +162,7 @@ pub(super) fn decode_preview_for_map_entry(
 
     if let Some(ra2_dir) = ra2_dir {
         let ini_path = ra2_dir.join(&entry.file_name);
-        if let Some(ini) = crate::app::frontend::list_maps::read_map_ini_for_metadata(&ini_path) {
+        if let Some(ini) = crate::map::source::read_map_ini_for_metadata(&ini_path) {
             if let Some(preview) = decode_preview_from_ini(&ini, &entry.file_name) {
                 return Some(preview);
             }
@@ -170,7 +170,7 @@ pub(super) fn decode_preview_for_map_entry(
     }
 
     if let Some(assets) = assets {
-        for candidate in crate::app::frontend::list_maps::asset_map_candidates(&entry.file_name) {
+        for candidate in crate::map::source::asset_map_candidates(&entry.file_name) {
             if let Some(bytes) = assets.get_ref(&candidate) {
                 if let Some(preview) = decode_preview_from_map_bytes(bytes, &candidate) {
                     return Some(preview);
@@ -242,11 +242,34 @@ pub(super) fn ensure_random_map_setup_preview_texture(state: &mut AppState) -> b
     true
 }
 
+/// The map the preview shows: while Choose Map shows, its highlighted map
+/// (the loop callback `0x005E66F0` reloads the preview for every new
+/// highlight and restores the session's map afterwards); otherwise the
+/// committed one.
+pub(super) fn preview_map_idx(state: &AppState) -> usize {
+    let shell = &state.frontend.skirmish_shell_state;
+    shell
+        .choose_map_modal
+        .as_ref()
+        .filter(|_| shell.random_map_setup_modal.is_none() && shell.saved_seed_browser.is_none())
+        .and_then(|modal| modal.selected_record_index())
+        .and_then(|record| state.frontend.scenario_catalog.records().get(record))
+        .and_then(|record| {
+            state
+                .frontend
+                .scenario_catalog
+                .shell_maps()
+                .iter()
+                .position(|map| map.file_name.eq_ignore_ascii_case(&record.file_name))
+        })
+        .unwrap_or(shell.selected_map_idx)
+}
+
 pub(super) fn ensure_selected_preview_texture(state: &mut AppState) {
     if ensure_random_map_setup_preview_texture(state) {
         return;
     }
-    let selected_map_idx = state.frontend.skirmish_shell_state.selected_map_idx;
+    let selected_map_idx = preview_map_idx(state);
     let selected_entry = state.frontend.scenario_catalog.shell_maps().get(selected_map_idx).cloned();
     let selected_is_random_sentinel = selected_entry
         .as_ref()

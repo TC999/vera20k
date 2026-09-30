@@ -93,6 +93,7 @@ pub struct Animation {
     /// Currently playing sequence.
     pub sequence: SequenceKind,
     /// Current frame within the sequence (0 to frame_count - 1).
+    /// Infantry draws from its private native Stage and Doing instead.
     pub frame_index: u16,
     /// Reached native frames accumulated since the last image advance.
     pub elapsed_frames: u16,
@@ -126,6 +127,7 @@ impl Animation {
 /// Whether a sequence represents the infantry being in a prone stance.
 ///
 /// This is a temporary stance proxy until the sim carries an explicit prone bit.
+#[cfg(test)]
 pub fn sequence_is_prone(sequence: SequenceKind) -> bool {
     matches!(
         sequence,
@@ -134,30 +136,6 @@ pub fn sequence_is_prone(sequence: SequenceKind) -> bool {
             | SequenceKind::FireProne
             | SequenceKind::SecondaryProne
             | SequenceKind::Down
-    )
-}
-
-/// Whether the current animation represents a prone stance.
-///
-/// TODO(RE): The sim does not yet enter these sequences during live infantry
-/// combat because prone-entry behavior has not been reverse engineered yet.
-/// This helper only recognizes prone once some other system explicitly switches
-/// the animation into one of the prone-related sequences.
-pub fn animation_is_prone(animation: Option<&Animation>) -> bool {
-    animation.is_some_and(|anim| sequence_is_prone(anim.sequence))
-}
-
-/// Whether a sequence is a one-shot infantry fire action.
-pub fn sequence_is_fire_action(sequence: SequenceKind) -> bool {
-    matches!(
-        sequence,
-        SequenceKind::Attack
-            | SequenceKind::FireProne
-            | SequenceKind::DeployedFire
-            | SequenceKind::SecondaryFire
-            | SequenceKind::SecondaryProne
-            | SequenceKind::FireFly
-            | SequenceKind::WetAttack
     )
 }
 
@@ -172,44 +150,75 @@ fn sequence_set_for_type<'a>(
     })
 }
 
-/// Compute the SHP frame index for a given sequence, facing, and animation frame.
+/// Borrowed frame data from the rules owner. Infantry keeps its signed native
+/// record and Doing identity; generic Unit/Building definitions retain their
+/// existing presentation vocabulary. This view owns no mutable state.
+pub enum ShpFrameDefinition<'a> {
+    Infantry(&'a crate::rules::infantry_sequence::InfantrySequenceEntry),
+    Generic(&'a SequenceDef),
+}
+
+impl<'a> From<&'a crate::rules::infantry_sequence::InfantrySequenceEntry>
+    for ShpFrameDefinition<'a>
+{
+    fn from(value: &'a crate::rules::infantry_sequence::InfantrySequenceEntry) -> Self {
+        Self::Infantry(value)
+    }
+}
+
+impl<'a> From<&'a SequenceDef> for ShpFrameDefinition<'a> {
+    fn from(value: &'a SequenceDef) -> Self {
+        Self::Generic(value)
+    }
+}
+
+/// Select a signed SHP frame. Native Infantry518D80, arithmetic518E08..1F
+/// and518F3B..88: clamp the signed count to1, divide full Stage, then add
+/// the positive facing stride and start with DWORD wrapping. Native keeps
+/// EAX signed through DrawIt5195DA; asset consumers check the frame boundary.
 ///
-/// For directional sequences (facings > 1):
-///   `start_frame + facing_slot * facing_multiplier + frame_index`
-/// For non-directional (facings == 1):
-///   `start_frame + frame_index`
-///
-/// `facing` is the RA2 DirStruct byte (0–255, clockwise in cell space:
-/// 0=N, 64=E, 128=S, 192=W). The facing-to-slot conversion is
-/// family-specific — see [`FacingSlots`].
-///
-/// The `facings <= 1` early return stands in for the original's directional
-/// test, which reads the facing multiplier rather than a facing count. The two
-/// agree because every producer that emits a zero multiplier also emits
-/// `facings == 1`, and a zero multiplier contributes nothing to the sum anyway.
-pub fn resolve_shp_frame(def: &SequenceDef, facing: u8, frame_index: u16) -> u16 {
-    let clamped: u16 = if def.frame_count > 0 {
-        frame_index % def.frame_count
+/// The caller owns selected type, Doing and body/Jumpjet target facing. Native
+/// evidence: tools/spatial_oracle/anytown_damage/foot_missions.json,
+/// draw_stage_modulo_receipt and infantry_frame_selection_receipt.
+pub fn resolve_shp_frame<'a>(
+    def: impl Into<ShpFrameDefinition<'a>>,
+    facing: u8,
+    frame_index: i32,
+) -> i32 {
+    let (start, count, stride, slot) = match def.into() {
+        ShpFrameDefinition::Infantry(record) => (
+            record.start_frame,
+            record.frames_per_facing,
+            record.facings,
+            i32::from(infantry_facing_slot(facing)),
+        ),
+        ShpFrameDefinition::Generic(def) => {
+            let slot = match def.facing_slots {
+                FacingSlots::InfantryTable => infantry_facing_slot(facing),
+                FacingSlots::VehicleOctant if def.facings == VEHICLE_FACING_SLOTS => {
+                    vehicle_facing_slot(facing)
+                }
+                FacingSlots::VehicleOctant => 0,
+            };
+            (
+                i32::from(def.start_frame),
+                i32::from(def.frame_count),
+                if def.facings <= 1 {
+                    0
+                } else {
+                    i32::from(def.facing_multiplier)
+                },
+                i32::from(slot),
+            )
+        }
+    };
+    let within = frame_index % count.max(1);
+    let direction = if stride > 0 {
+        slot.wrapping_mul(stride)
     } else {
         0
     };
-
-    if def.facings <= 1 {
-        return def.start_frame + clamped;
-    }
-
-    let facing_slot: u16 = match def.facing_slots {
-        FacingSlots::InfantryTable => infantry_facing_slot(facing),
-        // The vehicle draw path gates the whole slot computation on the body
-        // declaring exactly 8 frame blocks; any other count draws block 0 for
-        // every facing.
-        FacingSlots::VehicleOctant if def.facings == VEHICLE_FACING_SLOTS => {
-            vehicle_facing_slot(facing)
-        }
-        FacingSlots::VehicleOctant => 0,
-    };
-
-    def.start_frame + facing_slot * def.facing_multiplier + clamped
+    start.wrapping_add(direction).wrapping_add(within)
 }
 
 /// Advance the persistent Unit SHP body counter at FootClass's post-Process
@@ -221,6 +230,7 @@ pub fn resolve_shp_frame(def: &SequenceDef, facing: u8, frame_index: u16) -> u16
 /// division. The counter itself is a native dword, so increment wraps.
 pub(crate) fn tick_shp_vehicle_body_frame_counter(
     entity: &mut crate::sim::game_entity::GameEntity,
+    rules: Option<crate::sim::movement::SpeedRules<'_>>,
     cadence: ShpVehicleCadence,
     binary_frame: u32,
 ) {
@@ -229,7 +239,7 @@ pub(crate) fn tick_shp_vehicle_body_frame_counter(
         || entity.dying
         || !entity.lifecycle.object_alive
         || entity.lifecycle.in_limbo
-        || entity.object_is_falling_down != 0
+        || entity.is_falling_down()
     {
         return;
     }
@@ -239,22 +249,21 @@ pub(crate) fn tick_shp_vehicle_body_frame_counter(
     };
     if locomotor.piggyback.is_some()
         || entity.deploy_state.is_some()
-        || entity
-            .teleport_state
-            .as_ref()
-            .is_some_and(|state| state.warp_out_active() || state.warp_in_active())
+        || entity.is_warped_out()
+        || entity.is_warping_in()
     {
         return;
     }
 
-    let rate = if crate::sim::movement::ready_producer::is_moving_now_for(entity, binary_frame) {
-        cadence.walk_rate
-    } else {
-        if cadence.idle_rate == 0 {
-            return;
-        }
-        cadence.idle_rate
-    };
+    let rate =
+        if crate::sim::movement::ready_producer::is_moving_now_for(entity, rules, binary_frame) {
+            cadence.walk_rate
+        } else {
+            if cadence.idle_rate == 0 {
+                return;
+            }
+            cadence.idle_rate
+        };
 
     if (binary_frame as i32) % rate == 0 {
         entity.body_frame_counter = entity.body_frame_counter.wrapping_add(1);
@@ -282,7 +291,7 @@ pub fn resolve_shp_vehicle_body_frame(
     } else {
         0
     };
-    Some(resolve_shp_frame(def, facing, frame_index))
+    u16::try_from(resolve_shp_frame(def, facing, i32::from(frame_index))).ok()
 }
 
 /// Advance a single animation by one reached native gameplay frame.
@@ -344,6 +353,7 @@ pub fn advance_animation(
 ///
 /// `sequences` maps type_id → SequenceSet for frame timing lookup.
 /// Entities whose type_id isn't in the map are skipped (no animation advance).
+#[allow(clippy::too_many_arguments)]
 fn tick_animations_impl(
     entities: &mut crate::sim::entity_store::EntityStore,
     sequences: &BTreeMap<String, SequenceSet>,
@@ -357,20 +367,38 @@ fn tick_animations_impl(
     let keys: Vec<u64> = entities.keys_sorted();
 
     for &id in &keys {
-        let Some(entity) = entities.get_mut(id) else {
+        let Some(entity) = entities.get(id) else {
             continue;
         };
         if entity.dying && !tick_dying {
             continue;
         }
-        let type_ref = entity.type_ref();
-        let Some(anim) = entity.animation.as_mut() else {
+        // The stage steps in TechnoClass::AI_Update (`0x006FAC4D`), which a
+        // warped object never reaches (`GameEntity::ai_frozen`): its pose holds.
+        if !entity.dying && entity.ai_frozen() {
+            continue;
+        }
+        // Its Doing's sequence, which its actions restart and whose stage
+        // steps in its own turn (`sim::movement::infantry_action`); this
+        // frame-end clock leaves it.
+        if crate::sim::movement::infantry_action::doing_owns_sequence(entity) {
+            continue;
+        }
+        if entity.animation.is_none() {
             // Dying entity with no animation → ready for despawn.
             if entity.dying {
                 dying_finished.push(id);
             }
             continue;
-        };
+        }
+        let entity = entities
+            .get_mut(id)
+            .expect("an animated entity was just read");
+        let type_ref = entity.type_ref();
+        let anim = entity
+            .animation
+            .as_mut()
+            .expect("an animated entity was just read");
 
         // Dying entities: only advance the death animation, skip all transitions.
         if entity.dying {
@@ -378,8 +406,7 @@ fn tick_animations_impl(
                 dying_finished.push(id);
                 continue;
             }
-            let Some(seq_set) =
-                sequence_set_for_type(sequences, rules, interner.resolve(type_ref))
+            let Some(seq_set) = sequence_set_for_type(sequences, rules, interner.resolve(type_ref))
             else {
                 dying_finished.push(id);
                 continue;
@@ -396,75 +423,28 @@ fn tick_animations_impl(
         }
 
         let has_movement: bool = entity.movement_target.is_some();
-        let pending_fire_sequence = entity
-            .attack_target
-            .as_ref()
-            .and_then(|attack| attack.pending_infantry_fire.map(|pending| pending.sequence));
-        let has_fire_action = pending_fire_sequence.is_some();
-        let preserving_fire_action = sequence_is_fire_action(anim.sequence) && !has_fire_action;
-
-        // Look up this type's sequence definitions for transition checks.
+        // Infantry never enters this cascade: Doing/Stage is its only
+        // sequence clock. Retain the existing non-Infantry visual transitions.
         let seq_set = sequence_set_for_type(sequences, rules, interner.resolve(type_ref));
-
-        // Deploy state takes priority over the standard Stand/Walk/Attack cascade.
-        // The visual reflects the sim phase; DeployedFire is the auto-transition
-        // when a Deployed unit gains an attack target (visual-only, matches stock YR).
         match entity.deploy_state {
             Some(crate::sim::deploy::DeployPhase::Deploying { .. }) => {
-                anim.switch_to(SequenceKind::Deploy);
+                anim.switch_to(SequenceKind::Deploy)
             }
             Some(crate::sim::deploy::DeployPhase::Undeploying { .. }) => {
-                anim.switch_to(SequenceKind::Undeploy);
+                anim.switch_to(SequenceKind::Undeploy)
             }
             Some(crate::sim::deploy::DeployPhase::Deployed) => {
-                if let Some(sequence) = pending_fire_sequence {
-                    anim.switch_to(sequence);
-                } else if anim.sequence != SequenceKind::DeployedFire {
+                if anim.sequence != SequenceKind::DeployedFire {
                     anim.switch_to(SequenceKind::Deployed);
                 }
             }
             None => {
-                let runtime_prone = entity
-                    .infantry
-                    .as_ref()
-                    .is_some_and(|infantry| infantry.is_prone);
-                if !matches!(anim.sequence, SequenceKind::Down | SequenceKind::Up) && runtime_prone
-                {
-                    if let Some(set) = seq_set {
-                        if let Some(sequence) = pending_fire_sequence {
-                            anim.switch_to(sequence);
-                        } else if has_movement {
-                            if set.get(&SequenceKind::Crawl).is_some() {
-                                anim.switch_to(SequenceKind::Crawl);
-                            }
-                        } else if !preserving_fire_action && set.get(&SequenceKind::Prone).is_some()
-                        {
-                            anim.switch_to(SequenceKind::Prone);
-                        }
-                    }
-                }
-                // Standard cascade for upright entities — preserved verbatim from prior logic.
-                if !matches!(anim.sequence, SequenceKind::Down | SequenceKind::Up)
-                    && !runtime_prone
-                    && has_movement
-                    && anim.sequence == SequenceKind::Stand
-                {
+                if has_movement && anim.sequence == SequenceKind::Stand {
                     anim.switch_to(SequenceKind::Walk);
-                } else if !matches!(anim.sequence, SequenceKind::Down | SequenceKind::Up)
-                    && !runtime_prone
-                    && !has_movement
+                } else if !has_movement
                     && matches!(anim.sequence, SequenceKind::Walk | SequenceKind::Crawl)
                 {
                     anim.switch_to(SequenceKind::Stand);
-                }
-                if !matches!(anim.sequence, SequenceKind::Down | SequenceKind::Up)
-                    && !runtime_prone
-                    && has_fire_action
-                    && !has_movement
-                {
-                    if let Some(sequence) = pending_fire_sequence {
-                        anim.switch_to(sequence);
-                    }
                 }
             }
         }
@@ -489,14 +469,8 @@ fn tick_animations_impl(
         }
 
         if let Some(next) = advance_animation(anim, def, game_options) {
-            // gamemd-derived: `InfantryClass::DoType_Sequencer` @ 0x00520AE0
-            // (0x00520CEB..0x00520D16) updates the completed action's facing
-            // before dispatching its next/default action.
             if let Some(facing) = def.completion_facing {
-                entity.facing = facing;
-                if let Some(body_facing) = entity.body_facing.as_mut() {
-                    body_facing.snap(u16::from(facing) << 8, binary_frame);
-                }
+                snap_completion_facing(&mut entity.body_facing, facing, binary_frame);
             }
             anim.switch_to(next);
         }
@@ -505,6 +479,7 @@ fn tick_animations_impl(
     dying_finished
 }
 
+#[cfg(test)]
 pub fn tick_animations(
     entities: &mut crate::sim::entity_store::EntityStore,
     sequences: &BTreeMap<String, SequenceSet>,
@@ -523,9 +498,22 @@ pub fn tick_animations(
     )
 }
 
+/// `InfantryClass::DoType_Sequencer @ 0x00520AE0` (`0x00520CEB..0x00520D16`):
+/// a completed action's facing hint turns the body before the next or default
+/// action, through `FacingClass::UpdateFacing` (`FacingClass::snap`).
+/// Takes the body facing, which the cascade borrows beside its animation.
+pub(crate) fn snap_completion_facing(
+    body_facing: &mut crate::sim::movement::FacingClass,
+    facing: u8,
+    binary_frame: u32,
+) {
+    body_facing.snap(u16::from(facing) << 8, binary_frame);
+}
+
 /// Advance only living entity animations. Dying animation completion is owned
 /// by that object's live scheduler turn so UnInit can compact the LogicVector
 /// before the scheduler cursor advances.
+///
 pub(crate) fn tick_non_dying_animations(
     entities: &mut crate::sim::entity_store::EntityStore,
     sequences: &BTreeMap<String, SequenceSet>,
@@ -579,18 +567,23 @@ const HARVEST_OVERLAY_FRAMES: u16 = 15;
 /// Cycles through the 15-frame oregath.shp animation for harvesters that are
 /// actively gathering ore. When not visible, the overlay is skipped.
 pub fn tick_harvest_overlays(entities: &mut crate::sim::entity_store::EntityStore) {
-    let keys: Vec<u64> = entities.keys_sorted();
-    for &id in &keys {
-        let Some(entity) = entities.get_mut(id) else {
-            continue;
-        };
-        let Some(overlay) = entity.harvest_overlay.as_mut() else {
-            continue;
-        };
-        if !overlay.visible {
-            continue;
-        }
-        overlay.elapsed_frames = 0;
+    // Find the advancing overlays by reading: every mutable hand-out enters
+    // the store's touch logs, and most entities have none.
+    let advancing: Vec<u64> = entities
+        .values()
+        .filter(|entity| {
+            entity
+                .harvest_overlay
+                .as_ref()
+                .is_some_and(|overlay| overlay.visible)
+        })
+        .map(|entity| entity.stable_id())
+        .collect();
+    for id in advancing {
+        let overlay = entities
+            .get_mut(id)
+            .and_then(|entity| entity.harvest_overlay.as_mut())
+            .expect("an advancing overlay was just read");
         overlay.frame = (overlay.frame + 1) % HARVEST_OVERLAY_FRAMES;
     }
 }
@@ -600,17 +593,22 @@ pub fn tick_harvest_overlays(entities: &mut crate::sim::entity_store::EntityStor
 /// Cycles through HVA frames for voxel entities that have `playing == true`.
 /// Frame wraps around to 0 when reaching frame_count (looping animation).
 pub fn tick_voxel_animations(entities: &mut crate::sim::entity_store::EntityStore) {
-    let keys: Vec<u64> = entities.keys_sorted();
-    for &id in &keys {
-        let Some(entity) = entities.get_mut(id) else {
-            continue;
-        };
-        let Some(anim) = entity.voxel_animation.as_mut() else {
-            continue;
-        };
-        if !anim.playing || anim.frame_count <= 1 || anim.frame_delay == 0 {
-            continue;
-        }
+    // Read first, as in `tick_harvest_overlays`.
+    let advancing: Vec<u64> = entities
+        .values()
+        .filter(|entity| {
+            entity
+                .voxel_animation
+                .as_ref()
+                .is_some_and(|anim| anim.playing && anim.frame_count > 1 && anim.frame_delay != 0)
+        })
+        .map(|entity| entity.stable_id())
+        .collect();
+    for id in advancing {
+        let anim = entities
+            .get_mut(id)
+            .and_then(|entity| entity.voxel_animation.as_mut())
+            .expect("an advancing voxel animation was just read");
         anim.elapsed_frames = anim.elapsed_frames.saturating_add(1);
         while anim.elapsed_frames >= anim.frame_delay {
             anim.elapsed_frames -= anim.frame_delay;

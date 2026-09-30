@@ -1,6 +1,6 @@
 //! Bridge instance emission — body, shadow, railings, deck-variant overrides.
 //!
-//! Reads `BridgeRuntimeCell` post-tick (NOT `OverlayGrid`) and emits sprite
+//! Reads live CellClass bridge fields post-tick (NOT `OverlayGrid`) and emits sprite
 //! instances for the bridge body, body shadow, and railing passes per the
 //! per-frame draw chain in `BRIDGE_DISPLAY_TABLE_GHIDRA_REPORT.md` §3.3, §3.4.
 //!
@@ -15,13 +15,13 @@ use std::collections::BTreeMap;
 
 use crate::app::AppState;
 use crate::map::lighting::{self, CellLightGrid};
+use crate::map::resolved_terrain::{ResolvedTerrainCell, ResolvedTerrainGrid};
 use crate::map::terrain::{self, TILE_HEIGHT, TILE_WIDTH};
 use crate::render::batch::SpriteInstance;
 use crate::render::bridge_atlas::{BridgeAtlasLookup, is_high_bridge_body_identity};
 use crate::render::bridge_railing_atlas::BridgeKind;
 use crate::render::draw_state::DrawState;
-use crate::sim::bridge_state::{Axis, BridgeRuntimeCell, BridgeRuntimeState, DamageState};
-use crate::sim::map::bridge_topology::CellBridgeView;
+use crate::sim::bridge_state::{Axis, DamageState, cell_render_state};
 
 use super::helpers::{apply_shape_z_adjust, compute_sprite_depth_params, in_view};
 
@@ -38,7 +38,7 @@ const BRIDGE_BODY_Y_OFFSET_STATE_0_TO_8: f32 = -16.0;
 /// This follows the state byte, not the flipped SHP frame range.
 const BRIDGE_BODY_Y_OFFSET_STATE_9_TO_17: f32 = -31.0;
 
-/// Bonus added to `cell.deck_level` before the depth calc for HasBridge cells.
+/// Bonus added to `cell.bridge_deck_level` before the depth calc for HasBridge cells.
 /// RE doc §3.3.1, ledger #6.
 const BRIDGE_HEIGHT_BONUS: u8 = 4;
 
@@ -55,6 +55,14 @@ pub const BRIDGE_SHADOW_EW_DX: i32 = -15;
 /// Shadow Y displacement on EW states 9..17. Verified -0x2D = +7
 /// (RE doc §3.3.2, ledger #10).
 pub const BRIDGE_SHADOW_EW_DY: i32 = 7;
+
+/// A cell that carries a bridge deck: the live 0x100 structural bit, or the
+/// map-derived deck of a cell no structural stamp owns (ordinary low bridges).
+fn bridge_deck_present(cell: &ResolvedTerrainCell) -> bool {
+    cell.bridge_facts.has_structural_bridge()
+        || (cell.has_bridge_deck
+            && cell.bridge_facts.family == crate::map::bridge_facts::BridgeStampFamily::None)
+}
 
 /// Translate a cell's `(damage_state, axis)` into the SHP frame index for
 /// `bridge.tem` / `bridgb.tem`.
@@ -128,7 +136,7 @@ fn bridge_body_z_adjust(depth_z: u8) -> f32 {
 }
 
 /// Build sprite instances for the bridge body pass (RE doc §3.3, Step 5
-/// pass 1). Reads `BridgeRuntimeCell.damage_state` post-tick.
+/// pass 1). Reads the live CellClass state byte post-tick.
 ///
 /// Takes only the fields the body builder actually needs from `AppState`
 /// so the function is exercisable in unit tests with a pure-data mock atlas
@@ -136,7 +144,7 @@ fn bridge_body_z_adjust(depth_z: u8) -> f32 {
 /// `&AppState` directly — same minimal-context refactor pending.
 #[allow(clippy::too_many_arguments)]
 pub fn build_bridge_body_instances_inner(
-    bridge_state: &BridgeRuntimeState,
+    terrain: &ResolvedTerrainGrid,
     atlas: &dyn BridgeAtlasLookup,
     overlay_names: &BTreeMap<u8, String>,
     height_map: &BTreeMap<(u16, u16), u8>,
@@ -149,18 +157,21 @@ pub fn build_bridge_body_instances_inner(
     sh: f32,
     out: &mut Vec<SpriteInstance>,
 ) {
-    for ((rx, ry), cell) in bridge_state.iter_cells() {
-        if !cell.deck_present {
+    for cell in terrain.iter() {
+        let (rx, ry) = (cell.rx, cell.ry);
+        if !bridge_deck_present(cell) {
             continue;
         }
-        let Some(render_state) = BridgeRuntimeState::effective_render_state(cell) else {
+        let Some((render_state, axis)) = cell_render_state(cell.bridge_facts) else {
             continue;
         };
-        let Some(axis) = cell.axis else { continue };
-        let Some(name) = overlay_names.get(&cell.overlay_byte) else {
+        let Some(overlay) = cell.bridge_facts.overlay_id else {
             continue;
         };
-        if !is_high_bridge_body_identity(cell.overlay_byte, name) {
+        let Some(name) = overlay_names.get(&overlay) else {
+            continue;
+        };
+        if !is_high_bridge_body_identity(overlay, name) {
             continue;
         }
 
@@ -170,7 +181,7 @@ pub fn build_bridge_body_instances_inner(
         let z: u8 = height_map
             .get(&(rx, ry))
             .copied()
-            .unwrap_or(cell.deck_level);
+            .unwrap_or(cell.bridge_deck_level);
         let (sx, sy) = terrain::iso_to_screen(rx, ry, z);
         let sy = sy + y_offset;
         if !in_view(sx, sy, 120.0, 120.0, cam_x, cam_y, sw, sh, 120.0) {
@@ -231,7 +242,7 @@ pub(crate) fn build_bridge_body_instances(
     else {
         return;
     };
-    let Some(bridge_state) = sim.bridge_state.as_ref() else {
+    let Some(terrain) = sim.resolved_terrain.as_ref() else {
         return;
     };
     let Some(atlas) = state.match_state.match_presentation.bridge_atlas.as_ref() else {
@@ -245,7 +256,7 @@ pub(crate) fn build_bridge_body_instances(
         .map(|g| (g.origin_y, g.world_height))
         .unwrap_or((0.0, 1.0));
     build_bridge_body_instances_inner(
-        bridge_state,
+        terrain,
         atlas,
         &state.match_state.match_presentation.overlay_names,
         &state.height_map(),
@@ -266,7 +277,7 @@ pub(crate) fn build_bridge_body_instances(
 /// ledger #9–10. Drawn passthrough (Z-test ON, Z-write OFF, neutral tint).
 #[allow(clippy::too_many_arguments)]
 fn build_bridge_shadow_instances_inner(
-    bridge_state: &BridgeRuntimeState,
+    terrain: &ResolvedTerrainGrid,
     atlas: &dyn BridgeAtlasLookup,
     overlay_names: &BTreeMap<u8, String>,
     height_map: &BTreeMap<(u16, u16), u8>,
@@ -278,18 +289,21 @@ fn build_bridge_shadow_instances_inner(
     sh: f32,
     out: &mut Vec<SpriteInstance>,
 ) {
-    for ((rx, ry), cell) in bridge_state.iter_cells() {
-        if !cell.deck_present {
+    for cell in terrain.iter() {
+        let (rx, ry) = (cell.rx, cell.ry);
+        if !bridge_deck_present(cell) {
             continue;
         }
-        let Some(render_state) = BridgeRuntimeState::effective_render_state(cell) else {
+        let Some((render_state, axis)) = cell_render_state(cell.bridge_facts) else {
             continue;
         };
-        let Some(axis) = cell.axis else { continue };
-        let Some(name) = overlay_names.get(&cell.overlay_byte) else {
+        let Some(overlay) = cell.bridge_facts.overlay_id else {
             continue;
         };
-        if !is_high_bridge_body_identity(cell.overlay_byte, name) {
+        let Some(name) = overlay_names.get(&overlay) else {
+            continue;
+        };
+        if !is_high_bridge_body_identity(overlay, name) {
             continue;
         }
 
@@ -305,7 +319,7 @@ fn build_bridge_shadow_instances_inner(
         let z: u8 = height_map
             .get(&(rx, ry))
             .copied()
-            .unwrap_or(cell.deck_level);
+            .unwrap_or(cell.bridge_deck_level);
         let (mut sx, mut sy) = terrain::iso_to_screen(rx, ry, z);
         sy += y_offset;
 
@@ -358,7 +372,7 @@ pub(crate) fn build_bridge_shadow_instances(
     else {
         return;
     };
-    let Some(bridge_state) = sim.bridge_state.as_ref() else {
+    let Some(terrain) = sim.resolved_terrain.as_ref() else {
         return;
     };
     let Some(atlas) = state.match_state.match_presentation.bridge_atlas.as_ref() else {
@@ -377,7 +391,7 @@ pub(crate) fn build_bridge_shadow_instances(
     );
     let height_map = state.height_map();
     build_bridge_shadow_instances_inner(
-        bridge_state,
+        terrain,
         atlas,
         &state.match_state.match_presentation.overlay_names,
         &height_map,
@@ -409,7 +423,7 @@ pub(crate) fn build_bridge_railing_instances(
     else {
         return;
     };
-    let Some(bridge_state) = sim.bridge_state.as_ref() else {
+    let Some(terrain) = sim.resolved_terrain.as_ref() else {
         return;
     };
     let Some(atlas) = state
@@ -432,8 +446,9 @@ pub(crate) fn build_bridge_railing_instances(
         state.match_state.input.camera_y,
     );
 
-    for ((rx, ry), cell) in bridge_state.iter_cells() {
-        if !cell.deck_present || BridgeRuntimeState::effective_render_state(cell).is_none() {
+    for cell in terrain.iter() {
+        let (rx, ry) = (cell.rx, cell.ry);
+        if !bridge_deck_present(cell) || cell_render_state(cell.bridge_facts).is_none() {
             continue;
         }
         let Some((kind, tile_index, caller_sub_tile)) =
@@ -449,7 +464,7 @@ pub(crate) fn build_bridge_railing_instances(
             .height_map()
             .get(&(rx, ry))
             .copied()
-            .unwrap_or(cell.deck_level);
+            .unwrap_or(cell.bridge_deck_level);
         let (sx, sy) = terrain::iso_to_screen(rx, ry, z);
         let final_x = sx + entry.dx as f32 + TILE_WIDTH / 2.0;
         let final_y = sy + entry.dy as f32 + TILE_HEIGHT / 2.0;
@@ -491,13 +506,13 @@ fn resolve_bridge_kind_and_sub_idx(
     state: &AppState,
     rx: u16,
     ry: u16,
-    cell: &BridgeRuntimeCell,
+    cell: &ResolvedTerrainCell,
 ) -> Option<(BridgeKind, i32, u8)> {
     let name = state
         .match_state
         .match_presentation
         .overlay_names
-        .get(&cell.overlay_byte)?
+        .get(&cell.bridge_facts.overlay_id?)?
         .to_ascii_uppercase();
     let kind = if matches!(
         name.as_str(),
@@ -515,92 +530,9 @@ fn resolve_bridge_kind_and_sub_idx(
     Some((kind, tile_index, caller_sub_tile))
 }
 
-/// Render-facing bridge draw-offset trait (Slice 3, L18).
-///
-/// This is the render-side counterpart to the sim `BridgeTopology` predicates:
-/// it reads the SAME borrowed `CellBridgeView` the sim service uses, but lives in
-/// the render/app layer so `sim/` never gains a render dependency (invariant #1).
-/// It is the single render entry that folds the scattered draw-offset constants
-/// (`BRIDGE_BODY_Y_OFFSET_*`, `BRIDGE_SHADOW_EW_*`) so the per-pass builders can
-/// migrate onto one source as consumers are routed through it.
-pub trait BridgeDrawOffset {
-    /// Per-cell body draw offset `(dx, dy)` relative to the cell's screen anchor.
-    ///
-    /// `state_byte` selects the body Y offset (states 0..=8 vs 9..=17). For the
-    /// EW family (states 9..=17) the NS/EW shadow shift `(DX, DY)` is folded in
-    /// on the X axis. The shadow DX is still open (-15 vs -45 per the const doc)
-    /// and is intentionally read from the single `BRIDGE_SHADOW_EW_DX` change
-    /// point rather than re-literal'd here.
-    fn bridge_draw_offset(&self, view: &CellBridgeView) -> (i32, i32);
-}
-
-/// The app-layer offset policy, applied over a `CellBridgeView`. Folds the
-/// `:34-48` constants behind the trait without changing the authoritative
-/// per-pass builders above (those migrate onto this in a later step).
-pub struct BridgeDrawOffsetPolicy;
-
-impl BridgeDrawOffset for BridgeDrawOffsetPolicy {
-    fn bridge_draw_offset(&self, view: &CellBridgeView) -> (i32, i32) {
-        // State byte 9..=17 is the EW family: extra body lift + the shadow shift.
-        // 0..=8 is the NS family: the base HasBridge lift only.
-        let (dx, dy) = if (9..=17).contains(&view.state_byte) {
-            (
-                BRIDGE_SHADOW_EW_DX,
-                BRIDGE_BODY_Y_OFFSET_STATE_9_TO_17 as i32 + BRIDGE_SHADOW_EW_DY,
-            )
-        } else {
-            (0, BRIDGE_BODY_Y_OFFSET_STATE_0_TO_8 as i32)
-        };
-        (dx, dy)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::map::bridge_facts::BridgeFlags;
-
-    /// Build a minimal view fixture pinned to a given bridge state byte.
-    fn view_with_state(state_byte: u8) -> CellBridgeView {
-        CellBridgeView {
-            level: 0,
-            flags: BridgeFlags(0),
-            ramp_byte: 0,
-            iso_tile_index: 0,
-            tube_index: None,
-            land_type: 0,
-            state_byte,
-        }
-    }
-
-    #[test]
-    fn bridge_draw_offset_ns_states_use_base_lift_no_shadow_shift() {
-        // NS family (states 0..=8): base HasBridge lift only, no X shift.
-        let policy = BridgeDrawOffsetPolicy;
-        for state in [0u8, 4, 8] {
-            let (dx, dy) = policy.bridge_draw_offset(&view_with_state(state));
-            assert_eq!(dx, 0, "NS family has no shadow X shift (state {state})");
-            assert_eq!(
-                dy, BRIDGE_BODY_Y_OFFSET_STATE_0_TO_8 as i32,
-                "state {state}"
-            );
-        }
-    }
-
-    #[test]
-    fn bridge_shadow_shift_ns_x_minus15_y_plus7() {
-        // EW family (states 9..=17): the shadow X shift is the single open
-        // `BRIDGE_SHADOW_EW_DX` change point (-15 vs -45 unresolved), and the Y
-        // folds the state-9..17 body lift plus `BRIDGE_SHADOW_EW_DY` (+7).
-        let policy = BridgeDrawOffsetPolicy;
-        let (dx, dy) = policy.bridge_draw_offset(&view_with_state(9));
-        assert_eq!(dx, BRIDGE_SHADOW_EW_DX);
-        assert_eq!(dx, -15, "DX defaults to -15 (open value)");
-        assert_eq!(
-            dy,
-            BRIDGE_BODY_Y_OFFSET_STATE_9_TO_17 as i32 + BRIDGE_SHADOW_EW_DY
-        );
-    }
 
     #[test]
     fn latin_square_value_at_xy() {
@@ -736,17 +668,32 @@ mod tests {
     /// Lives here (`presentation/instances/bridges.rs`) rather than under `sim/world/`
     /// because it imports render-layer types (`BridgeAtlasLookup`,
     /// `OverlaySpriteEntry`, `SpriteInstance`) and sim/ must never depend on
-    /// render/. The bridge state is built directly via `test_seed_cell` to
-    /// avoid pulling in any sim-test fixtures.
+    /// render/. The CellClass bridge fields are seeded directly to avoid
+    /// pulling in any sim-test fixtures.
+    /// Structural high-bridge deck cells at level 0 (deck level 4), each with
+    /// its CellClass +44 overlay and +11E state byte.
+    fn test_bridge_grid(cells: &[((u16, u16), u8, u8)]) -> ResolvedTerrainGrid {
+        let mut terrain = crate::map::resolved_terrain::test_grid(
+            8,
+            8,
+            crate::map::resolved_terrain::test_flat_cell,
+        );
+        for &((x, y), overlay, state) in cells {
+            let cell = terrain.cell_mut(x, y).unwrap();
+            cell.bridge_facts.raw_flags = crate::map::bridge_facts::BRIDGE_FLAG_STRUCTURAL;
+            cell.bridge_facts.overlay_id = Some(overlay);
+            cell.bridge_facts.state_byte = state;
+            cell.has_bridge_deck = true;
+            cell.bridge_deck_level = 4;
+        }
+        terrain
+    }
+
     #[test]
     fn gsi_13_09_body_builder_anchors_depth_to_canvas_top_and_applies_native_minus_two() {
         use crate::map::lighting::CellLightGrid;
         use crate::render::bridge_atlas::BridgeAtlasLookup;
         use crate::render::overlay_atlas::OverlaySpriteEntry;
-        use crate::sim::bridge_state::{
-            Axis, BridgeCellRole, BridgeRuntimeCell, BridgeRuntimeState, BridgeheadAnchorClass,
-            DamageState,
-        };
         use std::collections::BTreeMap;
 
         struct MockAtlas {
@@ -772,31 +719,9 @@ mod tests {
 
         // Seed three visible EW cells. Their 0xDC overlay byte is the render
         // authority and decodes as Damaged for all three through
-        // `effective_render_state`; (5,5) is the depth assertion target.
-        let mut bridge_state = BridgeRuntimeState::default();
-        for x in 4u16..=6 {
-            let damage_state = if x == 5 {
-                DamageState::Damaged
-            } else {
-                DamageState::Healthy { variant: 0 }
-            };
-            bridge_state.test_seed_cell(
-                x,
-                5,
-                BridgeRuntimeCell {
-                    deck_present: true,
-                    destroyable: true,
-                    deck_level: 4,
-                    bridge_group_id: Some(1),
-                    damage_state,
-                    axis: Some(Axis::EW),
-                    role: BridgeCellRole::Body,
-                    anchor_span_id: Some(1),
-                    overlay_byte: 0xDC,
-                    bridgehead_anchor_class: BridgeheadAnchorClass::Variant0,
-                },
-            );
-        }
+        // `cell_render_state`; the EW state bytes select the axis. (5,5) is
+        // the depth assertion target.
+        let terrain = test_bridge_grid(&[((4, 5), 0xDC, 9), ((5, 5), 0xDC, 15), ((6, 5), 0xDC, 9)]);
 
         // Mock atlas accepts the EW Damaged body frame: axis base 9 plus the
         // damaged local offset 6 gives frame 15.
@@ -829,7 +754,7 @@ mod tests {
         let mut out: Vec<crate::render::batch::SpriteInstance> = Vec::new();
         let world_height = 5000.0;
         build_bridge_body_instances_inner(
-            &bridge_state,
+            &terrain,
             &mock,
             &overlay_names,
             &height_map,
@@ -886,7 +811,6 @@ mod tests {
     fn startup_numeric_high_identity_emits_custom_named_body_and_shadow() {
         use crate::map::lighting::CellLightGrid;
         use crate::render::overlay_atlas::OverlaySpriteEntry;
-        use crate::sim::bridge_state::{BridgeCellRole, BridgeheadAnchorClass};
 
         struct MockAtlas {
             entry: OverlaySpriteEntry,
@@ -909,23 +833,8 @@ mod tests {
             }
         }
 
-        let mut bridge_state = BridgeRuntimeState::default();
-        bridge_state.test_seed_cell(
-            5,
-            5,
-            BridgeRuntimeCell {
-                deck_present: true,
-                destroyable: true,
-                deck_level: 4,
-                bridge_group_id: Some(1),
-                damage_state: DamageState::Healthy { variant: 1 },
-                axis: Some(Axis::NS),
-                role: BridgeCellRole::Body,
-                anchor_span_id: Some(1),
-                overlay_byte: 0x18,
-                bridgehead_anchor_class: BridgeheadAnchorClass::Variant0,
-            },
-        );
+        // Healthy NS variant 1 is state byte 1.
+        let terrain = test_bridge_grid(&[((5, 5), 0x18, 1)]);
         let atlas = MockAtlas {
             entry: OverlaySpriteEntry {
                 uv_origin: [0.0, 0.0],
@@ -946,7 +855,7 @@ mod tests {
         let mut shadows = Vec::new();
 
         build_bridge_body_instances_inner(
-            &bridge_state,
+            &terrain,
             &atlas,
             &overlay_names,
             &height_map,
@@ -960,7 +869,7 @@ mod tests {
             &mut bodies,
         );
         build_bridge_shadow_instances_inner(
-            &bridge_state,
+            &terrain,
             &atlas,
             &overlay_names,
             &height_map,

@@ -18,16 +18,23 @@
 //! - sim/ NEVER depends on render/, ui/, sidebar/, audio/, net/.
 
 pub(crate) mod base_defense_response;
+pub mod burst;
 pub(crate) mod cell_spread;
 pub(crate) mod combat_aoe;
 pub(crate) mod combat_fire_gate;
 pub(crate) mod combat_targeting;
 pub(crate) mod combat_weapon;
 pub(crate) mod damage;
-pub(crate) mod fire_decision;
+pub(crate) mod destruction_effects;
+pub(crate) mod detonation_anim;
+pub(crate) mod fire_coord;
+pub(crate) mod fire_error;
+pub(crate) mod fire_error_world;
+pub(crate) mod gattling;
 pub(crate) mod greatest_threat;
 pub(crate) mod in_range;
-mod inviso_scatter;
+pub(crate) mod inviso_scatter;
+mod object_health;
 #[cfg(test)]
 pub(crate) mod receiver_fixture;
 mod receiver_health;
@@ -36,10 +43,13 @@ pub(crate) use receiver_fixture::{
     BaseDefenseResponseTraceEntry, FixtureTrace, commit_area_damage_receivers,
     commit_damage_events, emit_projectile_detonations, handle_entity_deaths, resolve_attacker_fire,
     tick_combat, tick_combat_with_fog, tick_combat_with_fog_and_main_rng,
-    tick_combat_with_fog_and_main_rng_with_terrain_area,
 };
 pub(crate) mod line_of_fire;
+pub(crate) mod parasite;
+pub(crate) mod rof;
 pub mod smudge_dispatch;
+mod threat_mask;
+mod threat_posed;
 pub(crate) mod threat_range;
 pub(crate) mod veterancy;
 pub(crate) mod world_receiver;
@@ -76,18 +86,35 @@ mod combat_cloak_damage_tests;
 #[path = "delayed_building_fire_tests.rs"]
 mod delayed_building_fire_tests;
 
-use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+#[path = "prone_damage_tests.rs"]
+mod prone_damage_tests;
 
 #[cfg(test)]
-use crate::sim::miner::ResourceNode;
+mod bridge_cluster_tests;
+#[cfg(test)]
+mod bridge_launch_tests;
+#[cfg(test)]
+mod bridge_live_chain_tests;
+#[cfg(test)]
+#[path = "fireat_launch_tests.rs"]
+mod fireat_launch_tests;
 
-use self::combat_weapon::{WeaponSlot, select_weapon_against, select_weapon_slot};
+#[cfg(test)]
+mod ifv_fireat_tests;
+#[cfg(test)]
+#[path = "open_topped_fire_tests.rs"]
+mod open_topped_fire_tests;
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use self::combat_weapon::{WeaponSlot, select_weapon_against};
 use crate::map::entities::EntityCategory;
 use crate::map::houses::HouseAllianceMap;
 use crate::map::overlay_types::OverlayTypeRegistry;
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::rules::object_type::ObjectType;
-use crate::rules::ruleset::RuleSet;
+use crate::rules::ruleset::{HouseCostFactors, RuleSet};
 use crate::rules::warhead_type::WarheadType;
 use crate::rules::weapon_type::WeaponType;
 use crate::sim::bridge_state::BridgeDamageEvent;
@@ -98,10 +125,7 @@ use crate::sim::house_state::HouseState;
 use crate::sim::house_strategy::update_anger_nodes;
 use crate::sim::infantry;
 use crate::sim::intern::{InternedId, StringInterner};
-use crate::sim::map::bridge_topology::BRIDGE_DECK_HEIGHT_LEPTONS;
-use crate::sim::mission::authority::{
-    override_mission_on_damage_response, queue_entity_mission_deferred,
-};
+use crate::sim::mission::authority::queue_entity_mission_deferred;
 use crate::sim::mission::concrete_effects::represented_assign_target;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::overlay_grid::OverlayGrid;
@@ -111,7 +135,7 @@ use crate::sim::overlay_grid::WallMutation;
 use crate::sim::power_system::PowerState;
 use crate::sim::projectile::{
     ProjectileCollisionPolicy, ProjectileCoord, ProjectileDetonation, ProjectileGuidance,
-    ProjectilePayload, ProjectileSpawn, ProjectileTarget, ProjectileTrajectory, ProjectileVelocity,
+    ProjectilePayload, ProjectileSpawn, ProjectileTarget, ProjectileTrajectory,
     ProjectileVisualState, SpecialDetonationAction, SpecialDetonationFlags,
     SpecialDetonationTarget, TargetExpiryPolicy, projectile_next_cluster_coord,
     projectile_random_shrapnel_cell, projectile_shrapnel_count,
@@ -124,40 +148,14 @@ use crate::sim::terrain_object::TerrainAreaState;
 use crate::sim::vision::FogState;
 use crate::sim::wave::WaveDamageEvent;
 use crate::sim::world::{FireOriginSnapshot, SimFireEvent, SimSoundEvent};
-use crate::util::fixed_math::{SIM_ZERO, SimFixed, sim_to_i32};
-use crate::util::lepton::{LEPTONS_PER_LEVEL, ground_height_leptons};
+use crate::util::fixed_math::SimFixed;
+use crate::util::lepton::LEPTONS_PER_LEVEL;
 use crate::util::native_x87::{NativeF32Bits, NativeF64Bits, X87Chop53};
 
-use super::animation::SequenceKind;
-use super::game_entity::{GameEntity, PendingBuildingFire};
+use super::game_entity::GameEntity;
 use super::occupancy::OccupancyGrid;
 use super::production::foundation_dimensions;
-
-/// RA2 runs at 15 logical frames per second. ROF values are in frames.
-/// Radius in cells that RevealOnFire clears shroud around the fire location.
-const REVEAL_ON_FIRE_RADIUS: u16 = 3;
-/// Step size for selecting explosion anim from a warhead's AnimList: idx = damage / 25.
-/// The facing slack a firer is allowed before its shot is refused, in 16-bit
-/// facing units — 1/32 of a turn.
-///
-/// gamemd-derived: `UnitClass::GetFireError @ 0x00740FD0`, built at
-/// `0x007412C9`/`0x007412CC` and compared at `0x007412ED`/`0x007412EF`.
-const NATIVE_FIRE_FACING_TOLERANCE: i32 = 0x0800;
-
-/// The widened slack a HOMING weapon gets — 1/16 of a turn. Native builds the
-/// tolerance byte from the PROJECTILE's `ROT=` (`WeaponType+0xA0` →
-/// `BulletTypeClass+0x2DC`, read at `0x007412BC`) with
-/// `NEG`/`SBB`/`AND 8`/`ADD 8` at `0x007412C3`..`0x007412CC`: 8 when that ROT is
-/// zero, 0x10 when it is not, then `MOV CH,BL` shifts it into the high byte.
-const NATIVE_FIRE_FACING_TOLERANCE_HOMING: i32 = 0x1000;
-
-/// A voxel-turret BUILDING must match its target facing EXACTLY.
-/// `BuildingClass::GetFireError @ 0x00447F10` builds the same tolerance byte
-/// from `BuildingTypeClass+0x16C5` (`TurretAnimIsVoxel=`, read at `0x00448010`)
-/// but with `AND -8`, giving 0 for a voxel turret and 8 for an SHP one.
-const NATIVE_FIRE_FACING_TOLERANCE_VOXEL_TURRET: i32 = 0x0000;
-
-const ANIM_LIST_DAMAGE_STEP: u16 = 25;
+use crate::rules::animation_sequence::SequenceSet;
 
 /// One Unit's post-Foot Facing slot output for this tick — the write half of
 /// `UnitClass::Facing_Update @ 0x00736990` plus the `Fire_At_Target @
@@ -207,41 +205,49 @@ fn projectile_arm_delay(arm: i32, target: ProjectileTarget, entities: &EntitySto
     }
 }
 
-/// Explicitly classified delivery decision at weapon fire.
-///
-/// Unsupported projectile behaviors intentionally remain on the established
-/// immediate path until their own native trajectory contracts are ported.
+/// The BulletType facts FireAt and `BulletClass::Fire` read for one shot.
+/// Every shot is a bullet; an `Inviso=` one is placed at its target and
+/// detonates on its first AI visit (`Projectile` `fire_inviso`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProjectileDelivery {
-    Persistent {
-        arm_frames: i32,
-        tracks_target: bool,
-        collision: ProjectileCollisionPolicy,
-        ballistic: bool,
-        /// `Vertical=` (`BulletTypeClass+0x2C0`) selects the third
-        /// `BulletClass::AI` arm. Carries `DetonationAltitude=` (`+0x2BC`).
-        vertical: Option<i32>,
-        /// `BulletTypeClass::Acceleration` (`+0x2D0`), constructor default 3.
-        acceleration: i32,
-        /// `Inaccurate= && Arcing=` — the launch-time scatter gate at
-        /// `TechnoClass::FireAt 0x006FE67D`/`0x006FE68B`. `Some(true)` takes
-        /// the range-scaled flak arm, `Some(false)` the plain arm.
-        launch_scatter_is_flak: Option<bool>,
-        guidance: Option<ProjectileGuidance>,
-    },
-    Immediate(ImmediateProjectileReason),
+struct ProjectileDelivery {
+    arm_frames: i32,
+    tracks_target: bool,
+    collision: ProjectileCollisionPolicy,
+    ballistic: bool,
+    /// `Vertical=` (`BulletTypeClass+0x2C0`) selects the third
+    /// `BulletClass::AI` arm. Carries `DetonationAltitude=` (`+0x2BC`).
+    vertical: Option<i32>,
+    /// `BulletTypeClass::Acceleration` (`+0x2D0`), constructor default 3.
+    acceleration: i32,
+    /// `Inaccurate= && Arcing=` — the launch-time scatter gate at
+    /// `TechnoClass::FireAt 0x006FE67D`/`0x006FE68B`. `Some(true)` takes
+    /// the range-scaled flak arm, `Some(false)` the plain arm.
+    launch_scatter_is_flak: Option<bool>,
+    guidance: Option<ProjectileGuidance>,
+    /// `Inviso=` (`+0x29E`): `BulletClass::Fire` places the bullet on its
+    /// target with no speed (`0x004688B7..0x00468A39`).
+    inviso: bool,
 }
 
-/// The bounded lifecycle never silently treats an unsupported bullet as a
-/// straight ordinary shot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ImmediateProjectileReason {
-    NoProjectile,
-    MissingProjectileType,
-    Invisible,
+/// VERA-internal: a weapon naming no BulletType, or one that does not
+/// resolve, never occurs in retail rules (native would dereference NULL at
+/// `0x006FE55D`). Such a shot is fired as a default BulletType with
+/// `Inviso=yes`, so fixtures land in the firing frame like the small-arms shots
+/// they stand for; its detonation takes no scatter or cluster draws.
+fn missing_projectile_fallback() -> &'static crate::rules::projectile_type::ProjectileType {
+    static FALLBACK: std::sync::OnceLock<crate::rules::projectile_type::ProjectileType> =
+        std::sync::OnceLock::new();
+    FALLBACK.get_or_init(|| {
+        let ini = crate::rules::ini_parser::IniFile::from_str("[MissingBulletType]\nInviso=yes\n");
+        crate::rules::projectile_type::ProjectileType::from_ini_section(
+            "MissingBulletType",
+            ini.section("MissingBulletType").expect("fallback section"),
+            None,
+        )
+    })
 }
 
-/// Which delivery path a weapon's shot takes.
+/// The BulletType facts a weapon's shot is fired with, and its flight arm.
 ///
 /// gamemd-derived: `BulletClass::AI @ 0x004666E0` has exactly two branches,
 /// keyed on `ROT < 1`; the non-homing arm then splits on `Vertical` (`+0x2C0`).
@@ -274,35 +280,22 @@ enum ImmediateProjectileReason {
 /// - `Elasticity=` (`+0x2C8`) is live in the ARM B reflection block but has
 ///   zero stock projectile users (the `[PIECE]`/`[TIRE]` hits are VoxelAnims).
 ///
-/// RESIDUAL (GSI-08.07) — the second scatter site is not modelled, because one
-/// of its operands is unidentified. `BulletClass::Fire @ 0x004687B4` offsets an
-/// `Inviso && FlakScatter` bullet's already-resolved target coordinate, drawing
-/// `Random__RandomRanged(0, RulesClass+0x1734 << 1)` for the magnitude and
-/// `Random__RandomRanged(0, 0x7FFFFFFE)` for the angle. **The blocker is the
-/// divisor.** The magnitude is `(roll * ftol(dist)) / *(*(Bullet+0x130) + 0xB4)`
-/// — `0x004687D9 IMUL ESI,EAX`, `0x004687DC MOV ECX,[EBX+0x130]`,
-/// `0x004687E5 IDIV dword ptr [ECX+0xB4]` — and neither `Bullet+0x130`'s
-/// referent nor its `+0xB4` field has been identified, so the offset cannot be
-/// computed at all today. It is NOT the weapon `Range=`; an earlier note here
-/// said so and was wrong.
-///
-/// Two facts for whoever implements it. First, the site OFFSETS, walked in
-/// assembly this session: `0x00468884 CALL Math__CosFromTable / 0x00468889 FMUL
-/// <mag> / 0x00468890 FIADD dword ptr [ESP+0x44]` and `0x00468864 CALL
-/// Math__SinFromTable / 0x00468869 FMUL <mag> / 0x0046886D FSUBR double ptr
-/// [ESP+0x38]` — `x += cos(theta)*mag`, `y -= sin(theta)*mag`, the same shape as
-/// the verified launch site at `0x006FE7E5`/`0x006FE7C0`. The decompiler renders
-/// it as a plain assignment (the dropped-`FIADD` artifact that made the mapping
-/// ledger wrong at the launch site); do not follow that rendering. Second, VERA
-/// resolves an `Inviso` shot on the immediate path, where the impact coordinate
-/// feeds area damage, wall routing, bridge damage, radiation and animation
-/// placement, so wiring the offset in touches all of those consumers.
+/// RESIDUAL (GSI-08.07) — the second scatter site is not ported.
+/// `BulletClass::Fire @ 0x0046874E..0x004688A9` offsets an
+/// `Inviso && FlakScatter` bullet's placement before the Inviso body
+/// ([`crate::sim::projectile::ProjectileStore::fire_inviso`]): magnitude
+/// `(RandomRanged(0, RulesClass+0x1734 << 1) * ftol(dist)) / Range`, angle
+/// `RandomRanged(0, 0x7FFFFFFE)`, then `x += cos*mag`, `y -= sin*mag`
+/// (`0x00468864..0x00468890`, the launch site's shape at
+/// `0x006FE7E5`/`0x006FE7C0`; the decompiler drops the `FIADD`). The divisor
+/// is the weapon's `Range=` in leptons: `Bullet+0x130` is the WeaponType
+/// FireAt installs through `SetWeaponType @ 0x0046B260` (`0x006FE573`), and
+/// WeaponType `+0xB4` is `Range=` (`ReadRange` at `0x00772336`). The x87
+/// distance, magnitude and angle conversion want a native oracle first.
 ///
 /// Trigger: every Flak Cannon / Flak Track shot at an aircraft (`[FlakProj]`,
-/// 6 weapons). Player effect: flak never misses — the miss distance itself is
-/// not yet derivable. Frequency: any skirmish with air units. Downstream risk:
-/// two Scenario RNG draws are missing from that path, so the draw sequence
-/// differs from native for those six weapons.
+/// 6 weapons). Player effect: flak never misses. Frequency: any skirmish with
+/// air units. Downstream risk: two Scenario RNG draws are missing per shot.
 ///
 /// Ordinary `ROT < 1, Vertical = no` AI subtracts gravity every visit
 /// (467402..467429), independently of `Arcing`. Production gives all such
@@ -313,20 +306,17 @@ fn classify_projectile_delivery(
     weapon: &crate::rules::weapon_type::WeaponType,
     rules: &RuleSet,
 ) -> ProjectileDelivery {
-    let Some(projectile_id) = weapon.projectile.as_deref() else {
-        return ProjectileDelivery::Immediate(ImmediateProjectileReason::NoProjectile);
-    };
-    let Some(projectile) = rules.projectile(projectile_id) else {
-        return ProjectileDelivery::Immediate(ImmediateProjectileReason::MissingProjectileType);
-    };
-    if projectile.inviso {
-        return ProjectileDelivery::Immediate(ImmediateProjectileReason::Invisible);
-    }
+    let projectile = weapon
+        .projectile
+        .as_deref()
+        .and_then(|projectile_id| rules.projectile(projectile_id))
+        .unwrap_or_else(|| missing_projectile_fallback());
     // `BulletClass::AI @ 0x004666E0` selects an arm exactly twice: `ROT < 1` at
     // `0x004668D1`, then `Vertical` (`+0x2C0`) at `0x004671D0`. Nothing else
     // participates.
     let ballistic = projectile.arcing;
-    ProjectileDelivery::Persistent {
+    ProjectileDelivery {
+        inviso: projectile.inviso,
         arm_frames: projectile.arm,
         tracks_target: projectile.rot > 0,
         collision: ProjectileCollisionPolicy {
@@ -341,6 +331,7 @@ fn classify_projectile_delivery(
             inaccurate: projectile.inaccurate,
             floater: projectile.floater,
             elasticity_bits: projectile.elasticity.to_bits(),
+            arcing: projectile.arcing,
         },
         ballistic,
         vertical: projectile
@@ -354,21 +345,17 @@ fn classify_projectile_delivery(
             .then_some(projectile.flak_scatter && !projectile.inviso),
         guidance: (projectile.rot > 0).then_some(ProjectileGuidance {
             rot: projectile.rot,
-            missile_rot_var: rules.general.missile_rot_var,
-            course_lock_duration: projectile
-                .course_lock_duration
-                .clamp(0, i32::from(u16::MAX)) as u16,
-            // The RE contract proves this is BulletClass-identity-derived but
-            // not its formula. Keep the raw phase as an explicit live seam.
-            sidewinder_phase: 0,
+            missile_rot_var: crate::util::native_x87::NativeF64Bits::from_bits(
+                rules.general.missile_rot_var.to_bits(),
+            ),
+            course_lock_duration: projectile.course_lock_duration,
+            course_frames: 0,
+            course_locked: true,
             airburst: projectile.airburst,
             inaccurate: projectile.inaccurate,
             very_high: projectile.very_high,
             level: projectile.level,
-            // Replaced at construction with the launch facing.
-            heading_bam: 0,
-            frames_elapsed: 0,
-            max_speed: weapon.speed.clamp(0, i32::from(u16::MAX)) as u16,
+            max_speed: weapon.speed,
             acceleration: projectile.acceleration,
             // Replaced at construction with the launch-time target coord.
             fuse_reference: ProjectileCoord::new(0, 0, 0),
@@ -394,15 +381,14 @@ mod projectile_delivery_tests {
         );
         let rules = RuleSet::from_ini(&ini).expect("projectile fixture parses");
 
-        for weapon_name in ["ProxGun", "CliffGun"] {
+        // Only ROT picks the homing arm; Proximity= and SubjectToCliffs= pick
+        // no flight arm at all.
+        for (weapon_name, homing) in [("ProxGun", true), ("CliffGun", false)] {
             let weapon = rules.weapon(weapon_name).expect("weapon");
-            assert!(
-                matches!(
-                    classify_projectile_delivery(weapon, &rules),
-                    ProjectileDelivery::Persistent { .. }
-                ),
-                "{weapon_name} must stay on the tracked path"
-            );
+            let delivery = classify_projectile_delivery(weapon, &rules);
+            assert_eq!(delivery.tracks_target, homing, "{weapon_name}");
+            assert_eq!(delivery.vertical, None, "{weapon_name}");
+            assert!(!delivery.inviso, "{weapon_name}");
         }
     }
 
@@ -416,7 +402,8 @@ mod projectile_delivery_tests {
 
         assert_eq!(
             classify_projectile_delivery(weapon, &rules),
-            ProjectileDelivery::Persistent {
+            ProjectileDelivery {
+                inviso: false,
                 arm_frames: 0,
                 tracks_target: false,
                 collision: ProjectileCollisionPolicy {
@@ -456,21 +443,19 @@ mod projectile_delivery_tests {
              [WH]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
         );
         let rules = RuleSet::from_ini(&ini).expect("projectile fixture parses");
-        for weapon_name in ["W0", "W1", "W2", "W3"] {
+        // Bouncy=, Degenerates=, Inaccurate=/FlakScatter= and Dropping= select
+        // no flight arm: ROT alone does.
+        for (weapon_name, homing) in [("W0", false), ("W1", false), ("W2", false), ("W3", true)] {
             let weapon = rules.weapon(weapon_name).expect("weapon");
-            assert!(
-                matches!(
-                    classify_projectile_delivery(weapon, &rules),
-                    ProjectileDelivery::Persistent { .. }
-                ),
-                "{weapon_name} must stay on the tracked path"
-            );
+            let delivery = classify_projectile_delivery(weapon, &rules);
+            assert_eq!(delivery.tracks_target, homing, "{weapon_name}");
+            assert_eq!(delivery.vertical, None, "{weapon_name}");
         }
         // The flak arm is only selected when `FlakScatter && !Inviso`.
         let flak = rules.weapon("W2").expect("weapon");
         assert!(matches!(
             classify_projectile_delivery(flak, &rules),
-            ProjectileDelivery::Persistent {
+            ProjectileDelivery {
                 launch_scatter_is_flak: Some(true),
                 ..
             }
@@ -479,7 +464,7 @@ mod projectile_delivery_tests {
         let bouncy = rules.weapon("W0").expect("weapon");
         assert!(matches!(
             classify_projectile_delivery(bouncy, &rules),
-            ProjectileDelivery::Persistent {
+            ProjectileDelivery {
                 ballistic: true,
                 launch_scatter_is_flak: None,
                 ..
@@ -501,7 +486,7 @@ mod projectile_delivery_tests {
         let weapon = rules.weapon("NUKE").expect("weapon");
         assert!(matches!(
             classify_projectile_delivery(weapon, &rules),
-            ProjectileDelivery::Persistent {
+            ProjectileDelivery {
                 vertical: Some(20000),
                 acceleration: 1,
                 arm_frames: 2,
@@ -511,14 +496,6 @@ mod projectile_delivery_tests {
             }
         ));
     }
-}
-
-/// A cell area to reveal due to a RevealOnFire weapon firing.
-pub struct RevealEvent {
-    pub owner: InternedId,
-    pub rx: u16,
-    pub ry: u16,
-    pub radius: u16,
 }
 
 /// Armor type name → Verses index mapping.
@@ -547,27 +524,6 @@ pub fn armor_index(armor: &str) -> usize {
     ARMOR_NAMES.iter().position(|&a| a == lower).unwrap_or(0)
 }
 
-/// Combat-only target category used for projectile AA/AG legality and weapon
-/// selection.
-///
-/// `ConsideredAircraft=yes` infantry, such as Rocketeers/JumpJets, remain
-/// infantry entities for movement, selection, crush, and animation, but weapon
-/// selection must treat them as air targets.
-pub(crate) fn combat_target_category(
-    entity: &GameEntity,
-    rules: &RuleSet,
-    interner: &StringInterner,
-) -> EntityCategory {
-    if rules
-        .object(interner.resolve(entity.type_ref()))
-        .is_some_and(|obj| obj.considered_aircraft)
-    {
-        EntityCategory::Aircraft
-    } else {
-        entity.category
-    }
-}
-
 /// Return the active wall-overlay flags at a cell, if available.
 fn wall_overlay_flags_at<'a>(
     overlay_grid: Option<&OverlayGrid>,
@@ -591,12 +547,20 @@ fn warhead_damages_wall(
     warhead.wall || warhead.wall_absolute_destroyer || (warhead.wood && wall_flags.armor_is_wood)
 }
 
-fn infantry_prone_area_raw_damage(
+/// InfantryClass::ReceiveDamage's prone head (`0x00517FC1..0x00517FEF`): a
+/// prone infantryman's positive raw damage, unless defenses are ignored,
+/// becomes `ftol(fild damage * fmul qword [warhead+0xF8])`, at least 1.
+/// Math__ftol (`0x007C5F00`) stores a qword and the head keeps EAX, so a
+/// product beyond 32 bits wraps before the clamp, and an infinite product
+/// (`1e39%`) converts to the indefinite qword, whose low dword 0 the clamp
+/// makes 1. Native rows: tools/rules_oracle/read_double_percent (group B).
+fn infantry_prone_raw_damage(
     target: &GameEntity,
     warhead: &WarheadType,
     damage: i32,
     ignore_defenses: bool,
 ) -> i32 {
+    use crate::util::native_x87::MaskedX87Chop53 as X87;
     if target.category != EntityCategory::Infantry
         || !infantry::is_prone_for_damage(target)
         || damage <= 0
@@ -604,22 +568,8 @@ fn infantry_prone_area_raw_damage(
     {
         return damage;
     }
-
-    let Ok(multiplier) =
-        X87Chop53::load_f64(NativeF64Bits::from_bits(warhead.prone_damage_f64.to_bits()))
-    else {
-        // FISTP's native indefinite result is negative and the wrapper's
-        // immediate minimum-one clamp therefore converts it to one.
-        return 1;
-    };
-    let product = X87Chop53::mul(X87Chop53::load_i32(damage), multiplier);
-    let scaled = X87Chop53::ftol_i64(product)
-        .ok()
-        .and_then(|value| i32::try_from(value).ok())
-        // A native out-of-range FISTP yields the signed indefinite value,
-        // which the immediately following minimum-one clamp replaces with 1.
-        .unwrap_or(i32::MIN);
-    scaled.max(1)
+    let multiplier = X87::load_f64(NativeF64Bits::from_bits(warhead.prone_damage_f64.to_bits()));
+    X87::ftol_i32_low_masked(X87::mul(X87::load_i32(damage), multiplier)).max(1)
 }
 
 /// What an `AttackTarget` is pointing at — an entity or a ground cell.
@@ -635,8 +585,8 @@ pub enum TargetKind {
 }
 
 /// Sentinel attacker id for sourceless damage (the radiation field). Stable
-/// entity ids start at 1, so 0 is never a live attacker; retaliation treats
-/// it as "attacker gone" and the last-attacker bookkeeping skips it.
+/// entity ids start at 1, so 0 is never a live attacker; the receiver asks no
+/// retaliation for it.
 pub(crate) const RAD_NO_ATTACKER: u64 = 0;
 
 /// The two receiver booleans carried by one native concrete `ReceiveDamage`
@@ -734,89 +684,74 @@ impl EntityDamageEvent {
     }
 }
 
-/// Infantry shot waiting for its current fire animation to reach the discharge frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct PendingInfantryFire {
-    /// Fire sequence started when the shot was accepted.
-    pub sequence: SequenceKind,
-    /// Animation frame index that spawns the projectile/damage.
-    pub fire_frame: u16,
-}
-
 /// Component: this entity is attacking a specific target.
 ///
-/// Attached by `issue_attack_command()` (entity targets) or
-/// `issue_attack_cell_command()` (cell targets). The combat system fires the
-/// attacker's weapon at the resolved target each tick. Supports burst firing:
-/// multiple rapid shots per attack cycle, with ROF cooldown only after
-/// the full burst completes.
+/// Installed by the concrete target authority for entity or cell targets.
+/// The combat system fires the
+/// attacker's weapon at the resolved target each tick. The reload between
+/// shots is the object's own `GameEntity::rearm_timer`, not the target's.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AttackTarget {
     /// What this attacker is firing at: an entity or a ground cell (force-fire).
     pub target: TargetKind,
-    /// Simulation ticks remaining before the next shot (ROF cooldown).
-    pub cooldown_ticks: u16,
-    /// Shots remaining in the current burst. When this reaches 0, ROF cooldown starts.
-    pub burst_remaining: u8,
-    /// Ticks between individual burst shots (short inter-shot delay).
-    pub burst_delay_ticks: u8,
-    /// Infantry-only delayed shot latch. `None` for vehicles/buildings/aircraft.
-    #[serde(default)]
-    pub pending_infantry_fire: Option<PendingInfantryFire>,
 }
 
-/// The inclusive bounds of the mid-burst delay draw.
-///
-/// gamemd-derived: `TechnoClass::GetROF @ 0x006FCFA0` — the mid-burst branch
-/// (`burst index < Burst=`) returns `Random::RandomRanged(3, 5)`.
-const BURST_INTER_SHOT_DELAY_MIN: i32 = 3;
-const BURST_INTER_SHOT_DELAY_MAX: i32 = 5;
-
-fn infantry_fire_sequence(
-    obj: &ObjectType,
-    weapon_slot: WeaponSlot,
+/// Infantry52083E..520904: deployment uses actual Doing27..30; secondary
+/// action availability is its signed native count, never a discharge-frame
+/// comparison. Jumpjet's earlier class arm is resolved by the live caller.
+fn infantry_fire_action(
+    sequences: Option<&SequenceSet>,
+    weapon_index: i32,
     is_prone: bool,
-    is_fully_deployed: bool,
-) -> SequenceKind {
-    if is_fully_deployed {
-        return SequenceKind::DeployedFire;
+    deploying: bool,
+) -> i32 {
+    if deploying {
+        return 29;
     }
-    match (weapon_slot, is_prone) {
-        (WeaponSlot::Primary, true) => SequenceKind::FireProne,
-        (WeaponSlot::Primary, false) => SequenceKind::Attack,
-        (WeaponSlot::Secondary, true) if obj.secondary_prone_frame != obj.fire_up_frame => {
-            SequenceKind::SecondaryProne
+    let has = |action| {
+        sequences
+            .and_then(|set| set.infantry_action(action))
+            .is_some_and(|record| record.frames_per_facing != 0)
+    };
+    if weapon_index != 0 {
+        if is_prone && has(41) {
+            return 41;
         }
-        (WeaponSlot::Secondary, false) if obj.secondary_fire_frame != obj.fire_up_frame => {
-            SequenceKind::SecondaryFire
+        if has(40) {
+            return 40;
         }
-        _ => SequenceKind::Attack,
     }
+    if is_prone { 8 } else { 4 }
 }
 
+/// Infantry52094C..5209A0: signed live type fields; a deployed action does
+/// not imply prone. An absent secondary sequence falls back to the matching
+/// primary discharge frame, independently of action admission.
 fn infantry_fire_frame(
     obj: &ObjectType,
-    weapon_slot: WeaponSlot,
+    sequences: Option<&SequenceSet>,
+    weapon_index: i32,
     is_prone: bool,
-    is_fully_deployed: bool,
-) -> u16 {
-    let frame = match (weapon_slot, is_prone || is_fully_deployed) {
-        (WeaponSlot::Primary, false) => obj.fire_up_frame,
-        (WeaponSlot::Primary, true) => obj.fire_prone_frame,
-        (WeaponSlot::Secondary, false) => obj.secondary_fire_frame,
-        (WeaponSlot::Secondary, true) => obj.secondary_prone_frame,
-    };
-    frame as u16
-}
-
-fn infantry_idle_sequence(is_prone: bool, is_fully_deployed: bool) -> SequenceKind {
-    if is_fully_deployed {
-        SequenceKind::Deployed
-    } else if is_prone {
-        SequenceKind::Prone
+) -> i32 {
+    let mut frame = if is_prone {
+        obj.fire_prone_frame as i32
     } else {
-        SequenceKind::Stand
+        obj.fire_up_frame as i32
+    };
+    if weapon_index != 0 {
+        let action = if is_prone { 41 } else { 40 };
+        if sequences
+            .and_then(|set| set.infantry_action(action))
+            .is_some_and(|record| record.frames_per_facing != 0)
+        {
+            frame = if is_prone {
+                obj.secondary_prone_frame as i32
+            } else {
+                obj.secondary_fire_frame as i32
+            };
+        }
     }
+    frame
 }
 
 impl AttackTarget {
@@ -824,10 +759,6 @@ impl AttackTarget {
     pub fn new(target_stable_id: u64) -> Self {
         Self {
             target: TargetKind::Entity(target_stable_id),
-            cooldown_ticks: 0,
-            burst_remaining: 0,
-            burst_delay_ticks: 0,
-            pending_infantry_fire: None,
         }
     }
 
@@ -835,53 +766,24 @@ impl AttackTarget {
     pub fn for_cell(rx: u16, ry: u16) -> Self {
         Self {
             target: TargetKind::Cell(rx, ry),
-            cooldown_ticks: 0,
-            burst_remaining: 0,
-            burst_delay_ticks: 0,
-            pending_infantry_fire: None,
         }
     }
 }
 
-/// Compute the effective target coordinates for an entity.
+/// An entity's GetCoords XY ([`object_center_xy`]) as a cell and in-cell
+/// leptons: a structure's foundation centre, any other object's Location.
+/// Callers which consume stored Location rather than this virtual point keep
+/// that distinction.
 ///
-/// For structures, returns the **foundation center** instead of the raw
-/// position (NW corner cell center):
-///   X = Location.X + (foundationWidth  - 1) * 128
-///   Y = Location.Y + (foundationHeight - 1) * 128
-///
-/// The vanilla game has bugs where some code paths use raw Location (NW corner)
-/// instead of foundation center — e.g. Destroyers mis-targeting Naval Yards
-/// from certain angles (Phobos bugfix at 0x70BCE6). We fix this from the start.
-fn target_coords(
-    entity: &GameEntity,
-    rules: Option<&RuleSet>,
-    interner: &StringInterner,
-) -> (u16, u16, SimFixed, SimFixed) {
-    let mut rx = entity.position.rx;
-    let mut ry = entity.position.ry;
-    let mut sub_x = entity.position.sub_x;
-    let mut sub_y = entity.position.sub_y;
-
-    if entity.category == EntityCategory::Structure {
-        if let Some(obj) = rules.and_then(|r| r.object(interner.resolve(entity.type_ref()))) {
-            let (fw, fh) = foundation_dimensions(&obj.foundation);
-            // Shift from NW corner cell center to foundation geometric center.
-            // (fw-1)*128 leptons in X, (fh-1)*128 leptons in Y.
-            // sub_x/sub_y may exceed 256 — lepton_distance_sq_raw handles
-            // this correctly since it computes cell*256+sub as a flat value.
-            let offset_x = (fw.saturating_sub(1) as i32) * 128;
-            let offset_y = (fh.saturating_sub(1) as i32) * 128;
-            let full_x: i32 = rx as i32 * 256 + sub_x.to_num::<i32>() + offset_x;
-            let full_y: i32 = ry as i32 * 256 + sub_y.to_num::<i32>() + offset_y;
-            rx = (full_x / 256) as u16;
-            ry = (full_y / 256) as u16;
-            sub_x = SimFixed::from_num(full_x % 256);
-            sub_y = SimFixed::from_num(full_y % 256);
-        }
-    }
-
-    (rx, ry, sub_x, sub_y)
+/// [`object_center_xy`]: crate::sim::movement::ground_pose::object_center_xy
+fn target_coords(entity: &GameEntity) -> (u16, u16, SimFixed, SimFixed) {
+    let [x, y] = crate::sim::movement::ground_pose::object_center_xy(entity);
+    (
+        (x / 256) as u16,
+        (y / 256) as u16,
+        SimFixed::from_num(x % 256),
+        SimFixed::from_num(y % 256),
+    )
 }
 
 /// Compute lepton-precise coordinates for a cell target (force-fire on terrain).
@@ -905,22 +807,58 @@ fn cell_center_coords(rx: u16, ry: u16) -> (u16, u16, SimFixed, SimFixed) {
 pub(crate) fn resolve_target_coords(
     target: &TargetKind,
     entities: &EntityStore,
-    rules: Option<&RuleSet>,
-    interner: &StringInterner,
 ) -> Option<(u16, u16, SimFixed, SimFixed)> {
     match *target {
-        TargetKind::Entity(id) => entities.get(id).map(|t| target_coords(t, rules, interner)),
+        TargetKind::Entity(id) => entities.get(id).map(target_coords),
         TargetKind::Cell(rx, ry) => Some(cell_center_coords(rx, ry)),
     }
+}
+
+/// ObjectClass::Distance_To5F6440: planar GetCoords distance, then the target
+/// building's (foundation width + height)*64 discount, clamped to zero. This
+/// differs from the weapon CanFireAt/InRange gate and has no altitude bonus.
+/// Reuse the coordinate projection and deterministic native sqrt owner: exact
+/// integer sqrt changes observable lepton ties (1281 becomes1280 natively).
+/// Native comparisons: tools/spatial_oracle/aircraft_approach_range.{py,json}.
+/// The discount reads the same stamped foundation as the target's GetCoords.
+pub(crate) fn object_distance_to(
+    source: &GameEntity,
+    target: &TargetKind,
+    entities: &EntityStore,
+) -> Option<i32> {
+    let planar = |(rx, ry, sx, sy): (u16, u16, SimFixed, SimFixed)| {
+        [
+            i32::from(rx) * 256 + sx.to_num::<i32>(),
+            i32::from(ry) * 256 + sy.to_num::<i32>(),
+            0,
+        ]
+    };
+    let from = planar(target_coords(source));
+    let to = planar(resolve_target_coords(target, entities)?);
+    let distance = crate::util::native_x87::distance_3d_leptons(from, to);
+    if let TargetKind::Entity(id) = *target
+        && let Some(building) = entities.get(id)
+        && building.category == EntityCategory::Structure
+    {
+        let (width, height) = foundation_dimensions(&building.foundation);
+        // Height query45ECA0 receives false: Bib never adds to this discount.
+        return Some(
+            distance
+                .wrapping_sub((i32::from(width) + i32::from(height)) * 64)
+                .max(0),
+        );
+    }
+    Some(distance)
 }
 
 /// Whether the attacker's normally selected weapon can currently reach this
 /// target through the authoritative 3D `InRange` path.
 ///
 /// gamemd-derived: SpawnManager mode 0 in `SpawnManagerClass::AI` @
-/// `0x006B7230` calls the Unit owner's `TechnoClass::CanFireAtTarget` vslot,
-/// which dispatches through weapon selection @ `0x006F7780`, `CanFireAt` @
-/// `0x006F77B0`, and ordinary `TechnoClass::InRange` @ `0x006F7220`.
+/// `0x006B7230` calls the Unit owner's `TechnoClass::CanFireAtTarget` vslot
+/// `0x006F7780`, which is `CanFireAt(target, SelectWeapon(target))`
+/// (`0x006F77B0`) and ordinary `TechnoClass::InRange` @ `0x006F7220`. It asks
+/// no legality: a target the weapon may not fire at is still in range.
 pub(crate) fn can_fire_at_target(
     entities: &EntityStore,
     rules: &RuleSet,
@@ -937,12 +875,12 @@ pub(crate) fn can_fire_at_target(
     let Some(attacker_obj) = rules.object(interner.resolve(attacker.type_ref())) else {
         return false;
     };
-    let Some(selected) = select_weapon_against(
+    let Some((_, Some(selected))) = select_weapon_against(
         rules,
         attacker_obj,
         &combat_weapon::attacker_facts(attacker, attacker_obj),
         attacker.owner(),
-        target,
+        Some(target),
         entities,
         interner,
         Some(terrain),
@@ -950,9 +888,14 @@ pub(crate) fn can_fire_at_target(
     ) else {
         return false;
     };
-    let Some(source) =
-        in_range::fire_source_coords(attacker, target, selected.weapon, entities, terrain)
-    else {
+    let Some(source) = in_range::fire_source_coords(
+        attacker,
+        target,
+        selected.weapon,
+        entities,
+        terrain,
+        (rules, interner),
+    ) else {
         return false;
     };
     in_range::compute_in_range(
@@ -974,9 +917,11 @@ pub(crate) fn can_fire_at_target(
 /// Uses the same weapon-select inputs as the combat tick's Phase 2 weapon
 /// selection so pursuit and combat agree on "in range" at the boundary.
 ///
-/// Returns `None` if the selected weapon cannot legally fire at the target
-/// (GetFireError targeting subset). Pursuit treats `None` as "skip — combat
-/// tick will drop the attack on its own weapon-select fail."
+/// Returns `None` only when the selected slot names no weapon. Legality is
+/// not asked: `FootClass::Approach_Target @ 0x004D5690` selects (`0x004D56CA`)
+/// and measures with CanFireAt without GetFireError. The fire routine asks
+/// GetFireError itself, and `TechnoClass::AI`'s 16-frame check drops an
+/// ILLEGAL or CANT target (a building drops it at once).
 pub(crate) fn pursuit_selected_weapon<'a>(
     entity: &GameEntity,
     target: &TargetKind,
@@ -986,19 +931,36 @@ pub(crate) fn pursuit_selected_weapon<'a>(
     terrain: Option<&ResolvedTerrainGrid>,
     alliances: Option<&HouseAllianceMap>,
 ) -> Option<&'a WeaponType> {
+    pursuit_selection(
+        entity, target, entities, rules, interner, terrain, alliances,
+    )
+    .map(|selected| selected.weapon)
+}
+
+/// [`pursuit_selected_weapon`]'s whole selection, native weapon index
+/// included.
+pub(crate) fn pursuit_selection<'a>(
+    entity: &GameEntity,
+    target: &TargetKind,
+    entities: &EntityStore,
+    rules: &'a RuleSet,
+    interner: &StringInterner,
+    terrain: Option<&ResolvedTerrainGrid>,
+    alliances: Option<&HouseAllianceMap>,
+) -> Option<combat_weapon::SelectedWeapon<'a>> {
     let attacker_obj = rules.object(interner.resolve(entity.type_ref()))?;
-    let selected = select_weapon_against(
+    select_weapon_against(
         rules,
         attacker_obj,
         &combat_weapon::attacker_facts(entity, attacker_obj),
         entity.owner(),
-        target,
+        Some(target),
         entities,
         interner,
         terrain,
         alliances,
-    )?;
-    Some(selected.weapon)
+    )
+    .and_then(|(_, selected)| selected)
 }
 
 /// What the pursuit stage should do with an attacker that is holding a target.
@@ -1067,9 +1029,7 @@ pub(crate) fn pursuit_in_range(
         // two stages still agree, which is the property that matters. That twin
         // has no MinimumRange arm either, so it cannot report the too-close
         // verdict.
-        let Some((trx, try_, tsx, tsy)) =
-            resolve_target_coords(target, entities, Some(rules), interner)
-        else {
+        let Some((trx, try_, tsx, tsy)) = resolve_target_coords(target, entities) else {
             return PursuitRangeVerdict::CloseIn;
         };
         let dist_sq = lepton_distance_sq_raw(
@@ -1089,7 +1049,9 @@ pub(crate) fn pursuit_in_range(
         };
     };
 
-    let Some(src) = in_range::fire_source_coords(entity, target, weapon, entities, terrain) else {
+    let Some(src) =
+        in_range::fire_source_coords(entity, target, weapon, entities, terrain, (rules, interner))
+    else {
         // The attacker has no resolvable ground height (off-grid). Report
         // "keep closing" rather than freezing; the fire gate returns without
         // firing on the same condition.
@@ -1106,73 +1068,25 @@ pub(crate) fn pursuit_in_range(
     PursuitRangeVerdict::CloseIn
 }
 
-/// Issue an attack command: make `attacker` fire at `target`.
-///
-/// Replaces any existing AttackTarget on the attacker. Also updates the
-/// attacker's facing to point toward the target.
-pub fn issue_attack_command(
+/// Install a bare combat fixture's entity target. Production commands use
+/// `Simulation::assign_target_represented`, including concrete class effects.
+/// This adapter stages the admitted Techno base state without running an event.
+#[cfg(test)]
+pub(crate) fn install_entity_attack_target_for_test(
     entities: &mut EntityStore,
     attacker_id: u64,
     target_id: u64,
-    rules: Option<&RuleSet>,
-    interner: &StringInterner,
 ) -> bool {
-    // Read target position first (immutable borrow, lepton-precise).
-    // Use foundation center for buildings (see target_coords doc comment).
-    let target_pos = entities
-        .get(target_id)
-        .map(|t| target_coords(t, rules, interner));
-    let (trx, try_, _tsx, _tsy) = match target_pos {
-        Some(p) => p,
-        None => return false,
-    };
-
-    // Read attacker position before mutable borrow (needed for body-facing delta).
-    let attacker_pos = entities.get(attacker_id).map(|a| {
-        (
-            a.position.rx,
-            a.position.ry,
-            a.barrel_facing.is_some(),
-            a.category,
-        )
-    });
-    let (arx, ary, has_turret, category) = match attacker_pos {
-        Some(p) => p,
-        None => return false,
-    };
-
-    // Mutate attacker.
+    if entities.get(target_id).is_none() {
+        return false;
+    }
     let attacker = match entities.get_mut(attacker_id) {
         Some(a) => a,
         None => return false,
     };
 
-    // gamemd-derived: a target assignment writes the target pointer and nothing
-    // else — no facing. A TURRETLESS VEHICLE therefore gets no instant snap
-    // here: `UnitClass::Fire_At_Target @ 0x00736DF0` case 2 turns its hull at
-    // `ROT=` (`FacingClass::Set(+0x388)` at `0x00737004`) only once the fire
-    // gate refuses the shot for facing, and only while it is stationary.
-    //
-    // RESIDUAL (GSI-08.04) — infantry (and the aircraft/structure fallthrough)
-    // keep the order-time snap. Native snaps infantry `+0x388` with
-    // `FacingClass::UpdateFacing` at `0x0052091F`, inside
-    // `InfantryClass::Fire_At_Target @ 0x005206B0`, at the moment the FIRE
-    // sequence starts — not at order time, and with no angle gate either way.
-    // - Trigger: ordering any infantryman to attack.
-    // - Player effect: he turns to face while still walking in, instead of
-    //   snapping round as he opens fire.
-    // - Frequency: every infantry attack order.
-    // - Downstream risk: none to the fire decision — infantry are not
-    //   angle-gated at all — but the rendered approach facing differs.
-    if !has_turret && category != EntityCategory::Unit {
-        let dx: i32 = trx as i32 - arx as i32;
-        let dy: i32 = try_ as i32 - ary as i32;
-        attacker.facing = crate::sim::movement::facing_from_delta(dx, dy);
-    }
-
-    // Walk's physical head survives a null destination. The synchronized
-    // command owner applies that setter after TarCom assignment; the shared
-    // target helper must not destroy the adapter needed to finish the head.
+    // Preserve historical fixture setup: discard a non-Walk movement adapter
+    // before installing the initial target. This is not a native setter effect.
     if !attacker
         .locomotor
         .as_ref()
@@ -1181,71 +1095,91 @@ pub fn issue_attack_command(
         attacker.movement_target = None;
     }
 
-    // Attach the attack target using stable ID (fire immediately).
-    attacker.attack_target = Some(AttackTarget::new(target_id));
-    // An ordered target was not picked up by the passive scanner, so it is not
-    // subject to the scanner's stale-target drop or the off-mission clear.
-    attacker.passively_acquired_target = false;
+    crate::sim::mission::concrete_effects::represented_assign_target_admitted(
+        attacker,
+        Some(TargetKind::Entity(target_id)),
+        true,
+    );
 
     true
 }
 
-/// Swing an existing attack onto a different entity WITHOUT restarting the
-/// weapon.
+/// `TechnoClass::EstimateDamage @ 0x006FDB80` for `attacker_id` shooting
+/// `target_id` with `weapon` (see [`damage::estimate`]): the target house's
+/// category multiplier for the attacker's type, the attacker's
+/// `ArmorMultiplier`, the attacker's FIREPOWER and the target's STRONGER ranks.
 ///
-/// The rearm countdown, the burst counter and the inter-shot delay all live on
-/// [`AttackTarget`] here, so replacing the whole record — which is what building
-/// a fresh `AttackTarget` does — zeroes them and hands the attacker a free shot
-/// on the spot. The original keeps its rearm timer on the OBJECT and its target
-/// assignment writes nothing but the target pointer and two adjacent fields, so
-/// swinging onto a new victim never shortens the reload. Mutating in place is
-/// how that contract is honoured here.
-///
-/// This is the one owner of that operation: combat's own auto-retarget and the
-/// passive scanner's re-pick both go through it. Only the pending infantry shot
-/// is dropped, because it was latched against the old victim.
-///
-/// RESIDUAL: this does NOT perform the infantry firing-sequence and animation
-/// reset that the full target setter does. That was unreachable in practice
-/// before the passive scanner existed; it is now reachable on every infantry
-/// re-pick, roughly every 28 frames. Deterministic and visual only — the fire
-/// decision does not read the sequence — so it is recorded rather than fixed
-/// here.
-///
-/// **Target provenance is preserved on purpose.** Swinging onto a new victim
-/// continues whatever acquisition installed the target in the first place — an
-/// auto-retarget after the old victim died is not a new order — so
-/// `passively_acquired_target` carries over. Clearing it here would leave the
-/// object holding a live target with the flag false, and that state is exactly
-/// what the passive block, the pursuit skip and the release-on-range-loss path
-/// all key off: the object would stop re-evaluating, start being chased across
-/// the map, and never let go of a target that walked out of range. The
-/// flag-clearing that the original's target ASSIGNMENT performs lives in the
-/// target setter, which is the assignment's counterpart; this in-place swing has
-/// no counterpart there.
-pub(crate) fn retarget_preserving_rearm(entity: &mut GameEntity, new_target_sid: u64) {
-    if let Some(ref mut attack) = entity.attack_target {
-        attack.target = TargetKind::Entity(new_target_sid);
-        attack.pending_infantry_fire = None;
-    }
+/// RESIDUAL: `House+0x188` and `Techno+0x160` are 1.0, as in FireAt's damage
+/// build (`world_receiver::fireat_damage`).
+pub(crate) fn estimated_damage_on(
+    sim: &crate::sim::world::Simulation,
+    rules: &RuleSet,
+    attacker_id: u64,
+    target_id: u64,
+    weapon: &crate::rules::weapon_type::WeaponType,
+) -> i32 {
+    use crate::rules::object_type::Ability;
+    use crate::util::native_x87::{NativeF32Bits, NativeF64Bits};
+    let entities = &sim.substrate.entities;
+    let (Some(attacker), Some(target)) = (entities.get(attacker_id), entities.get(target_id))
+    else {
+        return 0;
+    };
+    let Some(attacker_obj) = rules.object(sim.interner.resolve(attacker.type_ref())) else {
+        return 0;
+    };
+    let target_obj = rules.object(sim.interner.resolve(target.type_ref()));
+    let house_type_armor = sim.houses.get(&target.owner()).map_or(1.0, |house| {
+        rules.country_armor_mult_for_type(sim.interner.resolve(house.house_type_id()), attacker_obj)
+    });
+    let rank_firepower = self::veterancy::has_weapon_ability(
+        self::veterancy::rank_from_u16(attacker.veterancy()),
+        attacker_obj,
+        Ability::Firepower,
+    )
+    .then(|| NativeF64Bits::from_bits(rules.general.veteran_combat.to_bits()));
+    let rank_armor = target_obj
+        .is_some_and(|object| {
+            self::veterancy::has_weapon_ability(
+                self::veterancy::rank_from_u16(target.veterancy()),
+                object,
+                Ability::Stronger,
+            )
+        })
+        .then(|| NativeF64Bits::from_bits(rules.general.veteran_armor.to_bits()));
+    let warhead = combat_weapon::warhead_of(rules, weapon);
+    damage::estimate::estimated_damage(&damage::estimate::EstimateInputs {
+        damage: weapon.damage,
+        zeroed: weapon.is_sonic || weapon.use_fire_particles,
+        stages: damage::attacker::FireDamageStages {
+            house_firepower: NativeF64Bits::ONE,
+            unit_firepower: NativeF64Bits::ONE,
+            rank_firepower,
+            occupied: None,
+            bunkered: None,
+            open_topped: None,
+        },
+        divisors: damage::DefenceDivisors {
+            house_type_armor: NativeF32Bits::from_bits(house_type_armor.to_bits()),
+            unit_armor: attacker.armor_multiplier,
+            rank_armor,
+        },
+        warhead: warhead.map(|warhead| damage::estimate::EstimateWarhead {
+            cell_spread: warhead.cell_spread_f64,
+            percent_at_max: warhead.percent_at_max_f64,
+            verses: &warhead.verses_f64,
+        }),
+        armor: damage::ArmorClass(target_obj.map_or(0, |object| armor_index(&object.armor) as u8)),
+        scenario_no_damage: sim.session.no_damage,
+        max_damage: rules.combat_damage.max_damage,
+    })
 }
 
-/// Issue a force-fire-on-cell command: make `attacker` fire at a ground cell.
-///
-/// Used by `Command::ForceAttackCell` (Ctrl + left-click on empty terrain).
-/// Aborts (returns `false`) if the attacker has no weapon — caller filters
-/// unarmed units client-side, but this defensive check keeps a stray command
-/// from corrupting state.
-///
-/// gamemd-derived: `TechnoClass::What_Action_OnCell @ 0x00700600` inlines
-/// `TechnoClass::Is_Armed` at `0x007008BD..0x007008CE` —
-/// `CALL [EDX+0x3F4]` (`GetCurrentWeapon`), `TEST EAX,EAX`,
-/// `CMP dword [EAX],0x0`, both misses jumping to `0x00700AB7` past every arm
-/// that can return 5 (ACTION_ATTACK). That is the gate, and it is a single
-/// weapon slot — not `Primary=` plus `Secondary=`. Reading the INI keys
-/// refused force-fire for `[SREF]` and `[YAGGUN]`, whose weapons live only in
-/// `Weapon1..N`.
-pub fn issue_attack_cell_command(
+/// Install a bare combat fixture's cell target. Keep its current-weapon gate
+/// through the shared weapon reader; production ForceAttackCell uses the
+/// concrete class authority in `world_commands`, not this setup adapter.
+#[cfg(test)]
+pub(crate) fn install_cell_attack_target_for_test(
     entities: &mut EntityStore,
     attacker_id: u64,
     target_rx: u16,
@@ -1253,22 +1187,11 @@ pub fn issue_attack_cell_command(
     rules: Option<&RuleSet>,
     interner: &StringInterner,
 ) -> bool {
-    // Read attacker position + weapon presence before mutable borrow.
-    let attacker_info = entities.get(attacker_id).map(|a| {
-        let type_str = interner.resolve(a.type_ref());
-        let has_weapon = rules
-            .and_then(|r| r.object(type_str))
-            .is_some_and(|obj| combat_weapon::is_armed(a, obj));
-        (
-            a.position.rx,
-            a.position.ry,
-            a.barrel_facing.is_some(),
-            has_weapon,
-            a.category,
-        )
-    });
-    let (arx, ary, has_turret, has_weapon, category) = match attacker_info {
-        Some(info) => info,
+    // Read weapon presence before the mutable borrow.
+    let has_weapon = match entities.get(attacker_id) {
+        Some(a) => rules
+            .and_then(|r| r.object(interner.resolve(a.type_ref())))
+            .is_some_and(|obj| combat_weapon::is_armed(a, obj)),
         None => return false,
     };
 
@@ -1284,20 +1207,10 @@ pub fn issue_attack_cell_command(
         return false;
     }
 
-    let (trx, try_, _tsx, _tsy) = cell_center_coords(target_rx, target_ry);
-
     let attacker = match entities.get_mut(attacker_id) {
         Some(a) => a,
         None => return false,
     };
-
-    // See `issue_attack_command` — a turretless VEHICLE turns through
-    // `Fire_At_Target` case 2, not at order time.
-    if !has_turret && category != EntityCategory::Unit {
-        let dx: i32 = trx as i32 - arx as i32;
-        let dy: i32 = try_ as i32 - ary as i32;
-        attacker.facing = crate::sim::movement::facing_from_delta(dx, dy);
-    }
 
     if !attacker
         .locomotor
@@ -1306,8 +1219,10 @@ pub fn issue_attack_cell_command(
     {
         attacker.movement_target = None;
     }
-    attacker.attack_target = Some(AttackTarget::for_cell(target_rx, target_ry));
-    attacker.passively_acquired_target = false;
+    crate::sim::mission::concrete_effects::represented_assign_target(
+        attacker,
+        Some(TargetKind::Cell(target_rx, target_ry)),
+    );
     true
 }
 
@@ -1319,17 +1234,7 @@ pub(crate) fn cell_distance(ax: u16, ay: u16, bx: u16, by: u16) -> f32 {
     (dx * dx + dy * dy).sqrt()
 }
 
-use self::combat_targeting::{AttackerSnapshot, GarrisonSnapshot, acquire_best_target};
-
-/// Destroyed crewed building — survivor ejection is deferred to the caller
-/// (which has access to `Simulation` for spawning infantry).
-pub struct DestroyedCrewedBuilding {
-    pub type_id: InternedId,
-    pub owner: InternedId,
-    pub rx: u16,
-    pub ry: u16,
-    pub z: u8,
-}
+use self::combat_targeting::{AttackerSnapshot, GarrisonSnapshot};
 
 /// A `CanBeOccupied` building destroyed in combat with live occupants —
 /// gamemd routes this through `BuildingClass::SellBuilding @ 0x00457DE0`, the
@@ -1351,7 +1256,7 @@ pub struct DestroyedGarrisonBuilding {
 }
 
 /// Explosion animation to spawn at a world position (deferred to caller
-/// which has access to `Simulation` for WorldEffect spawning).
+/// which has access to `Simulation` for AnimClass construction).
 pub struct ExplosionEffect {
     pub shp_name: InternedId,
     pub rx: u16,
@@ -1362,23 +1267,42 @@ pub struct ExplosionEffect {
     /// Sub-cell impact Y in leptons.
     pub sub_y: SimFixed,
     pub z: u8,
+    /// Exact absolute Z in leptons; the anim is constructed there (its Middle
+    /// height gate reads it). `z` is the level byte of the same point.
+    pub world_z: i32,
+    /// A death producer's own constructor call (`Death_Explosion`, the
+    /// Aircraft death arm, `DestructionEffects`): `AnimClass(type, coord,
+    /// delay, 1, 0x600, 0, 0)` at an exact coordinate. `None` rows construct
+    /// with the warhead impact's `(0, 1, 0x2600, -15)` at the impact's cell,
+    /// sub-cell and exact `world_z`: the impact anim and the InfDeath anims. The TechnoClass
+    /// debris anims are death constructions at `center + 0x14 Z` (`0x007024AA`,
+    /// `0x00702566`) that already took their constructor draws.
+    pub death: Option<destruction_effects::DeathAnimSpawn>,
 }
 
-/// One transient combat-light request emitted when active IronCurtain or
-/// ForceShield rejects a positive receiver call. `FUN_0048A620` creates an
-/// unowned screen-space light, not an AnimClass/ParticleSystem, so this record
-/// retains the exact call inputs without inventing an attachment or house.
+/// One transient combat-light request, the inputs of one `FUN_0048A620` call.
+/// It creates an unowned screen-space light, not an AnimClass/ParticleSystem,
+/// so this record keeps the exact call inputs without inventing an attachment
+/// or house. Callers:
+/// - an active IronCurtain or ForceShield rejecting a positive receiver call
+///   (the damage shifted left once; flags IC=1, ForceShield=6);
+/// - a `Bright=` bullet's detonation (`BulletClass::DetonateAtCoord
+///   0x00469BD6..0x00469C41`: the bullet's damage `+0x6C`, flags from the
+///   warhead's `CLDisableRed/Green/Blue=` as 2/4/8);
+/// - every rocket impact (`RocketLocomotion::Detonate 0x006632AF`, not forced)
+///   and a bouncing chunk's dry landing (`AnimClass::AI 0x00423EF8`, not
+///   forced).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InvulnerabilityImpactEffect {
+pub struct CombatLightRequest {
     /// Receiver provenance only; this is not native effect ownership.
-    pub target_id: u64,
-    /// Post-defender-transform damage shifted left once before the helper call.
-    pub doubled_damage: i32,
+    pub target_id: Option<u64>,
+    /// The damage the helper sizes the light from.
+    pub damage: i32,
     pub warhead_ref: InternedId,
     pub coord: ProjectileCoord,
-    /// Native helper force/create argument (literal true on this callsite).
+    /// Native helper force/create argument (literal true on both callsites).
     pub force_create: bool,
-    /// Native raw draw flags: IC=1, ForceShield=6.
+    /// Native raw draw flags.
     pub flags: u32,
 }
 
@@ -1387,18 +1311,12 @@ pub struct InvulnerabilityImpactEffect {
 /// a test adapter.
 #[derive(Debug, Clone)]
 pub enum SmudgeSpawnRequest {
-    /// Emitted alongside ExplosionEffect when a warhead's AnimList anim spawns.
-    /// Carries the anim's interned SHP name for AnimType flag lookup.
-    Anim {
-        anim_name: InternedId,
-        rx: u16,
-        ry: u16,
-        sub_x: SimFixed,
-        sub_y: SimFixed,
-        /// Exact absolute CoordStruct Z. ExplosionEffect keeps its separate
-        /// coarse presentation byte; the native smudge altitude gate is in
-        /// leptons and must never reconstruct this value from that byte.
-        world_z_leptons: i32,
+    /// `AnimClass::Middle @ 0x00424F00` past its height gate: the anim's
+    /// coordinate (vt+0x48) and its marks. The anim runtime emits it at Start
+    /// or at the anim's middle frame.
+    AnimMiddle {
+        coord: crate::sim::smudge_grid::SimCoord,
+        marks: smudge_dispatch::AnimMiddleMarks,
     },
     /// Emitted once per >=2x2 building destruction (DestructionEffects path).
     BuildingCenter {
@@ -1408,32 +1326,25 @@ pub enum SmudgeSpawnRequest {
         foundation_w: u8,
         foundation_h: u8,
     },
-    /// Emitted per surviving foundation cell (SpawnSurvivors path).
+    /// One foundation cell's mark, committed by `SpawnSurvivors` after that
+    /// cell's survivor roll (never for a building owing no survivor).
     BuildingSurvivor { cell_rx: u16, cell_ry: u16 },
 }
 
-fn append_building_smudge_requests(
-    requests: &mut Vec<SmudgeSpawnRequest>,
+/// `BuildingClass::DestructionEffects`' centre mark for a destroyed building.
+fn building_center_smudge_request(
     rx: u16,
     ry: u16,
     building_z: i32,
     foundation: &str,
-) {
+) -> SmudgeSpawnRequest {
     let (foundation_w, foundation_h) = foundation_dimensions(foundation);
-    requests.push(SmudgeSpawnRequest::BuildingCenter {
+    SmudgeSpawnRequest::BuildingCenter {
         rx,
         ry,
         building_z,
         foundation_w: foundation_w as u8,
         foundation_h: foundation_h as u8,
-    });
-    for (dx, dy) in crate::rules::foundation::foundation_cell_offsets(foundation) {
-        let cell_rx = i32::from(rx) + i32::from(dx);
-        let cell_ry = i32::from(ry) + i32::from(dy);
-        let (Ok(cell_rx), Ok(cell_ry)) = (u16::try_from(cell_rx), u16::try_from(cell_ry)) else {
-            continue;
-        };
-        requests.push(SmudgeSpawnRequest::BuildingSurvivor { cell_rx, cell_ry });
     }
 }
 
@@ -1449,7 +1360,6 @@ pub(crate) fn emit_infantry_death_anim(
     world_z_leptons: i32,
     interner: &mut StringInterner,
     explosion_effects: &mut Vec<ExplosionEffect>,
-    smudge_spawn_requests: &mut Vec<SmudgeSpawnRequest>,
 ) {
     let Some(anim_name) = general.infantry_death_anim(inf_death) else {
         return;
@@ -1462,80 +1372,8 @@ pub(crate) fn emit_infantry_death_anim(
         sub_x,
         sub_y,
         z,
-    });
-    smudge_spawn_requests.push(SmudgeSpawnRequest::Anim {
-        anim_name,
-        rx,
-        ry,
-        sub_x,
-        sub_y,
-        world_z_leptons,
-    });
-}
-
-/// Emit the warhead's AnimList animation and a paired smudge spawn request
-/// for one detonation at (rx, ry, z). Mirrors gamemd's WarheadType::Detonate
-/// dispatch into AnimClass::Start: every detonation that spawns an anim
-/// also runs the anim's first-frame smudge logic.
-///
-/// Pushes nothing if `warhead.anim_list` is empty.
-///
-/// `base_damage` is the post-modifier damage at the impact center; it
-/// drives AnimList selection via `damage / 25`, clamped to `len - 1`.
-/// The dying object's OWN explosion is emitted separately, in the death loop —
-/// see `UnitClass::Death_Explosion @ 0x00738680` there. This function is only
-/// the warhead's half.
-///
-/// RESIDUAL (GSI-08.11) — crew survival is still absent. `Crewed=` (126 stock
-/// sections) only queues the building smudge arm, so a destroyed `Crewed=yes`
-/// vehicle ejects nobody. Native resolves the survivor's type through
-/// `TechnoClass::Crew_Type @ 0x00707D20` (`AlliedCrew`/`SovietCrew`/`ThirdCrew`
-/// by side, falling to `Technician` behind a 15% `RandomRanged(0, 99)` draw for
-/// a veteran), ejects exactly one from a vehicle behind a `CrewEscape` draw
-/// (Rules `+0x5C0`, stock 50%), and 0-5 from a building through
-/// `How_Many_Survivors @ 0x00451330` (cost / `*SurvivorDivisor`, clamped 1..5)
-/// with a per-cell roll interleaved with the debris roll.
-/// - Trigger: every `Crewed=yes` vehicle or building death.
-/// - Player effect: no crew ever runs out of a wreck or a levelled structure.
-/// - Frequency: continuous.
-/// - Downstream risk: crew ejection spawns entities, so it moves unit counts,
-///   occupancy, house counts and the pinned replay hash, and its per-cell draw
-///   order interleaves with the existing debris roll — it wants its own slice.
-///   The debris half of this row is recorded on `rules/warhead_type.rs`.
-pub(crate) fn emit_warhead_detonation_effects(
-    warhead: &WarheadType,
-    base_damage: i32,
-    rx: u16,
-    ry: u16,
-    sub_x: SimFixed,
-    sub_y: SimFixed,
-    z: u8,
-    world_z_leptons: i32,
-    interner: &mut StringInterner,
-    explosion_effects: &mut Vec<ExplosionEffect>,
-    smudge_spawn_requests: &mut Vec<SmudgeSpawnRequest>,
-) {
-    if warhead.anim_list.is_empty() {
-        return;
-    }
-    let idx = (base_damage / ANIM_LIST_DAMAGE_STEP as i32).max(0) as usize;
-    let idx = idx.min(warhead.anim_list.len() - 1);
-    let interned_name = interner.intern(&warhead.anim_list[idx]);
-    explosion_effects.push(ExplosionEffect {
-        shp_name: interned_name,
-        rx,
-        ry,
-        sub_x,
-        sub_y,
-        z,
-    });
-    smudge_spawn_requests.push(SmudgeSpawnRequest::Anim {
-        anim_name: interned_name,
-        rx,
-        ry,
-        sub_x,
-        sub_y,
-        world_z_leptons,
+        world_z: world_z_leptons,
+        death: None,
     });
 }
 
@@ -1564,11 +1402,58 @@ pub struct TiberiumReductionRequest {
     pub amount: i32,
 }
 
+/// The shots an object's own mission asked the combat phase for this frame,
+/// where VERA's FireAt lives. Filled by the live object pass, drained by
+/// combat in the same frame; never a permission carried to a later frame.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct FireRequests {
+    /// Aircraft whose Mission_Attack strike state (4..9) asked for its visit.
+    pub aircraft: std::collections::BTreeSet<u64>,
+    /// Buildings whose Update asked for a FireAt: GetFireError answered OK in
+    /// that visit, so combat emits the shot without asking again.
+    pub buildings: std::collections::BTreeMap<u64, BuildingShot>,
+}
+
+/// Which FireAt of `BuildingClass::Update` a building's request stands for.
+/// Both FireAts shoot the `TarCom` (`+0x2B4`) of the visit that asked, so the
+/// request carries it: the combat phase fires at it, and FireAt's own TarCom
+/// reads see it, whatever retargets the building later in the frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BuildingShot {
+    /// Mission_Attack's FireAt arm (`0x0044B6D0`), with the weapon index
+    /// SelectWeapon answered in that visit (`0x0044AFF2`). The visit's
+    /// Gattling charge after the FireAt (`0x0044B6EF`) may step the stage
+    /// before the combat phase fires, so the index is not asked again.
+    Mission { weapon: i32, target: TargetKind },
+    /// ProcessDelayedFire's mode-1 FireAt (`0x00450492`), with the weapon
+    /// Mission_Attack saved when it armed the shot (`+0x708`). A launched
+    /// bullet takes the building's support bonus
+    /// (`Simulation::take_support_bonus`).
+    Delayed {
+        slot: combat_weapon::WeaponSlot,
+        target: TargetKind,
+    },
+}
+
+impl BuildingShot {
+    /// The visit's TarCom the shot goes at.
+    pub(crate) fn target(self) -> TargetKind {
+        match self {
+            Self::Mission { target, .. } | Self::Delayed { target, .. } => target,
+        }
+    }
+}
+
 /// Ordinary fire prelude plus one consuming deferred-consequence packet.
 /// The frame admits bullets and applies facing before committing the packet at
 /// its existing post-SpawnManager boundary.
 pub struct CombatTickResult {
-    /// Bullets admitted after the current BulletClass pass; no recursive advance.
+    /// Test adapter observations of actual inline AnimStore construction.
+    #[cfg(test)]
+    pub(crate) fixture_anims: Vec<receiver_fixture::ConstructedAnimObservation>,
+    /// Shrapnel bullets from detonations the combat pass committed; the frame
+    /// admits them before its Logic tail visits the new objects. FireAt admits
+    /// its own bullets directly.
     pub projectile_spawns: Vec<ProjectileSpawn>,
     /// Phase-2 entry facing slots, amended by explicit retarget/removal and
     /// Fire_At_Target hull turns, applied by unit_post before SpawnManager.
@@ -1580,13 +1465,14 @@ pub struct CombatTickResult {
 /// this tick.
 ///
 /// Native has two producers and neither tests the attacker's house:
-/// `BuildingClass::ReceiveDamage @ 0x00442230` calls
-/// `HouseClass::NotifyUnderAttack` when the source is non-null, the damage
-/// result is non-zero and `BuildingType+0x232 Insignificant` is clear (after
-/// a victim `vtbl+0x80` pre-check whose identity is not pinned and is not
-/// modelled); own-fire on an own building announces. `UnitClass::ReceiveDamage 0x007384B9..0x00738530` pings a
-/// `Harvester=` unit on any non-zero, non-fatal result with or without a
-/// source.
+/// `BuildingClass::ReceiveDamage @ 0x00442230`'s retaliation block calls
+/// `HouseClass::NotifyUnderAttack` for a living building hit by a source
+/// object with a non-zero result, unless its type is `Insignificant=`
+/// (`+0x232`) or 1x1 with `UndeploysInto=` (vt+0x80, `0x00465D40`)
+/// ([`crate::sim::world::Simulation::building_hit_response`]); own-fire on an
+/// own building announces. `UnitClass::ReceiveDamage 0x007384B9..0x00738530`
+/// pings a `Harvester=` unit on any non-zero, non-fatal result with or
+/// without a source.
 #[derive(Debug, Clone, Copy)]
 pub struct UnderAttackEvent {
     pub rx: u16,
@@ -1618,10 +1504,11 @@ pub struct UnitLostEvent {
 ///
 /// Every native caller sits in a non-building `ReceiveDamage` override
 /// (`BuildingClass` has none), and `0x004D98DD` skips `Spawned=` types.
-/// Shared by the damage kill loop and the non-damage death sites that
-/// natively route through `+0x16C` (`ReceiveDamage`) with `C4Warhead=`:
+/// Called by the damage kill loop only. The non-damage death sites that
+/// natively route through `+0x16C` (`ReceiveDamage`) with `C4Warhead=`,
 /// `InfantryClass::IronCurtain 0x00522632` and `CellClass::BlowUpBridge
-/// 0x0047DDAE`. Paths that natively skip `ReceiveDamage` (crush
+/// 0x0047DDAE`, reach it the same way: VERA kills through that loop too.
+/// Paths that natively skip `ReceiveDamage` (crush
 /// `0x007416A0` → `RecordKill` only, `AircraftClass::Enter_Idle_Mode
 /// 0x004179FD/0x00417B88` → `Crash` slot `+0x3DC`, the off-playfield
 /// `UnInit` at `AircraftClass::AI 0x00414F93/0x00414FD1`) must not call it.
@@ -1639,177 +1526,10 @@ pub(crate) fn death_announcement_event(
     })
 }
 
-/// Exact ObjectClass-style world Z for effect and projectile coordinates.
-///
-/// This is deliberately distinct from [`in_range::effective_z_leptons`]: the
-/// range helper applies low-flight targeting rules, while native animation and
-/// bullet coordinates retain the object's actual airborne height. An explicit
-/// exact coordinate is already absolute. Otherwise the base is exact sloped
-/// terrain plus the object-owned bridge deck, followed by the one active
-/// object/locomotor altitude source in presentation precedence order.
-pub(crate) fn object_world_z_leptons(
-    entity: &GameEntity,
-    terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
-) -> i32 {
-    if let Some(exact_z_leptons) = entity.position.exact_z_leptons {
-        return exact_z_leptons;
-    }
-
-    let world_x = i32::from(entity.position.rx)
-        .wrapping_mul(256)
-        .wrapping_add(entity.position.sub_x.to_num::<i32>());
-    let world_y = i32::from(entity.position.ry)
-        .wrapping_mul(256)
-        .wrapping_add(entity.position.sub_y.to_num::<i32>());
-    let base_z = terrain
-        .and_then(|terrain| terrain.cell(entity.position.rx, entity.position.ry))
-        .and_then(|cell| ground_height_leptons(cell.level, cell.slope_type, world_x, world_y).ok())
-        .map(|ground_z| {
-            ground_z.wrapping_add(if entity.on_bridge {
-                BRIDGE_DECK_HEIGHT_LEPTONS
-            } else {
-                0
-            })
-        })
-        // Position.z is already the effective layer level (including a bridge
-        // deck), so the mapless fallback must not add OnBridge a second time.
-        .unwrap_or_else(|| i32::from(entity.position.z).wrapping_mul(LEPTONS_PER_LEVEL as i32));
-
-    let altitude = entity
-        .parachute_state
-        .as_ref()
-        .map(|state| state.altitude.to_num::<i32>())
-        .or_else(|| {
-            entity
-                .rocket_state
-                .as_ref()
-                .map(|state| state.altitude.to_num::<i32>())
-        })
-        .or_else(|| {
-            entity
-                .drop_pod_state
-                .as_ref()
-                .filter(|state| {
-                    state.phase == crate::sim::movement::drop_pod_movement::DropPodPhase::Descending
-                })
-                .map(|state| state.altitude.to_num::<i32>())
-        })
-        .or_else(|| {
-            entity
-                .locomotor
-                .as_ref()
-                .filter(|locomotor| {
-                    locomotor.layer == crate::sim::movement::locomotor::MovementLayer::Air
-                        && locomotor.kind != crate::rules::locomotor_type::LocomotorKind::Rocket
-                })
-                .map(|locomotor| locomotor.altitude.to_num::<i32>())
-        })
-        .unwrap_or(0);
-
-    base_z.wrapping_add(altitude)
-}
-
-/// The **one** impact height for an attack, in tile-step level units (signed).
-///
-/// The original engine forms a single impact coordinate per detonation and
-/// hands that same coordinate to area damage and to the animation placement —
-/// there is no second Z anywhere on the path. This function is VERA's
-/// equivalent single value, and every consumer reads it rather than deriving
-/// its own: the AoE object-layer selector, the bridge-damage Z gate, the
-/// persistent-projectile impact coordinate, the impact-animation height, and
-/// (through `app::presentation::fire_effects`) the pixel the tracer ends on. A second
-/// derivation could only agree with this one by coincidence.
-///
-/// Three native quantities sit close together here and are not the same
-/// thing:
-/// * a cell's **own** coordinate — cell centre on both axes, terrain floor
-///   height for Z;
-/// * the **aim point** for a cell target — that, plus a four-level structural
-///   bridge deck offset when a span crosses the cell;
-/// * the **impact** coordinate — the projectile's own location, whose Z the
-///   flight step clamps to the plain cell ground-height lookup at the moment
-///   of ground contact. The resolution ladder that can substitute a target's
-///   bridge-aware aim point runs only when there is a live *object* target;
-///   for a shot at bare ground it is skipped entirely.
-///
-/// VERA models the impact, so a ground cell contributes its terrain floor
-/// level and nothing else. There is no branch yielding zero: zero is what a
-/// level-0 cell is worth, never a stand-in for a height we failed to look up.
-/// VERA carries this quantity in whole tile-step levels along the entire
-/// impact path; native carries the same step count scaled into leptons.
-///
-/// **Residual DRIFT — the structural-bridge deck term is unmodelled here.**
-/// A force-fire at a bridge cell therefore damages the ground occupant list
-/// and draws its explosion at ground height rather than four levels up on the
-/// deck. It is not a one-line addition, because two VERA consumers want
-/// opposite values: `combat_aoe::select_object_damage_layer` picks the bridge
-/// occupant list only for an impact well above the cell's ground level (it
-/// wants the deck term), while `bridge_state`'s path Z gate accepts only an
-/// impact within one level of the cell's *ground* level (it rejects the deck
-/// term outright). With ground-only Z that gate now admits every cell target:
-/// it is **disabled, not widened** — a gate that can no longer reject
-/// anything is not a modelled gate. That is RNG-visible: a path that newly
-/// matches consumes a bridge-strength draw from the scenario stream, so a
-/// replay containing a `Wall=yes` force-fire at a bridge over ground level ≥ 2
-/// diverges from one recorded before this change. Trigger frequency: needs
-/// deliberate bridge-cutting over raised ground, uncommon per match but a real
-/// tactic on bridge maps.
-/// *Settling step:* walk the bridge block of the native area-damage routine
-/// and establish which reference **its** Z comparisons use — cell ground
-/// height or deck plane — before either the gate or the deck term moves. The
-/// VERA gate's native equivalent is UNCHECKED and is not authority for
-/// dropping a verified native term.
-///
-/// `terrain` is `None` only where combat runs without a loaded map (headless
-/// fixtures). With no map there is no cell to read — a VERA API boundary, not
-/// a game rule.
-pub(crate) fn attack_impact_z(
-    target: TargetKind,
-    entities: &EntityStore,
-    terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
-) -> i32 {
-    match target {
-        TargetKind::Entity(eid) => entities
-            .get(eid)
-            .map(|entity| i32::from(entity.position.z))
-            .unwrap_or(0),
-        TargetKind::Cell(rx, ry) => terrain
-            .and_then(|grid| grid.cell(rx, ry))
-            .map(|cell| i32::from(cell.level))
-            .unwrap_or(0),
-    }
-}
-
-fn attack_air_impact(
-    target: TargetKind,
-    impact_rx: u16,
-    impact_ry: u16,
-    impact_sub_x: SimFixed,
-    impact_sub_y: SimFixed,
-    entities: &EntityStore,
-    terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
-) -> Option<combat_aoe::AoEAirImpact> {
-    match target {
-        TargetKind::Entity(entity_id) => {
-            combat_aoe::air_impact_from_entity(entities.get(entity_id)?, terrain)
-        }
-        TargetKind::Cell(_, _) => combat_aoe::air_impact_from_layer_z(
-            terrain,
-            impact_rx,
-            impact_ry,
-            impact_sub_x,
-            impact_sub_y,
-            attack_impact_z(target, entities, terrain),
-        ),
-    }
-}
+use crate::sim::movement::ground_pose::object_world_z_leptons;
 
 fn attack_world_z_leptons(
     target: TargetKind,
-    impact_rx: u16,
-    impact_ry: u16,
-    impact_sub_x: SimFixed,
-    impact_sub_y: SimFixed,
     entities: &EntityStore,
     terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
 ) -> i32 {
@@ -1817,21 +1537,11 @@ fn attack_world_z_leptons(
         TargetKind::Entity(entity_id) => entities
             .get(entity_id)
             .map(|entity| object_world_z_leptons(entity, terrain))
-            .unwrap_or_else(|| {
-                attack_impact_z(target, entities, terrain).wrapping_mul(LEPTONS_PER_LEVEL as i32)
-            }),
-        TargetKind::Cell(_, _) => combat_aoe::air_impact_from_layer_z(
-            terrain,
-            impact_rx,
-            impact_ry,
-            impact_sub_x,
-            impact_sub_y,
-            attack_impact_z(target, entities, terrain),
-        )
-        .map(|impact| impact.z_leptons)
-        .unwrap_or_else(|| {
-            attack_impact_z(target, entities, terrain).wrapping_mul(LEPTONS_PER_LEVEL as i32)
-        }),
+            .unwrap_or(0),
+        // FireAt6FE1FF and Get_Led_Target_Coords70BCB0 read Cell+58;
+        // Bullet::Fire468707 freezes that same unled aim. The flight/impact
+        // owners separately resolve ground contact and the final detonation.
+        TargetKind::Cell(rx, ry) => crate::sim::projectile::cell_target_coord(terrain, rx, ry).z,
     }
 }
 
@@ -1865,48 +1575,53 @@ fn death_weapon_half_strength(strength: i32) -> Option<i32> {
     i32::try_from(X87Chop53::ftol_i64(product).ok()?).ok()
 }
 
-/// Resolve the active fatal-receiver death producer. The reachability gate is
-/// independent of `DeathWeapon=`: native consults effective Explodes abilities
-/// and the receiver's live `CurrentWeaponNumber` Suicide flag first. Once
-/// admitted, selection is explicit type weapon, current weapon, then the Rules
-/// default, with distinct native damage formulas for the first two vs default.
-fn death_weapon_aoe(
+/// The death arm's gate (`TechnoClass::ReceiveDamage 0x00702572..0x00702601`):
+/// Explodes (`+0xD15`), the veteran or elite `EXPLODES` ability (IsVeteran
+/// `0x0074FF90` with `+0x2A6`; IsElite `0x00750010` with `+0x2A6` or
+/// `+0x2B8`), or the weapon at `CurrentWeaponNumber` (`GetWeapon(+0x138)`,
+/// vtable `+0x3F8`) is `Suicide=` (`+0x144`). `+0x138` is a Gunner
+/// transport's passenger IFVMode (SetGunnerWeapon `0x0070DC70`), else 0: it
+/// is not the last-fired slot. When it holds, KillPassengers
+/// (`0x00702603..0x00702667`) and then Fire_Death_Weapon (`0x00702669`) run;
+/// otherwise neither does.
+pub(crate) fn death_arm_explodes(
     rules: &RuleSet,
     obj: &ObjectType,
     veterancy: u16,
-    current_weapon_index: u8,
-    current_weapon_ref: Option<InternedId>,
+    current_weapon_number: i32,
+) -> bool {
+    let numbered_weapon = combat_weapon::weapon_for_index(obj, veterancy, current_weapon_number)
+        .and_then(|(weapon_id, _)| rules.weapon(weapon_id));
+    obj.explodes
+        || (veterancy >= 100 && obj.veteran_explodes)
+        || (veterancy >= 200 && obj.elite_explodes)
+        || numbered_weapon.is_some_and(|weapon| weapon.suicide)
+}
+
+/// `TechnoClass::Fire_Death_Weapon @ 0x0070D690`'s weapon and damage, before
+/// its caller's extra damage: `DeathWeapon=` (`+0xD18`), else the current
+/// weapon (`GetCurrentWeapon`, vtable `+0x3F4`, the caller's `current_weapon`),
+/// each at `ftol(Damage * DeathWeaponDamageModifier)`
+/// (`0x0070D6EB..0x0070D6F7`); else `[CombatDamage] DeathWeapon=`
+/// (`Rules+0xFDC`) at `ftol(Strength * 0.5)` (`0x0070D6FE..0x0070D71F`). No
+/// weapon fires nothing. The function has no `Explodes=` gate: the death arm
+/// gates it ([`death_arm_explodes`]); a crash impact calls it bare.
+pub(crate) fn fire_death_weapon_payload(
+    rules: &RuleSet,
+    obj: &ObjectType,
+    current_weapon: Option<&str>,
     interner: &mut StringInterner,
 ) -> Option<(i32, InternedId, InternedId)> {
-    let selected_current_weapon =
-        current_weapon_ref.and_then(|weapon_id| rules.weapon(interner.resolve(weapon_id)));
-    let slot_current_weapon =
-        combat_weapon::weapon_for_slot_index(obj, veterancy, i32::from(current_weapon_index))
-            .and_then(|(weapon_id, _)| rules.weapon(weapon_id));
-    let current_weapon = selected_current_weapon.or(slot_current_weapon);
-    let effective_explodes = obj.explodes
-        || (veterancy >= 100 && obj.veteran_explodes)
-        || (veterancy >= 200 && obj.elite_explodes);
-    if !effective_explodes && !current_weapon.is_some_and(|weapon| weapon.suicide) {
-        return None;
-    }
-
-    if let Some(explicit) = obj
+    let chosen = obj
         .death_weapon
         .as_deref()
         .and_then(|weapon_id| rules.weapon(weapon_id))
-    {
+        .or_else(|| current_weapon.and_then(|weapon_id| rules.weapon(weapon_id)));
+    if let Some(weapon) = chosen {
         let damage =
-            death_weapon_ftol_product_i32_f32(explicit.damage, obj.death_weapon_damage_modifier)?;
-        let warhead_ref = interner.intern(explicit.warhead.as_ref()?);
-        let weapon_ref = interner.intern(&explicit.id);
-        return Some((damage, warhead_ref, weapon_ref));
-    }
-    if let Some(current) = current_weapon {
-        let damage =
-            death_weapon_ftol_product_i32_f32(current.damage, obj.death_weapon_damage_modifier)?;
-        let warhead_ref = interner.intern(current.warhead.as_ref()?);
-        let weapon_ref = interner.intern(&current.id);
+            death_weapon_ftol_product_i32_f32(weapon.damage, obj.death_weapon_damage_modifier)?;
+        let warhead_ref = interner.intern(weapon.warhead.as_ref()?);
+        let weapon_ref = interner.intern(&weapon.id);
         return Some((damage, warhead_ref, weapon_ref));
     }
     let fallback = rules
@@ -1932,14 +1647,15 @@ pub(crate) struct DeathEffects {
     /// Remaining world UnInit requests; distinct from all fatal receiver IDs.
     pub(crate) immediate_uninit_ids: Vec<u64>,
     pub(crate) structure_destroyed: bool,
-    pub(crate) destroyed_crewed_buildings: Vec<DestroyedCrewedBuilding>,
     pub(crate) explosion_effects: Vec<ExplosionEffect>,
     /// `VoxelAnimClass` debris planned by the death block for admission at the
     /// world consequence boundary. The live receiver has allocator access;
     /// deferred admission preserves the existing allocation and Logic order.
     pub(crate) voxel_debris: Vec<crate::sim::voxel_anim::VoxelDebrisSpawn>,
-    pub(crate) invulnerability_impact_effects: Vec<InvulnerabilityImpactEffect>,
-    pub(crate) bridge_damage_events: Vec<BridgeDamageEvent>,
+    pub(crate) combat_light_requests: Vec<CombatLightRequest>,
+    /// Receipt of synchronous Apply_area_damage bridge callbacks. Gameplay
+    /// already ran before the detonation's animation and cluster successor.
+    pub(crate) bridge_state_changed: bool,
     #[cfg(test)]
     pub(crate) wall_mutations: Vec<WallMutation>,
     #[cfg(test)]
@@ -2011,14 +1727,11 @@ impl DeathEffects {
         self.immediate_uninit_ids
             .append(&mut other.immediate_uninit_ids);
         self.structure_destroyed |= other.structure_destroyed;
-        self.destroyed_crewed_buildings
-            .append(&mut other.destroyed_crewed_buildings);
         self.explosion_effects.append(&mut other.explosion_effects);
         self.voxel_debris.append(&mut other.voxel_debris);
-        self.invulnerability_impact_effects
-            .append(&mut other.invulnerability_impact_effects);
-        self.bridge_damage_events
-            .append(&mut other.bridge_damage_events);
+        self.combat_light_requests
+            .append(&mut other.combat_light_requests);
+        self.bridge_state_changed |= other.bridge_state_changed;
         #[cfg(test)]
         self.wall_mutations.append(&mut other.wall_mutations);
 
@@ -2041,7 +1754,9 @@ impl DeathEffects {
 }
 
 /// The debris block of `TechnoClass::ReceiveDamage @ 0x00701900`, wired to the
-/// dying object.
+/// dying object. Every draw is on the Scenario stream (`[0x00A8B230]+0x218`:
+/// the count at `0x007022BA..0x007022C8`, the per-piece pick at `0x0070232B`,
+/// and the VoxelAnim constructor's seven), not the death sounds' stream.
 ///
 /// The entry gate is `0x00702232`..`0x0070227B` and it is a *drop-in* gate, not
 /// a water gate. `0x0070223D MOV AL,[ESI+0x8F] / TEST AL,AL / JZ 0x00702281`
@@ -2057,47 +1772,30 @@ impl DeathEffects {
 /// from a drop-in therefore has the byte clear, so an ordinary death over water
 /// DOES throw debris and consumes the block's draws.
 ///
-/// RESIDUAL (GSI-05.14) — the SHP half spawns through the existing
-/// `ExplosionEffect` -> `WorldEffect` path, which plays the sprite at a fixed
-/// point. Native builds a real `AnimClass` (`0x00421EA0`), and every stock
-/// debris AnimType is `Bouncer=yes` — all 26 named by `[General]
-/// MetallicDebris=` or by any `DebrisAnims=` line carry it, authored in
-/// `artmd.ini` rather than `rulesmd.ini` (`AnimTypeClass+0x35A`, read at
-/// `0x004286A7`) — so native's constructor enters its own `BounceClass::Init`
-/// arm and the chunk flies an arc before landing.
-/// - Trigger: every death that reaches either SHP arm — in gamemd, 324 of the
-///   356 stock sections that throw (of 439 authoring `MaxDebris=` in gamemd's
-///   own spelling, 83 author 0).
-/// - Player effect: the debris sprite plays where the wreck stood instead of
-///   tumbling outward, and its `Damage=`/`Warhead=` on landing is not applied.
-/// - Frequency: continuous — every building death (no `[BuildingTypes]` section
-///   authors `DebrisTypes=`, so all 292 that throw land here) plus 18 of the 50
-///   registered `[VehicleTypes]` that throw and 11 of the 12 `[AircraftTypes]`.
-///   The other 32 vehicle types take the voxel arm instead. Those counts are on
-///   gamemd's case-exact key read, which `ObjectType::from_ini_section` matches
-///   (`CCINIClass::ReadInt @ 0x005276D0` CRCs the raw key bytes): the 17
-///   `[VehicleTypes]` spelling `Maxdebris=` take the constructor default 0 here
-///   as they do in retail and never reach this arm.
-/// - Downstream risk: the constructor's own draws are not consumed either —
-///   one `RandomRanged` for `RandomRate=`, three `Random__Next()` for the
-///   launch velocity and three `RandomRanged(-0xFFFF, 0xFFFF)` inside
-///   `BounceClass::Init`, so seven per anim. Every `WorldEffect` anim in the
-///   engine shares that gap today; closing it belongs with the AnimClass
-///   bouncer owner, not here, because the same seven draws are missing from
-///   the `Explosion=`/`DestroyAnim=` producer beside this one.
+/// The SHP half constructs a bouncing `AnimClass` per piece (`0x00421EA0`):
+/// every stock debris AnimType is `Bouncer=yes` — all 26 named by `[General]
+/// MetallicDebris=` or by any `DebrisAnims=` line, authored in `artmd.ini`
+/// (`AnimTypeClass+0x35A`, read at `0x004286A7`). Each piece's constructor
+/// draws (`RandomRate=`, none for the stock chunks, then three velocity draws
+/// and `BounceClass::Init`'s three) are taken right after its pick, as native
+/// constructs it before picking the next; the row carries them to the
+/// deferred construction. Native execution:
+/// `tools/spatial_oracle/anim_bouncer_launch.py` (`debris_loop` rows).
+/// Counts on gamemd's case-exact key read, which `ObjectType::from_ini_section`
+/// matches (`CCINIClass::ReadInt @ 0x005276D0` CRCs the raw key bytes): 324 of
+/// the 356 stock sections that throw reach an SHP arm (of 439 authoring
+/// `MaxDebris=`, 83 author 0); the 17 `[VehicleTypes]` spelling `Maxdebris=`
+/// (the Rhino among them) take the constructor default 0 and throw nothing.
 #[allow(clippy::too_many_arguments)]
 fn throw_debris_for_death(
     object_type: &ObjectType,
     rules: &RuleSet,
     interner: &mut StringInterner,
     owner: InternedId,
-    rx: u16,
-    ry: u16,
-    sub_x: SimFixed,
-    sub_y: SimFixed,
-    z: u8,
+    (world_x, world_y): (i32, i32),
     world_z_leptons: i32,
-    main_rng: &mut SimRng,
+    scenario_rng: &mut SimRng,
+    native_ids: &mut Option<crate::sim::native_identity::NativeUniqueIdCursor>,
     voxel_debris: &mut Vec<crate::sim::voxel_anim::VoxelDebrisSpawn>,
     explosion_effects: &mut Vec<ExplosionEffect>,
 ) {
@@ -2106,12 +1804,6 @@ fn throw_debris_for_death(
     if object_type.max_debris <= 0 {
         return;
     }
-    let world_x = i32::from(rx)
-        .wrapping_mul(256)
-        .wrapping_add(sub_x.to_num::<i32>());
-    let world_y = i32::from(ry)
-        .wrapping_mul(256)
-        .wrapping_add(sub_y.to_num::<i32>());
 
     let debris_types: Vec<Option<(crate::rules::voxel_anim_type::VoxelAnimTypeId, _)>> =
         object_type
@@ -2131,11 +1823,47 @@ fn throw_debris_for_death(
         debris_anim_count: object_type.debris_anims.len(),
         metallic_debris_count: rules.general.metallic_debris.len(),
     };
+    // Native lifts the anim coordinate by 20 leptons (`ADD EAX, 0x14` at
+    // `0x00702443`/`0x0070254B`) and constructs `AnimClass(type, coord, 0, 1,
+    // 0x600, 0, 0)` there, exactly.
+    let anim_coord = crate::sim::anim_class::AnimWorldCoord {
+        x: world_x,
+        y: world_y,
+        z: world_z_leptons.wrapping_add(0x14),
+    };
+    let debris_name = |source: ShpDebrisSource, index: usize| match source {
+        ShpDebrisSource::TypeDebrisAnims => object_type.debris_anims.get(index),
+        ShpDebrisSource::RulesMetallicDebris => rules.general.metallic_debris.get(index),
+    };
     let Ok(thrown) = throw_death_debris(
         &data,
         Some(owner),
         glam::IVec3::new(world_x, world_y, world_z_leptons),
-        main_rng,
+        scenario_rng,
+        &mut |source, index, rng| {
+            // The selected piece is allocated before Anim42203D assigns its
+            // identity, then RandomRate/Bouncer draws run before the next pick.
+            // Carry this constructor result through delayed world publication.
+            let native_unique_id =
+                crate::sim::native_identity::NativeUniqueIdCursor::assign_runtime(native_ids);
+            let Some(config) = debris_name(source, index)
+                .and_then(|name| rules.art().anim_runtime_config(&name.to_ascii_uppercase()))
+            else {
+                // A missing bound SHP still corresponds to a native Anim
+                // constructor. Admission reports the asset failure later.
+                return Ok(Some(crate::sim::anim_class::AnimConstructorDraws {
+                    native_unique_id: Some(native_unique_id),
+                    random_rate: None,
+                    bounce: None,
+                }));
+            };
+            crate::sim::anim_class::anim_constructor_draws(config, anim_coord, rng).map(
+                |mut draws| {
+                    draws.native_unique_id = Some(native_unique_id);
+                    Some(draws)
+                },
+            )
+        },
     ) else {
         // A launch velocity outside the verified x87 domain needs a modded
         // `[VoxelAnims]` value far past any stock one; the draws are already
@@ -2144,16 +1872,9 @@ fn throw_debris_for_death(
     };
     voxel_debris.extend(thrown.voxels);
     for row in thrown.anims {
-        let name = match row.source {
-            ShpDebrisSource::TypeDebrisAnims => object_type.debris_anims.get(row.index),
-            ShpDebrisSource::RulesMetallicDebris => rules.general.metallic_debris.get(row.index),
-        };
-        // Native lifts the anim coordinate by 20 leptons (`ADD EAX, 0x14` at
-        // `0x00702443`). `ExplosionEffect` carries Z as a height LEVEL, and 20
-        // leptons is under a sixth of one, so the lift is below this row's
-        // resolution and is not represented.
-        if let Some(name) = name {
+        if let Some(name) = debris_name(row.source, row.index) {
             let shp_name = interner.intern(name);
+            let (rx, ry, sub_x, sub_y, z) = anim_coord.to_cell_sub_z();
             explosion_effects.push(ExplosionEffect {
                 shp_name,
                 rx,
@@ -2161,6 +1882,12 @@ fn throw_debris_for_death(
                 sub_x,
                 sub_y,
                 z,
+                world_z: anim_coord.z,
+                death: Some(destruction_effects::DeathAnimSpawn {
+                    coord: anim_coord,
+                    delay: 0,
+                    draws: row.draws,
+                }),
             });
         }
     }
@@ -2220,12 +1947,7 @@ fn append_selected_death_sounds(
 /// consuming smudge RNG (or interning the InfDeath AnimType) too early.
 enum ConcreteDeathSmudgePlan {
     Infantry(crate::sim::world::InfantryDeathPostlude),
-    Building {
-        rx: u16,
-        ry: u16,
-        z: i32,
-        foundation: String,
-    },
+    Building,
 }
 
 /// Build the native ReceiveDamage value ABI for one ordered area or direct
@@ -2234,7 +1956,7 @@ enum ConcreteDeathSmudgePlan {
 #[derive(Debug, Clone, Copy)]
 struct ResolvedReceiveDamage {
     outcome: damage::DamageOutcome,
-    invulnerability_impact: Option<InvulnerabilityImpactEffect>,
+    invulnerability_impact: Option<CombatLightRequest>,
 }
 
 fn receiver_effect_coord(
@@ -2328,7 +2050,7 @@ fn resolve_receive_damage(
     // InfantryClass mutates the positive raw i32 before forwarding to the
     // shared Techno receiver. Its sign is therefore Techno's original-sign
     // snapshot used by the IC/FS gate below.
-    let receiver_input = infantry_prone_area_raw_damage(
+    let receiver_input = infantry_prone_raw_damage(
         target,
         warhead,
         event.damage,
@@ -2352,16 +2074,8 @@ fn resolve_receive_damage(
                 .map(|object| armor_index(&object.armor))
                 .unwrap_or(0) as u8,
         ),
-        strength: target_type
-            .map(|object| object.strength)
-            .filter(|&strength| strength > 0)
-            .unwrap_or(i32::from(target.health.max)),
         current_hp: i32::from(target.health.current),
         object_immune: target_type.is_some_and(|object| object.immune),
-        is_building: target_is_building,
-        can_c4: target_type
-            .map(|object| object.can_c4)
-            .unwrap_or(target_is_building),
     };
     let type_immune = target_type.is_some_and(|object| object.type_immune)
         && source.is_some_and(|source| {
@@ -2392,11 +2106,9 @@ fn resolve_receive_damage(
         invulnerable: !receiver_flags.ignore_defenses
             && receiver_input >= 0
             && active_invulnerability.is_some(),
-        warping_out: !receiver_flags.ignore_defenses
-            && target
-                .teleport_state
-                .as_ref()
-                .is_some_and(|state| state.warp_out_active()),
+        // `+0x270` (vtable `+0x1D4`, `0x00701AB1`): a Chrono teleport's
+        // warp-out or a Temporal warp.
+        warping_out: !receiver_flags.ignore_defenses && target.is_warped_out(),
         bunker_blocked,
         radiation_immune: warhead.radiation
             && target_type.is_some_and(|object| object.immune_to_radiation),
@@ -2410,53 +2122,47 @@ fn resolve_receive_damage(
         psionics_immune: target_type.is_some_and(|object| object.immune_to_psionics),
         target_is_building,
     };
-    let defender_country_armor = houses.get(&target.owner()).map_or(1.0, |house| {
-        let difficulty_armor = rules.general.difficulty_armor[house.difficulty.table_index()];
-        let country_name = house
-            .country
-            .map(|country| interner.resolve(country))
-            .unwrap_or_else(|| interner.resolve(target.owner()));
-        let (country_armor, category_armor) = target_type
-            .map(|object| rules.country_armor_factors(country_name, object))
-            .unwrap_or((1.0, 1.0));
-        let house_armor = difficulty_armor * country_armor;
-        house_armor * category_armor
-    });
-    let defender_vet_armor = target_type
-        .is_some_and(|object| {
-            if target.veterancy >= ELITE_VETERANCY {
-                object.veteran_stronger || object.elite_stronger
-            } else {
-                target.veterancy >= VETERAN_VETERANCY && object.veteran_stronger
-            }
+    // `HouseClass::GetArmorMultForType @ 0x0050BD30` on the target's owner:
+    // its HouseType's per-category float. The difficulty and country
+    // `Armor=` product (`House+0x1A0`) is never read here.
+    let house_type_armor = houses.get(&target.owner()).map_or(1.0, |house| {
+        target_type.map_or(1.0, |object| {
+            rules.country_armor_mult_for_type(interner.resolve(house.house_type_id()), object)
         })
-        .then_some(rules.general.veteran_armor)
-        .unwrap_or(1.0);
-    let combat_mods = damage::CombatMods {
-        defender_country_armor,
-        defender_unit_armor: f64::from_bits(target.armor_multiplier.bits()),
-        defender_vet_armor,
-        ..damage::CombatMods::default()
+    });
+    let rank_armor = target_type
+        .is_some_and(|object| {
+            self::veterancy::has_weapon_ability(
+                self::veterancy::rank_from_u16(target.veterancy()),
+                object,
+                crate::rules::object_type::Ability::Stronger,
+            )
+        })
+        .then(|| {
+            crate::util::native_x87::NativeF64Bits::from_bits(rules.general.veteran_armor.to_bits())
+        });
+    let divisors = damage::DefenceDivisors {
+        house_type_armor: crate::util::native_x87::NativeF32Bits::from_bits(
+            house_type_armor.to_bits(),
+        ),
+        unit_armor: target.armor_multiplier,
+        rank_armor,
     };
-    // `arg6` is forwarded by the concrete ABI. Its only verified Unit-class
-    // consumer gates a crew-survivor branch that this lifecycle does not
-    // model; periodic radiation's true value is nevertheless retained on the
-    // ordered call rather than erased at collection time.
-    let _receiver_arg6 = receiver_flags.arg6;
+    // `arg6` stays on the ordered call: its Unit-class consumer is the crew
+    // block, which the concrete death reads from the killing event.
     let outcome = damage::receive::receive_damage(
         receiver_input,
         warhead.cell_spread_f64,
         warhead.percent_at_max_f64,
         &warhead.verses_f64,
         &target_view,
-        &combat_mods,
+        &divisors,
         &gates,
         distance_leptons,
         scenario_no_damage,
         rules.combat_damage.max_damage,
-        f64::from(rules.general.condition_red),
     );
-    let invulnerability_impact = outcome.invulnerability_impact_damage.map(|doubled_damage| {
+    let invulnerability_impact = outcome.invulnerability_impact_damage.map(|damage| {
         let flags = match active_invulnerability
             .expect("receiver gate retained active state")
             .kind
@@ -2464,9 +2170,9 @@ fn resolve_receive_damage(
             crate::sim::superweapon::invulnerability::InvulnKind::IronCurtain => 1,
             crate::sim::superweapon::invulnerability::InvulnKind::ForceShield => 6,
         };
-        InvulnerabilityImpactEffect {
-            target_id: target.stable_id(),
-            doubled_damage,
+        CombatLightRequest {
+            target_id: Some(target.stable_id()),
+            damage,
             warhead_ref: event.warhead_ref,
             coord: receiver_effect_coord(target, terrain),
             force_create: true,
@@ -2553,7 +2259,7 @@ fn postmortem_delay_duration(warhead: &WarheadType, distance_leptons: i32) -> i3
         base,
         X87Chop53::mul(X87Chop53::load_i32(distance_leptons), slope_per_lepton),
     );
-    X87Chop53::ftol_i64(delay).unwrap_or(i64::MIN) as i32
+    X87Chop53::ftol_i32_low_masked(delay)
 }
 
 fn postmortem_duration_for_event(
@@ -2561,25 +2267,15 @@ fn postmortem_duration_for_event(
     target: &GameEntity,
     rules: &RuleSet,
     interner: &StringInterner,
-    outcome: damage::DamageOutcome,
+    state: damage::DamageState,
 ) -> Option<i32> {
-    if outcome.state != damage::DamageState::Dead || target.category != EntityCategory::Structure {
+    if state != damage::DamageState::Dead || target.category != EntityCategory::Structure {
         return None;
     }
     let warhead = rules.warhead(interner.resolve(event.warhead_ref))?;
     let object = rules.object(interner.resolve(target.type_ref()))?;
     (warhead.causes_delay_kill && object.eligible_for_delay_kill)
         .then(|| postmortem_delay_duration(warhead, event.distance_leptons.unwrap_or(0)))
-}
-
-/// Type vtable `+0xAC` value used by receiver anger feedback. Unit, Infantry,
-/// and Aircraft types return `Cost=` directly; BuildingType applies its active
-/// bundled-pad and `FreeUnit=` deductions.
-fn receiver_type_value(target: &GameEntity, object: &ObjectType, rules: &RuleSet) -> i32 {
-    if target.category != EntityCategory::Structure {
-        return object.cost;
-    }
-    rules.building_actual_cost(object)
 }
 
 fn has_active_area_invulnerability(entity: &GameEntity, current_tick: u64) -> bool {
@@ -2592,22 +2288,29 @@ fn has_active_area_invulnerability(entity: &GameEntity, current_tick: u64) -> bo
     )
 }
 
+fn event_arms_ic_isolation(
+    event: &EntityDamageEvent,
+    entities: &EntityStore,
+    current_tick: u64,
+) -> bool {
+    event.near_center_ic_isolation_eligible
+        && event.distance_leptons.is_some_and(|distance| distance < 85)
+        && entities.get(event.target_id).is_some_and(|target| {
+            has_active_area_invulnerability(target, current_tick)
+                && target.invulnerability.as_ref().is_some_and(|state| {
+                    state.kind == crate::sim::superweapon::invulnerability::InvulnKind::IronCurtain
+                })
+        })
+}
+
 fn near_center_ic_isolation_armed(
     damage_events: &[EntityDamageEvent],
     entities: &EntityStore,
     current_tick: u64,
 ) -> bool {
-    damage_events.iter().any(|event| {
-        event.near_center_ic_isolation_eligible
-            && event.distance_leptons.is_some_and(|distance| distance < 85)
-            && entities.get(event.target_id).is_some_and(|target| {
-                has_active_area_invulnerability(target, current_tick)
-                    && target.invulnerability.as_ref().is_some_and(|state| {
-                        state.kind
-                            == crate::sim::superweapon::invulnerability::InvulnKind::IronCurtain
-                    })
-            })
-    })
+    damage_events
+        .iter()
+        .any(|event| event_arms_ic_isolation(event, entities, current_tick))
 }
 
 fn area_near_center_ic_isolation_armed(
@@ -2616,18 +2319,8 @@ fn area_near_center_ic_isolation_armed(
     current_tick: u64,
 ) -> bool {
     receivers.iter().any(|receiver| {
-        let combat_aoe::AreaDamageReceiver::Entity(event) = receiver else {
-            return false;
-        };
-        event.near_center_ic_isolation_eligible
-            && event.distance_leptons.is_some_and(|distance| distance < 85)
-            && entities.get(event.target_id).is_some_and(|target| {
-                has_active_area_invulnerability(target, current_tick)
-                    && target.invulnerability.as_ref().is_some_and(|state| {
-                        state.kind
-                            == crate::sim::superweapon::invulnerability::InvulnKind::IronCurtain
-                    })
-            })
+        matches!(receiver, combat_aoe::AreaDamageReceiver::Entity(event)
+            if event_arms_ic_isolation(event, entities, current_tick))
     })
 }
 
@@ -2646,21 +2339,12 @@ pub(crate) struct CombatEmit {
     /// Native-order ReceiveDamage calls, including raw area records.
     pub(crate) damage_events: Vec<combat_aoe::AreaDamageReceiver>,
     pub(crate) remove_attack: Vec<u64>,
-    /// (attacker_id, new_target_id)
-    pub(crate) retarget_events: Vec<(u64, u64)>,
     pub(crate) fire_events: Vec<SimFireEvent>,
-    pub(crate) reveal_events: Vec<RevealEvent>,
-    /// (id, burst_rem, burst_delay, rof_cd)
-    pub(crate) burst_updates: Vec<(u64, u8, u8, u16)>,
     /// aircraft that fired this tick
     pub(crate) ammo_deduct: Vec<u64>,
-    /// building IDs to advance fire index
-    pub(crate) garrison_advance: Vec<u64>,
-    pub(crate) pending_infantry_updates: Vec<(u64, Option<PendingInfantryFire>)>,
-    pub(crate) animation_switches: Vec<(u64, SequenceKind)>,
     /// Native `CurrentWeaponNumber` writes emitted by live weapon selection.
     /// The per-attacker host commits these before that attack's receivers run.
-    pub(crate) current_weapon_updates: Vec<(u64, u8, InternedId)>,
+    pub(crate) current_weapon_updates: Vec<(u64, u8)>,
     /// Per-Unit post-Foot Facing slot output — captured at Phase-2 entry before
     /// current-frame attacker damage; that Unit's own explicit retarget/remove
     /// may replace it. Applied post-batch by `unit_post::apply_unit_facing`.
@@ -2677,40 +2361,17 @@ pub(crate) struct CombatEmit {
     pub(crate) drain_links: Vec<(u64, u64)>,
 }
 
-fn projectile_impact_cell(impact: ProjectileCoord) -> (u16, u16, SimFixed, SimFixed, i32) {
-    let rx = impact.x.div_euclid(256).clamp(0, i32::from(u16::MAX)) as u16;
-    let ry = impact.y.div_euclid(256).clamp(0, i32::from(u16::MAX)) as u16;
+pub(crate) fn projectile_impact_cell(
+    impact: ProjectileCoord,
+) -> (u16, u16, SimFixed, SimFixed, i32) {
+    let rx = crate::util::lepton::lepton_to_cell(impact.x).clamp(0, i32::from(u16::MAX)) as u16;
+    let ry = crate::util::lepton::lepton_to_cell(impact.y).clamp(0, i32::from(u16::MAX)) as u16;
     (
         rx,
         ry,
         SimFixed::from_num(impact.x.rem_euclid(256)),
         SimFixed::from_num(impact.y.rem_euclid(256)),
         impact.z,
-    )
-}
-
-// RESIDUAL (GSI-08.08): this existing child producer still rounds host-math
-// components to integers. The shared binary64 state migration does not certify
-// its angle, target coordinate getter, or native launch arithmetic.
-fn shrapnel_launch_velocity(
-    origin: ProjectileCoord,
-    target: ProjectileCoord,
-    speed: i32,
-) -> ProjectileVelocity {
-    let dx = f64::from(target.x - origin.x);
-    let dy = f64::from(target.y - origin.y);
-    let length = dx.hypot(dy);
-    let angle = 0.7853262558535721_f64;
-    let horizontal = f64::from(speed) * angle.cos();
-    let (unit_x, unit_y) = if length == 0.0 {
-        (1.0, 0.0)
-    } else {
-        (dx / length, dy / length)
-    };
-    ProjectileVelocity::new(
-        (unit_x * horizontal).round_ties_even() as i32,
-        (unit_y * horizontal).round_ties_even() as i32,
-        (f64::from(speed) * angle.sin()).round_ties_even() as i32,
     )
 }
 
@@ -2723,6 +2384,7 @@ fn emit_projectile_shrapnel(
     terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
     house_alliances: &HouseAllianceMap,
     scenario_rng: &mut SimRng,
+    native_unique_ids: &mut Option<crate::sim::native_identity::NativeUniqueIdCursor>,
     out: &mut CombatEmit,
 ) {
     let Some(parent_weapon) = rules.weapon(interner.resolve(detonation.payload.weapon)) else {
@@ -2757,12 +2419,10 @@ fn emit_projectile_shrapnel(
     };
 
     let target_position = match detonation.target {
+        // `0x0046A370`: the Target's GetCoords (vt+0x48).
         ProjectileTarget::Entity(id) => entities.get(id).map(|entity| {
-            ProjectileCoord::new(
-                i32::from(entity.position.rx) * 256 + entity.position.sub_x.to_num::<i32>(),
-                i32::from(entity.position.ry) * 256 + entity.position.sub_y.to_num::<i32>(),
-                i32::from(entity.position.z) * crate::util::lepton::GROUND_LEVEL_HEIGHT_LEPTONS,
-            )
+            let coord = crate::sim::movement::ground_pose::object_get_coords(entity, terrain);
+            ProjectileCoord::new(coord.x, coord.y, coord.z)
         }),
         ProjectileTarget::Cell { rx, ry } => {
             Some(crate::sim::projectile::cell_target_coord(terrain, rx, ry))
@@ -2886,6 +2546,8 @@ fn emit_projectile_shrapnel(
     }
 
     for (target, captured_target_coord) in targets {
+        // The random-cell children (captured) launch through the second branch.
+        let random_cell = captured_target_coord.is_some();
         let target_coord = if let Some(captured) = captured_target_coord {
             captured
         } else {
@@ -2894,12 +2556,11 @@ fn emit_projectile_shrapnel(
                     let Some(entity) = entities.get(id) else {
                         continue;
                     };
-                    ProjectileCoord::new(
-                        i32::from(entity.position.rx) * 256 + entity.position.sub_x.to_num::<i32>(),
-                        i32::from(entity.position.ry) * 256 + entity.position.sub_y.to_num::<i32>(),
-                        i32::from(entity.position.z)
-                            * crate::util::lepton::GROUND_LEVEL_HEIGHT_LEPTONS,
-                    )
+                    // `0x0046A614`: the object's GetCoords (vt+0x48), a
+                    // building's foundation center (`0x00447AC0`).
+                    let coord =
+                        crate::sim::movement::ground_pose::object_get_coords(entity, terrain);
+                    ProjectileCoord::new(coord.x, coord.y, coord.z)
                 }
                 ProjectileTarget::Cell { rx, ry } => {
                     crate::sim::projectile::cell_target_coord(terrain, rx, ry)
@@ -2912,22 +2573,32 @@ fn emit_projectile_shrapnel(
                     .unwrap_or(ProjectileCoord::new(0, 0, 0)),
             }
         };
+        let native_unique_id =
+            crate::sim::native_identity::NativeUniqueIdCursor::assign_runtime(native_unique_ids);
         out.projectile_spawns.push(ProjectileSpawn {
+            native_unique_id,
+            line_trail: crate::sim::projectile::ProjectileLineTrail::from_type(
+                child_projectile,
+                rules.general.line_trail_color_override,
+            ),
+            flat: child_projectile.flat,
             source_id: detonation.source_id,
             origin: detonation.impact,
             target,
             initial_target_position: target_coord,
-            payload: ProjectilePayload {
-                base_damage: child_weapon.damage,
-                warhead: interner.intern(child_warhead_name),
-                weapon: interner.intern(child_weapon_name),
-                owner: detonation.payload.owner,
-            },
+            payload: ProjectilePayload::new(
+                child_weapon.damage,
+                interner.intern(child_warhead_name),
+                interner.intern(child_weapon_name),
+            ),
             speed_leptons_per_frame: child_weapon.speed.clamp(1, i32::from(u16::MAX)) as u16,
-            velocity: shrapnel_launch_velocity(detonation.impact, target_coord, child_weapon.speed),
+            velocity: crate::sim::projectile::launch::shrapnel_launch_velocity(
+                detonation.impact,
+                target_coord,
+                child_weapon.speed,
+                random_cell,
+            ),
             // Child launch owner: BulletClass::Shrapnel @ 0x0046A310.
-            // The upstream vector producer remains open; flight now uses the
-            // same persistent binary64 state and live gravity consumer.
             trajectory: ProjectileTrajectory::Ballistic,
             guidance: None,
             visual: ProjectileVisualState::new(
@@ -2952,6 +2623,7 @@ fn emit_projectile_shrapnel(
                 inaccurate: child_projectile.inaccurate,
                 floater: child_projectile.floater,
                 elasticity_bits: child_projectile.elasticity.to_bits(),
+                arcing: child_projectile.arcing,
             },
         });
     }
@@ -2973,13 +2645,9 @@ pub(crate) struct LogicProjectileCommit {
 pub(crate) fn build_attacker_snapshot(
     entity: &GameEntity,
     target: TargetKind,
-    cooldown_ticks: u16,
-    burst_remaining: u8,
-    burst_delay_ticks: u8,
-    pending_infantry_fire: Option<PendingInfantryFire>,
-    pending_building_fire: Option<PendingBuildingFire>,
     garrison: Option<GarrisonSnapshot>,
 ) -> AttackerSnapshot {
+    let infantry_pose = entity.infantry_sprite_pose();
     AttackerSnapshot {
         stable_id: entity.stable_id(),
         owner: entity.owner(),
@@ -2992,75 +2660,22 @@ pub(crate) fn build_attacker_snapshot(
         sub_x: entity.position.sub_x,
         sub_y: entity.position.sub_y,
         type_id: entity.type_ref(),
-        facing: entity.facing,
-        veterancy: entity.veterancy,
-        cooldown_ticks,
-        animation_sequence: entity.animation.as_ref().map(|a| a.sequence),
-        animation_frame: entity.animation.as_ref().map(|a| a.frame_index),
-        is_prone: entity
-            .infantry
-            .as_ref()
-            .is_some_and(|infantry| infantry.is_prone),
+        veterancy: entity.veterancy(),
+        infantry_doing: infantry_pose.map(|(doing, _)| doing),
         is_fully_deployed: entity.is_fully_deployed(),
         has_movement: entity.movement_target.is_some(),
-        pending_infantry_fire,
-        pending_building_fire,
         barrel_facing: entity.barrel_facing,
         hull_facing: entity.body_facing,
-        turret_rotation_latch: entity.turret_rotation_latch,
-        burst_remaining,
-        burst_delay_ticks,
         weapon_override: entity.weapon_override,
+        in_open_transport: entity.passenger_role.in_open_transport(),
         garrison,
         scan_mission: threat_range::scan_mission_for(entity),
+        building_shot: None,
     }
 }
 
-/// Veterancy at or above this counts as veteran for the score award.
-const VETERAN_VETERANCY: u16 = 100;
-/// Veterancy at or above this counts as elite for the score award.
-const ELITE_VETERANCY: u16 = 200;
-
-/// Score value destroying `victim` is worth, before the allied-victim zeroing the
-/// caller applies.
-///
-/// gamemd's kill-record step asks the victim's type for its value and that
-/// accessor returns the type's **`Cost=`** — the same field production charges —
-/// doubled at veteran and tripled at elite.
-///
-/// It is emphatically NOT `Points=`. `Points=` parses into its own type field
-/// that nothing in the binary ever reads back: the only references are the
-/// constructor zeroing it, the INI store, and the type-checksum walk. It is
-/// dormant Tiberian Sun legacy in YR, so this engine does not parse it at all.
-/// The two are not even proportional — a Rhino is `Cost=900 / Points=25` while a
-/// GI is `200 / 10` — so using `Points=` both shrinks the column and reorders the
-/// table.
-///
-/// gamemd passes the victim's house so its cost bonuses apply on top. This engine
-/// models no per-house cost modifier anywhere — production charges the raw
-/// `Cost=` too — so the award is the raw cost, consistent with what the player
-/// was actually charged. UNCHECKED against the native bonus set.
-pub(crate) fn score_award_for_victim(victim: Option<&ObjectType>, veterancy: u16) -> i32 {
-    let cost = victim.map_or(0, |obj| obj.cost);
-    if cost <= 0 {
-        return 0;
-    }
-    let multiplier = if veterancy >= ELITE_VETERANCY {
-        3
-    } else if veterancy >= VETERAN_VETERANCY {
-        2
-    } else {
-        1
-    };
-    cost.saturating_mul(multiplier)
-}
-
-/// Resolve and pay one kill's veterancy award.
-///
-/// gamemd-derived: `TechnoClass::Record_The_Kill @ 0x00702D40`. The award is the
-/// victim's cost, zeroed when the two houses are allied and otherwise doubled
-/// for a veteran victim or tripled for an elite one; the recipient's own cost
-/// then divides it inside `VeterancyClass::Add @ 0x0074FF50`.
+/// Pay one kill's veterancy award ([`record_the_kill`]'s `points`); the
+/// recipient's own cost divides it inside `VeterancyClass::Add @ 0x0074FF50`.
 ///
 /// Who receives it is the native redirection chain at
 /// `0x00702E9D..0x00702FF0`, in this order (`EDI` is the killer):
@@ -3076,94 +2691,72 @@ pub(crate) fn score_award_for_victim(victim: Option<&ObjectType>, veterancy: u16
 ///    (`0x00702F31..0x00702F96`); stock `V3ROCKET`/`DMISL`/`CMISL` are
 ///    `Trainable=no, MissileSpawn=yes`, which is how a V3 promotes.
 /// 4. else an occupied Building (`vtable+0x400`, RTTI 6) → the occupant at
-///    the building's fire index (`+0x688[+0x69C]`, `0x00702F98..0x00702FEA`).
-///    NOT MODELLED: it needs a `Trainable=no` occupiable type, and every stock
-///    `CanBeOccupied=yes` section leaves `Trainable=` at its default of yes,
-///    so branch 2 pays the BUILDING in stock and the occupant never promotes.
+///    the building's fire index (`+0x688[+0x69C]`, `0x00702F98..0x00702FEA`),
+///    with no `Trainable=` test on it. A BuildingType is untrainable by
+///    default (constructor `0x0045E42E`) and no retail occupiable type sets
+///    the key, so every garrison kill lands here: its occupants promote, the
+///    building never does. FireAt has already advanced the index past the
+///    shooter (`0x006FF031..0x006FF085`) when its bullet kills, so with
+///    several occupants the NEXT one in line is paid. (VERA's line runs in
+///    reverse entry order: see `passenger::PassengerCargo`.)
 /// 5. else nobody.
 ///
-/// RESIDUAL — the costs on both sides are `TechnoTypeClass::GetActualCost`
-/// (vtable `+0x84`) evaluated with the VICTIM's house (`0x00702ED1`,
-/// `0x00702F13`, `0x00702F77`, `0x00702FD4`), not the bare `Cost=`. Stock
-/// countries author no cost multipliers, so the two agree in every unmodded
-/// match; a mod with per-country cost mults diverges. Frequency: zero in
-/// stock.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn award_kill_experience(
+/// Every cost on both sides is the type's Cost_Of for the VICTIM's house
+/// (`victim_house`; `0x00702ED1`, `0x00702F13`, `0x00702F77`, `0x00702FD4`).
+fn award_kill_experience(
     entities: &mut EntityStore,
     rules: &RuleSet,
     interner: &StringInterner,
-    alliances: &HouseAllianceMap,
     killer_id: u64,
     victim_id: u64,
+    points: i32,
+    victim_house: Option<&HouseCostFactors>,
 ) {
     if killer_id == RAD_NO_ATTACKER || killer_id == victim_id {
         return;
     }
-    // `Record_The_Kill` reads the VICTIM type's `DontScore=` byte (`+0xC9F`) at
-    // 0x00702E4E and returns before the rank multiplier, before the accumulator
-    // and before the score add. Stock authors it on `SLAV`, `V3ROCKET`, `DMISL`
-    // and `CMISL` — the last three are the V3, Dreadnought and Boomer missiles,
-    // shot down by AA in most matches, so without this gate every intercepted
-    // missile promotes the interceptor.
-    let Some((victim_cost, victim_rank, victim_owner)) = entities
-        .get(victim_id)
-        .filter(|victim| !victim.dont_score)
-        .map(|victim| {
-            (
-                rules
-                    .object(interner.resolve(victim.type_ref()))
-                    .map_or(0, |obj| obj.cost),
-                self::veterancy::rank_of(victim.veterancy_raw),
-                victim.owner(),
-            )
-        })
-    else {
-        return;
-    };
+    let cost_of = |object: &ObjectType| rules.cost_of(object, victim_house);
     let Some(killer) = entities.get(killer_id) else {
         return;
     };
     let Some(killer_type) = rules.object(interner.resolve(killer.type_ref())) else {
         return;
     };
-    let killer_owner = killer.owner();
     let trainable_cost = |id: u64| -> Option<(u64, i32)> {
         let object = rules.object(interner.resolve(entities.get(id)?.type_ref()))?;
-        object.trainable.then_some((id, object.cost))
+        object.trainable.then_some((id, cost_of(object)))
     };
     // Branch 1: a passenger firing from an OpenTopped transport pays its
-    // transporter. `passenger_role.Inside` plus the transport's `OpenTopped=`
-    // is the `+0x82`/`+0x11C` pair.
-    let open_transporter = match killer.passenger_role {
-        crate::sim::passenger::PassengerRole::Inside { transport_id } => entities
-            .get(transport_id)
-            .and_then(|transport| rules.object(interner.resolve(transport.type_ref())))
-            .is_some_and(|transport_type| transport_type.open_topped)
-            .then_some(transport_id),
-        _ => None,
-    };
+    // transporter (the `+0x82`/`+0x11C` pair).
+    let open_transporter = killer.passenger_role.open_transport_id();
     let recipient = if let Some(transporter) = open_transporter.and_then(trainable_cost) {
         Some(transporter)
     } else if killer_type.trainable {
         // Branch 2: the killer itself.
-        Some((killer_id, killer_type.cost))
+        Some((killer_id, cost_of(killer_type)))
     } else if killer_type.missile_spawn {
         // Branch 3: a spawned missile pays its launcher.
         killer.spawn_owner_id.and_then(trainable_cost)
     } else {
-        // Branch 4 (garrison occupant) is stock-unreachable — see above.
-        None
+        // Branch 4: an occupied building pays the occupant at its fire index.
+        killer
+            .passenger_role
+            .cargo()
+            .filter(|cargo| {
+                killer.category == EntityCategory::Structure
+                    && killer_type.can_be_occupied
+                    && killer_type.can_occupy_fire
+                    && !cargo.is_empty()
+            })
+            .map(|cargo| {
+                cargo.passengers[usize::from(cargo.garrison_fire_index) % cargo.passengers.len()]
+            })
+            .and_then(|occupant| {
+                let occupant_type =
+                    rules.object(interner.resolve(entities.get(occupant)?.type_ref()))?;
+                Some((occupant, cost_of(occupant_type)))
+            })
     };
-    // `0x00702E64` loads the KILLER's house and calls `HouseClass::IsAlly @
-    // 0x004F9A90`, which reads only the asker's own ally bitfield — a one-way
-    // test, not the symmetric OR most "don't shoot me" call sites want.
-    let allied = crate::map::houses::is_allied_with(
-        alliances,
-        interner.resolve(killer_owner),
-        interner.resolve(victim_owner),
-    );
-    let points = self::veterancy::kill_award_points(victim_cost, victim_rank, allied);
     let Some((recipient_id, recipient_cost)) = recipient else {
         return;
     };
@@ -3179,73 +2772,135 @@ pub(crate) fn award_kill_experience(
     }
 }
 
-/// Record who destroyed `victim`, at the instant it happened.
+/// `TechnoClass::Record_The_Kill @ 0x00702D40` for `victim_id`, destroyed by
+/// `killer_id` (none for a death without an attacker) and credited to
+/// `killer_owner`: the kill and score record, then the experience award
+/// ([`award_kill_experience`]). Every cost it reads is Cost_Of for the victim's
+/// house, which it loads once (`0x00702D61`). One award feeds both the score
+/// (`0x0070300F`) and the experience: the victim's cost, zero when the
+/// killer's house is allied with the victim, else doubled for a veteran or
+/// tripled for an elite victim, from the rank it died at. It is not
+/// `Points=`, which gamemd parses but never reads back (TS legacy).
 ///
-/// Every lethal path funnels through here so there is one capture rather than a
-/// recording mechanism per death cause. Call it immediately after zeroing a
-/// victim's health, with the house that should be credited.
-///
-/// No-ops unless the victim is actually at zero health, and the first writer
-/// wins within one fatal transaction. A qualifying PostMortem callback consumes
-/// and clears this deferred-UnInit latch before restoring the object, so a later
-/// independent lethal transaction can attribute freshly. The award is resolved
-/// here because the rules are in hand and the veterancy is still the value the
-/// object died at.
-///
-/// Routed today: the projectile/damage-event loop, death-explosion area damage,
-/// and crushing. Spawner missiles arrive through the damage loop with the firer
-/// set to the launching object, so they credit the launcher's house; if the
-/// launcher itself dies during the missile's flight the firer no longer resolves
-/// and that kill goes uncredited.
+/// Every lethal path calls it at the instant of the kill, while the victim's
+/// veterancy is still the value it died at. The first credit wins within one
+/// fatal transaction; a qualifying PostMortem callback consumes and clears
+/// that deferred-UnInit latch before restoring the object, so a later
+/// independent lethal transaction can attribute freshly. Spawner missiles
+/// credit their launcher's house; if the launcher dies during the missile's
+/// flight, the kill goes uncredited.
 ///
 /// NOT routed yet, because each site would need a `&RuleSet` threaded into a
-/// function that does not take one: the Iron Curtain and Genetic Mutator infantry
-/// kills, aircraft self-destruct, passengers dying with their transport
-/// (`world::lifecycle`) or with a collapsing bridge, and passengers ejected by a
-/// sell. Those victims book a Loss with no matching Kill.
-pub(crate) fn capture_kill_credit(
-    victim: &mut crate::sim::game_entity::GameEntity,
+/// function that does not take one: the Iron Curtain and Genetic Mutator
+/// infantry kills, aircraft self-destruct, passengers dying with their
+/// transport (`world::lifecycle`) or with a collapsing bridge, and passengers
+/// ejected by a sell. Those victims book a Loss with no matching Kill.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_the_kill(
+    entities: &mut EntityStore,
+    houses: &BTreeMap<InternedId, HouseState>,
+    interner: &StringInterner,
+    alliances: &HouseAllianceMap,
+    victim_id: u64,
+    killer_id: Option<u64>,
     killer_owner: Option<InternedId>,
-    rules: &crate::rules::ruleset::RuleSet,
-    interner: &crate::sim::intern::StringInterner,
+    rules: &RuleSet,
 ) {
-    // `DontScore=` victims are invisible to the score screen entirely. gamemd
-    // returns on this byte before any of its bookkeeping, so the kill and the
-    // points are both suppressed here and the loss is suppressed at the
-    // lifecycle recorder — the two halves of that one native early return.
+    let Some(victim) = entities.get(victim_id) else {
+        return;
+    };
+    // `DontScore=` (`+0xC9F`) returns before any bookkeeping; the lifecycle
+    // recorder suppresses the loss half of the same early return. Stock sets
+    // it on `SLAV`, `V3ROCKET`, `DMISL` and `CMISL`: without it every missile
+    // shot down would promote its interceptor.
     if victim.dont_score {
         return;
     }
-    if victim.health.current != 0 || victim.killed_by.is_some() {
-        return;
-    }
-    let Some(killer_owner) = killer_owner else {
-        return;
-    };
-    victim.killed_by = Some(killer_owner);
-    victim.kill_award_points = score_award_for_victim(
-        rules.object(interner.resolve(victim.type_ref())),
-        victim.veterancy,
+    let victim_owner = victim.owner();
+    let victim_house = houses
+        .get(&victim_owner)
+        .map(crate::sim::house_state::HouseState::cost_factors);
+    let victim_cost = rules
+        .object(interner.resolve(victim.type_ref()))
+        .map_or(0, |object| rules.cost_of(object, victim_house.as_ref()));
+    // `0x00702E64` asks the killer's house `HouseClass::IsAlly @ 0x004F9A90`,
+    // which reads only the asker's own ally bits: a one-way test.
+    let asker = killer_id
+        .and_then(|id| entities.get(id))
+        .map(|killer| killer.owner())
+        .or(killer_owner);
+    let allied = asker.is_some_and(|asker| {
+        crate::map::houses::is_allied_with(
+            alliances,
+            interner.resolve(asker),
+            interner.resolve(victim_owner),
+        )
+    });
+    let points = self::veterancy::kill_award_points(
+        victim_cost,
+        self::veterancy::rank_of(victim.veterancy_raw),
+        allied,
     );
+    if let (Some(killer_owner), Some(victim)) = (killer_owner, entities.get_mut(victim_id)) {
+        record_kill_credit(victim, killer_owner, points);
+    }
+    if let Some(killer_id) = killer_id {
+        award_kill_experience(
+            entities,
+            rules,
+            interner,
+            killer_id,
+            victim_id,
+            points,
+            victim_house.as_ref(),
+        );
+    }
 }
 
-/// Squared distance in leptons between two positions (sub-cell precise).
-///
-/// Uses i64 arithmetic to avoid overflow on large maps — a 200-cell lepton
-/// delta squared is ~2.6 billion, which exceeds i32 max (2.1 billion).
-/// 256 leptons = 1 cell.
-#[allow(dead_code)] // Convenience API — callers currently use lepton_distance_sq_raw.
-pub(crate) fn lepton_distance_sq(
-    a: &crate::sim::components::Position,
-    b: &crate::sim::components::Position,
-) -> i64 {
-    lepton_distance_sq_raw(a.rx, a.ry, a.sub_x, a.sub_y, b.rx, b.ry, b.sub_x, b.sub_y)
+impl crate::sim::world::Simulation {
+    /// [`record_the_kill`] in this world.
+    pub(crate) fn record_the_kill(
+        &mut self,
+        victim_id: u64,
+        killer_id: Option<u64>,
+        killer_owner: Option<InternedId>,
+        rules: &RuleSet,
+    ) {
+        record_the_kill(
+            &mut self.substrate.entities,
+            &self.houses,
+            &self.interner,
+            &self.house_alliances,
+            victim_id,
+            killer_id,
+            killer_owner,
+            rules,
+        );
+    }
+}
+
+/// `Record_The_Kill`'s kill and score half: the first credit within one fatal
+/// transaction keeps its house and award for the destruction record
+/// (`record_destruction_once`), which books them. A Chrono Legionnaire's erase
+/// calls vtable `+0xE0` on a target it removes at full health
+/// (`TemporalClass::Update @ 0x0071AAC4`, then UnInit); the destruction record
+/// books the loss for a victim credited here, as for one at zero health.
+fn record_kill_credit(
+    victim: &mut crate::sim::game_entity::GameEntity,
+    killer_owner: InternedId,
+    points: i32,
+) {
+    if victim.killed_by.is_some() {
+        return;
+    }
+    victim.killed_by = Some(killer_owner);
+    victim.kill_award_points = points;
 }
 
 /// Squared distance in leptons from raw coordinates.
 ///
-/// Same as `lepton_distance_sq` but takes individual fields instead of
-/// `&Position`, for use with snapshots where positions are destructured.
+/// Takes individual fields rather than a `&Position`, for use with snapshots
+/// where positions are destructured.
 pub(crate) fn lepton_distance_sq_raw(
     ax_cell: u16,
     ay_cell: u16,
@@ -3268,7 +2923,7 @@ pub(crate) fn lepton_distance_sq_raw(
 /// Check if a squared lepton distance is within weapon range.
 ///
 /// Converts weapon range from cells to leptons (×256) before squaring.
-/// Uses i64 to match `lepton_distance_sq()` output.
+/// Uses i64 to match `lepton_distance_sq_raw()` output.
 ///
 /// The scale runs on the fixed-point bits, not through `to_num`, because
 /// `CCINIClass::ReadRange` 0x00474620 multiplies BEFORE truncating: a
@@ -3336,69 +2991,7 @@ pub(crate) fn is_within_range_leptons(dist_sq_leptons: i64, range_cells: SimFixe
     dist_sq_leptons <= range_sq
 }
 
-/// The end-of-burst reload, from `TechnoClass::GetROF @ 0x006FCFA0`.
-///
-/// gamemd-derived: the full-ROF branch computes
-/// `ftol(ROF * house difficulty ROF + Random::RandomRanged(0, 2))`. `ROF=` is
-/// already a native frame count, and the jitter is an ADDED integer, not a
-/// scale — a shot's reload is `ROF`, `ROF + 1` or `ROF + 2`. The draw is
-/// unconditional on this branch, so it must stay in the same slice as the
-/// mid-burst draw or the scenario stream shifts twice.
-///
-/// The `VeteranROF=` arm follows in `veteran_rof_frames`.
-///
-/// RESIDUAL (GSI-08.05) — two arms of the native function are still absent.
-/// - The per-house difficulty multiplier. Native scales `ROF` by the owning
-///   house's difficulty ROF before the truncation; VERA parses no
-///   `[Easy]/[Normal]/[Difficult] ROF=` and plumbs no per-house difficulty to
-///   this site. Frequency today: zero — every house in VERA is Normal, whose
-///   stock value is `1.0`, and there is no AI opponent to carry another.
-///   It becomes ±20% on every weapon in the game the moment a difficulty other
-///   than Normal can reach a house.
-/// - `RadialFireSegments=` (`TechnoTypeClass+0x6A4`) is not parsed. One stock
-///   author, `[AEGIS]`, which is buildable in an ordinary skirmish: native
-///   replaces the launch direction with
-///   `body facing + (PI * counter / segments - PI / 2)`, cycling a counter at
-///   `TechnoClass+0x43C`. Player effect: the Aegis Cruiser fires straight at
-///   one target instead of sweeping its flak arc. Frequency: every Aegis
-///   engagement in an Allied naval match.
-/// - Downstream risk: both change firing cadence or direction, so each moves
-///   combat-timing fixtures and the pinned replay hash.
-fn rof_to_cooldown_frames(rof_frames: i32, scenario_rng: &mut SimRng) -> u16 {
-    let jitter = scenario_rng.next_range_u32_inclusive(0, 2) as i32;
-    rof_frames.saturating_add(jitter).clamp(1, u16::MAX as i32) as u16
-}
-
-/// The `VeteranROF=` arm of `TechnoClass::GetROF @ 0x006FCFA0`.
-///
-/// gamemd-derived: `0x006FD0E2..0x006FD14C` — the inline `HasWeaponAbility(4)`
-/// (veteran byte `+0x2A0`, elite byte `+0x2B2`) selects
-/// `ftol(rof * Rules.VeteranROF)` (`FILD; FMUL [Rules+0x690]; ftol`) on the
-/// already-jittered integer. Applied ONCE — there is no `EliteROF` key in the
-/// binary. Stock `0.6` turns the elite Grizzly's 50..=52 into 30, 30, 31.
-///
-/// The `.max(1)` is VERA-internal: native stores whatever `ftol` yields, and
-/// a zero reload is only reachable with `ROF=1`/`ROF=0` weapons, which no
-/// stock type authors; it keeps the existing floor `rof_to_cooldown_frames`
-/// applies (gamemd equivalent UNCHECKED).
-fn veteran_rof_frames(
-    rof_ticks: u16,
-    rank: self::veterancy::VeterancyRank,
-    object: &ObjectType,
-    veteran_rof: f64,
-) -> u16 {
-    self::veterancy::scale_if_ability(
-        i32::from(rof_ticks),
-        rank,
-        object,
-        crate::rules::object_type::Ability::Rof,
-        veteran_rof,
-    )
-    .clamp(1, i32::from(u16::MAX)) as u16
-}
-
 pub(crate) use self::combat_targeting::acquire_best_target_for_entity;
-pub use self::combat_targeting::tick_retaliation;
 /// The threat mask an acquisition callsite pushes into
 /// `TechnoClass::Greatest_Threat @ 0x006F8DF0`, plus the passive block's own
 /// derivation of it. Re-exported because the mask is chosen by the mission
@@ -3406,14 +2999,12 @@ pub use self::combat_targeting::tick_retaliation;
 pub use self::threat_range::ScanMission;
 pub(crate) use self::threat_range::scan_mission_for;
 
-/// Impact-height tests: a shot that lands on a ground cell must take that
-/// cell's terrain floor height, not a constant. Kept inline because they pin
-/// `attack_impact_z` and the single-impact-coordinate wiring that lives in
-/// this file.
+/// Ordinary launch-height, resolved impact presentation and damage-effect
+/// wiring. Bridge Cell+58 launch and +48/+58 impact comparisons use the native
+/// oracle cases in `bridge_launch_tests` and `world::projectile_collision`.
 #[cfg(test)]
 mod impact_height_tests {
     use super::*;
-    use crate::map::bridge_facts::{BRIDGE_FLAG_STRUCTURAL, BridgeCellFacts};
     use crate::map::resolved_terrain::{ResolvedTerrainCell, ResolvedTerrainGrid};
     use crate::rules::ini_parser::IniFile;
     use crate::sim::intern::test_interner;
@@ -3425,25 +3016,17 @@ mod impact_height_tests {
     const RAISED_LEVEL: u8 = 2;
 
     #[test]
-    fn gsi_04_11_refinery_survivor_requests_follow_native_sentinel_offsets() {
-        let mut requests = Vec::new();
-        append_building_smudge_requests(&mut requests, 10, 20, 3, "3x3Refinery");
+    fn gsi_04_11_refinery_survivor_cells_follow_native_sentinel_offsets() {
         let SmudgeSpawnRequest::BuildingCenter {
             foundation_w,
             foundation_h,
             ..
-        } = &requests[0]
+        } = building_center_smudge_request(10, 20, 3, "3x3Refinery")
         else {
-            panic!("first request must be the destruction-center mark");
+            panic!("the destruction-center mark");
         };
-        assert_eq!((*foundation_w, *foundation_h), (3, 3));
-        let survivor_cells: Vec<_> = requests[1..]
-            .iter()
-            .map(|request| match request {
-                SmudgeSpawnRequest::BuildingSurvivor { cell_rx, cell_ry } => (*cell_rx, *cell_ry),
-                _ => panic!("remaining requests must be survivor marks"),
-            })
-            .collect();
+        assert_eq!((foundation_w, foundation_h), (3, 3));
+        let survivor_cells = crate::sim::crew_survival::foundation_cells(10, 20, "3x3Refinery");
         assert_eq!(
             survivor_cells,
             vec![
@@ -3461,7 +3044,7 @@ mod impact_height_tests {
     }
 
     #[test]
-    fn gsi_04_11_fatal_infantry_special_anim_emits_effect_and_smudge_request() {
+    fn gsi_04_11_fatal_infantry_special_anim_emits_effect_at_the_body_height() {
         let mut interner = test_interner();
         let general = crate::rules::ruleset::GeneralRules::default();
         let cases = [
@@ -3478,7 +3061,6 @@ mod impact_height_tests {
         ];
         for (inf_death, expected_name) in cases {
             let mut effects = Vec::new();
-            let mut smudges = Vec::new();
             emit_infantry_death_anim(
                 &general,
                 inf_death,
@@ -3490,105 +3072,143 @@ mod impact_height_tests {
                 208,
                 &mut interner,
                 &mut effects,
-                &mut smudges,
             );
             let Some(expected_name) = expected_name else {
                 assert!(effects.is_empty(), "InfDeath {inf_death}");
-                assert!(smudges.is_empty(), "InfDeath {inf_death}");
                 continue;
             };
             assert_eq!(effects.len(), 1, "InfDeath {inf_death}");
-            assert_eq!(smudges.len(), 1, "InfDeath {inf_death}");
             assert_eq!(interner.resolve(effects[0].shp_name), expected_name);
-            assert_eq!((effects[0].rx, effects[0].ry, effects[0].z), (7, 8, 2));
-            let SmudgeSpawnRequest::Anim {
-                anim_name,
-                rx,
-                ry,
-                sub_x,
-                sub_y,
-                world_z_leptons,
-            } = &smudges[0]
-            else {
-                panic!("special death effect must run the Anim smudge start path");
-            };
-            assert_eq!(interner.resolve(*anim_name), expected_name);
             assert_eq!(
                 (
-                    *rx,
-                    *ry,
-                    sub_x.to_num::<i32>(),
-                    sub_y.to_num::<i32>(),
-                    *world_z_leptons,
+                    effects[0].rx,
+                    effects[0].ry,
+                    effects[0].z,
+                    effects[0].world_z
                 ),
-                (7, 8, 64, 192, 208)
+                (7, 8, 2, 208)
             );
+        }
+    }
+
+    /// `TechnoClass::ReceiveDamage`'s metallic debris loop
+    /// (`0x007024E0..0x0070256B`, `tools/spatial_oracle/bridge_debris_producer.py`,
+    /// executed with the whole AnimClass constructor per piece) on retail
+    /// rules and art: each piece's `MetallicDebris=` pick, then that piece's
+    /// constructor draws, before the next pick. The budget is pinned (equal
+    /// bounds take no draw) so the rows start at the loop.
+    #[test]
+    fn debris_pieces_construct_between_picks_as_the_original() {
+        let Some(ini) = crate::rules::retail_ini_fixture::retail_ini("rulesmd.ini") else {
+            return;
+        };
+        let Some(art) = crate::rules::retail_ini_fixture::retail_ini("artmd.ini") else {
+            return;
+        };
+        let mut rules =
+            crate::rules::ruleset::RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
+        rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
+        let golden: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tools/spatial_oracle/bridge_debris_producer.json"
+        ))
+        .unwrap();
+        let rows = golden["death_loop"].as_array().unwrap();
+        assert_eq!(rows.len(), 12);
+        for row in rows {
+            let input = &row["input"];
+            let pieces = input["pieces"].as_i64().unwrap() as i32;
+            let mut object_type = rules.object("MTNK").unwrap().clone();
+            object_type.max_debris = pieces + 1;
+            object_type.min_debris = pieces;
+            object_type.debris_types.clear();
+            object_type.debris_anims.clear();
+            let coord = input["coord"].as_array().unwrap();
+            let at = |i: usize| coord[i].as_i64().unwrap() as i32;
+            let mut interner = test_interner();
+            let owner = interner.intern("Americans");
+            let mut rng = SimRng::new(input["seed"].as_u64().unwrap());
+            assert_eq!(rng.native_state_hex(), row["rng_before"].as_str().unwrap());
+            let mut voxels = Vec::new();
+            let mut effects = Vec::new();
+            let mut native_ids =
+                Some(crate::sim::native_identity::NativeUniqueIdCursor::for_synthetic_simulation());
+            throw_debris_for_death(
+                &object_type,
+                &rules,
+                &mut interner,
+                owner,
+                (at(0), at(1)),
+                at(2),
+                &mut rng,
+                &mut native_ids,
+                &mut voxels,
+                &mut effects,
+            );
+            assert_eq!(
+                rng.native_state_hex(),
+                row["rng_after"].as_str().unwrap(),
+                "{input}"
+            );
+            let names: Vec<String> = row["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|event| event["call"] == "anim_ctor")
+                .map(|event| event["type"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(
+                effects
+                    .iter()
+                    .map(|effect| interner.resolve(effect.shp_name).to_string())
+                    .collect::<Vec<_>>(),
+                names,
+                "{input}"
+            );
+            for (effect, native) in effects.iter().zip(row["anims"].as_array().unwrap()) {
+                let spawn = effect
+                    .death
+                    .expect("a debris piece is an exact construction");
+                let location = native["location"].as_array().unwrap();
+                assert_eq!(
+                    [spawn.coord.x, spawn.coord.y, spawn.coord.z],
+                    std::array::from_fn(|i| location[i].as_i64().unwrap() as i32),
+                    "{input}"
+                );
+                let draws = spawn
+                    .draws
+                    .expect("the resolved type supplies constructor draws");
+                if native["is_bouncing"].as_u64().unwrap() == 0 {
+                    assert!(
+                        draws.bounce.is_none(),
+                        "unread retail D is not a Bouncer: {input}"
+                    );
+                    assert_eq!(native["type"], "D");
+                    continue;
+                }
+                let body = draws.bounce.expect("an ART-read bouncing chunk");
+                let bits = |key: &str, i: usize| native["bounce"][key][i].as_u64().unwrap() as u32;
+                for axis in 0..3 {
+                    assert_eq!(body.position[axis].bits(), bits("position_bits", axis));
+                    assert_eq!(body.velocity[axis].bits(), bits("velocity_bits", axis));
+                }
+            }
         }
     }
 
     fn terrain_cell(rx: u16, ry: u16, level: u8) -> ResolvedTerrainCell {
         ResolvedTerrainCell {
-            rx,
-            ry,
-            source_tile_index: 0,
-            source_sub_tile: 0,
-            final_tile_index: 0,
-            final_sub_tile: 0,
-            is_wood_bridge_repair_tile: false,
             level,
             filled_clear: true,
-            tileset_index: Some(0),
-            land_type: 0,
-            yr_cell_land_type: 0,
-            slope_type: 0,
-            template_height: 0,
-            render_offset_x: 0,
-            render_offset_y: 0,
             terrain_class: Default::default(),
-            speed_costs: Default::default(),
-            is_water: false,
-            is_cliff_like: false,
-            is_rough: false,
-            is_road: false,
-            height_in_pixels: 0,
-            variant: 0,
-            has_ramp: false,
-            canonical_ramp: None,
-            ground_walk_blocked: false,
-            terrain_object_blocks: false,
-            terrain_object_occupation: None,
-            overlay_blocks: false,
-            overlay_zone_type: None,
-            outside_playfield: false,
-            zone_type: 0,
-            base_ground_walk_blocked: false,
-            base_build_blocked: false,
-            base_land_type: 0,
-            base_yr_cell_land_type: 0,
-            base_terrain_class: Default::default(),
-            base_speed_costs: Default::default(),
-            build_blocked: false,
-            has_bridge_deck: false,
-            bridge_walkable: false,
-            bridge_transition: false,
-            bridge_deck_level: 0,
-            bridge_layer: None,
-            bridge_facts: BridgeCellFacts::default(),
-            tube_index: None,
-            radar_left: [0; 3],
-            radar_right: [0; 3],
             accepts_smudge: true,
-            allows_tiberium: false,
-            has_damaged_data: false,
-            bridgehead_anchor_class_at_load: None,
+            ..crate::map::resolved_terrain::test_flat_cell(rx, ry)
         }
     }
 
     pub(super) fn terrain_at_level(level: u8) -> ResolvedTerrainGrid {
-        let cells: Vec<ResolvedTerrainCell> = (0..TEST_GRID)
-            .flat_map(|ry| (0..TEST_GRID).map(move |rx| terrain_cell(rx, ry, level)))
-            .collect();
-        ResolvedTerrainGrid::from_cells(TEST_GRID, TEST_GRID, cells)
+        crate::map::resolved_terrain::test_grid(TEST_GRID, TEST_GRID, |rx, ry| {
+            terrain_cell(rx, ry, level)
+        })
     }
 
     /// Armed tank plus a warhead that emits an impact animation, so a
@@ -3609,74 +3229,34 @@ mod impact_height_tests {
     }
 
     #[test]
-    fn cell_target_impact_z_is_the_cells_terrain_floor() {
+    fn ordinary_cell_launch_uses_terrain_ground_leptons() {
         let entities = EntityStore::new();
         let flat = terrain_at_level(0);
         let raised = terrain_at_level(RAISED_LEVEL);
 
         assert_eq!(
-            attack_impact_z(TargetKind::Cell(7, 9), &entities, Some(&raised)),
-            i32::from(RAISED_LEVEL),
-            "a ground-cell impact takes the cell's terrain floor height; a \
-             constant 0 here renders the impact one whole tile below the ground \
-             it landed on"
+            attack_world_z_leptons(TargetKind::Cell(7, 9), &entities, Some(&raised)),
+            208,
+            "a non-bridge Cell+58 aim is its ground surface in leptons"
         );
         assert_eq!(
-            attack_impact_z(TargetKind::Cell(7, 9), &entities, Some(&flat)),
+            attack_world_z_leptons(TargetKind::Cell(7, 9), &entities, Some(&flat)),
             0,
             "level-0 ground is still zero — that is the value, not the fallback"
         );
         assert_eq!(
-            attack_impact_z(TargetKind::Cell(7, 9), &entities, None),
+            attack_world_z_leptons(TargetKind::Cell(7, 9), &entities, None),
             0,
             "no loaded map means no cell to read"
         );
         assert_eq!(
-            attack_impact_z(
+            attack_world_z_leptons(
                 TargetKind::Cell(TEST_GRID + 5, TEST_GRID + 5),
                 &entities,
                 Some(&raised)
             ),
             0,
-            "VERA API boundary, no native equivalent: an off-map cell is not a \
-             targetable cell in the first place, so this pins only that the \
-             helper stays total, not a game rule about off-map heights"
-        );
-    }
-
-    #[test]
-    fn cell_target_impact_z_is_the_ground_floor_not_the_bridge_aim_point() {
-        // A structural bridge cell whose ground floor is RAISED_LEVEL and whose
-        // deck sits a full deck height above it.
-        let mut cells: Vec<ResolvedTerrainCell> = (0..TEST_GRID)
-            .flat_map(|ry| (0..TEST_GRID).map(move |rx| terrain_cell(rx, ry, RAISED_LEVEL)))
-            .collect();
-        let idx = 9 * TEST_GRID as usize + 7;
-        cells[idx].bridge_facts = BridgeCellFacts {
-            raw_flags: BRIDGE_FLAG_STRUCTURAL,
-            ..BridgeCellFacts::default()
-        };
-        cells[idx].has_bridge_deck = true;
-        cells[idx].bridge_walkable = true;
-        cells[idx].bridge_deck_level = RAISED_LEVEL + 4;
-        let terrain = ResolvedTerrainGrid::from_cells(TEST_GRID, TEST_GRID, cells);
-
-        let entities = EntityStore::new();
-        assert_eq!(
-            attack_impact_z(TargetKind::Cell(7, 9), &entities, Some(&terrain)),
-            i32::from(RAISED_LEVEL),
-            "the impact coordinate is the projectile's own location clamped to \
-             the cell's ground height, not the bridge-aware aim point — the \
-             deck-adding accessor is reached only for a live object target. The \
-             deck term is a recorded residual on `attack_impact_z`, not an \
-             oversight"
-        );
-        assert_ne!(
-            attack_impact_z(TargetKind::Cell(7, 9), &entities, Some(&terrain)),
-            combat_aoe::bridge_adjusted_impact_z(Some(&terrain), 7, 9),
-            "the aim-point helper is a different quantity; if these two ever \
-             agree, the deck residual was closed and the bridge-damage Z gate \
-             has to be settled in the same change"
+            "mapless test boundary; production fallback targets retain the shared CellClass"
         );
     }
 
@@ -3707,25 +3287,26 @@ mod impact_height_tests {
     }
 
     #[test]
-    fn entity_target_impact_z_still_reads_the_entity_height() {
+    fn entity_launch_uses_the_object_coordinate() {
         let mut entities = EntityStore::new();
         let mut on_deck = GameEntity::test_default(1, "MTNK", "Americans", 7, 9);
         on_deck.position.z = 6;
+        on_deck.on_bridge = true;
         entities.insert(on_deck);
         let terrain = terrain_at_level(RAISED_LEVEL);
 
         assert_eq!(
-            attack_impact_z(TargetKind::Entity(1), &entities, Some(&terrain)),
-            6,
-            "an object target still contributes its own height, terrain or not"
+            attack_world_z_leptons(TargetKind::Entity(1), &entities, Some(&terrain)),
+            624,
+            "the object-owned bridge layer raises its ground coordinate"
         );
         assert_eq!(
-            attack_impact_z(TargetKind::Entity(1), &entities, None),
-            6,
-            "entity height does not depend on the terrain grid"
+            attack_world_z_leptons(TargetKind::Entity(1), &entities, None),
+            624,
+            "the mapless fallback already includes the object layer"
         );
         assert_eq!(
-            attack_impact_z(TargetKind::Entity(404), &entities, Some(&terrain)),
+            attack_world_z_leptons(TargetKind::Entity(404), &entities, Some(&terrain)),
             0,
             "a vanished target contributes nothing"
         );
@@ -3733,7 +3314,10 @@ mod impact_height_tests {
 
     #[test]
     fn force_fire_on_raised_ground_places_the_explosion_at_the_terrain_height() {
-        let rules = impact_rules();
+        let mut rules = impact_rules();
+        rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(
+            &IniFile::from_str(""),
+        ));
         let mut terrain = terrain_at_level(RAISED_LEVEL);
         let mut store = EntityStore::new();
         // `test_interner` snapshots the thread-local, so the entity's type and
@@ -3743,11 +3327,11 @@ mod impact_height_tests {
         // native body gate compares (`UnitClass::GetFireError @ 0x00740FD0`
         // step 17). Face it south at the force-fire cell so this test measures
         // impact height, not turn-to-fire.
-        firer.facing = 128;
+        firer.body_facing.snap(0x8000, 0);
         store.insert(firer);
         let mut interner = test_interner();
         assert!(
-            issue_attack_cell_command(&mut store, 1, 5, 6, Some(&rules), &interner),
+            install_cell_attack_target_for_test(&mut store, 1, 5, 6, Some(&rules), &interner),
             "armed tank should accept a force-fire order on an adjacent cell"
         );
 
@@ -3760,7 +3344,6 @@ mod impact_height_tests {
             None,
             &BTreeMap::<InternedId, PowerState>::new(),
             None,
-            &mut BTreeMap::new(),
             None,
             None,
             Some(&mut terrain),
@@ -3773,14 +3356,14 @@ mod impact_height_tests {
         );
 
         let effect = result
-            .consequences
-            .effects()
-            .explosion_effects
+            .fixture_anims
             .first()
-            .expect("force-fire should emit the warhead's impact animation");
-        assert_eq!((effect.rx, effect.ry), (5, 6));
+            .expect("force-fire should construct the warhead's impact animation");
+        let (rx, ry, _, _, _) = effect.world_coord.to_cell_sub_z();
+        assert_eq!((rx, ry), (5, 6));
         assert_eq!(
-            effect.z, RAISED_LEVEL,
+            effect.world_coord.z,
+            i32::from(RAISED_LEVEL) * 104,
             "the impact animation is placed at the impact height; a constant 0 \
              draws it 15 screen pixels per level below the ground it hit"
         );

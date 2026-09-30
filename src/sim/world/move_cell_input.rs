@@ -7,10 +7,15 @@ use crate::sim::components::DriveCoord;
 use crate::sim::movement::ground_pose;
 
 impl Simulation {
-    /// Resolve the ordinary grounded Walk Cell-click corridor before event
-    /// encoding. None leaves other actor/caller families on their existing
-    /// input adapter; it is not permission to reinterpret a decoded Move.
-    pub(crate) fn ordinary_ground_walk_cell_input(
+    /// Resolve the ordinary grounded Foot Cell-click corridor (4DE1D0) before
+    /// event encoding, for Walk infantry and Drive/Ship Units. The receiver is
+    /// class-generic: Unit differs only in +70 (0x7404B0, action 1 for these
+    /// grounded non-Teleporter movers) and What_Am_I, and reads its locomotor
+    /// only through Foot+4C (0x4DBDF0). Unit reach: BandBox_LeftUp -> 4AE750 ->
+    /// 738910 -> 4D7D50 -> 4D806F -> 4DE1D0 (static chain). None leaves other
+    /// actor/caller families on their existing input adapter; it is not
+    /// permission to reinterpret a decoded Move.
+    pub(crate) fn ordinary_ground_foot_cell_input(
         &self,
         viewer: crate::sim::intern::InternedId,
         id: u64,
@@ -19,7 +24,16 @@ impl Simulation {
     ) -> Option<Result<Option<(u16, u16)>, String>> {
         let entity = self.substrate.entities.get(id)?;
         let object = rules.object(self.interner.resolve(entity.type_ref()))?;
-        if entity.locomotor.as_ref()?.active_kind() != LocomotorKind::Walk
+        let receiver = match entity.locomotor.as_ref()?.active_kind() {
+            LocomotorKind::Walk => true,
+            LocomotorKind::Drive | LocomotorKind::Ship => {
+                entity.category == crate::map::entities::EntityCategory::Unit
+            }
+            _ => false,
+        };
+        //Teleporter (+CD4) needs the per-object +70 action; Subterranean is
+        //the +D2C type term (ReadINI 71607E..8A) this port does not model.
+        if !receiver
             || object.teleporter
             || object.jumpjet
             || object.movement_zone == MovementZone::Subterranean
@@ -36,8 +50,8 @@ impl Simulation {
         let current = ground_pose::position_world_coord(&entity.position);
         let cells = NativeCellQuery::isolated(terrain);
         //Classify the bounded ordinary-ground arm without changing canonical
-        //query state. High/falling Walk and non-Walk input retain their prior
-        //adapter pending their own +70 action selection contract.
+        //query state. High/falling movers retain their prior adapter pending
+        //their own +70 action selection contract.
         let ground = match query_ground(&cells, current) {
             Ok(ground) => ground,
             Err(error) => return Some(Err(error)),
@@ -46,14 +60,14 @@ impl Simulation {
             .z
             .wrapping_sub(ground)
             .wrapping_sub(if entity.on_bridge {
-                BRIDGE_HEIGHT_DELTA_LEPTONS as i32
+                BRIDGE_DECK_HEIGHT_LEPTONS
             } else {
                 0
             });
         if entity.lifecycle.cell_marked && height >= 2 * GROUND_LEVEL_HEIGHT_LEPTONS {
             return None;
         }
-        let coordinate = match self.infantry_navigation_coordinate(id) {
+        let coordinate = match self.foot_navigation_coordinate(id) {
             Ok(coordinate) => coordinate,
             Err(error) => return Some(Err(error)),
         };
@@ -65,14 +79,14 @@ impl Simulation {
                 "input Dummy visibility outside the constructor-derived domain".into(),
             ));
         }
-        Some(resolve_walk_cell_click(
+        Some(resolve_foot_cell_click(
             &cells,
             zones,
             &self.substrate.raw_cell_occupation,
             bounds,
             size,
             self.session.binary_frame,
-            &WalkCellClick {
+            &FootCellClick {
                 clicked: (clicked.0 as i16, clicked.1 as i16),
                 action: 1,
                 current,
@@ -102,56 +116,6 @@ impl Simulation {
             },
         ))
     }
-
-    /// Foot4DBDF0 (+4C), including its TubeClass exit override. This query
-    /// precedes the hut/alive/navigation gates, even for pending Uninit rows.
-    pub(crate) fn infantry_navigation_coordinate(&self, id: u64) -> Result<DriveCoord, String> {
-        let e = self
-            .substrate
-            .entities
-            .get(id)
-            .ok_or("Infantry coordinate owner disappeared")?;
-        if let Some(state) = e.low_bridge_tube_state {
-            // Walk75B3FC/Drive4B1380 install Foot+684; Infantry51BA8D
-            // retires it. The query reads Tube+28 exit, not the path cursor.
-            let tube = self
-                .resolved_terrain
-                .as_ref()
-                .and_then(|terrain| terrain.tube(state.tube_id))
-                .ok_or("Infantry coordinate references a missing active TubeClass")?;
-            return Ok(DriveCoord {
-                x: i32::from(tube.exit.0 as i16) * 256 + 128,
-                y: i32::from(tube.exit.1 as i16) * 256 + 128,
-                z: 0,
-            });
-        }
-        let loco = e
-            .locomotor
-            .as_ref()
-            .ok_or("Infantry coordinate requires the active Infantry locomotor")?;
-        let raw = ground_pose::position_world_coord(&e.position);
-        match loco.active_kind() {
-            LocomotorKind::Walk => Ok(loco.step_head().unwrap_or(raw)),
-            // Teleport+18/55ACA0 copies linked owner+9C exactly.
-            LocomotorKind::Teleport => Ok(raw),
-            LocomotorKind::Jumpjet => {
-                let state = loco
-                    .jumpjet_runtime()
-                    .ok_or("Jumpjet payload does not match active class")?;
-                let coordinate = state.coordinate(raw);
-                Ok(
-                    if coordinate == crate::sim::movement::jumpjet_movement::JumpjetRuntime::NULL {
-                        raw
-                    } else {
-                        coordinate
-                    },
-                )
-            }
-            other => Err(format!(
-                "Infantry coordinate requires the {other:?} +18 receiver"
-            )),
-        }
-    }
 }
 
 use crate::map::cell_index::NativeCellIdentity;
@@ -165,11 +129,11 @@ use crate::sim::find_nearby_cell::{
 use crate::sim::movement::ground_pose::query_ground_height as query_ground;
 use crate::sim::occupancy::RawCellOccupationGrid;
 use crate::sim::pathfinding::zone_map::{ZoneGrid, ZoneQueryCell};
-use crate::util::lepton::{BRIDGE_HEIGHT_DELTA_LEPTONS, GROUND_LEVEL_HEIGHT_LEPTONS};
+use crate::util::lepton::{BRIDGE_DECK_HEIGHT_LEPTONS, GROUND_LEVEL_HEIGHT_LEPTONS};
 
-/// Values read by the ordinary Infantry/Walk4DE1D0 input receiver. The +70
-/// action has already been selected at the input boundary; it is not a mission.
-struct WalkCellClick {
+/// Values read by the ordinary Foot 4DE1D0 input receiver. The +70 action
+/// has already been selected at the input boundary; it is not a mission.
+struct FootCellClick {
     clicked: (i16, i16),
     action: u32,
     current: DriveCoord,
@@ -196,46 +160,23 @@ fn clicked_coordinate(
     point.z = query_ground(cells, point)?;
     //4DE242/4DE38C are separate Map calls after the height query.
     if cells.flags(cells.lookup_world(point.x, point.y)) & 0x100 != 0 {
-        point.z = point.z.wrapping_add(BRIDGE_HEIGHT_DELTA_LEPTONS as i32);
+        point.z = point.z.wrapping_add(BRIDGE_DECK_HEIGHT_LEPTONS);
     }
     Ok(point)
 }
 
-///586360 queries the projected Cell's ground-open bit. Keep its odd-height
-///481810(3) lookup conditional and use the first receiver's own coordinates.
-fn coordinate_is_shrouded(
-    cells: &NativeCellQuery<'_>,
-    point: DriveCoord,
-    open: &impl Fn(NativeCellIdentity) -> Result<bool, String>,
-) -> Result<bool, String> {
-    let level = point.z / GROUND_LEVEL_HEIGHT_LEPTONS;
-    let shift = level / 2 + i32::from(level & 1 != 0);
-    let first = cells.lookup((
-        ((point.x / 256) as i16).wrapping_sub(shift as i16),
-        ((point.y / 256) as i16).wrapping_sub(shift as i16),
-    ));
-    if open(first)? {
-        return Ok(false);
-    }
-    if level & 1 != 0 {
-        let (x, y) = cells.coord(first);
-        let next = cells.lookup((x.wrapping_add(1), y.wrapping_add(1)));
-        return open(next).map(|open| !open);
-    }
-    Ok(true)
-}
-
-/// Original4DE1D0 under the ordinary Walk type/actor gates. No A* search and
-/// no entity/mission/navigation mutation occurs here. Native comparisons live
-/// in tools/spatial_oracle/walk_move_admission (original input action supplied).
-fn resolve_walk_cell_click(
+/// Original 4DE1D0 under the ordinary grounded Foot type/actor gates. No A*
+/// search and no entity/mission/navigation mutation occurs here. Native
+/// comparisons live in tools/spatial_oracle/walk_move_admission (Infantry and
+/// Unit/Drive receivers, original input action supplied).
+fn resolve_foot_cell_click(
     cells: &NativeCellQuery<'_>,
     zones: &ZoneGrid,
     raw: &RawCellOccupationGrid,
     bounds: PlayfieldBounds,
     size: (i32, i32),
     frame: u32,
-    click: &WalkCellClick,
+    click: &FootCellClick,
     open: impl Fn(NativeCellIdentity) -> Result<bool, String>,
 ) -> Result<Option<(u16, u16)>, String> {
     let terrain = cells.terrain();
@@ -246,7 +187,7 @@ fn resolve_walk_cell_click(
         Some(cells),
     );
     let point = clicked_coordinate(cells, click.clicked)?;
-    if !click.move_to_shroud && coordinate_is_shrouded(cells, point, &open)? {
+    if !click.move_to_shroud && crate::sim::vision::coordinate_is_shrouded(cells, point, &open)? {
         return Ok(None);
     }
     let source = cells.lookup_world(click.coordinate.x, click.coordinate.y);
@@ -258,7 +199,7 @@ fn resolve_walk_cell_click(
             .z
             .wrapping_sub(query_ground(cells, click.current)?)
             .wrapping_sub(if click.on_bridge {
-                BRIDGE_HEIGHT_DELTA_LEPTONS as i32
+                BRIDGE_DECK_HEIGHT_LEPTONS
             } else {
                 0
             });
@@ -267,7 +208,7 @@ fn resolve_walk_cell_click(
         false
     };
     if click.movement_zone == MovementZone::Subterranean {
-        return Err("Subterranean input receiver is outside the ordinary Walk domain".into());
+        return Err("Subterranean input receiver is outside the ordinary Foot domain".into());
     }
     let special = high_flying || click.jumpjet_type;
     let source_bridge = ground_pose::navigation_should_be_on_bridge(
@@ -278,7 +219,7 @@ fn resolve_walk_cell_click(
         click.in_tube,
     )?;
     let point = clicked_coordinate(cells, click.clicked)?;
-    let shrouded = coordinate_is_shrouded(cells, point, &open)?;
+    let shrouded = crate::sim::vision::coordinate_is_shrouded(cells, point, &open)?;
     let unrestricted = special && click.action == 2;
     if !unrestricted && in_playfield && !shrouded {
         if special || (click.teleporter && click.action != 2) {
@@ -310,7 +251,7 @@ fn resolve_walk_cell_click(
     } else {
         let p = cells.coord(source);
         let zone = zones
-            .get_path_zone_id_native_in_query(
+            .get_zone_id_native_in_query(
                 terrain,
                 (p.0 as u16, p.1 as u16),
                 click.movement_zone,
@@ -318,8 +259,8 @@ fn resolve_walk_cell_click(
                 Some(cells),
             )
             .ok_or("input FNPC source lacks native zone topology")?;
-        //Native DWORD-1 disables the comparison; raw WORDFFFF does not.
-        u16::try_from(zone).ok()
+        // FNPC disables the comparison for DWORD -1 and raw 0xFFFF alike.
+        Some(zone)
     };
     Ok(find_nearby_passable_cell(
         (i32::from(click.clicked.0), i32::from(click.clicked.1)),

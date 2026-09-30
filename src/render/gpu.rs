@@ -27,7 +27,7 @@ use winit::window::Window;
 /// many pre-rendered sprites fit. 16384 is what current desktop GPUs offer; asking for
 /// more would fail on hardware that could otherwise run the game, and the request is
 /// clamped to the adapter's own maximum anyway.
-const MAX_USEFUL_TEXTURE_DIM: u32 = 16_384;
+pub(crate) const MAX_USEFUL_TEXTURE_DIM: u32 = 16_384;
 
 /// Borrowed, serialization-ready identity of the adapter selected for this GPU
 /// context. This is observation only: it mirrors the immutable `AdapterInfo`
@@ -167,6 +167,19 @@ impl GpuContext {
                 downlevel.flags
             );
         }
+        // TerrainDrawRenderer reduces ordered read-only Bullet destinations
+        // with fragment atomics. Reject an insufficient downlevel adapter here
+        // rather than panicking later during render-pipeline validation.
+        if !downlevel
+            .flags
+            .contains(wgpu::DownlevelFlags::FRAGMENT_WRITABLE_STORAGE)
+        {
+            bail!(
+                "native projectile drawing requires fragment-writable storage, \
+                 adapter downlevel flags are {:?}",
+                downlevel.flags
+            );
+        }
         let surface_format: wgpu::TextureFormat = surface_caps
             .formats
             .iter()
@@ -244,58 +257,6 @@ impl GpuContext {
             view_formats: &[],
         });
         texture.create_view(&Default::default())
-    }
-
-    /// Render a single frame with the given clear color (RGB, 0.0–1.0 range).
-    ///
-    /// This is the simplest possible render pass — just fills the screen with one color.
-    /// Used during early development to verify the GPU pipeline works.
-    /// Later replaced by actual terrain/sprite/UI rendering.
-    pub fn render_clear(&self, r: f64, g: f64, b: f64) -> Result<()> {
-        // Get the next framebuffer texture from the surface.
-        let output: wgpu::SurfaceTexture = self
-            .surface
-            .get_current_texture()
-            .context("Failed to get surface texture — surface may be lost")?;
-
-        // Create a view into the texture for the render pass.
-        let view: wgpu::TextureView = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        // Encode a render pass that clears the screen to our color.
-        let mut encoder: wgpu::CommandEncoder =
-            self.device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("Clear Encoder"),
-                });
-
-        {
-            // The render pass is scoped — it ends when _pass is dropped.
-            let _pass: wgpu::RenderPass<'_> =
-                encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("Clear Pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(wgpu::Color { r, g, b, a: 1.0 }),
-                            store: wgpu::StoreOp::Store,
-                        },
-                        // depth_slice is for 3D texture array layers — None for normal 2D rendering.
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                });
-        }
-
-        // Submit the encoded commands to the GPU and present the frame.
-        self.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
-
-        Ok(())
     }
 }
 

@@ -22,6 +22,8 @@ use crate::ui::game_screen::GameScreen;
 use crate::ui::main_menu_shell::MainMenuMovieBase;
 use crate::ui::shell::static_reveal::Kind1PaintWindow;
 
+mod movies;
+mod score;
 mod skirmish;
 pub(crate) use skirmish::PresentedShell;
 
@@ -29,6 +31,95 @@ pub(crate) const CAPTURE_FLAG: &str = "--shell-capture";
 const CHECKPOINT_MAIN_MENU_0XE2_STEADY: &str = "main-menu-0xe2-steady";
 const CHECKPOINT_MAIN_MENU_0XE2_ENTRY_SEQUENCE: &str = "main-menu-0xe2-entry-sequence";
 const CHECKPOINT_SKIRMISH_0X102_STEADY: &str = "skirmish-0x102-steady";
+const CHECKPOINT_MOVIES_0X101_STEADY: &str = "movies-0x101-steady";
+const CHECKPOINT_MAIN_MENU_0XE2_EXIT_CONFIRM: &str = "main-menu-0xe2-exit-confirm";
+const CHECKPOINT_MOVIE_LIST_0X129_STEADY: &str = "movie-list-0x129-steady";
+const CHECKPOINT_MOVIE_LIST_0X129_SELECTED: &str = "movie-list-0x129-selected";
+const CHECKPOINT_MOVIE_LIST_0X129_FULL: &str = "movie-list-0x129-full";
+const CHECKPOINT_MOVIE_LIST_0X129_FULL_DOWN2: &str = "movie-list-0x129-full-down2";
+const CHECKPOINT_MOVIE_LIST_0X129_BACK_FIRST_FRAME: &str = "movie-list-0x129-back-first-frame";
+const CHECKPOINT_CAMPAIGN_0X94_STEADY: &str = "campaign-0x94-steady";
+const CHECKPOINT_CAMPAIGN_0X94_SLIDER_LEFT: &str = "campaign-0x94-slider-left";
+const CHECKPOINT_CAMPAIGN_0X94_SLIDER_RIGHT: &str = "campaign-0x94-slider-right";
+/// The difficulty slider pressed at its left end and held with the pointer
+/// over Back: the slider keeps the mouse, so the status line keeps its help
+/// and Back stays unlit.
+const CHECKPOINT_CAMPAIGN_0X94_SLIDER_HELD: &str = "campaign-0x94-slider-held";
+const CHECKPOINT_CAMPAIGN_0X94_ENTRY_PREFIX: &str = "campaign-0x94-entry-tick-";
+const CHECKPOINT_LOAD_SAVED_GAME_0XB7_STEADY: &str = "load-saved-game-0xb7-steady";
+const CHECKPOINT_LOAD_SAVED_GAME_0XB7_ENTRY_PREFIX: &str = "load-saved-game-0xb7-entry-tick-";
+const CHECKPOINT_OPTIONS_0XD5_STEADY: &str = "options-0xd5-steady";
+const CHECKPOINT_MAIN_MENU_0XE2_NETWORK_BOUNCE: &str = "main-menu-0xe2-network-bounce";
+const CHECKPOINT_WOL_0X10E_STEADY: &str = "wol-0x10e-steady";
+const CHECKPOINT_WOL_0X10E_ENTRY_PREFIX: &str = "wol-0x10e-entry-tick-";
+const CHECKPOINT_WOL_0X10E_HOVER_QUICK_MATCH: &str = "wol-0x10e-hover-quick-match";
+const CHECKPOINT_WOL_0X10E_API_MISSING: &str = "wol-0x10e-api-missing";
+const CHECKPOINT_WOL_0X10E_BACK: &str = "wol-0x10e-back";
+/// Quick Match's centre at 800x600.
+const WOL_QUICK_MATCH_POINT: (i32, i32) = (720, 220);
+const CHECKPOINT_OPTIONS_0XD5_ENTRY_PREFIX: &str = "options-0xd5-entry-tick-";
+/// `options-0xd5-hover-<control>`: the pointer rests on a control (like the
+/// retail helper's hover capture) so the status line shows its help.
+const OPTIONS_0XD5_HOVER_CHECKPOINTS: [(&str, (i32, i32)); 3] = [
+    ("options-0xd5-hover-difficulty", (180, 214)),
+    ("options-0xd5-hover-tooltips", (175, 315)),
+    ("options-0xd5-hover-music", (140, 480)),
+];
+/// `skirmish-0x102-hover-<control>`: once `0x102` settles the pointer rests
+/// on a control, as in the retail stills `sk-hover-start.png` and
+/// `sk-hover-short.png`.
+const SKIRMISH_0X102_HOVER_CHECKPOINTS: [(&str, (i32, i32)); 2] = [
+    ("skirmish-0x102-hover-start", (720, 262)),
+    ("skirmish-0x102-hover-short-game", (110, 294)),
+];
+/// Slider press points of the retail comparison stills.
+const CAMPAIGN_SLIDER_LEFT_POINT: (i32, i32) = (190, 275);
+const CAMPAIGN_SLIDER_RIGHT_POINT: (i32, i32) = (440, 275);
+/// Back's centre at 800x600.
+const CAMPAIGN_BACK_POINT: (i32, i32) = (722, 556);
+const CHECKPOINT_CREDITS_ROLL_FRAME_PREFIX: &str = "credits-roll-frame-";
+const CHECKPOINT_SNEAK_PEEK_FRAME_PREFIX: &str = "sneak-peek-frame-";
+const CHECKPOINT_MAIN_MENU_0XE2_SLIDE_OUT_PREFIX: &str = "main-menu-0xe2-slide-out-tick-";
+const CHECKPOINT_MOVIE_LIST_0X129_SLIDE_OUT_PREFIX: &str = "movie-list-0x129-slide-out-tick-";
+const CHECKPOINT_SKIRMISH_0X102_BACK_SLIDE_OUT_PREFIX: &str = "skirmish-0x102-back-slide-out-tick-";
+const CHECKPOINT_SKIRMISH_0X102_ENTRY_PREFIX: &str = "skirmish-0x102-entry-tick-";
+const CHECKPOINT_SKIRMISH_0X6B_STEADY: &str = "skirmish-0x6b-steady";
+const CHECKPOINT_SKIRMISH_0X6B_ENTRY_PREFIX: &str = "skirmish-0x6b-entry-tick-";
+const CHECKPOINT_SKIRMISH_0X105_STEADY: &str = "skirmish-0x105-steady";
+const CHECKPOINT_SKIRMISH_0X105_ENTRY_PREFIX: &str = "skirmish-0x105-entry-tick-";
+/// Cancel on `0x105`, then `0x6B`'s entry slide held at one tick.
+const CHECKPOINT_SKIRMISH_0X105_CANCEL_PREFIX: &str = "skirmish-0x105-cancel-tick-";
+const CHECKPOINT_SKIRMISH_0X105_CANCEL_STEADY: &str = "skirmish-0x105-cancel-steady";
+const CHECKPOINT_SKIRMISH_0X105_USE_MAP: &str = "skirmish-0x105-use-map";
+const CHECKPOINT_SKIRMISH_0X105_SEED_BROWSER_RETURN: &str = "skirmish-0x105-seed-browser-return";
+/// Terrain Type's list open with the pointer below it on Map Size's face; the
+/// status line keeps Terrain Type's help (`ej-list-off.png`).
+const CHECKPOINT_SKIRMISH_0X105_LIST_OPEN: &str = "skirmish-0x105-list-open";
+/// Use Map with an AI row the random map cannot hold, then the eject box's
+/// Cancel (`0x6B` settled again) or OK (`0x102` settled with the map).
+const CHECKPOINT_SKIRMISH_0X105_EJECT_CANCEL: &str = "skirmish-0x105-eject-cancel";
+const CHECKPOINT_SKIRMISH_0X105_EJECT_OK: &str = "skirmish-0x105-eject-ok";
+/// The same route's eject box over no dialog (`ej-box.png`).
+const CHECKPOINT_SKIRMISH_0X105_EJECT_BOX: &str = "skirmish-0x105-eject-box";
+/// `skirmish-0x105-hover-<control>`: `0x105` settled with the pointer
+/// resting on a control, as in `rmg-hover-load.png` and
+/// `rmg-hover-surprise.png`.
+const SKIRMISH_0X105_HOVER_CHECKPOINTS: [(&str, (i32, i32)); 2] = [
+    ("skirmish-0x105-hover-load", (720, 262)),
+    ("skirmish-0x105-hover-surprise", (170, 430)),
+];
+const CHECKPOINT_SKIRMISH_0X102_CHOOSE_MAP_RETURN: &str = "skirmish-0x102-choose-map-return";
+const CHECKPOINT_SKIRMISH_START_BLANK: &str = "skirmish-start-blank";
+const CHECKPOINT_SKIRMISH_LOADING_FIRST_FRAME: &str = "skirmish-loading-first-frame";
+const CHECKPOINT_SKIRMISH_0X6B_EJECT_BOX: &str = "skirmish-0x6b-eject-box";
+const CHECKPOINT_SKIRMISH_AFTER_QUIT: &str = "skirmish-after-quit";
+const CHECKPOINT_SKIRMISH_DEFEAT_SCORE: &str = "skirmish-defeat-score";
+const CHECKPOINT_SKIRMISH_DEFEAT_CONTINUE: &str = "skirmish-defeat-continue";
+const CHECKPOINT_SCORE_0X108_STEADY: &str = "score-0x108-steady";
+const CHECKPOINT_SCORE_0X108_ENTRY_PREFIX: &str = "score-0x108-entry-tick-";
+const CHECKPOINT_SCORE_0X108_HOVER_CONTINUE: &str = "score-0x108-hover-continue";
+const CHECKPOINT_SCORE_0X108_LEAVE_CONTINUE: &str = "score-0x108-leave-continue";
+const CHECKPOINT_SCORE_0X108_SLIDE_OUT_PREFIX: &str = "score-0x108-slide-out-tick-";
 const EXPECTED_WIDTH: u32 = 800;
 const EXPECTED_HEIGHT: u32 = 600;
 const EXPECTED_CURSOR_X: u32 = 400;
@@ -42,8 +133,10 @@ const FRAME_FILE_NAME: &str = "frame.bgra";
 const ENTRY_SEQUENCE_FRAMES_FILE_NAME: &str = "frames.bgra";
 const MANIFEST_FILE_NAME: &str = "capture.json";
 const FRAME_BYTE_LENGTH: u64 = EXPECTED_WIDTH as u64 * EXPECTED_HEIGHT as u64 * 4;
-const ENTRY_SEQUENCE_BYTE_LENGTH: u64 =
-    FRAME_BYTE_LENGTH * crate::ui::shell::slide::MAIN_MENU_ENTRY_FRAME_COUNT as u64;
+/// Ticks of the `0xE2` entry slide at 800x600: 9 tile rows + 9 (`0x006071E0`).
+const ENTRY_SEQUENCE_FRAMES: u8 = 18;
+const ENTRY_SEQUENCE_TERMINAL_TICK: u8 = ENTRY_SEQUENCE_FRAMES - 1;
+const ENTRY_SEQUENCE_BYTE_LENGTH: u64 = FRAME_BYTE_LENGTH * ENTRY_SEQUENCE_FRAMES as u64;
 
 #[derive(Debug)]
 pub enum AppLaunchMode {
@@ -56,15 +149,300 @@ pub enum ShellCaptureCheckpoint {
     MainMenu0xE2Steady,
     MainMenu0xE2EntrySequence,
     Skirmish0x102Steady,
+    MoviesPage0x101Steady,
+    /// Exit Game on `0xE2`: after the teardown slide, the confirmation over
+    /// the empty shell backdrop (state 6).
+    MainMenu0xE2ExitConfirm,
+    MovieList0x129Steady,
+    MovieList0x129Selected,
+    /// All 17 movies unlocked (a scrollbar is shown), optionally after two
+    /// down-arrow presses.
+    MovieList0x129Full,
+    MovieList0x129FullDown2,
+    /// Back on the movie list: the first frame after its teardown slide,
+    /// which must already be the recreated `0x101`'s entry slide at tick 0.
+    MovieList0x129BackFirstFrame,
+    /// Single Player -> New Campaign: campaign selection `0x94` settled.
+    Campaign0x94Steady,
+    /// The same after a press on the difficulty slider's left or right end.
+    Campaign0x94SliderLeft,
+    Campaign0x94SliderRight,
+    /// A press on the slider held with the pointer over Back.
+    Campaign0x94SliderHeld,
+    /// Its entry slide held at one tick (`campaign-0x94-entry-tick-<N>`).
+    Campaign0x94Entry(u32),
+    /// Single Player -> Load Saved Game: `0xB7` settled. Needs a readable
+    /// save in the saves directory.
+    LoadSavedGame0xB7Steady,
+    /// Its entry slide held at one tick
+    /// (`load-saved-game-0xb7-entry-tick-<N>`).
+    LoadSavedGame0xB7Entry(u32),
+    /// Main Menu -> Options: `0xD5` settled.
+    Options0xD5Steady,
+    /// Network on `0xE2`: after its teardown slide and a new `0xE2`'s entry
+    /// slide, the settled main menu.
+    MainMenu0xE2NetworkBounce,
+    /// Main Menu -> Internet: `0x10E` settled.
+    Wol0x10ESteady,
+    /// Its entry slide held at one tick (`wol-0x10e-entry-tick-<N>`).
+    Wol0x10EEntry(u32),
+    /// Settled with the pointer on Quick Match.
+    Wol0x10EHoverQuickMatch,
+    /// My Information pressed: the `TXT_APIMISSING` box `0xD0`.
+    Wol0x10EApiMissing,
+    /// Main Menu pressed: the new `0xE2` settled.
+    Wol0x10EBack,
+    /// Its entry slide held at one tick (`options-0xd5-entry-tick-<N>`).
+    Options0xD5Entry(u32),
+    /// Settled with the pointer resting on a control
+    /// (`OPTIONS_0XD5_HOVER_CHECKPOINTS` index).
+    Options0xD5Hover(usize),
+    /// Show_Credits pinned at one roll frame (`credits-roll-frame-<N>`).
+    CreditsRollFrame(u64),
+    /// Sneak Peeks Play_Movie pinned at one video frame (`sneak-peek-frame-<N>`).
+    SneakPeekFrame(usize),
+    /// Exit Game on `0xE2`, its teardown slide held at one tick
+    /// (`main-menu-0xe2-slide-out-tick-<N>`).
+    MainMenu0xE2SlideOut(u32),
+    /// Back on the movie list, its teardown slide held at one tick
+    /// (`movie-list-0x129-slide-out-tick-<N>`).
+    MovieList0x129SlideOut(u32),
+    /// Back on Skirmish, its teardown slide held at one tick
+    /// (`skirmish-0x102-back-slide-out-tick-<N>`).
+    Skirmish0x102BackSlideOut(u32),
+    /// Skirmish opened from Single Player, its entry slide held at one tick
+    /// (`skirmish-0x102-entry-tick-<N>`).
+    Skirmish0x102Entry(u32),
+    /// Skirmish settled with the pointer resting on a control
+    /// (`SKIRMISH_0X102_HOVER_CHECKPOINTS` index).
+    Skirmish0x102Hover(usize),
+    /// Choose Map's Create Random Map: `0x105` settled.
+    Skirmish0x105Steady,
+    /// `0x105`'s entry slide held at one tick.
+    Skirmish0x105Entry(u32),
+    /// `0x105` settled with the pointer resting on a control
+    /// (`SKIRMISH_0X105_HOVER_CHECKPOINTS` index).
+    Skirmish0x105Hover(usize),
+    /// Cancel on `0x105`: `0x6B`'s entry slide held at one tick.
+    Skirmish0x105CancelEntry(u32),
+    /// Cancel on `0x105`: `0x6B` settled again.
+    Skirmish0x105CancelSteady,
+    /// Use Map on `0x105`: the map generates and `0x102` settles with it.
+    Skirmish0x105UseMap,
+    /// Save Map on `0x105` opens the seed browser over it; the browser's
+    /// Back uncovers `0x105`, which settles without an entry slide.
+    Skirmish0x105SeedBrowserReturn,
+    /// Terrain Type's list open on `0x105`, the pointer resting on a row.
+    Skirmish0x105ListOpen,
+    /// Use Map on `0x105` asks to eject AI players; the answer's dialog
+    /// settles (`CHECKPOINT_SKIRMISH_0X105_EJECT_*`).
+    Skirmish0x105Eject(crate::ui::skirmish_shell::EjectPromptButton),
+    /// The same route's eject box, unanswered.
+    Skirmish0x105EjectBox,
+    /// Choose Map `0x6B` settled after Skirmish's Choose Map.
+    Skirmish0x6BSteady,
+    /// Choose Map `0x6B`'s entry slide held at one tick
+    /// (`skirmish-0x6b-entry-tick-<N>`).
+    Skirmish0x6BEntry(u32),
+    /// Cancel on `0x6B`, then `0x102` settled after its new entry slide.
+    Skirmish0x102ChooseMapReturn,
+    /// Start Game on `0x102`: the black frame before the loading screen.
+    SkirmishStartBlank,
+    /// Start Game on `0x102`: the loading screen's first frame. The map load
+    /// then runs to the end before the process exits.
+    SkirmishLoadingFirstFrame,
+    /// Use Map on `0x6B`'s first map with AI rows that do not fit: the eject
+    /// box over the empty backdrop.
+    Skirmish0x6BEjectBox,
+    /// Start Game, a short game, Leave through the in-game abort: the new
+    /// `0x102` the shell resumes on, settled.
+    SkirmishAfterQuit,
+    /// Start Game, deploy the MCV and sell the Construction Yard (Short
+    /// Game): the score page after the real defeat, settled.
+    SkirmishDefeatScore,
+    /// The same, then Continue: the new `0x102`, settled.
+    SkirmishDefeatContinue,
+    /// The score dialog `0x108` with the retail comparison game's values,
+    /// settled.
+    Score0x108Steady,
+    /// Its entry slide held at one tick (`score-0x108-entry-tick-<N>`).
+    Score0x108Entry(u32),
+    /// Settled with the pointer on Continue.
+    Score0x108HoverContinue,
+    /// The pointer moved from Continue onto the bare art.
+    Score0x108LeaveContinue,
+    /// Continue pressed, its teardown slide held at one tick
+    /// (`score-0x108-slide-out-tick-<N>`).
+    Score0x108SlideOut(u32),
 }
 
 impl ShellCaptureCheckpoint {
     fn parse(value: &str) -> Result<Self> {
+        if let Some(frame) = value.strip_prefix(CHECKPOINT_CREDITS_ROLL_FRAME_PREFIX) {
+            let frame: u64 = frame
+                .parse()
+                .with_context(|| format!("credits roll frame is not an integer: {frame:?}"))?;
+            ensure!(frame > 0, "credits roll frames start at 1");
+            return Ok(Self::CreditsRollFrame(frame));
+        }
+        if let Some(frame) = value.strip_prefix(CHECKPOINT_SNEAK_PEEK_FRAME_PREFIX) {
+            let frame: usize = frame
+                .parse()
+                .with_context(|| format!("movie frame is not an integer: {frame:?}"))?;
+            return Ok(Self::SneakPeekFrame(frame));
+        }
+        for (prefix, kind, checkpoint) in [
+            (
+                CHECKPOINT_MAIN_MENU_0XE2_SLIDE_OUT_PREFIX,
+                ShellSlideKind::MainMenu,
+                Self::MainMenu0xE2SlideOut as fn(u32) -> Self,
+            ),
+            (
+                CHECKPOINT_MOVIE_LIST_0X129_SLIDE_OUT_PREFIX,
+                ShellSlideKind::MovieList,
+                Self::MovieList0x129SlideOut,
+            ),
+            (
+                CHECKPOINT_SKIRMISH_0X102_BACK_SLIDE_OUT_PREFIX,
+                ShellSlideKind::Skirmish,
+                Self::Skirmish0x102BackSlideOut,
+            ),
+            (
+                CHECKPOINT_SKIRMISH_0X102_ENTRY_PREFIX,
+                ShellSlideKind::Skirmish,
+                Self::Skirmish0x102Entry,
+            ),
+            (
+                CHECKPOINT_SKIRMISH_0X105_ENTRY_PREFIX,
+                ShellSlideKind::RandomMap,
+                Self::Skirmish0x105Entry,
+            ),
+            (
+                CHECKPOINT_SKIRMISH_0X105_CANCEL_PREFIX,
+                ShellSlideKind::ChooseMap,
+                Self::Skirmish0x105CancelEntry,
+            ),
+            (
+                CHECKPOINT_SKIRMISH_0X6B_ENTRY_PREFIX,
+                ShellSlideKind::ChooseMap,
+                Self::Skirmish0x6BEntry,
+            ),
+            (
+                CHECKPOINT_CAMPAIGN_0X94_ENTRY_PREFIX,
+                ShellSlideKind::Campaign,
+                Self::Campaign0x94Entry,
+            ),
+            (
+                CHECKPOINT_LOAD_SAVED_GAME_0XB7_ENTRY_PREFIX,
+                ShellSlideKind::LoadSavedGame,
+                Self::LoadSavedGame0xB7Entry,
+            ),
+            (
+                CHECKPOINT_OPTIONS_0XD5_ENTRY_PREFIX,
+                ShellSlideKind::Options,
+                Self::Options0xD5Entry,
+            ),
+            (
+                CHECKPOINT_WOL_0X10E_ENTRY_PREFIX,
+                ShellSlideKind::WolWelcome,
+                Self::Wol0x10EEntry,
+            ),
+            (
+                CHECKPOINT_SCORE_0X108_ENTRY_PREFIX,
+                ShellSlideKind::Score,
+                Self::Score0x108Entry,
+            ),
+            (
+                CHECKPOINT_SCORE_0X108_SLIDE_OUT_PREFIX,
+                ShellSlideKind::Score,
+                Self::Score0x108SlideOut,
+            ),
+        ] {
+            let Some(tick) = value.strip_prefix(prefix) else {
+                continue;
+            };
+            let tick: u32 = tick
+                .parse()
+                .with_context(|| format!("slide tick is not an integer: {tick:?}"))?;
+            // The slide shows ticks 0 up to its loop bound, exclusive: the
+            // panel's tile rows + 9 at the capture's 800x600.
+            let rows = crate::ui::shell::geom::right_panel_rects(
+                EXPECTED_WIDTH as i32,
+                EXPECTED_HEIGHT as i32,
+            )
+            .tile_count as u32;
+            let last = kind.column(rows).total_ticks() - 1;
+            ensure!(tick <= last, "{value}: the slide shows ticks 0..={last}");
+            return Ok(checkpoint(tick));
+        }
         match value {
             CHECKPOINT_MAIN_MENU_0XE2_STEADY => Ok(Self::MainMenu0xE2Steady),
             CHECKPOINT_MAIN_MENU_0XE2_ENTRY_SEQUENCE => Ok(Self::MainMenu0xE2EntrySequence),
             CHECKPOINT_SKIRMISH_0X102_STEADY => Ok(Self::Skirmish0x102Steady),
-            _ => bail!("unsupported shell-capture checkpoint {value:?}"),
+            CHECKPOINT_SKIRMISH_0X6B_STEADY => Ok(Self::Skirmish0x6BSteady),
+            CHECKPOINT_SKIRMISH_0X105_STEADY => Ok(Self::Skirmish0x105Steady),
+            CHECKPOINT_SKIRMISH_0X105_CANCEL_STEADY => Ok(Self::Skirmish0x105CancelSteady),
+            CHECKPOINT_SKIRMISH_0X105_USE_MAP => Ok(Self::Skirmish0x105UseMap),
+            CHECKPOINT_SKIRMISH_0X105_LIST_OPEN => Ok(Self::Skirmish0x105ListOpen),
+            CHECKPOINT_SKIRMISH_0X105_EJECT_BOX => Ok(Self::Skirmish0x105EjectBox),
+            CHECKPOINT_SKIRMISH_0X105_SEED_BROWSER_RETURN => {
+                Ok(Self::Skirmish0x105SeedBrowserReturn)
+            }
+            CHECKPOINT_SKIRMISH_0X105_EJECT_CANCEL => Ok(Self::Skirmish0x105Eject(
+                crate::ui::skirmish_shell::EjectPromptButton::Cancel,
+            )),
+            CHECKPOINT_SKIRMISH_0X105_EJECT_OK => Ok(Self::Skirmish0x105Eject(
+                crate::ui::skirmish_shell::EjectPromptButton::Ok,
+            )),
+            CHECKPOINT_SKIRMISH_0X102_CHOOSE_MAP_RETURN => Ok(Self::Skirmish0x102ChooseMapReturn),
+            CHECKPOINT_SKIRMISH_START_BLANK => Ok(Self::SkirmishStartBlank),
+            CHECKPOINT_SKIRMISH_LOADING_FIRST_FRAME => Ok(Self::SkirmishLoadingFirstFrame),
+            CHECKPOINT_SKIRMISH_0X6B_EJECT_BOX => Ok(Self::Skirmish0x6BEjectBox),
+            CHECKPOINT_SKIRMISH_AFTER_QUIT => Ok(Self::SkirmishAfterQuit),
+            CHECKPOINT_SKIRMISH_DEFEAT_SCORE => Ok(Self::SkirmishDefeatScore),
+            CHECKPOINT_SKIRMISH_DEFEAT_CONTINUE => Ok(Self::SkirmishDefeatContinue),
+            CHECKPOINT_SCORE_0X108_STEADY => Ok(Self::Score0x108Steady),
+            CHECKPOINT_SCORE_0X108_HOVER_CONTINUE => Ok(Self::Score0x108HoverContinue),
+            CHECKPOINT_SCORE_0X108_LEAVE_CONTINUE => Ok(Self::Score0x108LeaveContinue),
+            CHECKPOINT_MOVIES_0X101_STEADY => Ok(Self::MoviesPage0x101Steady),
+            CHECKPOINT_MAIN_MENU_0XE2_EXIT_CONFIRM => Ok(Self::MainMenu0xE2ExitConfirm),
+            CHECKPOINT_MOVIE_LIST_0X129_STEADY => Ok(Self::MovieList0x129Steady),
+            CHECKPOINT_MOVIE_LIST_0X129_SELECTED => Ok(Self::MovieList0x129Selected),
+            CHECKPOINT_MOVIE_LIST_0X129_FULL => Ok(Self::MovieList0x129Full),
+            CHECKPOINT_MOVIE_LIST_0X129_FULL_DOWN2 => Ok(Self::MovieList0x129FullDown2),
+            CHECKPOINT_MOVIE_LIST_0X129_BACK_FIRST_FRAME => Ok(Self::MovieList0x129BackFirstFrame),
+            CHECKPOINT_CAMPAIGN_0X94_STEADY => Ok(Self::Campaign0x94Steady),
+            CHECKPOINT_CAMPAIGN_0X94_SLIDER_LEFT => Ok(Self::Campaign0x94SliderLeft),
+            CHECKPOINT_CAMPAIGN_0X94_SLIDER_RIGHT => Ok(Self::Campaign0x94SliderRight),
+            CHECKPOINT_CAMPAIGN_0X94_SLIDER_HELD => Ok(Self::Campaign0x94SliderHeld),
+            CHECKPOINT_LOAD_SAVED_GAME_0XB7_STEADY => Ok(Self::LoadSavedGame0xB7Steady),
+            CHECKPOINT_OPTIONS_0XD5_STEADY => Ok(Self::Options0xD5Steady),
+            CHECKPOINT_MAIN_MENU_0XE2_NETWORK_BOUNCE => Ok(Self::MainMenu0xE2NetworkBounce),
+            CHECKPOINT_WOL_0X10E_STEADY => Ok(Self::Wol0x10ESteady),
+            CHECKPOINT_WOL_0X10E_HOVER_QUICK_MATCH => Ok(Self::Wol0x10EHoverQuickMatch),
+            CHECKPOINT_WOL_0X10E_API_MISSING => Ok(Self::Wol0x10EApiMissing),
+            CHECKPOINT_WOL_0X10E_BACK => Ok(Self::Wol0x10EBack),
+            _ => {
+                if let Some(index) = OPTIONS_0XD5_HOVER_CHECKPOINTS
+                    .iter()
+                    .position(|(name, _)| *name == value)
+                {
+                    return Ok(Self::Options0xD5Hover(index));
+                }
+                if let Some(index) = SKIRMISH_0X102_HOVER_CHECKPOINTS
+                    .iter()
+                    .position(|(name, _)| *name == value)
+                {
+                    return Ok(Self::Skirmish0x102Hover(index));
+                }
+                if let Some(index) = SKIRMISH_0X105_HOVER_CHECKPOINTS
+                    .iter()
+                    .position(|(name, _)| *name == value)
+                {
+                    return Ok(Self::Skirmish0x105Hover(index));
+                }
+                bail!("unsupported shell-capture checkpoint {value:?}")
+            }
         }
     }
 
@@ -73,7 +451,158 @@ impl ShellCaptureCheckpoint {
             Self::MainMenu0xE2Steady => CHECKPOINT_MAIN_MENU_0XE2_STEADY,
             Self::MainMenu0xE2EntrySequence => CHECKPOINT_MAIN_MENU_0XE2_ENTRY_SEQUENCE,
             Self::Skirmish0x102Steady => CHECKPOINT_SKIRMISH_0X102_STEADY,
+            Self::MoviesPage0x101Steady => CHECKPOINT_MOVIES_0X101_STEADY,
+            Self::MainMenu0xE2ExitConfirm => CHECKPOINT_MAIN_MENU_0XE2_EXIT_CONFIRM,
+            Self::MovieList0x129Steady => CHECKPOINT_MOVIE_LIST_0X129_STEADY,
+            Self::MovieList0x129Selected => CHECKPOINT_MOVIE_LIST_0X129_SELECTED,
+            Self::MovieList0x129Full => CHECKPOINT_MOVIE_LIST_0X129_FULL,
+            Self::MovieList0x129FullDown2 => CHECKPOINT_MOVIE_LIST_0X129_FULL_DOWN2,
+            Self::MovieList0x129BackFirstFrame => CHECKPOINT_MOVIE_LIST_0X129_BACK_FIRST_FRAME,
+            Self::Campaign0x94Steady => CHECKPOINT_CAMPAIGN_0X94_STEADY,
+            Self::Campaign0x94SliderLeft => CHECKPOINT_CAMPAIGN_0X94_SLIDER_LEFT,
+            Self::Campaign0x94SliderRight => CHECKPOINT_CAMPAIGN_0X94_SLIDER_RIGHT,
+            Self::Campaign0x94SliderHeld => CHECKPOINT_CAMPAIGN_0X94_SLIDER_HELD,
+            Self::Campaign0x94Entry(_) => "campaign-0x94-entry",
+            Self::LoadSavedGame0xB7Steady => CHECKPOINT_LOAD_SAVED_GAME_0XB7_STEADY,
+            Self::LoadSavedGame0xB7Entry(_) => "load-saved-game-0xb7-entry",
+            Self::Options0xD5Steady => CHECKPOINT_OPTIONS_0XD5_STEADY,
+            Self::MainMenu0xE2NetworkBounce => CHECKPOINT_MAIN_MENU_0XE2_NETWORK_BOUNCE,
+            Self::Wol0x10ESteady => CHECKPOINT_WOL_0X10E_STEADY,
+            Self::Wol0x10EEntry(_) => "wol-0x10e-entry",
+            Self::Wol0x10EHoverQuickMatch => CHECKPOINT_WOL_0X10E_HOVER_QUICK_MATCH,
+            Self::Wol0x10EApiMissing => CHECKPOINT_WOL_0X10E_API_MISSING,
+            Self::Wol0x10EBack => CHECKPOINT_WOL_0X10E_BACK,
+            Self::Options0xD5Entry(_) => "options-0xd5-entry",
+            Self::Options0xD5Hover(index) => OPTIONS_0XD5_HOVER_CHECKPOINTS[index].0,
+            Self::CreditsRollFrame(_) => "credits-roll-frame",
+            Self::SneakPeekFrame(_) => "sneak-peek-frame",
+            Self::MainMenu0xE2SlideOut(_) => "main-menu-0xe2-slide-out",
+            Self::MovieList0x129SlideOut(_) => "movie-list-0x129-slide-out",
+            Self::Skirmish0x102BackSlideOut(_) => "skirmish-0x102-back-slide-out",
+            Self::Skirmish0x102Entry(_) => "skirmish-0x102-entry",
+            Self::Skirmish0x102Hover(index) => SKIRMISH_0X102_HOVER_CHECKPOINTS[index].0,
+            Self::Skirmish0x105Steady => CHECKPOINT_SKIRMISH_0X105_STEADY,
+            Self::Skirmish0x105Entry(_) => "skirmish-0x105-entry",
+            Self::Skirmish0x105Hover(index) => SKIRMISH_0X105_HOVER_CHECKPOINTS[index].0,
+            Self::Skirmish0x105CancelEntry(_) => "skirmish-0x105-cancel",
+            Self::Skirmish0x105CancelSteady => CHECKPOINT_SKIRMISH_0X105_CANCEL_STEADY,
+            Self::Skirmish0x105UseMap => CHECKPOINT_SKIRMISH_0X105_USE_MAP,
+            Self::Skirmish0x105SeedBrowserReturn => CHECKPOINT_SKIRMISH_0X105_SEED_BROWSER_RETURN,
+            Self::Skirmish0x105ListOpen => CHECKPOINT_SKIRMISH_0X105_LIST_OPEN,
+            Self::Skirmish0x105EjectBox => CHECKPOINT_SKIRMISH_0X105_EJECT_BOX,
+            Self::Skirmish0x105Eject(crate::ui::skirmish_shell::EjectPromptButton::Cancel) => {
+                CHECKPOINT_SKIRMISH_0X105_EJECT_CANCEL
+            }
+            Self::Skirmish0x105Eject(crate::ui::skirmish_shell::EjectPromptButton::Ok) => {
+                CHECKPOINT_SKIRMISH_0X105_EJECT_OK
+            }
+            Self::Skirmish0x6BSteady => CHECKPOINT_SKIRMISH_0X6B_STEADY,
+            Self::Skirmish0x6BEntry(_) => "skirmish-0x6b-entry",
+            Self::Skirmish0x102ChooseMapReturn => CHECKPOINT_SKIRMISH_0X102_CHOOSE_MAP_RETURN,
+            Self::SkirmishStartBlank => CHECKPOINT_SKIRMISH_START_BLANK,
+            Self::SkirmishLoadingFirstFrame => CHECKPOINT_SKIRMISH_LOADING_FIRST_FRAME,
+            Self::Skirmish0x6BEjectBox => CHECKPOINT_SKIRMISH_0X6B_EJECT_BOX,
+            Self::SkirmishAfterQuit => CHECKPOINT_SKIRMISH_AFTER_QUIT,
+            Self::SkirmishDefeatScore => CHECKPOINT_SKIRMISH_DEFEAT_SCORE,
+            Self::SkirmishDefeatContinue => CHECKPOINT_SKIRMISH_DEFEAT_CONTINUE,
+            Self::Score0x108Steady => CHECKPOINT_SCORE_0X108_STEADY,
+            Self::Score0x108Entry(_) => "score-0x108-entry",
+            Self::Score0x108HoverContinue => CHECKPOINT_SCORE_0X108_HOVER_CONTINUE,
+            Self::Score0x108LeaveContinue => CHECKPOINT_SCORE_0X108_LEAVE_CONTINUE,
+            Self::Score0x108SlideOut(_) => "score-0x108-slide-out",
         }
+    }
+
+    fn movies_target(self) -> Option<movies::MoviesTarget> {
+        Some(match self {
+            Self::MoviesPage0x101Steady => movies::MoviesTarget::Page0x101,
+            Self::MainMenu0xE2ExitConfirm => movies::MoviesTarget::ExitConfirm,
+            Self::MovieList0x129Steady => movies::MoviesTarget::List0x129,
+            Self::MovieList0x129Selected => movies::MoviesTarget::List0x129Selected,
+            Self::MovieList0x129Full => movies::MoviesTarget::FullList { down_presses: 0 },
+            Self::MovieList0x129FullDown2 => movies::MoviesTarget::FullList { down_presses: 2 },
+            Self::MovieList0x129BackFirstFrame => movies::MoviesTarget::ListBackFirstFrame,
+            Self::Campaign0x94Steady => movies::MoviesTarget::Campaign0x94 {
+                press: None,
+                hold_over: None,
+                entry_tick: None,
+            },
+            Self::Campaign0x94SliderLeft => movies::MoviesTarget::Campaign0x94 {
+                press: Some(CAMPAIGN_SLIDER_LEFT_POINT),
+                hold_over: None,
+                entry_tick: None,
+            },
+            Self::Campaign0x94SliderRight => movies::MoviesTarget::Campaign0x94 {
+                press: Some(CAMPAIGN_SLIDER_RIGHT_POINT),
+                hold_over: None,
+                entry_tick: None,
+            },
+            Self::Campaign0x94SliderHeld => movies::MoviesTarget::Campaign0x94 {
+                press: Some(CAMPAIGN_SLIDER_LEFT_POINT),
+                hold_over: Some(CAMPAIGN_BACK_POINT),
+                entry_tick: None,
+            },
+            Self::Campaign0x94Entry(tick) => movies::MoviesTarget::Campaign0x94 {
+                press: None,
+                hold_over: None,
+                entry_tick: Some(tick),
+            },
+            Self::LoadSavedGame0xB7Steady => {
+                movies::MoviesTarget::LoadSavedGame0xB7 { entry_tick: None }
+            }
+            Self::LoadSavedGame0xB7Entry(tick) => movies::MoviesTarget::LoadSavedGame0xB7 {
+                entry_tick: Some(tick),
+            },
+            Self::MainMenu0xE2NetworkBounce => movies::MoviesTarget::NetworkBounce,
+            Self::Wol0x10ESteady => movies::MoviesTarget::WolWelcome {
+                entry_tick: None,
+                hover: None,
+                press: movies::WolPress::None,
+            },
+            Self::Wol0x10EEntry(tick) => movies::MoviesTarget::WolWelcome {
+                entry_tick: Some(tick),
+                hover: None,
+                press: movies::WolPress::None,
+            },
+            Self::Wol0x10EHoverQuickMatch => movies::MoviesTarget::WolWelcome {
+                entry_tick: None,
+                hover: Some(WOL_QUICK_MATCH_POINT),
+                press: movies::WolPress::None,
+            },
+            Self::Wol0x10EApiMissing => movies::MoviesTarget::WolWelcome {
+                entry_tick: None,
+                hover: None,
+                press: movies::WolPress::MyInformation,
+            },
+            Self::Wol0x10EBack => movies::MoviesTarget::WolWelcome {
+                entry_tick: None,
+                hover: None,
+                press: movies::WolPress::MainMenu,
+            },
+            Self::Options0xD5Steady => movies::MoviesTarget::Options0xD5 {
+                entry_tick: None,
+                hover: None,
+            },
+            Self::Options0xD5Entry(tick) => movies::MoviesTarget::Options0xD5 {
+                entry_tick: Some(tick),
+                hover: None,
+            },
+            Self::Options0xD5Hover(index) => movies::MoviesTarget::Options0xD5 {
+                entry_tick: None,
+                hover: Some(OPTIONS_0XD5_HOVER_CHECKPOINTS[index].1),
+            },
+            Self::CreditsRollFrame(frame) => movies::MoviesTarget::Credits { frame },
+            Self::SneakPeekFrame(frame) => movies::MoviesTarget::SneakPeek { frame },
+            Self::MainMenu0xE2SlideOut(tick) => movies::MoviesTarget::SlideOut {
+                kind: ShellSlideKind::MainMenu,
+                tick,
+            },
+            Self::MovieList0x129SlideOut(tick) => movies::MoviesTarget::SlideOut {
+                kind: ShellSlideKind::MovieList,
+                tick,
+            },
+            _ => return None,
+        })
     }
 }
 
@@ -303,10 +832,9 @@ impl MainMenuCaptureSnapshot {
             width: state.renderer.gpu.config.width,
             height: state.renderer.gpu.config.height,
             main_menu_screen: state.frontend.screen == GameScreen::MainMenu,
-            shell_failed: state.frontend.main_menu_shell_failed,
+            shell_failed: state.frontend.main_menu_shell_error.is_some(),
             single_player_active: state.frontend.shell_route.single_player(),
-            skirmish_active: state.frontend.shell_route.skirmish()
-                || state.frontend.dev_skirmish_shell_enabled,
+            skirmish_active: state.frontend.shell_route.skirmish(),
             // The legacy skirmish-setup flag was write-dead (never set after
             // startup); the capture snapshot keeps the field as literal false.
             legacy_skirmish_setup_active: false,
@@ -416,8 +944,8 @@ struct EntrySequenceState {
 impl EntrySequenceState {
     fn validate_next(&self, identity: EntrySequenceFrameIdentity) -> Result<()> {
         ensure!(
-            self.pending.len() < usize::from(crate::ui::shell::slide::MAIN_MENU_ENTRY_FRAME_COUNT),
-            "entry sequence attempted a fifteenth frame"
+            self.pending.len() < usize::from(ENTRY_SEQUENCE_FRAMES),
+            "entry sequence attempted a frame past tick {ENTRY_SEQUENCE_TERMINAL_TICK}"
         );
         ensure!(
             identity.tick == self.expected_next_tick,
@@ -426,7 +954,7 @@ impl EntrySequenceState {
             identity.tick
         );
         ensure!(
-            identity.tick <= crate::ui::shell::slide::MAIN_MENU_TERMINAL_TICK,
+            identity.tick <= ENTRY_SEQUENCE_TERMINAL_TICK,
             "entry sequence tick {} exceeds terminal tick",
             identity.tick
         );
@@ -465,6 +993,8 @@ pub(crate) struct ShellCaptureSession {
     readback_started: bool,
     entry_sequence: Option<EntrySequenceState>,
     skirmish: Option<skirmish::SkirmishCapture>,
+    movies: Option<movies::MoviesCapture>,
+    score: Option<score::ScoreCapture>,
     outcome: Option<std::result::Result<(), String>>,
 }
 
@@ -473,8 +1003,99 @@ impl ShellCaptureSession {
         let entry_sequence = (request.checkpoint
             == ShellCaptureCheckpoint::MainMenu0xE2EntrySequence)
             .then(EntrySequenceState::default);
-        let skirmish = (request.checkpoint == ShellCaptureCheckpoint::Skirmish0x102Steady)
-            .then(skirmish::SkirmishCapture::default);
+        let skirmish = match request.checkpoint {
+            ShellCaptureCheckpoint::Skirmish0x102Steady => {
+                Some(skirmish::SkirmishCapture::default())
+            }
+            ShellCaptureCheckpoint::Skirmish0x102BackSlideOut(tick) => {
+                Some(skirmish::SkirmishCapture::slide_out(tick))
+            }
+            ShellCaptureCheckpoint::Skirmish0x6BSteady => Some(skirmish::SkirmishCapture::chooser(
+                skirmish::ChooserTarget::Steady,
+            )),
+            ShellCaptureCheckpoint::Skirmish0x6BEntry(tick) => Some(
+                skirmish::SkirmishCapture::chooser(skirmish::ChooserTarget::Entry(tick)),
+            ),
+            ShellCaptureCheckpoint::Skirmish0x102ChooseMapReturn => Some(
+                skirmish::SkirmishCapture::chooser(skirmish::ChooserTarget::Return),
+            ),
+            ShellCaptureCheckpoint::SkirmishStartBlank => Some(skirmish::SkirmishCapture::loading(
+                skirmish::LoadingTarget::Blank,
+            )),
+            ShellCaptureCheckpoint::SkirmishLoadingFirstFrame => Some(
+                skirmish::SkirmishCapture::loading(skirmish::LoadingTarget::FirstFrame),
+            ),
+            ShellCaptureCheckpoint::Skirmish0x6BEjectBox => Some(
+                skirmish::SkirmishCapture::chooser(skirmish::ChooserTarget::Eject),
+            ),
+            ShellCaptureCheckpoint::SkirmishAfterQuit => Some(skirmish::SkirmishCapture::loading(
+                skirmish::LoadingTarget::AfterQuit,
+            )),
+            ShellCaptureCheckpoint::SkirmishDefeatScore => Some(
+                skirmish::SkirmishCapture::loading(skirmish::LoadingTarget::DefeatScore),
+            ),
+            ShellCaptureCheckpoint::SkirmishDefeatContinue => Some(
+                skirmish::SkirmishCapture::loading(skirmish::LoadingTarget::DefeatContinue),
+            ),
+            ShellCaptureCheckpoint::Skirmish0x102Entry(tick) => {
+                Some(skirmish::SkirmishCapture::entry(tick))
+            }
+            ShellCaptureCheckpoint::Skirmish0x102Hover(index) => Some(
+                skirmish::SkirmishCapture::hover(SKIRMISH_0X102_HOVER_CHECKPOINTS[index].1),
+            ),
+            ShellCaptureCheckpoint::Skirmish0x105Steady => Some(
+                skirmish::SkirmishCapture::random_map(skirmish::RandomMapTarget::Steady),
+            ),
+            ShellCaptureCheckpoint::Skirmish0x105Entry(tick) => Some(
+                skirmish::SkirmishCapture::random_map(skirmish::RandomMapTarget::Entry(tick)),
+            ),
+            ShellCaptureCheckpoint::Skirmish0x105Hover(index) => {
+                Some(skirmish::SkirmishCapture::random_map(
+                    skirmish::RandomMapTarget::Hover(SKIRMISH_0X105_HOVER_CHECKPOINTS[index].1),
+                ))
+            }
+            ShellCaptureCheckpoint::Skirmish0x105CancelEntry(tick) => Some(
+                skirmish::SkirmishCapture::random_map(skirmish::RandomMapTarget::CancelEntry(tick)),
+            ),
+            ShellCaptureCheckpoint::Skirmish0x105CancelSteady => Some(
+                skirmish::SkirmishCapture::random_map(skirmish::RandomMapTarget::CancelSteady),
+            ),
+            ShellCaptureCheckpoint::Skirmish0x105UseMap => Some(
+                skirmish::SkirmishCapture::random_map(skirmish::RandomMapTarget::UseMap),
+            ),
+            ShellCaptureCheckpoint::Skirmish0x105SeedBrowserReturn => Some(
+                skirmish::SkirmishCapture::random_map(skirmish::RandomMapTarget::SeedBrowserReturn),
+            ),
+            ShellCaptureCheckpoint::Skirmish0x105ListOpen => Some(
+                skirmish::SkirmishCapture::random_map(skirmish::RandomMapTarget::ListOpen),
+            ),
+            ShellCaptureCheckpoint::Skirmish0x105EjectBox => Some(
+                skirmish::SkirmishCapture::random_map(skirmish::RandomMapTarget::EjectBox),
+            ),
+            ShellCaptureCheckpoint::Skirmish0x105Eject(answer) => Some(
+                skirmish::SkirmishCapture::random_map(skirmish::RandomMapTarget::Eject(answer)),
+            ),
+            _ => None,
+        };
+        let movies = request
+            .checkpoint
+            .movies_target()
+            .map(movies::MoviesCapture::new);
+        let score = match request.checkpoint {
+            ShellCaptureCheckpoint::Score0x108Steady => Some(score::ScoreTarget::Steady),
+            ShellCaptureCheckpoint::Score0x108Entry(tick) => Some(score::ScoreTarget::Entry(tick)),
+            ShellCaptureCheckpoint::Score0x108HoverContinue => {
+                Some(score::ScoreTarget::HoverContinue)
+            }
+            ShellCaptureCheckpoint::Score0x108LeaveContinue => {
+                Some(score::ScoreTarget::LeaveContinue)
+            }
+            ShellCaptureCheckpoint::Score0x108SlideOut(tick) => {
+                Some(score::ScoreTarget::SlideOut(tick))
+            }
+            _ => None,
+        }
+        .map(score::ScoreCapture::new);
         Self {
             request,
             started_at: None,
@@ -482,6 +1103,8 @@ impl ShellCaptureSession {
             readback_started: false,
             entry_sequence,
             skirmish,
+            movies,
+            score,
             outcome: None,
         }
     }
@@ -509,7 +1132,9 @@ impl ShellCaptureSession {
     }
 
     fn timeout(&self) -> Duration {
-        if self.skirmish.is_some() {
+        if let Some(capture) = &self.skirmish {
+            capture.timeout()
+        } else if self.movies.is_some() || self.score.is_some() {
             Duration::from_secs(60)
         } else {
             CAPTURE_TIMEOUT
@@ -517,6 +1142,12 @@ impl ShellCaptureSession {
     }
 
     fn steady_ready(&self, state: &AppState) -> Result<bool> {
+        if let Some(capture) = &self.movies {
+            return capture.ready(state);
+        }
+        if let Some(capture) = &self.score {
+            return capture.ready(state);
+        }
         match &self.skirmish {
             Some(capture) => capture.ready(state),
             None => steady_main_menu_capture_ready(MainMenuCaptureSnapshot::from_state(state)),
@@ -529,6 +1160,12 @@ impl ShellCaptureSession {
         rendered: PresentedShell,
     ) -> Result<()> {
         if let Some(capture) = &mut self.skirmish {
+            capture.after_present(state, rendered, self.frames_seen)?;
+        }
+        if let Some(capture) = &mut self.movies {
+            capture.after_present(state, rendered, self.frames_seen)?;
+        }
+        if let Some(capture) = &mut self.score {
             capture.after_present(state, rendered, self.frames_seen)?;
         }
         Ok(())
@@ -723,14 +1360,26 @@ impl ShellCaptureSession {
         let frame_path = self.request.output_dir().join(FRAME_FILE_NAME);
         write_new_file(&frame_path, pixels)?;
 
-        let mut manifest_bytes = match &self.skirmish {
-            Some(capture) => serde_json::to_vec_pretty(&capture.manifest(
+        let mut manifest_bytes = match (&self.skirmish, &self.movies, &self.score) {
+            (Some(capture), _, _) => serde_json::to_vec_pretty(&capture.manifest(
                 &self.request,
                 surface_format,
                 pixels,
                 self.frames_seen,
             )),
-            None => serde_json::to_vec_pretty(&capture_manifest(
+            (None, Some(capture), _) => serde_json::to_vec_pretty(&capture.manifest(
+                &self.request,
+                surface_format,
+                pixels,
+                self.frames_seen,
+            )),
+            (None, None, Some(capture)) => serde_json::to_vec_pretty(&capture.manifest(
+                &self.request,
+                surface_format,
+                pixels,
+                self.frames_seen,
+            )),
+            (None, None, None) => serde_json::to_vec_pretty(&capture_manifest(
                 &self.request,
                 surface_format,
                 pixels.len() as u64,
@@ -766,13 +1415,12 @@ impl ShellCaptureSession {
             .as_mut()
             .context("entry-sequence state is unavailable")?;
         ensure!(
-            sequence.expected_next_tick == crate::ui::shell::slide::MAIN_MENU_ENTRY_FRAME_COUNT,
+            sequence.expected_next_tick == ENTRY_SEQUENCE_FRAMES,
             "entry sequence completed with {} accepted ticks",
             sequence.expected_next_tick
         );
         ensure!(
-            sequence.pending.len()
-                == usize::from(crate::ui::shell::slide::MAIN_MENU_ENTRY_FRAME_COUNT),
+            sequence.pending.len() == usize::from(ENTRY_SEQUENCE_FRAMES),
             "entry sequence completed with {} retained readbacks",
             sequence.pending.len()
         );
@@ -907,7 +1555,7 @@ fn entry_sequence_manifest(
     surface_format: wgpu::TextureFormat,
     generation: u64,
 ) -> EntrySequenceManifest {
-    let frames = (0..crate::ui::shell::slide::MAIN_MENU_ENTRY_FRAME_COUNT)
+    let frames = (0..ENTRY_SEQUENCE_FRAMES)
         .map(|tick| EntrySequenceFrameManifest {
             tick,
             byte_offset: u64::from(tick) * FRAME_BYTE_LENGTH,
@@ -1124,6 +1772,113 @@ mod tests {
     }
 
     #[test]
+    fn slide_checkpoints_accept_only_shown_ticks() {
+        // Every family slide at 800x600 shows ticks 0..=17 (9 tile rows + 9).
+        for (prefix, checkpoint) in [
+            (
+                "main-menu-0xe2-slide-out-tick-",
+                ShellCaptureCheckpoint::MainMenu0xE2SlideOut(17),
+            ),
+            (
+                "movie-list-0x129-slide-out-tick-",
+                ShellCaptureCheckpoint::MovieList0x129SlideOut(17),
+            ),
+            (
+                "skirmish-0x102-back-slide-out-tick-",
+                ShellCaptureCheckpoint::Skirmish0x102BackSlideOut(17),
+            ),
+            (
+                "skirmish-0x102-entry-tick-",
+                ShellCaptureCheckpoint::Skirmish0x102Entry(17),
+            ),
+            (
+                "skirmish-0x105-entry-tick-",
+                ShellCaptureCheckpoint::Skirmish0x105Entry(17),
+            ),
+            (
+                "skirmish-0x105-cancel-tick-",
+                ShellCaptureCheckpoint::Skirmish0x105CancelEntry(17),
+            ),
+            (
+                "campaign-0x94-entry-tick-",
+                ShellCaptureCheckpoint::Campaign0x94Entry(17),
+            ),
+            (
+                "load-saved-game-0xb7-entry-tick-",
+                ShellCaptureCheckpoint::LoadSavedGame0xB7Entry(17),
+            ),
+            (
+                "options-0xd5-entry-tick-",
+                ShellCaptureCheckpoint::Options0xD5Entry(17),
+            ),
+        ] {
+            assert_eq!(
+                ShellCaptureCheckpoint::parse(&format!("{prefix}17")).expect("last tick"),
+                checkpoint
+            );
+            assert!(ShellCaptureCheckpoint::parse(&format!("{prefix}18")).is_err());
+        }
+    }
+
+    #[test]
+    fn options_hover_checkpoints_round_trip_their_names() {
+        for (name, _) in OPTIONS_0XD5_HOVER_CHECKPOINTS
+            .into_iter()
+            .chain(SKIRMISH_0X102_HOVER_CHECKPOINTS)
+            .chain(SKIRMISH_0X105_HOVER_CHECKPOINTS)
+        {
+            let checkpoint = ShellCaptureCheckpoint::parse(name).expect("hover checkpoint");
+            assert_eq!(checkpoint.as_str(), name);
+        }
+        assert!(ShellCaptureCheckpoint::parse("options-0xd5-hover-nothing").is_err());
+    }
+
+    #[test]
+    fn wol_checkpoints_round_trip() {
+        for name in [
+            CHECKPOINT_WOL_0X10E_STEADY,
+            CHECKPOINT_WOL_0X10E_HOVER_QUICK_MATCH,
+            CHECKPOINT_WOL_0X10E_API_MISSING,
+            CHECKPOINT_WOL_0X10E_BACK,
+        ] {
+            let checkpoint = ShellCaptureCheckpoint::parse(name).expect("WOL checkpoint");
+            assert_eq!(checkpoint.as_str(), name);
+        }
+        assert_eq!(
+            ShellCaptureCheckpoint::parse("wol-0x10e-entry-tick-17").expect("last tick"),
+            ShellCaptureCheckpoint::Wol0x10EEntry(17)
+        );
+        assert!(ShellCaptureCheckpoint::parse("wol-0x10e-entry-tick-18").is_err());
+    }
+
+    #[test]
+    fn network_bounce_checkpoint_round_trips() {
+        let checkpoint = ShellCaptureCheckpoint::parse(CHECKPOINT_MAIN_MENU_0XE2_NETWORK_BOUNCE)
+            .expect("network bounce checkpoint");
+        assert_eq!(
+            checkpoint,
+            ShellCaptureCheckpoint::MainMenu0xE2NetworkBounce
+        );
+        assert_eq!(
+            checkpoint.as_str(),
+            CHECKPOINT_MAIN_MENU_0XE2_NETWORK_BOUNCE
+        );
+    }
+
+    #[test]
+    fn entry_sequence_holds_every_main_menu_entry_tick() {
+        let rows = crate::ui::shell::geom::right_panel_rects(
+            EXPECTED_WIDTH as i32,
+            EXPECTED_HEIGHT as i32,
+        )
+        .tile_count as u32;
+        assert_eq!(
+            ShellSlideKind::MainMenu.column(rows).total_ticks(),
+            u32::from(ENTRY_SEQUENCE_FRAMES)
+        );
+    }
+
+    #[test]
     fn skirmish_capture_uses_distinct_checkpoint_and_route_budget() {
         let output = new_output_path("skirmish");
         let mut values = valid_args(&output);
@@ -1165,9 +1920,10 @@ mod tests {
         );
         assert_eq!(value["generation"].as_u64(), Some(73));
         assert_eq!(value["completion_observed"].as_bool(), Some(true));
-        assert_eq!(value["payload"]["byte_length"].as_u64(), Some(26_880_000));
+        // 18 ticks of 800x600 BGRA8 (9 tile rows + 9, `0x006071E0`).
+        assert_eq!(value["payload"]["byte_length"].as_u64(), Some(34_560_000));
         let frames = value["frames"].as_array().expect("frames");
-        assert_eq!(frames.len(), 14);
+        assert_eq!(frames.len(), 18);
         for (tick, frame) in frames.iter().enumerate() {
             assert_eq!(frame["tick"].as_u64(), Some(tick as u64));
             assert_eq!(frame["byte_offset"].as_u64(), Some(tick as u64 * 1_920_000));

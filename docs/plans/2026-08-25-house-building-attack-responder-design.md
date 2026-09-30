@@ -10,7 +10,7 @@ Damage is committed in native receiver order by `sim/combat/mod.rs::commit_damag
 
 Persistent type data flows from `RuleSet`/`ObjectType`; map-authored Unit/Infantry/Aircraft placement state flows through `MapEntity` into `GameEntity`. EntityStore iteration is stable creation order. Missions are persistent `MissionCom` state: receiver code can queue a deferred mission immediately, while `world/techno_ai/mission_handlers.rs` owns later ground mission dispatch. `TeamScriptVm` is the only existing TeamClass storage seam, but currently lacks priority/base-defence/suspension state and has no production Team producer. `ZoneGrid` retains native raw movement-row topology, but its public `can_reach` intentionally widens distinct zones and rejects the native source-outside-playfield special admit.
 
-The research authority is `docs/research/PHASE3_HOUSE_BUILDING_ATTACK_RESPONDER_00708080_GHIDRA_REPORT.md`, based on live `gamemd.exe` callers/body and retail Rules. Older Rescue research is orientation only; its probability and Foot-caller reachability claims are superseded by the new direct proof.
+The research authority is [docs/research/PHASE3_HOUSE_BUILDING_ATTACK_RESPONDER_00708080_GHIDRA_REPORT.md](https://github.com/YuriPlanet/vera20k/blob/108924bc237d14342b68b8bb78f2bba0400d2443/docs/research/PHASE3_HOUSE_BUILDING_ATTACK_RESPONDER_00708080_GHIDRA_REPORT.md), based on live `gamemd.exe` callers/body and retail Rules. Older Rescue research is orientation only; its probability and Foot-caller reachability claims are superseded by the new direct proof.
 
 ## Impact Analysis
 
@@ -63,7 +63,7 @@ This follows the existing inline lifecycle/smudge/wave pattern and the existing 
 
 ### Components
 
-`BaseDefenseResponseContext` is a short-lived bundle of mutable entity/House/Team/RNG authority and immutable rules/map/session facts. `respond_to_base_attack(victim_id, attacker_id, context)` owns literal entry order and mutations.
+`respond_to_base_attack(world, rules, victim_id, attacker_id)` owns literal entry order and mutations. Its candidate scan reads the whole `Simulation` (the weapon-0 peek is GetFireError itself, through `FireSubject`); every mutation follows the scan. (The first version bundled the authorities in a `BaseDefenseResponseContext`; #628 replaced it.)
 
 `BaseDefenseResponseCooldown { start_frame: i32, duration_frames: i32 }` defaults to `(current construction frame, 0)` for new live objects and uses a serde migration default equivalent to the native inactive sentinel. A helper implements wrapping remaining-time logic.
 
@@ -103,7 +103,7 @@ Parser/snapshot tests pin four Rules values, ToProtect, map bytes including abse
 
 Integration tests enter normal `commit_damage_events` for Building and ToProtect victims, assert native call ordering even on nullified/fatal hits, and verify per-receiver RNG/state visibility. A production-style `Simulation` test runs deterministic skirmish mode from damage through mission commence, attacker loss, Rescue anchor search/move and AreaGuard continuation.
 
-Focused validation while working is `cargo test -p vera20k --lib <module/filter>`, after checking no other Cargo/rustc process owns the target directory. The phase-wide full `cargo test -p vera20k --lib` remains reserved for the end of the larger goal as required by `ENGINE.md`.
+Focused validation while working is `cargo test -p vera20k --lib <module/filter>`, after checking no other Cargo/rustc process owns the target directory. The phase-wide full `cargo test -p vera20k --lib` remains reserved for the end of the larger goal as required by `AGENTS.md`.
 
 ## Architectural Decisions
 

@@ -14,7 +14,6 @@ use crate::sim::combat::combat_aoe::{
     AoELayerContext, TerrainCollectionView, apply_aoe_damage_with_terrain_and_scenario,
     bridge_adjusted_impact_z,
 };
-use crate::sim::components::WorldEffect;
 use crate::sim::intern::InternedId;
 use crate::sim::world::{SimSoundEvent, Simulation};
 
@@ -142,8 +141,7 @@ pub fn start(
 
 /// Process the active lightning storm for one tick.
 /// Called from `tick_active_superweapon_effects()` each tick, which is what
-/// `World::advance_tick` reaches in production; `tick_superweapons()` is a
-/// test-only compatibility wrapper and is not on the production path.
+/// `World::advance_tick` reaches in production.
 pub fn process(
     sim: &mut Simulation,
     rules: &RuleSet,
@@ -298,26 +296,10 @@ fn spawn_bolt(
         .superweapon_rng()
         .next_range_u32(BOLT_ANIMS.len() as u32) as usize;
     let anim_name = BOLT_ANIMS[anim_idx];
-    let frames = rules.effect_frame_count(anim_name).unwrap_or(20);
-    let anim_iid = sim.interner.intern(anim_name);
-
-    sim.world_effects.push(WorldEffect {
-        anim_spawn: None,
-        shp_name: anim_iid,
-        rx,
-        ry,
-        sub_x: crate::util::lepton::CELL_CENTER_LEPTON,
-        sub_y: crate::util::lepton::CELL_CENTER_LEPTON,
-        z: 0,
-        frame: 0,
-        total_frames: frames,
-        frame_delay: 1,
-        elapsed_frames: 0,
-        translucent: true,
-        delay_frames: 0,
-        start_sound_id: None,
-        start_sound_emitted: false,
-    });
+    // `LightningStorm::GroundStrike @ 0x0053A300` constructs the bolt at the
+    // cell's centre coordinate with the row `(type, &coord, 0, 1, 0x600, 0, 0)`
+    // (`0x0053A387`), the same row as the superweapon invoke animations.
+    super::spawn_cell_anim(sim, rules, anim_name, rx, ry, false);
 
     // 2. Apply area damage via lightning warhead.
     let warhead_id = &rules.general.lightning_warhead;
@@ -339,47 +321,27 @@ fn spawn_bolt(
             });
 
         // GroundStrike selects and starts its explosion AnimClass before it
-        // enters Apply_area_damage. Commit the Anim's immediate smudge/RNG at
-        // that producer boundary; the later per-cell ore sweep must observe it.
-        let mut explosions: Vec<crate::sim::combat::ExplosionEffect> = Vec::new();
-        let mut smudges = Vec::new();
-        crate::sim::combat::emit_warhead_detonation_effects(
+        // enters Apply_area_damage; the anim's scorch or crater is its own
+        // Middle, at its middle frame.
+        // GroundStrike53A4C2 supplies the cell's land and the saved strike
+        // coordinate. Its LightningWarhead reference selects the retained
+        // WeatherConBoltExplosion through the common SelectAnim owner.
+        let coordinate = crate::sim::projectile::ProjectileCoord::new(
+            i32::from(rx) * 256 + 128,
+            i32::from(ry) * 256 + 128,
+            world_z_leptons,
+        );
+        let land = crate::sim::combat::detonation_anim::land_at(sim, coordinate);
+        if let Some(effect) = crate::sim::combat::detonation_anim::effect(
+            sim,
+            rules,
             warhead,
             rules.general.lightning_damage,
-            rx,
-            ry,
-            crate::util::lepton::CELL_CENTER_LEPTON,
-            crate::util::lepton::CELL_CENTER_LEPTON,
-            crate::sim::combat::impact_z_byte(impact_z),
-            world_z_leptons,
-            &mut sim.interner,
-            &mut explosions,
-            &mut smudges,
-        );
-        for request in smudges {
-            sim.commit_smudge_request_inline(rules, overlay_registry, request);
-        }
-        for fx in &explosions {
-            let frames = rules
-                .effect_frame_count(sim.interner.resolve(fx.shp_name))
-                .unwrap_or(20);
-            sim.world_effects.push(WorldEffect {
-                anim_spawn: None,
-                shp_name: fx.shp_name,
-                rx: fx.rx,
-                ry: fx.ry,
-                sub_x: fx.sub_x,
-                sub_y: fx.sub_y,
-                z: fx.z,
-                frame: 0,
-                total_frames: frames,
-                frame_delay: 1,
-                elapsed_frames: 0,
-                translucent: true,
-                delay_frames: 0,
-                start_sound_id: None,
-                start_sound_emitted: false,
-            });
+            land,
+            coordinate,
+            coordinate,
+        ) {
+            crate::sim::world::damage_consequences::admit_explosion_effect(sim, rules, effect);
         }
 
         let scenario_no_damage = sim.session.no_damage;
@@ -391,7 +353,6 @@ fn spawn_bolt(
             rules.general.lightning_damage,
             true,
             scenario_no_damage,
-            &mut sim.production.resource_nodes,
             &mut sim.production.ore_growth_state,
             &sim.production.tiberium_spawning_terrain_cells,
             &sim.production.terrain_object_cells,
@@ -466,7 +427,6 @@ mod tests {
     use crate::map::resolved_terrain::{ResolvedTerrainCell, ResolvedTerrainGrid};
     use crate::rules::art_data::ArtRegistry;
     use crate::rules::ini_parser::IniFile;
-    use crate::rules::terrain_rules::{SpeedCostProfile, TerrainClass};
     use crate::sim::components::Health;
     use crate::sim::game_entity::GameEntity;
     use crate::sim::movement::locomotor::MovementLayer;
@@ -495,7 +455,6 @@ mod tests {
         assert_eq!(rules.general.ambient_change_interval_frames, 1);
         let mut sim = Simulation::with_seed(0x420);
         let owner = sim.interner.intern("Americans");
-        let heights = std::collections::BTreeMap::new();
         let rng_before = sim.scenario_rng.state();
 
         let sw_test = sim.interner.intern("SWTEST");
@@ -506,7 +465,7 @@ mod tests {
             "a deferred request must not select Ion"
         );
 
-        sim.advance_tick(&[], Some(&rules), &heights, None, None, 67);
+        sim.advance_tick(&[], Some(&rules), None, None, 67);
         assert_eq!(
             sim.session.lighting.selected_profile,
             ScenarioLightingProfile::Ion,
@@ -518,7 +477,7 @@ mod tests {
             "the pre-ore ambient rung already ran before activation"
         );
 
-        sim.advance_tick(&[], Some(&rules), &heights, None, None, 67);
+        sim.advance_tick(&[], Some(&rules), None, None, 67);
         assert!(sim.lightning_storm.is_some());
         assert_eq!(sim.session.lighting.current_ambient, 87);
         assert_eq!(
@@ -529,7 +488,7 @@ mod tests {
             1
         );
 
-        sim.advance_tick(&[], Some(&rules), &heights, None, None, 67);
+        sim.advance_tick(&[], Some(&rules), None, None, 67);
         assert!(sim.lightning_storm.is_some());
         assert_eq!(
             sim.lightning_storm
@@ -543,7 +502,7 @@ mod tests {
             ScenarioLightingProfile::Ion
         );
 
-        sim.advance_tick(&[], Some(&rules), &heights, None, None, 67);
+        sim.advance_tick(&[], Some(&rules), None, None, 67);
         assert_eq!(
             sim.lightning_storm
                 .as_ref()
@@ -557,7 +516,7 @@ mod tests {
             "the explicit ending turn retains Ion lighting"
         );
 
-        sim.advance_tick(&[], Some(&rules), &heights, None, None, 67);
+        sim.advance_tick(&[], Some(&rules), None, None, 67);
         assert!(sim.lightning_storm.is_none());
         assert_eq!(
             sim.session.lighting.selected_profile,
@@ -569,7 +528,7 @@ mod tests {
             "cleanup selects Normal after this frame's ambient rung"
         );
 
-        sim.advance_tick(&[], Some(&rules), &heights, None, None, 67);
+        sim.advance_tick(&[], Some(&rules), None, None, 67);
         assert_eq!(sim.session.lighting.current_ambient, 100);
         assert_eq!(sim.scenario_rng.state(), rng_before);
     }
@@ -768,10 +727,9 @@ mod tests {
         let mut sim = Simulation::with_seed(0x42);
         let lighting_before = sim.session.lighting;
         let rng_before = sim.scenario_rng.state();
-        let heights = std::collections::BTreeMap::new();
 
         for _ in 0..400 {
-            sim.advance_tick(&[], Some(&rules), &heights, None, None, 67);
+            sim.advance_tick(&[], Some(&rules), None, None, 67);
         }
 
         assert_eq!(sim.session.lighting, lighting_before);
@@ -789,7 +747,7 @@ mod tests {
              [Warheads]\n0=LWH\n\n\
              [DUMMY]\nStrength=100\nArmor=none\nSpeed=4\n\n\
              [GAPOWR]\nStrength=200\nArmor=wood\n\n\
-             [General]\nLightningDamage=100\nLightningWarhead=LWH\n\n\
+             [General]\nLightningDamage=100\nLightningWarhead=LWH\nWeatherConBoltExplosion=EXPLOSION\n\n\
              [LWH]\nCellSpread=1\nPercentAtMax=1\nAnimList=EXPLOSION\n\
              Verses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
         ))
@@ -800,19 +758,49 @@ mod tests {
 
     #[test]
     fn gsi_04_11_registry_only_lightning_anim_smudge_is_not_deferred() {
-        let (mut sim, rules) = registry_only_warhead_lightning_test_setup();
+        let (mut sim, mut rules) = registry_only_warhead_lightning_test_setup();
+        let mut art = crate::rules::art_data::ArtRegistry::from_ini(&IniFile::from_str(
+            "[EXPLOSION]
+Rate=900
+[WCLBOLT1]
+Layer=ground
+[WCLBOLT2]
+Layer=ground
+\n             [WCLBOLT3]
+Layer=ground
+",
+        ));
+        for name in ["EXPLOSION", "WCLBOLT1", "WCLBOLT2", "WCLBOLT3"] {
+            art.bind_anim_frame_count_for_test(name, 10);
+        }
+        rules.replace_art_registry_for_test(art);
         let owner = sim.interner.intern("Americans");
 
         spawn_bolt(&mut sim, &rules, 5, 5, owner, None);
 
         assert!(sim.pending_smudge_requests.is_empty());
 
+        // Bolt and explosion are both real AnimClass instances at the struck
+        // cell; no second animation lane receives either.
         let explosion_iid = sim.interner.intern("EXPLOSION");
+        let at_cell = |anim: &crate::sim::anim_class::AnimObject| {
+            let (rx, ry, ..) = anim.world_coord.to_cell_sub_z();
+            (rx, ry) == (5, 5)
+        };
+        let anims: Vec<_> = sim.substrate.anims.iter().map(|(_, anim)| anim).collect();
         assert!(
-            sim.world_effects
-                .iter()
-                .any(|fx| fx.shp_name == explosion_iid && fx.rx == 5 && fx.ry == 5),
-            "lightning warhead AnimList anim must be pushed to world_effects"
+            anims.iter().any(|anim| anim.type_id == explosion_iid
+                && at_cell(anim)
+                && anim.draw_flags == 0x2600),
+            "the LightningWarhead selects WeatherConBoltExplosion and takes the combat explosion row"
+        );
+        assert!(
+            anims.iter().any(|anim| {
+                sim.interner.resolve(anim.type_id).starts_with("WCLBOLT")
+                    && at_cell(anim)
+                    && anim.draw_flags == 0x600
+            }),
+            "the bolt takes the (0, 1, 0x600, 0, 0) row"
         );
     }
 
@@ -835,9 +823,9 @@ mod tests {
              [CR1]\nCrater=yes\nWidth=1\nHeight=1\n",
         );
         let mut rules = RuleSet::from_ini(&ini).expect("ore-order lightning rules");
-        rules.art_registry = ArtRegistry::from_ini(&IniFile::from_str(
+        rules.replace_art_registry_for_test(ArtRegistry::from_ini(&IniFile::from_str(
             "[EXPLOSION]\nCrater=yes\nScorch=no\nFrameWidth=100\nFrameHeight=100\n",
-        ));
+        )));
         let overlay_registry = OverlayTypeRegistry::from_ini(&ini, None);
         let ore_id = overlay_registry.id_for_name("ORE").expect("ORE overlay id");
 
@@ -1034,12 +1022,10 @@ mod tests {
         let mut building = GameEntity::test_default(10, "GAPOWR", "Soviet", 5, 5);
         building.category = EntityCategory::Structure;
         building.lifecycle.in_limbo = false;
+        building.lifecycle.cell_marked = true;
         building.owner = sim.interner.intern("Soviet");
         building.type_ref = type_ref;
-        building.health = Health {
-            current: 150,
-            max: 200,
-        };
+        building.health = Health { current: 150 };
         sim.substrate.entities.insert(building);
 
         spawn_bolt(&mut sim, &rules, 5, 5, owner, None);
@@ -1050,12 +1036,22 @@ mod tests {
             .get(10)
             .expect("building remains in sim");
         assert_eq!(building.health.current, 50);
-        assert!(building.building_damage_state_active);
+        assert!(matches!(
+            building.health.compare_ratio(
+                rules
+                    .object(sim.interner.resolve(building.type_ref()))
+                    .unwrap()
+                    .strength,
+                rules.general.condition_yellow,
+            ),
+            crate::util::native_x87::MaskedX87Ordering::Less
+                | crate::util::native_x87::MaskedX87Ordering::Equal
+        ));
     }
 
     #[test]
     fn gsi_04_07_damage_lightning_fatal_uses_inline_death_transaction() {
-        fn run(carrier_hp: u16) -> (Simulation, u64) {
+        fn run(carrier_hp: i32) -> (Simulation, u64) {
             let ini = IniFile::from_str(
                 "[InfantryTypes]\n\
                  [VehicleTypes]\n0=BOOMER\n\
@@ -1088,13 +1084,13 @@ mod tests {
             carrier.type_ref = sim.interner.intern("BOOMER");
             carrier.health = Health {
                 current: carrier_hp,
-                max: carrier_hp,
             };
             sim.substrate.entities.insert(carrier);
             let _ = sim.reveal(10);
             let mut overlays = OverlayGrid::new(12, 12);
             overlays.place_overlay(5, 5, 0, 0);
             sim.overlay_grid = Some(overlays);
+            sim.resolved_terrain = Some(crate::sim::tiberium::test_support::flat_terrain(12, 12));
 
             spawn_bolt(&mut sim, &rules, 5, 5, owner, Some(&registry));
             let rng_state = sim.scenario_rng.state();
@@ -1141,23 +1137,23 @@ mod tests {
         let owner = sim.interner.intern("Soviet");
         let type_ref = sim.interner.intern(type_name);
 
+        // Both stand in the cell's lists, so they are on the map: out of
+        // limbo and marked (`+0x74`), which Apply_area_damage's dispatch reads.
         let mut ground = GameEntity::test_default(1, type_name, "Soviet", 5, 5);
         ground.owner = owner;
         ground.type_ref = type_ref;
-        ground.health = Health {
-            current: 100,
-            max: 100,
-        };
+        ground.health = Health { current: 100 };
+        ground.lifecycle.in_limbo = false;
+        ground.lifecycle.cell_marked = true;
 
         let mut bridge = GameEntity::test_default(2, type_name, "Soviet", 5, 5);
         bridge.owner = owner;
         bridge.type_ref = type_ref;
-        bridge.health = Health {
-            current: 100,
-            max: 100,
-        };
+        bridge.health = Health { current: 100 };
         bridge.on_bridge = true;
         bridge.position.z = 4;
+        bridge.lifecycle.in_limbo = false;
+        bridge.lifecycle.cell_marked = true;
 
         sim.substrate.entities.insert(ground);
         sim.substrate.entities.insert(bridge);
@@ -1200,59 +1196,7 @@ mod tests {
 
     fn test_terrain_cell(rx: u16, ry: u16) -> ResolvedTerrainCell {
         ResolvedTerrainCell {
-            rx,
-            ry,
-            source_tile_index: 0,
-            source_sub_tile: 0,
-            final_tile_index: 0,
-            final_sub_tile: 0,
-            is_wood_bridge_repair_tile: false,
-            level: 0,
-            filled_clear: false,
-            tileset_index: Some(0),
-            land_type: 0,
-            yr_cell_land_type: 0,
-            slope_type: 0,
-            template_height: 0,
-            render_offset_x: 0,
-            render_offset_y: 0,
-            terrain_class: TerrainClass::Clear,
-            speed_costs: SpeedCostProfile::default(),
-            is_water: false,
-            is_cliff_like: false,
-            is_rough: false,
-            is_road: false,
-            accepts_smudge: false,
-            allows_tiberium: false,
-            height_in_pixels: 0,
-            variant: 0,
-            has_ramp: false,
-            canonical_ramp: None,
-            ground_walk_blocked: false,
-            terrain_object_blocks: false,
-            terrain_object_occupation: None,
-            overlay_blocks: false,
-            overlay_zone_type: None,
-            outside_playfield: false,
-            zone_type: 0,
-            base_ground_walk_blocked: false,
-            base_build_blocked: false,
-            base_land_type: 0,
-            base_yr_cell_land_type: 0,
-            base_terrain_class: Default::default(),
-            base_speed_costs: Default::default(),
-            build_blocked: false,
-            has_bridge_deck: false,
-            bridge_walkable: false,
-            bridge_transition: false,
-            bridge_deck_level: 0,
-            bridge_layer: None,
-            bridge_facts: BridgeCellFacts::default(),
-            tube_index: None,
-            radar_left: [0, 0, 0],
-            radar_right: [0, 0, 0],
-            has_damaged_data: false,
-            bridgehead_anchor_class_at_load: None,
+            ..crate::map::resolved_terrain::test_flat_cell(rx, ry)
         }
     }
 }

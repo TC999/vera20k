@@ -50,8 +50,8 @@ writes depth. Cliff redraw uses `zdepth+Less`.
 ### Why we're changing it
 
 Two reports
-([VXL_HVA_FILE_FORMAT_GHIDRA_REPORT.md](docs/research/VXL_HVA_FILE_FORMAT_GHIDRA_REPORT.md),
-[VXL_RASTERIZER_DISPATCH_GHIDRA_REPORT.md](docs/research/VXL_RASTERIZER_DISPATCH_GHIDRA_REPORT.md))
+([VXL_HVA_FILE_FORMAT_GHIDRA_REPORT.md](https://github.com/YuriPlanet/vera20k/blob/108924bc237d14342b68b8bb78f2bba0400d2443/docs/research/VXL_HVA_FILE_FORMAT_GHIDRA_REPORT.md),
+[VXL_RASTERIZER_DISPATCH_GHIDRA_REPORT.md](https://github.com/YuriPlanet/vera20k/blob/108924bc237d14342b68b8bb78f2bba0400d2443/docs/research/VXL_RASTERIZER_DISPATCH_GHIDRA_REPORT.md))
 established that gamemd applies house remap **at blit time**, not at rasterize
 time, and stores **pre-remap palette indices** in its visibility-map
 intermediate. Our current atlas inverts that: it bakes house remap in.
@@ -78,7 +78,7 @@ happens to defer remap and FX to fragment-shader time.
 | [src/render/batch_renderer.rs](src/render/batch_renderer.rs) | Per-instance uniform buffer for `(house_color_idx, fx_flags, fx_params)`. Add bind groups for palette + remap LUT. |
 | [src/app_instances/units.rs](src/app_instances/units.rs) | Drop `house_color` from key build. Pass `house_color_idx` and `fx_state` per-instance. |
 | New / extended: sim components | `Cloak`, `EmpEffect`, `IronCurtain`, `WarpEffect`, `Mirror` (per-entity FX state). |
-| [src/bin/audit-assets.rs](src/bin/audit-assets.rs) | Verify VXL header parser fix. |
+| `asset parse-check` (historical tool: `src/bin/audit-assets.rs`, now retired) | Verify VXL header parser fix. |
 
 **Determinism:** None affected. The render path does not feed sim. Per
 CLAUDE.md the architectural invariant `sim/ NEVER depends on render/` is

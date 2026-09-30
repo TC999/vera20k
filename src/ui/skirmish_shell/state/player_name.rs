@@ -4,16 +4,16 @@ use crate::map::scenario_menu::MapMenuEntry;
 use crate::sim::game_options::GameOptions;
 use crate::skirmish_launch::{SKIRMISH_PLAYER_SLOT_COUNT, SkirmishLaunchOptions};
 use crate::skirmish_modes::{SkirmishGameMode, mode_by_id};
-use crate::ui::main_menu::{SkirmishCountry, SkirmishSettings, StartPosition};
+use crate::ui::main_menu::{SkirmishCountry, StartPosition};
+use crate::ui::shell::trackbar::TrackbarHold;
 
+use super::super::SkirmishStatics;
 use super::super::layout::{SkirmishShellLayout, SkirmishTrackbarId};
-use super::super::static_reveal::StaticReveal;
-use super::trackbars::{SkirmishTrackbarBounds, trackbar_control_id, trackbar_hscroll_wparam};
+use super::trackbars::SkirmishTrackbarBounds;
 use super::{
     ChooseMapModalState, DropdownScrollDragState, DropdownScrollbarPressState, OpenComboDropdown,
     OwnerDrawButton, RandomMapSetupModalState, SkirmishShellOpponent, SkirmishShellUiSound,
-    SkirmishTrackbarHScrollNotification, SkirmishValidationModalState, TrackbarDragState,
-    default_opponents,
+    SkirmishValidationModalState, default_opponents,
 };
 
 pub const PLAYER_NAME_DEFAULT: &str = "Player";
@@ -264,7 +264,8 @@ pub struct SkirmishShellState {
     pub selected_mode_allies_allowed: bool,
     pub selected_mode_must_ally: bool,
     pub pressed_owner_draw_button: Option<OwnerDrawButton>,
-    pub trackbar_drag: Option<TrackbarDragState>,
+    /// The trackbar holding the mouse since a press on its window.
+    pub trackbar_hold: Option<TrackbarHold<SkirmishTrackbarId>>,
     pub dropdown_scroll_drag: Option<DropdownScrollDragState>,
     pub dropdown_scroll_press: Option<DropdownScrollbarPressState>,
     pub open_combo_dropdown: Option<OpenComboDropdown>,
@@ -276,26 +277,52 @@ pub struct SkirmishShellState {
     /// the setup dialog on screen while that dialog keeps its working options.
     pub saved_seed_browser: Option<super::SavedSeedBrowserState>,
     pub validation_modal: Option<SkirmishValidationModalState>,
-    pub status_help_text: String,
-    pub pending_trackbar_hscrolls: Vec<SkirmishTrackbarHScrollNotification>,
     pub pending_ui_sounds: Vec<SkirmishShellUiSound>,
-    /// Title static 0x694 reveal cursor.
-    pub title_reveal: StaticReveal,
-    /// Game-type static 0x6EC reveal cursor.
-    pub game_type_reveal: StaticReveal,
-    /// Map-label static 0x5A8 reveal cursor.
-    pub map_label_reveal: StaticReveal,
+    /// The kind-1 statics; the status line holds the hover help.
+    pub(crate) statics: SkirmishStatics,
+}
+
+/// A family dialog of the Skirmish stack. Choose Map `0x6B` hides `0x102`
+/// and the random-map dialog `0x105` hides `0x6B`; the seed browser (`0xB7`,
+/// `0x2B4`, `0x2B5`) opens over `0x105` without hiding it (`0x00558DD0`
+/// creates and shows its own dialog, `0x00622650`, `0x00622800`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkirmishShellDialog {
+    Skirmish,
+    ChooseMap,
+    RandomMap,
+    SeedBrowser,
+}
+
+impl SkirmishShellState {
+    /// The dialog that shows on top of the Skirmish stack: the one decision
+    /// for the slide target, the renderer and input. `None` while the
+    /// chooser stays hidden after the random-map run, behind its Use Map's
+    /// eject box.
+    pub fn top_dialog(&self) -> Option<SkirmishShellDialog> {
+        let Some(chooser) = self.choose_map_modal.as_ref() else {
+            return Some(SkirmishShellDialog::Skirmish);
+        };
+        if self.saved_seed_browser.is_some() {
+            Some(SkirmishShellDialog::SeedBrowser)
+        } else if self.random_map_setup_modal.is_some() {
+            Some(SkirmishShellDialog::RandomMap)
+        } else if chooser.is_hidden() {
+            None
+        } else {
+            Some(SkirmishShellDialog::ChooseMap)
+        }
+    }
 }
 
 impl Default for SkirmishShellState {
     fn default() -> Self {
-        let settings = SkirmishSettings::default();
         let options = SkirmishLaunchOptions::default();
         Self {
-            selected_map_idx: settings.selected_map_idx,
+            selected_map_idx: 0,
             selected_mode_id: 1,
             player_name_edit: PlayerNameEditState::default(),
-            player_country: settings.player_country,
+            player_country: SkirmishCountry::default(),
             player_country_random: false,
             player_color_index: 0,
             player_color_claimed: true,
@@ -313,12 +340,12 @@ impl Default for SkirmishShellState {
             build_off_ally: options.build_off_ally,
             crates: options.crates,
             mcv_redeploy: options.mcv_redeploy,
-            zoom_enabled: settings.zoom_enabled,
-            opponents: default_opponents(settings.ai_country),
+            zoom_enabled: true,
+            opponents: default_opponents(SkirmishCountry::Russia),
             selected_mode_allies_allowed: true,
             selected_mode_must_ally: false,
             pressed_owner_draw_button: None,
-            trackbar_drag: None,
+            trackbar_hold: None,
             dropdown_scroll_drag: None,
             dropdown_scroll_press: None,
             open_combo_dropdown: None,
@@ -326,20 +353,13 @@ impl Default for SkirmishShellState {
             random_map_setup_modal: None,
             saved_seed_browser: None,
             validation_modal: None,
-            status_help_text: String::new(),
-            pending_trackbar_hscrolls: Vec::new(),
             pending_ui_sounds: Vec::new(),
-            title_reveal: StaticReveal::default(),
-            game_type_reveal: StaticReveal::default(),
-            map_label_reveal: StaticReveal::default(),
+            statics: SkirmishStatics::default(),
         }
     }
 }
 
 impl SkirmishShellState {
-    pub const TRACKBAR_WM_HSCROLL_MESSAGE: u32 = 0x114;
-    pub const TRACKBAR_HSCROLL_CHANGED_LOW_WORD: u16 = 5;
-
     /// Seed the lobby from per-match options parsed from
     /// `[MultiplayerDialogSettings]`. The values the setup dialog exposes as
     /// widgets are copied into the live fields so each control opens on the
@@ -362,22 +382,6 @@ impl SkirmishShellState {
         self.pending_ui_sounds.push(sound);
     }
 
-    pub(super) fn push_trackbar_hscroll(&mut self, id: SkirmishTrackbarId, visual_value: i32) {
-        self.pending_trackbar_hscrolls.push((
-            trackbar_control_id(id),
-            visual_value,
-            trackbar_hscroll_wparam(visual_value),
-        ));
-    }
-
-    pub fn pending_trackbar_hscrolls(&self) -> &[SkirmishTrackbarHScrollNotification] {
-        &self.pending_trackbar_hscrolls
-    }
-
-    pub fn drain_pending_trackbar_hscrolls(&mut self) -> Vec<SkirmishTrackbarHScrollNotification> {
-        std::mem::take(&mut self.pending_trackbar_hscrolls)
-    }
-
     pub fn pending_ui_sounds(&self) -> &[SkirmishShellUiSound] {
         &self.pending_ui_sounds
     }
@@ -385,37 +389,12 @@ impl SkirmishShellState {
     pub fn drain_pending_ui_sounds(&mut self) -> Vec<SkirmishShellUiSound> {
         std::mem::take(&mut self.pending_ui_sounds)
     }
-
-    /// Start the reveal for all three right-panel statics using their current
-    /// text. Called at shell first-paint slide completion (the 0x4EC->0x4EE
-    /// event).
-    pub fn start_right_panel_static_reveals(
-        &mut self,
-        title: &str,
-        game_type: &str,
-        map_label: &str,
-        now: std::time::Instant,
-    ) {
-        self.title_reveal.start(title, now);
-        self.game_type_reveal.start(game_type, now);
-        self.map_label_reveal.start(map_label, now);
-    }
-
-    /// Advance all three reveals one cadence step (each is internally 30 ms-gated).
-    pub fn advance_right_panel_static_reveals(&mut self, now: std::time::Instant) {
-        self.title_reveal.advance(now);
-        self.game_type_reveal.advance(now);
-        self.map_label_reveal.advance(now);
-    }
 }
 
+/// A hover message to the status line ([`SkirmishStatics::hover`]). Returns
+/// whether the help changed.
 pub fn set_status_help_text(state: &mut SkirmishShellState, text: impl Into<String>) -> bool {
-    let text = text.into();
-    if state.status_help_text == text {
-        return false;
-    }
-    state.status_help_text = text;
-    true
+    state.statics.hover(&text.into(), std::time::Instant::now())
 }
 
 pub fn clear_status_help_text(state: &mut SkirmishShellState) -> bool {
@@ -595,7 +574,7 @@ pub fn focus_player_name_edit(state: &mut SkirmishShellState) -> bool {
     state.open_combo_dropdown = None;
     state.dropdown_scroll_drag = None;
     state.dropdown_scroll_press = None;
-    state.trackbar_drag = None;
+    state.trackbar_hold = None;
     state.pressed_owner_draw_button = None;
     state.player_name_edit.focus_select_all()
 }
@@ -676,23 +655,6 @@ pub fn handle_player_name_tab(state: &mut SkirmishShellState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn map_change_restarts_map_label_reveal_from_count_one() {
-        let now = Instant::now();
-        let mut s = SkirmishShellState::default();
-        s.map_label_reveal.start("OLD MAP", now);
-        for i in 1..=4 {
-            s.map_label_reveal
-                .advance(now + Duration::from_millis(30 * i));
-        }
-        // Selecting a new map restarts the reveal with the new text (the 0x4B2
-        // text-update path the use-map handler drives), from the first character.
-        s.map_label_reveal
-            .start("NEW MAP", now + Duration::from_millis(500));
-        assert_eq!(s.map_label_reveal.window().unwrap().count, 1);
-    }
 
     #[test]
     fn fresh_shell_starts_with_an_unreserved_random_position() {

@@ -4,23 +4,26 @@
 //! status help text, and start-marker number labels.
 
 use crate::app::AppState;
+use crate::app::frontend::main_menu_shell_render::shell_reveal_path_a;
 use crate::app::loading::init::MapMenuEntry;
 use crate::render::batch::SpriteInstance;
 use crate::render::bit_font::BitFont;
 use crate::render::shell_paint::{self, PaintLabel};
-use crate::render::shell_text::{self, Reveal, ShellAlign, ShellTextDraw, TextRect};
+use crate::render::shell_text::{self, ShellAlign, ShellTextDraw, TextRect};
+use crate::skirmish_modes::mode_by_id;
 use crate::ui::main_menu::SkirmishCountry;
+use crate::ui::shell::modal::BodyOkLayout;
+use crate::ui::shell::static_reveal::StaticPaint;
+use crate::ui::shell::trackbar::value_text_rect;
 use crate::ui::skirmish_shell::{
     COMBO_DROPDOWN_ROW_H, COMBO_FACE_H, COMBO_TEXT_LEFT_INSET, ChooseMapModalButton,
-    ChooseMapModalLayout, OwnerDrawButton, RandomMapSetupLayout, RectPx, SETUP_COMBO_ROWS,
-    SavedSeedLayout, SkirmishAiRowType, SkirmishCheckboxId, SkirmishComboId, SkirmishComboItem,
-    SkirmishCountryChoice, SkirmishShellLayout, SkirmishShellOpponent, SkirmishShellState,
-    SkirmishTrackbarId, ValidationModalLayout, checkbox_text_rect, choose_map_listbox_content_rect,
-    choose_map_listbox_row_rect,
-    choose_map_listbox_visible_row_count, combo_dropdown_content_rect, combo_dropdown_rect,
-    combo_dropdown_visible_row_count, combo_enabled, combo_items, combo_text_rect,
-    player_name_edit_text_rect, player_row_visible, random_map_setup_dropdown_rect,
-    setup_combo_items, trackbar_value_text_rect, trackbar_visual_value,
+    ChooseMapModalLayout, OwnerDrawButton, RandomMapSetupControl, RandomMapSetupLayout, RectPx,
+    SETUP_COMBO_ROWS, SavedSeedLayout, SkirmishAiRowType, SkirmishCheckboxId, SkirmishComboId,
+    SkirmishComboItem, SkirmishCountryChoice, SkirmishShellLayout, SkirmishShellOpponent,
+    SkirmishShellState, SkirmishTrackbarId, checkbox_text_rect, combo_dropdown_content_rect,
+    combo_dropdown_rect, combo_dropdown_visible_row_count, combo_enabled, combo_items,
+    combo_text_rect, player_name_edit_text_rect, player_row_visible,
+    random_map_setup_dropdown_rect, setup_combo_items, trackbar_visual_value,
 };
 
 use super::controls::trackbar_rect_for_id;
@@ -106,7 +109,7 @@ pub(super) fn country_choice_label(
 pub(super) fn trackbar_display_value(shell: &SkirmishShellState, id: SkirmishTrackbarId) -> String {
     match id {
         SkirmishTrackbarId::GameSpeed0x529 => trackbar_visual_value(shell, id).to_string(),
-        SkirmishTrackbarId::Credits0x511 => shell.starting_credits.to_string(),
+        SkirmishTrackbarId::Credits0x511 => shell.credits().to_string(),
         SkirmishTrackbarId::UnitCount0x50c => shell.unit_count.to_string(),
     }
 }
@@ -163,10 +166,11 @@ pub(super) fn button_label_color() -> [f32; 3] {
 }
 
 /// Retail provenance: disabled `OwnerDraw_Button_00612B70` replaces the normal
-/// yellow label with its disabled palette color at `0x00612F5F`.
+/// yellow label with its disabled color at `0x00612F5F`
+/// ([`crate::render::shell_paint::SHELL_TEXT_RGB_DISABLED`]).
 pub(super) fn button_label_color_for_disabled(disabled: bool) -> [f32; 3] {
     if disabled {
-        SHELL_DISABLED_TEXT_RGB_FROM_PACKED_0000009F
+        crate::render::shell_paint::SHELL_TEXT_RGB_DISABLED
     } else {
         button_label_color()
     }
@@ -218,24 +222,7 @@ pub(super) fn push_text_draw(
     align: ShellAlign,
     depth: f32,
 ) {
-    push_text_draw_revealed(out, state, label, text_rect, color, align, depth, None);
-}
-
-/// `push_text_draw` carrying a kind-1 character reveal window through to
-/// `draw_in_rect`. Only the three Skirmish right-panel statics use the reveal;
-/// every other text draw goes through the `None` wrapper above.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn push_text_draw_revealed(
-    out: &mut Vec<ShellTextDraw>,
-    state: &AppState,
-    label: &str,
-    text_rect: TextRect,
-    color: [f32; 3],
-    align: ShellAlign,
-    depth: f32,
-    reveal: Option<Reveal>,
-) {
-    let draw = shell_text::draw_in_rect(
+    out.push(shell_text::draw_in_rect(
         &state.renderer.bit_font,
         label,
         text_rect,
@@ -243,9 +230,7 @@ pub(super) fn push_text_draw_revealed(
         align,
         [0.0, 0.0],
         depth,
-        reveal,
-    );
-    out.push(draw);
+    ));
 }
 
 pub(super) fn rect_to_text_rect(rect: RectPx) -> TextRect {
@@ -432,42 +417,9 @@ fn push_combo_face_label_draw_with_color(
     );
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(super) fn push_static_label_draw(
-    out: &mut Vec<ShellTextDraw>,
-    state: &AppState,
-    label: &str,
-    rect: RectPx,
-    align: ShellAlign,
-    depth: f32,
-    reveal: Option<Reveal>,
-) {
-    push_text_draw_revealed(
-        out,
-        state,
-        label,
-        rect_to_text_rect(rect),
-        SHELL_LABEL_TEXT_RGB,
-        align,
-        depth,
-        reveal,
-    );
-}
-
-/// Reveal window for the renderer: maps a static's [`StaticReveal`] cursor onto
-/// the render-layer [`Reveal`] type (or `None` when inactive / complete).
-fn static_reveal_window(
-    reveal: &crate::ui::skirmish_shell::static_reveal::StaticReveal,
-) -> Option<Reveal> {
-    reveal.window().map(|w| Reveal {
-        count: w.count,
-        range: w.range,
-    })
-}
-
-/// Single source of truth for the three Skirmish 0x102 right-panel static
-/// label strings (title / game-type / map-label). Shared by the renderer and
-/// the reveal-start trigger so both resolve identical text.
+/// The texts `0x102` holds for its heading, game type and map name statics
+/// (`0x006AEC86`, `0x006AEC8D`; again after Use Map, `0x006ADA99`); its SHOW
+/// completion hands them to [`crate::ui::skirmish_shell::SkirmishStatics`].
 pub(crate) fn skirmish_right_panel_label_strings(state: &AppState) -> (String, String, String) {
     let shell = &state.frontend.skirmish_shell_state;
     let title = localized_label(state, "GUI:SkirmishGame", "Skirmish Game");
@@ -483,6 +435,76 @@ pub(crate) fn skirmish_right_panel_label_strings(state: &AppState) -> (String, S
         .map(|map| map.display_name.clone())
         .unwrap_or_else(|| "None".to_string());
     (title, game_type, map_label)
+}
+
+/// A kind-1 static's label: the Path-A reveal of its text in its window
+/// (kind-1 paint passes the window's horizontal alignment only,
+/// `0x00615A81`).
+pub(super) fn static_label(
+    shown: StaticPaint<'_>,
+    rect: RectPx,
+    align: ShellAlign,
+) -> PaintLabel<'static> {
+    PaintLabel {
+        text: shown.text.to_owned().into(),
+        rect,
+        align,
+        rgb: SHELL_LABEL_TEXT_RGB,
+        path_a_reveal: Some(shell_reveal_path_a(shown.window)),
+    }
+}
+
+/// A status line's label, top-left in its window; nothing while it is
+/// hidden or blank.
+pub(super) fn status_line_label(
+    shown: Option<StaticPaint<'_>>,
+    rect: RectPx,
+) -> Option<PaintLabel<'static>> {
+    shown
+        .filter(|shown| !shown.text.is_empty())
+        .map(|shown| static_label(shown, rect, ShellAlign::NONE))
+}
+
+/// Paint `0x102`'s kind-1 statics for this recomposition. While a slide runs
+/// it blits the top panel over the heading, game type and map name; the
+/// status line keeps what it painted when the dialog showed.
+pub(super) fn paint_skirmish_statics(
+    state: &mut AppState,
+    layout: &SkirmishShellLayout,
+    sliding: bool,
+) -> Vec<PaintLabel<'static>> {
+    let shown = state
+        .frontend
+        .skirmish_shell_state
+        .statics
+        .paint(std::time::Instant::now(), sliding);
+    let text = &layout.right_panel_text;
+    [
+        (shown.heading, text.title),
+        (shown.game_type, text.game_type),
+        (shown.map_label, text.map_label),
+    ]
+    .into_iter()
+    .filter_map(|(shown, rect)| shown.map(|shown| static_label(shown, rect, ShellAlign::H_CENTER)))
+    .chain(status_line_label(shown.status_line, layout.status_help))
+    .collect()
+}
+
+/// A family dialog's heading and status line for this recomposition
+/// ([`crate::ui::shell::static_reveal::DialogStatics::paint`]).
+pub(super) fn dialog_statics_labels(
+    statics: &mut crate::ui::shell::static_reveal::DialogStatics,
+    title: RectPx,
+    status_line: RectPx,
+    sliding: bool,
+) -> Vec<PaintLabel<'static>> {
+    let shown = statics.paint(std::time::Instant::now(), sliding);
+    shown
+        .heading
+        .map(|shown| static_label(shown, title, ShellAlign::H_CENTER))
+        .into_iter()
+        .chain(status_line_label(shown.status_line, status_line))
+        .collect()
 }
 
 pub(super) fn push_player_name_edit_text_draw(
@@ -520,12 +542,17 @@ pub(super) fn push_player_name_edit_text_draw(
     out.push(ShellTextDraw { instances, scissor });
 }
 
+/// The dialog's text. While a slide runs (`sliding`) the right panel shows only
+/// the slide engine's art (the captions are overdrawn every tick) and the
+/// kind-1 statics (`statics`, from [`paint_skirmish_statics`]) stay hidden;
+/// the left-side controls keep what they painted.
 pub(super) fn build_shell_text_draws(
     state: &AppState,
     layout: &SkirmishShellLayout,
-    validation_layout: Option<&ValidationModalLayout>,
     shell: &SkirmishShellState,
     maps: &[MapMenuEntry],
+    sliding: bool,
+    statics: &[PaintLabel<'_>],
 ) -> (Vec<ShellTextDraw>, Vec<SpriteInstance>) {
     let mut shell_draws: Vec<ShellTextDraw> = Vec::new();
     let bare_instances: Vec<SpriteInstance> = Vec::new();
@@ -536,40 +563,15 @@ pub(super) fn build_shell_text_draws(
     {
         covering_overlays.push(dropdown);
     }
-    if let Some(validation_layout) = validation_layout {
-        covering_overlays.push(validation_layout.dialog);
-    }
 
-    let start = localized_label(state, "GUI:StartGame", "Start Game");
-    let choose = localized_label(state, "GUI:ChooseMap", "Choose Map");
-    let back = localized_label(state, "GUI:Back", "Back");
-
-    for (label, rect, button) in [
-        (
-            start.as_str(),
-            layout.start_button,
-            OwnerDrawButton::StartGame0x617,
-        ),
-        (
-            choose.as_str(),
-            layout.choose_map_button,
-            OwnerDrawButton::ChooseMap0x5aa,
-        ),
-        (
-            back.as_str(),
-            layout.back_button,
-            OwnerDrawButton::Back0x5c0,
-        ),
-    ] {
-        push_button_label_draw(
-            &mut shell_draws,
-            state,
-            label,
-            rect,
-            shell.pressed_owner_draw_button == Some(button),
-            0.00041,
-        );
+    if !sliding {
+        push_right_panel_text_draws(&mut shell_draws, state, layout, shell);
     }
+    shell_draws.extend(shell_paint::paint_labels_at_depth(
+        &state.renderer.bit_font,
+        statics,
+        SHELL_CONTROL_TEXT_DEPTH,
+    ));
 
     for (key, fallback, rect) in [
         ("GUI:Players", "Players", layout.column_labels.players),
@@ -587,38 +589,6 @@ pub(super) fn build_shell_text_draws(
             SHELL_CONTROL_TEXT_DEPTH,
         );
     }
-
-    // Resolve all three static strings from the single shared source so the
-    // reveal-start trigger (`frontend::shell_transition`) and this renderer agree on the
-    // exact text whose length sets the reveal target.
-    let (title, game_type, map_label) = skirmish_right_panel_label_strings(state);
-    push_static_label_draw(
-        &mut shell_draws,
-        state,
-        &title,
-        layout.right_panel_text.title,
-        ShellAlign::H_CENTER,
-        SHELL_CONTROL_TEXT_DEPTH,
-        static_reveal_window(&shell.title_reveal),
-    );
-    push_static_label_draw(
-        &mut shell_draws,
-        state,
-        &game_type,
-        layout.right_panel_text.game_type,
-        ShellAlign::H_CENTER,
-        SHELL_CONTROL_TEXT_DEPTH,
-        static_reveal_window(&shell.game_type_reveal),
-    );
-    push_static_label_draw(
-        &mut shell_draws,
-        state,
-        &map_label,
-        layout.right_panel_text.map_label,
-        ShellAlign::H_CENTER,
-        SHELL_CONTROL_TEXT_DEPTH,
-        static_reveal_window(&shell.map_label_reveal),
-    );
 
     push_player_name_edit_text_draw(&mut shell_draws, state, shell, layout);
 
@@ -653,19 +623,9 @@ pub(super) fn build_shell_text_draws(
             &mut shell_draws,
             state,
             &value,
-            rect_to_text_rect(trackbar_value_text_rect(trackbar_rect_for_id(layout, id))),
+            rect_to_text_rect(value_text_rect(trackbar_rect_for_id(layout, id))),
             trackbar_value_text_color(),
             ShellAlign::H_CENTER | ShellAlign::V_CENTER,
-            SHELL_CONTROL_TEXT_DEPTH,
-        );
-    }
-
-    if let Some(status_help_text) = parent_shell_status_help_text(shell) {
-        push_label_draw(
-            &mut shell_draws,
-            state,
-            status_help_text,
-            layout.status_help,
             SHELL_CONTROL_TEXT_DEPTH,
         );
     }
@@ -799,19 +759,43 @@ pub(super) fn build_shell_text_draws(
     (shell_draws, bare_instances)
 }
 
-pub(super) fn parent_shell_status_help_text(shell: &SkirmishShellState) -> Option<&str> {
-    (!shell.status_help_text.is_empty()).then_some(shell.status_help_text.as_str())
-}
+/// The right panel's button captions.
+fn push_right_panel_text_draws(
+    shell_draws: &mut Vec<ShellTextDraw>,
+    state: &AppState,
+    layout: &SkirmishShellLayout,
+    shell: &SkirmishShellState,
+) {
+    let start = localized_label(state, "GUI:StartGame", "Start Game");
+    let choose = localized_label(state, "GUI:ChooseMap", "Choose Map");
+    let back = localized_label(state, "GUI:Back", "Back");
 
-#[cfg(test)]
-pub(super) fn choose_map_modal_parent_status_help_text(
-    _shell: &SkirmishShellState,
-) -> Option<&str> {
-    None
-}
-
-pub(super) fn choose_map_modal_status_help_text(shell: &SkirmishShellState) -> Option<&str> {
-    (!shell.status_help_text.is_empty()).then_some(shell.status_help_text.as_str())
+    for (label, rect, button) in [
+        (
+            start.as_str(),
+            layout.start_button,
+            OwnerDrawButton::StartGame0x617,
+        ),
+        (
+            choose.as_str(),
+            layout.choose_map_button,
+            OwnerDrawButton::ChooseMap0x5aa,
+        ),
+        (
+            back.as_str(),
+            layout.back_button,
+            OwnerDrawButton::Back0x5c0,
+        ),
+    ] {
+        push_button_label_draw(
+            shell_draws,
+            state,
+            label,
+            rect,
+            shell.pressed_owner_draw_button == Some(button),
+            0.00041,
+        );
+    }
 }
 
 /// Text for the random-map setup dialog `0x105`.
@@ -829,20 +813,12 @@ pub(super) fn push_random_map_setup_modal_text_draws(
     out: &mut Vec<ShellTextDraw>,
     state: &AppState,
     layout: &RandomMapSetupLayout,
+    // While a slide runs the column draws the right buttons without captions.
+    sliding: bool,
 ) {
     let Some(modal) = state.frontend.skirmish_shell_state.random_map_setup_modal.as_ref() else {
         return;
     };
-
-    push_text_draw(
-        out,
-        state,
-        &localized_label(state, "GUI:GenerateMap", "Generate Map"),
-        rect_to_text_rect(layout.title),
-        SHELL_LABEL_TEXT_RGB,
-        ShellAlign::H_CENTER | ShellAlign::V_CENTER,
-        SHELL_DROPDOWN_TEXT_DEPTH - 0.00008,
-    );
 
     // Row order: map type, time, theater, size, resources, players. The 0x405
     // label reads "Environment" even though the control writes the map type.
@@ -868,25 +844,86 @@ pub(super) fn push_random_map_setup_modal_text_draws(
         );
     }
 
-    for (key, fallback, rect) in [
-        ("GUI:SurpriseMe", "Surprise Me", layout.randomize),
-        ("GUI:PreviewMap", "Preview Map", layout.generate),
-        ("GUI:UseMap", "Use Map", layout.use_map),
-        ("GUI:LoadMap", "Load Map", layout.load),
-        ("GUI:SaveMap", "Save Map", layout.save),
-        ("GUI:DeleteMap", "Delete Map", layout.delete),
-        ("GUI:Cancel", "Cancel", layout.cancel),
+    for (key, fallback, rect, control) in [
+        (
+            "GUI:SurpriseMe",
+            "Surprise Me",
+            layout.randomize,
+            RandomMapSetupControl::Randomize0x621,
+        ),
+        (
+            "GUI:PreviewMap",
+            "Preview Map",
+            layout.generate,
+            RandomMapSetupControl::Generate0x620,
+        ),
     ] {
         push_text_draw(
             out,
             state,
             &localized_label(state, key, fallback),
             rect_to_text_rect(rect),
-            SHELL_LABEL_TEXT_RGB,
+            button_label_color_for_disabled(!modal.is_enabled(control)),
             ShellAlign::H_CENTER | ShellAlign::V_CENTER,
             SHELL_DROPDOWN_TEXT_DEPTH - 0.00009,
         );
     }
+    // The column's owner-draw type-1 captions, as on `0x102` and `0x6B`.
+    for (key, fallback, rect, control) in [
+        (
+            "GUI:UseMap",
+            "Use Map",
+            layout.use_map,
+            RandomMapSetupControl::Ok0x6c5,
+        ),
+        (
+            "GUI:LoadMap",
+            "Load Map",
+            layout.load,
+            RandomMapSetupControl::Load0x6c2,
+        ),
+        (
+            "GUI:SaveMap",
+            "Save Map",
+            layout.save,
+            RandomMapSetupControl::Save0x6c3,
+        ),
+        (
+            "GUI:DeleteMap",
+            "Delete Map",
+            layout.delete,
+            RandomMapSetupControl::Delete0x6c4,
+        ),
+        (
+            "GUI:Cancel",
+            "Cancel",
+            layout.cancel,
+            RandomMapSetupControl::Cancel0x5c0,
+        ),
+    ]
+    .into_iter()
+    .filter(|_| !sliding)
+    {
+        push_text_draw(
+            out,
+            state,
+            &localized_label(state, key, fallback),
+            button_text_rect(rect, modal.pressed_control == Some(control)),
+            button_label_color_for_disabled(!modal.is_enabled(control)),
+            ShellAlign::H_CENTER | ShellAlign::V_CENTER,
+            SHELL_DROPDOWN_TEXT_DEPTH - 0.00009,
+        );
+    }
+
+    // An open list covers the faces and the trackbar under it; each ends in
+    // the gap above a row, so a covered text is covered whole.
+    let open_list: Vec<RectPx> = modal
+        .open_combo
+        .map(|combo| {
+            random_map_setup_dropdown_rect(layout, combo.row(), setup_combo_items(combo).len())
+        })
+        .into_iter()
+        .collect();
 
     // Selected entry on each closed combo face. A value with no entry -- map
     // type 0, which the list omits -- leaves the face blank, as the original's
@@ -896,12 +933,16 @@ pub(super) fn push_random_map_setup_modal_text_draws(
         let Some(selected) = modal.selected_item_index(*combo) else {
             continue;
         };
+        let rect = combo_text_rect(layout.control_rects[row]);
+        if text_covered_by_overlay(rect, &open_list) {
+            continue;
+        }
         let entry = items[selected];
         push_text_draw(
             out,
             state,
             &localized_label(state, entry.key, entry.fallback),
-            rect_to_text_rect(combo_text_rect(layout.control_rects[row])),
+            rect_to_text_rect(rect),
             SHELL_LABEL_TEXT_RGB,
             ShellAlign::V_CENTER,
             SHELL_DROPDOWN_TEXT_DEPTH - 0.00009,
@@ -909,15 +950,18 @@ pub(super) fn push_random_map_setup_modal_text_draws(
     }
 
     // The players trackbar carries its value in the plaque at its right end.
-    push_text_draw(
-        out,
-        state,
-        &modal.options.num_players.to_string(),
-        rect_to_text_rect(trackbar_value_text_rect(layout.control_rects[PLAYERS_ROW])),
-        SHELL_LABEL_TEXT_RGB,
-        ShellAlign::H_CENTER | ShellAlign::V_CENTER,
-        SHELL_DROPDOWN_TEXT_DEPTH - 0.00009,
-    );
+    let value_rect = value_text_rect(layout.control_rects[PLAYERS_ROW]);
+    if !text_covered_by_overlay(value_rect, &open_list) {
+        push_text_draw(
+            out,
+            state,
+            &modal.options.num_players.to_string(),
+            rect_to_text_rect(value_rect),
+            SHELL_LABEL_TEXT_RGB,
+            ShellAlign::H_CENTER | ShellAlign::V_CENTER,
+            SHELL_DROPDOWN_TEXT_DEPTH - 0.00009,
+        );
+    }
 
     if modal.generating {
         push_text_draw(
@@ -956,40 +1000,27 @@ pub(super) fn push_random_map_setup_modal_text_draws(
     }
 }
 
+/// Text of Choose Map `0x6B` besides its heading and status line, which the
+/// caller paints ([`dialog_statics_labels`]). While a slide runs the column
+/// draws the buttons without captions; the labels and lists (left-side
+/// children) still paint.
 pub(super) fn push_choose_map_modal_text_draws(
     out: &mut Vec<ShellTextDraw>,
     state: &AppState,
     layout: &ChooseMapModalLayout,
+    sliding: bool,
 ) {
     let Some(modal) = state.frontend.skirmish_shell_state.choose_map_modal.as_ref() else {
         return;
     };
-
-    for (key, fallback, rect, align) in [
-        (
-            "GUI:ChooseMap",
-            "Choose Map",
-            layout.title,
-            ShellAlign::H_CENTER | ShellAlign::V_CENTER,
-        ),
+    for (key, fallback, rect) in [
         (
             "GUI:SelectEngagement",
             "Select Engagement",
             layout.select_engagement,
-            ShellAlign::H_CENTER | ShellAlign::V_CENTER,
         ),
-        (
-            "GUI:GameType",
-            "Game Type",
-            layout.game_type_heading,
-            ShellAlign::H_CENTER | ShellAlign::V_CENTER,
-        ),
-        (
-            "GUI:GameMap",
-            "Game Map",
-            layout.game_map_heading,
-            ShellAlign::H_CENTER | ShellAlign::V_CENTER,
-        ),
+        ("GUI:GameType", "Game Type", layout.game_type_heading),
+        ("GUI:GameMap", "Game Map", layout.game_map_heading),
     ] {
         let label = localized_label(state, key, fallback);
         push_text_draw(
@@ -998,94 +1029,80 @@ pub(super) fn push_choose_map_modal_text_draws(
             &label,
             rect_to_text_rect(rect),
             SHELL_LABEL_TEXT_RGB,
-            align,
+            ShellAlign::H_CENTER | ShellAlign::V_CENTER,
             SHELL_DROPDOWN_TEXT_DEPTH - 0.00008,
         );
     }
-
-    for (label, rect, button) in [
-        (
-            localized_label(state, "GUI:UseMap", "Use Map"),
-            layout.use_map_button,
-            ChooseMapModalButton::UseMap0x6c5,
-        ),
-        (
-            localized_label(state, "GUI:Cancel", "Cancel"),
-            layout.cancel_button,
-            ChooseMapModalButton::Cancel0x5c0,
-        ),
-        (
-            localized_label(state, "GUI:CreateRandomMap", "Create Random Map"),
-            layout.create_random_map_button,
-            ChooseMapModalButton::CreateRandomMap0x583,
-        ),
-    ] {
-        let disabled = !modal.button_enabled(button, &state.frontend.skirmish_modes);
-        push_text_draw(
-            out,
-            state,
-            &label,
-            rect_to_text_rect(rect),
-            button_label_color_for_disabled(disabled),
-            ShellAlign::H_CENTER | ShellAlign::V_CENTER,
-            SHELL_DROPDOWN_TEXT_DEPTH - 0.00009,
-        );
+    if !sliding {
+        for (label, rect, button) in [
+            (
+                localized_label(state, "GUI:UseMap", "Use Map"),
+                layout.use_map_button,
+                ChooseMapModalButton::UseMap0x6c5,
+            ),
+            (
+                localized_label(state, "GUI:Cancel", "Cancel"),
+                layout.cancel_button,
+                ChooseMapModalButton::Cancel0x5c0,
+            ),
+            (
+                localized_label(state, "GUI:CreateRandomMap", "Create Random Map"),
+                layout.create_random_map_button,
+                ChooseMapModalButton::CreateRandomMap0x583,
+            ),
+        ] {
+            let disabled = !modal.button_enabled(button);
+            push_text_draw(
+                out,
+                state,
+                &label,
+                rect_to_text_rect(rect),
+                button_label_color_for_disabled(disabled),
+                ShellAlign::H_CENTER | ShellAlign::V_CENTER,
+                SHELL_DROPDOWN_TEXT_DEPTH - 0.00009,
+            );
+        }
     }
-
-    if let Some(status_help_text) = choose_map_modal_status_help_text(&state.frontend.skirmish_shell_state) {
-        push_label_draw(
-            out,
-            state,
-            status_help_text,
-            layout.status_help,
-            SHELL_DROPDOWN_TEXT_DEPTH - 0.0001,
-        );
-    }
-
-    let mode_count = modal.mode_row_count(&state.frontend.skirmish_modes);
-    let mode_content = choose_map_listbox_content_rect(mode_count, layout.mode_list);
-    let visible_mode_rows = choose_map_listbox_visible_row_count(layout.mode_list);
-    for (visible_row, mode) in state
-        .frontend.skirmish_modes
+    let geometry = modal.mode_geometry(layout);
+    for (visible, mode_id) in modal
+        .mode_rows()
         .iter()
         .skip(modal.mode_top_index)
-        .take(visible_mode_rows)
+        .take(geometry.visible_rows)
         .enumerate()
     {
+        let Some(mode) = mode_by_id(&state.frontend.skirmish_modes, *mode_id) else {
+            continue;
+        };
         let label = localized_label(state, &mode.ui_name_key, &mode.ui_name_key);
-        let row_rect = choose_map_listbox_row_rect(mode_content, visible_row);
-        let rect = RectPx::new(row_rect.x + 2, row_rect.y, row_rect.w - 2, row_rect.h);
+        let row = geometry.row(visible);
         push_text_draw(
             out,
             state,
             &label,
-            rect_to_text_rect(rect),
+            rect_to_text_rect(RectPx::new(row.x + 2, row.y, row.w - 2, row.h)),
             SHELL_LABEL_TEXT_RGB,
             ShellAlign::V_CENTER,
             SHELL_DROPDOWN_TEXT_DEPTH - 0.00009,
         );
     }
-
-    let map_count = modal.map_row_count();
-    let map_content = choose_map_listbox_content_rect(map_count, layout.map_list);
-    let visible_map_rows = choose_map_listbox_visible_row_count(layout.map_list);
-    for (visible_row, record_idx) in modal
+    let geometry = modal.map_geometry(layout);
+    for (visible, record_idx) in modal
         .filtered_record_indices
         .iter()
         .skip(modal.map_top_index)
-        .take(visible_map_rows)
+        .take(geometry.visible_rows)
         .enumerate()
     {
         let Some(record) = state.frontend.scenario_catalog.records().get(*record_idx) else {
             continue;
         };
-        let row_rect = choose_map_listbox_row_rect(map_content, visible_row);
-        let rect = RectPx::new(row_rect.x + 2, row_rect.y, row_rect.w - 2, row_rect.h);
+        let row = geometry.row(visible);
         push_text_draw(
             out,
             state,
             &record.display_name,
-            rect_to_text_rect(rect),
+            rect_to_text_rect(RectPx::new(row.x + 2, row.y, row.w - 2, row.h)),
             SHELL_LABEL_TEXT_RGB,
             ShellAlign::V_CENTER,
             SHELL_DROPDOWN_TEXT_DEPTH - 0.00009,
@@ -1096,7 +1113,7 @@ pub(super) fn push_choose_map_modal_text_draws(
 pub(super) fn push_validation_modal_text_draws(
     out: &mut Vec<ShellTextDraw>,
     state: &AppState,
-    layout: &ValidationModalLayout,
+    layout: &BodyOkLayout,
     pressed: bool,
 ) {
     let Some(modal) = state.frontend.skirmish_shell_state.validation_modal.as_ref() else {
@@ -1104,7 +1121,7 @@ pub(super) fn push_validation_modal_text_draws(
     };
     let body = [PaintLabel {
         text: (&modal.message).into(),
-        rect: layout.message,
+        rect: layout.body,
         rgb: SHELL_LABEL_TEXT_RGB,
         align: validation_modal_body_text_align(),
         path_a_reveal: None,
@@ -1116,7 +1133,7 @@ pub(super) fn push_validation_modal_text_draws(
     ));
     let ok = [PaintLabel {
         text: (&modal.ok_button).into(),
-        rect: button_label_rect_px(layout.ok_button, pressed),
+        rect: button_label_rect_px(layout.ok, pressed),
         rgb: SHELL_LABEL_TEXT_RGB,
         align: ShellAlign::H_CENTER | ShellAlign::V_CENTER,
         path_a_reveal: None,
@@ -1179,6 +1196,41 @@ mod tests {
         assert!(text_covered_by_overlay(covered_combo_text, &[dropdown]));
         assert!(!text_covered_by_overlay(clear_combo_text, &[dropdown]));
         assert!(!text_covered_by_overlay(covered_combo_text, &[]));
+    }
+
+    /// `0x105` hides a text an open list touches; that is exact only while
+    /// every list ends in the gap between rows.
+    #[test]
+    fn every_random_map_list_covers_the_texts_under_it_whole() {
+        for (width, height) in [(640, 480), (800, 600), (1024, 768)] {
+            let layout = crate::ui::skirmish_shell::compute_random_map_setup_layout(width, height);
+            // The Players window has the runtime growth (226 wide) the
+            // combos do not have yet (225), so its value text runs one
+            // column past the lists.
+            let mut players_value = value_text_rect(layout.control_rects[PLAYERS_ROW]);
+            players_value.w -= 1;
+            let texts: Vec<RectPx> = (0..PLAYERS_ROW)
+                .map(|row| combo_text_rect(layout.control_rects[row]))
+                .chain([players_value])
+                .collect();
+            for combo in SETUP_COMBO_ROWS {
+                let list = random_map_setup_dropdown_rect(
+                    &layout,
+                    combo.row(),
+                    setup_combo_items(combo).len(),
+                );
+                for text in &texts {
+                    let inside = text.x >= list.x
+                        && text.y >= list.y
+                        && text.x + text.w <= list.x + list.w
+                        && text.y + text.h <= list.y + list.h;
+                    assert!(
+                        !text_covered_by_overlay(*text, &[list]) || inside,
+                        "{width}x{height}: {combo:?}'s list {list:?} cuts {text:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -1422,6 +1474,91 @@ pub(super) fn push_saved_browser_contents_text<I>(
 
 }
 
+/// Chrome is drawn before text in this renderer: cut a message box's
+/// rectangle out of the text already queued so it cannot paint through the
+/// box's panel.
+pub(super) fn exclude_text_under(out: &mut Vec<ShellTextDraw>, dialog: RectPx) {
+    let underlying = std::mem::take(out);
+    for draw in underlying {
+        let clip = draw.scissor;
+        let x0 = clip.x as i32;
+        let y0 = clip.y as i32;
+        let x1 = x0 + clip.w as i32;
+        let y1 = y0 + clip.h as i32;
+        let cut_x0 = dialog.x.clamp(x0, x1);
+        let cut_x1 = (dialog.x + dialog.w).clamp(x0, x1);
+        let cut_y0 = dialog.y.clamp(y0, y1);
+        let cut_y1 = (dialog.y + dialog.h).clamp(y0, y1);
+        for (left, top, right, bottom) in [
+            (x0, y0, x1, cut_y0),
+            (x0, cut_y1, x1, y1),
+            (x0, cut_y0, cut_x0, cut_y1),
+            (cut_x1, cut_y0, x1, cut_y1),
+        ] {
+            if right > left && bottom > top {
+                out.push(ShellTextDraw {
+                    instances: draw.instances.clone(),
+                    scissor: crate::render::shell_text::ScissorRect {
+                        x: left as u32,
+                        y: top as u32,
+                        w: (right - left) as u32,
+                        h: (bottom - top) as u32,
+                    },
+                });
+            }
+        }
+    }
+}
+
+/// Use Map's eject box over the chooser: body `GUI:EjectAIPlayers`, OK and
+/// Cancel.
+pub(super) fn push_choose_map_eject_prompt_text(
+    out: &mut Vec<ShellTextDraw>,
+    state: &AppState,
+    prompt: &crate::ui::skirmish_shell::EjectPrompt,
+) {
+    let layout = crate::ui::shell::modal::quit_confirm_layout(
+        state.render_width() as i32,
+        state.render_height() as i32,
+    );
+    exclude_text_under(out, layout.dialog);
+    let pressed = |button| prompt.pressed == Some(button);
+    let labels = [
+        PaintLabel {
+            text: localized_label(state, "GUI:EjectAIPlayers", "GUI:EjectAIPlayers").into(),
+            rect: layout.body,
+            rgb: SHELL_LABEL_TEXT_RGB,
+            align: validation_modal_body_text_align(),
+            path_a_reveal: None,
+        },
+        PaintLabel {
+            text: localized_label(state, "GUI:Ok", "OK").into(),
+            rect: button_label_rect_px(
+                layout.ok,
+                pressed(crate::ui::skirmish_shell::EjectPromptButton::Ok),
+            ),
+            rgb: SHELL_LABEL_TEXT_RGB,
+            align: ShellAlign::H_CENTER | ShellAlign::V_CENTER,
+            path_a_reveal: None,
+        },
+        PaintLabel {
+            text: localized_label(state, "GUI:Cancel", "Cancel").into(),
+            rect: button_label_rect_px(
+                layout.cancel,
+                pressed(crate::ui::skirmish_shell::EjectPromptButton::Cancel),
+            ),
+            rgb: SHELL_LABEL_TEXT_RGB,
+            align: ShellAlign::H_CENTER | ShellAlign::V_CENTER,
+            path_a_reveal: None,
+        },
+    ];
+    out.extend(shell_paint::paint_labels_at_depth(
+        &state.renderer.bit_font,
+        &labels,
+        SHELL_DROPDOWN_TEXT_DEPTH - 0.00013,
+    ));
+}
+
 pub(super) fn push_saved_browser_prompt_text<I>(
     out: &mut Vec<ShellTextDraw>,
     state: &AppState,
@@ -1429,35 +1566,9 @@ pub(super) fn push_saved_browser_prompt_text<I>(
     browser: &crate::ui::skirmish_shell::SavedSeedBrowserState<I>,
 ) {
     if let Some(prompt) = browser.prompt.as_ref() {
-        let (dialog, body_rect, yes, no) = prompt.layout(layout.screen.w as u32, layout.screen.h as u32);
-        // Chrome is drawn before text in this renderer. Exclude the prompt's
-        // rectangle from underlying text so it cannot paint through its panel.
-        let underlying = std::mem::take(out);
-        for draw in underlying {
-            let clip = draw.scissor;
-            let x0 = clip.x as i32;
-            let y0 = clip.y as i32;
-            let x1 = x0 + clip.w as i32;
-            let y1 = y0 + clip.h as i32;
-            let cut_x0 = dialog.x.clamp(x0, x1);
-            let cut_x1 = (dialog.x + dialog.w).clamp(x0, x1);
-            let cut_y0 = dialog.y.clamp(y0, y1);
-            let cut_y1 = (dialog.y + dialog.h).clamp(y0, y1);
-            for (left, top, right, bottom) in [
-                (x0, y0, x1, cut_y0), (x0, cut_y1, x1, y1),
-                (x0, cut_y0, cut_x0, cut_y1), (cut_x1, cut_y0, x1, cut_y1),
-            ] {
-                if right > left && bottom > top {
-                    out.push(ShellTextDraw {
-                        instances: draw.instances.clone(),
-                        scissor: crate::render::shell_text::ScissorRect {
-                            x: left as u32, y: top as u32,
-                            w: (right - left) as u32, h: (bottom - top) as u32,
-                        },
-                    });
-                }
-            }
-        }
+        let (dialog, body_rect, yes, no) =
+            prompt.layout(layout.screen.w as u32, layout.screen.h as u32);
+        exclude_text_under(out, dialog);
         let mut labels = vec![PaintLabel {
             text: prompt.body.as_str().into(), rect: body_rect, rgb: SHELL_LABEL_TEXT_RGB,
             align: validation_modal_body_text_align(), path_a_reveal: None,

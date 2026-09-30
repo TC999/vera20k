@@ -2,6 +2,358 @@
 
 use super::*;
 
+/// Each row is the next original ReadGeneral call on the same RulesClass.
+/// Exercise the production pass owner and its RuleSet publication, not a second
+/// list parser. The native corpus also checks ctor emptiness and factory order.
+#[test]
+fn bridge_animation_lists_match_original_retained_vectors() {
+    use crate::rules::ruleset::RuleSet;
+    let oracle: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tools/rules_oracle/bridge_anim_lists.json"
+    ))
+    .unwrap();
+    let mut layers = RulesLayerStack::new(IniFile::empty());
+    let initial = RuleSet::from_rules_layers(&layers).unwrap();
+    assert!(initial.general.metallic_debris.is_empty());
+    assert!(initial.bridge_rules.explosions.is_empty());
+    for (index, row) in oracle["rows"].as_array().unwrap().iter().enumerate() {
+        let key = row["key"].as_str().unwrap();
+        let mut pass = IniFile::empty();
+        if let Some(raw) = row["raw"].as_str() {
+            // Set allows cached empty/whitespace inputs that the physical file
+            // loader drops. ReadString must retain the vector for either path.
+            let mut general = IniSection::new("General".to_owned());
+            general.set(key, raw);
+            pass.replace_first_section(general);
+        }
+        layers.push(RulesLayerKind::Scenario, pass);
+        let processed = layers.process().unwrap();
+        let rules = RuleSet::from_processed_rules(&processed).unwrap();
+        let actual = if key == "MetallicDebris" {
+            assert_eq!(rules.general.metallic_debris, processed.metallic_debris());
+            &rules.general.metallic_debris
+        } else {
+            assert_eq!(rules.bridge_rules.explosions, processed.bridge_explosions());
+            &rules.bridge_rules.explosions
+        };
+        let expected = row["result"]["names"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, &expected, "native sequential row {index}: {row}");
+    }
+}
+
+#[test]
+fn bridge_animation_vectors_belong_to_rules_stack_not_type_registry() {
+    use crate::rules::ruleset::RuleSet;
+    let processed = RulesLayerStack::new(IniFile::from_str(
+        "[General]\nMetallicDebris=ONE,ONE\nBridgeExplosions=TWO\n",
+    ))
+    .process()
+    .unwrap();
+    let (_, receipt) = processed.into_ini_and_native_type_construction_trace();
+    let fresh_rules = RulesLayerStack::new(IniFile::empty())
+        .process_with_fixed_art_and_registry_state(
+            &IniFile::empty(),
+            receipt.into_registry_state_discarding_events(),
+        )
+        .unwrap();
+    let rules = RuleSet::from_processed_rules(&fresh_rules).unwrap();
+    assert!(rules.general.metallic_debris.is_empty());
+    assert!(rules.bridge_rules.explosions.is_empty());
+    assert!(rules.anim_type_names.iter().any(|name| name == "ONE"));
+    assert!(rules.anim_type_names.iter().any(|name| name == "TWO"));
+}
+
+#[test]
+fn retail_bridge_animation_vectors_match_original_reader_and_unread_d() {
+    use crate::rules::{art_data::ArtRegistry, ruleset::RuleSet};
+    let Some((ini, fixed_art)) = crate::rules::retail_ini_fixture::retail_rules_and_art() else {
+        return;
+    };
+    let oracle: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tools/rules_oracle/bridge_anim_lists.json"
+    ))
+    .unwrap();
+    let processed = RulesLayerStack::new(ini)
+        .process_with_fixed_art(&fixed_art)
+        .unwrap();
+    let mut rules = RuleSet::from_processed_rules(&processed).unwrap();
+    for (key, actual) in [
+        ("MetallicDebris", &rules.general.metallic_debris),
+        ("BridgeExplosions", &rules.bridge_rules.explosions),
+    ] {
+        let row = oracle["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["file"] == "RULESMD.INI" && row["key"] == key)
+            .unwrap();
+        let expected = row["result"]["names"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(actual, &expected);
+    }
+    assert_eq!(rules.general.metallic_debris.len(), 15);
+    assert_eq!(
+        rules.general.metallic_debris.last().map(String::as_str),
+        Some("D")
+    );
+    assert!(
+        rules
+            .anim_type_art_read_states
+            .iter()
+            .any(|(name, read)| name == "D" && !read)
+    );
+    assert!(fixed_art.section("D").is_none());
+    rules.install_art_data(ArtRegistry::from_ini(&fixed_art));
+    let d = rules
+        .art()
+        .anim_runtime_config("D")
+        .expect("registered unread D");
+    assert!(!d.art_body_read);
+    assert!(!d.bouncer);
+    assert_eq!(d.end, 0);
+    assert_eq!(d.loop_end, 0);
+    assert_eq!(d.rate_logic_frames, 1);
+    assert_eq!(d.raw_shp_frame_count, None);
+}
+
+#[test]
+fn projectile_flat_matches_original_art_reader_and_retained_defaults() {
+    use crate::rules::ruleset::RuleSet;
+    let cases: serde_json::Value =
+        serde_json::from_str(include_str!("../../tools/projectile_oracle/flat_art.json")).unwrap();
+    let cases = cases.as_array().unwrap();
+    assert_eq!(cases.len(), 38);
+    for case in cases {
+        let prior = case["prior"].as_bool().unwrap();
+        let mut art = format!(
+            "[PRIOR]\nFlat={}\n[{}]\nImage=UNREAD_REDIRECT\n",
+            if prior { "yes" } else { "no" },
+            case["art_section"].as_str().unwrap()
+        );
+        if let Some(flat) = case["flat"].as_str() {
+            art.push_str(&format!("Flat={flat}\n"));
+        }
+        // A redirected ART body must not become the source of Flat.
+        art.push_str(&format!(
+            "[UNREAD_REDIRECT]\nFlat={}\n",
+            if prior { "no" } else { "yes" }
+        ));
+        let mut layers = RulesLayerStack::new(IniFile::from_str(
+            "[VehicleTypes]\n0=UNIT\n[UNIT]\nPrimary=GUN\n\
+             [GUN]\nProjectile=SHOT\n[SHOT]\nImage=PRIOR\n",
+        ));
+        let mut pass = format!("[SHOT]\nROT=1\nFlat={}\n", if prior { "no" } else { "yes" });
+        if let Some(image) = case["image"].as_str() {
+            pass.push_str(&format!("Image={image}\n"));
+        }
+        layers.push(RulesLayerKind::Scenario, IniFile::from_str(&pass));
+        let processed = layers
+            .process_with_fixed_art(&IniFile::from_str(&art))
+            .unwrap();
+        let rules = RuleSet::from_processed_rules(&processed).unwrap();
+        assert_eq!(
+            rules.projectile("SHOT").unwrap().flat,
+            case["effective_flat"].as_bool().unwrap(),
+            "{}",
+            case["name"]
+        );
+    }
+}
+
+#[test]
+fn projectile_flat_survives_registry_handoff_and_resets_with_its_owner() {
+    use crate::rules::ruleset::RuleSet;
+    let art = IniFile::from_str("[YES]\nFlat=yes\n");
+    let root = IniFile::from_str(
+        "[VehicleTypes]\n0=UNIT\n[UNIT]\nPrimary=GUN\n\
+         [GUN]\nProjectile=SHOT\n[SHOT]\nImage=YES\n",
+    );
+    let processed = RulesLayerStack::new(root.clone())
+        .process_with_fixed_art(&art)
+        .unwrap();
+    let (_, receipt) = processed.into_ini_and_native_type_construction_trace();
+    let continued = RulesLayerStack::new(IniFile::from_str("[SHOT]\nROT=1\n"))
+        .process_with_fixed_art_and_registry_state(
+            &art,
+            receipt.into_registry_state_discarding_events(),
+        )
+        .unwrap();
+    assert!(
+        RuleSet::from_processed_rules(&continued)
+            .unwrap()
+            .projectile("SHOT")
+            .unwrap()
+            .flat
+    );
+    assert!(
+        continued
+            .native_type_construction_trace()
+            .events()
+            .is_empty()
+    );
+    let (_, receipt) = continued.into_ini_and_native_type_construction_trace();
+    let mut no_image_root = root;
+    no_image_root.replace_first_section(
+        IniFile::from_str("[SHOT]\nROT=1\n")
+            .section("SHOT")
+            .unwrap()
+            .clone(),
+    );
+    let reset = RulesLayerStack::new(no_image_root)
+        .process_with_fixed_art_and_registry_state(
+            &art,
+            receipt
+                .into_registry_state_discarding_events()
+                .destructive_reset(),
+        )
+        .unwrap();
+    assert!(
+        !RuleSet::from_processed_rules(&reset)
+            .unwrap()
+            .projectile("SHOT")
+            .unwrap()
+            .flat
+    );
+}
+
+#[test]
+fn anim_art_read_receipt_distinguishes_live_sweep_from_late_allocation() {
+    // ReadTypeData 0x00679A5D..0x00679A82 reloads the live Anim count, then
+    // proceeds to Techno readers; AudioVisual runs still later in Process.
+    let root = IniFile::from_str(
+        "[Animations]\n0=ROOT\n1=MISSING\n2=EMPTY\n\
+         [General]\nDamageFireTypes=EARLY\n\
+         [VehicleTypes]\n0=UNIT\n[UNIT]\nExplosion=LATE\n\
+         [AudioVisual]\nSmoke=AFTER\n",
+    );
+    let art = IniFile::from_str(
+        "[ROOT]\nNext=CHILD\n[CHILD]\nTrailerAnim=TAIL\n\
+         [TAIL]\nRate=1\n[EARLY]\nRate=1\n[LATE]\nRate=1\n\
+         [AFTER]\nRate=1\n[EMPTY]\n",
+    );
+    let mut layers = RulesLayerStack::new(root);
+    let first = layers.process_with_fixed_art(&art).unwrap();
+    assert_eq!(
+        first.anim_type_art_read_states().collect::<Vec<_>>(),
+        vec![
+            ("ROOT", true),
+            ("MISSING", false),
+            ("EMPTY", false),
+            ("EARLY", true),
+            ("CHILD", true),
+            ("TAIL", true),
+            ("LATE", false),
+            ("AFTER", false),
+        ],
+    );
+    assert!(
+        first
+            .ini()
+            .section("Animations")
+            .unwrap()
+            .registry_ids()
+            .contains(&"LATE")
+    );
+    assert!(
+        art.section("LATE").is_some(),
+        "ART presence is not a read receipt"
+    );
+    assert!(
+        art.section("EMPTY").is_none(),
+        "native lexical loading drops empty sections"
+    );
+
+    layers.push(RulesLayerKind::Scenario, IniFile::empty());
+    let next = layers.process_with_fixed_art(&art).unwrap();
+    assert_eq!(
+        next.anim_type_art_read_states().collect::<Vec<_>>(),
+        vec![
+            ("ROOT", true),
+            ("MISSING", false),
+            ("EMPTY", false),
+            ("EARLY", true),
+            ("CHILD", true),
+            ("TAIL", true),
+            ("LATE", true),
+            ("AFTER", true),
+        ],
+    );
+    assert_eq!(
+        first.native_type_construction_trace().events(),
+        next.native_type_construction_trace().events(),
+        "body reads do not spend new constructor IDs",
+    );
+}
+
+#[test]
+fn anim_art_read_receipt_survives_handoff_and_follows_registry_reset() {
+    let root = IniFile::from_str("[Animations]\n0=READ\n1=MISSING\n");
+    let art = IniFile::from_str("[READ]\nRate=1\n");
+    let processed = RulesLayerStack::new(root)
+        .process_with_fixed_art(&art)
+        .unwrap();
+    let (_, receipt) = processed.into_ini_and_native_type_construction_trace();
+    let state = receipt.into_registry_state_discarding_events();
+    assert_eq!(
+        state.anim_type_art_read_states().collect::<Vec<_>>(),
+        vec![("READ", true), ("MISSING", false)],
+    );
+    let continued = RulesLayerStack::new(IniFile::empty())
+        .process_with_fixed_art_and_registry_state(&art, state)
+        .unwrap();
+    assert_eq!(
+        continued.anim_type_art_read_states().collect::<Vec<_>>(),
+        vec![("READ", true), ("MISSING", false)],
+    );
+    assert!(
+        continued
+            .native_type_construction_trace()
+            .events()
+            .is_empty()
+    );
+    let (_, receipt) = continued.into_ini_and_native_type_construction_trace();
+    let reset = receipt
+        .into_registry_state_discarding_events()
+        .destructive_reset();
+    assert_eq!(reset.anim_type_art_read_states().count(), 0);
+    let after_reset = RulesLayerStack::new(IniFile::empty())
+        .process_with_fixed_art_and_registry_state(&art, reset)
+        .unwrap();
+    assert_eq!(after_reset.anim_type_art_read_states().count(), 0);
+}
+
+#[test]
+fn anim_art_read_receipt_preserves_stored_identity_and_duplicate_slots() {
+    let root = IniFile::from_str(
+        "[General]\nDamageFireTypes=FIRST, SPACED,ABCDEFGHIJKLMNOPQRSTUVWXY,ABCDEFGHIJKLMNOPQRSTUVWXY\n",
+    );
+    let art = IniFile::from_str(
+        "[FIRST]\nRate=1\n[ SPACED]\nRate=1\n[ABCDEFGHIJKLMNOPQRSTUVWX]\nRate=1\n",
+    );
+    let processed = RulesLayerStack::new(root)
+        .process_with_fixed_art(&art)
+        .unwrap();
+    assert_eq!(
+        processed.anim_type_art_read_states().collect::<Vec<_>>(),
+        vec![
+            ("FIRST", true),
+            (" SPACED", true),
+            ("ABCDEFGHIJKLMNOPQRSTUVWX", true),
+            ("ABCDEFGHIJKLMNOPQRSTUVWX", true),
+        ],
+        "the receipt is ordered per type, not a trimmed or deduplicated root set",
+    );
+}
+
 fn process_ini_passes(root: IniFile, later: IniFile) -> ProcessedRulesLayers {
     let mut layers = RulesLayerStack::new(root);
     layers.push(RulesLayerKind::Scenario, later);
@@ -12,15 +364,15 @@ fn process_ini_passes(root: IniFile, later: IniFile) -> ProcessedRulesLayers {
 /// later rules layer, preserving entry order independently of the key text.
 #[test]
 fn map_overrides_union_type_registries_by_value() {
-    let mut rules = IniFile::from_str("[VehicleTypes]\n0=MTNK\n[Animations]\n0=RING1\n");
+    let rules = IniFile::from_str("[VehicleTypes]\n0=MTNK\n[Animations]\n0=RING1\n");
     let map = IniFile::from_str("[VehicleTypes]\n0=EVILTANK\n[Animations]\n0=EVILANIM\n");
     let rules = process_ini_passes(rules, map).into_projection_discarding_native_receipt();
     assert_eq!(
-        rules.section("VehicleTypes").unwrap().get_values(),
+        rules.section("VehicleTypes").unwrap().registry_ids(),
         vec!["MTNK", "EVILTANK"]
     );
     assert_eq!(
-        rules.section("Animations").unwrap().get_values(),
+        rules.section("Animations").unwrap().registry_ids(),
         vec!["RING1", "EVILANIM"]
     );
 }
@@ -78,7 +430,11 @@ fn native_type_construction_trace_preserves_first_new_process_and_lazy_order() {
         3
     );
     assert_eq!(
-        processed.ini().section("Sides").unwrap().get("GDI"),
+        processed
+            .ini()
+            .section("Sides")
+            .unwrap()
+            .get_for_test("GDI"),
         Some("British"),
         "Side constructor identity is the key, while the compatibility value remains the membership list"
     );
@@ -118,7 +474,7 @@ fn native_type_registry_compares_full_input_but_stores_and_emits_24_bytes() {
             .ini()
             .section("VehicleTypes")
             .expect("rebuilt Unit registry")
-            .get_values(),
+            .registry_ids(),
         vec![prefix, prefix, prefix]
     );
 }
@@ -143,9 +499,11 @@ fn side_registry_and_house_side_lookup_do_not_apply_generic_none_sentinels() {
             (NativeTypeConstructorFamily::Side, "<NONE>"),
         ]
     );
-    assert!(explicit_events
-        .iter()
-        .all(|(family, _)| *family != NativeTypeConstructorFamily::HouseType));
+    assert!(
+        explicit_events
+            .iter()
+            .all(|(family, _)| *family != NativeTypeConstructorFamily::HouseType)
+    );
 
     let lazy = RulesLayerStack::new(IniFile::from_str(
         "[Countries]\n0=House\n[House]\nSide=<none>\n",
@@ -167,20 +525,15 @@ fn side_registry_and_house_side_lookup_do_not_apply_generic_none_sentinels() {
 
 #[test]
 fn constructor_lists_collapse_empty_fields_without_trimming_individual_tokens() {
+    let list = IniFile::from_str(
+        "[General]\nDamageFireTypes=FIRST, SECOND ,,FIRST,,,none,<NoNe>, none , THIRD\n",
+    );
     assert_eq!(
-        native_strtok_comma_tokens(
-            "FIRST, SECOND ,,FIRST,,,none,<NoNe>, none , THIRD",
-        )
-        .collect::<Vec<_>>(),
-        vec![
-            "FIRST",
-            " SECOND ",
-            "FIRST",
-            "none",
-            "<NoNe>",
-            " none ",
-            " THIRD",
-        ]
+        list.section_or_empty("General")
+            .read_list("DamageFireTypes", 0x80),
+        Some(vec![
+            "FIRST", " SECOND ", "FIRST", "none", "<NoNe>", " none ", " THIRD",
+        ])
     );
     let processed = RulesLayerStack::new(IniFile::from_str(
         "[BuildingTypes]\n0=FIRST\n\
@@ -203,7 +556,7 @@ fn constructor_lists_collapse_empty_fields_without_trimming_individual_tokens() 
             .ini()
             .section("General")
             .expect("projected General section")
-            .get("PrerequisitePower"),
+            .get_for_test("PrerequisitePower"),
         Some("FIRST,FIRST"),
         "native strtok vectors retain repeated resolved pointers",
     );
@@ -252,20 +605,16 @@ fn native_type_event_oracle_hash(events: &[NativeTypeConstructionEvent]) -> u64 
 
 #[test]
 fn retail_rulesmd_artmd_constructor_trace_matches_verified_base_oracle() {
-    let rules = IniFile::from_bytes(include_bytes!("../../ini/rulesmd.ini"))
-        .expect("stock RULESMD.INI parses");
-    let fixed_art = IniFile::from_bytes(include_bytes!("../../ini/artmd.ini"))
-        .expect("stock ARTMD.INI parses");
+    let Some((rules, fixed_art)) = crate::rules::retail_ini_fixture::retail_rules_and_art() else {
+        return;
+    };
     let processed = RulesLayerStack::new(rules)
         .process_with_fixed_art(&fixed_art)
         .expect("stock base Rules pass processes");
     let events = processed.native_type_construction_trace().events();
 
     assert_eq!(events.len(), 1_975);
-    assert_eq!(
-        native_type_event_oracle_hash(events),
-        0x24516fbd1a096a12
-    );
+    assert_eq!(native_type_event_oracle_hash(events), 0x24516fbd1a096a12);
 
     let explicit_boundary = events[1_699..1_704]
         .iter()
@@ -288,9 +637,7 @@ fn retail_rulesmd_artmd_constructor_trace_matches_verified_base_oracle() {
         for &(family, identity) in expected {
             let relative = events[cursor..]
                 .iter()
-                .position(|event| {
-                    event.family() == family && event.native_stored_id() == identity
-                })
+                .position(|event| event.family() == family && event.native_stored_id() == identity)
                 .unwrap_or_else(|| {
                     panic!("missing ordered retail constructor {family:?} {identity}")
                 });
@@ -356,10 +703,9 @@ fn retail_rulesmd_artmd_constructor_trace_matches_verified_base_oracle() {
 
 #[test]
 fn retail_cold_start_and_noncampaign_prepass_match_verified_native_oracles() {
-    let rules = IniFile::from_bytes(include_bytes!("../../ini/rulesmd.ini"))
-        .expect("stock RULESMD.INI parses");
-    let fixed_art = IniFile::from_bytes(include_bytes!("../../ini/artmd.ini"))
-        .expect("stock ARTMD.INI parses");
+    let Some((rules, fixed_art)) = crate::rules::retail_ini_fixture::retail_rules_and_art() else {
+        return;
+    };
     let (startup, startup_boundaries) = process_native_rules_cold_start_inner(
         NativeRulesRegistryState::default(),
         &rules,
@@ -519,7 +865,10 @@ fn native_startup_prepass_repeat_and_reset_keep_each_phase_on_one_registry_owner
         .map(NativeTypeConstructionEvent::native_stored_id)
         .collect::<Vec<_>>();
     for expected in ["W", "BA", "U", "B2", "BOV", "W2", "B2OV"] {
-        assert!(startup_ids.contains(&expected), "missing startup event {expected}");
+        assert!(
+            startup_ids.contains(&expected),
+            "missing startup event {expected}"
+        );
     }
     for forbidden in [
         "RULES_ANIM_BODY_IGNORED",
@@ -541,10 +890,7 @@ fn native_startup_prepass_repeat_and_reset_keep_each_phase_on_one_registry_owner
             .iter()
             .map(|event| (event.family(), event.native_stored_id()))
             .collect::<Vec<_>>(),
-        vec![(
-            NativeTypeConstructorFamily::AnimType,
-            "TOO_LATE_ANIM_BODY"
-        )],
+        vec![(NativeTypeConstructorFamily::AnimType, "TOO_LATE_ANIM_BODY")],
         "the repeat's live Anim sweep must reach BA, which the prior Building sweep allocated after the first Anim sweep",
     );
 
@@ -597,7 +943,11 @@ fn fixed_art_drives_constructors_without_entering_rules_content_or_bodies() {
 
     assert_eq!(without_art.content_hash(), with_art.content_hash());
     assert_eq!(
-        with_art.ini().section("ROOT").expect("Rules body").get("Next"),
+        with_art
+            .ini()
+            .section("ROOT")
+            .expect("Rules body")
+            .get_for_test("Next"),
         None,
         "standalone Art keys must not merge into the Rules body projection",
     );
@@ -619,6 +969,27 @@ fn fixed_art_drives_constructors_without_entering_rules_content_or_bodies() {
             .collect::<Vec<_>>(),
         vec!["ROOT", "TAIL"],
     );
+}
+
+/// Retail `[KTSTLEXP]` is an Animation and the elite Kirov bomb's warhead.
+/// The AnimType reads only ART, so its empty Rules body must not replace the
+/// warhead's keys in the projection.
+#[test]
+fn an_animation_keeps_the_rules_body_of_a_warhead_of_the_same_name() {
+    use crate::rules::ruleset::RuleSet;
+    let processed = RulesLayerStack::new(IniFile::from_str(
+        "[Warheads]\n0=BOOM\n[Animations]\n0=BOOM\n\
+         [BOOM]\nCellSpread=2\nWall=yes\nProneDamage=70%\n",
+    ))
+    .process()
+    .unwrap();
+    let body = processed.ini().section("BOOM").expect("Rules body");
+    assert_eq!(body.get_for_test("CellSpread"), Some("2"));
+    let rules = RuleSet::from_processed_rules(&processed).unwrap();
+    let warhead = rules.warhead("BOOM").unwrap();
+    assert_eq!(warhead.cell_spread_f64, 2.0);
+    assert!(warhead.wall);
+    assert_eq!(warhead.prone_damage_f64.to_bits(), 0x3fe6_6666_6666_6666);
 }
 
 #[test]
@@ -723,11 +1094,15 @@ fn techno_weapon_bank_uses_effective_native_gates_and_elite_slot_order() {
 
     assert_eq!(
         weapon_ids,
-        vec!["W1", "E1", "W2", "E2", "P", "S", "EP", "ES", "MAPW1", "MAPE1"]
+        vec![
+            "W1", "E1", "W2", "E2", "P", "S", "EP", "ES", "MAPW1", "MAPE1"
+        ]
     );
-    assert!(weapon_ids
-        .iter()
-        .all(|id| !matches!(*id, "WRONG" | "ALSO_WRONG" | "MAP_WRONG")));
+    assert!(
+        weapon_ids
+            .iter()
+            .all(|id| !matches!(*id, "WRONG" | "ALSO_WRONG" | "MAP_WRONG"))
+    );
 }
 
 #[test]
@@ -875,10 +1250,7 @@ fn ai_and_general_constructor_sites_cover_the_verified_20_and_89_order() {
             "WeatherConBoltExplosion",
             NativeTypeConstructorFamily::AnimType,
         ),
-        (
-            "DominatorWarhead",
-            NativeTypeConstructorFamily::WarheadType,
-        ),
+        ("DominatorWarhead", NativeTypeConstructorFamily::WarheadType),
         ("DominatorFirstAnim", NativeTypeConstructorFamily::AnimType),
         ("DominatorSecondAnim", NativeTypeConstructorFamily::AnimType),
         ("ChronoPlacement", NativeTypeConstructorFamily::AnimType),
@@ -918,8 +1290,14 @@ fn ai_and_general_constructor_sites_cover_the_verified_20_and_89_order() {
             "ExplosiveVoxelDebris",
             NativeTypeConstructorFamily::VoxelAnimType,
         ),
-        ("TireVoxelDebris", NativeTypeConstructorFamily::VoxelAnimType),
-        ("ScrapVoxelDebris", NativeTypeConstructorFamily::VoxelAnimType),
+        (
+            "TireVoxelDebris",
+            NativeTypeConstructorFamily::VoxelAnimType,
+        ),
+        (
+            "ScrapVoxelDebris",
+            NativeTypeConstructorFamily::VoxelAnimType,
+        ),
         ("RepairBay", NativeTypeConstructorFamily::BuildingType),
         ("GDIGateOne", NativeTypeConstructorFamily::BuildingType),
         ("GDIGateTwo", NativeTypeConstructorFamily::BuildingType),
@@ -929,7 +1307,10 @@ fn ai_and_general_constructor_sites_cover_the_verified_20_and_89_order() {
         ("Shipyard", NativeTypeConstructorFamily::BuildingType),
         ("GDIPowerPlant", NativeTypeConstructorFamily::BuildingType),
         ("NodRegularPower", NativeTypeConstructorFamily::BuildingType),
-        ("NodAdvancedPower", NativeTypeConstructorFamily::BuildingType),
+        (
+            "NodAdvancedPower",
+            NativeTypeConstructorFamily::BuildingType,
+        ),
         ("ThirdPowerPlant", NativeTypeConstructorFamily::BuildingType),
         (
             "PrerequisiteProcAlternate",
@@ -956,15 +1337,15 @@ fn ai_and_general_constructor_sites_cover_the_verified_20_and_89_order() {
         ("SovParaDropInf", NativeTypeConstructorFamily::InfantryType),
         ("YuriParaDropInf", NativeTypeConstructorFamily::InfantryType),
         ("AnimToInfantry", NativeTypeConstructorFamily::InfantryType),
-        (
-            "LightningWarhead",
-            NativeTypeConstructorFamily::WarheadType,
-        ),
+        ("LightningWarhead", NativeTypeConstructorFamily::WarheadType),
         ("PrismType", NativeTypeConstructorFamily::BuildingType),
         ("V3RocketType", NativeTypeConstructorFamily::AircraftType),
         ("DMislType", NativeTypeConstructorFamily::AircraftType),
         ("CMislType", NativeTypeConstructorFamily::AircraftType),
-        ("VeinholeTypeClass", NativeTypeConstructorFamily::TerrainType),
+        (
+            "VeinholeTypeClass",
+            NativeTypeConstructorFamily::TerrainType,
+        ),
         (
             "DefaultMirageDisguises",
             NativeTypeConstructorFamily::TerrainType,
@@ -1053,7 +1434,7 @@ fn warhead_particle_system_and_voxel_children_obey_passed_family_timing() {
             .ini()
             .section("Particles")
             .expect("Particle registry")
-            .get_values(),
+            .registry_ids(),
         vec!["PART", "undefined", "WHOLD"]
     );
     assert!(actual.iter().all(|(_, id)| {
@@ -1144,7 +1525,7 @@ fn crate_rule_images_allocate_and_alias_by_overlay_identity() {
         .ini()
         .section("OverlayTypes")
         .expect("crate references allocate overlays");
-    assert_eq!(overlays.get_values(), vec!["AliasCrate", "NewWater"]);
+    assert_eq!(overlays.registry_ids(), vec!["AliasCrate", "NewWater"]);
 
     let registry =
         crate::rules::overlay_types::OverlayTypeRegistry::from_ini(processed.ini(), None);
@@ -1194,7 +1575,7 @@ fn crate_rule_image_readstring_capacity_owns_retention_and_allocation() {
             .ini()
             .section("OverlayTypes")
             .expect("truncated references allocate")
-            .get_values(),
+            .registry_ids(),
         vec![stored_a.as_str(), stored_b.as_str(), stored_b.as_str()],
         "late allocation stores 24-byte IDs while semantic crate strings keep 127 bytes"
     );
@@ -1224,7 +1605,7 @@ fn later_malformed_weapon_bool_preserves_current_field_default() {
     );
     let section = processed.ini().section("Gun").expect("allocated Gun body");
 
-    assert_eq!(section.get("RevealOnFire"), Some("maybe"));
+    assert_eq!(section.get_for_test("RevealOnFire"), Some("maybe"));
     assert!(WeaponType::from_ini_section("Gun", section).reveal_on_fire);
 }
 
@@ -1235,8 +1616,8 @@ fn later_allocated_type_does_not_read_earlier_orphan_body() {
         "[VehicleTypes]\n0=LATE\n",
     );
     let late = processed.ini().section("LATE").expect("allocated body");
-    assert_eq!(late.get("Strength"), None);
-    assert_eq!(late.get("Cost"), None);
+    assert_eq!(late.get_for_test("Strength"), None);
+    assert_eq!(late.get_for_test("Cost"), None);
 }
 
 #[test]
@@ -1246,8 +1627,8 @@ fn existing_type_keeps_prior_fields_and_applies_current_body() {
         "[EARLY]\nStrength=250\n",
     );
     let early = processed.ini().section("EARLY").expect("EARLY body");
-    assert_eq!(early.get("Strength"), Some("250"));
-    assert_eq!(early.get("Cost"), Some("700"));
+    assert_eq!(early.get_for_test("Strength"), Some("250"));
+    assert_eq!(early.get_for_test("Cost"), Some("700"));
 }
 
 #[test]
@@ -1258,12 +1639,12 @@ fn tiberium_pass_reuses_numeric_slot_and_ignores_replacement_identity() {
     );
 
     assert_eq!(
-        processed.ini().section("Tiberiums").unwrap().get_values(),
+        processed.ini().section("Tiberiums").unwrap().registry_ids(),
         vec!["Riparius"]
     );
     let riparius = processed.ini().section("Riparius").unwrap();
-    assert_eq!(riparius.get("Image"), Some("4"));
-    assert_eq!(riparius.get("Value"), Some("25"));
+    assert_eq!(riparius.get_for_test("Image"), Some("4"));
+    assert_eq!(riparius.get_for_test("Value"), Some("25"));
     assert!(processed.ini().section("Cruentus").is_some());
 }
 
@@ -1276,14 +1657,14 @@ fn tiberium_out_of_range_slot_appends_one_live_type() {
     .expect("Tiberium pass processes");
 
     assert_eq!(
-        processed.ini().section("Tiberiums").unwrap().get_values(),
+        processed.ini().section("Tiberiums").unwrap().registry_ids(),
         vec!["Riparius"]
     );
     assert_eq!(
         processed
             .ini()
             .section("Riparius")
-            .and_then(|section| section.get("Image")),
+            .and_then(|section| section.get_for_test("Image")),
         Some("1")
     );
 }
@@ -1298,7 +1679,7 @@ fn new_type_reads_its_same_pass_body() {
         processed
             .ini()
             .section("LATE")
-            .and_then(|section| section.get("Strength")),
+            .and_then(|section| section.get_for_test("Strength")),
         Some("250")
     );
 }
@@ -1314,7 +1695,7 @@ fn ordered_pass_registry_union_is_case_insensitive_by_value() {
             .ini()
             .section("VehicleTypes")
             .unwrap()
-            .get_values(),
+            .registry_ids(),
         vec!["MTNK", "HTNK"]
     );
 }
@@ -1332,12 +1713,15 @@ fn gsi_05_01_type_allocation_rejects_native_none_sentinels() {
             .ini()
             .section("VehicleTypes")
             .expect("rebuilt vehicle registry")
-            .get_values(),
+            .registry_ids(),
         vec!["NONE_TANK"]
     );
 
     let mut processor = RulesPassProcessor::default();
-    assert_eq!(processor.find_or_allocate(RulesTypeFamily::Vehicle, ""), None);
+    assert_eq!(
+        processor.find_or_allocate(RulesTypeFamily::Vehicle, ""),
+        None
+    );
     assert_eq!(
         processor.find_or_allocate(RulesTypeFamily::Vehicle, "none"),
         None
@@ -1355,8 +1739,8 @@ fn later_pass_missing_scalar_key_preserves_live_value() {
         "[General]\nBuildSpeed=.58\n",
     );
     let general = processed.ini().section("General").unwrap();
-    assert_eq!(general.get("BuildSpeed"), Some(".58"));
-    assert_eq!(general.get("FlightLevel"), Some("1500"));
+    assert_eq!(general.get_for_test("BuildSpeed"), Some(".58"));
+    assert_eq!(general.get_for_test("FlightLevel"), Some("1500"));
 }
 
 #[test]
@@ -1366,8 +1750,11 @@ fn later_general_section_without_damage_fire_types_preserves_live_list() {
         "[General]\nBuildSpeed=.58\n",
     );
     let general = processed.ini().section("General").unwrap();
-    assert_eq!(general.get("DamageFireTypes"), Some("FIRE01,FIRE02"));
-    assert_eq!(general.get("BuildSpeed"), Some(".58"));
+    assert_eq!(
+        general.get_for_test("DamageFireTypes"),
+        Some("FIRE01,FIRE02")
+    );
+    assert_eq!(general.get_for_test("BuildSpeed"), Some(".58"));
 }
 
 #[test]
@@ -1383,7 +1770,7 @@ fn general_prerequisite_groups_are_lookup_only() {
             .ini()
             .section("BuildingTypes")
             .unwrap()
-            .get_values()
+            .registry_ids()
             .is_empty()
     );
     assert_eq!(
@@ -1391,7 +1778,7 @@ fn general_prerequisite_groups_are_lookup_only() {
             .ini()
             .section("General")
             .unwrap()
-            .get("PrerequisitePower"),
+            .get_for_test("PrerequisitePower"),
         Some("")
     );
 }
@@ -1409,7 +1796,7 @@ fn general_prerequisite_groups_keep_only_registered_buildings() {
             .ini()
             .section("General")
             .unwrap()
-            .get("PrerequisitePower"),
+            .get_for_test("PrerequisitePower"),
         Some("GAPOWR")
     );
 }
@@ -1427,14 +1814,14 @@ fn prerequisite_proc_alternate_allocates_unit_before_same_pass_body_sweep() {
             .ini()
             .section("VehicleTypes")
             .unwrap()
-            .get_values(),
+            .registry_ids(),
         vec!["SMIN"]
     );
     assert_eq!(
         processed
             .ini()
             .section("SMIN")
-            .and_then(|section| section.get("Strength")),
+            .and_then(|section| section.get_for_test("Strength")),
         Some("2000")
     );
 }
@@ -1452,25 +1839,25 @@ fn barrel_particle_allocates_particle_system_before_same_pass_body_sweep() {
             .ini()
             .section("ParticleSystems")
             .unwrap()
-            .get_values(),
+            .registry_ids(),
         vec!["BarrelSys"]
     );
     assert_eq!(
-        processed.ini().section("Particles").unwrap().get_values(),
+        processed.ini().section("Particles").unwrap().registry_ids(),
         vec!["SmokePart"]
     );
     assert_eq!(
         processed
             .ini()
             .section("BarrelSys")
-            .and_then(|section| section.get("HoldsWhat")),
+            .and_then(|section| section.get_for_test("HoldsWhat")),
         Some("SmokePart")
     );
     assert_eq!(
         processed
             .ini()
             .section("SmokePart")
-            .and_then(|section| section.get("Damage")),
+            .and_then(|section| section.get_for_test("Damage")),
         None,
         "HoldsWhat allocates the particle after the particle body sweep"
     );
@@ -1489,7 +1876,7 @@ fn special_weapons_created_warhead_reads_same_pass_body() {
         processed
             .ini()
             .section("FreshMutate")
-            .and_then(|section| section.get("CellSpread")),
+            .and_then(|section| section.get_for_test("CellSpread")),
         Some("3")
     );
 }
@@ -1506,7 +1893,7 @@ fn special_weapons_created_projectile_waits_for_next_pass_body_sweep() {
         processed
             .ini()
             .section("FreshNuke")
-            .and_then(|section| section.get("Image")),
+            .and_then(|section| section.get_for_test("Image")),
         None
     );
 }
@@ -1530,18 +1917,26 @@ fn combat_damage_allocates_late_smudge_and_animation_references() {
     .expect("CombatDamage fixture processes");
 
     assert_eq!(
-        processed.ini().section("SmudgeTypes").unwrap().get_values(),
+        processed
+            .ini()
+            .section("SmudgeTypes")
+            .unwrap()
+            .registry_ids(),
         vec!["BurnA", "BurnB", "BurnC", "BurnD", "BurnE", "BurnF"]
     );
     assert_eq!(
-        processed.ini().section("Animations").unwrap().get_values(),
+        processed
+            .ini()
+            .section("Animations")
+            .unwrap()
+            .registry_ids(),
         vec!["SplashA", "SplashB", "DrainAnim", "MindAnim", "MindAnimR"]
     );
     assert_eq!(
         processed
             .ini()
             .section("BurnA")
-            .and_then(|section| section.get("Width")),
+            .and_then(|section| section.get_for_test("Width")),
         None,
         "late CombatDamage allocations wait for the next type-data pass"
     );
@@ -1562,14 +1957,14 @@ fn rules_hash_preserves_pass_boundaries() {
             .ini()
             .section("General")
             .unwrap()
-            .get("BuildSpeed"),
+            .get_for_test("BuildSpeed"),
         layered
             .process()
             .expect("layered Rules passes process")
             .ini()
             .section("General")
             .unwrap()
-            .get("BuildSpeed")
+            .get_for_test("BuildSpeed")
     );
     assert_ne!(single.content_hash(), layered.content_hash());
 }
@@ -1581,11 +1976,19 @@ fn projectiles_and_sides_keep_ordinary_compatibility_projection_overlay() {
         "[Projectiles]\n0=REPLACE\n[Sides]\nGDI=French\n",
     );
     assert_eq!(
-        processed.ini().section("Projectiles").unwrap().get("0"),
+        processed
+            .ini()
+            .section("Projectiles")
+            .unwrap()
+            .get_for_test("0"),
         Some("REPLACE")
     );
     assert_eq!(
-        processed.ini().section("Sides").unwrap().get("GDI"),
+        processed
+            .ini()
+            .section("Sides")
+            .unwrap()
+            .get_for_test("GDI"),
         Some("French")
     );
 }
@@ -1593,28 +1996,31 @@ fn projectiles_and_sides_keep_ordinary_compatibility_projection_overlay() {
 /// Sections not proven to be native registries keep ordinary overlay behavior.
 #[test]
 fn existing_unlisted_numbered_section_receives_ordinary_overlay() {
-    let mut rules = IniFile::from_str("[FutureTypes]\n0=KEEP\n");
+    let rules = IniFile::from_str("[FutureTypes]\n0=KEEP\n");
     let map = IniFile::from_str("[FutureTypes]\n0=EVIL\n");
     let rules = process_ini_passes(rules, map).into_projection_discarding_native_receipt();
-    assert_eq!(rules.section("FutureTypes").unwrap().get("0"), Some("EVIL"));
+    assert_eq!(
+        rules.section("FutureTypes").unwrap().get_for_test("0"),
+        Some("EVIL")
+    );
 }
 
 /// Registry processing uses every entry value, including entries whose keys
 /// are not numeric.
 #[test]
 fn map_registry_pass_uses_every_entry_in_source_order() {
-    let mut rules =
+    let rules =
         IniFile::from_str("[Particles]\n30=FireStream\n[ParticleSystems]\n10=GasCloudSys\n");
     let map = IniFile::from_str(
         "[Particles]\n30=EvilFire\nName=oops\n[ParticleSystems]\n10=EvilSys\nStray=1\n",
     );
     let rules = process_ini_passes(rules, map).into_projection_discarding_native_receipt();
     assert_eq!(
-        rules.section("Particles").unwrap().get_values(),
+        rules.section("Particles").unwrap().registry_ids(),
         vec!["FireStream", "EvilFire", "oops"]
     );
     assert_eq!(
-        rules.section("ParticleSystems").unwrap().get_values(),
+        rules.section("ParticleSystems").unwrap().registry_ids(),
         vec!["GasCloudSys", "EvilSys", "1"]
     );
 }
@@ -1626,18 +2032,21 @@ fn map_registry_pass_uses_every_entry_in_source_order() {
 /// with `""` would reset the field to the hardcoded Rust default at parse time.
 #[test]
 fn map_overrides_skip_empty_valued_keys() {
-    let mut rules = IniFile::from_str(
+    let rules = IniFile::from_str(
         "[General]\nBuildSpeed=.7\nFlightLevel=1500\n[CombatDamage]\nC4Delay=.03\n",
     );
     let map = IniFile::from_str("[General]\nBuildSpeed=\n[CombatDamage]\nC4Delay=.06\n");
     let rules = process_ini_passes(rules, map).into_projection_discarding_native_receipt();
     assert_eq!(
-        rules.section("General").unwrap().get("BuildSpeed"),
+        rules.section("General").unwrap().get_for_test("BuildSpeed"),
         Some(".7"),
         "empty map value must leave the merged value intact"
     );
     assert_eq!(
-        rules.section("CombatDamage").unwrap().get("C4Delay"),
+        rules
+            .section("CombatDamage")
+            .unwrap()
+            .get_for_test("C4Delay"),
         Some(".06")
     );
 }
@@ -1646,16 +2055,15 @@ fn map_overrides_skip_empty_valued_keys() {
 /// identity keeps its first HSV value, while a new name allocates.
 #[test]
 fn map_colors_keep_existing_identity_and_allocate_new_name() {
-    let mut rules = IniFile::from_str("[Colors]\nGold=42,252,252\nDarkRed=0,151,239\n");
+    let rules = IniFile::from_str("[Colors]\nGold=42,252,252\nDarkRed=0,151,239\n");
     let map = IniFile::from_str("[Colors]\ngold=1,2,3\nNeonPink=12,200,255\n");
     let rules = process_ini_passes(rules, map).into_projection_discarding_native_receipt();
     assert_eq!(
-        rules.section("Colors").unwrap().get("Gold"),
+        rules.section("Colors").unwrap().get_for_test("Gold"),
         Some("42,252,252")
     );
     assert_eq!(
-        rules.section("Colors").unwrap().get("NeonPink"),
+        rules.section("Colors").unwrap().get_for_test("NeonPink"),
         Some("12,200,255")
     );
 }
-

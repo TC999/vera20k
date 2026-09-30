@@ -34,33 +34,32 @@ use crate::sim::vision::FogState;
 use std::collections::{BTreeMap, HashMap};
 
 use super::current_radar_cell::CurrentRadarCellAuthority;
+pub(crate) use super::minimap_helpers::minimap_overlay_datum;
 use super::minimap_helpers::{
-    COLOR_SHROUD, MINIMAP_DEPTH, MINIMAP_HEIGHT, MINIMAP_WIDTH,
-    RadarSurfacePixel, cell_visibility_color, dim_color, set_pixel, surface_visibility_color,
+    COLOR_SHROUD, MINIMAP_DEPTH, MINIMAP_HEIGHT, MINIMAP_WIDTH, RadarSurfacePixel,
+    cell_visibility_color, dim_color, set_pixel, surface_visibility_color,
 };
+pub use super::minimap_helpers::{OverlayClassification, default_minimap_rect};
+use super::minimap_helpers::{OverlayPixel, TerrainPixel};
+#[cfg(test)]
+use super::minimap_projection::minimap_screen_point_to_camera_top_left;
+use super::minimap_projection::{
+    MinimapPlayfieldProjection, aperture_pixel, generated_primary_copy_frame,
+};
+use super::native_radar_surface::NativeRadarSurfaceGeometry;
+use super::native_radar_terrain::NativeRadarTerrainSurface;
+use super::native_radar_viewport::NativeRadarViewportState;
+use super::radar_events::{ClientRadarEvents, RadarEventSource};
+use super::radar_terrain_updates::{
+    RadarTerrainUpdateLayers, stage_radar_terrain_dirty_generation,
+};
+#[cfg(test)]
+use super::radar_tracker::RadarTrackerEntry;
 use super::radar_tracker::{
     RadarProjectionFacts, RetainedRadarTracker, radar_entity_owner_color,
     radar_pixel_candidate_eligible,
 };
 use super::radar_visibility::build_radar_object_update;
-#[cfg(test)]
-use super::radar_tracker::RadarTrackerEntry;
-pub use super::minimap_helpers::{OverlayClassification, default_minimap_rect};
-pub(crate) use super::minimap_helpers::minimap_overlay_datum;
-use super::minimap_helpers::{OverlayPixel, TerrainPixel};
-use super::minimap_legacy_events::draw_legacy_sim_radar_events;
-use super::minimap_projection::{
-    MinimapPlayfieldProjection, aperture_pixel, generated_primary_copy_frame,
-};
-#[cfg(test)]
-use super::minimap_projection::minimap_screen_point_to_camera_top_left;
-use super::native_radar_surface::NativeRadarSurfaceGeometry;
-use super::native_radar_terrain::NativeRadarTerrainSurface;
-use super::native_radar_viewport::NativeRadarViewportState;
-use super::radar_events::{ClientRadarEvents, EnemySensedSource};
-use super::radar_terrain_updates::{
-    RadarTerrainUpdateLayers, stage_radar_terrain_dirty_generation,
-};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MinimapCellRadarSource {
@@ -179,13 +178,12 @@ impl MinimapRenderer {
             None,
         );
 
-        let (map_texture_raw, map_texture) =
-            batch.create_updatable_texture(
-                gpu,
-                &projection.base_rgba,
-                MINIMAP_WIDTH,
-                MINIMAP_HEIGHT,
-            );
+        let (map_texture_raw, map_texture) = batch.create_updatable_texture(
+            gpu,
+            &projection.base_rgba,
+            MINIMAP_WIDTH,
+            MINIMAP_HEIGHT,
+        );
         let white_texture: BatchTexture = create_white_texture(gpu, batch);
         let rgba_scratch: Vec<u8> = vec![0u8; pixel_count];
 
@@ -373,9 +371,7 @@ impl MinimapRenderer {
         full_visibility: bool,
         game_mode_nonzero: bool,
         rules: Option<&RuleSet>,
-        radar_events: Option<&crate::sim::radar::RadarEventQueue>,
         interner: Option<&crate::sim::intern::StringInterner>,
-        bridge_state: Option<&crate::sim::bridge_state::BridgeRuntimeState>,
         overlay_grid: Option<&crate::sim::overlay_grid::OverlayGrid>,
         overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
         overlay_radar_colors: &HashMap<(u8, u8), [u8; 3]>,
@@ -383,7 +379,11 @@ impl MinimapRenderer {
         radar_terrain_dirty_cells: &[(u16, u16)],
         radar_terrain_dirty_generation: u64,
     ) -> Option<u64> {
-        let fog_generation = if full_visibility { 0 } else { fog.view_generation() };
+        let fog_generation = if full_visibility {
+            0
+        } else {
+            fog.view_generation()
+        };
         let visibility_owner = local_owner;
         if sim_tick == self.last_sim_tick
             && fog_generation == self.last_fog_generation
@@ -401,13 +401,7 @@ impl MinimapRenderer {
                 native_surface: self.native_radar_surface,
                 native_terrain: &mut self.native_radar_terrain,
             },
-            CurrentRadarCellAuthority::new(
-                resolved_terrain,
-                bridge_state,
-                overlay_grid,
-                overlay_registry,
-                rules,
-            ),
+            CurrentRadarCellAuthority::new(resolved_terrain, overlay_grid, overlay_registry, rules),
             self.structural_bridge_radar_color,
             overlay_radar_colors,
             radar_terrain_dirty_cells,
@@ -592,33 +586,20 @@ impl MinimapRenderer {
             };
             let color = radar_entity_owner_color(entity, interner, house_colors, ramps);
             if entry.x >= 0 && entry.y >= 0 {
-                if let Some((x, y)) = aperture_pixel(
-                    self.native_radar_surface,
-                    (entry.x as u32, entry.y as u32),
-                ) {
+                if let Some((x, y)) =
+                    aperture_pixel(self.native_radar_surface, (entry.x as u32, entry.y as u32))
+                {
                     set_pixel(rgba, size, x, y, color);
                 }
             }
         }
 
-        // Preserve not-yet-migrated event types on their historical renderer.
-        if let Some(events) = radar_events {
-            draw_legacy_sim_radar_events(
-                rgba,
-                size,
-                events,
-                rules.map(|rules| &rules.radar_event_config),
-                self.playfield_bounds,
-                visibility_owner,
-                projection,
-            );
-        }
         // `RadarClass::Update @ 0x00656EC0` composes object pixels, then the
         // ascending radar-event array, then SpySatellite vision. Rust's SpySat
-        // materialization is already present in the fog/base inputs; the type-5
-        // outline must nevertheless remain after object pixels here.
+        // materialization is already present in the fog/base inputs; the event
+        // outlines must nevertheless remain after object pixels here.
         if let Some(surface) = self.native_radar_surface {
-            self.radar_events.draw_type5(
+            self.radar_events.draw(
                 rgba,
                 MINIMAP_WIDTH,
                 MINIMAP_HEIGHT,
@@ -627,8 +608,9 @@ impl MinimapRenderer {
             );
         }
 
-        let consumed_radar_terrain_generation = staged_radar_terrain_update
-            .finish_infallible(&mut self.last_radar_terrain_dirty_generation, || {
+        let consumed_radar_terrain_generation = staged_radar_terrain_update.finish_infallible(
+            &mut self.last_radar_terrain_dirty_generation,
+            || {
                 gpu.queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture: &self.map_texture_raw,
@@ -648,7 +630,8 @@ impl MinimapRenderer {
                         depth_or_array_layers: 1,
                     },
                 );
-            });
+            },
+        );
         self.last_sim_tick = sim_tick;
         (self.last_fog_generation, self.last_visibility_owner) = (fog_generation, visibility_owner);
         consumed_radar_terrain_generation
@@ -685,7 +668,7 @@ impl MinimapRenderer {
             .map(|rules| &rules.radar_event_config)
             .unwrap_or(&default_config);
         self.radar_events.create_enemy_sensed(
-            EnemySensedSource {
+            RadarEventSource {
                 cell: event.cell,
                 radar_pixel: pixel,
             },
@@ -695,10 +678,32 @@ impl MinimapRenderer {
         );
     }
 
-    pub(crate) fn cycle_enemy_sensed_event(
+    /// `CreateRadarEvent @ 0x0065FA70` for a simulation-published request the
+    /// app already passed through the native caller's own gate. The result
+    /// gates that caller's EVA line.
+    pub(crate) fn admit_radar_event(
         &mut self,
-        now: std::time::Instant,
-    ) -> Option<(u16, u16)> {
+        request: crate::sim::radar::RadarEventRequest,
+        sim_tick: u64,
+        rules: Option<&RuleSet>,
+    ) -> bool {
+        let default_config = crate::rules::radar_event_config::RadarEventConfig::default();
+        let config = rules
+            .map(|rules| &rules.radar_event_config)
+            .unwrap_or(&default_config);
+        // `InitRadarEvent @ 0x0065FB80` measures the shrink start from the
+        // generated primary surface.
+        let geometry = self.native_radar_surface.map(|surface| {
+            (
+                surface.cell_to_surface_pixel((request.rx, request.ry)),
+                surface.generated_size(),
+            )
+        });
+        self.radar_events.admit(request, sim_tick, geometry, config)
+    }
+
+    /// Spacebar review of the eight most recent accepted event cells.
+    pub(crate) fn cycle_radar_event(&mut self, now: std::time::Instant) -> Option<(u16, u16)> {
         self.radar_events.cycle_cell(now)
     }
 

@@ -5,10 +5,6 @@
 
 mod chrome;
 mod controls;
-// Retained as executable documentation of the native shell draw order; its
-// items are exercised only by this file's tests since the F14 reexport
-// narrowing.
-#[cfg_attr(not(test), allow(dead_code))]
 mod draw_order;
 #[cfg(test)]
 use draw_order::{
@@ -22,9 +18,9 @@ pub(crate) use in_game_shell::{native_in_game_shell_active, current_in_game_shel
 mod pause_menu;
 pub(crate) use pause_menu::render_pause_menu_shell;
 mod saved_games;
-pub(crate) use saved_games::render_saved_game_shell;
+pub(crate) use saved_games::{family_saved_game_overlays, render_saved_game_shell};
 mod launcher_options;
-pub(crate) use launcher_options::{LauncherOptionsPresentation, render_launcher_options};
+pub(crate) use launcher_options::render_launcher_options;
 mod modals;
 mod preview;
 mod text;
@@ -33,8 +29,8 @@ pub(crate) use preview::SkirmishPreviewTexture;
 pub(crate) use text::skirmish_right_panel_label_strings;
 
 use crate::app::AppState;
+use crate::app::frontend::shell_transition::ShellFrameWave;
 use crate::app::loading::init::MapMenuEntry;
-use crate::app::frontend::shell_transition::{ButtonGroup, ShellFrameWave};
 #[cfg(test)]
 use crate::map::preview::PreviewSourceBounds;
 use crate::render::batch::SpriteInstance;
@@ -44,17 +40,16 @@ use crate::render::shell_text::ShellAlign;
 use crate::render::shell_transition_pass::ShellRenderTarget;
 use crate::render::skirmish_shell_chrome::{SkirmishShellChromeAtlas, SkirmishShellChromeEntry};
 use crate::rules::color_scheme::ColorSchemeEntry;
-use crate::skirmish_modes::SkirmishGameMode;
 use crate::ui::main_menu::SkirmishCountry;
+use crate::ui::shell::modal::body_ok_layout;
 #[cfg(test)]
 use crate::ui::skirmish_shell::{
     COMBO_DROPDOWN_ROW_H, SkirmishComboId, combo_dropdown_content_rect, player_name_edit_text_rect,
 };
 use crate::ui::skirmish_shell::{
     ChooseMapModalLayout, OwnerDrawButton, RectPx, SkirmishShellAction, SkirmishShellLayout,
-    SkirmishShellState, ValidationModalLayout, compute_choose_map_modal_layout, compute_layout,
-    compute_random_map_setup_layout, compute_saved_seed_layout, compute_validation_modal_layout,
-    player_row_visible,
+    SkirmishShellState, compute_choose_map_modal_layout, compute_layout,
+    compute_random_map_setup_layout, compute_saved_seed_layout, player_row_visible,
 };
 
 use self::chrome::*;
@@ -114,12 +109,6 @@ const SHELL_DROPDOWN_BG_RGB_PENDING_COMBODROPWIN_SOURCE_CAPTURE: [f32; 3] = [0.0
 const SHELL_SCROLLBAR_TRACK_RGB_PENDING_SCROLLBAR_SOURCE_CAPTURE: [f32; 3] = [0.035, 0.042, 0.034];
 const SHELL_MODAL_BG_RGB: [f32; 3] = [0.020, 0.032, 0.025];
 const SHELL_MODAL_PANEL_RGB: [f32; 3] = [0.050, 0.060, 0.044];
-
-/// The single discrete horizontal move in the native slide-in: the radar/SDTP
-/// shape shifts right by this many pixels while the wave is mid-flight.
-const RADAR_TRANSITION_SHIFT_PX: i32 = 80;
-/// The shift only applies at or above this shell width; below it the radar stays put.
-const RADAR_TRANSITION_MIN_WIDTH: i32 = 800;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShellRenderMode {
@@ -201,18 +190,19 @@ fn flag_entry(atlas: &SkirmishShellChromeAtlas, label: &str) -> Option<SkirmishS
         .map(|(_, entry)| *entry)
 }
 
+/// Depth of `0x6B`'s slide column, with the steady chooser buttons.
+const CHOOSE_MAP_COLUMN_DEPTH: f32 = SHELL_DROPDOWN_DEPTH - 0.00011;
+
 fn build_skirmish_shell_instances(
     atlas: &SkirmishShellChromeAtlas,
     font: &BitFont,
     layout: &SkirmishShellLayout,
     choose_map_layout: Option<&ChooseMapModalLayout>,
-    validation_layout: Option<&ValidationModalLayout>,
-    validation_ok_pressed: bool,
     shell: &SkirmishShellState,
     color_schemes: &[ColorSchemeEntry],
     maps: &[MapMenuEntry],
-    modes: &[SkirmishGameMode],
     wave: Option<&ShellFrameWave>,
+    leaving: bool,
 ) -> Vec<SpriteInstance> {
     let mut instances = Vec::new();
 
@@ -226,7 +216,7 @@ fn build_skirmish_shell_instances(
                 choose_map_layout.screen.w as u32,
                 choose_map_layout.screen.h as u32,
             );
-            push_right_panel_base_instances(&mut instances, atlas, layout, 0, false);
+            push_right_panel_base_instances(&mut instances, atlas, layout, false);
             push_lower_strip_instance(&mut instances, atlas, layout);
             let interior = push_choose_map_background_instances(&mut instances, atlas, layout, choose_map_layout);
             push_saved_seed_modal_instances(&mut instances, atlas, font, &seed_layout, browser, interior);
@@ -235,25 +225,41 @@ fn build_skirmish_shell_instances(
                 choose_map_layout.screen.w as u32,
                 choose_map_layout.screen.h as u32,
             );
-            push_right_panel_base_instances(&mut instances, atlas, layout, 0, false);
+            push_right_panel_base_instances(&mut instances, atlas, layout, false);
             push_lower_strip_instance(&mut instances, atlas, layout);
-            let interior =
-                push_random_map_setup_background_instances(&mut instances, atlas, layout);
-            push_steady_optional_chrome_instances(
-                &mut instances,
-                atlas,
-                layout,
-                ShellDialogChromeProfile::RandomMapSetup0x105,
-            );
-            push_random_map_setup_modal_control_instances(
-                &mut instances,
-                atlas,
-                &setup_layout,
-                interior,
-                modal,
-            );
+            let interior = push_generic_shell_background_instances(&mut instances, atlas, layout);
+            // `0x105`'s slides draw the top panel and the column like `0x6B`'s;
+            // the slide-out repaint blanks every child.
+            match wave {
+                Some(wave) => {
+                    push_slide_panel_art(&mut instances, atlas, layout, &wave.panel_art());
+                    push_slide_column(
+                        &mut instances,
+                        atlas,
+                        layout,
+                        &wave.button_draws(),
+                        CHOOSE_MAP_COLUMN_DEPTH,
+                    );
+                }
+                None => push_steady_optional_chrome_instances(
+                    &mut instances,
+                    atlas,
+                    layout,
+                    ShellDialogChromeProfile::RandomMapSetup0x105,
+                ),
+            }
+            if !leaving {
+                push_random_map_setup_modal_control_instances(
+                    &mut instances,
+                    atlas,
+                    &setup_layout,
+                    interior,
+                    modal,
+                    wave.is_none(),
+                );
+            }
         } else {
-            push_right_panel_base_instances(&mut instances, atlas, layout, 0, false);
+            push_right_panel_base_instances(&mut instances, atlas, layout, false);
             push_lower_strip_instance(&mut instances, atlas, layout);
             let interior = push_choose_map_background_instances(
                 &mut instances,
@@ -261,44 +267,53 @@ fn build_skirmish_shell_instances(
                 layout,
                 choose_map_layout,
             );
-            push_steady_optional_chrome_instances(
-                &mut instances,
-                atlas,
-                layout,
-                ShellDialogChromeProfile::ChooseMap0x6b,
-            );
-            push_choose_map_modal_control_instances(
-                &mut instances,
-                atlas,
-                choose_map_layout,
-                interior,
-                shell,
-                modes,
-            );
+            // `0x6B`'s slides draw the top panel and the column like `0x102`'s
+            // (no map button); the slide-out repaint blanks every child.
+            match wave {
+                Some(wave) => {
+                    push_slide_panel_art(&mut instances, atlas, layout, &wave.panel_art());
+                    push_slide_column(
+                        &mut instances,
+                        atlas,
+                        layout,
+                        &wave.button_draws(),
+                        CHOOSE_MAP_COLUMN_DEPTH,
+                    );
+                }
+                None => push_steady_optional_chrome_instances(
+                    &mut instances,
+                    atlas,
+                    layout,
+                    ShellDialogChromeProfile::ChooseMap0x6b,
+                ),
+            }
+            if !leaving {
+                push_choose_map_modal_control_instances(
+                    &mut instances,
+                    atlas,
+                    choose_map_layout,
+                    interior,
+                    shell,
+                    wave.is_none(),
+                );
+            }
         }
         return instances;
     }
 
-    // The one real positional move in the native slide-in: a single discrete
-    // horizontal shift of the radar/SDTP shape, applied only above the high-res
-    // width threshold and only while the wave is mid-flight (keyed by phase, not
-    // ramped). It snaps back to 0 once the wave completes.
-    let top_offset_x = if wave.is_some_and(|wave| !wave.is_complete())
-        && layout.screen.w >= RADAR_TRANSITION_MIN_WIDTH
-    {
-        RADAR_TRANSITION_SHIFT_PX
-    } else {
-        0
-    };
     push_right_panel_base_instances(
         &mut instances,
         atlas,
         layout,
-        top_offset_x,
         right_panel_frame10_overlay_active(shell),
     );
 
-    push_player_name_edit_instances(&mut instances, atlas, font, layout, shell);
+    // The teardown slide repaints the dialog over every child and runs to its
+    // end without dispatching messages (`0x00622C4F`, `0x006071E0`): only the
+    // dialog's own paint and the button frames show.
+    if !leaving {
+        push_player_name_edit_instances(&mut instances, atlas, font, layout, shell);
+    }
 
     push_lower_strip_instance(&mut instances, atlas, layout);
 
@@ -312,66 +327,55 @@ fn build_skirmish_shell_instances(
         );
     }
 
-    push_steady_optional_chrome_instances(
-        &mut instances,
-        atlas,
-        layout,
-        ShellDialogChromeProfile::SkirmishSetup0x102,
-    );
-
-    // Right-column owner-draw buttons. During the Single Player -> Skirmish slide-in
-    // wave each button shows its wave-scheduled SDBTNANM frame; slot index = top-to-bottom
-    // position in the right column (Start=0, Choose=1, Back=2). All three are enabled main
-    // buttons => Group A (held 1 -> ramp 5..=10 -> held 10). Off-transition uses the
-    // unchanged idle frame2/frame4 path.
     const RIGHT_PANEL_BUTTON_DEPTH: f32 = 0.00059;
-    let emit_right_panel_button = |instances: &mut Vec<SpriteInstance>,
-                                   rect: RectPx,
-                                   pressed: bool,
-                                   disabled: bool,
-                                   slot: u32| {
-        match wave {
-            Some(wave) => {
-                let frame = wave.sdbtnanm_frame(slot, ButtonGroup::A);
-                push_right_panel_button_wave(
-                    instances,
+    match wave {
+        // While either slide runs the engine draws the top-panel art (map
+        // button, top panel, warning display) and the whole tile column in
+        // place of the steady top, map button and buttons (`0x006071E0`).
+        Some(wave) => {
+            push_slide_panel_art(&mut instances, atlas, layout, &wave.panel_art());
+            push_slide_column(
+                &mut instances,
+                atlas,
+                layout,
+                &wave.button_draws(),
+                RIGHT_PANEL_BUTTON_DEPTH,
+            );
+        }
+        None => {
+            push_steady_optional_chrome_instances(
+                &mut instances,
+                atlas,
+                layout,
+                ShellDialogChromeProfile::SkirmishSetup0x102,
+            );
+            for (rect, button, disabled) in [
+                (
+                    layout.start_button,
+                    OwnerDrawButton::StartGame0x617,
+                    shell.validation_modal.is_some(),
+                ),
+                (
+                    layout.choose_map_button,
+                    OwnerDrawButton::ChooseMap0x5aa,
+                    false,
+                ),
+                (layout.back_button, OwnerDrawButton::Back0x5c0, false),
+            ] {
+                push_right_panel_button_shp(
+                    &mut instances,
                     atlas,
                     rect,
-                    frame,
+                    shell.pressed_owner_draw_button == Some(button),
+                    disabled,
                     RIGHT_PANEL_BUTTON_DEPTH,
                 );
             }
-            None => push_right_panel_button_shp(
-                instances,
-                atlas,
-                rect,
-                pressed,
-                disabled,
-                RIGHT_PANEL_BUTTON_DEPTH,
-            ),
         }
-    };
-    emit_right_panel_button(
-        &mut instances,
-        layout.start_button,
-        shell.pressed_owner_draw_button == Some(OwnerDrawButton::StartGame0x617),
-        shell.validation_modal.is_some(),
-        0,
-    );
-    emit_right_panel_button(
-        &mut instances,
-        layout.choose_map_button,
-        shell.pressed_owner_draw_button == Some(OwnerDrawButton::ChooseMap0x5aa),
-        false,
-        1,
-    );
-    emit_right_panel_button(
-        &mut instances,
-        layout.back_button,
-        shell.pressed_owner_draw_button == Some(OwnerDrawButton::Back0x5c0),
-        false,
-        2,
-    );
+    }
+    if leaving {
+        return instances;
+    }
 
     push_combo_instances(&mut instances, atlas, color_schemes, layout, shell, maps);
     push_checkbox_instances(&mut instances, atlas, layout, shell);
@@ -406,16 +410,6 @@ fn build_skirmish_shell_instances(
     }
 
     push_dropdown_instances(&mut instances, atlas, color_schemes, layout, shell, maps);
-    if shell.validation_modal.is_some() {
-        if let Some(validation_layout) = validation_layout {
-            push_validation_modal_instances(
-                &mut instances,
-                atlas,
-                validation_layout,
-                validation_ok_pressed,
-            );
-        }
-    }
     instances
 }
 
@@ -465,30 +459,6 @@ pub(crate) fn render_skirmish_shell(
     Ok(action)
 }
 
-/// Build the software-cursor sprite for the skirmish shell.
-///
-/// The shell renders in screen space with the camera at (0,0), so the cursor
-/// sits at the raw pointer position minus its hotspot — same convention as the
-/// main-menu shell. Returns None when no software cursor is loaded; the OS
-/// cursor is hidden process-wide, so without this the shell shows no pointer.
-fn shell_cursor_instance(state: &AppState) -> Option<SpriteInstance> {
-    let cursor = state.match_state.match_presentation.software_cursor.as_ref()?;
-    let sequence = cursor.get(crate::app::types::CursorId::Default)?;
-    let frame = crate::app::input::cursor::current_software_cursor_frame(sequence)?;
-    Some(SpriteInstance {
-        position: [
-            state.match_state.input.cursor_x - sequence.hotspot[0],
-            state.match_state.input.cursor_y - sequence.hotspot[1],
-        ],
-        size: [frame.width, frame.height],
-        uv_origin: [0.0, 0.0],
-        uv_size: [1.0, 1.0],
-        depth: SHELL_CURSOR_DEPTH,
-        tint: [1.0, 1.0, 1.0],
-        alpha: 1.0,
-        ..Default::default()
-    })
-}
 
 pub(crate) fn render_skirmish_shell_to_target(
     state: &mut AppState,
@@ -530,7 +500,16 @@ fn render_skirmish_shell_with_atlas(
         .frontend.skirmish_shell_state
         .validation_modal
         .as_ref()
-        .map(|_| compute_validation_modal_layout(state.render_width(), state.render_height()));
+        .map(|_| body_ok_layout(state.render_width() as i32, state.render_height() as i32));
+    // `ShellMessageBox__Run` draws the empty backdrop before its box
+    // (`0x005D3514`): while a box is up the dialog behind does not show.
+    let eject_prompt = state
+        .frontend
+        .skirmish_shell_state
+        .choose_map_modal
+        .as_ref()
+        .and_then(|modal| modal.eject_prompt);
+    let message_box_up = validation_layout.is_some() || eject_prompt.is_some();
     let action = SkirmishShellAction::None;
 
     let Some(atlas) = atlas else {
@@ -538,11 +517,77 @@ fn render_skirmish_shell_with_atlas(
         return Ok(action);
     };
 
-    update_owner_draw_button_paint_sound(state, mode);
+    // Choose Map `0x6B` is its own family page over the hidden `0x102`, and
+    // the random-map dialog `0x105` one over the hidden `0x6B`; the seed
+    // browser covers `0x105`.
+    let top_dialog = state.frontend.skirmish_shell_state.top_dialog();
+    let chooser_showing =
+        top_dialog == Some(crate::ui::skirmish_shell::SkirmishShellDialog::ChooseMap);
+    let setup_showing =
+        top_dialog == Some(crate::ui::skirmish_shell::SkirmishShellDialog::RandomMap);
+    let exit_wave = crate::app::frontend::shell_transition::skirmish_slide_target(
+        &state.frontend.skirmish_shell_state,
+    )
+    .and_then(|kind| crate::app::frontend::shell_transition::shell_exit_wave(state, kind))
+    .cloned();
+    let leaving = exit_wave.is_some();
+    let wave = exit_wave.or_else(|| {
+        (mode == ShellRenderMode::TransitionPreview)
+            .then(|| state.frontend.shell_first_paint_slide.clone())
+            .flatten()
+    });
+    // Every slide tick blits the top panel and the tile column from the
+    // dialog's own surface (`0x00607EC8`, `0x00607EF1` with record `+0xD5`),
+    // so no right-panel child shows while either slide runs.
+    let sliding = wave.is_some();
+    // No pressed-button click is painted while a slide draws the frames.
+    let paint_mode = if leaving {
+        ShellRenderMode::TransitionPreview
+    } else {
+        mode
+    };
+    update_owner_draw_button_paint_sound(state, paint_mode);
+    // `0x6B`'s and `0x105`'s heading and status line, revealed from the
+    // entry slide's end.
+    let chooser_statics = match (
+        choose_map_layout.as_ref(),
+        state
+            .frontend
+            .skirmish_shell_state
+            .choose_map_modal
+            .as_mut(),
+    ) {
+        (Some(chooser), Some(modal)) if chooser_showing && !leaving && !message_box_up => {
+            text::dialog_statics_labels(
+                &mut modal.statics,
+                chooser.title,
+                chooser.status_help,
+                sliding,
+            )
+        }
+        _ => Vec::new(),
+    };
+    let setup_layout = compute_random_map_setup_layout(state.render_width(), state.render_height());
+    let setup_statics = match state
+        .frontend
+        .skirmish_shell_state
+        .random_map_setup_modal
+        .as_mut()
+    {
+        Some(setup) if setup_showing && !leaving && !message_box_up => text::dialog_statics_labels(
+            &mut setup.statics,
+            setup_layout.title,
+            setup_layout.status_help,
+            sliding,
+        ),
+        _ => Vec::new(),
+    };
     ensure_selected_preview_texture(state);
     let selected_entry = state
-        .frontend.scenario_catalog.shell_maps()
-        .get(state.frontend.skirmish_shell_state.selected_map_idx);
+        .frontend
+        .scenario_catalog
+        .shell_maps()
+        .get(preview::preview_map_idx(state));
     // Both the sentinel's RandMap.img and the setup dialog's generated image
     // already carry their start markers, so the overlay pass must not add them
     // a second time.
@@ -567,14 +612,22 @@ fn render_skirmish_shell_with_atlas(
         .zip(fitted_preview_rect)
         .map(|(bounds, rect)| project_preview_start_positions(bounds, rect))
         .unwrap_or_default();
-    let draw_start_marker_overlays = should_draw_start_marker_overlays(
-        fitted_preview_rect,
-        &projected_start_positions,
-        preview_has_baked_start_markers,
-    );
-    let preview_instance = state.frontend.skirmish_preview_texture.as_ref().and_then(|preview| {
-        build_preview_surface_instance(preview_rect, preview.width, preview.height)
-    });
+    // The map preview static and its markers sit in the top panel.
+    let draw_start_marker_overlays = !sliding
+        && !message_box_up
+        && should_draw_start_marker_overlays(
+            fitted_preview_rect,
+            &projected_start_positions,
+            preview_has_baked_start_markers,
+        );
+    let preview_instance = state
+        .frontend
+        .skirmish_preview_texture
+        .as_ref()
+        .filter(|_| !sliding && !message_box_up)
+        .and_then(|preview| {
+            build_preview_surface_instance(preview_rect, preview.width, preview.height)
+        });
     let preview_buffer = preview_instance.as_ref().and_then(|instance| {
         state
             .renderer.batch_renderer
@@ -589,11 +642,6 @@ fn render_skirmish_shell_with_atlas(
         .renderer.batch_renderer
         .create_instance_buffer(&state.renderer.gpu, &marker_instances);
 
-    let wave = if mode == ShellRenderMode::TransitionPreview {
-        state.frontend.shell_first_paint_slide.as_ref()
-    } else {
-        None
-    };
     let color_schemes = state
         .rules()
         .map(|rules| rules.color_schemes.as_slice())
@@ -601,20 +649,34 @@ fn render_skirmish_shell_with_atlas(
     let validation_ok_pressed = state.frontend.shell_controller.top_id()
         == Some(crate::ui::shell::descriptor::DialogId(0x00CE))
         && state.frontend.shell_controller.pressed() == Some(crate::ui::shell::modal::control::OK);
-    let instances = build_skirmish_shell_instances(
-        atlas,
-        &state.renderer.bit_font,
-        &layout,
-        choose_map_layout.as_ref(),
-        validation_layout.as_ref(),
-        validation_ok_pressed,
-        &state.frontend.skirmish_shell_state,
-        color_schemes,
-        state.frontend.scenario_catalog.shell_maps(),
-        &state.frontend.skirmish_modes,
-        wave,
-    );
-    let mut instances = instances;
+    let mut instances = if message_box_up {
+        let mut instances = Vec::new();
+        push_message_box_backdrop_instances(&mut instances, atlas, &layout);
+        if let Some(validation_layout) = validation_layout.as_ref() {
+            push_validation_modal_instances(
+                &mut instances,
+                atlas,
+                validation_layout,
+                validation_ok_pressed,
+            );
+        }
+        if let Some(prompt) = eject_prompt {
+            push_eject_box_instances(&mut instances, atlas, layout.screen, prompt);
+        }
+        instances
+    } else {
+        build_skirmish_shell_instances(
+            atlas,
+            &state.renderer.bit_font,
+            &layout,
+            choose_map_layout.as_ref(),
+            &state.frontend.skirmish_shell_state,
+            color_schemes,
+            state.frontend.scenario_catalog.shell_maps(),
+            wave.as_ref(),
+            leaving,
+        )
+    };
     if preview_instance.is_some() {
         push_solid_rect(
             &mut instances,
@@ -624,18 +686,25 @@ fn render_skirmish_shell_with_atlas(
             SHELL_PREVIEW_BACKDROP_DEPTH,
         );
     }
-    let (mut shell_draws, bare_text_instances) = if choose_map_layout.is_some() {
-        (Vec::new(), Vec::new())
+    let parent_showing = !message_box_up && choose_map_layout.is_none() && !leaving;
+    let parent_statics = if parent_showing {
+        text::paint_skirmish_statics(state, &layout, sliding)
     } else {
+        Vec::new()
+    };
+    let (mut shell_draws, bare_text_instances) = if parent_showing {
         build_shell_text_draws(
             state,
             &layout,
-            validation_layout.as_ref(),
             &state.frontend.skirmish_shell_state,
             state.frontend.scenario_catalog.shell_maps(),
+            sliding,
+            &parent_statics,
         )
+    } else {
+        (Vec::new(), Vec::new())
     };
-    if let Some(choose_map_layout) = choose_map_layout.as_ref() {
+    if let Some(choose_map_layout) = choose_map_layout.as_ref().filter(|_| !message_box_up) {
         // Mirrors the sprite pass: the setup dialog replaces the chooser, so
         // only one of the two contributes text.
         if let Some(mode) = state
@@ -650,15 +719,40 @@ fn render_skirmish_shell_with_atlas(
                 choose_map_layout.screen.h as u32,
             );
             push_saved_seed_modal_text_draws(&mut shell_draws, state, &seed_layout);
-        } else if state.frontend.skirmish_shell_state.random_map_setup_modal.is_some() {
-            let setup_layout = compute_random_map_setup_layout(
-                choose_map_layout.screen.w as u32,
-                choose_map_layout.screen.h as u32,
-            );
-            push_random_map_setup_modal_text_draws(&mut shell_draws, state, &setup_layout);
-        } else {
-            push_choose_map_modal_text_draws(&mut shell_draws, state, choose_map_layout);
+        } else if state
+            .frontend
+            .skirmish_shell_state
+            .random_map_setup_modal
+            .is_some()
+        {
+            if !leaving {
+                let setup_layout = compute_random_map_setup_layout(
+                    choose_map_layout.screen.w as u32,
+                    choose_map_layout.screen.h as u32,
+                );
+                push_random_map_setup_modal_text_draws(
+                    &mut shell_draws,
+                    state,
+                    &setup_layout,
+                    sliding,
+                );
+                shell_draws.extend(crate::render::shell_paint::paint_labels_at_depth(
+                    &state.renderer.bit_font,
+                    &setup_statics,
+                    SHELL_DROPDOWN_TEXT_DEPTH - 0.00008,
+                ));
+            }
+        } else if !leaving {
+            push_choose_map_modal_text_draws(&mut shell_draws, state, choose_map_layout, sliding);
+            shell_draws.extend(crate::render::shell_paint::paint_labels_at_depth(
+                &state.renderer.bit_font,
+                &chooser_statics,
+                SHELL_DROPDOWN_TEXT_DEPTH - 0.00008,
+            ));
         }
+    }
+    if let Some(prompt) = eject_prompt {
+        text::push_choose_map_eject_prompt_text(&mut shell_draws, state, &prompt);
     }
     if let Some(validation_layout) = validation_layout.as_ref() {
         push_validation_modal_text_draws(
@@ -704,7 +798,11 @@ fn render_skirmish_shell_with_atlas(
                 .create_instance_buffer(&state.renderer.gpu, &d.instances)
         })
         .collect();
-    let cursor_instances: Vec<SpriteInstance> = shell_cursor_instance(state).into_iter().collect();
+    let cursor_instances: Vec<SpriteInstance> =
+        crate::app::frontend::shell_pass::software_cursor(state, SHELL_CURSOR_DEPTH)
+            .map(|(_, instance)| instance)
+            .into_iter()
+            .collect();
     let cursor_buffer = state
         .renderer.batch_renderer
         .create_instance_buffer(&state.renderer.gpu, &cursor_instances);
@@ -887,10 +985,17 @@ mod tests {
     #[ignore]
     fn official_pkt_backed_skirmish_map_preview_decodes_from_mix_and_fits_right_panel() {
         let config = crate::util::config::GameConfig::load().expect("game config");
-        let assets =
-            crate::assets::asset_manager::AssetManager::new(&config.paths.ra2_dir).expect("assets");
-        let records =
-            crate::app::frontend::list_maps::list_skirmish_scenario_records().expect("scenario records");
+        let mut assets = crate::assets::asset_manager::AssetManager::new(
+            &config.paths.ra2_dir,
+            crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+        )
+        .expect("assets");
+        let records = crate::map::scenario_sources::list_skirmish_scenario_records_with_assets(
+            &config.paths.ra2_dir,
+            &mut assets,
+            None,
+        )
+        .expect("scenario records");
         let record = records
             .iter()
             .find(|record| {
@@ -1061,16 +1166,11 @@ mod tests {
     }
 
     #[test]
-    fn gsi_03_11_random_map_button_disabled_render_uses_idle_art_alpha_and_text() {
+    fn gsi_03_11_random_map_button_disabled_render_uses_idle_art_and_text() {
         assert_eq!(right_panel_button_sdbtnanm_frame_index(true, true), 2);
-        assert_f32_close(
-            right_panel_button_sdbtnanm_alpha(true),
-            BUTTON_DISABLED_ALPHA,
-        );
-        assert_f32_close(right_panel_button_sdbtnanm_alpha(false), 1.0);
         assert_eq!(
             button_label_color_for_disabled(true),
-            SHELL_DISABLED_TEXT_RGB_FROM_PACKED_0000009F
+            crate::render::shell_paint::SHELL_TEXT_RGB_DISABLED
         );
         assert_eq!(button_label_color_for_disabled(false), SHELL_LABEL_TEXT_RGB);
     }
@@ -1469,27 +1569,6 @@ mod tests {
         );
         assert!(!order.contains(&SkirmishShellDrawRole::OwnerDrawButton));
         assert!(!order.contains(&SkirmishShellDrawRole::ChooseMapOwnerDrawButton));
-    }
-
-    #[test]
-    fn parent_shell_status_text_is_blank_when_empty_and_present_when_set() {
-        let mut shell = SkirmishShellState::default();
-        assert_eq!(parent_shell_status_help_text(&shell), None);
-
-        shell.status_help_text = "Start Game".to_string();
-        assert_eq!(parent_shell_status_help_text(&shell), Some("Start Game"));
-    }
-
-    #[test]
-    fn choose_map_modal_suppresses_parent_status_text_even_if_stale() {
-        let mut shell = SkirmishShellState::default();
-        shell.status_help_text = "Start Game".to_string();
-
-        assert_eq!(choose_map_modal_parent_status_help_text(&shell), None);
-        assert_eq!(
-            choose_map_modal_status_help_text(&shell),
-            Some("Start Game")
-        );
     }
 
     #[test]

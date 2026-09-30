@@ -1,7 +1,7 @@
 //! P5c — the Factory/House authority-flip replay/parity ACCEPTANCE GATE.
 //!
 //! The ratification of the P5b authority flip (the first hashed-state change).
-//! Drives REAL production commands (`QueueProduction` / `TogglePauseProduction` /
+//! Drives REAL production commands (`QueueProduction` / `SuspendProduction` /
 //! `CancelProductionByType`) through `advance_tick` and the shared replay harness
 //! (`ReplayLog` / `ReplayRunner`), and asserts:
 //!
@@ -10,15 +10,13 @@
 //!     `state_hash` timeline. This is the lockstep ratification of the flip: the
 //!     newly-hashed `Factory`/`Economy` state machine adds no nondeterminism.
 //!   - (B) CONSERVATION (C15) — over a refund-free replay, EVERY tick conserves
-//!     `Σ_owners(house.credits + economy.spent_credits) == Σ_owners(initial)`.
+//!     `Σ_owners(house.economy.credits + economy.spent_credits) == Σ_owners(initial)`.
 //!     The per-step charge moves credits out of the one wallet into `spent_credits`
 //!     and nowhere else; no credit is created or destroyed by the charge machinery.
 //!
 //! Pre-flip-baseline observable equivalence (P5c part C) is intentionally DEFERRED:
-//! the pre-flip charge path is retired at the flip, and the one intended difference
-//! (the x0.9-free producer cadence) is already documented and asserted by the
-//! producer's own tests. The determinism + conservation gates here are the
-//! load-bearing ratification of the flip.
+//! the pre-flip charge path is retired at the flip. The determinism + conservation
+//! gates here are the load-bearing ratification of the flip.
 //!
 //! Cross-sim replay invariant: a command carries owner/type as `InternedId`, and
 //! `advance_tick` resolves those IDs against the sim's OWN interner. `scenario()`
@@ -34,7 +32,7 @@ use super::tests::{build_catalog_rules, spawn_structure};
 use super::{BuildQueueState, ProductionCategory, queue_view_for_owner};
 use crate::map::entities::EntityCategory;
 use crate::rules::ruleset::RuleSet;
-use crate::sim::command::{Command, CommandEnvelope, QueueMode};
+use crate::sim::command::{Command, CommandEnvelope};
 use crate::sim::house_state::HouseState;
 use crate::sim::intern::InternedId;
 use crate::sim::replay::{ReplayHeader, ReplayLog, ReplayRunner};
@@ -43,13 +41,73 @@ use crate::sim::world::Simulation;
 const TICK_MS: u32 = 67;
 const START_CREDITS: i32 = 50_000;
 
+#[test]
+fn income_spending_and_factory_refund_share_the_runtime_wallet() {
+    let (simulation, rules) = scenario();
+    let (owner, _, _, tank) = ids(&simulation);
+    let mut resources = crate::sim::runtime::SimResources::empty();
+    resources.rules = rules;
+    let mut runtime = crate::sim::runtime::SimRuntime {
+        simulation,
+        resources,
+    };
+    for tick in 1..=40 {
+        if tick == 5 {
+            crate::sim::credit_income::add_credits(&mut runtime.simulation, owner, 123);
+        }
+        if tick == 10 {
+            assert_eq!(
+                crate::sim::credit_income::spend_money(&mut runtime.simulation, owner, 17),
+                17
+            );
+        }
+        let commands = match tick {
+            1 => vec![queue(owner, tank, tick)],
+            40 => vec![env(
+                owner,
+                tick,
+                Command::CancelProductionByType {
+                    type_id: tank,
+                    all: false,
+                },
+            )],
+            _ => Vec::new(),
+        };
+        runtime
+            .advance_frame(&commands, TICK_MS, crate::sim::world::TickLane::Ordinary)
+            .expect("production frame");
+        let cash = runtime.simulation.houses[&owner].economy.credits;
+        assert_eq!(
+            cash,
+            super::credits_for_owner(&runtime.simulation, "Americans")
+        );
+        assert_eq!(
+            cash,
+            crate::sim::credit_income::available_money(&runtime.simulation, owner)
+        );
+        if tick == 39 {
+            assert!(
+                cash < START_CREDITS + 123 - 17,
+                "the live factory charged the wallet"
+            );
+        }
+    }
+    let economy = &runtime.simulation.houses[&owner].economy;
+    assert!(economy.spent_credits > 0);
+    assert_eq!(
+        economy.credits,
+        START_CREDITS + 123 - 17,
+        "active cancellation refunds every factory charge without losing intervening income/debits"
+    );
+}
+
 /// Two funded human owners (Americans, Alliance), each owning a Construction Yard
 /// + Barracks + War Factory + Air Force HQ, so the [`build_catalog_rules`] units
 /// (E1 / MTNK / ORCA) are Strict-mode buildable. No power plant is needed — none of
 /// these structures drains power, so the producer runs at full rate.
 ///
 /// Fully deterministic so the cross-sim replay invariant holds (see module docs).
-fn scenario() -> (Simulation, RuleSet, BTreeMap<(u16, u16), u8>) {
+fn scenario() -> (Simulation, RuleSet) {
     let mut sim = Simulation::new();
     let rules = build_catalog_rules();
     sim.intern_rule_type_ids(&rules);
@@ -67,15 +125,16 @@ fn scenario() -> (Simulation, RuleSet, BTreeMap<(u16, u16), u8>) {
         spawn_structure(&mut sim, sid + 1, owner, "GAPILE", *base_x + 2, 10);
         spawn_structure(&mut sim, sid + 2, owner, "GAWEAP", *base_x + 4, 10);
         spawn_structure(&mut sim, sid + 3, owner, "GAAIRC", *base_x + 6, 10);
-        // `spawn_structure` is a raw test helper and intentionally bypasses the
-        // lifecycle-owned count hook.  Keep this replay fixture in a live match
+        // `spawn_structure` is a raw test helper and intentionally bypasses
+        // construction's Add_Tracking.  Keep this replay fixture in a live match
         // so late defeat handling cannot freeze its command ordinal.
         sim.houses
             .get_mut(&oid)
             .expect("scenario house exists")
-            .owned_building_count = 4;
+            .tracking
+            .set_buildings_for_test(4);
     }
-    (sim, rules, BTreeMap::new())
+    (sim, rules)
 }
 
 fn env(owner: InternedId, tick: u64, payload: Command) -> CommandEnvelope {
@@ -83,15 +142,7 @@ fn env(owner: InternedId, tick: u64, payload: Command) -> CommandEnvelope {
 }
 
 fn queue(owner: InternedId, type_id: InternedId, tick: u64) -> CommandEnvelope {
-    env(
-        owner,
-        tick,
-        Command::QueueProduction {
-            owner,
-            type_id,
-            mode: QueueMode::Append,
-        },
-    )
+    env(owner, tick, Command::QueueProduction { type_id })
 }
 
 /// Resolve the owner/type IDs the streams reference. All are already interned by
@@ -107,8 +158,8 @@ fn ids(sim: &Simulation) -> (InternedId, InternedId, InternedId, InternedId) {
 
 /// A rich stream exercising the full hashed-state machinery: a same-tick two-Begin
 /// from two owners, a second category (Vehicle) for one owner, a FIFO tail (a second
-/// infantry queued behind the first), a mid-build pause + resume, and a mid-build
-/// cancel (partial-refund active-abandon).
+/// infantry queued behind the first), a mid-build hold + resume (a PRODUCE of the held
+/// type), and a mid-build cancel (partial-refund active-abandon).
 fn rich_command_stream(sim: &Simulation) -> Vec<CommandEnvelope> {
     let (am, al, e1, mtnk) = ids(sim);
     vec![
@@ -118,30 +169,22 @@ fn rich_command_stream(sim: &Simulation) -> Vec<CommandEnvelope> {
         queue(am, mtnk, 1),
         // tick 2 — a second infantry behind the first (FIFO tail) for Americans.
         queue(am, e1, 2),
-        // pause Americans' Vehicle build, then resume.
+        // hold Americans' Vehicle build, then resume it.
         env(
             am,
             8,
-            Command::TogglePauseProduction {
-                owner: am,
+            Command::SuspendProduction {
                 category: ProductionCategory::Vehicle,
             },
         ),
-        env(
-            am,
-            25,
-            Command::TogglePauseProduction {
-                owner: am,
-                category: ProductionCategory::Vehicle,
-            },
-        ),
+        queue(am, mtnk, 25),
         // Alliance cancels its active infantry mid-build (partial refund).
         env(
             al,
             12,
             Command::CancelProductionByType {
-                owner: al,
                 type_id: e1,
+                all: false,
             },
         ),
     ]
@@ -165,11 +208,11 @@ fn refund_free_stream(sim: &Simulation) -> Vec<CommandEnvelope> {
 fn record(
     sim: &mut Simulation,
     rules: &RuleSet,
-    heights: &BTreeMap<(u16, u16), u8>,
     pending: Vec<CommandEnvelope>,
     ticks: u64,
 ) -> (Vec<u64>, ReplayLog) {
     let mut log = ReplayLog::new(ReplayHeader {
+        pixel_conversion_bounds: Default::default(),
         version: 1,
         tick_hz: 15,
         // Record the sim's actual construction seed — playback fidelity is
@@ -182,58 +225,67 @@ fn record(
     sim.queue_commands(pending);
     for _ in 0..ticks {
         let due = sim.take_due_commands();
-        let r = sim.advance_tick(&due, Some(rules), heights, None, None, TICK_MS);
+        let r = sim.advance_tick(&due, Some(rules), None, None, TICK_MS);
         hashes.push(r.state_hash);
         log.record_tick(r.tick, due, r.state_hash);
     }
     (hashes, log)
 }
 
+/// A build started by a command is armed at that frame (the build start `0x004C9EA0`) and
+/// first steps, charging the wallet, one rate later (`FactoryClass::AI 0x004C9B20`).
 #[test]
-fn event_tail_enqueue_first_charges_on_the_following_frame() {
-    let (mut sim, rules, heights) = scenario();
+fn event_tail_enqueue_first_charges_one_rate_later() {
+    let (mut sim, rules) = scenario();
     let (owner, _, infantry, _) = ids(&sim);
-    let credits_before = sim.houses[&owner].credits;
+    let credits_before = sim.houses[&owner].economy.credits;
 
+    let start_frame = sim.session.binary_frame;
     sim.advance_tick(
         &[queue(owner, infantry, 1)],
         Some(&rules),
-        &heights,
         None,
         None,
         TICK_MS,
     );
-    let armed = sim
-        .production
-        .factory_shadow
-        .view(owner, ProductionCategory::Infantry)
-        .expect("the command tail arms the factory");
-    assert_eq!(armed.progress, 0);
-    assert_eq!(sim.houses[&owner].credits, credits_before);
+    let factory = |sim: &Simulation| {
+        sim.production
+            .factory_shadow
+            .iter_insertion_ordered()
+            .into_iter()
+            .find(|f| f.owner == owner && f.category == ProductionCategory::Infantry)
+            .map(|f| (f.progress, f.step_rate_frames, f.step_timer))
+            .expect("the command tail arms the factory")
+    };
+    let (progress, rate, timer) = factory(&sim);
+    assert_eq!(progress, 0);
+    assert_eq!(timer.start_frame(), start_frame as i32);
+    assert!(rate > 1);
+    assert_eq!(sim.houses[&owner].economy.credits, credits_before);
 
-    sim.advance_tick(&[], Some(&rules), &heights, None, None, TICK_MS);
-    let charged = sim
-        .production
-        .factory_shadow
-        .view(owner, ProductionCategory::Infantry)
-        .expect("the active factory remains registered");
-    assert_eq!(charged.progress, 1);
-    assert!(sim.houses[&owner].credits < credits_before);
+    for _ in 1..rate {
+        sim.advance_tick(&[], Some(&rules), None, None, TICK_MS);
+        assert_eq!(factory(&sim).0, 0);
+    }
+    assert_eq!(sim.houses[&owner].economy.credits, credits_before);
+    sim.advance_tick(&[], Some(&rules), None, None, TICK_MS);
+    assert_eq!(factory(&sim).0, 1);
+    assert!(sim.houses[&owner].economy.credits < credits_before);
 }
 
 /// (P5d derived-state) An underfunded mid-build factory (on_hold) renders as Building in
-/// the sidebar build queue, NOT "On Hold"/NoFunds — the pre-P5d front never surfaced NoFunds
-/// during a stall (it stayed Building; on_hold is internal). The sibling of the blocked-exit
-/// Done case: the derived view state must reproduce the exact observed label set
-/// {Building, Paused, Done, Queued}.
+/// the sidebar build queue, NOT "On Hold": a cash stall keeps the factory's rate and leaves
+/// `+0x70` clear, so the strip's hold text (`0x006A9E9C..0x006A9ECC`) never shows for it.
+/// The sibling of the blocked-exit Done case: the derived view state must reproduce the
+/// exact observed label set {Building, Paused, Done, Queued}.
 #[test]
 fn derived_view_state_stays_building_on_underfunded_stall() {
-    let (mut sim, rules, _heights) = scenario();
+    let (mut sim, rules) = scenario();
     let (am, _, e1, _) = ids(&sim);
     // Arm an E1 build directly, then simulate a mid-build underfunded stall.
     sim.production
         .factory_shadow
-        .enqueue(am, ProductionCategory::Infantry, e1, 1, 100, 200);
+        .test_enqueue_kernel(am, ProductionCategory::Infantry, e1, 1, 200);
     {
         let f = sim
             .production
@@ -272,22 +324,21 @@ fn factory_flip_replay_is_bit_identical_across_runs_and_playback() {
     const TICKS: u64 = 120;
 
     // Run 1 — live record.
-    let (mut s1, rules, heights) = scenario();
+    let (mut s1, rules) = scenario();
     let cmds = rich_command_stream(&s1);
-    let (timeline_live, log) = record(&mut s1, &rules, &heights, cmds.clone(), TICKS);
+    let (timeline_live, log) = record(&mut s1, &rules, cmds.clone(), TICKS);
 
     // Run 2 — live record again (pure repeatability).
-    let (mut s2, rules2, heights2) = scenario();
-    let (timeline_live2, _) = record(&mut s2, &rules2, &heights2, cmds, TICKS);
+    let (mut s2, rules2) = scenario();
+    let (timeline_live2, _) = record(&mut s2, &rules2, cmds, TICKS);
     assert_eq!(
         timeline_live, timeline_live2,
         "two live runs of the same command stream must produce an identical per-tick hash timeline"
     );
 
     // Run 3 — replay the recorded log through the shared ReplayRunner.
-    let (mut s3, rules3, heights3) = scenario();
-    let timeline_playback =
-        ReplayRunner::run_fixture(&mut s3, &log, Some(&rules3), &heights3, None, TICK_MS);
+    let (mut s3, rules3) = scenario();
+    let timeline_playback = ReplayRunner::run_fixture(&mut s3, &log, Some(&rules3), None, TICK_MS);
     assert_eq!(
         timeline_live, timeline_playback,
         "replay playback must reproduce the live hash timeline bit-for-bit"
@@ -302,29 +353,32 @@ fn factory_flip_replay_is_bit_identical_across_runs_and_playback() {
 }
 
 /// (B) CONSERVATION (C15) — over a refund-free replay, every tick conserves the
-/// global money pool: `Σ(house.credits + economy.spent_credits) == Σ(initial)`.
+/// global money pool: `Σ(house.economy.credits + economy.spent_credits) == Σ(initial)`.
 /// The per-step charge is the only mover of credits; nothing is created or lost.
 #[test]
 fn economy_conservation_over_replay() {
     const TICKS: u64 = 600;
 
-    let (mut sim, rules, heights) = scenario();
+    let (mut sim, rules) = scenario();
     let (am, al, _, _) = ids(&sim);
     let pending = refund_free_stream(&sim);
 
-    let initial: i64 = [am, al].iter().map(|o| sim.houses[o].credits as i64).sum();
+    let initial: i64 = [am, al]
+        .iter()
+        .map(|o| sim.houses[o].economy.credits as i64)
+        .sum();
 
     sim.queue_commands(pending);
     let mut any_spent = false;
     for _ in 0..TICKS {
         let due = sim.take_due_commands();
-        sim.advance_tick(&due, Some(&rules), &heights, None, None, TICK_MS);
+        sim.advance_tick(&due, Some(&rules), None, None, TICK_MS);
 
         let total: i64 = [am, al]
             .iter()
             .map(|o| {
                 let h = &sim.houses[o];
-                h.credits as i64 + h.economy.spent_credits as i64
+                h.economy.credits as i64 + h.economy.spent_credits as i64
             })
             .sum();
         assert_eq!(
@@ -351,8 +405,9 @@ fn economy_conservation_over_replay() {
 }
 
 /// (B') CONSERVATION THROUGH THE PARTIAL-REFUND BRANCH (C8/C15) — the cancel of a
-/// mid-build active object refunds exactly the already-charged portion
-/// (`original_balance − balance`) back to the one wallet and nowhere else. The
+/// mid-build active object refunds its Cost_Of less the Balance still owed, which with
+/// no FactoryPlant change is exactly the already-charged portion, back to the one
+/// wallet and nowhere else. The
 /// global pool is conserved once refunds are accounted for:
 /// `Σ(credits + spent_credits) − cumulative_refunded == initial` at every tick.
 ///
@@ -371,7 +426,7 @@ fn economy_conservation_through_cancel_refund() {
     // MTNK balance when the cancel reaches the command tail.
     const CANCEL_TICK: u64 = 40;
 
-    let (mut sim, rules, heights) = scenario();
+    let (mut sim, rules) = scenario();
     let (am, al, e1, mtnk) = ids(&sim);
 
     // Americans: ONLY an MTNK (Cost 900 -> guaranteed mid-build at the cancel tick),
@@ -384,13 +439,16 @@ fn economy_conservation_through_cancel_refund() {
             am,
             CANCEL_TICK,
             Command::CancelProductionByType {
-                owner: am,
                 type_id: mtnk,
+                all: false,
             },
         ),
     ]);
 
-    let initial: i64 = [am, al].iter().map(|o| sim.houses[o].credits as i64).sum();
+    let initial: i64 = [am, al]
+        .iter()
+        .map(|o| sim.houses[o].economy.credits as i64)
+        .sum();
     let mtnk_cost = sim
         .object_type(mtnk, &rules)
         .map(|o| o.cost.max(0))
@@ -398,17 +456,17 @@ fn economy_conservation_through_cancel_refund() {
 
     let mut prev: BTreeMap<InternedId, i32> = [am, al]
         .iter()
-        .map(|&o| (o, sim.houses[&o].credits))
+        .map(|&o| (o, sim.houses[&o].economy.credits))
         .collect();
     let mut cumulative_refunded: i64 = 0;
 
     for _ in 0..TICKS {
         let due = sim.take_due_commands();
-        sim.advance_tick(&due, Some(&rules), &heights, None, None, TICK_MS);
+        sim.advance_tick(&due, Some(&rules), None, None, TICK_MS);
 
         // Every per-owner credit INCREASE is a refund (no deposits in this scenario).
         for &o in &[am, al] {
-            let now = sim.houses[&o].credits;
+            let now = sim.houses[&o].economy.credits;
             let delta = now - *prev.get(&o).unwrap();
             if delta > 0 {
                 cumulative_refunded += delta as i64;
@@ -420,7 +478,7 @@ fn economy_conservation_through_cancel_refund() {
             .iter()
             .map(|o| {
                 let h = &sim.houses[o];
-                h.credits as i64 + h.economy.spent_credits as i64
+                h.economy.credits as i64 + h.economy.spent_credits as i64
             })
             .sum();
         assert_eq!(
@@ -468,20 +526,27 @@ fn revalidate_abandons_build_with_no_factory_and_drops_queued() {
     let mtnk = sim.interner.intern("MTNK");
     // Arm directly (bypassing the enqueue eligibility gate) an active + one queued MTNK for
     // an owner with NO war factory -> both classify NoFactory -> PermanentlyBlocked.
-    sim.production
-        .factory_shadow
-        .enqueue(am, ProductionCategory::Vehicle, mtnk, 1, 100, 900);
-    sim.production
-        .factory_shadow
-        .enqueue(am, ProductionCategory::Vehicle, mtnk, 2, 100, 900);
+    sim.production.factory_shadow.test_enqueue_kernel(
+        am,
+        ProductionCategory::Vehicle,
+        mtnk,
+        1,
+        900,
+    );
+    sim.production.factory_shadow.test_enqueue_kernel(
+        am,
+        ProductionCategory::Vehicle,
+        mtnk,
+        2,
+        900,
+    );
     assert!(
         sim.production
             .factory_shadow
             .view(am, ProductionCategory::Vehicle)
             .is_some()
     );
-    let heights: BTreeMap<(u16, u16), u8> = BTreeMap::new();
-    sim.advance_tick(&[], Some(&rules), &heights, None, None, TICK_MS);
+    sim.advance_tick(&[], Some(&rules), None, None, TICK_MS);
     assert!(
         sim.production
             .factory_shadow
@@ -490,25 +555,25 @@ fn revalidate_abandons_build_with_no_factory_and_drops_queued() {
         "no-factory build abandoned + queued dropped -> factory pruned"
     );
     assert_eq!(
-        sim.houses[&am].credits, 50_000,
+        sim.houses[&am].economy.credits, 50_000,
         "an uncharged abandon refunds nothing (credits unchanged)"
     );
 }
 
 /// A build whose producing factory is DESTROYED mid-progress is abandoned with the C8 PARTIAL
-/// refund (exactly the already-charged portion `original_balance - balance`) into house.credits,
-/// and the factory is pruned. Revalidation runs before the charge sweep, so no extra charge
-/// lands the abandon tick.
+/// refund (Cost_Of - Balance: exactly the already-charged portion) into
+/// house.economy.credits, and the factory is pruned. Revalidation runs before the charge
+/// sweep, so no extra charge lands the abandon tick.
 #[test]
 fn revalidate_abandons_active_on_factory_loss_partial_refund() {
-    let (mut sim, rules, heights) = scenario();
+    let (mut sim, rules) = scenario();
     let (am, _, _, mtnk) = ids(&sim);
     // Enqueue MTNK via the real command path (eligible — Americans owns GAWEAP), then charge
     // partway.
     sim.queue_command(queue(am, mtnk, 1));
     for _ in 0..40 {
         let due = sim.take_due_commands();
-        sim.advance_tick(&due, Some(&rules), &heights, None, None, TICK_MS);
+        sim.advance_tick(&due, Some(&rules), None, None, TICK_MS);
     }
     // Mid-build before factory loss; read the spent portion = the expected refund.
     let spent = {
@@ -521,7 +586,7 @@ fn revalidate_abandons_active_on_factory_loss_partial_refund() {
             f.object.is_some() && f.progress > 0 && f.progress < 54,
             "MTNK must be mid-build (active, in-progress) before factory loss"
         );
-        f.original_balance - f.balance
+        900 - f.balance
     };
     assert!(
         spent > 0 && spent < 900,
@@ -539,9 +604,9 @@ fn revalidate_abandons_active_on_factory_loss_partial_refund() {
     );
     sim.substrate.entities.remove(3);
 
-    let credits_before = sim.houses[&am].credits;
-    sim.advance_tick(&[], Some(&rules), &heights, None, None, TICK_MS);
-    let refund = sim.houses[&am].credits - credits_before;
+    let credits_before = sim.houses[&am].economy.credits;
+    sim.advance_tick(&[], Some(&rules), None, None, TICK_MS);
+    let refund = sim.houses[&am].economy.credits - credits_before;
     assert_eq!(
         refund, spent,
         "factory-loss abandon refunds exactly the already-charged portion"
@@ -560,12 +625,12 @@ fn revalidate_abandons_active_on_factory_loss_partial_refund() {
 /// hash-neutral steady state).
 #[test]
 fn revalidate_keeps_buildable_build_untouched() {
-    let (mut sim, rules, heights) = scenario();
+    let (mut sim, rules) = scenario();
     let (am, _, _, mtnk) = ids(&sim);
     sim.queue_command(queue(am, mtnk, 1));
     for _ in 0..40 {
         let due = sim.take_due_commands();
-        sim.advance_tick(&due, Some(&rules), &heights, None, None, TICK_MS);
+        sim.advance_tick(&due, Some(&rules), None, None, TICK_MS);
     }
     let view = sim
         .production
@@ -587,17 +652,16 @@ fn revalidate_keeps_buildable_build_untouched() {
 fn runtime_backed_replay_hashes_match_each_tick() {
     const TICKS: u64 = 120;
 
-    let (mut live, rules, heights) = scenario();
+    let (mut live, rules) = scenario();
     let cmds = rich_command_stream(&live);
-    let (timeline_live, log) = record(&mut live, &rules, &heights, cmds, TICKS);
+    let (timeline_live, log) = record(&mut live, &rules, cmds, TICKS);
 
-    let (fresh, runtime_rules, runtime_heights) = scenario();
+    let (fresh, runtime_rules) = scenario();
     let mut runtime = crate::sim::runtime::SimRuntime {
         simulation: fresh,
         resources: {
             let mut resources = crate::sim::runtime::SimResources::empty();
             resources.rules = runtime_rules;
-            resources.height_map = runtime_heights;
             resources
         },
     };
@@ -606,4 +670,127 @@ fn runtime_backed_replay_hashes_match_each_tick() {
         timeline_live, timeline_runtime,
         "runtime-backed replay must reproduce the live hash timeline bit-for-bit"
     );
+}
+
+/// Retail MTNK, FV and E1 through the production path. The queue command starts
+/// the build, and its rate and steps match the originals' (`0x004C9EA0`, then
+/// `FactoryClass::AI` `0x004C9B20` each frame) for the inputs the factory
+/// resolved: the cadence oracle's funded row with those inputs, offset to the
+/// build's start frame.
+#[test]
+fn retail_builds_step_at_the_native_frames() {
+    let Some((rules_ini, art_ini)) = crate::rules::retail_ini_fixture::retail_rules_and_art()
+    else {
+        return;
+    };
+    let mut rules = RuleSet::from_ini(&rules_ini).expect("retail rules");
+    rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art_ini));
+    let cadence = super::factory::native_factory_cadence();
+    let oracle_start = cadence["start_frame"].as_u64().unwrap() as u32;
+    for (unit, factory, category) in [
+        ("MTNK", "GAWEAP", ProductionCategory::Vehicle),
+        ("FV", "GAWEAP", ProductionCategory::Vehicle),
+        ("E1", "GAPILE", ProductionCategory::Infantry),
+    ] {
+        let mut sim = Simulation::new();
+        sim.intern_rule_type_ids(&rules);
+        sim.resolve_type_handles(&rules);
+        let owner = sim.interner.intern("Americans");
+        sim.houses.insert(
+            owner,
+            HouseState::new(owner, 0, None, true, START_CREDITS, 10),
+        );
+        spawn_structure(&mut sim, 1, "Americans", "GACNST", 10, 10);
+        spawn_structure(&mut sim, 2, "Americans", factory, 16, 10);
+        spawn_structure(&mut sim, 3, "Americans", "GAPOWR", 22, 10);
+        spawn_structure(&mut sim, 4, "Americans", "GAPOWR", 26, 10);
+        spawn_structure(&mut sim, 5, "Americans", "GAPOWR", 30, 10);
+        // Full-strength buildings, so the plants give their retail 200 each.
+        for id in 1..=5 {
+            let entity = sim.substrate.entities.get_mut(id).expect("structure");
+            let strength = rules
+                .object(sim.interner.resolve(entity.type_ref))
+                .expect("retail building")
+                .strength;
+            entity.health.current = strength;
+        }
+        sim.houses
+            .get_mut(&owner)
+            .unwrap()
+            .tracking
+            .set_buildings_for_test(5);
+        let type_id = sim.interner.intern(unit);
+
+        let factory_state = |sim: &Simulation| {
+            sim.production
+                .factory_shadow
+                .iter_insertion_ordered()
+                .into_iter()
+                .find(|f| f.owner == owner && f.category == category)
+                .map(|f| {
+                    let held = f.object.as_ref().and_then(|object| object.entity_id);
+                    (f.progress, f.step_rate_frames, f.step_timer, held)
+                })
+        };
+        let mut start = None;
+        let mut held = None;
+        let mut step_frames = Vec::new();
+        for tick in 1..=3000u64 {
+            let frame = sim.session.binary_frame;
+            let commands = if tick == 1 {
+                vec![queue(owner, type_id, 1)]
+            } else {
+                Vec::new()
+            };
+            let before = factory_state(&sim).map_or(0, |(progress, ..)| progress);
+            sim.advance_tick(&commands, Some(&rules), None, None, TICK_MS);
+            let Some((progress, rate, timer, object)) = factory_state(&sim) else {
+                // The last step completes the build and the unit leaves in the
+                // same frame, which retires the idle factory.
+                if let Some(held) = held {
+                    let unit_entity = sim.substrate.entities.get(held).expect("built unit");
+                    assert!(!unit_entity.lifecycle.in_limbo, "{unit}: delivered");
+                    step_frames.push(frame);
+                    break;
+                }
+                continue;
+            };
+            if start.is_none() {
+                assert_eq!(
+                    timer.start_frame(),
+                    frame as i32,
+                    "{unit}: the build start arms the timer"
+                );
+                start = Some((frame, rate));
+                held = object;
+            }
+            if progress != before {
+                step_frames.push(frame);
+            }
+        }
+        let (start_frame, rate) = start.expect("the build started");
+        let obj = sim.object_type(type_id, &rules).expect("retail type");
+        let inputs = super::factory::time_to_build_inputs(&sim, &rules, owner, category, obj);
+        let row = cadence["builds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| {
+                super::factory::native_time_to_build_inputs(row) == inputs
+                    && row["final"]["stage"] == 54
+            })
+            .unwrap_or_else(|| panic!("{unit}: no funded cadence row for {inputs:?}"));
+        assert_eq!(
+            u64::from(rate),
+            row["after_start"]["rate"].as_u64().unwrap(),
+            "{unit}: the start's rate"
+        );
+        let expected: Vec<u32> = row["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|attempt| start_frame + (attempt[0].as_u64().unwrap() as u32 - oracle_start))
+            .collect();
+        assert_eq!(step_frames, expected, "{unit}: the native step frames");
+    }
 }

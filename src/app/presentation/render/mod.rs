@@ -3,7 +3,7 @@
 //! `render_game()` is the per-frame entry point. It runs a 7-phase pipeline:
 //!
 //! 1. **World instances** — terrain tiles, map overlays, bridges, VXL units,
-//!    SHP buildings/infantry, world effects, damage fires, fog snapshots
+//!    SHP buildings/infantry, AnimClass objects, damage fires, fog snapshots
 //! 2. **Debug instances** — pathgrid, cell grid, heightmap overlays (toggled by hotkey)
 //! 3. **Shroud ABuffer** - CPU shroud buffer rebuilt before UI overlays sample it
 //! 4. **UI instances** - minimap dots, selection brackets, health bars, placement preview
@@ -14,13 +14,15 @@
 //! ## Sub-modules
 //! - `build_instances` — phase 1-4 builders: named functions + structs per phase
 //! - `draw_passes` — phase 6: render pass creation and GPU draw call dispatch
-//! - `merge_passes` — Y-sorted multi-way merge algorithm for interleaving atlas textures
+//! - `merge_passes` — replay retained native object layers across atlas textures
 //!
 //! ## Dependency rules
 //! - Part of the app layer — may depend on everything.
 
 mod build_instances;
 mod draw_passes;
+#[cfg(test)]
+pub(crate) use draw_passes::draw_pooled_overlay_bodies;
 pub(crate) mod draw_plan_lowering;
 mod merge_passes;
 pub(crate) mod minimap_transaction;
@@ -63,6 +65,16 @@ impl GameRenderInstanceCounts {
 pub(crate) struct GameRenderOutput {
     pub sidebar_view: Option<SidebarView>,
     pub instance_counts: GameRenderInstanceCounts,
+    pub times: GameRenderTimes,
+}
+
+/// Actual HUD update inputs observed by the frame owner, and the radar draw
+/// input consumed here. The distinct ordinary clock epochs remain unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct GameRenderTimes {
+    pub radar_ms: u64,
+    pub tooltip_ms: u64,
+    pub message_ms: Option<u64>,
 }
 
 /// Render one in-game frame: terrain, units, overlays, UI, sidebar.
@@ -72,13 +84,12 @@ pub(crate) struct GameRenderOutput {
 pub(crate) fn render_game(
     state: &mut AppState,
     encoder: &mut wgpu::CommandEncoder,
+    times: GameRenderTimes,
 ) -> Result<GameRenderOutput> {
-    // RadarClass::Draw 653100 uses wall-clock buckets, not simulation ticks.
-    let wall_ms = crate::app::match_runtime::sim_tick::monotonic_frame_pacer_ms(
-        state, std::time::Instant::now(),
-    );
+    // RadarClass::Draw 653100 consumes timeGetTime buckets. The frame owner
+    // supplies wall time normally, or the map diagnostic's recorded OS input.
     if let Some(radar) = state.match_state.match_presentation.radar_anim.as_mut() {
-        radar.tick(&state.renderer.gpu, wall_ms);
+        radar.tick(&state.renderer.gpu, times.radar_ms);
     }
     let (sw, sh) = (state.render_width() as f32, state.render_height() as f32);
 
@@ -156,16 +167,67 @@ pub(crate) fn render_game(
         state.match_state.input.zoom_level,
     );
     let composition_view = state.renderer.combat_light_renderer.composition_view();
-    let (_, tactical_y, _, _) = crate::app::input::camera::tactical_viewport_px(state);
+    let (tactical_x, tactical_y, tactical_w, tactical_h) =
+        crate::app::input::camera::tactical_viewport_px(state);
     // Shader row coordinates are unscaled world pixels; scissor uses target
     // pixels. Native zoom1 is exact, and scaled views preserve that unit frame.
     let native_z_origin_y = tactical_y as f32 / state.match_state.input.zoom_level;
-    state.renderer.batch_renderer.update_native_z_origin(&state.renderer.gpu.queue, native_z_origin_y);
+    state
+        .renderer
+        .batch_renderer
+        .update_native_z_origin(&state.renderer.gpu.queue, native_z_origin_y);
     state.renderer.terrain_draw_renderer.prepare(
         &state.renderer.gpu.device,
         state.renderer.combat_light_renderer.composition_texture(),
         &state.renderer.depth_view,
         state.renderer.batch_renderer.camera_uniform(),
+    );
+
+    // Tactical6D4673 -> LineTrail556D40 updates once per actual composite.
+    // It reads committed Bullet coordinates even when no simulation tick ran.
+    // The ring belongs to presentation and survives only until it fades or loads.
+    let camera = [
+        state.match_state.input.camera_x,
+        state.match_state.input.camera_y,
+    ];
+    let sim = state
+        .match_state
+        .sim_runtime
+        .as_ref()
+        .map(|runtime| runtime.view().simulation());
+    let presentation = &mut state.match_state.match_presentation;
+    let segments = presentation.line_trails.composite(|id| {
+        sim.and_then(|sim| sim.projectiles.get(id))
+            .map(|bullet| bullet.position)
+    });
+    let shroud = presentation.shroud_buffer.as_ref();
+    let sandbox = state.match_state.sandbox_full_visibility;
+    state.renderer.terrain_draw_renderer.prepare_line_trails(
+        &state.renderer.gpu.device,
+        &state.renderer.gpu.queue,
+        segments,
+        crate::render::line_trail::LineTrailViewport {
+            camera: camera.map(|v| v.floor() as i32),
+            clip: [tactical_x, tactical_y, tactical_w, tactical_h].map(|v| (v as f32 / z) as i32),
+            z_origin_y: native_z_origin_y as i32,
+            zoom: z,
+        },
+        |point| {
+            if sandbox {
+                127
+            } else {
+                shroud
+                    .and_then(|buffer| {
+                        buffer.sample_world(
+                            point[0] as f32 + camera[0].floor(),
+                            point[1] as f32 + camera[1].floor(),
+                            camera[0],
+                            camera[1],
+                        )
+                    })
+                    .map_or(127, u16::from)
+            }
+        },
     );
 
     // Phase 7: Dispatch draw calls in render order.
@@ -175,23 +237,14 @@ pub(crate) fn render_game(
         &composition_view,
         &draw_passes::DrawPassData {
             overlay_render_z: &world.overlay_render_z,
-            ground: &world.ground,
-            unit_instances: &world.unit,
-            unit_pages: &world.unit_pages,
-            unit_transition_paged: &world.unit_transition_paged,
-            shp_paged: &world.shp_paged,
-            top_unit_pages: &world.top_unit_pages,
-            top_shp_pages: &world.top_shp_pages,
+            object_layers: &world.object_layers,
             ghost_page: ui.ghost_page,
         },
     );
-    // Return unit instances vec to AppState (deferred until after the draw pass
-    // because the multi-way merge needs the CPU-side Y values).
-    state.match_state.match_presentation.cached_unit_instances = world.unit;
-    state.match_state.match_presentation.cached_unit_pages = world.unit_pages;
     Ok(GameRenderOutput {
         instance_counts: sidebar.emitted_instance_counts(),
         sidebar_view: sidebar.view,
+        times,
     })
 }
 
@@ -226,11 +279,14 @@ fn upload_to_gpu(
     // Terrain + overlays
     pool.upload(&state.renderer.gpu, "terrain", &world.terrain.normal);
     pool.upload(&state.renderer.gpu, "overlay", &world.overlay);
-    pool.upload(
-        &state.renderer.gpu,
-        "ground_objects",
-        &world.ground.instances,
-    );
+    for (layer, objects) in world.object_layers.iter().enumerate() {
+        pool.upload_page(
+            &state.renderer.gpu,
+            "object_layer",
+            layer,
+            &objects.instances,
+        );
+    }
     pool.upload(
         &state.renderer.gpu,
         "overlay_bridge_body",
@@ -250,34 +306,7 @@ fn upload_to_gpu(
     // before overlays, matching the native per-cell tile-then-smudge dispatch.
     pool.upload(&state.renderer.gpu, "smudge", &world.smudge);
 
-    // Entities (VXL + SHP)
-    pool.upload(&state.renderer.gpu, "unit", &world.unit);
-    const UNIT_TRANSITION_KEYS: [&str; 4] = [
-        "unit_transition_p0",
-        "unit_transition_p1",
-        "unit_transition_p2",
-        "unit_transition_p3",
-    ];
-    for (i, page_inst) in world.unit_transition_paged.iter().enumerate() {
-        if let Some(key) = UNIT_TRANSITION_KEYS.get(i) {
-            pool.upload(&state.renderer.gpu, key, page_inst);
-        }
-    }
-    const SHP_PAGE_KEYS: [&str; 4] = ["shp_p0", "shp_p1", "shp_p2", "shp_p3"];
-    for (i, page_inst) in world.shp_paged.iter().enumerate() {
-        if i < SHP_PAGE_KEYS.len() {
-            pool.upload(&state.renderer.gpu, SHP_PAGE_KEYS[i], page_inst);
-        }
-    }
-    // The band above Ground (gamemd layers 3 and 4) — drawn after every ground
-    // object. Voxel bodies and SHP bodies keep separate streams because they
-    // sample different atlases; the band is unsorted either way.
-    pool.upload(&state.renderer.gpu, "unit_top", &world.top_unit);
-    pool.upload(&state.renderer.gpu, "shp_top", &world.top_shp);
-    // (No `building_turret` buffer: a building's voxel turret rides the `unit`
-    // stream and is drawn inside the sorted ground pass, as gamemd draws it.)
-    // PixelFX water/ore sparkles — drawn after the ground object pass.
-    // Empty when the live `[Options] DetailLevel` projection is zero.
+    // Residual effects keep their existing uploads and pass ownership.
     pool.upload(&state.renderer.gpu, "cell_sparkles", &world.cell_sparkles);
     pool.upload(&state.renderer.gpu, "weapon_waves", &world.weapon_waves);
     pool.upload(
@@ -285,11 +314,8 @@ fn upload_to_gpu(
         "spotlight_type16",
         &world.spotlight_type16,
     );
-    const PARTICLE_KEYS: [&str; 4] = ["particle_p0", "particle_p1", "particle_p2", "particle_p3"];
-    for (i, page_inst) in world.particle_paged.iter().enumerate() {
-        if i < PARTICLE_KEYS.len() {
-            pool.upload(&state.renderer.gpu, PARTICLE_KEYS[i], page_inst);
-        }
+    for (page, page_inst) in world.particle_paged.iter().enumerate() {
+        pool.upload_page(&state.renderer.gpu, "particle_page", page, page_inst);
     }
 
     // UI overlays
@@ -315,6 +341,8 @@ fn upload_to_gpu(
         &ui.radius_ring,
     );
     pool.upload(&state.renderer.gpu, "status_building", &ui.building_status);
+    pool.upload(&state.renderer.gpu, "bomb_clocks", &ui.bomb_clock);
+    pool.upload(&state.renderer.gpu, "repair_wrenches", &ui.repair_wrench);
     pool.upload(&state.renderer.gpu, "occupant_pips", &ui.occupant_pip);
     pool.upload(&state.renderer.gpu, "status_unit_bg", &ui.unit_status_bg);
     pool.upload(

@@ -105,10 +105,7 @@ fn build_synthetic_simulation(seed: u32) -> Simulation {
                 0,
                 0,
                 owner_id,
-                Health {
-                    current: 1000,
-                    max: 1000,
-                },
+                Health { current: 1000 },
                 type_ref,
                 EntityCategory::Structure,
                 0,
@@ -164,7 +161,7 @@ fn main() -> Result<(), String> {
             };
             for _ in 0..args.ticks {
                 runtime
-                    .advance_idle_frame_for_tooling(SIM_TICK_MS)
+                    .advance_frame_for_tooling(&[], SIM_TICK_MS)
                     .map_err(|error| error.to_string())?;
                 let digest = runtime.simulation.parity_digest();
                 sink.write(&digest)

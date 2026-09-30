@@ -4,19 +4,19 @@
 //! frame: `current(frame) = current - (diff / step_size) * remaining`, where
 //! `step_size = abs(diff) / rot_per_frame` and `remaining = duration - elapsed`.
 //! The per-step rate spreads the full signed arc evenly across the rotation's
-//! frame count, so elapsed=0 lands exactly on `prev` even when the arc is not a
-//! whole multiple of `rot_per_frame` (the remainder is absorbed into the rate,
-//! not dropped). Setting a new target snapshots the current animated value into
+//! frame count using integer division; elapsed=0 can differ slightly from `prev`
+//! when the arc is not divisible by the frame count. Setting a new target snapshots the current animated value into
 //! `prev` so rotations retarget smoothly without snap-back.
 //!
-//! Verified against gamemd.exe — see
-//! ra2-rust-game-docs/UNITCLASS_TURRET_TRACKING_AND_FIRE_TIMING_GHIDRA_REPORT.md
-//! §1.3 (24-byte byte layout), §2.1 (Current interpolation), §2.4 (Set
-//! semantics), §2.7 (SetROT clamp + shift).
+//! Original gamemd 4C91C0/4C91E0 constructors, 4C9220 Set, 4C9300 Snap,
+//! 4C93D0 Current, 4C9480 IsRotating and 4C9680 SetROT are exercised by
+//! `tools/spatial_oracle/facing_class.py` and its retained-history corpus.
 //!
 //! ## Dependency rules
-//! - Part of sim/ — depends only on serde and std.
+//! - Part of sim/ — depends only on `sim::timer`, serde and std.
 //! - sim/ NEVER depends on render/, ui/, sidebar/, audio/, net/.
+
+use crate::sim::timer::CdTimer;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FacingClass {
@@ -31,16 +31,16 @@ pub struct FacingClass {
     /// Total binary frames needed to complete the rotation. When this is
     /// 0, `current()` returns `current` immediately (snap-on-step<1).
     duration_frames: u16,
-    /// Per-frame step in 16-bit facing units. Stored as `(rot_byte << 8)`.
-    /// Zero means instant rotator (no interpolation).
+    /// Raw native rate word, interpreted as signed by all rotation queries.
+    /// A non-positive signed rate means instant rotation.
     rot_per_frame: u16,
 }
 
 impl FacingClass {
     /// Construct a new FacingClass at the given initial facing with the
-    /// given ROT byte. ROT byte is the value from rules.ini (e.g. 5 for
+    /// given signed ROT. ROT is the value from rules.ini (e.g. 5 for
     /// War Miner, 10 for Harvester) before the binary's <<8 shift.
-    pub fn new(initial: u16, rot_byte: u8) -> Self {
+    pub fn new(initial: u16, rot: impl Into<i32>) -> Self {
         let mut fc = Self {
             current: initial,
             prev: initial,
@@ -48,15 +48,29 @@ impl FacingClass {
             duration_frames: 0,
             rot_per_frame: 0,
         };
-        fc.set_rot(rot_byte);
+        fc.set_rot(rot);
+        fc
+    }
+
+    /// A controller at rest on `initial` that turns at `rate_source`'s rate.
+    pub(crate) fn with_rate_of(initial: u16, rate_source: &Self) -> Self {
+        let mut fc = Self::new(initial, 0);
+        fc.rot_per_frame = rate_source.rot_per_frame;
         fc
     }
 
     /// Update the rate of turn. Mirrors gamemd's SetROT (`FacingClass::Set_ROT` @ `0x004C9680`):
-    /// clamps input > 126 to 127, then stores `(byte << 8)`.
-    pub fn set_rot(&mut self, rot_byte: u8) {
-        let clamped: u8 = if rot_byte > 0x7E { 0x7F } else { rot_byte };
-        self.rot_per_frame = (clamped as u16) << 8;
+    /// clamps only inputs >=127, then shifts the low byte. For example,
+    /// -1 becomes 0xFF00 (instant), while -255 becomes 0x0100 (animated).
+    /// Changing ROT preserves the existing timer and directions.
+    pub fn set_rot(&mut self, rot: impl Into<i32>) {
+        self.rot_per_frame = Self::rate_from_rot(rot.into()) as u16;
+    }
+
+    /// Shared with movement admission, which must not interpret raw negative
+    /// ROT as necessarily instant before the controller gets the turn.
+    pub(crate) fn rate_from_rot(rot: i32) -> i16 {
+        (u16::from(rot.min(127) as u8) << 8) as i16
     }
 
     /// Destination facing — where the rotation will end (regardless of
@@ -76,10 +90,22 @@ impl FacingClass {
         self.start_frame
     }
 
+    /// The native start word (`+0x04`).
+    #[cfg(test)]
+    pub(crate) fn start_word(&self) -> u16 {
+        self.prev
+    }
+
+    /// The native timer's time left (`+0x10`).
+    #[cfg(test)]
+    pub(crate) fn timer_duration(&self) -> u16 {
+        self.duration_frames
+    }
+
     /// Animated facing at the given binary frame. Pure function of state.
     ///
     /// Returns `current` when:
-    /// - rot_per_frame == 0 (instant rotator)
+    /// - signed rot_per_frame <= 0 (instant rotator)
     /// - start_frame is None (no rotation initiated)
     /// - elapsed >= duration_frames (rotation complete)
     /// - step_size < 1 (rotation request smaller than one frame's ROT — snaps)
@@ -88,14 +114,10 @@ impl FacingClass {
     /// prev to current at the per-step rate `diff / step_size` (the arc spread
     /// evenly across the rotation's frame count).
     pub fn current(&self, binary_frame: u32) -> u16 {
-        if self.rot_per_frame == 0 {
+        if (self.rot_per_frame as i16) <= 0 {
             return self.current;
         }
-        let Some(start) = self.start_frame else {
-            return self.current;
-        };
-        let elapsed = (binary_frame as i32).wrapping_sub(start as i32);
-        let remaining = i32::from(self.duration_frames).wrapping_sub(elapsed).max(0);
+        let remaining = self.remaining_frames(binary_frame);
         if remaining == 0 {
             return self.current;
         }
@@ -113,8 +135,9 @@ impl FacingClass {
         // Per-step is the full signed arc spread evenly across the rotation's
         // frame count (`diff / step_size`, integer-truncated toward zero), not a
         // fixed `rot_per_frame`. When abs(diff) is not an exact multiple of
-        // rot_per_frame, this absorbs the remainder into the rate so elapsed=0
-        // lands exactly on `prev` instead of `prev + (diff % rot_per_frame)`.
+        // rot_per_frame, the second division can leave a sub-byte remainder:
+        // 0x4000 -> 0xC000 at ROT5 samples 0x3FEE at elapsed0, not 0x4000.
+        // Original sample: tools/spatial_oracle/drive_fresh_turn.json.
         let per_step: i32 = (diff as i32) / (step_size as i32);
         let delta = per_step.wrapping_mul(remaining);
         i32::from(self.current).wrapping_sub(delta) as u16
@@ -129,14 +152,14 @@ impl FacingClass {
         if new_target == self.current {
             return false;
         }
-        if self.rot_per_frame > 0 {
+        if (self.rot_per_frame as i16) > 0 {
             // Snapshot animated value into prev BEFORE writing new target.
             self.prev = self.current(binary_frame);
         } else {
             self.prev = self.current;
         }
         self.current = new_target;
-        if self.rot_per_frame > 0 {
+        if (self.rot_per_frame as i16) > 0 {
             let diff: i16 = self.current.wrapping_sub(self.prev) as i16;
             self.duration_frames = diff.unsigned_abs() / self.rot_per_frame;
             self.start_frame = Some(binary_frame);
@@ -144,18 +167,23 @@ impl FacingClass {
         true
     }
 
-    /// Snap setter — writes target to both current and prev, resets the
-    /// timer. Mirrors `FacingClass::UpdateFacing` @ `0x004C9300`.
+    /// Snap setter — writes target to both current and prev when it differs
+    /// from the animated heading, and always resets the timer. Mirrors
+    /// `FacingClass::UpdateFacing` @ `0x004C9300`.
     ///
     /// Its primary consumers are not spawn paths: `DriveLocomotionClass::
     /// Process_Drive_Track` @ `0x004B1AC1` and its Ship twin @ `0x006A10FD`
     /// snap the **body facing to each consumed track point's facing byte**,
     /// so a Drive unit's hull facing is snapped rather than interpolated for
     /// the whole duration of a curve. Spawn, takeoff and deploy use it too.
-    /// Returns true if the destination changed.
+    /// At 004C937B..004C93A9 native compares only the animated heading. If it
+    /// already equals the request during a turn, native retains the previous
+    /// destination but cancels the timer, making that destination visible.
+    /// The infantry_fire_start native corpus includes this equality branch.
+    /// Returns true when native writes the requested direction.
     pub fn snap(&mut self, new_target: u16, binary_frame: u32) -> bool {
         let animated = self.current(binary_frame);
-        if animated == new_target && self.current == new_target {
+        if animated == new_target {
             self.start_frame = Some(binary_frame);
             self.duration_frames = 0;
             return false;
@@ -172,20 +200,75 @@ impl FacingClass {
     /// FacingClass (research doc §5.5, §1.5). Computed on demand —
     /// not cached.
     pub fn is_rotating(&self, binary_frame: u32) -> bool {
-        if self.rot_per_frame == 0 {
-            return false;
-        }
-        let Some(start) = self.start_frame else {
-            return false;
+        (self.rot_per_frame as i16) > 0 && self.remaining_frames(binary_frame) != 0
+    }
+
+    /// The rotation timer's time left (`4C93E9..4C93F8` / `4C948D..4C94A0`).
+    /// A setter at frame u32::MAX leaves the native epoch -1, which pauses
+    /// the countdown; a never-started timer has none left.
+    fn remaining_frames(&self, binary_frame: u32) -> i32 {
+        let timer = match self.start_frame {
+            Some(start) => CdTimer::from_raw(start as i32, i32::from(self.duration_frames)),
+            None => CdTimer::from_raw(-1, 0),
         };
-        let elapsed = (binary_frame as i32).wrapping_sub(start as i32);
-        i32::from(self.duration_frames).wrapping_sub(elapsed).max(0) != 0
+        timer.remaining(binary_frame as i32)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signed_rates_and_retained_histories_match_native() {
+        let rows: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tools/spatial_oracle/facing_class.json"
+        ))
+        .unwrap();
+        for row in rows.as_array().unwrap() {
+            let input = &row["input"];
+            let mut facing = FacingClass::new(0, input["rot"].as_i64().unwrap() as i32);
+            facing.snap(
+                input["initial"].as_u64().unwrap() as u16,
+                input["start"].as_u64().unwrap() as u32,
+            );
+            for (operation, expected) in input["operations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .zip(row["observations"].as_array().unwrap())
+            {
+                let frame = operation["frame"].as_u64().unwrap() as u32;
+                let value = operation["value"].as_i64().unwrap() as i32;
+                let result = match operation["kind"].as_str().unwrap() {
+                    "rate" => {
+                        facing.set_rot(value);
+                        None
+                    }
+                    "set" => Some(facing.set(value as u16, frame)),
+                    "snap" => Some(facing.snap(value as u16, frame)),
+                    "sample" => None,
+                    kind => panic!("unknown facing operation {kind}"),
+                };
+                assert_eq!(
+                    serde_json::json!({
+                        "destination": facing.destination(), "previous": facing.prev,
+                        "start": facing.start_frame.unwrap(), "duration": facing.duration_frames,
+                        "rate": facing.rot_per_frame(), "animated": facing.current(frame),
+                        "rotating": facing.is_rotating(frame), "result": result,
+                    }),
+                    *expected,
+                    "input={input}, operation={operation}"
+                );
+                // Resume each history through the same serialized fields used
+                // by snapshots; signed rate bits and a live timer must survive.
+                let saved = serde_json::to_vec(&facing).unwrap();
+                let restored: FacingClass = serde_json::from_slice(&saved).unwrap();
+                assert_eq!(facing, restored);
+                facing = restored;
+            }
+        }
+    }
 
     #[test]
     fn new_initializes_at_given_facing() {

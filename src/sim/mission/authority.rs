@@ -29,8 +29,8 @@ use crate::sim::world::Simulation;
 use super::concrete_effects::UnavailableConcreteMissionEffects;
 use super::concrete_effects::{
     AuthorityUnavailable, ConcreteMissionEffects, ConcreteSetterRequest,
-    RepresentedConcreteMissionEffects, represented_assign_destination_mode_one,
-    represented_assign_target,
+    RepresentedConcreteMissionEffects, assign_target_commits,
+    represented_assign_destination_mode_one, represented_assign_target_admitted,
 };
 use super::readiness::{
     AircraftReadyView, BuildingReadyView, InfantryReadyView, ReadyLeptonPoint, ReadyResult,
@@ -51,9 +51,11 @@ mod ready_private {
 /// The write set matches native Restore: selector first, then archived Target,
 /// then mode-one destination. Callers must preserve the distinct expiry order
 /// (clear first, then conditionally Restore); live-object detach uses a separate
-/// wrapper and order.
+/// wrapper and order. `saved_target_commits` is `assign_target_commits` for the
+/// archived target, read before the receiver was borrowed.
 pub(crate) fn restore_entity_after_target_expiry(
     entity: &mut crate::sim::game_entity::GameEntity,
+    saved_target_commits: bool,
 ) -> bool {
     if entity.mission.suspended() == MissionId::NONE {
         return false;
@@ -64,7 +66,7 @@ pub(crate) fn restore_entity_after_target_expiry(
     let category = entity.category;
     let restored = verb::restore_base(&mut entity.mission);
     debug_assert!(restored);
-    represented_assign_target(entity, saved_target);
+    represented_assign_target_admitted(entity, saved_target, saved_target_commits);
     if category != EntityCategory::Structure {
         represented_assign_destination_mode_one(entity, saved_destination);
         if saved_destination.is_some() {
@@ -122,15 +124,17 @@ pub(crate) fn override_mission_on_blocked_step(
         return false;
     }
 
+    let blocker_commits = assign_target_commits(entities, Some(TargetKind::Entity(blocker)));
     let Some(entity) = entities.get_mut(mover) else {
         return false;
     };
     let archived_destination = represented_archived_destination(entity);
+    // The calling locomotor owns its active-path stop.
     override_entity_to_attack(
         entity,
         TargetKind::Entity(blocker),
+        blocker_commits,
         archived_destination,
-        false, // the calling locomotor owns its active-path stop
     )
 }
 
@@ -147,10 +151,10 @@ pub(crate) fn override_mission_on_blocked_step(
 /// Termination needs nothing new: when the wall segment dies,
 /// `expire_cell_target_references` clears every listener whose `attack_target`
 /// is that cell and runs Restore, which is the native pointer-expiry order.
-// Unwired until the crossing's wall arm lands; see ledger row I9b in
-// docs/plans/2026-09-15-movement-retail-acceptance.md. Kept rather than deleted
-// because the producer it pairs with is already in the tree.
-#[allow(dead_code)]
+// Wired 2026-09-16 by the crossing's wall arm: `process_cell_crossings` defers
+// the cell through `CrossingOutput::deferred_wall_override` and
+// `advance_ordinary_mover` calls this outside the entity borrow. See ledger row
+// I9b in docs/plans/2026-09-15-movement-retail-acceptance.md.
 pub(crate) fn override_mission_on_wall_cell(
     entities: &mut crate::sim::entity_store::EntityStore,
     mover: u64,
@@ -160,73 +164,36 @@ pub(crate) fn override_mission_on_wall_cell(
         return false;
     };
     let archived_destination = represented_archived_destination(entity);
+    // The calling locomotor owns its active-path stop.
     override_entity_to_attack(
         entity,
         TargetKind::Cell(cell.0, cell.1),
-        archived_destination,
-        false, // the calling locomotor owns its active-path stop
-    )
-}
-
-/// Entity-local `Override(Attack, attacker, NULL)` used by the synchronous
-/// ReceiveDamage retaliation path.
-///
-/// `TechnoClass::ReceiveDamage @ 0x00701900` dispatches the concrete Mission
-/// wrapper before returning to its caller. Buildings archive/set only TarCom;
-/// Foot-derived objects archive NavCom first and assign the null destination
-/// after the target. Keeping this transaction over bare storage lets an
-/// ordered receiver make the new mission visible to a later live-order combat
-/// slot in the same frame.
-pub(crate) fn override_mission_on_damage_response(
-    entities: &mut crate::sim::entity_store::EntityStore,
-    receiver: u64,
-    attacker: u64,
-) -> bool {
-    if entities.get(attacker).is_none() {
-        return false;
-    }
-    let Some(entity) = entities.get_mut(receiver) else {
-        return false;
-    };
-    let archived_destination = entity.navigation.nav_com;
-    override_entity_to_attack(
-        entity,
-        TargetKind::Entity(attacker),
-        archived_destination,
         true,
+        archived_destination,
     )
 }
 
-/// One represented concrete Mission wrapper transaction shared by bare-store
-/// callers. The caller supplies the already-resolved NavCom archive because a
-/// locomotor obstruction has a VERA-specific walking-path fallback, while the
-/// ReceiveDamage wrapper reads the ordinary Foot NavCom field directly.
+/// Legacy bare-store Override for the crossing adapter's wall/object paths.
+/// Those paths cannot dispatch class setters until their host has world
+/// capabilities. The live damage and native locomotor callers use the shared
+/// world transaction below; this partial target/destination seam remains only
+/// for the separate crossing migration.
 fn override_entity_to_attack(
     entity: &mut crate::sim::game_entity::GameEntity,
     target: TargetKind,
+    target_commits: bool,
     archived_destination: Option<NavTargetRef>,
-    stop_active_path: bool,
 ) -> bool {
     if !aircraft_allows(entity, MISSION_ATTACK) {
         return false;
     }
-
-    // Concrete order: Foot NavCom archive, Techno TarCom archive, base verb,
-    // Target setter, then Foot destination setter. Building skips both Foot
-    // writes; an Aircraft gate above suppresses the transaction atomically.
     if entity.category != EntityCategory::Structure {
         entity.navigation.suspended_nav_com = archived_destination;
     }
     entity.suspended_attack_target = entity.attack_target.as_ref().map(|target| target.target);
     verb::override_base(&mut entity.mission, MISSION_ATTACK);
-    represented_assign_target(entity, Some(target));
+    represented_assign_target_admitted(entity, Some(target), target_commits);
     if entity.category != EntityCategory::Structure {
-        if stop_active_path {
-            // Native has one NavCom. VERA's active path executor is a second
-            // representation, so ReceiveDamage's concrete NULL destination
-            // must stop it in the same transaction.
-            entity.movement_target = None;
-        }
         represented_assign_destination_mode_one(entity, None);
     }
     true
@@ -259,7 +226,6 @@ fn represented_archived_destination(
 }
 
 const AIRCRAFT_ACTION_EXCEPTION: MissionId = MissionId::from_raw(0x1e);
-#[cfg(test)]
 const MISSION_GUARD: MissionId = MissionId::from_raw(5);
 /// Mission id 1, the `[Attack]` control entry. The selector every ground
 /// locomotor overrides onto when an object it is not allied with stands in the
@@ -274,11 +240,10 @@ const AIRCRAFT_PROTECTED: [MissionId; 5] = [
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(test)]
-pub(crate) struct OverridePacket {
-    pub mission: MissionId,
-    pub combat_target: Option<TargetKind>,
-    pub destination: Option<NavTargetRef>,
+struct OverridePacket {
+    mission: MissionId,
+    combat_target: Option<TargetKind>,
+    destination: Option<NavTargetRef>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -322,7 +287,6 @@ pub(crate) struct EntityReadyInputProvider;
 ///
 /// Retained as the rules-aware exact readiness provider while the current host
 /// evaluates the same inputs directly.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub(crate) struct LiveReadyInputProvider<'r> {
     pub(crate) rules: &'r RuleSet,
@@ -466,13 +430,18 @@ fn evaluate_ready(
         // it runs, and it runs twice per object per tick — once either side of
         // that object's movement step — so a single stored value would answer
         // the second call with the first call's state.
-        let locomotor =
-            crate::sim::movement::ready_producer::ready_state_for(entity, sim.session.binary_frame)
-                .or(if degraded_moving_gate {
-                    Some(DEGRADED_NOT_MOVING)
-                } else {
-                    None
-                });
+        let locomotor = crate::sim::movement::ready_producer::ready_state_for(
+            entity,
+            rules.map(|rules| {
+                crate::sim::movement::SpeedRules::new(rules, &sim.interner, &sim.type_handles)
+            }),
+            sim.session.binary_frame,
+        )
+        .or(if degraded_moving_gate {
+            Some(DEGRADED_NOT_MOVING)
+        } else {
+            None
+        });
         let attack_target_present = entity.attack_target.is_some();
 
         match entity.category {
@@ -545,10 +514,10 @@ fn evaluate_ready(
                             == MissionId::from_known(super::MissionType::Unload)
                             && crate::sim::mcv_deploy::is_mcv(sim, entity, rules))
                         .then(|| {
-                            entity
-                                .locomotor
-                                .as_ref()
-                                .map_or(0, |l| l.altitude.to_num::<i32>())
+                            crate::sim::movement::air_movement::current_fly_height(
+                                entity,
+                                sim.resolved_terrain.as_ref(),
+                            )
                         }),
                         attack_target_present,
                         position,
@@ -574,7 +543,7 @@ fn evaluate_ready(
                 infantry_ready_to_commence(InfantryReadyView {
                     mission,
                     leaf,
-                    object_is_falling_down: entity.object_is_falling_down,
+                    object_is_falling_down: u8::from(entity.is_falling_down()),
                     locomotor,
                     attack_target_present,
                 })
@@ -648,7 +617,48 @@ fn commence_leaf(entity: &mut crate::sim::game_entity::GameEntity, now: u32) -> 
     verb::commence_base(&mut entity.mission, now)
 }
 
+/// The `RandomRanged(0, 2)` ceiling of the Rate epilogue.
+pub(crate) const RATE_EPILOGUE_JITTER_MAX_FRAMES: u32 = 2;
+
 impl Simulation {
+    /// The handler return every `ftol(Rate × 900) + RandomRanged(0, 2)` exit
+    /// shares — Mission_Harvest (`0x0073EF77`), Mission_Enter (`0x004D946C`),
+    /// Mission_Unload (`0x0073E289`) and the Foot handlers: the base is the
+    /// MissionControl slot of `mission` (`0x005B3A00` indexes the object's
+    /// CURRENT mission, so a handler that commenced another mission passes
+    /// that one), computed first with no RNG, then one draw on the Scenario
+    /// stream (`0x0065C7E0` on `*(0x00A8B230)+0x218`). Native evidence:
+    /// tools/spatial_oracle/refinery_dock.json (`delay` of the Enter, Harvest
+    /// and Unload rows, one `[0, 2]` draw each).
+    pub(crate) fn mission_rate_epilogue(
+        &mut self,
+        rules: &RuleSet,
+        mission: super::MissionType,
+    ) -> i32 {
+        let base = rules.mission_control.rate_frames(mission);
+        base.wrapping_add(
+            self.scenario_rng
+                .next_range_u32_inclusive(0, RATE_EPILOGUE_JITTER_MAX_FRAMES) as i32,
+        )
+    }
+
+    /// [`Self::mission_rate_epilogue`] on `receiver`'s current mission as the
+    /// handler leaves it (`dispatched` when the object is gone or holds none).
+    pub(crate) fn mission_rate_epilogue_for(
+        &mut self,
+        rules: &RuleSet,
+        receiver: u64,
+        dispatched: super::MissionType,
+    ) -> i32 {
+        let current = self
+            .substrate
+            .entities
+            .get(receiver)
+            .and_then(|entity| entity.mission.current().known())
+            .unwrap_or(dispatched);
+        self.mission_rate_epilogue(rules, current)
+    }
+
     pub(crate) fn mission_assign_exact(
         &mut self,
         receiver: u64,
@@ -699,25 +709,34 @@ impl Simulation {
     /// Infantry firing/falling/Doing gates, the Aircraft and Building latches
     /// — evaluates exactly. Any other unavailable input blocks promotion.
     pub(crate) fn mission_host_promote(&mut self, receiver: u64, now: u32, rules: &RuleSet) {
-        let Some(entity) = self.substrate.entities.get(receiver) else {
-            return;
-        };
-        if entity.mission.queued() == MissionId::NONE {
-            return;
+        let queued = self
+            .substrate
+            .entities
+            .get(receiver)
+            .is_some_and(|entity| entity.mission.queued() != MissionId::NONE);
+        if queued
+            && self.mission_ready_to_commence(receiver, rules)
+            && let Some(entity) = self.substrate.entities.get_mut(receiver)
+        {
+            commence_leaf(entity, now);
         }
-        // Degraded moving-gate: absent locomotor producers read as "not
-        // moving now" so every later exact gate still evaluates; a residual
-        // Locomotor/SignedHeight error (a live producer without a height
-        // owner) degrades to the branch's pass outcome.
-        let ready = match evaluate_ready(self, receiver, &entity.mission, Some(rules), true) {
+    }
+
+    /// `Ready_To_Commence` (vt+0x200) as a query, also for handlers that act
+    /// between the answer and the Commence (Mission_Unload state 4 sends
+    /// OVER_OUT first, `0x0073E264..0x0073E279`). Degraded moving gate:
+    /// absent locomotor producers read as "not moving now" so every later
+    /// exact gate still evaluates; a residual Locomotor/SignedHeight error (a
+    /// live producer without a height owner) degrades to the branch's pass
+    /// outcome.
+    pub(crate) fn mission_ready_to_commence(&self, receiver: u64, rules: &RuleSet) -> bool {
+        let Some(entity) = self.substrate.entities.get(receiver) else {
+            return false;
+        };
+        match evaluate_ready(self, receiver, &entity.mission, Some(rules), true) {
             Ok(ready) => ready,
             Err(ReadyUnavailable::Locomotor | ReadyUnavailable::SignedHeight) => true,
             Err(_) => false,
-        };
-        if ready {
-            if let Some(entity) = self.substrate.entities.get_mut(receiver) {
-                commence_leaf(entity, now);
-            }
         }
     }
 
@@ -780,11 +799,11 @@ impl Simulation {
     }
 
     #[cfg(test)]
-    pub(crate) fn mission_override_exact(
+    fn mission_override_exact(
         &mut self,
         receiver: u64,
         packet: OverridePacket,
-    ) -> Result<(), MissionAuthorityError> {
+    ) -> Result<bool, MissionAuthorityError> {
         let mut effects = UnavailableConcreteMissionEffects;
         self.mission_override_exact_with_effects(receiver, packet, &mut effects)
     }
@@ -798,26 +817,51 @@ impl Simulation {
         self.mission_restore_exact_with_effects(receiver, &mut effects)
     }
 
-    pub(crate) fn set_archive_target_represented(
+    pub(crate) fn assign_target_represented(
         &mut self,
         receiver: u64,
         requested: Option<TargetKind>,
+        rules: Option<&RuleSet>,
     ) -> Result<(), MissionAuthorityError> {
         if !self.substrate.entities.contains(receiver) {
             return Err(MissionAuthorityError::MissingReceiver(receiver));
         }
-        let mut effects = RepresentedConcreteMissionEffects;
+        let mut effects = RepresentedConcreteMissionEffects::new(rules, None);
         let prepared =
             effects.preflight(self, receiver, ConcreteSetterRequest::Target { requested })?;
         effects.apply_target(self, &prepared, requested);
         Ok(())
     }
 
+    /// Dispatch the same concrete destination owner used by Override/Restore,
+    /// without changing a mission or its Target. AreaGuard and Rescue require
+    /// its synchronous Move_To/path/timer effects before their cadence tail.
+    pub(crate) fn assign_destination_represented(
+        &mut self,
+        receiver: u64,
+        requested: Option<NavTargetRef>,
+        rules: Option<&RuleSet>,
+        overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
+    ) -> Result<(), MissionAuthorityError> {
+        if !self.substrate.entities.contains(receiver) {
+            return Err(MissionAuthorityError::MissingReceiver(receiver));
+        }
+        let mut effects = RepresentedConcreteMissionEffects::new(rules, overlay_registry);
+        let prepared = effects.preflight(
+            self,
+            receiver,
+            ConcreteSetterRequest::Destination { requested },
+        )?;
+        effects.apply_destination_mode_one(self, &prepared, requested);
+        Ok(())
+    }
+
     pub(crate) fn mission_restore_after_target_expiry(
         &mut self,
         receiver: u64,
+        rules: Option<&RuleSet>,
     ) -> Result<bool, MissionAuthorityError> {
-        let mut effects = RepresentedConcreteMissionEffects;
+        let mut effects = RepresentedConcreteMissionEffects::new(rules, None);
         self.mission_restore_exact_with_effects(receiver, &mut effects)
     }
 
@@ -836,9 +880,78 @@ impl Simulation {
     pub(crate) fn mission_restore_on_target_detach(
         &mut self,
         receiver: u64,
+        rules: Option<&RuleSet>,
     ) -> Result<bool, MissionAuthorityError> {
-        let mut effects = RepresentedConcreteMissionEffects;
+        let mut effects = RepresentedConcreteMissionEffects::new(rules, None);
         self.mission_restore_exact_with_effects(receiver, &mut effects)
+    }
+
+    /// `Override(Attack, attacker, NULL)` from the synchronous ReceiveDamage
+    /// retaliation.
+    ///
+    /// `TechnoClass::ReceiveDamage @ 0x00701900` dispatches the concrete
+    /// Mission wrapper before returning to its caller, so an ordered receiver
+    /// makes the new mission visible to a later live-order combat slot in the
+    /// same frame. Buildings archive/set only TarCom; Foot-derived objects
+    /// archive NavCom first and then take the class setter's NULL destination
+    /// (Foot::Override_Mission `0x004D8F6D`), which for a Drive/Ship Unit is
+    /// Unit `0x00741970` ([`Self::assign_null_destination`]).
+    pub(crate) fn override_mission_on_damage_response(
+        &mut self,
+        receiver: u64,
+        attacker: u64,
+        rules: &RuleSet,
+    ) -> bool {
+        if !self.substrate.entities.contains(attacker)
+            || !self.substrate.entities.contains(receiver)
+        {
+            return false;
+        }
+        let mut effects = RepresentedConcreteMissionEffects::new(Some(rules), None);
+        //7013CB dispatches the class target setter AFTER the mission writes.
+        // A dying source or a refused Building target still takes the override;
+        // target admission belongs to that live setter, not this caller.
+        self.mission_override_exact_with_effects(
+            receiver,
+            OverridePacket {
+                mission: MISSION_ATTACK,
+                combat_target: Some(TargetKind::Entity(attacker)),
+                destination: None,
+            },
+            &mut effects,
+        )
+        .expect("present represented retaliation receiver has concrete setters")
+    }
+
+    /// `Foot::Override_Mission(Attack, target, NULL)` (`0x004D8F40`) from the
+    /// ground locomotor code-4/5 arm (Drive `0x004B3BE9`, Ship `0x006A3238`,
+    /// Walk `0x0075BAEB`/`0x0075BB49`), after
+    /// that arm asked the mover's House about an object target. NavCom and
+    /// TarCom are archived, the mission overrides onto Attack and the target
+    /// is assigned, then the class setter receives NULL. Ordinary Walk
+    /// Infantry uses51AA40; the existing Unit path uses741970.
+    pub(crate) fn mission_override_movement_blocker(
+        &mut self,
+        mover: u64,
+        target: TargetKind,
+        rules: &RuleSet,
+    ) -> bool {
+        if !self.substrate.entities.contains(mover) {
+            return false;
+        }
+        let mut effects = RepresentedConcreteMissionEffects::new(Some(rules), None);
+        // The locomotor caller owns its later head/Stop suffix. A refused
+        // class destination must retain navigation through this transaction.
+        self.mission_override_exact_with_effects(
+            mover,
+            OverridePacket {
+                mission: MISSION_ATTACK,
+                combat_target: Some(target),
+                destination: None,
+            },
+            &mut effects,
+        )
+        .expect("present represented blocker receiver has concrete setters")
     }
 
     /// The blocked-step Override every ground locomotor runs: stop, and fight
@@ -899,7 +1012,9 @@ impl Simulation {
         Ok(())
     }
 
-    #[cfg(test)]
+    /// `JumpjetLocomotionClass::Move_To`'s lift tail for an unloading owner
+    /// (`0x0054B479..0x0054B4B1`): `Queue_Mission(Guard, 1)`, the queued
+    /// bypass latch `+0xB8`, then a second readiness gate and Commence.
     pub(crate) fn mission_jumpjet_move_to_completion_exact(
         &mut self,
         receiver: u64,
@@ -935,7 +1050,6 @@ impl Simulation {
         Ok(())
     }
 
-    #[cfg(test)]
     fn validate_jumpjet_second_gate_previews(
         &self,
         receiver: u64,
@@ -969,8 +1083,13 @@ impl Simulation {
         Ok(())
     }
 
-    #[cfg(test)]
-    pub(crate) fn mission_try_consume_building_ready_exact(
+    /// A building's ready check in its Update (`0x0043FE27..0x0043FE54`
+    /// before the Techno AI, which also needs BState out of 0, and
+    /// `0x0043FF91..0x0043FFB4` after it): with `+0x6DD` set
+    /// (Ready_To_Commence, building vt+0x200 = `0x00454250`), a successful
+    /// Commence clears the byte. Commence fails with nothing queued and then
+    /// leaves it set.
+    pub(crate) fn mission_building_ready_commence(
         &mut self,
         receiver: u64,
         now: u32,
@@ -1003,20 +1122,22 @@ impl Simulation {
         Ok(true)
     }
 
-    #[cfg(test)]
+    /// Original Foot4D8F40 -> Techno7013A0 -> Mission5B3650, then the
+    /// concrete Target7013CB and Destination4D8F6D. Refused setters retain
+    /// their native partial effects; they do not undo the prior override.
     fn mission_override_exact_with_effects<E: ConcreteMissionEffects>(
         &mut self,
         receiver: u64,
         packet: OverridePacket,
         effects: &mut E,
-    ) -> Result<(), MissionAuthorityError> {
+    ) -> Result<bool, MissionAuthorityError> {
         let entity = self
             .substrate
             .entities
             .get(receiver)
             .ok_or(MissionAuthorityError::MissingReceiver(receiver))?;
         if !aircraft_allows(entity, packet.mission) {
-            return Ok(());
+            return Ok(false);
         }
         let request = match entity.category {
             EntityCategory::Structure => ConcreteSetterRequest::Target {
@@ -1054,7 +1175,7 @@ impl Simulation {
         ) {
             effects.apply_destination_mode_one(self, &prepared, packet.destination);
         }
-        Ok(())
+        Ok(true)
     }
 
     fn mission_restore_exact_with_effects<E: ConcreteMissionEffects>(
@@ -1101,15 +1222,17 @@ impl Simulation {
             if saved_destination.is_some()
                 && let Some(entity) = self.substrate.entities.get_mut(receiver)
             {
-                // The original's destination setter drives the locomotor's path
-                // timer to already-expired on every path it takes, so the next
-                // locomotor step re-runs its path search toward the destination
-                // just installed — the stored path array is never archived, only
-                // the destination is. VERA's equivalent re-path hook is the
-                // deferred process-entry pass at the top of the movement tick,
-                // and this flag is what arms it. Without it a restored object
-                // holds its order and never builds a path for it, which is
-                // exactly the state a blocked-step Override leaves it in.
+                // The original calls the class setter with the saved NavCom
+                // (`FootClass::Restore_Mission` `0x004D8F99`), whose Move_To
+                // the next locomotor step acts on — the stored path array is
+                // never archived, only the destination is. VERA finishes that
+                // setter at the object's next Process entry, which this flag
+                // arms: `complete_pending_order` for Drive, Ship, Teleport,
+                // Fly and Jumpjet, and the ground corridor's rebuild for Walk
+                // and Hover.
+                // Without it a restored object holds its order and never moves
+                // toward it, which is exactly the state a blocked-step Override
+                // leaves it in.
                 entity.navigation.pending_arrival_clear = true;
             }
         }
@@ -1127,8 +1250,7 @@ mod tests {
     use super::super::leaf::MissionLeafState;
     use super::super::state::MissionTestFixture;
     use super::*;
-    use crate::sim::animation::SequenceKind;
-    use crate::sim::combat::{AttackTarget, PendingInfantryFire};
+    use crate::sim::combat::AttackTarget;
     use crate::sim::game_entity::GameEntity;
 
     const GUARD: MissionId = MissionId::from_raw(5);
@@ -1541,6 +1663,258 @@ mod tests {
     }
 
     #[test]
+    fn native_e1_override_callers_keep_target_action_and_destination_refusal_order() {
+        use crate::rules::ini_parser::IniFile;
+        use crate::rules::native_processing::{RulesLayerKind, RulesLayerStack};
+        use crate::sim::components::{Health, MovementTarget};
+        use crate::sim::house_state::HouseState;
+        use crate::sim::movement::locomotor::LocomotorState;
+        use crate::sim::rng::SimRng;
+        use serde_json::Value;
+
+        let Some(ini) = crate::rules::retail_ini_fixture::retail_ini("rulesmd.ini") else {
+            return;
+        };
+        let Some(art) = crate::rules::retail_ini_fixture::retail_ini("artmd.ini") else {
+            return;
+        };
+        let registry = crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art);
+        let rules: std::collections::BTreeMap<_, _> = ["yes", "no"]
+            .into_iter()
+            .map(|raw| {
+                let mut layers = RulesLayerStack::new(ini.clone());
+                layers.push(
+                    RulesLayerKind::Scenario,
+                    IniFile::from_str(&format!("[E1]\nDeployFire={raw}\n")),
+                );
+                let mut rules =
+                    RuleSet::from_processed_rules(&layers.process_with_fixed_art(&art).unwrap())
+                        .unwrap();
+                rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
+                rules.bind_animation_sequences(&registry);
+                (raw, rules)
+            })
+            .collect();
+        let native: Value = serde_json::from_str(include_str!(
+            "../../../tools/spatial_oracle/base_defense_response.json"
+        ))
+        .unwrap();
+        let completion: Value = serde_json::from_str(include_str!(
+            "../../../tools/spatial_oracle/walk_completion.json"
+        ))
+        .unwrap();
+
+        // Original51B1F0/51D6F0/6FCDB0 establish each target/action result.
+        // Original51AA40's human Doing gate in walk_completion establishes
+        // NULL destination admission after the resulting action. Foot4D8F40
+        // and Techno7013A0 call those setters in this order, even on refusal.
+        for name in [
+            "doing_4_target_assign",
+            "doing_0_target_same",
+            "deployfire_false_27_assign",
+            "deployfire_false_29_assign",
+        ] {
+            let row = native["infantry_assignment"]["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["input"]["name"] == name)
+                .unwrap();
+            let before = &row["before"];
+            let after = &row["after"];
+            let destination = completion
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| {
+                    row["input"]["human"] == 1
+                        && row["input"]["doing"] == after["doing"]
+                        && row["input"]["mission"] == 1
+                        && row["input"]["queued_mission"] == -1
+                        && row["input"]["contact"] == 0
+                        && row["input"]["alive"] == 1
+                        && row["input"]["limbo"] == 0
+                        && row["input"]["falling"] == 0
+                })
+                .unwrap();
+            for damage_response in [true, false] {
+                let rules = &rules[row["input"]["deploy_fire_raw"].as_str().unwrap()];
+                let mut sim = Simulation::new();
+                let owner = sim.interner.intern("Receiver");
+                sim.houses
+                    .insert(owner, HouseState::new(owner, 0, None, true, 0, 0));
+                let mut actor = GameEntity::new_at_frame_zero_for_test(
+                    1,
+                    10,
+                    10,
+                    0,
+                    0,
+                    owner,
+                    Health { current: 100 },
+                    sim.interner.intern("E1"),
+                    EntityCategory::Infantry,
+                    0,
+                    0,
+                    false,
+                );
+                actor.lifecycle.in_limbo = false;
+                actor.mission.apply_test_fixture(MissionTestFixture {
+                    current: MOVE,
+                    suspended: MissionId::NONE,
+                    queued: GUARD,
+                    movement_bypass_latch: 0,
+                    handler_state: 0,
+                    mission_start_frame: 0,
+                    ai_counter: 0,
+                    dispatch_timer: MissionDispatchTimer::at_frame(0),
+                });
+                let doing = before["doing"].as_i64().unwrap() as i32;
+                actor
+                    .mission_leaf
+                    .set_infantry_doing_verified(doing)
+                    .unwrap();
+                actor
+                    .mission_leaf
+                    .set_foot_firing_sequence(before["firing_latch"].as_u64().unwrap() as u8);
+                actor.passively_acquired_target = before["passive"].as_u64().unwrap() != 0;
+                let prior_target =
+                    (before["target"] == "new_target").then_some(TargetKind::Entity(2));
+                actor.attack_target = prior_target.map(|_| AttackTarget::new(2));
+                actor.navigation.nav_com = Some(NavTargetRef::cell(12, 10));
+                actor.navigation.path_replay.directions =
+                    vec![before["path_field"].as_u64().unwrap() as u8, 2, 3];
+                actor.movement_target = Some(MovementTarget {
+                    path: vec![(10, 10), (11, 10), (12, 10)],
+                    next_index: 1,
+                    final_goal: Some((12, 10)),
+                    ..Default::default()
+                });
+                actor.locomotor = Some(LocomotorState::for_test_kind(
+                    crate::rules::locomotor_type::LocomotorKind::Walk,
+                ));
+                let signed = |value: &Value| value.as_i64().unwrap() as i32;
+                let words = &before["action_timer"];
+                // Supplied native raw entity backing in the existing oracle;
+                // FC/110 do not enter this setter comparison or its expected outputs.
+                actor.install_native_stage_fixture(
+                    crate::sim::stage::StageClass::from_native_fixture(
+                        signed(&before["frame"]),
+                        0,
+                        crate::sim::timer::CdTimer::from_raw(signed(&words[0]), signed(&words[2])),
+                        signed(&before["action_repeat"]),
+                        0,
+                    ),
+                );
+                sim.substrate.entities.insert(actor);
+                sim.substrate
+                    .entities
+                    .insert(GameEntity::new_at_frame_zero_for_test(
+                        2,
+                        11,
+                        10,
+                        0,
+                        0,
+                        owner,
+                        Health { current: 100 },
+                        sim.interner.intern("MTNK"),
+                        EntityCategory::Unit,
+                        0,
+                        0,
+                        true,
+                    ));
+                sim.session.binary_frame = row["input"]["frame"].as_u64().unwrap() as u32;
+                sim.scenario_rng = SimRng::new(row["input"]["seed"].as_u64().unwrap());
+                assert_eq!(sim.scenario_rng.native_state_hex(), row["rng_before"]);
+
+                let ran = if damage_response {
+                    sim.override_mission_on_damage_response(1, 2, rules)
+                } else {
+                    sim.mission_override_movement_blocker(1, TargetKind::Entity(2), rules)
+                };
+                assert!(ran, "{name}, damage={damage_response}");
+                let actor = sim.substrate.entities.get(1).unwrap();
+                assert_eq!(actor.mission.current(), ATTACK, "{name}");
+                // Original5B3675..5B367B archives the non-null queued
+                // selector; current Move is used only without a queue.
+                assert_eq!(actor.mission.suspended(), GUARD, "{name}");
+                assert_eq!(actor.suspended_attack_target, prior_target, "{name}");
+                assert_eq!(
+                    actor.navigation.suspended_nav_com,
+                    Some(NavTargetRef::cell(12, 10)),
+                    "{name}",
+                );
+                let leaf = actor.mission_leaf.as_infantry().unwrap();
+                assert_eq!(
+                    leaf.doing(),
+                    after["doing"].as_i64().unwrap() as i32,
+                    "{name}"
+                );
+                assert_eq!(
+                    leaf.firing_sequence_latch(),
+                    after["firing_latch"].as_u64().unwrap() as u8,
+                    "{name}",
+                );
+                assert_eq!(
+                    actor.attack_target.as_ref().map(|target| target.target),
+                    (after["target"] == "new_target").then_some(TargetKind::Entity(2)),
+                    "{name}",
+                );
+                assert_eq!(
+                    actor.passively_acquired_target,
+                    after["passive"].as_u64().unwrap() != 0,
+                    "{name}",
+                );
+                assert_eq!(
+                    actor.native_stage().value(),
+                    after["frame"].as_i64().unwrap() as i32,
+                    "{name}",
+                );
+                let words = &after["action_timer"];
+                assert_eq!(
+                    (
+                        actor.native_stage().timer().start_frame(),
+                        actor.native_stage().timer().duration(),
+                        actor.native_stage().rate(),
+                    ),
+                    (
+                        signed(&words[0]),
+                        signed(&words[2]),
+                        signed(&after["action_repeat"]),
+                    ),
+                    "{name}: native retained action clock",
+                );
+                assert_eq!(
+                    actor.navigation.nav_com.is_some(),
+                    destination["nav"].as_bool().unwrap(),
+                    "{name}",
+                );
+                assert_eq!(
+                    actor.movement_target.is_some(),
+                    destination["nav"].as_bool().unwrap() && after["path_field"] != -1,
+                    "only a retained path head can keep its derived movement adapter: {name}",
+                );
+                let expected_head = (after["path_field"] != -1)
+                    .then(|| after["path_field"].as_u64().unwrap() as u8);
+                assert_eq!(
+                    actor
+                        .navigation
+                        .path_replay
+                        .remaining_directions()
+                        .first()
+                        .copied(),
+                    expected_head,
+                    "{name}",
+                );
+                assert_eq!(
+                    sim.scenario_rng.native_state_hex(),
+                    row["rng_after"],
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn override_target_unavailable_is_fieldwise_noop() {
         let mut building = entity(EntityCategory::Structure, GUARD);
         building.attack_target = Some(AttackTarget::new(7));
@@ -1604,14 +1978,9 @@ mod tests {
     #[test]
     fn foot_override_provider_order_includes_same_identity_target_dispatch() {
         let mut unit = entity(EntityCategory::Unit, GUARD);
-        let mut active_target = AttackTarget::new(7);
-        active_target.cooldown_ticks = 17;
-        active_target.burst_remaining = 3;
-        active_target.burst_delay_ticks = 2;
-        active_target.pending_infantry_fire = Some(PendingInfantryFire {
-            sequence: SequenceKind::Attack,
-            fire_frame: 4,
-        });
+        let active_target = AttackTarget::new(7);
+        unit.rearm_timer = crate::sim::timer::CdTimer::started(0, 17);
+        unit.weapon_burst.complete_shot(4);
         unit.attack_target = Some(active_target);
         unit.navigation.nav_com = Some(NavTargetRef::cell(1, 2));
         unit.navigation.pending_arrival_clear = true;
@@ -1665,16 +2034,15 @@ mod tests {
             .attack_target
             .as_ref()
             .unwrap();
-        assert_eq!(installed.cooldown_ticks, 17);
-        assert_eq!(installed.burst_remaining, 3);
-        assert_eq!(installed.burst_delay_ticks, 2);
         assert_eq!(
-            installed.pending_infantry_fire,
-            Some(PendingInfantryFire {
-                sequence: SequenceKind::Attack,
-                fire_frame: 4,
-            })
+            sim.substrate.entities.get(1).unwrap().rearm_timer,
+            crate::sim::timer::CdTimer::started(0, 17)
         );
+        assert_eq!(
+            sim.substrate.entities.get(1).unwrap().weapon_burst.index(),
+            1
+        );
+        assert_eq!(installed.target, TargetKind::Entity(7));
         assert!(
             !sim.substrate
                 .entities
@@ -2040,7 +2408,7 @@ mod tests {
         building.mission_leaf = MissionLeafState::building_raw_for_test(1);
         let mut sim = sim_with(building);
 
-        assert!(!sim.mission_try_consume_building_ready_exact(1, 10).unwrap());
+        assert!(!sim.mission_building_ready_commence(1, 10).unwrap());
         assert_eq!(
             sim.substrate
                 .entities
@@ -2070,7 +2438,7 @@ mod tests {
         });
         let mut sim = sim_with(building);
 
-        assert!(sim.mission_try_consume_building_ready_exact(1, 10).unwrap());
+        assert!(sim.mission_building_ready_commence(1, 10).unwrap());
         let entity = sim.substrate.entities.get(1).unwrap();
         assert_eq!(entity.mission.current(), MOVE);
         assert_eq!(entity.mission_leaf.as_building().unwrap().ready_latch(), 0);

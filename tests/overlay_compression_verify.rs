@@ -27,12 +27,7 @@ fn is_ore(id: u8) -> bool {
 
 fn load_raw_overlay_pack_from_map(map: &vera20k::map::map_file::MapFile) -> Vec<u8> {
     let section = map.ini.section("OverlayPack").expect("OverlayPack section");
-    let mut b64: String = String::new();
-    for key in section.keys() {
-        if let Some(val) = section.get(key) {
-            b64.push_str(val);
-        }
-    }
+    let b64 = section.read_packed_text();
     assert!(!b64.is_empty(), "no base64 data in OverlayPack");
     base64::base64_decode(&b64).expect("base64 decode")
 }
@@ -65,7 +60,7 @@ fn lcw_vs_lzo_on_real_overlay_pack() {
     }
 
     let map_path = ra2_dir.join("Dustbowl.mmx");
-    let map = vera20k::map::map_file::load_mmx(&map_path).expect("load map");
+    let map = vera20k::map::map_file::load_from_path(&map_path).expect("load map");
     let raw = load_raw_overlay_pack_from_map(&map);
     println!("Raw base64-decoded OverlayPack: {} bytes", raw.len());
     println!("First 16 raw bytes: {:02X?}", &raw[..16.min(raw.len())]);
@@ -165,7 +160,7 @@ fn overlay_pack_first_bytes_identify_codec() {
     }
 
     let map_path = ra2_dir.join("Dustbowl.mmx");
-    let map = vera20k::map::map_file::load_mmx(&map_path).expect("load map");
+    let map = vera20k::map::map_file::load_from_path(&map_path).expect("load map");
     let raw = load_raw_overlay_pack_from_map(&map);
 
     if raw.len() < 8 {

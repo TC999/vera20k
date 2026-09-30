@@ -51,7 +51,10 @@ macro_rules! require_ra2_dir {
                 }
             },
         };
-        if !dir.exists() {
+        // Without config.toml, GameConfig::load falls back to the running
+        // executable's folder, which for a test binary is `target/`: require
+        // an actual install, not just an existing directory.
+        if !dir.join("ra2.mix").exists() {
             eprintln!("SKIPPED: RA2 assets not found at {}", dir.display());
             return;
         }
@@ -431,7 +434,7 @@ fn test_load_mmx_map_file() {
         if !path.exists() {
             continue;
         }
-        match map_file::load_mmx(&path) {
+        match map_file::load_from_path(&path) {
             Ok(map) => {
                 eprintln!(
                     "{}: theater={}, {}x{}, {} cells",
@@ -460,8 +463,11 @@ fn test_load_mmx_map_file() {
 #[test]
 fn test_asset_manager_finds_palettes() {
     let dir: PathBuf = require_ra2_dir!();
-    let asset_manager =
-        crate::assets::asset_manager::AssetManager::new(&dir).expect("Should load AssetManager");
+    let asset_manager = crate::assets::asset_manager::AssetManager::new(
+        &dir,
+        crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+    )
+    .expect("Should load AssetManager");
 
     let pal_names: &[&str] = &[
         "unittem.pal",
@@ -543,8 +549,11 @@ fn test_asset_manager_finds_palettes() {
 #[test]
 fn test_find_theater_ini_in_mix_chain() {
     let dir: PathBuf = require_ra2_dir!();
-    let asset_manager =
-        crate::assets::asset_manager::AssetManager::new(&dir).expect("Should load AssetManager");
+    let asset_manager = crate::assets::asset_manager::AssetManager::new(
+        &dir,
+        crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+    )
+    .expect("Should load AssetManager");
 
     // Theater INI files live inside local.mix (nested in ra2.mix),
     // or localmd.mix (nested in ra2md.mix) for Yuri's Revenge installs.

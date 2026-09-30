@@ -12,10 +12,6 @@ use crate::util::native_x87::{
     NativeF32Bits, NativeF64Bits, NativeX87Error, X87Chop53, X87Ordering, X87Value,
 };
 
-// Spark collision's verified structural-bridge role; keep independently named
-// (same retail value as `sim::map::bridge_topology::BRIDGE_DECK_HEIGHT_LEPTONS`;
-// see the separation notes there and at `util::lepton::BRIDGE_HEIGHT_DELTA_LEPTONS`).
-const STRUCTURAL_BRIDGE_HEIGHT: i32 = crate::sim::map::bridge_topology::BRIDGE_DECK_HEIGHT_LEPTONS;
 const ASCENDING_BRIDGE_DELETE_OFFSET: i32 = 20;
 const GROUND_CLAMP_DEPTH: i32 = 100;
 const BUILDING_CONTACT_HEIGHT_F32: NativeF32Bits = NativeF32Bits::from_bits(0x4316_0000);
@@ -95,25 +91,10 @@ pub enum SparkKernelError {
     NativeX87(#[from] NativeX87Error),
 }
 
-/// Signed toward-zero lepton→cell — `v / 256` is bit-identical to the
-/// canonical biased shift; delegated so the conversion exists once.
-pub fn lepton_to_cell_trunc(value: i32) -> i32 {
-    crate::util::direction_tables::lepton_to_cell(value)
-}
-
 /// Convert the signed `[General] Gravity=` storage to the f32 bits consumed by
 /// behavior-3 arithmetic at its native boundary.
 pub fn gravity_as_stored_f32(value: i32) -> Result<NativeF32Bits, SparkKernelError> {
     integer_as_stored_f32(value).map_err(Into::into)
-}
-
-pub fn integrate_motion(
-    coords: IVec3,
-    spark: SparkRuntimeState,
-    gravity: NativeF32Bits,
-) -> Result<SparkMotionStep, SparkKernelError> {
-    let persistent_z = persistent_velocity_z(spark.velocity_z, gravity)?;
-    integrate_motion_after_persistent_z(coords, spark, gravity, persistent_z)
 }
 
 fn persistent_velocity_z(
@@ -173,6 +154,7 @@ fn add_stored_f32(
     X87Chop53::store_f32(sum).map_err(Into::into)
 }
 
+#[cfg(test)]
 pub fn resolve_collision(
     motion: SparkMotionStep,
     facts: SparkCollisionFacts,
@@ -188,7 +170,7 @@ fn resolve_collision_decision(
     // bridge, ground, building, wall, commit-Z, and slope-reflection decisions.
     let ground_z = facts.ground_z;
     let ground_exact = X87Chop53::load_i32(ground_z);
-    let bridge_plane = ground_z.wrapping_add(STRUCTURAL_BRIDGE_HEIGHT);
+    let bridge_plane = ground_z.wrapping_add(crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS);
     let kind = classify_collision_kind(motion, facts)?;
     let ground_stored_bits = X87Chop53::store_f32(ground_exact)?;
 
@@ -229,7 +211,7 @@ pub(super) fn bridge_collision_kind(
     old_has_structural_bridge: bool,
     candidate_has_structural_bridge: bool,
 ) -> Option<SparkCollisionKind> {
-    let bridge_plane = ground_z.wrapping_add(STRUCTURAL_BRIDGE_HEIGHT);
+    let bridge_plane = ground_z.wrapping_add(crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS);
     let structural = old_has_structural_bridge || candidate_has_structural_bridge;
     if structural && motion.candidate_coords.z < bridge_plane && motion.old_coords.z >= bridge_plane
     {
@@ -507,6 +489,7 @@ pub fn advance_color(
     Ok(())
 }
 
+#[cfg(test)]
 pub fn tick_particle_with_facts(
     particle: &mut Particle,
     inputs: SparkTickInputs,
@@ -635,7 +618,6 @@ mod tests {
         Particle {
             type_id: ParticleTypeId(0),
             coords,
-            previous_coords: coords,
             origin: coords,
             direction: [SimFixed::from_num(0); 3],
             velocity: SimFixed::from_num(0),
@@ -644,14 +626,10 @@ mod tests {
             state_ai_advance: 0,
             animation_state: 0,
             translucency: 0,
-            hit_ground: false,
             marked_for_deletion: false,
             drift_x: 0,
             drift_y: 0,
             drift_z: 0,
-            current_color: [0; 3],
-            color_index: 0,
-            color_accumulator: SimFixed::from_num(0),
             spark: Some(spark_state(vz)),
             prev_delta: [SimFixed::from_num(0); 3],
             state_advance_counter: 0,
@@ -823,11 +801,11 @@ mod tests {
 
     #[test]
     fn signed_leptons_truncate_toward_zero_at_cell_boundaries() {
-        assert_eq!(lepton_to_cell_trunc(-1), 0);
-        assert_eq!(lepton_to_cell_trunc(-255), 0);
-        assert_eq!(lepton_to_cell_trunc(-256), -1);
-        assert_eq!(lepton_to_cell_trunc(255), 0);
-        assert_eq!(lepton_to_cell_trunc(256), 1);
+        assert_eq!(crate::util::lepton::lepton_to_cell(-1), 0);
+        assert_eq!(crate::util::lepton::lepton_to_cell(-255), 0);
+        assert_eq!(crate::util::lepton::lepton_to_cell(-256), -1);
+        assert_eq!(crate::util::lepton::lepton_to_cell(255), 0);
+        assert_eq!(crate::util::lepton::lepton_to_cell(256), 1);
     }
 
     #[test]

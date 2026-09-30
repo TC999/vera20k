@@ -8,8 +8,8 @@
 //! dropping to the riverbed underneath?
 //!
 //! The invariant asserted after every committed frame is the algebraic inverse
-//! of `FootClass::Set_Height_On_Bridge` @ `0x005F5FA0` recorded by
-//! `ObjectClass::GetHeight` @ `0x005F5F30`:
+//! of `ObjectClass::SetHeight` @ `0x005F5FA0` recorded by
+//! `ObjectClass::GetHeight` @ `0x005F5F40`:
 //!
 //! ```text
 //! position.z == GroundHeight(own cell) + (OnBridge ? 4 levels : 0)
@@ -25,7 +25,6 @@
 
 use std::path::PathBuf;
 
-use super::movement_occupancy::BRIDGE_DECK_LEVEL_DELTA;
 use crate::headless_scenario::{self, SIM_TICK_MS};
 use crate::map::resolved_terrain::{BridgeDirection, ResolvedTerrainGrid};
 use crate::rules::locomotor_type::MovementZone;
@@ -168,7 +167,6 @@ struct TickRow {
     cell: (u16, u16),
     z: u8,
     on_bridge: bool,
-    occupancy_deck: Option<u8>,
     terrain_level: u8,
     structural: bool,
     bridge_walkable: bool,
@@ -196,12 +194,12 @@ struct TickRow {
 }
 
 impl TickRow {
-    /// `ObjectClass::GetHeight` @ `0x005F5F30` inverted: the only Z the native
+    /// `ObjectClass::GetHeight` @ `0x005F5F40` inverted: the only Z the native
     /// model can produce for this cell and this OnBridge state.
     fn expected_z(&self) -> i16 {
         i16::from(self.terrain_level as i8)
             + if self.on_bridge {
-                BRIDGE_DECK_LEVEL_DELTA
+                crate::util::lepton::BRIDGE_DECK_HEIGHT_LEVELS as i16
             } else {
                 0
             }
@@ -269,19 +267,16 @@ fn print_inventory(grid: &PathGrid, span: &HighBridgeSpan) {
 /// The per-frame observation table both crossing drivers print.
 fn print_tick_table(rows: &[TickRow]) {
     println!(
-        "\ntick  cell        z  on_bridge  occ_deck  terrain  deck?  walkable  lowtube  stored_deck  layer   prefix_z  expect_z  ok"
+        "\ntick  cell        z  on_bridge  terrain  deck?  walkable  lowtube  stored_deck  layer   prefix_z  expect_z  ok"
     );
     for row in rows {
         println!(
-            "{:5} ({:3},{:3}) {:3}  {:9}  {:8}  {:7}  {:5}  {:8}  {:7}  {:11}  {:6}  {:8}  {:8}  {}",
+            "{:5} ({:3},{:3}) {:3}  {:9}  {:7}  {:5}  {:8}  {:7}  {:11}  {:6}  {:8}  {:8}  {}",
             row.tick,
             row.cell.0,
             row.cell.1,
             row.z,
             row.on_bridge,
-            row.occupancy_deck
-                .map(|d| d.to_string())
-                .unwrap_or_else(|| "-".to_string()),
             row.terrain_level,
             row.structural,
             row.bridge_walkable,
@@ -386,13 +381,13 @@ fn diagnose_rejected_order(
         &AStarOptions::default(),
     );
     match &layered {
-        Some(steps) => {
+        Ok(steps) => {
             println!("layered A*: {} step(s)", steps.len());
             for step in steps.iter().take(30) {
                 println!("   ({:3},{:3}) layer={:?}", step.rx, step.ry, step.layer);
             }
         }
-        None => println!("layered A*: no path"),
+        Err(cause) => println!("layered A*: {cause:?}"),
     }
 
     // Ablation over the four production inputs the bare `astar_search` above did
@@ -419,7 +414,7 @@ fn diagnose_rejected_order(
             sim.resolved_terrain.is_some(),
             sim.playfield_bounds.is_some(),
         );
-        let (blocks, block_map) = crate::sim::movement::bump_crush::build_entity_block_set(
+        let (blocks, block_map) = crate::sim::movement::block_index::build_owner_block_set(
             sim.entities(),
             owner_name,
             &sim.house_alliances,
@@ -461,7 +456,6 @@ fn diagnose_rejected_order(
                 grid.height(),
                 sim.resolved_terrain.as_ref(),
                 sim.overlay_grid.as_ref(),
-                Some(&scenario.runtime.resources.overlay_registry),
                 &sim.interner,
                 Some(&scenario.runtime.resources.rules),
             );
@@ -476,7 +470,7 @@ fn diagnose_rejected_order(
             ("all", true, true, true, true, true),
         ] {
             let ctx = PathfindingContext {
-                wall_cost: None,
+                wall_tables: None,
                 path_grid: Some(&grid),
                 zone_grid: if use_zone {
                     sim.zone_grid.as_ref()
@@ -508,11 +502,8 @@ fn diagnose_rejected_order(
                 block_ref,
                 movement_zone.unwrap_or(MovementZone::Normal),
                 movement_zone,
-                false,
                 use_blocks.then_some(&block_map),
-                0,
-                false,
-                false,
+                super::MoverPathFacts::without_wall_arm(0, false, false),
                 true,
             );
             println!(
@@ -524,7 +515,7 @@ fn diagnose_rejected_order(
         // Exact production argument set.
         let production = find_move_path(
             PathfindingContext {
-                wall_cost: None,
+                wall_tables: None,
                 path_grid: Some(&grid),
                 zone_grid: sim.zone_grid.as_ref(),
                 resolved_terrain: sim.resolved_terrain.as_ref(),
@@ -541,11 +532,8 @@ fn diagnose_rejected_order(
             Some(&occupation_blocks),
             movement_zone.unwrap_or(MovementZone::Normal),
             movement_zone,
-            false,
             Some(&block_map),
-            0,
-            true,
-            false,
+            super::MoverPathFacts::without_wall_arm(0, true, false),
             true,
         );
         println!(
@@ -556,7 +544,7 @@ fn diagnose_rejected_order(
         // Same, minus one input at a time.
         let without_occupation = find_move_path(
             PathfindingContext {
-                wall_cost: None,
+                wall_tables: None,
                 path_grid: Some(&grid),
                 zone_grid: sim.zone_grid.as_ref(),
                 resolved_terrain: sim.resolved_terrain.as_ref(),
@@ -573,11 +561,8 @@ fn diagnose_rejected_order(
             Some(&blocks),
             movement_zone.unwrap_or(MovementZone::Normal),
             movement_zone,
-            false,
             Some(&block_map),
-            0,
-            true,
-            false,
+            super::MoverPathFacts::without_wall_arm(0, true, false),
             true,
         );
         println!(
@@ -586,7 +571,7 @@ fn diagnose_rejected_order(
         );
         let without_neighbors = find_move_path(
             PathfindingContext {
-                wall_cost: None,
+                wall_tables: None,
                 path_grid: Some(&grid),
                 zone_grid: sim.zone_grid.as_ref(),
                 resolved_terrain: sim.resolved_terrain.as_ref(),
@@ -603,11 +588,8 @@ fn diagnose_rejected_order(
             Some(&occupation_blocks),
             movement_zone.unwrap_or(MovementZone::Normal),
             movement_zone,
-            false,
             Some(&block_map),
-            0,
-            true,
-            false,
+            super::MoverPathFacts::without_wall_arm(0, true, false),
             true,
         );
         println!(
@@ -616,7 +598,7 @@ fn diagnose_rejected_order(
         );
         let without_block_map = find_move_path(
             PathfindingContext {
-                wall_cost: None,
+                wall_tables: None,
                 path_grid: Some(&grid),
                 zone_grid: sim.zone_grid.as_ref(),
                 resolved_terrain: sim.resolved_terrain.as_ref(),
@@ -633,11 +615,8 @@ fn diagnose_rejected_order(
             Some(&occupation_blocks),
             movement_zone.unwrap_or(MovementZone::Normal),
             movement_zone,
-            false,
             None,
-            0,
-            true,
-            false,
+            super::MoverPathFacts::without_wall_arm(0, true, false),
             true,
         );
         println!(
@@ -673,7 +652,7 @@ fn diagnose_rejected_order(
         for goal in goals {
             let reached = find_move_path(
                 PathfindingContext {
-                    wall_cost: None,
+                    wall_tables: None,
                     path_grid: Some(&grid),
                     zone_grid: sim.zone_grid.as_ref(),
                     resolved_terrain: sim.resolved_terrain.as_ref(),
@@ -690,11 +669,8 @@ fn diagnose_rejected_order(
                 Some(&occupation_blocks),
                 movement_zone.unwrap_or(MovementZone::Normal),
                 movement_zone,
-                false,
                 Some(&block_map),
-                0,
-                true,
-                false,
+                super::MoverPathFacts::without_wall_arm(0, true, false),
                 true,
             );
             println!(
@@ -721,11 +697,8 @@ fn diagnose_rejected_order(
             target_rx: span.approach_b.0,
             target_ry: span.approach_b.1,
             queue: false,
-            group_id: None,
         },
         Some(&resources.rules),
-        Some(&grid),
-        &resources.height_map,
     );
     println!("direct apply_command(Move) -> {applied}");
     println!(
@@ -751,10 +724,7 @@ fn issue_ordinary_move(
     entity_id: u64,
     target: (u16, u16),
 ) -> bool {
-    let grid = scenario
-        .sim()
-        .path_grid_snapshot()
-        .expect("navigation published");
+    assert!(scenario.sim().path_grid().is_some(), "navigation published");
     let SimRuntime {
         simulation,
         resources,
@@ -766,11 +736,8 @@ fn issue_ordinary_move(
             target_rx: target.0,
             target_ry: target.1,
             queue: false,
-            group_id: None,
         },
         Some(&resources.rules),
-        Some(&grid),
-        &resources.height_map,
     )
 }
 
@@ -805,7 +772,6 @@ impl OrderSource {
                 target_rx: target.0,
                 target_ry: target.1,
                 queue: false,
-                group_id: None,
             },
             OrderSource::AttackMove => Command::AttackMove {
                 entity_id,
@@ -895,7 +861,6 @@ fn drive_across_high_bridge_with_order(
             candidate.1,
             0,
             &resources.rules,
-            &resources.height_map,
         ) {
             entity_id = Some(id);
             start_cell = candidate;
@@ -1007,7 +972,6 @@ fn drive_across_high_bridge_with_order(
             cell,
             z: entity.position.z,
             on_bridge: entity.on_bridge,
-            occupancy_deck: entity.bridge_occupancy.map(|occ| occ.deck_level),
             terrain_level: facts.ground_level,
             structural: facts.bridge_structural,
             bridge_walkable: facts.bridge_walkable,
@@ -1120,19 +1084,14 @@ fn drive_across_high_bridge_with_order(
         );
         assert_eq!(
             i16::from(row.z as i8),
-            i16::from(row.terrain_level as i8) + BRIDGE_DECK_LEVEL_DELTA,
+            i16::from(row.terrain_level as i8)
+                + crate::util::lepton::BRIDGE_DECK_HEIGHT_LEVELS as i16,
             "tank is not at deck height on {:?}: {row:?}",
             row.cell
         );
         assert_ne!(
             row.z, span.deck_terrain_level,
             "tank dropped to the terrain under the bridge at {:?}: {row:?}",
-            row.cell
-        );
-        assert_eq!(
-            row.occupancy_deck,
-            Some(row.z),
-            "BridgeOccupancy.deck_level disagrees with position.z at {:?}: {row:?}",
             row.cell
         );
     }
@@ -1175,7 +1134,8 @@ fn drive_across_high_bridge_with_order(
         );
         assert_eq!(
             i16::from(row.z as i8),
-            i16::from(row.terrain_level as i8) + BRIDGE_DECK_LEVEL_DELTA,
+            i16::from(row.terrain_level as i8)
+                + crate::util::lepton::BRIDGE_DECK_HEIGHT_LEVELS as i16,
             "the mover is not at deck height on bridgehead cell {:?}: {row:?}",
             row.cell
         );
@@ -1507,18 +1467,17 @@ fn print_low_inventory(terrain: &ResolvedTerrainGrid, grid: &PathGrid, span: &Lo
 /// event anywhere on a low span; the crossing *is* the ground plane.
 ///
 /// So the correct invariant is the degenerate case of
-/// `ObjectClass::GetHeight @ 0x005F5F30` with OnBridge clear:
+/// `ObjectClass::GetHeight @ 0x005F5F40` with OnBridge clear:
 ///
 /// ```text
 /// position.z == GroundHeight(own cell)   and   OnBridge == false
 /// ```
 ///
 /// The `OnBridge == false` half is load-bearing, not decoration: were a low deck
-/// to set it, `Set_Height_On_Bridge` would add four levels of nothing and float
+/// to set it, SetHeight would add four levels of nothing and float
 /// the mover over a flat span. Asserting only "z == ground" would pass a
 /// hypothetical implementation that sets `on_bridge` and then re-derives z from
-/// it, so both halves are checked, plus the absence of a `BridgeOccupancy`
-/// entry, which is the third place the deck term is stored.
+/// it, so both halves are checked.
 fn assert_low_span_invariant(rows: &[TickRow], deck_frames: &[&TickRow]) {
     let violations: Vec<&TickRow> = rows.iter().filter(|row| !row.holds_invariant()).collect();
     assert!(
@@ -1533,7 +1492,7 @@ fn assert_low_span_invariant(rows: &[TickRow], deck_frames: &[&TickRow]) {
         assert!(
             !row.on_bridge,
             "a LOW deck cell {:?} set on_bridge; there is no deck plane over a low span, so \
-             Set_Height_On_Bridge would lift the mover four levels above flat ground: {row:?}",
+             SetHeight would lift the mover four levels above flat ground: {row:?}",
             row.cell
         );
         assert!(
@@ -1546,11 +1505,6 @@ fn assert_low_span_invariant(rows: &[TickRow], deck_frames: &[&TickRow]) {
             i16::from(row.z as i8),
             i16::from(row.terrain_level as i8),
             "the mover is not at ground height on low deck cell {:?}: {row:?}",
-            row.cell
-        );
-        assert_eq!(
-            row.occupancy_deck, None,
-            "a low deck cell {:?} produced a BridgeOccupancy entry: {row:?}",
             row.cell
         );
         assert_eq!(
@@ -1629,7 +1583,6 @@ fn drive_across_low_bridge(map_file: &str, unit_type: &str) {
             candidate.1,
             0,
             &resources.rules,
-            &resources.height_map,
         ) {
             entity_id = Some(id);
             start_cell = candidate;
@@ -1689,7 +1642,6 @@ fn drive_across_low_bridge(map_file: &str, unit_type: &str) {
             target_rx: span.approach_b.0,
             target_ry: span.approach_b.1,
             queue: false,
-            group_id: None,
         },
     );
     scenario
@@ -1750,7 +1702,6 @@ fn drive_across_low_bridge(map_file: &str, unit_type: &str) {
             cell,
             z: entity.position.z,
             on_bridge: entity.on_bridge,
-            occupancy_deck: entity.bridge_occupancy.map(|occ| occ.deck_level),
             terrain_level: facts.ground_level,
             structural: facts.bridge_structural,
             bridge_walkable: facts.bridge_walkable,
@@ -1973,7 +1924,7 @@ fn infantry_crosses_lostlake_low_bridge_at_ground_height() {
 /// y=136 and hovers open water to y=143 before rejoining, covering 6 of 14. Both
 /// are legitimate. What this row therefore settles is that an ordinary Move
 /// across a low span is accepted, that the mover holds ground height with no
-/// `on_bridge` and no `BridgeOccupancy` on every deck cell it does use, and that
+/// `on_bridge` on every deck cell it does use, and that
 /// it arrives — not that it needed the bridge.
 #[test]
 #[ignore = "requires a retail RA2/YR install (RA2_DIR or config.toml)"]
@@ -2110,8 +2061,7 @@ fn tank_crosses_hills_high_bridge_at_deck_height() {
 /// crossing, holding the Hover mover to exactly what the Drive crossings assert:
 /// it reaches the deck at all, stands mid-span rather than only on the end
 /// cells, and on every deck frame carries `on_bridge`, `z == terrain + 4`, a
-/// height that is not the riverbed, and a `BridgeOccupancy` agreeing with its
-/// own `z`. `drive_across_high_bridge` also now asserts arrival at the far
+/// height that is not the riverbed. `drive_across_high_bridge` also now asserts arrival at the far
 /// approach, so a mover that reaches the deck and then dies mid-span fails.
 #[test]
 #[ignore = "requires a retail RA2/YR install (RA2_DIR or config.toml)"]
@@ -2164,7 +2114,7 @@ fn infantry_crosses_hills_high_bridge_at_deck_height() {
 // wrapped round it — `queue_megamission_with_teardown(MissionType::AttackMove)`,
 // the `attack_target` / `passively_acquired_target` clear, and the
 // `OrderIntent::AttackMove` stamp, which arms a per-tick resume in
-// `tick_order_intents_post_combat_with_overlay_registry` (`world_orders.rs`)
+// `tick_order_intents_post_combat_except` (`world_orders.rs`)
 // that re-issues the move from wherever the unit is standing every time it
 // finds itself with no attack target and no movement target.
 //
@@ -2298,7 +2248,6 @@ fn tank_repathing_around_a_deck_blocker_stays_on_the_bridge_layer() {
                 span.approach_a.1,
                 0,
                 &resources.rules,
-                &resources.height_map,
             )
             .expect("blocker placed on the near approach")
     };
@@ -2333,7 +2282,8 @@ fn tank_repathing_around_a_deck_blocker_stays_on_the_bridge_layer() {
     );
     assert_eq!(
         i16::from(blocker_last.z as i8),
-        i16::from(blocker_last.terrain_level as i8) + BRIDGE_DECK_LEVEL_DELTA,
+        i16::from(blocker_last.terrain_level as i8)
+            + crate::util::lepton::BRIDGE_DECK_HEIGHT_LEVELS as i16,
         "a track TERMINATING on a deck cell left the mover off deck height: {blocker_last:?}"
     );
     // Settle it: let the parked mover idle a while and confirm it stays put and
@@ -2356,19 +2306,10 @@ fn tank_repathing_around_a_deck_blocker_stays_on_the_bridge_layer() {
                 span.approach_a.1,
                 0,
                 &resources.rules,
-                &resources.height_map,
             )
             .or_else(|| {
                 let back = offset(span.approach_a, (-span.step.0, -span.step.1))?;
-                simulation.spawn_object(
-                    "MTNK",
-                    &owner_name,
-                    back.0,
-                    back.1,
-                    0,
-                    &resources.rules,
-                    &resources.height_map,
-                )
+                simulation.spawn_object("MTNK", &owner_name, back.0, back.1, 0, &resources.rules)
             })
             .expect("crosser placed behind the span")
     };
@@ -2411,7 +2352,6 @@ fn tank_repathing_around_a_deck_blocker_stays_on_the_bridge_layer() {
             cell,
             z: entity.position.z,
             on_bridge: entity.on_bridge,
-            occupancy_deck: entity.bridge_occupancy.map(|occ| occ.deck_level),
             terrain_level: facts.ground_level,
             structural: facts.bridge_structural,
             bridge_walkable: facts.bridge_walkable,
@@ -2621,7 +2561,7 @@ struct CollapseGap {
     approach: (u16, u16),
     /// Stamped stub cells on the near side, in travel order.
     near_stubs: Vec<(u16, u16)>,
-    /// The hole: unstamped cells whose ground sits `BRIDGE_DECK_LEVEL_DELTA`
+    /// The hole: unstamped cells whose ground sits `crate::util::lepton::BRIDGE_DECK_HEIGHT_LEVELS as i16`
     /// below the stubs' deck.
     gap: Vec<(u16, u16)>,
     /// The first stamped cell on the far side of the hole.
@@ -2650,7 +2590,9 @@ fn find_collapse_gap(grid: &PathGrid) -> Option<CollapseGap> {
             }
             let deck_level = first.bridge_deck_level;
             let ground = first.ground_level;
-            if i16::from(deck_level) != i16::from(ground) + BRIDGE_DECK_LEVEL_DELTA {
+            if i16::from(deck_level)
+                != i16::from(ground) + crate::util::lepton::BRIDGE_DECK_HEIGHT_LEVELS as i16
+            {
                 continue;
             }
             for step in STEPS {
@@ -2737,8 +2679,8 @@ fn find_collapse_gap(grid: &PathGrid) -> Option<CollapseGap> {
 ///
 /// 1. The native height model holds on every frame, so a mover that did end up
 ///    in the hole would have to be at the riverbed level, not floating.
-/// 2. No frame puts the mover on a gap cell carrying `on_bridge`, a
-///    `BridgeOccupancy` entry, or deck height — that is "driving into the gap",
+/// 2. No frame puts the mover on a gap cell carrying `on_bridge` or deck
+///    height — that is "driving into the gap",
 ///    and it is the failure the row names.
 /// 3. If the order was accepted and the mover arrived, it arrived by a route
 ///    that satisfies (2) — a legitimate way round.
@@ -2792,7 +2734,6 @@ fn tank_ordered_across_the_deadman_collapse_gap_never_drives_into_it() {
                 gap.approach.1,
                 0,
                 &resources.rules,
-                &resources.height_map,
             )
             .unwrap_or_else(|| panic!("could not place an MTNK on {:?}", gap.approach))
     };
@@ -2820,7 +2761,6 @@ fn tank_ordered_across_the_deadman_collapse_gap_never_drives_into_it() {
                     target_rx: gap.far_stub.0,
                     target_ry: gap.far_stub.1,
                     queue: false,
-                    group_id: None,
                 },
             )],
             SIM_TICK_MS,
@@ -2868,14 +2808,10 @@ fn tank_ordered_across_the_deadman_collapse_gap_never_drives_into_it() {
              deck that is not there: {row:?}",
             row.cell
         );
-        assert_eq!(
-            row.occupancy_deck, None,
-            "the mover took a BridgeOccupancy entry inside the collapse gap at {:?}: {row:?}",
-            row.cell
-        );
         assert_ne!(
             i16::from(row.z as i8),
-            i16::from(row.terrain_level as i8) + BRIDGE_DECK_LEVEL_DELTA,
+            i16::from(row.terrain_level as i8)
+                + crate::util::lepton::BRIDGE_DECK_HEIGHT_LEVELS as i16,
             "the mover sat at deck height inside the collapse gap at {:?}: {row:?}",
             row.cell
         );
@@ -2918,23 +2854,20 @@ fn tank_ordered_across_the_deadman_collapse_gap_never_drives_into_it() {
 /// So the row's question is sharp: a destroyed low bridge over water. Does VERA
 /// still let a tank drive over it?
 ///
-/// **Measured answer: no, and this is the right answer.** The ordinary Move is
-/// admitted but its goal is resolved back to `(106,46)`, the last surviving deck
-/// cell before the destroyed one; the tank drives out to the broken edge over
-/// water and stops. It never occupies a `0x64`/`0x65` cell.
+/// **Answer: no; the order is dropped before the tank moves.** The break splits
+/// the MovementZone, so the far approach fails CanReachDestination (vt+0x2CC)
+/// and the outer Drive Process zone test (`0x4B09AB..0x4B0A68`: in playfield
+/// +3D5, not Enter, moving) clears the head and calls SetDestination(NULL, 1)
+/// on the first Process, before Process_Movement. The setter (`0x741970`)
+/// accepts the clicked cell unchanged; nothing resolves it to the near edge.
 ///
-/// The discriminator is exact and worth stating, because a `ground_walkable`
-/// read would have got it backwards — that flag is `true` on the destroyed cell,
-/// the same trap the matrix's evidence gap 1 was opened over. `(106,46)` and
-/// `(107,46)` sit on the *same* pre-overlay Water; the only difference between
-/// them is the overlay id, and the tank crosses the first and cannot enter the
-/// second. So passability here is decided by the damage-table overlay, not by
-/// the water beneath.
+/// The damage-table overlay, not the water, is what breaks the span: the near
+/// edge `(106,46)` and the destroyed `(107,46)` sit on the *same* pre-overlay
+/// Water and differ only in overlay id. A `ground_walkable` read would have got
+/// it backwards — that flag is `true` on the destroyed cell.
 ///
-/// What this does **not** claim: that the stopping *point* matches gamemd.
-/// Whether the original refuses the order outright, truncates to the same cell,
-/// or routes elsewhere is an unread question, as is whether `0x64`/`0x65` are
-/// the right terminal sinks. Both need the binary.
+/// Coverage: the drop is native control flow; the zone split is VERA's native
+/// zone port on this map, not a gamemd execution of it.
 #[test]
 #[ignore = "requires a retail RA2/YR install (RA2_DIR or config.toml)"]
 fn tank_cannot_cross_a_destroyed_shrapnel_low_bridge() {
@@ -3017,7 +2950,6 @@ fn tank_cannot_cross_a_destroyed_shrapnel_low_bridge() {
                 span.approach_a.1,
                 0,
                 &resources.rules,
-                &resources.height_map,
             )
             .unwrap_or_else(|| panic!("could not place an MTNK on {:?}", span.approach_a))
     };
@@ -3045,7 +2977,6 @@ fn tank_cannot_cross_a_destroyed_shrapnel_low_bridge() {
                     target_rx: span.approach_b.0,
                     target_ry: span.approach_b.1,
                     queue: false,
-                    group_id: None,
                 },
             )],
             SIM_TICK_MS,
@@ -3098,19 +3029,23 @@ fn tank_cannot_cross_a_destroyed_shrapnel_low_bridge() {
         destroyed_visited,
     );
 
-    // 2. It did not simply fail to move: it reached the near edge of the break,
-    //    which is the last surviving deck cell before the destroyed one. Without
-    //    this the run would pass on a mover that never left its approach.
+    // 2. The first Process drops the unreachable order (0x4B09AB..0x4B0A68):
+    //    the tank never leaves its approach and keeps no destination.
     let first_destroyed_on_route = *on_route.first().expect("a destroyed cell on the route");
     let near_edge = offset(first_destroyed_on_route, (-span.step.0, -span.step.1))
         .expect("the cell before the break is in bounds");
-    assert_eq!(
-        last.cell,
-        near_edge,
-        "the tank stopped at {:?} rather than at the near edge of the break {near_edge:?}; \
-         cells visited {:?}",
-        last.cell,
+    assert!(
+        rows.iter().all(|row| row.cell == span.approach_a),
+        "the tank left its approach {:?} on an order the zone test drops; cells visited {:?}",
+        span.approach_a,
         rows.iter().map(|row| row.cell).collect::<Vec<_>>(),
+    );
+    let tank = scenario.sim().entities().get(entity_id).expect("the tank");
+    assert!(
+        tank.drive_locomotion
+            .as_ref()
+            .is_some_and(|drive| drive.destination.is_none()),
+        "the zone test did not clear the Drive destination"
     );
 
     // 3. The near edge and the destroyed cell sit on the same pre-overlay Water,
@@ -3129,8 +3064,9 @@ fn tank_cannot_cross_a_destroyed_shrapnel_low_bridge() {
         "the tank completed the crossing over a destroyed low bridge"
     );
     println!(
-        "T2-10: the break at {first_destroyed_on_route:?} is impassable; the tank drove to the \
-         near edge {near_edge:?} — water-backed, same river, passable — and stopped."
+        "T2-10: the break at {first_destroyed_on_route:?} splits the zone; the first Process \
+         dropped the order and the tank stayed at {:?}.",
+        span.approach_a
     );
 }
 
@@ -3469,7 +3405,6 @@ fn retail_under_high_span_geometry() {
                             sim.resolved_terrain.as_ref(),
                             costs,
                             false,
-                            crate::sim::pathfinding::cell_entry::TerrainEntryMode::AStarNeighbor,
                             infantry,
                             false,
                         )
@@ -3511,7 +3446,7 @@ fn retail_under_high_span_geometry() {
                         ..Default::default()
                     };
                     match astar_search(grid, a, MovementLayer::Ground, b, &options) {
-                        Some(steps) => {
+                        Ok(steps) => {
                             // Any structural cell, not just this transect's four:
                             // the band runs the whole length of the span, so a
                             // route that travels along it sideways touches
@@ -3543,7 +3478,9 @@ fn retail_under_high_span_geometry() {
                                     .collect::<Vec<_>>()
                             );
                         }
-                        None => println!("  ground-plane A* [{label}] {a:?} -> {b:?}: NO PATH"),
+                        Err(cause) => {
+                            println!("  ground-plane A* [{label}] {a:?} -> {b:?}: {cause:?}")
+                        }
                     }
                 }
             } else {
@@ -3584,24 +3521,19 @@ impl UnderSpanRun {
     }
 }
 
-/// The under-span invariant: `ObjectClass::GetHeight` @ `0x005F5F30` with
+/// The under-span invariant: `ObjectClass::GetHeight` @ `0x005F5F40` with
 /// OnBridge clear, plus the two other places the deck term is stored.
 ///
 /// A mover under a span occupies the same cell as the deck above it, so the only
-/// thing separating the two states is this triple: no `on_bridge` flag, no
-/// `BridgeOccupancy` entry, and `position.z` at the cell's own ground level
-/// rather than `ground + 4`. All three are asserted, because any one alone would
+/// thing separating the two states is this pair: no `on_bridge` flag and
+/// `position.z` at the cell's own ground level rather than `ground + 4`. Both
+/// are asserted, because either one alone would
 /// pass an implementation that got the other two wrong.
 fn assert_under_span_invariant(frames: &[&TickRow]) {
     for row in frames {
         assert!(
             !row.on_bridge,
             "under-span frame on {:?} carries on_bridge: {row:?}",
-            row.cell
-        );
-        assert_eq!(
-            row.occupancy_deck, None,
-            "under-span frame on {:?} produced a BridgeOccupancy entry: {row:?}",
             row.cell
         );
         assert_eq!(
@@ -3612,7 +3544,8 @@ fn assert_under_span_invariant(frames: &[&TickRow]) {
         );
         assert_ne!(
             i16::from(row.z as i8),
-            i16::from(row.terrain_level as i8) + BRIDGE_DECK_LEVEL_DELTA,
+            i16::from(row.terrain_level as i8)
+                + crate::util::lepton::BRIDGE_DECK_HEIGHT_LEVELS as i16,
             "under-span frame on {:?} sits at deck height: {row:?}",
             row.cell
         );
@@ -3683,7 +3616,6 @@ fn record_until(
             cell,
             z: entity.position.z,
             on_bridge: entity.on_bridge,
-            occupancy_deck: entity.bridge_occupancy.map(|occ| occ.deck_level),
             terrain_level: facts.ground_level,
             structural: facts.bridge_structural,
             bridge_walkable: facts.bridge_walkable,
@@ -3771,7 +3703,6 @@ fn order_under_high_span(map_file: &str, unit_type: &str) -> Option<UnderSpanRun
             candidate.1,
             0,
             &resources.rules,
-            &resources.height_map,
         ) {
             entity_id = Some(id);
             start_cell = candidate;
@@ -3823,7 +3754,6 @@ fn order_under_high_span(map_file: &str, unit_type: &str) -> Option<UnderSpanRun
                     target_rx: under_b.0,
                     target_ry: under_b.1,
                     queue: false,
-                    group_id: None,
                 },
             )],
             SIM_TICK_MS,
@@ -4119,7 +4049,6 @@ fn ground_entry_under_a_high_span_is_admitted_on_every_lane() {
     };
     use crate::rules::locomotor_type::SpeedType;
     use crate::sim::movement::locomotor::MovementLayer;
-    use crate::sim::pathfinding::cell_entry::TerrainEntryMode;
 
     let scenario = headless_scenario::load(&retail, "Hills.mmx", SEED).expect("Hills.mmx loads");
     let sim = scenario.sim();
@@ -4138,7 +4067,6 @@ fn ground_entry_under_a_high_span_is_admitted_on_every_lane() {
             sim.resolved_terrain.as_ref(),
             costs,
             false,
-            TerrainEntryMode::AStarNeighbor,
             false,
             false,
         )
@@ -4200,7 +4128,6 @@ fn tank_cannot_reach_the_riverbed_beside_bay_of_pigs_high_bridge() {
     };
     use crate::rules::locomotor_type::SpeedType;
     use crate::sim::movement::locomotor::MovementLayer;
-    use crate::sim::pathfinding::cell_entry::TerrainEntryMode;
 
     let scenario =
         headless_scenario::load(&retail, "BayOPigs.mmx", SEED).expect("BayOPigs.mmx loads");
@@ -4224,7 +4151,6 @@ fn tank_cannot_reach_the_riverbed_beside_bay_of_pigs_high_bridge() {
             sim.resolved_terrain.as_ref(),
             track,
             false,
-            TerrainEntryMode::AStarNeighbor,
             false,
             false,
         );
@@ -4293,7 +4219,7 @@ fn deck_and_ground_under_one_high_bridge_cell_are_separate_occupancy_planes() {
         "shared cell {shared:?} (terrain level {}, deck level {}); deck mover enters from {:?}, \
          under mover leaves to {exit:?}",
         cut.deck_terrain_level,
-        cut.deck_terrain_level + BRIDGE_DECK_LEVEL_DELTA as u8,
+        cut.deck_terrain_level + crate::util::lepton::BRIDGE_DECK_HEIGHT_LEVELS as u8,
         span.approach_a,
     );
 
@@ -4315,7 +4241,6 @@ fn deck_and_ground_under_one_high_bridge_cell_are_separate_occupancy_planes() {
                 span.approach_a.1,
                 0,
                 &resources.rules,
-                &resources.height_map,
             )
             .expect("MTNK placed on the west approach")
     };
@@ -4333,8 +4258,8 @@ fn deck_and_ground_under_one_high_bridge_cell_are_separate_occupancy_planes() {
     let deck_rows = record_until(&mut scenario, deck_id, shared);
     let deck_last = *deck_rows.last().expect("deck mover recorded frames");
     println!(
-        "deck mover finished at {:?} z={} on_bridge={} occ={:?}",
-        deck_last.cell, deck_last.z, deck_last.on_bridge, deck_last.occupancy_deck
+        "deck mover finished at {:?} z={} on_bridge={}",
+        deck_last.cell, deck_last.z, deck_last.on_bridge
     );
     assert_eq!(
         deck_last.cell, shared,
@@ -4343,7 +4268,8 @@ fn deck_and_ground_under_one_high_bridge_cell_are_separate_occupancy_planes() {
     assert!(deck_last.on_bridge, "the deck mover is not on the deck");
     assert_eq!(
         i16::from(deck_last.z as i8),
-        i16::from(deck_last.terrain_level as i8) + BRIDGE_DECK_LEVEL_DELTA,
+        i16::from(deck_last.terrain_level as i8)
+            + crate::util::lepton::BRIDGE_DECK_HEIGHT_LEVELS as i16,
         "the deck mover is not at deck height: {deck_last:?}"
     );
 
@@ -4353,15 +4279,7 @@ fn deck_and_ground_under_one_high_bridge_cell_are_separate_occupancy_planes() {
             simulation,
             resources,
         } = &mut scenario.runtime;
-        simulation.spawn_object(
-            "MTNK",
-            &owner_name,
-            shared.0,
-            shared.1,
-            0,
-            &resources.rules,
-            &resources.height_map,
-        )
+        simulation.spawn_object("MTNK", &owner_name, shared.0, shared.1, 0, &resources.rules)
     };
     let Some(under_id) = under_id else {
         println!(
@@ -4370,21 +4288,15 @@ fn deck_and_ground_under_one_high_bridge_cell_are_separate_occupancy_planes() {
         );
         return;
     };
-    let (under_z, under_on_bridge, under_occ) = {
+    let (under_z, under_on_bridge) = {
         let entity = scenario
             .sim()
             .entities()
             .get(under_id)
             .expect("under mover present");
-        (
-            entity.position.z,
-            entity.on_bridge,
-            entity.bridge_occupancy.map(|occ| occ.deck_level),
-        )
+        (entity.position.z, entity.on_bridge)
     };
-    println!(
-        "under mover placed on {shared:?}: z={under_z} on_bridge={under_on_bridge} occ={under_occ:?}"
-    );
+    println!("under mover placed on {shared:?}: z={under_z} on_bridge={under_on_bridge}");
 
     // Both entities exist, on one cell, at two heights.
     let deck_still = scenario
@@ -4407,7 +4319,6 @@ fn deck_and_ground_under_one_high_bridge_cell_are_separate_occupancy_planes() {
         "the under mover is not at the cell's own ground level"
     );
     assert!(!under_on_bridge, "the under mover carries on_bridge");
-    assert_eq!(under_occ, None, "the under mover holds a BridgeOccupancy");
     assert_ne!(
         under_z, deck_still.position.z,
         "the two movers share one height on one cell"
@@ -4507,6 +4418,9 @@ fn retail_high_bridge_inventory() {
 /// Scale instrument, not a parity test: N tanks on `Hills.mmx` all ordered
 /// across the valley, per-frame wall time of the whole simulation frame.
 /// `VERA20K_SCALE_MOVERS` overrides the count (default 400).
+/// `VERA20K_SKIP_LIVE_READ_CHECK=1` drops the debug cross-checks of the pass's
+/// derived inputs (live reads, cached blocker plane), which otherwise rebuild
+/// their whole-world forms every turn.
 #[test]
 #[ignore = "requires a retail RA2/YR install (RA2_DIR or config.toml)"]
 fn scale_benchmark_many_movers_on_hills() {
@@ -4533,15 +4447,9 @@ fn scale_benchmark_many_movers_on_hills() {
                 simulation,
                 resources,
             } = &mut scenario.runtime;
-            if let Some(id) = simulation.spawn_object(
-                "MTNK",
-                &owner_name,
-                rx,
-                ry,
-                0,
-                &resources.rules,
-                &resources.height_map,
-            ) {
+            if let Some(id) =
+                simulation.spawn_object("MTNK", &owner_name, rx, ry, 0, &resources.rules)
+            {
                 ids.push((id, rx, ry));
             }
         }
@@ -4570,7 +4478,6 @@ fn scale_benchmark_many_movers_on_hills() {
                     target_rx: rx.wrapping_add(30),
                     target_ry: ry,
                     queue: false,
-                    group_id: None,
                 },
             )
         })
@@ -4600,9 +4507,18 @@ fn scale_benchmark_many_movers_on_hills() {
         })
         .count();
     println!(
-        "SCALE movers={} live_objects={live_objects} frames={frames} avg_ms={:.2} worst_ms={:.2} moved={moved}",
+        "SCALE movers={} live_objects={live_objects} frames={frames} avg_ms={:.2} worst_ms={:.2} moved={moved} entity_bytes={} world_reads={}/{}",
         ids.len(),
         total.as_secs_f64() * 1000.0 / frames as f64,
         worst.as_secs_f64() * 1000.0,
+        std::mem::size_of::<crate::sim::game_entity::GameEntity>(),
+        scenario
+            .sim()
+            .movement_pass_cache
+            .block_index_world_rebuilds(),
+        scenario
+            .sim()
+            .movement_pass_cache
+            .blocker_plane_world_rebuilds(),
     );
 }

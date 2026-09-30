@@ -79,16 +79,17 @@ pub fn list_saved_seeds(dir: &Path) -> Vec<SavedSeed> {
                 return None;
             }
             let ini = crate::rules::ini_parser::IniFile::from_bytes(&bytes).ok();
-            let raw = ini
+            let section = ini
                 .as_ref()
-                .and_then(|ini| ini.section("RandomMap"))
-                .and_then(|section| section.get("Description"));
+                .map_or(crate::rules::ini_parser::IniSection::empty(), |ini| {
+                    ini.section_or_empty("RandomMap")
+                });
             Some(SavedSeed {
                 // Read using the full enumeration name; actions use the bounded
                 // copy at 0x00597E96, even if the boundary splits an ANSI character.
                 file_name: name.truncated(32),
                 description: super::description::read_description(
-                    raw,
+                    section,
                     &super::SeedDescription::default(),
                 ),
                 last_write_time: time,
@@ -208,6 +209,7 @@ pub fn allocate_seed_file_name(
 /// retain the player's working values. The setup caller at 0x005969B1 then
 /// synchronizes controls through 0x00596E50, which normalizes the record.
 /// See RANDOM_MAP_SAVED_SEED_SLOTS_GHIDRA_REPORT.md sections 3.5 and 3.6.
+#[cfg(test)]
 pub fn load_saved_seed(
     path: &Path,
     current: &RmgOptions,
@@ -230,11 +232,13 @@ fn options_from_bytes(bytes: &[u8], current: &RmgOptions, default_description: &
 }
 
 /// Write a saved seed.
+#[cfg(test)]
 pub fn save_saved_seed(path: &Path, options: &RmgOptions) -> std::io::Result<()> {
     std::fs::write(path, options.to_sed_bytes())
 }
 
 /// Delete a saved seed.
+#[cfg(test)]
 pub fn delete_saved_seed(path: &Path) -> std::io::Result<()> {
     std::fs::remove_file(path)
 }

@@ -14,10 +14,11 @@
 
 use std::collections::HashMap;
 
+#[cfg(test)]
 use crate::map::entities::{EntityCategory, MapEntity};
-use crate::map::map_file::MapCell;
 use crate::rules::art_data::AnimTypeRuntimeConfig;
 use crate::rules::ini_parser::IniFile;
+#[cfg(test)]
 use crate::rules::ruleset::RuleSet;
 
 /// Maximum combined lighting value per channel in current compatibility tint output.
@@ -34,9 +35,6 @@ pub const LIGHT_CLAMP_MAX: i32 = 2000;
 
 /// Identity 16.16 scale used by the LightConvert normalization path.
 pub const LIGHT_SCALE16_IDENTITY: i32 = 0x10000;
-
-/// Binary light unit scale for Ambient/Red/Green/Blue INI values parsed as Rust ratios.
-pub const AMBIENT_RGB_UNIT_SCALE: i32 = LIGHT_UNIT;
 
 /// Scenario Ground/Level: original 0068A92E/0068A968 multiply by double
 /// [007E4658] = 1000.0, then add 0.01 and truncate. See the Ground/Level
@@ -376,6 +374,7 @@ impl CellLightGrid {
         );
     }
 
+    #[cfg(test)]
     pub fn set_compat_tint(&mut self, cell: (u16, u16), tint: [f32; 3]) {
         self.insert_profiled_light(cell, tint, 1.0);
     }
@@ -425,6 +424,7 @@ impl CellLightGrid {
         self.tint_or_default(cell)
     }
 
+    #[cfg(test)]
     pub fn terrain_object_tint_at(&self, cell: (u16, u16)) -> [f32; 3] {
         self.tint_for_common_scalar_or_default(cell)
     }
@@ -561,6 +561,7 @@ fn key_to_rgb(key: LightRgbKey) -> [f32; 3] {
 }
 
 /// Return signed building body draw-depth adjustment from art.ini ExtraLight.
+#[cfg(test)]
 pub fn building_body_depth_adjustment(extra_light: i32) -> i32 {
     extra_light
 }
@@ -572,18 +573,18 @@ pub fn parse_lighting(ini: &IniFile) -> LightingConfig {
         None => return LightingConfig::default(),
     };
     LightingConfig {
-        ambient: section.get_f32("Ambient").unwrap_or(1.0),
-        red: section.get_f32("Red").unwrap_or(1.0),
-        green: section.get_f32("Green").unwrap_or(1.0),
-        blue: section.get_f32("Blue").unwrap_or(1.0),
-        ground: section.get_f32("Ground").unwrap_or(0.05),
-        level: section.get_f32("Level").unwrap_or(0.008),
-        ion_ambient: section.get_f32("IonAmbient").unwrap_or(0.87),
-        ion_red: section.get_f32("IonRed").unwrap_or(0.30),
-        ion_green: section.get_f32("IonGreen").unwrap_or(0.40),
-        ion_blue: section.get_f32("IonBlue").unwrap_or(0.75),
-        ion_ground: section.get_f32("IonGround").unwrap_or(0.0),
-        ion_level: section.get_f32("IonLevel").unwrap_or(0.0),
+        ambient: section.read_double("Ambient", 1.0) as f32,
+        red: section.read_double("Red", 1.0) as f32,
+        green: section.read_double("Green", 1.0) as f32,
+        blue: section.read_double("Blue", 1.0) as f32,
+        ground: section.read_double("Ground", 0.05) as f32,
+        level: section.read_double("Level", 0.008) as f32,
+        ion_ambient: section.read_double("IonAmbient", 0.87) as f32,
+        ion_red: section.read_double("IonRed", 0.30) as f32,
+        ion_green: section.read_double("IonGreen", 0.40) as f32,
+        ion_blue: section.read_double("IonBlue", 0.75) as f32,
+        ion_ground: section.read_double("IonGround", 0.0) as f32,
+        ion_level: section.read_double("IonLevel", 0.0) as f32,
     }
 }
 
@@ -655,28 +656,13 @@ pub fn cell_tint(config: &LightingConfig, z: u8) -> [f32; 3] {
     grid.tint_or_default((1, 1))
 }
 
-/// Compute the shared ambient scalar for a terrain elevation level.
-pub fn cell_light_scalar(config: &LightingConfig, z: u8) -> f32 {
-    let units = scenario_units(config);
-    let scalar = units.ambient + units.level * i32::from(z) - units.ground;
-    clamp_light_scalar(scalar) as f32 / LIGHT_UNIT as f32
-}
-
 /// Compute the uniform terrain tint for the map.
 ///
 /// Terrain uses the ground-level lighting value across all cells so repeating
 /// tile textures do not expose the map grid through per-cell tint boundaries.
+#[cfg(test)]
 pub fn terrain_tint(config: &LightingConfig) -> [f32; 3] {
     cell_tint(config, 0)
-}
-
-/// Build the profile-backed base cell light grid from map INI and cell data.
-pub fn build_cell_light_grid(ini: &IniFile, cells: &[MapCell]) -> CellLightGrid {
-    let config = parse_lighting(ini);
-    build_cell_light_grid_from_heights(
-        cells.iter().map(|cell| ((cell.rx, cell.ry), cell.z)),
-        &config,
-    )
 }
 
 /// Build the profile-backed base cell light grid from known cell heights.
@@ -934,6 +920,7 @@ pub fn point_light_area_cells(
 ///
 /// Iterates all structure entities on the map and checks their ObjectType
 /// for light emission properties parsed from rules.ini.
+#[cfg(test)]
 pub fn collect_building_lights(entities: &[MapEntity], rules: Option<&RuleSet>) -> Vec<PointLight> {
     let Some(rules) = rules else {
         return Vec::new();
@@ -1174,10 +1161,6 @@ struct NormalizedLight {
     scale16: i32,
     common_scalar: i32,
     rgb_key: LightRgbKey,
-}
-
-fn scenario_units(config: &LightingConfig) -> ScenarioLightUnits {
-    scenario_units_from_profile(scenario_profile_units(config))
 }
 
 fn scenario_profile_units(config: &LightingConfig) -> LightingProfileUnits {
@@ -2216,6 +2199,8 @@ mod tests {
             recruitable_a: true,
             recruitable_b: true,
             structure_upgrades: [None, None, None],
+            structure_ai_sellable: false,
+            structure_ai_repairable: false,
         }
     }
 

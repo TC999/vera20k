@@ -2,122 +2,78 @@
 //! oil-derrick `ProduceCash` and the Floating Disc money drain (GSI-09.01).
 //!
 //! Both mechanisms move credits through the one authoritative wallet
-//! (`HouseState.credits`) with the native primitives' semantics:
+//! (`HouseState.economy.credits`) with the native primitives' semantics:
 //! `HouseClass::Add_Credits @ 0x004F9950` (`credits += amount`, no clamp) and
 //! `HouseClass::Spend_Money @ 0x004F9790` (cash first, then the silo-drain
-//! fallback that stock skirmish never reaches because house storage stays 0.0
-//! — see the 09.01 scan §1.2; VERA has no house storage, so the fallback is
-//! the `min(credits, amount)` clamp).
+//! fallback. The current wallet adapter clamps to available credits; native
+//! saved nonzero Building/House storage withdrawal and liquidation remain a
+//! required integration boundary, not a proof that storage is always zero.
 //!
-//! Ordering residual (VERA-internal, gamemd equivalent UNCHECKED beyond the
-//! call order): native `BuildingClass::Update` runs the ProduceCash block
-//! before `TechnoClass::AI_Update` (where the drain transfer lives); VERA
-//! runs the ProduceCash step after the promotion/drain steps. No stock type
-//! carries both `ProduceCash*` and `Drainable=`, so no frame-observable
-//! difference exists on retail data.
+//! Building AI runs ProduceCash43FD2C before shared Techno43FE56 promotion
+//! and drain transfer, matching the implemented Structure prelude order.
 //!
 //! ## Dependency rules
 //! - Part of sim/ — depends on rules/ and sim/ only. NEVER on render/, ui/,
 //!   sidebar/, audio/ or net/.
 
-use serde::{Deserialize, Serialize};
-
 use crate::map::entities::EntityCategory;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::entity_store::EntityStore;
 use crate::sim::intern::InternedId;
+#[cfg(test)]
 use crate::sim::mission::MissionType;
+use crate::sim::timer::CdTimer;
 use crate::sim::world::Simulation;
 
-/// `BuildingClass+0x6D0` (start frame) / `+0x6D8` (duration): the ProduceCash
-/// `TimerStruct`. `BuildingClass::Constructor @ 0x0043B92B..0x0043B937` seeds
-/// `start = g_CurrentFrameCounter`, `duration = 0` — a timer that has already
-/// expired and never fires; only `BuildingClass::ChangeOwner @ 0x004482DB..
-/// 0x004482F9` (capture from a `MultiplayPassive` house) and the re-arm inside
-/// `BuildingClass::Update @ 0x0043FD5B..0x0043FD86` ever give it a duration.
-/// (`+0x6D4`, the middle dword, is scratch copied from a stack local and is
-/// never read by the fire test.)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
-pub struct ProduceCashTimer {
-    /// Raw signed start dword; `-1` is the native "not started" sentinel.
-    pub start_frame: i32,
-    /// Raw signed duration dword.
-    pub duration: i32,
-}
-
-impl ProduceCashTimer {
-    /// Constructor state: started at `frame` with a zero duration.
-    pub const fn constructed(frame: u32) -> Self {
-        Self {
-            start_frame: frame as i32,
-            duration: 0,
-        }
-    }
-
-    /// Arm/re-arm: `start = frame`, `duration = delay`.
-    pub const fn armed(frame: u32, delay: i32) -> Self {
-        Self {
-            start_frame: frame as i32,
-            duration: delay,
-        }
-    }
-
-    /// The inlined fire test of `BuildingClass::Update @ 0x0043FD2C..0x0043FD59`:
-    ///
-    /// ```text
-    /// if (start != -1) { elapsed = frame - start; if (elapsed >= duration) skip;
-    ///                    remaining = duration - elapsed } else remaining = duration
-    /// fire iff remaining == 1
-    /// ```
-    ///
-    /// So an armed timer of duration `D` fires on the frame where
-    /// `frame - start == D - 1`, i.e. every `D - 1` frames after each re-arm,
-    /// and a timer whose expiry frame was skipped (the two warp gates at
-    /// `0x0043FD0C`/`0x0043FD1E` jump past the block) is dead until re-armed.
-    pub fn fires_now(self, frame: u32) -> bool {
-        let remaining = if self.start_frame != -1 {
-            let elapsed = (frame as i32).wrapping_sub(self.start_frame);
-            if elapsed >= self.duration {
-                return false;
-            }
-            self.duration.wrapping_sub(elapsed)
-        } else {
-            self.duration
-        };
-        remaining == 1
-    }
+/// The ProduceCash fire test inlined in `BuildingClass::Update @
+/// 0x0043FD2C..0x0043FD59` on the `+0x6D0`/`+0x6D8` timer
+/// ([`GameEntity::produce_cash_timer`](crate::sim::game_entity::GameEntity::produce_cash_timer)):
+/// it fires when exactly one frame remains. An armed timer of duration `D`
+/// fires on the frame where `frame - start == D - 1`, i.e. every `D - 1`
+/// frames after each re-arm, and a timer whose expiry frame was skipped (the
+/// two warp gates at `0x0043FD0C`/`0x0043FD1E` jump past the block) is dead
+/// until re-armed.
+fn produce_cash_fires(timer: CdTimer, frame: u32) -> bool {
+    timer.remaining(frame as i32) == 1
 }
 
 /// `HouseClass::Add_Credits @ 0x004F9950`: `credits += amount`, unclamped.
 pub(crate) fn add_credits(sim: &mut Simulation, owner: InternedId, amount: i32) {
     if let Some(house) = sim.houses.get_mut(&owner) {
-        house.credits = house.credits.wrapping_add(amount);
+        house.economy.credits = house.economy.credits.wrapping_add(amount);
     }
 }
 
 /// `HouseClass::Spend_Money @ 0x004F9790`, cash arm only (`credits >= amount`
 /// → `credits -= amount`; else `credits = 0` and the silo-drain fallback,
 /// which is dead in stock skirmish because house storage is never filled —
-/// scan §1.2). Returns the amount actually taken from cash.
+/// scan §1.2). The amount taken joins the house's spending statistic
+/// (`+0x2DC`, `ADD` at the tail), which the factory's charges feed too
+/// ([`Economy::spend`](crate::sim::economy::Economy::spend)). Returns the
+/// amount actually taken from cash.
 pub(crate) fn spend_money(sim: &mut Simulation, owner: InternedId, amount: i32) -> i32 {
     let Some(house) = sim.houses.get_mut(&owner) else {
         return 0;
     };
-    if house.credits >= amount {
-        house.credits -= amount;
+    let spent = if house.economy.credits >= amount {
+        house.economy.credits -= amount;
         amount
     } else {
-        let spent = house.credits.max(0);
-        house.credits = 0;
+        let spent = house.economy.credits.max(0);
+        house.economy.credits = 0;
         spent
-    }
+    };
+    house.economy.spent_credits = house.economy.spent_credits.wrapping_add(spent);
+    spent
 }
 
 /// `HouseClass` money-interface slot `+0x18` = `Available_Money @ 0x004F6990`:
 /// `ftol(storage_total × IncomeMult) + credits`; storage is 0 in stock
 /// skirmish (scan §1.1/§2.1) so this is the cash balance.
 pub(crate) fn available_money(sim: &Simulation, owner: InternedId) -> i32 {
-    sim.houses.get(&owner).map_or(0, |house| house.credits)
+    sim.houses
+        .get(&owner)
+        .map_or(0, |house| house.economy.credits)
 }
 
 // ---------------------------------------------------------------------------
@@ -161,68 +117,12 @@ pub(crate) fn produce_cash_on_owner_change(
     let frame = sim.session.binary_frame;
     add_credits(sim, new_owner, startup);
     if let Some(entity) = sim.substrate.entities.get_mut(stable_id) {
-        entity.produce_cash_timer = ProduceCashTimer::armed(frame, delay);
+        entity.produce_cash_timer = CdTimer::started(frame as i32, delay);
     }
-}
-
-/// The operational gate `BuildingClass` vtable `+0x350` = `0x004555D0` (DB
-/// label `CanSellOrUndeploy` is a misnomer; the body is the "is this building
-/// online" test that both `BuildingClass::Update`'s prologue at `0x0043FB2B`
-/// and the ProduceCash block at `0x0043FDA0` call):
-///
-/// ```text
-/// if (!HasPower && +0x67C < 2) return false;            // unpowered
-/// if (EMPLockRemaining > 0) return false;               // EMP
-/// if (Health == 0) return false;
-/// if (Powered && Power < 0 && PowerRatio < 1.0 && +0x67C < 2) return false;
-/// if (+0x1574 && (house blackout timer running || house+0x577B)) return false;
-/// return (!NeedsEngineer(+0x1552) || HasEngineer)
-///     && mission != Selling(0x12) && mission != Construction(0x13);
-/// ```
-///
-/// VERA folds the two power terms and the house blackout into
-/// `power_system::is_building_powered`. Residuals (each names its trigger):
-/// EMP (`EMPLockRemaining`) has no VERA field — a derrick under EMP keeps
-/// paying (trigger: EMP on a captured derrick; rare, 20 credits per pulse);
-/// `NeedsEngineer`/`HasEngineer` is not modelled — the timer only ever arms
-/// through `ChangeOwner`, which sets `HasEngineer`, so the term is always true
-/// on a live timer; the `+0x67C < 2` clause on both power terms is UNMODELLED
-/// (the field's identity is UNCHECKED — VERA treats it as always `< 2`, i.e.
-/// the power terms always apply); the `Type+0x1574` term is `PoweredSpecial=`
-/// (`BuildingTypeClass::ReadINI @ 0x0046000A..0x0046000F`, string
-/// `0x0081AE1C`) and is UNMODELLED — with it set the gate also refuses while
-/// the house blackout timer runs or house byte `+0x577B` is set, a flag
-/// written by `HouseClass::AI_AssessPower @ 0x00508D4A` and read by
-/// `AI_Choose_Building` whose meaning is UNCHECKED (trigger: a
-/// `PoweredSpecial=yes` derrick — none in stock, where rulesmd.ini puts the
-/// key on the power plants `GAPOWR`/`NAPOWR`/`NANRCT`/`YAPOWR` only, none
-/// of which carries `ProduceCash*`; frequency: zero in stock).
-fn building_operational(sim: &Simulation, stable_id: u64, rules: &RuleSet) -> bool {
-    let Some(entity) = sim.substrate.entities.get(stable_id) else {
-        return false;
-    };
-    if entity.health.current == 0 {
-        return false;
-    }
-    if !crate::sim::power_system::is_building_powered(
-        &sim.power_states,
-        rules,
-        entity,
-        &sim.interner,
-    ) {
-        return false;
-    }
-    if entity.building_up.is_some() {
-        return false;
-    }
-    !matches!(
-        entity.mission.current().known(),
-        Some(MissionType::Selling | MissionType::Construction)
-    )
 }
 
 /// `BuildingClass::Update @ 0x0043FD2C..0x0043FDD6`, the ProduceCash block:
-/// fire test on the `+0x6D0` timer (see [`ProduceCashTimer::fires_now`]),
+/// fire test on the `+0x6D0` timer (see [`produce_cash_fires`]),
 /// re-arm with `ProduceCashDelay`, skip when the owner's HouseType is
 /// `MultiplayPassive` (`0x0043FD89..0x0043FD9A`), skip unless operational
 /// (`vtable+0x350`, `0x0043FDA0`), then `amount > 0 → Add_Credits(amount)`
@@ -241,7 +141,7 @@ pub(crate) fn produce_cash_step(sim: &mut Simulation, stable_id: u64, rules: &Ru
         return;
     }
     let frame = sim.session.binary_frame;
-    if !entity.produce_cash_timer.fires_now(frame) {
+    if !produce_cash_fires(entity.produce_cash_timer, frame) {
         return;
     }
     let owner = entity.owner();
@@ -251,7 +151,7 @@ pub(crate) fn produce_cash_step(sim: &mut Simulation, stable_id: u64, rules: &Ru
     let amount = obj.produce_cash_amount;
     let delay = obj.produce_cash_delay;
     if let Some(entity) = sim.substrate.entities.get_mut(stable_id) {
-        entity.produce_cash_timer = ProduceCashTimer::armed(frame, delay);
+        entity.produce_cash_timer = CdTimer::started(frame as i32, delay);
     }
     if sim
         .houses
@@ -260,7 +160,7 @@ pub(crate) fn produce_cash_step(sim: &mut Simulation, stable_id: u64, rules: &Ru
     {
         return;
     }
-    if !building_operational(sim, stable_id, rules) {
+    if sim.building_operational_state(stable_id, rules) != Some(true) {
         return;
     }
     if amount > 0 {
@@ -300,8 +200,9 @@ pub(crate) fn building_at_cell_in_store(entities: &EntityStore, rx: u16, ry: u16
 /// `target+0x1D0 = drainer` (`DrainingMe`), `drainer+0x1CC = target`
 /// (`DrainTarget`), flag the victim house's power recalc (`+0x5778`), free any
 /// mind-controlled captives, create the `DrainAnim` and drop the drainer from
-/// its team. Only the two pointers are modelled here; the power recalc
-/// (drained buildings output no power) and the anim are recorded residuals.
+/// its team. Only the two pointers are modelled here, the captives and the
+/// team by the caller; the power recalc (drained buildings output no power)
+/// and the anim are recorded residuals.
 ///
 /// Returns whether the link was made.
 pub(crate) fn install_drain_link(
@@ -478,7 +379,6 @@ mod tests {
     use crate::sim::combat::TargetKind;
     use crate::sim::command::{Command, CommandEnvelope};
     use crate::sim::house_state::HouseState;
-    use std::collections::BTreeMap;
 
     /// Retail shape: `GAPOWR` is `Drainable=yes` only; the refineries carry
     /// both `ResourceDestination=yes` and `Drainable=yes` (rulesmd.ini
@@ -528,16 +428,14 @@ mod tests {
     /// base unit → lose → sole survivor wins → frames stop after SavourDelay)
     /// never terminates the fixture match.
     fn base(sim: &mut Simulation, rules: &RuleSet, owner: &str, rx: u16, ry: u16) {
-        let heights: BTreeMap<(u16, u16), u8> = BTreeMap::new();
-        sim.spawn_object("GAPOWR", owner, rx, ry, 0, rules, &heights)
+        sim.spawn_object("GAPOWR", owner, rx, ry, 0, rules)
             .expect("base building spawns");
     }
 
     fn run_ticks(sim: &mut Simulation, rules: &RuleSet, ticks: u32) {
-        let heights: BTreeMap<(u16, u16), u8> = BTreeMap::new();
         let grid = crate::sim::pathfinding::PathGrid::new(64, 64);
         for _ in 0..ticks {
-            let _ = sim.advance_tick(&[], Some(rules), &heights, Some(&grid), None, 67);
+            let _ = sim.advance_tick(&[], Some(rules), Some(&grid), None, 67);
         }
     }
 
@@ -563,7 +461,7 @@ mod tests {
     }
 
     fn credits(sim: &Simulation, owner: InternedId) -> i32 {
-        sim.houses[&owner].credits
+        sim.houses[&owner].economy.credits
     }
 
     /// §2.13: capture from a `MultiplayPassive` house grants
@@ -581,12 +479,11 @@ mod tests {
         let soviets = house(&mut sim, "Soviet", true, 5_000);
         base(&mut sim, &rules, "Americans", 30, 30);
         base(&mut sim, &rules, "Soviet", 40, 40);
-        let heights: BTreeMap<(u16, u16), u8> = BTreeMap::new();
         let oil = sim
-            .spawn_object("CAOILD", "Neutral", 10, 10, 0, &rules, &heights)
+            .spawn_object("CAOILD", "Neutral", 10, 10, 0, &rules)
             .expect("derrick spawns");
         let constructed = sim.substrate.entities.get(oil).unwrap().produce_cash_timer;
-        assert_eq!(constructed.duration, 0, "constructor timer is dead");
+        assert_eq!(constructed.duration(), 0, "constructor timer is dead");
 
         // Owned by the passive house nothing is ever paid.
         run_ticks(&mut sim, &rules, 120);
@@ -599,8 +496,8 @@ mod tests {
             "ProduceCashStartup on capture"
         );
         let armed = sim.substrate.entities.get(oil).unwrap().produce_cash_timer;
-        assert_eq!(armed.duration, 100);
-        assert_eq!(armed.start_frame, sim.session.binary_frame as i32);
+        assert_eq!(armed.duration(), 100);
+        assert_eq!(armed.start_frame(), sim.session.binary_frame as i32);
 
         // Arming frame semantics: `change_owner` armed the timer at frame
         // `F = start_frame` with duration `Delay = 100`. `advance_tick` runs
@@ -609,7 +506,7 @@ mod tests {
         // frame `F + k - 1`; `remaining = Delay - (frame - F) == 1` holds at
         // frame `F + 99`, i.e. on tick 100 exactly. Each re-arm then repeats
         // the period of `Delay - 1 = 99` frames.
-        let start = armed.start_frame as u32;
+        let start = armed.start_frame() as u32;
         let mut payments: Vec<(u32, u32)> = Vec::new();
         let mut last = credits(&sim, americans);
         for tick in 1..=400 {
@@ -652,15 +549,63 @@ mod tests {
     /// building, so a `Powered=yes` derrick under low power re-arms without
     /// paying.
     #[test]
+    fn cash_uses_shared_powered_special_outage_and_effective_mission_gate() {
+        use crate::sim::mission::state::MissionTestFixture;
+        use crate::sim::mission::{MissionDispatchTimer, MissionId};
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[BuildingTypes]\n0=OIL\n[OIL]\nStrength=100\nPoweredSpecial=yes\nProduceCashAmount=20\nProduceCashDelay=100\n"
+        )).unwrap();
+        let mut sim = Simulation::new();
+        let owner = house(&mut sim, "A", true, 0);
+        let id = sim
+            .spawn_object_at_height("OIL", "A", 10, 10, 0, 0, &rules)
+            .unwrap();
+        for (outage, current, queued, pays) in [
+            (true, 5, -1, false),
+            (false, -1, 0x12, false),
+            (false, -1, 0x13, false),
+            (false, -1, 5, true),
+        ] {
+            sim.power_states
+                .entry(owner)
+                .or_default()
+                .power_blackout_remaining = u32::from(outage);
+            let entity = sim.substrate.entities.get_mut(id).unwrap();
+            entity.produce_cash_timer = CdTimer::started(0, 100);
+            entity.mission.apply_test_fixture(MissionTestFixture {
+                current: MissionId::from_raw(current),
+                queued: MissionId::from_raw(queued),
+                suspended: MissionId::NONE,
+                movement_bypass_latch: 0,
+                handler_state: 0,
+                mission_start_frame: 0,
+                ai_counter: 0,
+                dispatch_timer: MissionDispatchTimer::at_frame(0),
+            });
+            sim.session.binary_frame = 99;
+            let before = credits(&sim, owner);
+            produce_cash_step(&mut sim, id, &rules);
+            assert_eq!(credits(&sim, owner) - before, if pays { 20 } else { 0 });
+            assert_eq!(
+                sim.entities()
+                    .get(id)
+                    .unwrap()
+                    .produce_cash_timer
+                    .start_frame(),
+                99
+            );
+        }
+    }
+
+    #[test]
     fn derrick_stops_paying_while_not_operational() {
         let rules = rules();
         let mut sim = Simulation::with_seed(0x0011_0902);
         let neutral = house(&mut sim, "Neutral", false, 0);
         sim.houses.get_mut(&neutral).unwrap().multiplay_passive = true;
         let americans = house(&mut sim, "Americans", true, 0);
-        let heights: BTreeMap<(u16, u16), u8> = BTreeMap::new();
         let oil = sim
-            .spawn_object("CAOILDP", "Neutral", 10, 10, 0, &rules, &heights)
+            .spawn_object("CAOILDP", "Neutral", 10, 10, 0, &rules)
             .expect("powered derrick spawns");
         sim.change_owner_with_rules(oil, americans, &rules);
         assert_eq!(credits(&sim, americans), 1_000);
@@ -677,9 +622,9 @@ mod tests {
         );
         // The timer still re-armed on every expiry (the re-arm precedes the gate).
         let timer = sim.substrate.entities.get(oil).unwrap().produce_cash_timer;
-        assert_eq!(timer.duration, 100);
+        assert_eq!(timer.duration(), 100);
         assert!(
-            (sim.session.binary_frame as i32).wrapping_sub(timer.start_frame) < 100,
+            (sim.session.binary_frame as i32).wrapping_sub(timer.start_frame()) < 100,
             "timer keeps cycling while offline"
         );
     }
@@ -696,12 +641,11 @@ mod tests {
         let americans = house(&mut sim, "Americans", true, 75);
         base(&mut sim, &rules, "YuriCountry", 40, 40);
         base(&mut sim, &rules, "Americans", 44, 44);
-        let heights: BTreeMap<(u16, u16), u8> = BTreeMap::new();
         let refinery = sim
-            .spawn_object("NAREFN", "Americans", 20, 20, 0, &rules, &heights)
+            .spawn_object("NAREFN", "Americans", 20, 20, 0, &rules)
             .expect("refinery spawns");
         let disk = sim
-            .spawn_object("DISK", "YuriCountry", 21, 21, 0, &rules, &heights)
+            .spawn_object("DISK", "YuriCountry", 21, 21, 0, &rules)
             .expect("disc spawns");
         assert_eq!(building_at_cell(&sim, 21, 21), Some(refinery));
         assert!(install_drain_link(
@@ -755,12 +699,11 @@ mod tests {
         let yuri = house(&mut sim, "YuriCountry", false, 500);
         let americans = house(&mut sim, "Americans", true, 75);
         base(&mut sim, &rules, "YuriCountry", 40, 40);
-        let heights: BTreeMap<(u16, u16), u8> = BTreeMap::new();
         let plant = sim
-            .spawn_object("GAPOWR", "Americans", 20, 20, 0, &rules, &heights)
+            .spawn_object("GAPOWR", "Americans", 20, 20, 0, &rules)
             .expect("power plant spawns");
         let disk = sim
-            .spawn_object("DISK", "YuriCountry", 21, 21, 0, &rules, &heights)
+            .spawn_object("DISK", "YuriCountry", 21, 21, 0, &rules)
             .expect("disc spawns");
         assert!(install_drain_link(&mut sim.substrate.entities, disk, plant));
         run_ticks(&mut sim, &rules, 150);
@@ -791,12 +734,11 @@ mod tests {
         let americans = house(&mut sim, "Americans", true, 5_000);
         base(&mut sim, &rules, "YuriCountry", 40, 40);
         base(&mut sim, &rules, "Americans", 44, 44);
-        let heights: BTreeMap<(u16, u16), u8> = BTreeMap::new();
         let refinery = sim
-            .spawn_object("NAREFN", "Americans", 20, 20, 0, &rules, &heights)
+            .spawn_object("NAREFN", "Americans", 20, 20, 0, &rules)
             .expect("refinery spawns");
         let disk = sim
-            .spawn_object("DISK", "YuriCountry", 21, 21, 0, &rules, &heights)
+            .spawn_object("DISK", "YuriCountry", 21, 21, 0, &rules)
             .expect("disc spawns");
         let grid = crate::sim::pathfinding::PathGrid::new(64, 64);
         let order = cmd(
@@ -808,14 +750,15 @@ mod tests {
                 target_id: refinery,
             },
         );
-        let result = sim.advance_tick(&[order], Some(&rules), &heights, Some(&grid), None, 67);
+        let result = sim.advance_tick(&[order], Some(&rules), Some(&grid), None, 67);
         assert_eq!(result.executed_commands, 1, "the Attack order is admitted");
         let disc = sim.substrate.entities.get(disk).unwrap();
-        // The MEGAMISSION arm queues Attack; the queued mission is the
-        // effective selector until the per-object AI's Ready->Commence
-        // promotes it on a later visit (`mission_host_promote`).
+        // The MEGAMISSION arm queues Attack behind the Guard the disc took at
+        // Unlimbo (`UnitClass::Enter_Idle_Mode 0x00738970`); the per-object
+        // AI's Ready->Commence promotes it on a later visit
+        // (`mission_host_promote`).
         assert_eq!(
-            disc.mission.effective().known(),
+            disc.mission.queued().known(),
             Some(MissionType::Attack),
             "the order queues Attack"
         );
@@ -882,12 +825,11 @@ mod tests {
         let _yuri = house(&mut sim, "YuriCountry", false, 500);
         let _americans = house(&mut sim, "Americans", true, 500);
         base(&mut sim, &rules, "YuriCountry", 40, 40);
-        let heights: BTreeMap<(u16, u16), u8> = BTreeMap::new();
         let plant = sim
-            .spawn_object("GAPOWR", "Americans", 20, 20, 0, &rules, &heights)
+            .spawn_object("GAPOWR", "Americans", 20, 20, 0, &rules)
             .expect("power plant spawns");
         let disk = sim
-            .spawn_object("DISK", "YuriCountry", 30, 30, 0, &rules, &heights)
+            .spawn_object("DISK", "YuriCountry", 30, 30, 0, &rules)
             .expect("disc spawns");
         assert!(!install_drain_link(
             &mut sim.substrate.entities,
@@ -916,58 +858,31 @@ mod tests {
         assert_eq!(sim.substrate.entities.get(plant).unwrap().draining_me, None);
     }
 
-    /// The v135 folds move only the current hash schema; the pre-v135 probe
-    /// reproduces the v133/v134 layout for an armed timer and a drain link.
-    #[test]
-    fn credit_income_state_affects_only_current_v135_hash_schema() {
-        let rules = rules();
-        let mut sim = Simulation::with_seed(0x0011_0905);
-        let _americans = house(&mut sim, "Americans", true, 500);
-        let heights: BTreeMap<(u16, u16), u8> = BTreeMap::new();
-        let oil = sim
-            .spawn_object("CAOILD", "Americans", 10, 10, 0, &rules, &heights)
-            .expect("derrick spawns");
-        let baseline_current = sim.state_hash();
-        let baseline_probe = sim.state_hash_without_credit_income_v135();
-        sim.substrate
-            .entities
-            .get_mut(oil)
-            .unwrap()
-            .produce_cash_timer = ProduceCashTimer::armed(sim.session.binary_frame, 100);
-        assert_ne!(baseline_current, sim.state_hash());
-        assert_eq!(baseline_probe, sim.state_hash_without_credit_income_v135());
-        sim.substrate.entities.get_mut(oil).unwrap().draining_me = Some(oil);
-        assert_eq!(baseline_probe, sim.state_hash_without_credit_income_v135());
-    }
-
     #[test]
     fn produce_cash_timer_fires_once_at_delay_minus_one_then_needs_rearm() {
-        let timer = ProduceCashTimer::armed(100, 100);
+        let timer = CdTimer::started(100, 100);
         for frame in 100..199 {
-            assert!(!timer.fires_now(frame), "frame {frame} must not fire");
+            assert!(
+                !produce_cash_fires(timer, frame),
+                "frame {frame} must not fire"
+            );
         }
-        assert!(timer.fires_now(199));
+        assert!(produce_cash_fires(timer, 199));
         // Past its duration the native timer is dead: `elapsed >= duration`
         // jumps over the block until something re-arms it.
-        assert!(!timer.fires_now(200));
-        assert!(!timer.fires_now(5_000));
+        assert!(!produce_cash_fires(timer, 200));
+        assert!(!produce_cash_fires(timer, 5_000));
     }
 
     #[test]
     fn constructed_timer_never_fires() {
         // Frames only move forward from the construction frame natively.
-        let timer = ProduceCashTimer::constructed(7);
+        let timer = CdTimer::started(7, 0);
         for frame in 7..400 {
-            assert!(!timer.fires_now(frame));
+            assert!(!produce_cash_fires(timer, frame));
         }
         // The `-1` sentinel reads the raw duration; only duration 1 fires.
-        assert!(!ProduceCashTimer::default().fires_now(0));
-        assert!(
-            ProduceCashTimer {
-                start_frame: -1,
-                duration: 1
-            }
-            .fires_now(123)
-        );
+        assert!(!produce_cash_fires(CdTimer::from_raw(-1, 0), 0));
+        assert!(produce_cash_fires(CdTimer::from_raw(-1, 1), 123));
     }
 }

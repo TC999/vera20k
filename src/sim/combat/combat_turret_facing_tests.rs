@@ -9,17 +9,13 @@ use std::collections::BTreeMap;
 
 use crate::rules::ini_parser::IniFile;
 use crate::rules::ruleset::RuleSet;
-use crate::sim::combat::{AttackTarget, TargetKind};
+use crate::sim::combat::AttackTarget;
 use crate::sim::game_entity::GameEntity;
 use crate::sim::intern::InternedId;
 use crate::sim::movement::FacingClass;
 use crate::sim::movement::turret::{body_facing_to_turret, desired_turret_facing};
 use crate::sim::power_system::PowerState;
 use crate::sim::world::Simulation;
-
-fn empty_height_map() -> BTreeMap<(u16, u16), u8> {
-    BTreeMap::new()
-}
 
 /// Minimal rules with MTNK at the given ROT byte. tick_turret_rotation
 /// re-applies this each tick via barrel.set_rot, so it drives the
@@ -30,7 +26,7 @@ fn rules_with_mtnk_rot(rot: u32) -> RuleSet {
 [InfantryTypes]\n0=ENGI\n\n\
 [BuildingTypes]\n0=GAPILE\n\n\
 [AircraftTypes]\n\n\
-[MTNK]\nStrength=300\nArmor=heavy\nSpeed=6\nPrimary=105mm\nROT={rot}\n\n\
+[MTNK]\nStrength=300\nArmor=heavy\nSpeed=6\nPrimary=105mm\nROT={rot}\nTurret=yes\n\n\
 [ENGI]\nStrength=75\nArmor=none\nSpeed=4\n\n\
 [GAPILE]\nStrength=300\nArmor=heavy\n\n\
 [105mm]\nDamage=65\nROF=50\nRange=6\nWarhead=AP\n\n\
@@ -86,7 +82,7 @@ fn one_tick_acquisition_latency_first_tick_no_fire() {
     }
 
     let initial_target_health = sim.substrate.entities.get(2).unwrap().health.current;
-    sim.advance_tick(&[], Some(&rules), &empty_height_map(), None, None, 67);
+    sim.advance_tick(&[], Some(&rules), None, None, 67);
 
     // Target should still be alive — combat ran before turret rotation, so
     // turret was at facing 0 (body), not aligned with target.
@@ -134,8 +130,8 @@ fn slow_rot_takes_more_frames_to_align_than_fast_rot() {
 
     // Each 67ms tick advances binary_frame by ~1.
     for _ in 0..13 {
-        sim_slow.advance_tick(&[], Some(&rules_slow), &empty_height_map(), None, None, 67);
-        sim_fast.advance_tick(&[], Some(&rules_fast), &empty_height_map(), None, None, 67);
+        sim_slow.advance_tick(&[], Some(&rules_slow), None, None, 67);
+        sim_fast.advance_tick(&[], Some(&rules_fast), None, None, 67);
     }
 
     let slow_rotating = sim_slow
@@ -172,7 +168,7 @@ fn idle_turret_returns_to_body_facing() {
     // No attack_target, body facing east (64) — turret should rotate to match.
     let mut sim = Simulation::new();
     let mut entity = GameEntity::test_default(1, "MTNK", "Americans", 5, 5);
-    entity.facing = 64; // body east
+    entity.body_facing.snap(0x4000, 0); // body east
     entity.barrel_facing = Some(FacingClass::new(body_facing_to_turret(0), 100));
     // ROT=100 → rot_per_frame=25600. Diff from 0 (north turret) to body_facing_to_turret(64) =
     // 64*256 = 16384. Duration = 16384/25600 = 0 → snaps in 1 frame.
@@ -181,8 +177,8 @@ fn idle_turret_returns_to_body_facing() {
     let rules = rules_with_mtnk_rot(100);
 
     // Run 2 ticks to ensure turret_rotation has had a chance to act.
-    sim.advance_tick(&[], Some(&rules), &empty_height_map(), None, None, 67);
-    sim.advance_tick(&[], Some(&rules), &empty_height_map(), None, None, 67);
+    sim.advance_tick(&[], Some(&rules), None, None, 67);
+    sim.advance_tick(&[], Some(&rules), None, None, 67);
 
     let barrel = sim
         .substrate
@@ -317,7 +313,7 @@ fn unit_authoritative_fire_kills_target_via_advance_tick() {
     let mut fired = false;
     let mut target_gone = false;
     for _ in 0..400 {
-        sim.advance_tick(&[], Some(&rules), &empty_height_map(), None, None, 67);
+        sim.advance_tick(&[], Some(&rules), None, None, 67);
         match sim.substrate.entities.get(2) {
             Some(t) => {
                 if t.health.current < start_hp {
@@ -358,7 +354,6 @@ fn run_combat_direct(
         None,
         &BTreeMap::<InternedId, PowerState>::new(),
         None,
-        &mut sim.production.resource_nodes,
         None,
         None,
         None,
@@ -387,7 +382,12 @@ fn s3_unit_facing_emitted_for_attacker_and_idle() {
     spawn_turreted(&mut sim, 1, 5, 5, 5);
     spawn_target(&mut sim, 2, 5, 8); // hostile, 3 cells south, in range
     spawn_turreted(&mut sim, 3, 10, 10, 5); // idle — residual pass
-    sim.substrate.entities.get_mut(3).unwrap().facing = 64; // body east
+    sim.substrate
+        .entities
+        .get_mut(3)
+        .unwrap()
+        .body_facing
+        .snap(0x4000, 0); // body east
     use_test_interner(&mut sim);
     let rules = rules_with_mtnk_rot(5);
     sim.substrate.entities.get_mut(1).unwrap().attack_target = Some(AttackTarget::new(2));
@@ -420,8 +420,8 @@ fn s3_unit_facing_emitted_for_attacker_and_idle() {
 #[test]
 fn removed_attacker_returns_to_body_same_tick() {
     // A unit whose own resolution cleared its attack (dead target, nothing to
-    // acquire) returns to body facing the same tick — matching both today's
-    // output and gamemd's upstream same-pass target-validation clear.
+    // acquire) and that has not fired within the idle dwell returns to body
+    // facing the same tick.
     let mut sim = Simulation::new();
     spawn_turreted(&mut sim, 1, 5, 5, 5);
     spawn_target(&mut sim, 2, 5, 8);
@@ -448,46 +448,32 @@ fn removed_attacker_returns_to_body_same_tick() {
     );
 }
 
+/// `UnitClass::Facing_Update @ 0x00736990`'s idle return waits
+/// `GuardAreaTargetingDelay + 5` frames since the last shot (`0x00736B4B`): a
+/// unit that dropped its target right after firing holds its turret instead
+/// of swinging back the same tick, and swings once the dwell has passed.
 #[test]
-fn retargeted_attacker_aims_new_target_same_tick() {
-    // A unit whose own resolution retargeted aims at the NEW target the same
-    // tick — the gamemd analog is upstream same-pass acquisition, which the
-    // unit's Facing_Update sees in the same AI pass.
-    let mut sim = Simulation::new();
-    spawn_turreted(&mut sim, 1, 5, 5, 5);
-    spawn_target(&mut sim, 2, 5, 8);
-    sim.substrate.entities.get_mut(2).unwrap().health.current = 0; // dead → re-acquire
-    // Hostile alternative in range (2 cells east).
-    let mut alt = GameEntity::test_default(4, "MTNK", "Soviet", 7, 5);
-    alt.barrel_facing = Some(FacingClass::new(body_facing_to_turret(0), 5));
-    alt.lifecycle.in_limbo = false;
-    sim.substrate.entities.insert(alt);
-    sim.add_entity_occupancy(4);
-    use_test_interner(&mut sim);
-    let rules = rules_with_mtnk_rot(5);
-    sim.substrate.entities.get_mut(1).unwrap().attack_target = Some(AttackTarget::new(2));
+fn removed_attacker_holds_its_turret_through_the_dwell() {
+    for (since_last_shot, expected) in [(40, None), (41, Some(body_facing_to_turret(0)))] {
+        let mut sim = Simulation::new();
+        spawn_turreted(&mut sim, 1, 5, 5, 5);
+        spawn_target(&mut sim, 2, 5, 8);
+        sim.substrate.entities.get_mut(2).unwrap().health.current = 0;
+        use_test_interner(&mut sim);
+        let rules = rules_with_mtnk_rot(5);
+        sim.session.binary_frame = 100;
+        let unit = sim.substrate.entities.get_mut(1).unwrap();
+        unit.attack_target = Some(AttackTarget::new(2));
+        unit.last_fire_frame = 100 - since_last_shot;
 
-    let want = {
-        let e = sim.substrate.entities.get(1).unwrap();
-        let t = sim.substrate.entities.get(4).unwrap();
-        crate::sim::movement::turret::facing_toward_lepton(
-            e.position.rx,
-            e.position.ry,
-            e.position.sub_x,
-            e.position.sub_y,
-            t.position.rx,
-            t.position.ry,
-            t.position.sub_x,
-            t.position.sub_y,
-        )
-    };
-    let result = run_combat_direct(&mut sim, &rules);
+        let result = run_combat_direct(&mut sim, &rules);
 
-    assert_eq!(
-        unit_facing_of(&result, 1),
-        Some(want),
-        "own-retarget → aim the new target same tick"
-    );
+        assert_eq!(
+            unit_facing_of(&result, 1),
+            expected,
+            "{since_last_shot} frames"
+        );
+    }
 }
 
 #[test]
@@ -495,8 +481,10 @@ fn kill_tick_unit_facing_holds_target() {
     // THE S3 fidelity pin: a unit whose target dies from this tick's fire
     // keeps aiming at it this tick (gamemd: the munition is deferred and the
     // bullet's AI runs after the firing unit's pass, so Facing_Update reads a
-    // live TarCom on the kill tick). Lethal damage must not run the later
-    // Object UnInit pointer-expiry listener stage early.
+    // live TarCom on the kill tick). This receiver fixture disables the death
+    // callbacks, so it pins only the barrel; in production the killing hit's
+    // Destroy (0x005F57AF) expires the target, see
+    // `co_attacker_facing_matches_killer`.
     let mut sim = Simulation::new();
     spawn_turreted(&mut sim, 1, 5, 5, 100);
     spawn_target(&mut sim, 2, 5, 8);
@@ -538,16 +526,6 @@ fn kill_tick_unit_facing_holds_target() {
         Some(toward_target),
         "kill tick: barrel destination holds the dying target's facing"
     );
-    assert!(
-        sim.substrate
-            .entities
-            .get(1)
-            .unwrap()
-            .attack_target
-            .as_ref()
-            .is_some_and(|target| matches!(target.target, TargetKind::Entity(2))),
-        "lethal damage must retain the target until the UnInit listener stage"
-    );
 }
 
 #[test]
@@ -580,7 +558,7 @@ fn kill_tick_barrel_holds_target_facing() {
         Some(FacingClass::new(toward_target, 100));
     sim.substrate.entities.get_mut(2).unwrap().health.current = 10; // Damage=65
 
-    sim.advance_tick(&[], Some(&rules), &empty_height_map(), None, None, 67);
+    sim.advance_tick(&[], Some(&rules), None, None, 67);
 
     let attacker = sim.substrate.entities.get(1).unwrap();
     assert!(
@@ -602,7 +580,7 @@ fn kill_tick_barrel_holds_target_facing() {
     // (`0x00736B35`..`0x00736B7C`), and `+0x120` was just stamped with this
     // frame by `TechnoClass::Fire_At @ 0x006FF743` — so the dwell is measured
     // from the unit's OWN LAST SHOT, not from target loss, and the barrel holds.
-    sim.advance_tick(&[], Some(&rules), &empty_height_map(), None, None, 67);
+    sim.advance_tick(&[], Some(&rules), None, None, 67);
     let attacker = sim.substrate.entities.get(1).unwrap();
     assert_eq!(
         attacker.barrel_facing.as_ref().unwrap().destination(),
@@ -613,12 +591,12 @@ fn kill_tick_barrel_holds_target_facing() {
     // 36 (`[General] GuardAreaTargetingDelay=`, the RuleSet default) + 5 frames
     // after that shot, the turret returns to the hull heading.
     for _ in 0..45 {
-        sim.advance_tick(&[], Some(&rules), &empty_height_map(), None, None, 67);
+        sim.advance_tick(&[], Some(&rules), None, None, 67);
     }
     let attacker = sim.substrate.entities.get(1).unwrap();
     assert_eq!(
         attacker.barrel_facing.as_ref().unwrap().destination(),
-        body_facing_to_turret(attacker.facing),
+        attacker.body_facing.destination(),
         "past the dwell: idle-return to the hull heading"
     );
 }
@@ -636,14 +614,19 @@ fn facing_apply_point_equivalence_no_kill() {
     spawn_turreted(&mut sim, 1, 5, 5, 1); // ROT=1 — rotation spans many ticks
     spawn_target(&mut sim, 2, 5, 9); // far enough that no kill happens quickly
     spawn_turreted(&mut sim, 3, 12, 12, 1); // idle co-unit (residual path)
-    sim.substrate.entities.get_mut(3).unwrap().facing = 96;
+    sim.substrate
+        .entities
+        .get_mut(3)
+        .unwrap()
+        .body_facing
+        .snap(0x6000, 0);
     use_test_interner(&mut sim);
     let rules = rules_with_mtnk_rot(1);
     sim.substrate.entities.get_mut(1).unwrap().attack_target = Some(AttackTarget::new(2));
 
     let mut previous_destination: BTreeMap<u64, u16> = BTreeMap::new();
     for tick in 0..12 {
-        sim.advance_tick(&[], Some(&rules), &empty_height_map(), None, None, 67);
+        sim.advance_tick(&[], Some(&rules), None, None, 67);
         // No deaths/retargets in this scenario — assert preconditions hold.
         assert!(
             sim.substrate.entities.get(2).is_some_and(|t| !t.dying),
@@ -688,8 +671,8 @@ fn co_attacker_facing_matches_killer() {
     // Two attackers on one target; the killer's shot lands this tick. The
     // co-attacker's barrel destination this tick must ALSO hold the dying
     // target's facing because its facing read happens before lethal damage.
-    // The later same-frame UnInit pointer-expiry stage clears its target
-    // reference without rewriting that already-computed barrel destination.
+    // The killing hit's Destroy (0x005F57AF) then clears its target reference
+    // without rewriting that already-computed barrel destination.
     let mut sim = Simulation::new();
     spawn_turreted(&mut sim, 1, 5, 5, 100); // killer
     spawn_turreted(&mut sim, 3, 8, 8, 100); // co-attacker (out of its own ROF this tick)
@@ -725,7 +708,7 @@ fn co_attacker_facing_matches_killer() {
         Some(FacingClass::new(killer_aim, 100));
     sim.substrate.entities.get_mut(2).unwrap().health.current = 10;
 
-    sim.advance_tick(&[], Some(&rules), &empty_height_map(), None, None, 67);
+    sim.advance_tick(&[], Some(&rules), None, None, 67);
 
     assert!(
         sim.substrate
@@ -738,7 +721,7 @@ fn co_attacker_facing_matches_killer() {
     let co = sim.substrate.entities.get(3).unwrap();
     assert!(
         co.attack_target.is_none(),
-        "same-frame UnInit clears the co-attacker's expired target"
+        "the killing hit's Destroy clears the co-attacker's expired target"
     );
     assert_eq!(
         co.barrel_facing.as_ref().unwrap().destination(),
@@ -776,7 +759,7 @@ fn save_load_round_trip_on_kill_tick() {
         Some(FacingClass::new(toward_target, 100));
     sim.substrate.entities.get_mut(2).unwrap().health.current = 10;
 
-    sim.advance_tick(&[], Some(&rules), &empty_height_map(), None, None, 67); // kill tick
+    sim.advance_tick(&[], Some(&rules), None, None, 67); // kill tick
 
     // Native in-scenario load restarts Scenario RNG from Seed0; isolate the
     // kill-tick/turret persistence hash on that same post-load cursor.
@@ -793,47 +776,59 @@ fn save_load_round_trip_on_kill_tick() {
 }
 
 #[test]
-fn non_unit_barrel_still_driven_by_global_sweep() {
-    // Non-Unit categories keep the legacy post-batch sweep until their slices
-    // land (S7/S8): a turreted Structure's barrel is still driven toward its
-    // target by tick_turret_rotation after the flip.
+fn a_building_barrel_turns_through_mission_attack_not_the_sweep() {
+    // A building's turret (`+0x388`) turns only through Mission_Attack's
+    // Set_Desired (`0x0044B16F`, `0x0044B1A8`, `0x0044B1FF`;
+    // `techno_ai::building_missions`): the per-frame turret sweep leaves it
+    // alone, so a building holding a target off Attack keeps its aim, and
+    // one on Attack turns toward its target on its dispatch.
     let mut sim = Simulation::new();
-    // Armed type (the fixture GAPILE has no Primary, which would remove the
-    // attack pre-sweep); the CATEGORY is what routes facing ownership.
+    // Armed type; the CATEGORY is what routes facing ownership.
     let mut tower = GameEntity::test_default(1, "MTNK", "Americans", 5, 5);
     tower.category = crate::map::entities::EntityCategory::Structure;
-    tower.lifecycle.in_limbo = false;
-    tower.barrel_facing = Some(FacingClass::new(body_facing_to_turret(0), 100));
+    tower.mission_leaf = crate::sim::mission::MissionLeafState::for_entity_category(
+        crate::map::entities::EntityCategory::Structure,
+    );
+    tower.body_facing = FacingClass::new(0, 100);
     tower.attack_target = Some(AttackTarget::new(2));
     sim.substrate.entities.insert(tower);
+    assert!(matches!(
+        sim.reveal(1),
+        crate::sim::world::RevealOutcome::Revealed { .. }
+    ));
     spawn_target(&mut sim, 2, 5, 9);
     use_test_interner(&mut sim);
     let rules = rules_with_mtnk_rot(100);
-
-    let want = {
-        let e = sim.substrate.entities.get(1).unwrap();
-        desired_turret_facing(
-            e,
-            &sim.substrate.entities,
-            Some(&rules),
-            &sim.interner,
-            sim.session.binary_frame,
-        )
-        .expect("turreted structure")
-    };
-    sim.advance_tick(&[], Some(&rules), &empty_height_map(), None, None, 67);
-    assert_eq!(
+    let aim = |sim: &Simulation| {
         sim.substrate
             .entities
             .get(1)
             .unwrap()
-            .barrel_facing
-            .as_ref()
-            .unwrap()
-            .destination(),
-        want,
-        "Structure barrel still driven by the legacy tick_turret_rotation sweep"
-    );
+            .body_facing
+            .destination()
+    };
+
+    sim.advance_tick(&[], Some(&rules), None, None, 67);
+    assert_eq!(aim(&sim), body_facing_to_turret(0), "no mission, no turn");
+
+    let now = sim.session.binary_frame;
+    sim.mission_assign_exact(
+        1,
+        crate::sim::mission::MissionId::from_known(crate::sim::mission::MissionType::Attack),
+        now,
+    )
+    .unwrap();
+    let want = {
+        let e = sim.substrate.entities.get(1).unwrap();
+        crate::sim::movement::turret::facing_toward_target(
+            e,
+            &crate::sim::combat::TargetKind::Entity(2),
+            &sim.substrate.entities,
+        )
+        .expect("a live target")
+    };
+    sim.advance_tick(&[], Some(&rules), None, None, 67);
+    assert_eq!(aim(&sim), want, "Mission_Attack's FACING arm aims it");
 }
 
 #[test]
@@ -844,7 +839,7 @@ fn unit_facing_pass_idles_turret_to_body_without_target() {
     // exists to prevent.
     let mut sim = Simulation::new();
     let mut entity = GameEntity::test_default(1, "MTNK", "Americans", 5, 5);
-    entity.facing = 64; // body east
+    entity.body_facing.snap(0x4000, 0); // body east
     entity.barrel_facing = Some(FacingClass::new(body_facing_to_turret(0), 100));
     sim.substrate.entities.insert(entity);
     use_test_interner(&mut sim);
@@ -879,9 +874,11 @@ fn unit_facing_pass_idles_turret_to_body_without_target() {
 
 /// Spawn a `Turret=no` attacker at (rx, ry) facing north. `rules_with_mtnk_rot`
 /// authors no `Turret=` for `[MTNK]`, so leaving `barrel_facing` unset is what
-/// makes this the turretless case the body gate covers.
-fn spawn_turretless(sim: &mut Simulation, stable_id: u64, rx: u16, ry: u16) {
-    let entity = GameEntity::test_default(stable_id, "MTNK", "Americans", rx, ry);
+/// makes this the turretless case the body gate covers. `rot` is the hull
+/// rate UnitClass's constructor writes from `ROT=` (`0x00735579`).
+fn spawn_turretless(sim: &mut Simulation, stable_id: u64, rx: u16, ry: u16, rot: i32) {
+    let mut entity = GameEntity::test_default(stable_id, "MTNK", "Americans", rx, ry);
+    entity.set_body_facing_rot(rot);
     sim.substrate.entities.insert(entity);
     assert!(matches!(
         sim.reveal(stable_id),
@@ -901,7 +898,7 @@ fn gsi_08_04_turretless_vehicle_turns_its_hull_before_it_fires() {
     // turns the hull at `ROT=` with `FacingClass::Set(+0x388)` at `0x00737004`,
     // but only while the unit is stationary with no destination.
     let mut sim = Simulation::new();
-    spawn_turretless(&mut sim, 1, 5, 5); // facing north (0)
+    spawn_turretless(&mut sim, 1, 5, 5, 5); // facing north (0)
     spawn_target(&mut sim, 2, 5, 9); // due south, inside Range=6
     use_test_interner(&mut sim);
     let rules = rules_with_mtnk_rot(5);
@@ -909,14 +906,19 @@ fn gsi_08_04_turretless_vehicle_turns_its_hull_before_it_fires() {
 
     // A target assignment writes the pointer and nothing else - no snap.
     assert_eq!(
-        sim.substrate.entities.get(1).unwrap().facing,
+        sim.substrate
+            .entities
+            .get(1)
+            .unwrap()
+            .body_facing
+            .destination(),
         0,
         "assigning a target must not rotate the hull by itself"
     );
 
     let start_hp = sim.substrate.entities.get(2).unwrap().health.current;
     for tick in 0..8 {
-        sim.advance_tick(&[], Some(&rules), &empty_height_map(), None, None, 67);
+        sim.advance_tick(&[], Some(&rules), None, None, 67);
         assert_eq!(
             sim.substrate.entities.get(2).unwrap().health.current,
             start_hp,
@@ -924,7 +926,11 @@ fn gsi_08_04_turretless_vehicle_turns_its_hull_before_it_fires() {
         );
     }
     assert_ne!(
-        sim.substrate.entities.get(1).unwrap().facing,
+        sim.substrate
+            .entities
+            .get(1)
+            .unwrap()
+            .body_facing_current(sim.session.binary_frame),
         0,
         "the hull must be turning toward the target meanwhile"
     );
@@ -933,7 +939,7 @@ fn gsi_08_04_turretless_vehicle_turns_its_hull_before_it_fires() {
     // unit that has no turret to aim with.
     let mut fired = false;
     for _ in 0..80 {
-        sim.advance_tick(&[], Some(&rules), &empty_height_map(), None, None, 67);
+        sim.advance_tick(&[], Some(&rules), None, None, 67);
         if sim
             .substrate
             .entities
@@ -956,7 +962,7 @@ fn gsi_08_04_moving_turretless_vehicle_does_not_turn_to_fire() {
     // locomotor reports not-moving (`0x00736FB6`..`0x00736FE6`). A unit under a
     // move order keeps its travel heading; nothing re-aims it for the shot.
     let mut sim = Simulation::new();
-    spawn_turretless(&mut sim, 1, 5, 5);
+    spawn_turretless(&mut sim, 1, 5, 5, 5);
     spawn_target(&mut sim, 2, 5, 9);
     use_test_interner(&mut sim);
     let rules = rules_with_mtnk_rot(5);
@@ -967,7 +973,7 @@ fn gsi_08_04_moving_turretless_vehicle_does_not_turn_to_fire() {
         attacker.movement_target = Some(crate::sim::components::MovementTarget::default());
     }
 
-    let facing_before = sim.substrate.entities.get(1).unwrap().facing;
+    let facing_before = sim.substrate.entities.get(1).unwrap().body_facing;
     let result = run_combat_direct(&mut sim, &rules);
     let slot = result
         .unit_facing
@@ -979,7 +985,7 @@ fn gsi_08_04_moving_turretless_vehicle_does_not_turn_to_fire() {
         "a moving turretless firer emits no hull turn"
     );
     assert_eq!(
-        sim.substrate.entities.get(1).unwrap().facing,
+        sim.substrate.entities.get(1).unwrap().body_facing,
         facing_before,
         "and its heading is untouched by the fire decision"
     );
@@ -993,7 +999,12 @@ fn gsi_08_14_idle_turret_dwell_is_measured_from_the_units_own_last_shot() {
     // it is already past the dwell and returns on the first idle frame.
     let mut sim = Simulation::new();
     spawn_turreted(&mut sim, 1, 5, 5, 100);
-    sim.substrate.entities.get_mut(1).unwrap().facing = 64;
+    sim.substrate
+        .entities
+        .get_mut(1)
+        .unwrap()
+        .body_facing
+        .snap(0x4000, 0);
     use_test_interner(&mut sim);
     let rules = rules_with_mtnk_rot(100);
 
@@ -1030,7 +1041,12 @@ fn gsi_08_14_idle_turret_leads_toward_the_move_destination() {
     // leads toward where the unit is going, not back to the hull.
     let mut sim = Simulation::new();
     spawn_turreted(&mut sim, 1, 5, 5, 100);
-    sim.substrate.entities.get_mut(1).unwrap().facing = 0; // hull north
+    sim.substrate
+        .entities
+        .get_mut(1)
+        .unwrap()
+        .body_facing
+        .snap(0x0000, 0); // hull north
     use_test_interner(&mut sim);
     let rules = rules_with_mtnk_rot(100);
     {
@@ -1086,8 +1102,8 @@ fn gsi_08_14_rotation_latch_suppresses_the_aim_while_the_arc_runs() {
     // and the latch both land at the post-batch apply, the latch armed by that
     // same `Set` (`0x00736B16` follows `0x00736A89`). A second tick leaves the
     // arc running, which is the state under test.
-    sim.advance_tick(&[], Some(&rules), &empty_height_map(), None, None, 67);
-    sim.advance_tick(&[], Some(&rules), &empty_height_map(), None, None, 67);
+    sim.advance_tick(&[], Some(&rules), None, None, 67);
+    sim.advance_tick(&[], Some(&rules), None, None, 67);
     let attacker = sim.substrate.entities.get(1).unwrap();
     assert!(
         attacker.turret_rotation_latch,
@@ -1225,39 +1241,49 @@ fn gsi_08_14_building_turret_holds_its_last_aim() {
     let mut sim = Simulation::new();
     let mut tower = GameEntity::test_default(1, "MTNK", "Americans", 5, 5);
     tower.category = crate::map::entities::EntityCategory::Structure;
-    tower.lifecycle.in_limbo = false;
-    tower.barrel_facing = Some(FacingClass::new(body_facing_to_turret(0), 100));
+    tower.mission_leaf = crate::sim::mission::MissionLeafState::for_entity_category(
+        crate::map::entities::EntityCategory::Structure,
+    );
+    tower.body_facing = FacingClass::new(0, 100);
     tower.attack_target = Some(AttackTarget::new(2));
     sim.substrate.entities.insert(tower);
+    assert!(matches!(
+        sim.reveal(1),
+        crate::sim::world::RevealOutcome::Revealed { .. }
+    ));
     spawn_target(&mut sim, 2, 5, 9); // due south
     use_test_interner(&mut sim);
     let rules = rules_with_mtnk_rot(100);
+    // On Attack, whose FACING arm aims the turret (`0x0044B187`).
+    let now = sim.session.binary_frame;
+    sim.mission_assign_exact(
+        1,
+        crate::sim::mission::MissionId::from_known(crate::sim::mission::MissionType::Attack),
+        now,
+    )
+    .unwrap();
 
-    sim.advance_tick(&[], Some(&rules), &empty_height_map(), None, None, 67);
+    sim.advance_tick(&[], Some(&rules), None, None, 67);
     let aimed = sim
         .substrate
         .entities
         .get(1)
         .unwrap()
-        .barrel_facing
-        .as_ref()
-        .unwrap()
+        .body_facing
         .destination();
-    assert_ne!(aimed, body_facing_to_turret(0), "it aimed at the target");
+    assert_ne!(aimed, 0, "it aimed at the target");
 
     // Drop the target and let a long time pass - the aim must not move.
     sim.substrate.entities.get_mut(1).unwrap().attack_target = None;
     for _ in 0..60 {
-        sim.advance_tick(&[], Some(&rules), &empty_height_map(), None, None, 67);
+        sim.advance_tick(&[], Some(&rules), None, None, 67);
     }
     assert_eq!(
         sim.substrate
             .entities
             .get(1)
             .unwrap()
-            .barrel_facing
-            .as_ref()
-            .unwrap()
+            .body_facing
             .destination(),
         aimed,
         "a target-less building turret keeps its last aim forever"
@@ -1271,7 +1297,7 @@ fn gsi_08_04_voxel_turret_building_needs_an_exact_match_then_snaps_within_one_ro
     // is set, and `BuildingClass::Mission_Attack @ 0x0044B068`..`0x0044B0B3`
     // gives it a second chance in the SAME visit: within one `ROT=` step it
     // snaps `+0x388` with `UpdateFacing` and re-runs the error check.
-    fn tower_rules(voxel: bool, rot: u32) -> RuleSet {
+    fn tower_rules(voxel: bool, rot: i32) -> RuleSet {
         let ini_str: String = format!(
             "[VehicleTypes]\n\n\
 [InfantryTypes]\n\n\
@@ -1286,16 +1312,13 @@ TurretAnimIsVoxel={}\n\n\
         );
         RuleSet::from_ini(&IniFile::from_str(&ini_str)).expect("tower fixture should parse")
     }
-    fn fires_at_offset(voxel: bool, rot: u32, offset: u16) -> bool {
+    fn fires_at_offset(voxel: bool, rot: i32, offset: u16) -> bool {
         let rules = tower_rules(voxel, rot);
         let mut sim = Simulation::new();
         let mut tower = GameEntity::test_default(1, "GTGCAN", "Americans", 5, 5);
         tower.category = crate::map::entities::EntityCategory::Structure;
         tower.lifecycle.in_limbo = false;
-        tower.barrel_facing = Some(FacingClass::new(
-            facing_from_5_5_to_5_9().wrapping_add(offset),
-            rot.clamp(0, 0x7F) as u8,
-        ));
+        tower.body_facing = FacingClass::new(facing_from_5_5_to_5_9().wrapping_add(offset), rot);
         tower.attack_target = Some(AttackTarget::new(2));
         sim.substrate.entities.insert(tower);
         let target = GameEntity::test_default(2, "TGT", "Soviet", 5, 9); // due south -> 0x8000
@@ -1328,6 +1351,19 @@ TurretAnimIsVoxel={}\n\n\
         !fires_at_offset(false, 1, 0x0801),
         "and is refused past it, with no snap-and-retry"
     );
+    let native: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tools/spatial_oracle/building_fire_turn.json"
+    ))
+    .unwrap();
+    for row in native.as_array().unwrap() {
+        let rot = row["rot"].as_i64().unwrap() as i32;
+        let delta = row["delta"].as_u64().unwrap() as u16;
+        assert_eq!(
+            fires_at_offset(true, rot, delta),
+            row["retry"].as_bool().unwrap(),
+            "{row}"
+        );
+    }
 }
 
 #[test]
@@ -1454,7 +1490,7 @@ fn gsi_08_04_no_shot_lands_while_the_turret_is_still_swinging() {
             .barrel_facing
             .as_ref()
             .is_some_and(|barrel| barrel.is_rotating(frame));
-        sim.advance_tick(&[], Some(&rules), &empty_height_map(), None, None, 67);
+        sim.advance_tick(&[], Some(&rules), None, None, 67);
         let hp = sim
             .substrate
             .entities
@@ -1526,7 +1562,7 @@ fn gsi_08_04_a_two_step_re_aim_is_refused_for_the_whole_arc_not_only_its_first_f
         if off_axis <= 0x0800 && aimed_on_tick.is_none() {
             aimed_on_tick = Some(tick);
         }
-        sim.advance_tick(&[], Some(&rules), &empty_height_map(), None, None, 67);
+        sim.advance_tick(&[], Some(&rules), None, None, 67);
         let hp = sim
             .substrate
             .entities
@@ -1551,4 +1587,168 @@ fn gsi_08_04_a_two_step_re_aim_is_refused_for_the_whole_arc_not_only_its_first_f
         "gamemd holds fire for the whole two-frame arc; firing on tick 1 means the \
          latch was committed before arm A's Set instead of after it"
     );
+}
+
+/// `UnitClass::Facing_Update @ 0x00736990` executed frame after frame
+/// (`tools/spatial_oracle/turret_cadence.py`, every callee native): the aim
+/// `Set` and its latch, re-aims at a moving target only once an arc ends, the
+/// idle return exactly `GuardAreaTargetingDelay + 5` frames after the last
+/// shot, hull turns, and FacingClass interpolation — turret current and
+/// desired facing and the `+0x6AF` latch, frame for frame, through VERA's
+/// `facing_update` and `apply_unit_facing`. Rows exercising arms VERA does not
+/// model on this path (OmniFire, TurretLocked, TurretSpins, a simple deployer,
+/// a Battle Bunker, Magnetron, a NavCom, no weapon) are left out, as are
+/// targets off the map (negative world coordinates), which VERA's cell
+/// positions cannot hold.
+#[test]
+fn turret_cadence_matches_the_original() {
+    use crate::sim::movement::turret::facing_update;
+    use crate::util::fixed_math::SimFixed;
+
+    let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+        "../../../tools/spatial_oracle/turret_cadence.json"
+    ))
+    .unwrap();
+    let off_map = |input: &serde_json::Value| {
+        std::iter::once(&input["target_coord"])
+            .chain(
+                input["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|event| &event["value"]),
+            )
+            .filter_map(|value| value.as_array())
+            .any(|coord| coord.iter().take(2).any(|axis| axis.as_i64().unwrap() < 0))
+    };
+    let mut compared = 0;
+    let mut issues = Vec::new();
+    for row in &rows {
+        let input = &row["input"];
+        let int = |key: &str| input[key].as_i64().unwrap_or(0);
+        let weapon = &input["weapon"];
+        let navcom_events = input["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["kind"].as_str().unwrap().contains("navcom"));
+        if weapon["present"] != 1
+            || weapon["omni_fire"] != 0
+            || weapon["turret_locked"] != 0
+            || int("turret_spins") != 0
+            || int("simple_deployer") != 0
+            || int("deployed") != 0
+            || int("bunkered") != 0
+            || int("magnetron") != 0
+            || !input["navcom_coord"].is_null()
+            || navcom_events
+            || int("hull_rot") != int("turret_rot")
+            || off_map(input)
+        {
+            continue;
+        }
+        let rot = int("turret_rot") as i32;
+        let rules = RuleSet::from_ini(&IniFile::from_str(&format!(
+            "[General]\nGuardAreaTargetingDelay={}\n\
+             [VehicleTypes]\n0=MTNK\n[InfantryTypes]\n[BuildingTypes]\n0=GAPILE\n[AircraftTypes]\n\
+             [MTNK]\nStrength=300\nArmor=heavy\nSpeed=6\nPrimary=105mm\nROT={rot}\nTurret=yes\n\
+             [GAPILE]\nStrength=300\nArmor=heavy\n\
+             [105mm]\nDamage=65\nROF=50\nRange=6\nWarhead=AP\n\
+             [AP]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,0%,0%\n",
+            int("delay")
+        )))
+        .unwrap();
+        let coord = |value: &serde_json::Value| {
+            let at = |i: usize| value[i].as_i64().unwrap() as i32;
+            (at(0), at(1))
+        };
+        let place = |entity: &mut GameEntity, (x, y): (i32, i32)| {
+            entity.position.rx = (x / 256) as u16;
+            entity.position.ry = (y / 256) as u16;
+            entity.position.sub_x = SimFixed::from_num(x % 256);
+            entity.position.sub_y = SimFixed::from_num(y % 256);
+        };
+        let mut sim = Simulation::new();
+        let mut unit = GameEntity::test_default(1, "MTNK", "Americans", 0, 0);
+        place(&mut unit, coord(&input["unit_coord"]));
+        let hull_init = int("hull_init") as u16;
+        unit.body_facing = FacingClass::new(hull_init, rot);
+        unit.barrel_facing = Some(FacingClass::new(int("turret_init") as u16, rot));
+        unit.last_fire_frame = int("last_fire");
+        unit.turret_rotation_latch = int("latch_init") != 0;
+        let mut target = GameEntity::test_default(2, "GAPILE", "Soviet", 0, 0);
+        if !input["target_coord"].is_null() {
+            place(&mut target, coord(&input["target_coord"]));
+            unit.attack_target = Some(AttackTarget::new(2));
+        }
+        sim.substrate.entities.insert(unit);
+        sim.substrate.entities.insert(target);
+        use_test_interner(&mut sim);
+        let start = int("start") as u32;
+        let events = input["events"].as_array().unwrap();
+        for (index, native) in row["frames"].as_array().unwrap().iter().enumerate() {
+            let frame = start + index as u32;
+            for event in events.iter().filter(|event| event["at"] == index) {
+                let value = &event["value"];
+                match event["kind"].as_str().unwrap() {
+                    "target_coord" => {
+                        place(sim.substrate.entities.get_mut(2).unwrap(), coord(value));
+                        sim.substrate.entities.get_mut(1).unwrap().attack_target =
+                            Some(AttackTarget::new(2));
+                    }
+                    "clear_target" => {
+                        sim.substrate.entities.get_mut(1).unwrap().attack_target = None;
+                    }
+                    "last_fire" => {
+                        sim.substrate.entities.get_mut(1).unwrap().last_fire_frame =
+                            value.as_i64().unwrap();
+                    }
+                    "hull_set" => {
+                        let unit = sim.substrate.entities.get_mut(1).unwrap();
+                        unit.body_facing.set(value.as_u64().unwrap() as u16, frame);
+                    }
+                    other => panic!("unmodelled event {other}"),
+                }
+            }
+            let update = facing_update(
+                sim.substrate.entities.get(1).unwrap(),
+                &sim.substrate.entities,
+                Some(&rules),
+                &sim.interner,
+                frame,
+            );
+            crate::sim::world::unit_post::apply_unit_facing(
+                &mut sim.substrate.entities,
+                &[crate::sim::combat::UnitFacingUpdate::from_facing_update(
+                    1, update,
+                )],
+                &rules,
+                &sim.interner,
+                frame,
+            );
+            let unit = sim.substrate.entities.get(1).unwrap();
+            let barrel = unit.barrel_facing.as_ref().unwrap();
+            let actual = (
+                barrel.current(frame),
+                barrel.destination(),
+                unit.turret_rotation_latch,
+            );
+            let turret = native["turret"].as_array().unwrap();
+            let expected = (
+                turret[0].as_u64().unwrap() as u16,
+                turret[1].as_u64().unwrap() as u16,
+                native["latch"].as_u64().unwrap() != 0,
+            );
+            if actual != expected {
+                issues.push(format!(
+                    "{} frame {frame}: {actual:?} != {expected:?}",
+                    input["name"]
+                ));
+                break;
+            }
+        }
+        compared += 1;
+    }
+    assert!(compared >= 40, "only {compared} rows compared");
+    assert!(issues.is_empty(), "{}", issues.join("\n"));
 }

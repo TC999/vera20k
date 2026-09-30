@@ -14,7 +14,6 @@ use crate::map::trigger_graph::TriggerGraph;
 use crate::render::minimap::MinimapRenderer;
 use crate::render::selection_overlay::SelectionOverlay;
 use crate::sidebar::SidebarTab;
-use crate::sim::trigger_runtime::TriggerRuntime;
 use crate::ui::game_screen::GameScreen;
 
 use crate::app::AppState;
@@ -54,7 +53,7 @@ pub(crate) fn fallback_map_load_result() -> init::MapLoadResult {
             startup: crate::match_bootstrap::LoadingStartup::Generic {
                 selected_map_file: "fallback".to_string(),
             },
-            map_source: crate::app::frontend::list_maps::LoadedMapSource::LegacyFallback {
+            map_source: crate::map::source::LoadedMapSource::LegacyFallback {
                 label: "fallback".to_string(),
             },
             map_hash: None,
@@ -71,19 +70,16 @@ pub(crate) fn fallback_map_load_result() -> init::MapLoadResult {
             events: HashMap::new(),
             actions: HashMap::new(),
             trigger_graph: TriggerGraph::default(),
-            trigger_runtime: TriggerRuntime::default(),
             overlay_registry: OverlayTypeRegistry::empty(),
             house_roster: HouseRoster::default(),
             height_map: BTreeMap::new(),
             bridge_height_map: BTreeMap::new(),
-            tactical_bridge_inverse_map: BTreeMap::new(),
             rules: None,
             map_lighting_config: crate::map::lighting::LightingConfig::default(),
             theater_name: "TEMPERATE".to_string(),
             theater_ext: "tem".to_string(),
             initial_local_owner: None,
             sandbox_full_visibility: false,
-            spawn_pick_pending: false,
             camera_anchor_x: 0.0,
             camera_anchor_y: 0.0,
         },
@@ -118,11 +114,14 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
     // mode at 00683DF3. Loading artwork stays at shell size; successful tactical
     // installation must size its camera/shroud against the applied game mode.
     crate::app::App::enter_game_window_mode(state);
+    crate::app::loading::pump::present_game_mode_blank(state);
     crate::app::reset_scenario_exit_runtime(state);
     let startup = result.scenario.startup;
     let returns_scenario_rng_to_offline_shell = startup.launch_session().is_some();
-    // A loaded world is not timed until the launch handoff actually reaches
-    // InGame (SpawnPick remains outside the scenario elapsed span).
+    state.match_state.match_presentation.local_player_handle = startup
+        .launch_session()
+        .map(|launch| launch.player_name.clone());
+    // A loaded world is not timed until the launch handoff reaches InGame.
     state.match_state.scenario_elapsed_clock.reset();
     state.match_state.match_presentation.tile_atlas = result.presentation.tile_atlas;
     state.match_state.match_presentation.building_zshape = result.presentation.building_zshape;
@@ -131,6 +130,8 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
     state.match_state.loaded_map_source = Some(result.scenario.map_source);
     state.match_state.loaded_map_hash = result.scenario.map_hash;
     state.match_state.match_presentation.terrain_grid = result.scenario.terrain_grid;
+    state.match_state.match_presentation.height_map = result.scenario.height_map;
+    state.match_state.match_presentation.bridge_height_map = result.scenario.bridge_height_map;
     state
         .match_state
         .match_presentation
@@ -151,8 +152,6 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
             .map(|(simulation, rules)| crate::sim::runtime::SimRuntime {
                 simulation,
                 resources: crate::sim::runtime::SimResources {
-                    height_map: result.scenario.height_map,
-                    bridge_height_map: result.scenario.bridge_height_map,
                     overlay_registry: result.scenario.overlay_registry,
                     terrain_template: result.scenario.resolved_terrain,
                     rules,
@@ -164,6 +163,23 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
                 },
             });
     state.match_state.match_presentation.combat_lights.clear();
+    state
+        .match_state
+        .match_presentation
+        .sinking_waterlines
+        .borrow_mut()
+        .clear();
+    state
+        .match_state
+        .match_presentation
+        .barrel_image_pitches
+        .borrow_mut()
+        .clear();
+    state
+        .match_state
+        .match_presentation
+        .line_trails
+        .clear_on_load();
     // A new simulation is a new scenario for `SidebarClass::AddCameo`'s
     // init gate: its first projection must seed the strip silently.
     state
@@ -181,6 +197,9 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
         sim.set_input_delay_ticks(state.match_state.configured_input_delay_ticks);
     }
     state.match_state.match_presentation.unit_atlas = result.presentation.unit_atlas;
+    // Slope-transition sprites belong to the match's voxel models; the cache
+    // otherwise keeps every earlier match's pages alive.
+    *state.renderer.vxl_slope_transition_cache.borrow_mut() = Default::default();
     state.match_state.match_presentation.palette_set = result.presentation.palette_set;
     state.match_state.match_presentation.sprite_atlas = result.presentation.sprite_atlas;
     state.match_state.match_presentation.overlay_atlas = result.presentation.overlay_atlas;
@@ -216,23 +235,11 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
     state.match_state.match_presentation.waypoints = result.scenario.waypoints;
     state.match_state.match_presentation.cell_tags = result.scenario.cell_tags;
     state.match_state.match_presentation.tags = result.scenario.tags;
-    if let Some(sim) = state
-        .match_state
-        .sim_runtime
-        .as_mut()
-        .map(|rt| &mut rt.simulation)
-    {
-        sim.install_trigger_runtime(result.scenario.trigger_runtime);
-    }
     state.match_state.match_presentation.overlay_names = result.presentation.overlay_names;
     state.match_state.match_presentation.overlay_radar_colors =
         result.presentation.overlay_radar_colors;
     state.match_state.match_presentation.house_color_map = result.presentation.house_color_map;
     state.match_state.match_presentation.house_roster = result.scenario.house_roster;
-    state
-        .match_state
-        .match_presentation
-        .tactical_bridge_inverse_map = result.scenario.tactical_bridge_inverse_map;
     // F04: the app no longer stores a second ArtRegistry; presentation
     // borrows the sole copy owned by RuleSet (state.rules).
     state.process_assets.csf = result.presentation.csf;
@@ -301,16 +308,8 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
     );
     state.match_state.match_presentation.message_clock =
         crate::ui::messages::PauseAwareClock::default();
-    let map_title: &str = state
-        .match_state
-        .map_basic
-        .name
-        .as_deref()
-        .unwrap_or("Unknown Map");
-    state
-        .platform
-        .window
-        .set_title(&format!("RA2 - {}", map_title));
+    // The window keeps its title: gamemd names it once at CreateWindowExA
+    // (`0x00777CC5`) and imports no SetWindowText.
     state.platform.window.set_cursor_visible(
         state
             .match_state
@@ -414,10 +413,8 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
     for group in &mut state.match_state.input.control_groups {
         group.clear();
     }
-    // Pin the match-scoped local player once at launch. When the launch flow
-    // supplies no identity (dev/sandbox), the pin stays None and the legacy
-    // override/heuristic path resolves the owner instead.
-    state.match_state.local_player_owner = result.scenario.initial_local_owner.clone();
+    // Ordinary identity is already bound in Simulation.session.current_house.
+    // Keep a preference only for development worlds without that authority.
     state.match_state.local_owner_override = result.scenario.initial_local_owner;
     // F11: reset the whole per-match audio owner. The old reset cleared only
     // three EVA latches — the tick-indexed under-attack suppression window
@@ -426,19 +423,6 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
     // sound-event queue kept the previous match's undrained events.
     state.match_state.match_audio.reset_for_new_match();
     state.match_state.sandbox_full_visibility = result.scenario.sandbox_full_visibility;
-    state.match_state.input.spawn_pick_pending = result.scenario.spawn_pick_pending;
-
-    // Load sound.ini / soundmd.ini for SFX sound ID resolution.
-    if let Some(assets) = state.process_assets.manager() {
-        state.audio.sound_registry = load_sound_registry(assets);
-        state.audio.audio_indices =
-            if crate::app::should_load_audio_indices(state.audio.audio_indices_enabled) {
-                load_audio_indices(assets)
-            } else {
-                Vec::new()
-            };
-        state.audio.eva_registry = load_eva_registry(assets);
-    }
 
     // `Start_Scenario @ 0x00683AB0` after `Read_Scenario`: `[Basic] Theme`
     // resolves through `From_Name` (`0x004758F0`); -1 -> `Stop(fade=1)` of the
@@ -447,16 +431,6 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
     // once the fade lands. The shuffle stream is a presentation-side copy of
     // `g_MainRng` seeded from the match seed (never the sim's own cursor), and
     // `Is_Allowed`'s `Side=` gate compares the local player's side.
-    //
-    // VERA-internal residual (gamemd has no equivalent screen): when the map
-    // routes through `GameScreen::SpawnPick` below, `Main_Tick`'s head rule
-    // (`main_tick_theme` inside `advance_in_game_runtime`, gated on
-    // `GameScreen::InGame` in `frame.rs`) does not run until the player picks
-    // a start. After the `Stop(1)` fade of the LOADING stream lands, Theme sits
-    // with retained == -1 and no `Queue_Song(-2)`, so the spawn-pick screen is
-    // silent; the first score track starts on the first in-game frame. Maps
-    // with a resolvable `[Basic] Theme=` are unaffected (the queued index is
-    // consumed by the audio pump's AI as soon as the fade completes).
     let music_now_ms = sim_tick::monotonic_frame_pacer_ms(state, std::time::Instant::now());
     let (match_seed, local_side) = state
         .match_state
@@ -466,8 +440,7 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
             let simulation = &rt.simulation;
             let local_side = state
                 .match_state
-                .local_player_owner
-                .as_deref()
+                .local_player_owner()
                 .and_then(|owner| {
                     crate::sim::house_state::house_state_for_owner(
                         &simulation.houses,
@@ -522,182 +495,56 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
         );
     }
 
-    if state.match_state.input.spawn_pick_pending {
-        state.match_state.startup.clear();
-        state.frontend.screen = GameScreen::SpawnPick;
-        if returns_scenario_rng_to_offline_shell {
-            state
-                .frontend
-                .offline_skirmish_runtime
-                .mark_gameplay_rng_return_pending();
-        }
-        log::info!("Transitioned to SpawnPick — player must choose a start location");
-    } else {
-        match startup {
-            crate::match_bootstrap::LoadingStartup::Accepted(prepared) => {
-                let receipt = state.match_state.startup.acknowledge(
-                    prepared,
-                    state
-                        .match_state
-                        .sim_runtime
-                        .as_ref()
-                        .map(|rt| &rt.simulation),
-                    matches!(state.frontend.screen, GameScreen::Loading),
-                    state.match_state.input.spawn_pick_pending,
-                );
+    match startup {
+        crate::match_bootstrap::LoadingStartup::Accepted(prepared) => {
+            let receipt = state.match_state.startup.acknowledge(
+                prepared,
+                state
+                    .match_state
+                    .sim_runtime
+                    .as_ref()
+                    .map(|rt| &rt.simulation),
+                matches!(state.frontend.screen, GameScreen::Loading),
+            );
 
-                match receipt {
-                    Ok(()) => {
-                        let now_ms =
-                            sim_tick::monotonic_frame_pacer_ms(state, std::time::Instant::now());
-                        state.match_state.scenario_elapsed_clock.start(now_ms);
-                        state.frontend.screen = GameScreen::InGame;
-                        state
-                            .frontend
-                            .offline_skirmish_runtime
-                            .mark_gameplay_rng_return_pending();
-                        log::info!("Transitioned to InGame after Rust L0 acknowledgement");
-                    }
-                    Err(err) => {
-                        state.match_state.startup.clear();
-                        state.frontend.screen = GameScreen::MissionResult {
-                            title: "Startup Rejected".to_string(),
-                            detail: err.clone(),
-                        };
-                        log::error!("Accepted startup failed closed at Rust L0: {err}");
-                    }
-                }
-            }
-            crate::match_bootstrap::LoadingStartup::UnverifiedLegacy { .. }
-            | crate::match_bootstrap::LoadingStartup::Generic { .. } => {
-                state.match_state.startup.clear();
-                let now_ms = sim_tick::monotonic_frame_pacer_ms(state, std::time::Instant::now());
-                state.match_state.scenario_elapsed_clock.start(now_ms);
-                state.frontend.screen = GameScreen::InGame;
-                if returns_scenario_rng_to_offline_shell {
+            match receipt {
+                Ok(()) => {
+                    let now_ms =
+                        sim_tick::monotonic_frame_pacer_ms(state, std::time::Instant::now());
+                    state.match_state.scenario_elapsed_clock.start(now_ms);
+                    state.frontend.screen = GameScreen::InGame;
                     state
                         .frontend
                         .offline_skirmish_runtime
                         .mark_gameplay_rng_return_pending();
+                    log::info!("Transitioned to InGame after Rust L0 acknowledgement");
                 }
-                log::info!("Transitioned to InGame on noncertifying startup path");
+                Err(err) => {
+                    state.match_state.startup.clear();
+                    state.frontend.screen = GameScreen::MissionResult {
+                        title: "Startup Rejected".to_string(),
+                        detail: err.clone(),
+                    };
+                    log::error!("Accepted startup failed closed at Rust L0: {err}");
+                }
             }
+        }
+        crate::match_bootstrap::LoadingStartup::UnverifiedLegacy { .. }
+        | crate::match_bootstrap::LoadingStartup::Generic { .. } => {
+            state.match_state.startup.clear();
+            let now_ms = sim_tick::monotonic_frame_pacer_ms(state, std::time::Instant::now());
+            state.match_state.scenario_elapsed_clock.start(now_ms);
+            state.frontend.screen = GameScreen::InGame;
+            if returns_scenario_rng_to_offline_shell {
+                state
+                    .frontend
+                    .offline_skirmish_runtime
+                    .mark_gameplay_rng_return_pending();
+            }
+            log::info!("Transitioned to InGame on noncertifying startup path");
         }
     }
     crate::app::presentation::sidebar_render::refresh_sidebar_projection(state);
-}
-
-/// Load sound.ini / soundmd.ini and build a SoundRegistry.
-/// YR-first: soundmd.ini takes precedence, sound.ini fills gaps.
-pub(crate) fn load_sound_registry(
-    assets: &crate::assets::asset_manager::AssetManager,
-) -> crate::rules::sound_ini::SoundRegistry {
-    use crate::rules::ini_parser::IniFile;
-    use crate::rules::sound_ini::SoundRegistry;
-
-    // Try YR sound.ini first (soundmd.ini).
-    let mut registry: Option<SoundRegistry> = None;
-    for name in ["soundmd.ini", "sound.ini"] {
-        if let Some(bytes) = assets.get(name) {
-            if let Ok(text) = String::from_utf8(bytes) {
-                let ini: IniFile = IniFile::from_str(&text);
-                match &mut registry {
-                    None => {
-                        registry = Some(SoundRegistry::from_ini(&ini));
-                        log::info!("Loaded {} for SFX", name);
-                    }
-                    Some(reg) => {
-                        reg.merge_fallback(&ini);
-                        log::info!("Merged fallback {} for SFX", name);
-                    }
-                }
-            }
-        }
-    }
-    registry.unwrap_or_default()
-}
-
-/// Load audio.idx/bag indices for bag-based sound playback (voices, EVA).
-///
-/// Tries YR (audiomd) first, then base RA2 (audio). Both are loaded if present
-/// so YR sounds take priority but base RA2 sounds are still available.
-pub(crate) fn load_audio_indices(
-    assets: &crate::assets::asset_manager::AssetManager,
-) -> Vec<crate::assets::audio_bag::AudioIndex> {
-    use crate::assets::audio_bag::AudioIndex;
-
-    let mut indices = Vec::new();
-
-    // Both AUDIO.MIX and AUDIOMD.MIX contain entries named "audio.idx" and "audio.bag"
-    // internally. We need to load each MIX explicitly and extract from within, because
-    // the generic first-match lookup would conflate the shared internal filenames.
-    // YR (AUDIOMD.MIX) is loaded first so its sounds take priority in the search.
-    for mix_name in ["AUDIOMD.MIX", "AUDIO.MIX"] {
-        let Some(mix) = assets.archive(mix_name) else {
-            continue;
-        };
-        let idx_data = match mix.get_by_name("audio.idx") {
-            Some(d) => d,
-            None => {
-                log::warn!("{} has no audio.idx entry", mix_name);
-                continue;
-            }
-        };
-        let bag_data = match mix.get_by_name("audio.bag") {
-            Some(d) => d.to_vec(),
-            None => {
-                log::warn!("{} has audio.idx but no audio.bag", mix_name);
-                continue;
-            }
-        };
-        match AudioIndex::from_idx_bag(idx_data, bag_data) {
-            Some(index) => {
-                log::info!(
-                    "Loaded audio.idx/bag from {}: {} entries",
-                    mix_name,
-                    index.len()
-                );
-                indices.push(index);
-            }
-            None => {
-                log::warn!("Failed to parse audio.idx from {}", mix_name);
-            }
-        }
-    }
-
-    if indices.is_empty() {
-        log::warn!("No audio.idx/bag found — bag-based sounds (voices, EVA) will be silent");
-    }
-    indices
-}
-
-/// Build the `VoxClass` registry the way `Init_Game @ 0x0052C8A0` does:
-/// `VoxClass::ReadEVAINI @ 0x00753000` on the `EVAMD.INI` CCINI (string
-/// `0x00825DF0`, "Reading EVAMD.INI" `0x00825DFC`) and nothing else. gamemd
-/// never opens `eva.ini`, so an RA2-only section is not a YR line.
-pub(crate) fn load_eva_registry(
-    assets: &crate::assets::asset_manager::AssetManager,
-) -> crate::rules::sound_ini::EvaRegistry {
-    build_eva_registry(|name| assets.get(name))
-}
-
-/// The lookup-agnostic half of [`load_eva_registry`].
-pub(crate) fn build_eva_registry(
-    lookup: impl Fn(&str) -> Option<Vec<u8>>,
-) -> crate::rules::sound_ini::EvaRegistry {
-    use crate::rules::ini_parser::IniFile;
-    use crate::rules::sound_ini::EvaRegistry;
-
-    let Some(bytes) = lookup("evamd.ini") else {
-        log::warn!("Failed to find EVAMD.INI — EVA lines will be silent");
-        return EvaRegistry::default();
-    };
-    // EVA INI files from MIX archives may contain non-UTF8 bytes (Windows-1252).
-    let text = String::from_utf8_lossy(&bytes);
-    let ini: IniFile = IniFile::from_str(&text);
-    let registry = EvaRegistry::from_ini(&ini);
-    log::info!("Loaded evamd.ini for EVA");
-    registry
 }
 
 /// Build overlay classification data for the minimap from map overlay entries.
@@ -757,40 +604,6 @@ pub(crate) fn clear_screen(encoder: &mut wgpu::CommandEncoder, view: &wgpu::Text
         timestamp_writes: None,
         occlusion_query_set: None,
     });
-}
-
-#[cfg(test)]
-mod eva_registry_tests {
-    use super::build_eva_registry;
-    use crate::rules::sound_ini::EvaSide;
-
-    /// `Init_Game @ 0x0052C8A0` reads `EVAMD.INI` only (`0x00825DF0`); an
-    /// `eva.ini` sitting next to it is never opened, so its entries do not
-    /// exist and it cannot override or fill a YR row.
-    #[test]
-    fn eva_registry_reads_evamd_only_and_ignores_eva_ini() {
-        let evamd = "[DialogList]\n0=EVA_UnitLost\n[EVA_UnitLost]\nAllied=ceva064\n";
-        let eva = "[DialogList]\n0=EVA_UnitLost\n1=EVA_Ra2Only\n\
-                   [EVA_UnitLost]\nAllied=old064\nRussian=old064r\n\
-                   [EVA_Ra2Only]\nAllied=ra2only\n";
-        let lookup = |name: &str| -> Option<Vec<u8>> {
-            match name {
-                "evamd.ini" => Some(evamd.as_bytes().to_vec()),
-                "eva.ini" => Some(eva.as_bytes().to_vec()),
-                _ => None,
-            }
-        };
-        let reg = build_eva_registry(lookup);
-        assert_eq!(reg.len(), 1);
-        assert_eq!(reg.get("EVA_UnitLost", EvaSide::Allied), Some("ceva064"));
-        assert_eq!(reg.get("EVA_UnitLost", EvaSide::Russian), None);
-        assert!(reg.entry("EVA_Ra2Only").is_none());
-
-        // Only eva.ini present: nothing is read at all.
-        let reg =
-            build_eva_registry(|name: &str| (name == "eva.ini").then(|| eva.as_bytes().to_vec()));
-        assert!(reg.is_empty());
-    }
 }
 
 #[cfg(test)]

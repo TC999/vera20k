@@ -4,8 +4,8 @@
 //!
 //! Replaces the 2D `lepton_distance_sq_raw` + `is_within_range_leptons` pair
 //! at the four targeting/cursor sites. Implements 3D distance, IsLowFlying
-//! ground-snap, AirRange bonus, arcing-weapon 2D fallthrough, foundation
-//! bonus, the InRange bridge gate (0x006F75FB), the verified boundary
+//! ground-snap, AirRange bonus, the open-topped passenger's bonus,
+//! arcing-weapon 2D fallthrough, foundation bonus, the InRange bridge gate (0x006F75FB), the verified boundary
 //! semantics (<= max inclusive, < min strict, -512 lep sentinel), and the two
 //! caller-side source substitutions — `CellRangefinding=` and the high-flying
 //! attacker's target-Z swap — that let a Kirov reach the ground below it.
@@ -20,7 +20,7 @@
 //! module takes `LineOfFireInputs` alongside the terrain grid.
 //!
 //! Stages 2-N add the remaining range-VALUE chain (Garrison / Bunker /
-//! OpenTopped / Veteran). Stage Arcing adds the full Branch B slope-arc check.
+//! Veteran). Stage Arcing adds the full Branch B slope-arc check.
 //!
 //! Depends on: rules (ObjectType, Weapon, ProjectileType), map (terrain
 //! height + bridge), sim/combat/line_of_fire, util/lepton (constants),
@@ -29,7 +29,7 @@
 
 use crate::map::cell_index::NativeCellIdentity;
 use crate::map::entities::EntityCategory;
-use crate::map::resolved_terrain::ResolvedTerrainGrid;
+use crate::map::resolved_terrain::{NativeCellQuery, ResolvedTerrainGrid};
 use crate::rules::ruleset::RuleSet;
 use crate::rules::weapon_type::WeaponType;
 use crate::sim::combat::TargetKind;
@@ -37,12 +37,12 @@ use crate::sim::combat::line_of_fire::{self, LineOfFireInputs};
 use crate::sim::entity_store::EntityStore;
 use crate::sim::game_entity::GameEntity;
 use crate::sim::intern::StringInterner;
-use crate::sim::map::bridge_topology::BRIDGE_DECK_HEIGHT_LEPTONS;
+use crate::sim::movement::air_movement::{is_high_flying_in_query, is_low_flying_in_query};
+use crate::sim::movement::ground_pose::object_world_z_leptons;
 use crate::sim::production::foundation_dimensions;
 use crate::util::fixed_math::{SimFixed, isqrt_i64};
 use crate::util::lepton::{
-    BRIDGE_HEIGHT_DELTA_LEPTONS, HIGH_FLIGHT_THRESHOLD_LEPTONS,
-    WEAPON_RANGE_ALWAYS_IN_RANGE_LEPTONS, ground_height_leptons,
+    BRIDGE_DECK_HEIGHT_LEPTONS, WEAPON_RANGE_ALWAYS_IN_RANGE_LEPTONS, ground_height_leptons,
 };
 
 fn terrain_ground_z_at(
@@ -56,95 +56,6 @@ fn terrain_ground_z_at(
     ground_height_leptons(cell.level, cell.slope_type, world_x, world_y)
         .ok()
         .map(i64::from)
-}
-
-fn entity_ground_z_leptons(entity: &GameEntity, terrain: &ResolvedTerrainGrid) -> Option<i64> {
-    let world_x = i32::from(entity.position.rx)
-        .wrapping_mul(256)
-        .wrapping_add(entity.position.sub_x.to_num::<i32>());
-    let world_y = i32::from(entity.position.ry)
-        .wrapping_mul(256)
-        .wrapping_add(entity.position.sub_y.to_num::<i32>());
-    let ground = terrain_ground_z_at(
-        terrain,
-        entity.position.rx,
-        entity.position.ry,
-        world_x,
-        world_y,
-    )?;
-    Some(
-        ground
-            + if entity.on_bridge {
-                i64::from(BRIDGE_DECK_HEIGHT_LEPTONS)
-            } else {
-                0
-            },
-    )
-}
-
-/// Absolute world-coordinate Z of an entity. An object-owned exact coordinate
-/// is authoritative; otherwise this reconstructs exact sloped terrain ground,
-/// the entity-owned OnBridge deck offset, and locomotor altitude.
-///
-/// Droppod and parachute altitudes are intentionally NOT added — those
-/// entities are always IsLowFlying-equivalent during descent and get
-/// ground-snapped by the InRange caller.
-pub(crate) fn effective_z_leptons(
-    entity: &GameEntity,
-    terrain: &ResolvedTerrainGrid,
-) -> Option<i64> {
-    if let Some(exact_z_leptons) = entity.position.exact_z_leptons {
-        return Some(i64::from(exact_z_leptons));
-    }
-
-    let base = entity_ground_z_leptons(entity, terrain)?;
-    Some(
-        base + entity
-            .locomotor
-            .as_ref()
-            .map(|loco| loco.altitude.to_num::<i64>())
-            .unwrap_or(0),
-    )
-}
-
-/// Current altitude above the object's own ground, in leptons — the VERA
-/// stand-in for the height `ObjectClass::IsLowFlying` 0x005F6B60 and
-/// `ObjectClass::IsHighFlying` 0x004DE620 fetch through `vtable+0x1C8`.
-fn airborne_height_leptons(entity: &GameEntity) -> i64 {
-    entity
-        .locomotor
-        .as_ref()
-        .map(|l| l.altitude.to_num::<i64>())
-        .unwrap_or(0)
-}
-
-/// `ObjectClass::IsLowFlying` 0x005F6B60 — `this->+0x74 != 0 &&
-/// this->vtable+0x1C8() < 2 * g_nFootLevelHeightLeptons`.
-///
-/// Used by the InRange caller to decide whether to ground-snap the target's
-/// Z before the distance computation: low-flying targets are ranged at the
-/// ground beneath them, not at their actual altitude.
-///
-/// **Not scoped to aircraft.** The native predicate lives on `ObjectClass`, so
-/// it answers for a `UnitClass` too — and the stock Kirov `[ZEP]` is listed in
-/// `[VehicleTypes]`, not `[AircraftTypes]`, so a category gate here silently
-/// grounded every Jumpjet vehicle. The `+0x74` byte's INI identity is
-/// UNCHECKED; VERA reads a positive locomotor altitude as its analogue, which
-/// differs from the native only for an in-air object at height exactly 0.
-pub(crate) fn is_low_flying(entity: &GameEntity) -> bool {
-    let alt = airborne_height_leptons(entity);
-    alt > 0 && alt < HIGH_FLIGHT_THRESHOLD_LEPTONS
-}
-
-/// `ObjectClass::IsHighFlying` 0x004DE620 — `this->+0x74 != 0 &&
-/// this->vtable+0x1C8() >= 2 * g_nFootLevelHeightLeptons`. Mutually exclusive
-/// with `is_low_flying`; see that function for the scope note.
-///
-/// Read on the TARGET at 0x006F7263 to enable the AirRange bonus, and on the
-/// ATTACKER at 0x006F7895 (in `TechnoClass::CanFireAt`) to decide whether the
-/// shot is measured from the target's own Z.
-pub(crate) fn is_high_flying(entity: &GameEntity) -> bool {
-    airborne_height_leptons(entity) >= HIGH_FLIGHT_THRESHOLD_LEPTONS
 }
 
 /// `AirRangeBonus=` reaches `TechnoTypeClass+0x68C` through
@@ -162,38 +73,33 @@ fn cells_fixed_to_leptons(cells: SimFixed) -> i64 {
     (i64::from(cells.to_bits()) * 256) >> 16
 }
 
-/// Effective max range in leptons for an attacker firing at a target with
-/// `weapon`: weapon base range plus AirRange bonus (target high-flying) plus
-/// foundation bonus (target is a building) plus height-fire bonus (Stage 1
-/// stub returns 0).
+/// Range before target-coordinate resolution, 6F7261..6F7308. The target's
+/// +54 query and AirRange bonus precede +48/+50, even when MinimumRange later
+/// rejects the shot. Foundation size belongs to the later non-arcing arm.
+/// Height-fire remains a documented stub. The caller adds the open-topped
+/// passenger bonus here for both abstract and retained Cell targets.
 ///
-/// Stages 2-N add: Garrison REPLACES, Bunker, OpenTopped, Veteran. Each is a
+/// Stages 2-N add: Garrison REPLACES, Bunker, Veteran. Each is a
 /// branch added to this function — call sites stay unchanged.
-pub(crate) fn compute_effective_max_range_leptons(
+fn initial_range_leptons(
     attacker: &GameEntity,
     target: &TargetKind,
     weapon: &WeaponType,
     rules: &RuleSet,
     interner: &StringInterner,
     entities: &EntityStore,
+    cells: &NativeCellQuery<'_>,
 ) -> i64 {
     let mut range_lep: i64 = i64::from(weapon.range_leptons);
 
     if let TargetKind::Entity(target_id) = *target {
         if let Some(target_entity) = entities.get(target_id) {
             // AirRange bonus when target is high-flying.
-            if is_high_flying(target_entity) {
+            if is_high_flying_in_query(target_entity, cells, Some((rules, interner))) {
                 if let Some(attacker_obj) = rules.object(interner.resolve(attacker.type_ref())) {
                     if let Some(air_bonus) = attacker_obj.air_range_bonus {
                         range_lep += cells_fixed_to_leptons(air_bonus);
                     }
-                }
-            }
-            // Foundation bonus when target is a building: (FoundationW + FoundationH) * 64 lep.
-            if target_entity.category == EntityCategory::Structure {
-                if let Some(target_obj) = rules.object(interner.resolve(target_entity.type_ref())) {
-                    let (fw, fh) = foundation_dimensions(&target_obj.foundation);
-                    range_lep += (fw as i64 + fh as i64) * 0x40;
                 }
             }
         }
@@ -215,6 +121,19 @@ pub(crate) fn compute_effective_max_range_leptons(
     }
 
     range_lep
+}
+
+/// `0x006F72C8..0x006F72E1`: a passenger of an open-topped transport
+/// (`+0x82`) reaches `[CombatDamage] OpenToppedRangeBonus=` cells farther
+/// (`Rules+0xF5C`, shifted to leptons). The stage runs before the
+/// MinimumRange test and the arcing split, so both arms and a cell target
+/// read it.
+fn open_topped_range_bonus_leptons(attacker: &GameEntity, rules: &RuleSet) -> i64 {
+    if attacker.passenger_role.in_open_transport() {
+        i64::from(rules.garrison_rules.open_topped_range_bonus) << 8
+    } else {
+        0
+    }
 }
 
 /// Stage 1 stub — returns 0.
@@ -260,7 +179,8 @@ pub(crate) fn inside_minimum_range(
     entities: &EntityStore,
     terrain: &ResolvedTerrainGrid,
 ) -> bool {
-    let Some(tgt) = resolve_target_coords_3d(target, entities, rules, interner, terrain) else {
+    let cells = NativeCellQuery::canonical(terrain);
+    let Some(tgt) = resolve_target_coords_3d(target, entities, rules, interner, &cells) else {
         return false;
     };
     minimum_range_blocks(weapon, src, tgt)
@@ -270,7 +190,7 @@ pub(crate) fn inside_minimum_range(
 /// hit `target` with `weapon`, accounting for all Stage 1 gates.
 ///
 /// `src` is caller-supplied as `(attacker_x_lep, attacker_y_lep,
-/// effective_z_leptons(attacker, terrain))`.
+/// object_world_z_leptons(attacker, Some(terrain)))`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_in_range(
     attacker: &GameEntity,
@@ -283,6 +203,34 @@ pub(crate) fn compute_in_range(
     terrain: &ResolvedTerrainGrid,
     los: &LineOfFireInputs<'_>,
 ) -> bool {
+    compute_in_range_in_query(
+        attacker,
+        src,
+        target,
+        weapon,
+        rules,
+        interner,
+        entities,
+        &NativeCellQuery::canonical(terrain),
+        los,
+    )
+}
+
+/// Run the shared range decision in the caller's cell-query domain. Cursor
+/// probing supplies one isolated domain across source construction and range;
+/// simulation wrappers retain canonical lookup order and Dummy side effects.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compute_in_range_in_query(
+    attacker: &GameEntity,
+    src: (i64, i64, i64),
+    target: &TargetKind,
+    weapon: &WeaponType,
+    rules: &RuleSet,
+    interner: &StringInterner,
+    entities: &EntityStore,
+    cells: &NativeCellQuery<'_>,
+    los: &LineOfFireInputs<'_>,
+) -> bool {
     compute_range_target(
         attacker,
         src,
@@ -291,7 +239,7 @@ pub(crate) fn compute_in_range(
         rules,
         interner,
         entities,
-        terrain,
+        cells,
         los,
     )
 }
@@ -318,10 +266,18 @@ pub(crate) fn cell_target_in_range(
     terrain: &ResolvedTerrainGrid,
     los: &LineOfFireInputs<'_>,
 ) -> Option<bool> {
+    let cells = NativeCellQuery::canonical(terrain);
     let target = RangeTarget::Cell(target);
-    let source = fire_source_for_target(attacker, target, weapon, entities, terrain)?;
+    let source = fire_source_for_target(
+        attacker,
+        target,
+        weapon,
+        entities,
+        &cells,
+        (rules, interner),
+    )?;
     Some(compute_range_target(
-        attacker, source, target, weapon, rules, interner, entities, terrain, los,
+        attacker, source, target, weapon, rules, interner, entities, &cells, los,
     ))
 }
 
@@ -334,9 +290,10 @@ fn compute_range_target(
     rules: &RuleSet,
     interner: &StringInterner,
     entities: &EntityStore,
-    terrain: &ResolvedTerrainGrid,
+    cells: &NativeCellQuery<'_>,
     los: &LineOfFireInputs<'_>,
 ) -> bool {
+    let terrain = cells.terrain();
     let weapon_range_lep: i64 = i64::from(weapon.range_leptons);
 
     // Sentinel — always-in-range short-circuit (`CMP EDI,0xFFFFFE00` at
@@ -345,11 +302,19 @@ fn compute_range_target(
         return true;
     }
 
+    let initial_range_lep = match target {
+        RangeTarget::Abstract(target) => {
+            initial_range_leptons(attacker, target, weapon, rules, interner, entities, cells)
+        }
+        // CellClass+54 is the false Abstract predicate; it has no map query.
+        RangeTarget::Cell(_) => weapon_range_lep,
+    } + open_topped_range_bonus_leptons(attacker, rules);
+
     let coords = match target {
         RangeTarget::Abstract(target) => {
-            resolve_target_coords_3d(target, entities, rules, interner, terrain)
+            resolve_target_coords_3d(target, entities, rules, interner, cells)
         }
-        RangeTarget::Cell(cell) => native_cell_range_coords(cell, terrain),
+        RangeTarget::Cell(cell) => native_cell_range_coords(cell, cells),
     };
     let Some((tx, ty, tz)) = coords else {
         return false;
@@ -370,7 +335,7 @@ fn compute_range_target(
         .map(|p| p.arcing)
         .unwrap_or(false);
     if arcing {
-        if !compute_in_range_arcing_2d(src, (tx, ty), weapon_range_lep) {
+        if !compute_in_range_arcing_2d(src, (tx, ty), initial_range_lep) {
             return false;
         }
         // The arcing arm is NOT exempt from the line-of-fire walk: 0x006F7519
@@ -390,12 +355,17 @@ fn compute_range_target(
         );
     }
 
-    let max_range_lep = match target {
-        RangeTarget::Abstract(target) => {
-            compute_effective_max_range_leptons(attacker, target, weapon, rules, interner, entities)
-        }
-        RangeTarget::Cell(_) => weapon_range_lep,
-    };
+    let mut max_range_lep = initial_range_lep;
+    // Building foundation size is queried only after the non-arcing split,
+    // 6F7525..6F7554, after target coordinates and MinimumRange.
+    if let RangeTarget::Abstract(TargetKind::Entity(id)) = target
+        && let Some(entity) = entities.get(*id)
+        && entity.category == EntityCategory::Structure
+        && let Some(object) = rules.object(interner.resolve(entity.type_ref()))
+    {
+        let (width, height) = foundation_dimensions(&object.foundation);
+        max_range_lep += (width as i64 + height as i64) * 0x40;
+    }
 
     let dx = sx - tx;
     let dy = sy - ty;
@@ -407,11 +377,7 @@ fn compute_range_target(
         return false;
     }
 
-    let under_bridge = match target {
-        RangeTarget::Abstract(_) => attacker_under_bridge_targeting_above(src, tz, terrain),
-        RangeTarget::Cell(_) => native_source_under_bridge(src, tz, terrain),
-    };
-    if under_bridge {
+    if native_source_under_bridge(src, tz, cells) {
         return false;
     }
 
@@ -516,34 +482,25 @@ fn resolve_target_coords_3d(
     entities: &EntityStore,
     rules: &RuleSet,
     interner: &StringInterner,
-    terrain: &ResolvedTerrainGrid,
+    cells: &NativeCellQuery<'_>,
 ) -> Option<(i64, i64, i64)> {
+    let terrain = cells.terrain();
     match *target {
         TargetKind::Entity(id) => {
             let Some(t) = entities.get(id) else {
                 return Some((i64::MAX / 4, i64::MAX / 4, 0));
             };
-            let (rx, ry, sub_x, sub_y) = resolve_entity_target_coords(t, rules, interner);
+            let (rx, ry, sub_x, sub_y) = super::target_coords(t);
             let tx = rx as i64 * 256 + sub_x.to_num::<i64>();
             let ty = ry as i64 * 256 + sub_y.to_num::<i64>();
-            let tz = if is_low_flying(t) {
-                let world_x = i32::from(t.position.rx)
-                    .wrapping_mul(256)
-                    .wrapping_add(t.position.sub_x.to_num::<i32>());
-                let world_y = i32::from(t.position.ry)
-                    .wrapping_mul(256)
-                    .wrapping_add(t.position.sub_y.to_num::<i32>());
-                let mut ground =
-                    terrain_ground_z_at(terrain, t.position.rx, t.position.ry, world_x, world_y)?;
-                if terrain
-                    .cell(t.position.rx, t.position.ry)
-                    .is_some_and(|cell| cell.bridge_facts.has_structural_bridge())
-                {
-                    ground += BRIDGE_HEIGHT_DELTA_LEPTONS;
-                }
-                ground
+            // Virtual+48 supplies the target point before +50. The height
+            // predicate reads physical XY; the following Map queries use this
+            // returned point (which can be a building's foundation centre).
+            let own_z = i64::from(object_world_z_leptons(t, Some(terrain)));
+            let tz = if is_low_flying_in_query(t, cells, Some((rules, interner))) {
+                native_ground_target_z(tx as i32, ty as i32, cells)?
             } else {
-                effective_z_leptons(t, terrain)?
+                own_z
             };
             Some((tx, ty, tz))
         }
@@ -571,60 +528,72 @@ fn cell_own_coords(rx: u16, ry: u16, terrain: &ResolvedTerrainGrid) -> Option<(i
 
 fn native_cell_own_coords(
     cell: NativeCellIdentity,
-    terrain: &ResolvedTerrainGrid,
+    cells: &NativeCellQuery<'_>,
 ) -> Option<(i64, i64, i64)> {
-    let (x, y) = terrain.native_cell_coord(cell);
+    let (x, y) = cells.coord(cell);
     let x = i32::from(x).wrapping_mul(256).wrapping_add(128);
     let y = i32::from(y).wrapping_mul(256).wrapping_add(128);
-    let (level, slope) = terrain.native_cell_ground_fields(cell);
+    let (level, slope) = cells.ground_fields(cell);
     let z = ground_height_leptons(level, slope, x, y).ok()?;
     Some((i64::from(x), i64::from(y), i64::from(z)))
 }
 
 fn native_cell_range_coords(
     cell: NativeCellIdentity,
-    terrain: &ResolvedTerrainGrid,
+    cells: &NativeCellQuery<'_>,
 ) -> Option<(i64, i64, i64)> {
-    let (x, y, mut z) = native_cell_own_coords(cell, terrain)?;
+    let (x, y, mut z) = native_cell_own_coords(cell, cells)?;
     // Actual Cell+50=4867E0: false only inside the signed WaterSet window.
     // The -1 base is not special, and native ADD14 wraps before signed CMP.
-    let tile = terrain.native_cell_tile_index(cell);
-    let water = terrain.projectile_water_set_base();
+    let tile = cells.terrain().native_cell_tile_index(cell);
+    let water = cells.terrain().projectile_water_set_base();
     if tile < water || tile >= water.wrapping_add(14) {
-        // 6F733F first samples Map578080, then6F7353 separately resolves
-        // flags. Negative centers can resolve a different Cell than `cell`.
-        z = i64::from(crate::sim::movement::ground_pose::ground_surface_z_at(
-            [x as i32, y as i32],
-            false,
-            Some(terrain),
-            None,
-        )?);
-        let sampled = terrain.native_cell_identity(((x / 256) as i16, (y / 256) as i16));
-        if terrain.native_cell_flags(sampled) & 0x100 != 0 {
-            z += BRIDGE_HEIGHT_DELTA_LEPTONS;
-        }
+        z = native_ground_target_z(x as i32, y as i32, cells)?;
     }
     Some((x, y, z))
 }
 
+/// InRange6F7340/6F7353: first read ground through Map578080, then
+/// independently resolve Cell flags through Map565730. Both may stamp Dummy.
+fn native_ground_target_z(x: i32, y: i32, cells: &NativeCellQuery<'_>) -> Option<i64> {
+    let ground = crate::sim::movement::ground_pose::query_ground_height(
+        cells,
+        crate::sim::components::DriveCoord { x, y, z: 0 },
+    )
+    .ok()?;
+    let cell = cells.lookup_world(x, y);
+    Some(
+        i64::from(ground)
+            + if cells.flags(cell) & 0x100 != 0 {
+                i64::from(BRIDGE_DECK_HEIGHT_LEPTONS)
+            } else {
+                0
+            },
+    )
+}
+
+/// InRange6F7601 first reads source flags; only a structural span reaches
+/// Map578080 at6F7617. The source comparison is strict, the target inclusive.
 fn native_source_under_bridge(
     src: (i64, i64, i64),
     target_z: i64,
-    terrain: &ResolvedTerrainGrid,
+    cells: &NativeCellQuery<'_>,
 ) -> bool {
-    let cell = terrain.native_cell_identity(((src.0 / 256) as i16, (src.1 / 256) as i16));
-    if terrain.native_cell_flags(cell) & 0x100 == 0 {
+    let cell = cells.lookup_world(src.0 as i32, src.1 as i32);
+    if cells.flags(cell) & 0x100 == 0 {
         return false;
     }
-    let Some(ground) = crate::sim::movement::ground_pose::ground_surface_z_at(
-        [src.0 as i32, src.1 as i32],
-        false,
-        Some(terrain),
-        None,
+    let Ok(ground) = crate::sim::movement::ground_pose::query_ground_height(
+        cells,
+        crate::sim::components::DriveCoord {
+            x: src.0 as i32,
+            y: src.1 as i32,
+            z: 0,
+        },
     ) else {
         return false;
     };
-    let top = i64::from(ground) + BRIDGE_HEIGHT_DELTA_LEPTONS;
+    let top = i64::from(ground) + i64::from(BRIDGE_DECK_HEIGHT_LEPTONS);
     src.2 < top && target_z >= top
 }
 
@@ -636,7 +605,10 @@ fn target_own_z_leptons(
     terrain: &ResolvedTerrainGrid,
 ) -> Option<i64> {
     match *target {
-        TargetKind::Entity(id) => effective_z_leptons(entities.get(id)?, terrain),
+        TargetKind::Entity(id) => Some(i64::from(object_world_z_leptons(
+            entities.get(id)?,
+            Some(terrain),
+        ))),
         TargetKind::Cell(rx, ry) => cell_own_coords(rx, ry, terrain).map(|(_, _, z)| z),
     }
 }
@@ -662,35 +634,46 @@ fn target_own_z_leptons(
 /// Both steps write the same Z slot, so a high-flying attacker with
 /// `CellRangefinding=` ends on the target's Z — step 3 runs last.
 ///
-/// RESIDUAL (VERA-internal, gamemd equivalent UNCHECKED) — this returns
-/// `Option` where native cannot fail: `GetCoords` and `CellClass::GetCoords`
-/// always answer, so 0x006F77B0 has no "could not build a source" path. Two of
-/// the three `None` arms are new with this function — a `CellRangefinding=`
-/// attacker whose own cell has no resolved terrain, and a high-flying attacker
-/// whose entity target has already left the store. Callers treat `None` as
-/// "no shot" and return BEFORE the range-failure bookkeeping they would
-/// otherwise run (`resolve_attacker_fire`'s `pending_infantry_updates` and idle
-/// switch), so such a shot is dropped one step earlier than a native refusal.
-/// Trigger: an unresolved/off-map cell under a `CellRangefinding=` attacker, or
-/// a target removed between the attacker snapshot and the fire step in the same
-/// tick. Frequency: rare — the entity arm needs a same-tick removal, and the
-/// cell arm an attacker standing where terrain did not resolve. Downstream
-/// risk: bounded to that one tick's bookkeeping; the third arm
-/// (`effective_z_leptons` on the attacker) is pre-existing and every call site
-/// already had it.
+/// Source CellRangefinding now resolves the real-or-Dummy allocation through
+/// the caller's query domain, including signed truncation. The remaining
+/// `Option` is a compatibility boundary for targets removed from the store,
+/// unsupported slopes, or fixtures lacking exact physical Z and terrain;
+/// ordinary live objects retain exact coordinates. General Abstract Cell
+/// target identity/projection remains the separate residual recorded below.
 pub(crate) fn fire_source_coords(
     attacker: &GameEntity,
     target: &TargetKind,
     weapon: &WeaponType,
     entities: &EntityStore,
     terrain: &ResolvedTerrainGrid,
+    rules_context: (&RuleSet, &StringInterner),
+) -> Option<(i64, i64, i64)> {
+    fire_source_coords_in_query(
+        attacker,
+        target,
+        weapon,
+        entities,
+        &NativeCellQuery::canonical(terrain),
+        rules_context,
+    )
+}
+
+/// Source substitutions share the range caller's retained query identity.
+pub(crate) fn fire_source_coords_in_query(
+    attacker: &GameEntity,
+    target: &TargetKind,
+    weapon: &WeaponType,
+    entities: &EntityStore,
+    cells: &NativeCellQuery<'_>,
+    rules_context: (&RuleSet, &StringInterner),
 ) -> Option<(i64, i64, i64)> {
     fire_source_for_target(
         attacker,
         RangeTarget::Abstract(target),
         weapon,
         entities,
-        terrain,
+        cells,
+        rules_context,
     )
 }
 
@@ -699,92 +682,43 @@ fn fire_source_for_target(
     target: RangeTarget<'_>,
     weapon: &WeaponType,
     entities: &EntityStore,
-    terrain: &ResolvedTerrainGrid,
+    cells: &NativeCellQuery<'_>,
+    rules_context: (&RuleSet, &StringInterner),
 ) -> Option<(i64, i64, i64)> {
+    let terrain = cells.terrain();
     let mut x = i64::from(attacker.position.rx) * 256 + attacker.position.sub_x.to_num::<i64>();
     let mut y = i64::from(attacker.position.ry) * 256 + attacker.position.sub_y.to_num::<i64>();
     let mut z = match target {
-        RangeTarget::Abstract(_) => effective_z_leptons(attacker, terrain)?,
+        RangeTarget::Abstract(_) => i64::from(object_world_z_leptons(attacker, Some(terrain))),
         RangeTarget::Cell(_) => {
             i64::from(crate::sim::movement::ground_pose::position_world_coord(&attacker.position).z)
         }
     };
 
     if weapon.cell_rangefinding {
-        // `SAR` after the sign-bias add is a truncate-toward-zero cell index;
-        // VERA cell coordinates are unsigned, so the bias term is always 0.
-        let (cell_x, cell_y, cell_z) = match target {
-            RangeTarget::Abstract(_) => cell_own_coords((x >> 8) as u16, (y >> 8) as u16, terrain)?,
-            RangeTarget::Cell(_) => native_cell_own_coords(
-                terrain.native_cell_identity(((x / 256) as i16, (y / 256) as i16)),
-                terrain,
-            )?,
-        };
+        // 6F7821..6F7845 truncates signed world XY toward zero before the
+        // packed CellCoord lookup5657A0. Source substitution is independent
+        // of whether the target is an Abstract or retained Cell receiver.
+        let (cell_x, cell_y, cell_z) =
+            native_cell_own_coords(cells.lookup(((x / 256) as i16, (y / 256) as i16)), cells)?;
         x = cell_x;
         y = cell_y;
         z = cell_z
             + if attacker.on_bridge {
-                BRIDGE_HEIGHT_DELTA_LEPTONS
+                i64::from(BRIDGE_DECK_HEIGHT_LEPTONS)
             } else {
                 0
             };
     }
 
-    match target {
-        RangeTarget::Abstract(target) if is_high_flying(attacker) => {
-            z = target_own_z_leptons(target, entities, terrain)?;
-        }
-        RangeTarget::Cell(cell) if attacker.lifecycle.cell_marked => {
-            // Actual+54 reads +74 first, then GetHeight's current raw XYZ and
-            // Map ground/OnBridge. Its query can restamp the retained Dummy.
-            let raw = crate::sim::movement::ground_pose::position_world_coord(&attacker.position);
-            let ground = crate::sim::movement::ground_pose::ground_surface_z_at(
-                [raw.x, raw.y],
-                attacker.on_bridge,
-                Some(terrain),
-                None,
-            )?;
-            if i64::from(raw.z.wrapping_sub(ground)) >= HIGH_FLIGHT_THRESHOLD_LEPTONS {
-                z = native_cell_own_coords(cell, terrain)?.2;
-            }
-        }
-        _ => {}
+    if is_high_flying_in_query(attacker, cells, Some(rules_context)) {
+        z = match target {
+            RangeTarget::Abstract(target) => target_own_z_leptons(target, entities, terrain)?,
+            RangeTarget::Cell(cell) => native_cell_own_coords(cell, cells)?.2,
+        };
     }
 
     Some((x, y, z))
-}
-
-/// Resolve an entity's target coords (rx, ry, sub_x, sub_y) — buildings shift
-/// from NW corner cell center to foundation geometric center, others use the
-/// entity's raw position.
-fn resolve_entity_target_coords(
-    t: &GameEntity,
-    rules: &RuleSet,
-    interner: &StringInterner,
-) -> (u16, u16, SimFixed, SimFixed) {
-    if t.category == EntityCategory::Structure {
-        if let Some(obj) = rules.object(interner.resolve(t.type_ref())) {
-            let (fw, fh) = foundation_dimensions(&obj.foundation);
-            let offset_x = (fw.saturating_sub(1) as i32) * 128;
-            let offset_y = (fh.saturating_sub(1) as i32) * 128;
-            let full_x: i32 =
-                t.position.rx as i32 * 256 + t.position.sub_x.to_num::<i32>() + offset_x;
-            let full_y: i32 =
-                t.position.ry as i32 * 256 + t.position.sub_y.to_num::<i32>() + offset_y;
-            return (
-                (full_x / 256) as u16,
-                (full_y / 256) as u16,
-                SimFixed::from_num(full_x % 256),
-                SimFixed::from_num(full_y % 256),
-            );
-        }
-    }
-    (
-        t.position.rx,
-        t.position.ry,
-        t.position.sub_x,
-        t.position.sub_y,
-    )
 }
 
 /// Ground Z in leptons for a cell, plus bridge deck offset if a bridge deck
@@ -795,129 +729,39 @@ fn ground_z_with_bridge_offset(rx: u16, ry: u16, terrain: &ResolvedTerrainGrid) 
     let world_y = i32::from(ry).wrapping_mul(256).wrapping_add(128);
     let mut z = terrain_ground_z_at(terrain, rx, ry, world_x, world_y)?;
     if cell.has_bridge_deck {
-        z += BRIDGE_HEIGHT_DELTA_LEPTONS;
+        z += i64::from(BRIDGE_DECK_HEIGHT_LEPTONS);
     }
     Some(z)
 }
 
-/// `cell+0x140 & 0x100` — "this cell belongs to a bridge". Written by
-/// `CellClass::SetBridgeDirection_NESW` 0x0047E040 / `_NWSE` 0x0047E470, and
-/// the exact word `TechnoClass::InRange` and `GetFireError` both test.
-fn cell_is_bridge(terrain: &ResolvedTerrainGrid, rx: u16, ry: u16) -> bool {
-    terrain
-        .cell(rx, ry)
-        .is_some_and(|cell| cell.bridge_facts.has_structural_bridge())
+/// `TechnoClass::IsOnBridge_ForFiring @ 0x00703B10`, GetFireError T35's
+/// refusal of a Spawner launch: an object not on a deck (OnBridge `+0x8C`,
+/// VERA's `on_bridge`) in or beside a bridge cell
+/// ([`crate::map::bridge_facts::near_bridge`], shared with the render depth
+/// fudge). A missing cell (off the map) answers nothing.
+pub(crate) fn is_on_bridge_for_firing(entity: &GameEntity, terrain: &ResolvedTerrainGrid) -> bool {
+    if entity.on_bridge {
+        return false;
+    }
+    let (rx, ry) = (entity.position.rx, entity.position.ry);
+    let flags = |dx: i32, dy: i32| {
+        let x = u16::try_from(i32::from(rx) + dx).ok()?;
+        let y = u16::try_from(i32::from(ry) + dy).ok()?;
+        terrain.cell(x, y).map(|cell| cell.bridge_facts.raw_flags)
+    };
+    let Some(own) = flags(0, 0) else {
+        return false;
+    };
+    crate::map::bridge_facts::near_bridge(
+        own,
+        [flags(0, 1), flags(0, -1), flags(1, 0), flags(-1, 0)],
+        crate::map::bridge_facts::BRIDGE_FLAG_STRUCTURAL,
+    )
 }
 
-/// `TechnoClass::GetFireError` 0x006FC0B0, the block at 0x006FCBE6.
-///
-/// ```text
-/// MOV CL,[ESI+0x8C]        ; attacker OnBridge
-/// MOV AL,[EBP+0x8C]        ; target   OnBridge
-/// CMP CL,AL ; JZ           ; only runs when they DISAGREE
-/// ...  both objects' own cells (vtable+0x1BC = ObjectClass::GetOccupiedCell
-///      0x005F6960) must carry cell+0x140 & 0x100
-/// ...  and the attacker must NOT satisfy vtable+0x54
-/// -> FireError 5, the shot does not happen
-/// ```
-///
-/// `EBP` is built at 0x006FC177 as `(target->flags_0x14 & 1) ? target : 0` and
-/// the tail is guarded by `TEST EBP,EBP` at 0x006FCAFA, so the block is reached
-/// only when the target narrows to a TechnoClass — a cell target never gets
-/// here.
-///
-/// **vtable+0x54, pinned 2026-08-19.** For `FootClass` (so every infantry and
-/// vehicle) the slot holds `ObjectClass::IsHighFlying` 0x004DE620:
-/// `this->+0x74 != 0 && this->vtable+0x1C8() >= 2 * g_nFootLevelHeightLeptons`,
-/// i.e. height at or above 208 leptons. `AircraftClass` overrides it at
-/// 0x0041B920 and forwards to the same body EXCEPT for two Rules-designated
-/// types, which answer from the spawn manager's `vtable+0x80` instead:
-/// `RulesClass+0x4E0` = `[General] V3RocketType` (key string 0x0083BA88,
-/// written at 0x006713B0) and `RulesClass+0x514` = `[General] DMislType`
-/// (key string 0x0083B9B0, written at 0x0067156A). Both are missile bodies
-/// that are airborne whenever they are alive, so the branch cannot decide this
-/// gate for anything a player commands.
-///
-/// `is_high_flying` is the universal `ObjectClass` predicate — the same body
-/// this slot resolves to — so the exemption now answers for any high-flying
-/// object, not only for the aircraft category. That is a behaviour change AT
-/// THIS SITE: a Jumpjet vehicle or a Rocketeer above 208 leptons used to eat
-/// FireError 5 for a bridge mismatch and now does not, which is what
-/// `vtable+0x54` does at 0x006FCBE6. Do NOT re-scope the predicate to
-/// `EntityCategory::Aircraft` to "tighten" this gate: the stock Kirov `[ZEP]`
-/// is a `[VehicleTypes]` Jumpjet, and a category test grounds it.
-///
-/// This is deliberately NOT folded into `compute_in_range`. The native
-/// `InRange` 0x006F7220 has no such clause; putting it there would be a gate
-/// gamemd's InRange lacks. It is evaluated beside the range test at the fire
-/// site, as its own refusal.
-///
-/// What a refused attacker does NEXT is a separate question. Native consumers
-/// of the FireError code outside 0x006FC0B0 have not been traced — UNCHECKED —
-/// so this only suppresses the shot and leaves target selection and pursuit
-/// exactly as they were.
-pub(crate) fn fire_error_on_bridge_mismatch(
-    attacker: &GameEntity,
-    target: &crate::sim::combat::TargetKind,
-    entities: &EntityStore,
-    terrain: &ResolvedTerrainGrid,
-) -> bool {
-    let crate::sim::combat::TargetKind::Entity(target_id) = target else {
-        return false;
-    };
-    let Some(target_entity) = entities.get(*target_id) else {
-        return false;
-    };
-    if attacker.bridge_occupancy.is_some() == target_entity.bridge_occupancy.is_some() {
-        return false;
-    }
-    if !cell_is_bridge(terrain, attacker.position.rx, attacker.position.ry) {
-        return false;
-    }
-    if !cell_is_bridge(
-        terrain,
-        target_entity.position.rx,
-        target_entity.position.ry,
-    ) {
-        return false;
-    }
-    !is_high_flying(attacker)
-}
-
-/// `TechnoClass::InRange` 0x006F7220, the block at 0x006F75FB reached once the
-/// distance test has already passed:
-///
-/// ```text
-/// cell = MapClass::Get_CellClass_At_Coord(source);
-/// if (cell->flags_140 & 0x100) {                       // 0x006F760C  TEST CH,0x1
-///     top = CellClass::GetGroundHeight(source) + g_nTechnoInRangeStructuralDeckOffsetLeptons;
-///     if (source.Z < top && target.Z >= top)           // 0x006F7627 / 0x006F762B
-///         return false;
-/// }
-/// ```
-///
-/// The attacker is standing in a bridge cell underneath the deck and the target
-/// sits at or above the deck top, so the shot would pass through the deck.
-/// Only the attacker's cell is consulted — the target may be anywhere.
-/// Boundary semantics are asymmetric on purpose: the source test is strict
-/// (`JGE` allows equality), the target test is inclusive.
-fn attacker_under_bridge_targeting_above(
-    src: (i64, i64, i64),
-    target_z_lep: i64,
-    terrain: &ResolvedTerrainGrid,
-) -> bool {
-    let (sx, sy, sz) = src;
-    let rx = (sx / 256) as u16;
-    let ry = (sy / 256) as u16;
-    if !cell_is_bridge(terrain, rx, ry) {
-        return false;
-    }
-    let Some(ground_z) = terrain_ground_z_at(terrain, rx, ry, sx as i32, sy as i32) else {
-        return false;
-    };
-    let bridge_top = ground_z + BRIDGE_HEIGHT_DELTA_LEPTONS;
-    sz < bridge_top && target_z_lep >= bridge_top
-}
+#[cfg(test)]
+#[path = "in_range_cell_tests.rs"]
+mod cell_query_tests;
 
 #[cfg(test)]
 mod tests {
@@ -929,86 +773,64 @@ mod tests {
     use crate::sim::entity_store::EntityStore;
     use crate::sim::game_entity::GameEntity;
     use crate::sim::intern::test_interner;
-    use crate::sim::movement::locomotion::LocomotorSlot;
-    use crate::sim::movement::locomotor::{
-        AirMovePhase, GroundMovePhase, LocomotorState, MovementLayer,
-    };
-    use crate::util::fixed_math::{SIM_ONE, SIM_ZERO, SimFixed};
-    use crate::util::lepton::LEPTONS_PER_LEVEL;
+    use crate::sim::movement::air_movement::{is_high_flying, is_low_flying};
+    use crate::sim::movement::locomotor::LocomotorState;
+    use crate::util::fixed_math::{SIM_ZERO, SimFixed};
+    use crate::util::lepton::{HIGH_FLIGHT_THRESHOLD_LEPTONS, LEPTONS_PER_LEVEL};
 
     fn ground_entity_at_level(level: u8) -> GameEntity {
         let mut e = GameEntity::test_default(1, "MTNK", "Test", 10, 10);
         e.position.z = level;
         e.category = EntityCategory::Unit;
+        e.lifecycle.cell_marked = true;
         e
     }
 
     fn aircraft_at_altitude(altitude_lep: i64) -> GameEntity {
         let mut e = GameEntity::test_default(2, "ORCA", "Test", 10, 10);
         e.category = EntityCategory::Aircraft;
-        e.locomotor = Some(LocomotorState {
-            kind: LocomotorKind::Fly,
-            slot: LocomotorSlot::from_kind(LocomotorKind::Fly),
-            powered: true,
-            piggyback: None,
-            runtime_payload: crate::sim::movement::locomotion::LocomotorRuntimePayload::for_kind(
-                LocomotorKind::Fly,
-                0,
-            ),
-            layer: MovementLayer::Air,
-            phase: GroundMovePhase::Idle,
-            air_phase: AirMovePhase::Cruising,
-            speed_multiplier: SIM_ONE,
-            speed_fraction: SIM_ONE,
-            fly_current_speed: SIM_ZERO,
-            altitude: SimFixed::from_num(altitude_lep as i32),
-            target_altitude: SimFixed::from_num(altitude_lep as i32),
-            climb_rate: SIM_ZERO,
-            jumpjet_speed: SIM_ZERO,
-            jumpjet_accel: SIM_ZERO,
-            jumpjet_current_speed: SIM_ZERO,
-            jumpjet_deviation: 0,
-            jumpjet_crash_speed: SIM_ZERO,
-            jumpjet_turn_rate: 0,
-            balloon_hover: false,
-            hover_attack: false,
-            speed_type: SpeedType::Winged,
-            movement_zone: MovementZone::Fly,
-            rot: 0,
-            air_progress: SIM_ZERO,
-            infantry_wobble_phase: 0.0,
-            subcell_dest: None,
-            hover_throttle: crate::util::fixed_math::SIM_ZERO,
-            hover_speed_request: crate::util::fixed_math::SIM_ZERO,
-            hover_bob_offset: crate::util::fixed_math::SIM_ZERO,
-        });
+        e.lifecycle.cell_marked = true;
+        let mut loco = LocomotorState::for_test_kind(LocomotorKind::Fly);
+        loco.altitude = SimFixed::from_num(altitude_lep as i32);
+        loco.speed_type = SpeedType::Winged;
+        loco.movement_zone = MovementZone::Fly;
+        e.locomotor = Some(loco);
         e
     }
 
     #[test]
-    fn effective_z_ground_unit() {
+    fn world_z_ground_unit() {
         let e = ground_entity_at_level(5);
         let mut terrain = flat_terrain(16, 16);
         terrain.cells[10 * 16 + 10].level = 5;
-        assert_eq!(effective_z_leptons(&e, &terrain), Some(520));
+        assert_eq!(
+            crate::sim::movement::ground_pose::object_world_z_leptons(&e, Some(&terrain)),
+            520
+        );
     }
 
     #[test]
-    fn effective_z_airborne_aircraft_adds_altitude() {
+    fn world_z_airborne_aircraft_adds_altitude() {
         let mut e = aircraft_at_altitude(1500);
         e.position.z = 0;
         let terrain = flat_terrain(16, 16);
-        assert_eq!(effective_z_leptons(&e, &terrain), Some(1500));
+        assert_eq!(
+            crate::sim::movement::ground_pose::object_world_z_leptons(&e, Some(&terrain)),
+            1500
+        );
 
         let mut e2 = aircraft_at_altitude(800);
         e2.position.z = 2;
         let mut elevated = flat_terrain(16, 16);
         elevated.cells[10 * 16 + 10].level = 2;
-        assert_eq!(effective_z_leptons(&e2, &elevated), Some(1008));
+        assert_eq!(
+            crate::sim::movement::ground_pose::object_world_z_leptons(&e2, Some(&elevated)),
+            1008
+        );
     }
 
     #[test]
-    fn gsi_04_03b_effective_z_uses_exact_sloped_subcell_and_air_altitude() {
+    fn gsi_04_03b_world_z_uses_exact_sloped_subcell_and_air_altitude() {
         let mut entity = aircraft_at_altitude(500);
         entity.position.sub_x = SimFixed::from_num(64);
         entity.position.sub_y = SimFixed::from_num(192);
@@ -1016,25 +838,31 @@ mod tests {
         let cell = &mut terrain.cells[10 * 16 + 10];
         cell.level = 2;
         cell.slope_type = 1;
-        assert_eq!(effective_z_leptons(&entity, &terrain), Some(734));
-    }
-
-    #[test]
-    fn gsi_04_03b_effective_z_uses_entity_on_bridge_not_cell_deck() {
-        let mut entity = ground_entity_at_level(0);
-        let mut terrain = flat_terrain(16, 16);
-        terrain.cells[10 * 16 + 10].has_bridge_deck = true;
-
-        assert_eq!(effective_z_leptons(&entity, &terrain), Some(0));
-        entity.on_bridge = true;
         assert_eq!(
-            effective_z_leptons(&entity, &terrain),
-            Some(i64::from(BRIDGE_DECK_HEIGHT_LEPTONS))
+            crate::sim::movement::ground_pose::object_world_z_leptons(&entity, Some(&terrain)),
+            734
         );
     }
 
     #[test]
-    fn gsi_04_15_effective_z_prefers_exact_signed_world_coordinate() {
+    fn gsi_04_03b_world_z_uses_entity_on_bridge_not_cell_deck() {
+        let mut entity = ground_entity_at_level(0);
+        let mut terrain = flat_terrain(16, 16);
+        terrain.cells[10 * 16 + 10].has_bridge_deck = true;
+
+        assert_eq!(
+            crate::sim::movement::ground_pose::object_world_z_leptons(&entity, Some(&terrain)),
+            0
+        );
+        entity.on_bridge = true;
+        assert_eq!(
+            crate::sim::movement::ground_pose::object_world_z_leptons(&entity, Some(&terrain)),
+            crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS
+        );
+    }
+
+    #[test]
+    fn gsi_04_15_world_z_prefers_exact_signed_world_coordinate() {
         let mut entity = aircraft_at_altitude(1500);
         entity.position.rx = 600;
         entity.position.ry = 600;
@@ -1043,40 +871,58 @@ mod tests {
         entity.on_bridge = true;
 
         let terrain = flat_terrain(1, 1);
-        assert_eq!(effective_z_leptons(&entity, &terrain), Some(-137));
+        assert_eq!(
+            crate::sim::movement::ground_pose::object_world_z_leptons(&entity, Some(&terrain)),
+            -137
+        );
     }
 
     #[test]
-    fn is_low_flying_only_for_airborne_objects() {
+    fn low_flight_includes_marked_ground_objects_below_the_native_threshold() {
         let ground = ground_entity_at_level(5);
-        assert!(!is_low_flying(&ground));
+        assert!(is_low_flying(&ground, None, None));
 
         let grounded_air = aircraft_at_altitude(0);
-        assert!(!is_low_flying(&grounded_air));
+        assert!(is_low_flying(&grounded_air, None, None));
 
         let low = aircraft_at_altitude(HIGH_FLIGHT_THRESHOLD_LEPTONS - 1);
-        assert!(is_low_flying(&low));
+        assert!(is_low_flying(&low, None, None));
 
         let high = aircraft_at_altitude(1500);
-        assert!(!is_low_flying(&high));
+        assert!(!is_low_flying(&high, None, None));
     }
 
     #[test]
     fn is_high_flying_inverse_threshold() {
         let just_below = aircraft_at_altitude(HIGH_FLIGHT_THRESHOLD_LEPTONS - 1);
-        assert!(!is_high_flying(&just_below));
+        assert!(!is_high_flying(&just_below, None, None));
 
         let at_threshold = aircraft_at_altitude(HIGH_FLIGHT_THRESHOLD_LEPTONS);
-        assert!(is_high_flying(&at_threshold));
+        assert!(is_high_flying(&at_threshold, None, None));
 
         let cruise = aircraft_at_altitude(1500);
-        assert!(is_high_flying(&cruise));
+        assert!(is_high_flying(&cruise, None, None));
 
         let ground = ground_entity_at_level(5);
-        assert!(!is_high_flying(&ground));
+        assert!(!is_high_flying(&ground, None, None));
     }
 
-    /// `ObjectClass::IsHighFlying` 0x004DE620 and `ObjectClass::IsLowFlying`
+    #[test]
+    fn unmarked_objects_are_neither_low_nor_high_flying() {
+        for altitude in [
+            0,
+            HIGH_FLIGHT_THRESHOLD_LEPTONS - 1,
+            HIGH_FLIGHT_THRESHOLD_LEPTONS,
+            1500,
+        ] {
+            let mut entity = aircraft_at_altitude(altitude);
+            entity.lifecycle.cell_marked = false;
+            assert!(!is_low_flying(&entity, None, None));
+            assert!(!is_high_flying(&entity, None, None));
+        }
+    }
+
+    /// `ObjectClass::IsHighFlying` 0x005F6B90 and `ObjectClass::IsLowFlying`
     /// 0x005F6B60 live on `ObjectClass`, so they answer for a `UnitClass` too.
     /// The stock Kirov `[ZEP]` is a `[VehicleTypes]` entry, so an aircraft-only
     /// gate here would have called a Jumpjet at 750 leptons "grounded".
@@ -1084,25 +930,26 @@ mod tests {
     fn flight_predicates_are_not_scoped_to_the_aircraft_category() {
         let cruising = jumpjet_unit_at_altitude(KIROV_JUMPJET_HEIGHT_LEPTONS);
         assert_eq!(cruising.category, EntityCategory::Unit);
-        assert!(is_high_flying(&cruising));
-        assert!(!is_low_flying(&cruising));
+        assert!(is_high_flying(&cruising, None, None));
+        assert!(!is_low_flying(&cruising, None, None));
 
         let climbing = jumpjet_unit_at_altitude(HIGH_FLIGHT_THRESHOLD_LEPTONS - 1);
-        assert!(is_low_flying(&climbing));
-        assert!(!is_high_flying(&climbing));
+        assert!(is_low_flying(&climbing, None, None));
+        assert!(!is_high_flying(&climbing, None, None));
 
         let landed = jumpjet_unit_at_altitude(0);
-        assert!(!is_low_flying(&landed));
-        assert!(!is_high_flying(&landed));
+        assert!(is_low_flying(&landed, None, None));
+        assert!(!is_high_flying(&landed, None, None));
     }
 
     // ─── Fixtures for compute_in_range tests ────────────────────────────
 
-    fn flat_terrain(w: u16, h: u16) -> ResolvedTerrainGrid {
-        let cells: Vec<ResolvedTerrainCell> = (0..h)
-            .flat_map(|ry| (0..w).map(move |rx| default_cell(rx, ry)))
-            .collect();
-        ResolvedTerrainGrid::from_cells(w, h, cells)
+    pub(super) fn flat_terrain(w: u16, h: u16) -> ResolvedTerrainGrid {
+        crate::map::resolved_terrain::test_grid(
+            w,
+            h,
+            crate::map::resolved_terrain::test_unclassified_cell,
+        )
     }
 
     #[test]
@@ -1111,7 +958,7 @@ mod tests {
             "../../../tools/spatial_oracle/walk_cell_range.json"
         ))
         .unwrap();
-        let rules = rules_with_weapon(
+        let mut rules = rules_with_weapon(
             "Range=3\nProjectile=Bullet\nWarhead=WH\n[Bullet]\nArcing=no\nSubjectToWalls=no\nSubjectToCliffs=no",
             "",
             "",
@@ -1120,6 +967,8 @@ mod tests {
         let entities = EntityStore::new();
         for (index, row) in rows.as_array().unwrap().iter().enumerate() {
             let input = &row["input"];
+            rules.garrison_rules.open_topped_range_bonus =
+                input["open_topped_bonus"].as_i64().unwrap_or(2) as i32;
             let mut terrain = flat_terrain(32, 32);
             terrain
                 .set_projectile_water_set_base(input["water_base"].as_i64().unwrap_or(314) as i32);
@@ -1162,6 +1011,12 @@ mod tests {
             actor.position.exact_z_leptons = Some(z);
             actor.lifecycle.cell_marked = input["marked"].as_bool().unwrap_or(false);
             actor.on_bridge = input["on_bridge"].as_bool().unwrap_or(false);
+            if input["open_topped"] == true {
+                actor.passenger_role = crate::sim::passenger::PassengerRole::Inside {
+                    transport_id: 2,
+                    open_topped: true,
+                };
+            }
             let mut weapon = rules.weapon("GUN").unwrap().clone();
             weapon.range_leptons = input["range"].as_i64().unwrap_or(768) as i32;
             weapon.minimum_range_leptons = input["minimum"].as_i64().unwrap_or(0) as i32;
@@ -1176,8 +1031,16 @@ mod tests {
             );
             let identity = terrain.native_cell_identity(coord);
             let range_target = RangeTarget::Cell(identity);
-            let source =
-                fire_source_for_target(&actor, range_target, &weapon, &entities, &terrain).unwrap();
+            let cells = NativeCellQuery::canonical(&terrain);
+            let source = fire_source_for_target(
+                &actor,
+                range_target,
+                &weapon,
+                &entities,
+                &cells,
+                (&rules, &interner),
+            )
+            .unwrap();
             let native_source = row["events"]
                 .as_array()
                 .unwrap()
@@ -1190,7 +1053,7 @@ mod tests {
                 "row {index}: source"
             );
             if !row["target_geometry"].is_null() {
-                let geometry = native_cell_range_coords(identity, &terrain).unwrap();
+                let geometry = native_cell_range_coords(identity, &cells).unwrap();
                 assert_eq!(
                     serde_json::json!([geometry.0, geometry.1, geometry.2]),
                     row["target_geometry"],
@@ -1221,64 +1084,6 @@ mod tests {
         }
     }
 
-    fn default_cell(rx: u16, ry: u16) -> ResolvedTerrainCell {
-        ResolvedTerrainCell {
-            rx,
-            ry,
-            source_tile_index: 0,
-            source_sub_tile: 0,
-            final_tile_index: 0,
-            final_sub_tile: 0,
-            is_wood_bridge_repair_tile: false,
-            level: 0,
-            filled_clear: true,
-            tileset_index: Some(0),
-            land_type: 0,
-            yr_cell_land_type: 0,
-            slope_type: 0,
-            template_height: 0,
-            render_offset_x: 0,
-            render_offset_y: 0,
-            terrain_class: Default::default(),
-            speed_costs: Default::default(),
-            is_water: false,
-            is_cliff_like: false,
-            is_rough: false,
-            is_road: false,
-            height_in_pixels: 0,
-            variant: 0,
-            has_ramp: false,
-            canonical_ramp: None,
-            ground_walk_blocked: false,
-            terrain_object_blocks: false,
-            terrain_object_occupation: None,
-            overlay_blocks: false,
-            overlay_zone_type: None,
-            outside_playfield: false,
-            zone_type: 0,
-            base_ground_walk_blocked: false,
-            base_build_blocked: false,
-            base_land_type: 0,
-            base_yr_cell_land_type: 0,
-            base_terrain_class: Default::default(),
-            base_speed_costs: Default::default(),
-            build_blocked: false,
-            has_bridge_deck: false,
-            bridge_walkable: false,
-            bridge_transition: false,
-            bridge_deck_level: 0,
-            bridge_layer: None,
-            bridge_facts: crate::map::bridge_facts::BridgeCellFacts::default(),
-            tube_index: None,
-            radar_left: [0; 3],
-            radar_right: [0; 3],
-            accepts_smudge: true,
-            allows_tiberium: false,
-            has_damaged_data: false,
-            bridgehead_anchor_class_at_load: None,
-        }
-    }
-
     fn rules_with_weapon(weapon_ini: &str, attacker_ini: &str, target_ini: &str) -> RuleSet {
         let ini_str = format!(
             "[InfantryTypes]\n\n\
@@ -1298,6 +1103,7 @@ mod tests {
         let mut e = GameEntity::test_default(100, type_ref, "Attackers", rx, ry);
         e.position.z = level;
         e.category = EntityCategory::Unit;
+        e.lifecycle.cell_marked = true;
         e
     }
 
@@ -1305,6 +1111,7 @@ mod tests {
         let mut e = GameEntity::test_default(200, type_ref, "Defenders", rx, ry);
         e.position.z = level;
         e.category = EntityCategory::Unit;
+        e.lifecycle.cell_marked = true;
         e
     }
 
@@ -1312,6 +1119,7 @@ mod tests {
         let mut e = GameEntity::test_default(300, type_ref, "Defenders", rx, ry);
         e.position.z = 0;
         e.category = EntityCategory::Structure;
+        e.lifecycle.cell_marked = true;
         e
     }
 
@@ -1557,12 +1365,13 @@ mod tests {
     #[test]
     fn gsi_04_03b_low_flight_snap_uses_exact_target_subcell() {
         let rules = rules_with_weapon("Damage=1\nROF=20\nRange=4\nWarhead=WH", "", "");
-        let interner = test_interner();
         let mut target = aircraft_target(4, 0, 0, HIGH_FLIGHT_THRESHOLD_LEPTONS - 1, "TGT");
         target.position.sub_x = SimFixed::from_num(3);
         target.position.sub_y = SIM_ZERO;
         let mut entities = EntityStore::new();
         entities.insert(target);
+        // Snapshot after the target has interned its Aircraft type identity.
+        let interner = test_interner();
         let mut terrain = flat_terrain(8, 1);
         terrain.cells[4].slope_type = 1;
 
@@ -1571,7 +1380,7 @@ mod tests {
             &entities,
             &rules,
             &interner,
-            &terrain,
+            &NativeCellQuery::canonical(&terrain),
         )
         .expect("supported target terrain");
         assert_eq!(target_z, 1, "slope 1 at local X=3 is one lepton high");
@@ -1580,10 +1389,11 @@ mod tests {
     #[test]
     fn gsi_04_03b_low_flight_bridge_snap_requires_structural_flag() {
         let rules = rules_with_weapon("Damage=1\nROF=20\nRange=4\nWarhead=WH", "", "");
-        let interner = test_interner();
         let target = aircraft_target(0, 0, 0, HIGH_FLIGHT_THRESHOLD_LEPTONS - 1, "TGT");
         let mut entities = EntityStore::new();
         entities.insert(target);
+        // Snapshot after the target has interned its Aircraft type identity.
+        let interner = test_interner();
         let mut terrain = flat_terrain(1, 1);
         terrain.cells[0].has_bridge_deck = true;
 
@@ -1592,7 +1402,7 @@ mod tests {
             &entities,
             &rules,
             &interner,
-            &terrain,
+            &NativeCellQuery::canonical(&terrain),
         )
         .expect("supported non-structural terrain")
         .2;
@@ -1607,11 +1417,11 @@ mod tests {
             &entities,
             &rules,
             &interner,
-            &terrain,
+            &NativeCellQuery::canonical(&terrain),
         )
         .expect("supported structural terrain")
         .2;
-        assert_eq!(structural_z, BRIDGE_HEIGHT_DELTA_LEPTONS);
+        assert_eq!(structural_z, i64::from(BRIDGE_DECK_HEIGHT_LEPTONS));
     }
 
     #[test]
@@ -1622,7 +1432,7 @@ mod tests {
         terrain.cells[0].has_bridge_deck = true;
         assert_eq!(
             ground_z_with_bridge_offset(0, 0, &terrain),
-            Some(52 + BRIDGE_HEIGHT_DELTA_LEPTONS)
+            Some(52 + i64::from(BRIDGE_DECK_HEIGHT_LEPTONS))
         );
     }
 
@@ -1686,7 +1496,9 @@ mod tests {
         let weapon = rules.weapon("GUN").expect("weapon");
 
         let attacker = ground_attacker(6, 1, 0, "ATKR");
-        let target = building_target(0, 0, "BLDG");
+        let mut target = building_target(0, 0, "BLDG");
+        // Construction stamps the type's `Foundation=4x2`.
+        target.foundation = "4x2".to_string();
         let mut entities = EntityStore::new();
         entities.insert(target);
         let interner = test_interner();
@@ -1849,8 +1661,15 @@ mod tests {
         entities.insert(target);
         let weapon = rules.weapon("BlimpBomb").expect("weapon");
         let target = TargetKind::Entity(200);
-        let src =
-            fire_source_coords(kirov, &target, weapon, &entities, &terrain).expect("source coords");
+        let src = fire_source_coords(
+            kirov,
+            &target,
+            weapon,
+            &entities,
+            &terrain,
+            (&rules, &test_interner()),
+        )
+        .expect("source coords");
         compute_in_range(
             kirov,
             src,
@@ -1927,6 +1746,7 @@ mod tests {
                 without.weapon("BlimpBomb").unwrap(),
                 &entities,
                 &terrain,
+                (&without, &test_interner()),
             ),
             Some((
                 5 * 256 + 3,
@@ -1944,6 +1764,7 @@ mod tests {
                 with.weapon("BlimpBomb").unwrap(),
                 &entities,
                 &terrain,
+                (&with, &test_interner()),
             ),
             Some((5 * 256 + 128, 5 * 256 + 128, 0)),
             "the key replaces X/Y with the cell centre and Z with the ground"
@@ -1965,15 +1786,31 @@ mod tests {
         ground.position.rx = 5;
         ground.position.ry = 5;
         assert_eq!(
-            fire_source_coords(&ground, &target, weapon, &entities, &terrain).map(|(_, _, z)| z),
+            fire_source_coords(
+                &ground,
+                &target,
+                weapon,
+                &entities,
+                &terrain,
+                (&rules, &test_interner()),
+            )
+            .map(|(_, _, z)| z),
             Some(0),
             "standing under the deck keeps ground Z"
         );
 
         ground.on_bridge = true;
         assert_eq!(
-            fire_source_coords(&ground, &target, weapon, &entities, &terrain).map(|(_, _, z)| z),
-            Some(BRIDGE_HEIGHT_DELTA_LEPTONS)
+            fire_source_coords(
+                &ground,
+                &target,
+                weapon,
+                &entities,
+                &terrain,
+                (&rules, &test_interner()),
+            )
+            .map(|(_, _, z)| z),
+            Some(i64::from(BRIDGE_DECK_HEIGHT_LEPTONS))
         );
     }
 
@@ -1994,7 +1831,15 @@ mod tests {
         let target = TargetKind::Entity(200);
 
         let cruising = kirov_at(5, 5, KIROV_JUMPJET_HEIGHT_LEPTONS);
-        let src = fire_source_coords(&cruising, &target, weapon, &entities, &terrain).unwrap();
+        let src = fire_source_coords(
+            &cruising,
+            &target,
+            weapon,
+            &entities,
+            &terrain,
+            (&rules, &test_interner()),
+        )
+        .unwrap();
         assert_eq!(
             src,
             (5 * 256 + 128, 5 * 256 + 128, 0),
@@ -2015,8 +1860,15 @@ mod tests {
         // The same airship one lepton below the split is NOT high-flying, so
         // native charges its altitude and the shot is refused.
         let climbing = kirov_at(5, 5, HIGH_FLIGHT_THRESHOLD_LEPTONS - 1);
-        let climbing_src =
-            fire_source_coords(&climbing, &target, weapon, &entities, &terrain).unwrap();
+        let climbing_src = fire_source_coords(
+            &climbing,
+            &target,
+            weapon,
+            &entities,
+            &terrain,
+            (&rules, &test_interner()),
+        )
+        .unwrap();
         assert_eq!(climbing_src.2, 5 * 104 + HIGH_FLIGHT_THRESHOLD_LEPTONS - 1);
         assert!(
             !compute_in_range(
@@ -2105,7 +1957,9 @@ mod tests {
     /// 16x16 grid whose listed cells carry `CellClass+0x140` bit 0x100.
     fn terrain_with_bridge_cells(cells_on_bridge: &[(u16, u16)]) -> ResolvedTerrainGrid {
         let mut cells: Vec<ResolvedTerrainCell> = (0..16)
-            .flat_map(|ry| (0..16).map(move |rx| default_cell(rx, ry)))
+            .flat_map(|ry| {
+                (0..16).map(move |rx| crate::map::resolved_terrain::test_unclassified_cell(rx, ry))
+            })
             .collect();
         for &(rx, ry) in cells_on_bridge {
             let idx = ry as usize * 16 + rx as usize;
@@ -2171,7 +2025,7 @@ mod tests {
         let on_deck = (
             5i64 * 256 + 128,
             5i64 * 256 + 128,
-            BRIDGE_HEIGHT_DELTA_LEPTONS,
+            i64::from(BRIDGE_DECK_HEIGHT_LEPTONS),
         );
         assert!(
             in_range_at(
@@ -2207,7 +2061,9 @@ mod tests {
     #[test]
     fn inrange_bridge_gate_follows_flag_0x100_not_the_overlay_deck() {
         let mut cells: Vec<ResolvedTerrainCell> = (0..16)
-            .flat_map(|ry| (0..16).map(move |rx| default_cell(rx, ry)))
+            .flat_map(|ry| {
+                (0..16).map(move |rx| crate::map::resolved_terrain::test_unclassified_cell(rx, ry))
+            })
             .collect();
         let idx = 5 * 16 + 5;
         cells[idx].has_bridge_deck = true;
@@ -2250,238 +2106,91 @@ mod tests {
         );
     }
 
-    /// `TechnoClass::GetFireError` 0x006FC0B0 block at 0x006FCBE6, ported as
-    /// `fire_error_on_bridge_mismatch`. One test per term of the conjunction.
-    fn bridge_pair_terrain() -> ResolvedTerrainGrid {
-        let mut terrain = flat_terrain(16, 16);
-        for (rx, ry) in [(10u16, 10u16), (11, 10)] {
-            let idx = ry as usize * 16 + rx as usize;
-            terrain.cells[idx].bridge_facts.raw_flags |=
-                crate::map::bridge_facts::BRIDGE_FLAG_STRUCTURAL;
-        }
-        terrain
-    }
-
-    /// Attacker at (10,10), target at (11,10); `on_deck` picks which of the
-    /// two carries the OnBridge byte.
-    fn mismatched_pair(attacker_on_deck: bool, target_on_deck: bool) -> EntityStore {
-        let mut store = EntityStore::new();
-        let mut attacker = GameEntity::test_default(1, "MTNK", "Test", 10, 10);
-        attacker.category = EntityCategory::Unit;
-        if attacker_on_deck {
-            attacker.bridge_occupancy =
-                Some(crate::sim::components::BridgeOccupancy { deck_level: 4 });
-        }
-        let mut target = GameEntity::test_default(2, "MTNK", "Test", 11, 10);
-        target.category = EntityCategory::Unit;
-        if target_on_deck {
-            target.bridge_occupancy =
-                Some(crate::sim::components::BridgeOccupancy { deck_level: 4 });
-        }
-        store.insert(attacker);
-        store.insert(target);
-        store
-    }
-
+    /// `IsOnBridge_ForFiring @ 0x00703B10` over its five cells: the own cell
+    /// needs the bridge flag; S and N neighbours need it with the axis bit
+    /// `0x800`, E and W without; an object on the deck is exempt.
     #[test]
-    fn getfireerror_refuses_a_shot_from_the_deck_down_at_a_unit_beneath_it() {
-        // The half `InRange` 0x006F75FB does NOT cover: the attacker is on the
-        // deck, so its own under-bridge height clause never fires.
-        let terrain = bridge_pair_terrain();
-        let store = mismatched_pair(true, false);
-        let attacker = store.get(1).unwrap();
-        assert!(fire_error_on_bridge_mismatch(
-            attacker,
-            &crate::sim::combat::TargetKind::Entity(2),
-            &store,
-            &terrain,
+    fn a_spawner_beside_a_span_along_that_side_is_on_bridge_for_firing() {
+        use crate::map::bridge_facts::{BRIDGE_FLAG_DIRECTION_ZERO, BRIDGE_FLAG_STRUCTURAL};
+        let unit = GameEntity::test_default(1, "MTNK", "Test", 10, 10);
+        let with = |cells: &[((u16, u16), u32)]| {
+            let mut terrain = flat_terrain(16, 16);
+            for &((rx, ry), flags) in cells {
+                terrain.cells[ry as usize * 16 + rx as usize]
+                    .bridge_facts
+                    .raw_flags = flags;
+            }
+            terrain
+        };
+        let span = BRIDGE_FLAG_STRUCTURAL | BRIDGE_FLAG_DIRECTION_ZERO;
+        assert!(!is_on_bridge_for_firing(&unit, &with(&[])));
+        assert!(is_on_bridge_for_firing(
+            &unit,
+            &with(&[((10, 10), BRIDGE_FLAG_STRUCTURAL)])
+        ));
+        for north_south in [(10, 11), (10, 9)] {
+            assert!(is_on_bridge_for_firing(
+                &unit,
+                &with(&[(north_south, span)])
+            ));
+            assert!(!is_on_bridge_for_firing(
+                &unit,
+                &with(&[(north_south, BRIDGE_FLAG_STRUCTURAL)])
+            ));
+        }
+        for east_west in [(11, 10), (9, 10)] {
+            assert!(is_on_bridge_for_firing(
+                &unit,
+                &with(&[(east_west, BRIDGE_FLAG_STRUCTURAL)])
+            ));
+            assert!(!is_on_bridge_for_firing(&unit, &with(&[(east_west, span)])));
+        }
+        // Diagonals are not asked.
+        assert!(!is_on_bridge_for_firing(&unit, &with(&[((11, 11), span)])));
+        let mut on_deck = unit.clone();
+        on_deck.on_bridge = true;
+        assert!(!is_on_bridge_for_firing(
+            &on_deck,
+            &with(&[((10, 10), BRIDGE_FLAG_STRUCTURAL)])
         ));
     }
 
-    #[test]
-    fn getfireerror_refuses_the_shot_from_underneath_as_well() {
-        let terrain = bridge_pair_terrain();
-        let store = mismatched_pair(false, true);
-        let attacker = store.get(1).unwrap();
-        assert!(fire_error_on_bridge_mismatch(
-            attacker,
-            &crate::sim::combat::TargetKind::Entity(2),
-            &store,
-            &terrain,
-        ));
-    }
-
-    #[test]
-    fn getfireerror_allows_the_shot_when_both_agree_on_onbridge() {
-        // CMP CL,AL / JZ — equal OnBridge bytes skip the whole block.
-        let terrain = bridge_pair_terrain();
-        for both in [false, true] {
-            let store = mismatched_pair(both, both);
-            let attacker = store.get(1).unwrap();
-            assert!(
-                !fire_error_on_bridge_mismatch(
-                    attacker,
-                    &crate::sim::combat::TargetKind::Entity(2),
-                    &store,
-                    &terrain,
-                ),
-                "both on_bridge={both} must not refuse"
-            );
-        }
-    }
-
-    #[test]
-    fn getfireerror_needs_both_cells_to_carry_the_structural_flag() {
-        // Same mismatch, but one of the two cells is ordinary ground.
-        let store = mismatched_pair(true, false);
-        let attacker = store.get(1).unwrap();
-        for drop_idx in [10usize * 16 + 10, 10 * 16 + 11] {
-            let mut terrain = bridge_pair_terrain();
-            terrain.cells[drop_idx].bridge_facts.raw_flags = 0;
-            assert!(
-                !fire_error_on_bridge_mismatch(
-                    attacker,
-                    &crate::sim::combat::TargetKind::Entity(2),
-                    &store,
-                    &terrain,
-                ),
-                "cell {drop_idx} without 0x100 must not refuse"
-            );
-        }
-    }
-
-    #[test]
-    fn getfireerror_exempts_a_high_flying_attacker() {
-        // vtable+0x54. An aircraft at or above 2 level heights is exempt; the
-        // same aircraft sitting on the deck is not.
-        let terrain = bridge_pair_terrain();
-        let mut store = EntityStore::new();
-        let mut flyer = aircraft_at_altitude(HIGH_FLIGHT_THRESHOLD_LEPTONS);
-        flyer.position.rx = 10;
-        flyer.position.ry = 10;
-        let mut target = GameEntity::test_default(3, "MTNK", "Test", 11, 10);
-        target.category = EntityCategory::Unit;
-        target.bridge_occupancy = Some(crate::sim::components::BridgeOccupancy { deck_level: 4 });
-        store.insert(flyer);
-        store.insert(target);
-        let flyer_ref = store.get(2).unwrap();
-        assert!(!fire_error_on_bridge_mismatch(
-            flyer_ref,
-            &crate::sim::combat::TargetKind::Entity(3),
-            &store,
-            &terrain,
-        ));
-    }
-
-    #[test]
-    fn getfireerror_skips_a_cell_target() {
-        // EBP is null unless the target narrows to a TechnoClass, and the tail
-        // is guarded by TEST EBP,EBP at 0x006FCAFA.
-        let terrain = bridge_pair_terrain();
-        let store = mismatched_pair(true, false);
-        let attacker = store.get(1).unwrap();
-        assert!(!fire_error_on_bridge_mismatch(
-            attacker,
-            &crate::sim::combat::TargetKind::Cell(11, 10),
-            &store,
-            &terrain,
-        ));
-    }
-
-    /// RESIDUAL — gamemd address 0x006FC0B0, fall-through of the same block at
-    /// 0x006FCC5D–0x006FCCBA.
-    ///
-    /// Mechanism: when the warhead byte at `WeaponType+0xAC` `+0x159` is set
-    /// and `abs(attacker.Z - target.Z)` exceeds
-    /// `2 * g_nTechnoInRangeLevelHeightLeptons` (`LEA EDX,[ECX+ECX]` at
-    /// 0x006FCCA7), the call returns FireError 5 at 0x006FCCAE. Reached under
-    /// the same `OnBridge`-mismatch guard as the gate above.
-    ///
-    /// Trigger: a warhead whose `Parasite=` flag is set, fired across a
-    /// deck at a height difference over two level heights. The byte is
-    /// written by `WarheadTypeClass::ReadINI` at 0x0075D84E from the key
-    /// string at 0x0081717C, which `read_memory` gives as `Parasite`.
-    ///
-    /// Effect: unmodelled; VERA allows shots gamemd refuses.
-    ///
-    /// Frequency: bounded to the three stock warheads carrying
-    /// `Parasite=yes` in `ini/rulesmd.ini` - `[Parasite]` (Terror Drone),
-    /// `[ParasiteDog]` (attack dog) and `[ParasitePlus]` (Giant Squid) -
-    /// each attacking across a bridge deck. Uncommon, but all three are
-    /// ordinary skirmish units rather than edge cases.
-    #[test]
-    #[ignore = "gamemd 0x006FCCAE Parasite-warhead height clause across a deck is unported"]
-    fn getfireerror_bridge_height_clause_is_unported() {
-        panic!("unimplemented: GetFireError 0x006FCCAE warhead +0x159 height clause");
-    }
-
-    /// RESIDUAL — gamemd address 0x006FC612, calling
-    /// `TechnoClass::IsOnBridge_ForFiring` 0x00703B10.
-    ///
-    /// Mechanism: `MOV AL,[EDI+0x131]` at 0x006FC606 gates on the weapon-type
-    /// byte that `WeaponTypeClass::ReadINI` 0x007720FA fills from the INI key
-    /// `Spawner=` (key string at 0x00849538); the call to
-    /// `SpawnManagerClass::CountAliveSpawns` 0x006B7D30 just after confirms it.
-    /// When set, `IsOnBridge_ForFiring` non-zero returns FireError 6 at
-    /// 0x006FCD29. That predicate is NOT the mismatch gate: it early-outs to 0
-    /// when the object's own `OnBridge` byte +0x8C is set, then tests the
-    /// object's own cell for flag 0x100 plus four neighbour cells, each
-    /// qualified by that neighbour's orientation bit 0x800 matching the axis it
-    /// lies on.
-    ///
-    /// Trigger: a `Spawner=` unit (aircraft carrier, Boomer sub) standing
-    /// UNDER or immediately beside a bridge deck cell. Not on the deck — the
-    /// +0x8C early-out exempts a unit that is actually on it.
-    ///
-    /// Effect: gamemd refuses to launch spawns; VERA launches them.
-    ///
-    /// Frequency: occasional — needs a naval or amphibious map with a bridge
-    /// over water and a spawner unit parked at it.
-    #[test]
-    #[ignore = "gamemd 0x006FC612 blocks spawner weapons on/beside a bridge; VERA does not"]
-    fn getfireerror_spawner_bridge_block_is_unported() {
-        panic!("unimplemented: GetFireError 0x006FC612 IsOnBridge_ForFiring spawner gate");
-    }
-
-    /// RESIDUAL — gamemd address 0x006F7220, the arcing branch of
-    /// `TechnoClass::InRange`.
-    ///
-    /// Branch selector: `0x006F73F6 MOV CL,[EDX+0x29B]` with `EDX` = the
-    /// projectile at `WeaponType+0xA0`. `BulletTypeClass::ReadINI` 0x0046BFC4
-    /// fills +0x29B from the INI key `Arcing=` (key string at 0x0081B130). It
-    /// is NOT `WeaponType+0xB8`, which is read at 0x006F737F and gates only the
-    /// MinimumRange test.
-    ///
-    /// Clause, at 0x006F74D7–0x006F7504: the arc/slope test at 0x0048ABC0 must
-    /// pass in every case, and when it does, the shot is additionally refused
-    /// unless the TARGET's cell has flag 0x100 clear, or
-    /// `target.Z - source.Z < 3 * g_nTechnoInRangeLevelHeightLeptons`. A bridge
-    /// cell under the target therefore TIGHTENS the check with an extra height
-    /// ceiling; it does not relax it. Note this reads the target's cell, the
-    /// opposite of the gate at 0x006F75FB in the same function, which reads the
-    /// source's.
-    ///
-    /// Trigger: an arcing weapon firing at something standing on a bridge
-    /// deck. The arcing population is every cannon tank — `Cannon`,
-    /// `Ballistic`, `FlakTProj`, `GrandCannonBall`, `Lobbed`, `Lobbed2` and
-    /// `DogShard` — NOT the V3/Dreadnought/Cruise launchers, which fire
-    /// `InvisibleHigh` and carry no `Arcing=` key. See
-    /// `compute_in_range_arcing_2d` for the full weapon list.
-    ///
-    /// Effect: `compute_in_range_arcing_2d` is a documented 2D fallthrough stub
-    /// with neither the slope test nor this ceiling, so VERA allows arcing
-    /// shots at deck targets that gamemd refuses.
-    ///
-    /// Frequency: every arcing shot at a unit on a bridge — i.e. Grizzly,
-    /// Rhino, Apocalypse, Lasher, Tank Destroyer, Flak Track and Destroyer
-    /// fire, not a siege-unit footnote. Bounded by the fact that the whole arc
-    /// check is stubbed, so this clause is downstream of a larger unported
-    /// mechanism and cannot be fixed on its own.
-    #[test]
-    #[ignore = "gamemd 0x006F74D7 adds a height ceiling for arcing shots at bridge-cell targets; VERA's arcing path is a 2D stub"]
-    fn inrange_arcing_branch_bridge_ceiling_is_unported() {
-        panic!("unimplemented: InRange 0x006F74D7 arcing bridge height ceiling");
-    }
+    // RESIDUAL — gamemd address 0x006F7220, the arcing branch of
+    // `TechnoClass::InRange`.
+    //
+    // Branch selector: `0x006F73F6 MOV CL,[EDX+0x29B]` with `EDX` = the
+    // projectile at `WeaponType+0xA0`. `BulletTypeClass::ReadINI` 0x0046BFC4
+    // fills +0x29B from the INI key `Arcing=` (key string at 0x0081B130). It
+    // is NOT `WeaponType+0xB8`, which is read at 0x006F737F and gates only the
+    // MinimumRange test.
+    //
+    // Clause, at 0x006F74D7–0x006F7504: the arc/slope test at 0x0048ABC0 must
+    // pass in every case, and when it does, the shot is additionally refused
+    // unless the TARGET's cell has flag 0x100 clear, or
+    // `target.Z - source.Z < 3 * g_nTechnoInRangeLevelHeightLeptons`. A bridge
+    // cell under the target therefore TIGHTENS the check with an extra height
+    // ceiling; it does not relax it. Note this reads the target's cell, the
+    // opposite of the gate at 0x006F75FB in the same function, which reads the
+    // source's.
+    //
+    // Trigger: an arcing weapon firing at something standing on a bridge
+    // deck. The arcing population is every cannon tank — `Cannon`,
+    // `Ballistic`, `FlakTProj`, `GrandCannonBall`, `Lobbed`, `Lobbed2` and
+    // `DogShard` — NOT the V3/Dreadnought/Cruise launchers, which fire
+    // `InvisibleHigh` and carry no `Arcing=` key. See
+    // `compute_in_range_arcing_2d` for the full weapon list.
+    //
+    // Effect: `compute_in_range_arcing_2d` is a documented 2D fallthrough stub
+    // with neither the slope test nor this ceiling, so VERA allows arcing
+    // shots at deck targets that gamemd refuses.
+    //
+    // Frequency: every arcing shot at a unit on a bridge — i.e. Grizzly,
+    // Rhino, Apocalypse, Lasher, Tank Destroyer, Flak Track and Destroyer
+    // fire, not a siege-unit footnote. Bounded by the fact that the whole arc
+    // check is stubbed, so this clause is downstream of a larger unported
+    // mechanism and cannot be fixed on its own.
+    // Residual (formerly an ignored placeholder test): gamemd 0x006F74D7 adds a height ceiling for arcing shots at bridge-cell targets; VERA's arcing path is a 2D stub.
+    // Unimplemented: InRange 0x006F74D7 arcing bridge height ceiling.
 
     /// `InRange`'s final `return`, 0x006F7642: `CALL 0x004CC310` and
     /// `TEST EAX,EAX; SETZ AL`. A `SubjectToCliffs` projectile with a
@@ -2625,35 +2334,29 @@ mod tests {
         ));
     }
 
-    /// Abstract Cell callers still use the legacy terrain projection. The
-    /// composed retained-Cell path above proves the actual WaterSet+50 gate,
-    /// own-ground read, map relookup and structural offset. General force-fire
-    /// callers must preserve that identity across their source/range pair too.
-    #[test]
-    #[ignore = "legacy Abstract Cell callers do not yet use the retained Cell source/range transaction"]
-    fn abstract_cell_range_transaction_remains_unintegrated() {
-        panic!("unimplemented: general Abstract Cell source/range identity and WaterSet gate");
-    }
+    // Abstract Cell callers still use the legacy terrain projection. The
+    // composed retained-Cell path above proves the actual WaterSet+50 gate,
+    // own-ground read, map relookup and structural offset. General force-fire
+    // callers must preserve that identity across their source/range pair too.
+    // Residual (formerly an ignored placeholder test): legacy Abstract Cell callers do not yet use the retained Cell source/range transaction.
+    // Unimplemented: general Abstract Cell source/range identity and WaterSet gate.
 
-    /// RESIDUAL — gamemd address 0x006F724E, `CMP EDI,0xFFFFFE00`, the first
-    /// thing `TechnoClass::InRange` tests.
-    ///
-    /// `compute_in_range` honours the `-512` always-in-range sentinel;
-    /// `combat::is_within_range_leptons`, the 2-D twin the other range call
-    /// sites still use, does not — `Range=-2` squares to a positive `262144`
-    /// there and reads as a two-cell reach. Full trigger / effect / frequency /
-    /// downstream note sits on that function in `sim/combat/mod.rs`; the short
-    /// of it is that a Destroyer's `ASWLauncher` closes to two cells where
-    /// gamemd is always in range.
-    ///
-    /// Pre-existing, and recorded here rather than fixed because the cure is
-    /// migrating those call sites onto `compute_in_range`, not adding a second
-    /// sentinel test to the twin.
-    #[test]
-    #[ignore = "gamemd 0x006F724E -512 always-in-range sentinel is unhandled in combat::is_within_range_leptons"]
-    fn is_within_range_leptons_ignores_the_always_in_range_sentinel() {
-        panic!("unimplemented: is_within_range_leptons has no InRange 0x006F724E -512 sentinel");
-    }
+    // RESIDUAL — gamemd address 0x006F724E, `CMP EDI,0xFFFFFE00`, the first
+    // thing `TechnoClass::InRange` tests.
+    //
+    // `compute_in_range` honours the `-512` always-in-range sentinel;
+    // `combat::is_within_range_leptons`, the 2-D twin the other range call
+    // sites still use, does not — `Range=-2` squares to a positive `262144`
+    // there and reads as a two-cell reach. Full trigger / effect / frequency /
+    // downstream note sits on that function in `sim/combat/mod.rs`; the short
+    // of it is that a Destroyer's `ASWLauncher` closes to two cells where
+    // gamemd is always in range.
+    //
+    // Pre-existing, and recorded here rather than fixed because the cure is
+    // migrating those call sites onto `compute_in_range`, not adding a second
+    // sentinel test to the twin.
+    // Residual (formerly an ignored placeholder test): gamemd 0x006F724E -512 always-in-range sentinel is unhandled in combat::is_within_range_leptons.
+    // Unimplemented: is_within_range_leptons has no InRange 0x006F724E -512 sentinel.
 
     /// Guards the INCLUSIVE half of the gate's boundary pair (`JGE` at
     /// 0x006F762F): a target exactly on the deck top is refused. Without this
@@ -2661,12 +2364,26 @@ mod tests {
     /// this group would still pass.
     #[test]
     fn inrange_bridge_gate_target_boundary_is_inclusive() {
-        let terrain = terrain_with_bridge_cells(&[(5, 5)]);
+        let terrain = terrain_with_bridge_cells(&[(5, 5), (6, 5)]);
         let attacker = ground_attacker(5, 5, 0, "ATKR");
         let mut entities = EntityStore::new();
         let mut target = ground_target(6, 5, 0, "TGT");
         target.on_bridge = true;
+        target.position.exact_z_leptons = Some(BRIDGE_DECK_HEIGHT_LEPTONS);
         entities.insert(target);
+        // Marked Object+50 snaps to the live target-cell surface. Both source
+        // and target must have a structural span for this exact-deck test;
+        // OnBridge alone cannot make a clear target cell snap to its deck.
+        let rules = rules_with_weapon("Damage=1\nROF=20\nRange=6\nWarhead=WH", "", "");
+        let target_point = resolve_target_coords_3d(
+            &TargetKind::Entity(200),
+            &entities,
+            &rules,
+            &test_interner(),
+            &NativeCellQuery::canonical(&terrain),
+        )
+        .unwrap();
+        assert_eq!(target_point.2, i64::from(BRIDGE_DECK_HEIGHT_LEPTONS));
 
         let under = (5i64 * 256 + 128, 5i64 * 256 + 128, 0i64);
         assert!(

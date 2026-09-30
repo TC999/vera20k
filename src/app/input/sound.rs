@@ -74,7 +74,6 @@ pub(crate) fn open(state: &mut AppState) {
         state.audio.theme.current_song(),
     ));
     state.match_state.match_presentation.in_game_menu = InGameMenuState::Sound;
-    state.match_state.paused = true;
 }
 fn back(state: &mut AppState) {
     let Some(dialog) = state.match_state.match_presentation.sound_dialog.take() else {
@@ -108,7 +107,6 @@ fn back(state: &mut AppState) {
         .in_game_options
         .on_open();
     state.match_state.match_presentation.in_game_menu = InGameMenuState::Options;
-    state.match_state.paused = true;
 }
 fn activate(state: &mut AppState, id: SoundButton) {
     let now = crate::app::match_runtime::sim_tick::monotonic_frame_pacer_ms(
@@ -214,7 +212,7 @@ pub(crate) fn mouse(state: &mut AppState, button: MouseButton, pressed: bool) {
         Some(SoundControl::Button(_)) => App::play_skirmish_shell_generic_click_sound(state),
         Some(SoundControl::Slider(id)) => {
             let rect = layout.sliders[id as usize];
-            if !crate::ui::skirmish_shell::trackbar_mouse_allowed_y(rect, y) {
+            if !crate::ui::shell::trackbar::admits_press_y(y - rect.y, rect.h) {
                 return;
             }
             let left = rect.x + dialog.thumb_left(id, rect);

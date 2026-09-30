@@ -1,29 +1,36 @@
-//! Receiver pipeline: armor divides -> immunity gates -> Verses kernel ->
-//! building min-1 -> overkill clamp -> classify. Pure over caller-built views.
-//!
-//! Stage order verified against TechnoClass::ReceiveDamage (0x00701900) +
-//! ObjectClass::ReceiveDamage (0x005f5390):
-//!   1. country-armor DIVIDE (folds Techno+0x158), ftol
-//!   2. VeteranArmor DIVIDE (Rules+0x688), ftol
-//!   3. defender min-1
-//!   4. immunity gates (TypeImmune is checked HERE, after the divides)
-//!   5. Verses kernel (falloff -> Verses -> MaxDamage cap)
-//!   6. building min-1 (Building && !CanC4), applied to the kernel output
-//!   7. overkill clamp to remaining HP
-//!   8. classify (Yellow = integer Strength>>1; Red = double Strength*ratio)
+//! Receiver preparation: Techno armor/gates and Object entry/kernel.
+//! Object's mutable packet rewrite, HP commit and native return classification
+//! live in combat::object_health and execute once after this preparation.
+//! The represented order follows Techno701900 and Object5F5390.
 
 use super::gates::evaluate_gates;
 use super::kernel::apply_warhead_damage;
-use super::{CombatMods, DamageGate, DamageOutcome, DamageState, ImmunityInputs, TargetDamageView};
+use super::{DamageGate, DamageOutcome, DefenceDivisors, ImmunityInputs, TargetDamageView};
+use crate::util::native_x87::MaskedX87Chop53 as X;
 
-/// ftol toward zero (gamemd Math__ftol). Mirrors kernel::ftol; defined here to
-/// keep the receiver divides truncating identically without exporting it.
-#[inline]
-fn ftol(v: f64) -> i32 {
-    v as i32
+/// `TechnoClass::ReceiveDamage @ 0x00701900`'s defence divides for a
+/// defended, non-negative hit (`0x00701939..0x007019E3`), each an x87 divide
+/// (53-bit, chop) and `Math::ftol`'s low 32 bits:
+/// `ftol(damage / (GetArmorMultForType * Techno+0x158))`, then for a STRONGER
+/// rank `ftol(damage / VeteranArmor)`, then at least 1. A zero divisor gives
+/// an infinity whose conversion is 0, so the hit still lands for 1.
+///
+/// Native execution: `tools/spatial_oracle/damage_build.py` (`receive` rows).
+pub(crate) fn defence_divides(damage: i32, divisors: &DefenceDivisors) -> i32 {
+    let mut damage = X::ftol_i32_low_masked(X::div(
+        X::load_i32(damage),
+        X::mul(
+            X::load_f32(divisors.house_type_armor),
+            X::load_f64(divisors.unit_armor),
+        ),
+    ));
+    if let Some(rank_armor) = divisors.rank_armor {
+        damage = X::ftol_i32_low_masked(X::div(X::load_i32(damage), X::load_f64(rank_armor)));
+    }
+    damage.max(1)
 }
 
-/// Full receiver pipeline. `condition_red_ratio` = Rules+0x1708 (~0.25).
+/// Prepare the receiver packet without committing HP or predicting its result.
 /// `cell_spread`/`percent_at_max`/`verses_f64` are the warhead's decoded kernel
 /// inputs (see kernel::apply_warhead_damage). `distance_leptons` is the impact
 /// distance in the kernel lepton unit (256 leptons/cell).
@@ -34,39 +41,27 @@ pub(crate) fn receive_damage(
     percent_at_max: f64,
     verses_f64: &[f64; 11],
     target: &TargetDamageView,
-    mods: &CombatMods,
+    divisors: &DefenceDivisors,
     gates: &ImmunityInputs,
     distance_leptons: i32,
     scenario_no_damage: bool,
     max_damage: i32,
-    condition_red_ratio: f64,
 ) -> DamageOutcome {
     let unaffected = DamageOutcome {
+        apply_object_damage: false,
         hp_delta: 0,
         post_object_damage: None,
-        state: DamageState::Unaffected,
         psychedelic_value: None,
         invulnerability_impact_damage: None,
         reached_survivor_postlude: false,
     };
 
-    // Nonnegative receiver divides. Healing (incoming < 0) bypasses. gamemd
-    // runs the divides BEFORE the immunity gates (TypeImmune included), so the
-    // gates are evaluated below, not before the divides.
+    // Nonnegative receiver divides (`0x0070192B..0x00701933` skips them for
+    // ignoreDefenses or a heal). gamemd runs them BEFORE the immunity gates
+    // (TypeImmune included), so the gates are evaluated below.
     let mut dmg = incoming;
     if !gates.ignore_defenses && dmg >= 0 {
-        // country-armor DIVIDE folding per-unit ArmorMultiplier, ONE ftol.
-        // FDIVR: damage / (country * unit); larger mult => less damage.
-        let armor_div = mods.defender_country_armor * mods.defender_unit_armor;
-        if armor_div != 0.0 {
-            dmg = ftol(dmg as f64 / armor_div);
-        }
-        // VeteranArmor DIVIDE, ONE ftol (only when set and != 1.0).
-        if mods.defender_vet_armor != 0.0 && mods.defender_vet_armor != 1.0 {
-            dmg = ftol(dmg as f64 / mods.defender_vet_armor);
-        }
-        // Defender min-1: AFTER the divides, BEFORE the gates and Verses kernel.
-        dmg = dmg.max(1);
+        dmg = defence_divides(dmg, divisors);
     }
 
     // Immunity gates (after the divides; TypeImmune handled inside).
@@ -93,9 +88,9 @@ pub(crate) fn receive_damage(
                 max_damage,
             );
             return DamageOutcome {
+                apply_object_damage: false,
                 hp_delta: 0,
                 post_object_damage: None,
-                state: DamageState::Damaged,
                 psychedelic_value: Some(psychedelic_value),
                 invulnerability_impact_damage: None,
                 reached_survivor_postlude: false,
@@ -114,15 +109,13 @@ pub(crate) fn receive_damage(
     // return 0`, ahead of the Immune test: the kernel, the building min-1, the
     // HP write and the state classification are all skipped for an
     // already-dead receiver, while the Techno tail still feeds the anger nodes
-    // the PRE-kernel damage. VERA filtered dead targets at collection only, so
-    // a target driven to zero by an earlier record of the SAME blast — a Demo
-    // Truck, an Ivan-bombed cluster, any `DeathWeapon` cascade — was
-    // re-processed here and fed the post-Verses value instead.
+    // the PRE-kernel damage. An area record never gets here dead:
+    // `Apply_area_damage` checks Health before dispatching it
+    // (`world_receiver::area_record_dispatches`). The direct callers do — the
+    // bridge, C4 and Ivan expiry receivers and Blowup_All.
     // The `Health < 1` half is UNCONDITIONAL — only the Immune clause is behind
-    // `ignoreDefenses`. That distinction is the whole point here: VERA's two
-    // `ignore_defenses` callers are the C4 and Ivan expiry receivers, which is
-    // exactly the same-blast cascade this gate exists to stop.
-    if target.current_hp < 1 || (!gates.ignore_defenses && target.object_immune) {
+    // `ignoreDefenses`, which VERA's C4 and Ivan expiry receivers set.
+    if target.current_hp < 1 || dmg == 0 || (!gates.ignore_defenses && target.object_immune) {
         return DamageOutcome {
             post_object_damage: Some(dmg),
             reached_survivor_postlude: true,
@@ -131,7 +124,7 @@ pub(crate) fn receive_damage(
     }
 
     // Verses kernel (falloff -> Verses -> cap; also re-runs the D1/D2 early-outs).
-    let mut delta = if gates.ignore_defenses {
+    let delta = if gates.ignore_defenses {
         dmg
     } else {
         apply_warhead_damage(
@@ -146,89 +139,188 @@ pub(crate) fn receive_damage(
         )
     };
 
-    // Building min-1 (ObjectClass::ReceiveDamage, post-Verses, Building && !CanC4).
-    // MUST run before the sign/zero dispatch: a building whose Verses collapses
-    // to zero, or whose packet was negative, is rewritten to positive one.
-    if target.is_building && !target.can_c4 {
-        delta = delta.max(1);
-    }
-    // Healing path (delta < 0): caller adds back, clamped to strength elsewhere.
-    if delta < 0 {
-        return DamageOutcome {
-            hp_delta: delta,
-            post_object_damage: Some(delta),
-            state: classify(target, delta, condition_red_ratio),
-            psychedelic_value: None,
-            invulnerability_impact_damage: None,
-            reached_survivor_postlude: true,
-        };
-    }
-    if delta == 0 {
-        return DamageOutcome {
-            post_object_damage: Some(0),
-            reached_survivor_postlude: true,
-            ..unaffected
-        };
-    }
-
-    // Overkill clamp: damage never exceeds remaining HP.
-    if delta > target.current_hp {
-        delta = target.current_hp;
-    }
-
+    // Object HP mutation, Building minimum, packet clamp and return-code
+    // classification belong to object_health::commit, after preparation.
     DamageOutcome {
+        apply_object_damage: true,
         hp_delta: delta,
         post_object_damage: Some(delta),
-        state: classify(target, delta, condition_red_ratio),
         psychedelic_value: None,
         invulnerability_impact_damage: None,
         reached_survivor_postlude: true,
     }
 }
 
-/// Health-state classification. Yellow uses integer `Strength >> 1` (the state
-/// crossing, NOT the ConditionYellow ratio); Red uses `Strength * red_ratio`
-/// (Rules+0x1708) compared in DOUBLE precision (verified: no ftol on the Red
-/// threshold). Dead when post-hit HP reaches 0.
-///
-/// NB the ConditionYellow ratio (Rules+0x1700) is a SEPARATE mechanism used by
-/// the health-bar/smoke/fear gate (IsYellowHP), distinct from this integer
-/// state crossing — do not unify them at the cutover.
-fn classify(target: &TargetDamageView, delta: i32, red_ratio: f64) -> DamageState {
-    let prev = target.current_hp;
-    let post = prev - delta; // delta may be negative (heal) => post > prev
-    if post <= 0 {
-        return DamageState::Dead;
-    }
-    // Red: double multiply + double compare (no integer truncation).
-    let red = target.strength as f64 * red_ratio;
-    if red < prev as f64 && (post as f64) < red {
-        return DamageState::Red;
-    }
-    // Yellow: integer Strength>>1 (arithmetic shift).
-    let yellow = target.strength >> 1;
-    if yellow <= prev && post < yellow {
-        return DamageState::Yellow;
-    }
-    DamageState::Damaged
-}
-
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
-    use crate::sim::combat::damage::{ArmorClass, CombatMods, ImmunityInputs, TargetDamageView};
+    use crate::sim::combat::damage::{
+        ArmorClass, DefenceDivisors, ImmunityInputs, TargetDamageView,
+    };
 
     const MAXD: i32 = 10000;
-    const RED: f64 = 0.25;
 
-    fn tgt(strength: i32, hp: i32) -> TargetDamageView {
+    /// A TechnoType whose rank lists hold (or lack) `ability`.
+    pub(crate) fn object_with_ability(
+        ability: crate::rules::object_type::Ability,
+        veteran: bool,
+        elite: bool,
+    ) -> crate::rules::object_type::ObjectType {
+        use crate::rules::object_type::{AbilityFlags, ObjectCategory, ObjectType};
+        let ini = crate::rules::ini_parser::IniFile::from_str("[X]\nStrength=300\n");
+        let mut object =
+            ObjectType::from_ini_section("X", ini.section("X").unwrap(), ObjectCategory::Vehicle);
+        let flags = |on: bool| {
+            if on {
+                AbilityFlags::from_abilities(&[ability])
+            } else {
+                AbilityFlags::from_abilities(&[])
+            }
+        };
+        object.veteran_abilities = flags(veteran);
+        object.elite_abilities = flags(elite);
+        object
+    }
+
+    /// The production adapter picks the float native loaded:
+    /// `RuleSet::country_armor_mult_for_type` over every corpus row whose
+    /// WhatAmI VERA represents (infantry, unit, aircraft, building with and
+    /// without `BuildCat=Combat`), parsed through the production reader.
+    #[test]
+    fn original_armor_mult_for_type_rows_through_the_rules_reader() {
+        use crate::rules::ini_parser::IniFile;
+        use crate::rules::ruleset::RuleSet;
+        #[derive(serde::Deserialize)]
+        struct Corpus {
+            receive: Vec<Row>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Row {
+            input: Input,
+            armor_mult_for_type: u32,
+        }
+        #[derive(serde::Deserialize)]
+        struct Input {
+            type_whatami: u32,
+            build_cat: u32,
+            house_type_mults: [u32; 5],
+        }
+        let corpus: Corpus = serde_json::from_str(include_str!(
+            "../../../../tools/spatial_oracle/damage_build.json"
+        ))
+        .expect("original damage-build corpus");
+        let mut rulesets = std::collections::BTreeMap::new();
+        let mut compared = 0;
+        for (index, row) in corpus.receive.iter().enumerate() {
+            let input = &row.input;
+            let list = match input.type_whatami {
+                0x10 => "InfantryTypes",
+                0x28 => "VehicleTypes",
+                0x03 => "AircraftTypes",
+                0x07 => "BuildingTypes",
+                _ => continue,
+            };
+            let rules = rulesets
+                .entry((input.house_type_mults, list, input.build_cat))
+                .or_insert_with(|| {
+                    let float = |bits: u32| f32::from_bits(bits).to_string();
+                    let [infantry, units, aircraft, buildings, defenses] =
+                        input.house_type_mults.map(float);
+                    let build_cat = match input.build_cat {
+                        5 => "BuildCat=Combat\n",
+                        3 => "BuildCat=Power\n",
+                        _ => "",
+                    };
+                    RuleSet::from_ini(&IniFile::from_str(&format!(
+                        "[Countries]\n0=T\n[T]\nArmorInfantryMult={infantry}\n\
+                         ArmorUnitsMult={units}\nArmorAircraftMult={aircraft}\n\
+                         ArmorBuildingsMult={buildings}\nArmorDefensesMult={defenses}\n\
+                         [{list}]\n0=X\n[X]\nStrength=1\n{build_cat}"
+                    )))
+                    .expect("armor-mult fixture parses")
+                });
+            let object = rules.object("X").expect("fixture type");
+            assert_eq!(
+                rules.country_armor_mult_for_type("T", object).to_bits(),
+                row.armor_mult_for_type,
+                "row {index}"
+            );
+            compared += 1;
+        }
+        assert!(compared > 1000, "{compared} rows compared");
+    }
+
+    /// Native execution of `0x00701939..0x007019E3`
+    /// (`tools/spatial_oracle/damage_build.py`, `receive` rows): VERA's
+    /// STRONGER gate takes the branch native took, and the divides reproduce
+    /// every result from the float `GetArmorMultForType` loaded.
+    #[test]
+    fn original_defence_divides_rows() {
+        use crate::rules::object_type::Ability;
+        use crate::sim::combat::veterancy::{has_weapon_ability, rank_of};
+        use crate::util::native_x87::{NativeF32Bits, NativeF64Bits};
+        #[derive(serde::Deserialize)]
+        struct Corpus {
+            receive: Vec<Row>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Row {
+            input: Input,
+            stages: Vec<String>,
+            armor_mult_for_type: u32,
+            damage: i32,
+        }
+        #[derive(serde::Deserialize)]
+        struct Input {
+            damage: i32,
+            armor_mult: Option<u64>,
+            veterancy: u32,
+            veteran_stronger: u8,
+            elite_stronger: u8,
+            veteran_armor: u32,
+        }
+        let corpus: Corpus = serde_json::from_str(include_str!(
+            "../../../../tools/spatial_oracle/damage_build.json"
+        ))
+        .expect("original damage-build corpus");
+        assert_eq!(corpus.receive.len(), 1659);
+        for (index, row) in corpus.receive.iter().enumerate() {
+            let input = &row.input;
+            let object = object_with_ability(
+                Ability::Stronger,
+                input.veteran_stronger != 0,
+                input.elite_stronger != 0,
+            );
+            let stronger = has_weapon_ability(
+                rank_of(NativeF32Bits::from_bits(input.veterancy)),
+                &object,
+                Ability::Stronger,
+            );
+            assert_eq!(
+                stronger,
+                row.stages.iter().any(|stage| stage == "rank_armor"),
+                "row {index}: STRONGER gate"
+            );
+            // ReadDouble's value: the parsed single widened.
+            let veteran_armor = f64::from(f32::from_bits(input.veteran_armor));
+            let divisors = DefenceDivisors {
+                house_type_armor: NativeF32Bits::from_bits(row.armor_mult_for_type),
+                unit_armor: NativeF64Bits::from_bits(input.armor_mult.unwrap_or(1.0_f64.to_bits())),
+                rank_armor: stronger.then(|| NativeF64Bits::from_bits(veteran_armor.to_bits())),
+            };
+            assert_eq!(
+                defence_divides(input.damage, &divisors),
+                row.damage,
+                "row {index}"
+            );
+        }
+    }
+
+    fn tgt(_strength: i32, hp: i32) -> TargetDamageView {
         TargetDamageView {
             armor: ArmorClass(5),
-            strength,
             current_hp: hp,
             object_immune: false,
-            is_building: false,
-            can_c4: false,
         }
     }
     fn allow() -> ImmunityInputs {
@@ -254,15 +346,13 @@ mod tests {
             1.0,
             &verses(0.25),
             &tgt(300, 0),
-            &CombatMods::default(),
+            &DefenceDivisors::default(),
             &allow(),
             0,
             false,
             MAXD,
-            RED,
         );
         assert_eq!(dead.hp_delta, 0);
-        assert_eq!(dead.state, DamageState::Unaffected);
         // Pre-kernel: the two armour divides are no-ops here, so 400 survives
         // whole rather than being scaled by the 0.25 Verses entry.
         assert_eq!(dead.post_object_damage, Some(400));
@@ -286,15 +376,13 @@ mod tests {
             1.0,
             &verses(1.0),
             &tgt(300, 0),
-            &CombatMods::default(),
+            &DefenceDivisors::default(),
             &ignoring,
             0,
             false,
             MAXD,
-            RED,
         );
         assert_eq!(out.hp_delta, 0);
-        assert_eq!(out.state, DamageState::Unaffected);
     }
 
     /// One HP is still alive, so the gate must not fire.
@@ -306,172 +394,31 @@ mod tests {
             1.0,
             &verses(0.25),
             &tgt(300, 1),
-            &CombatMods::default(),
+            &DefenceDivisors::default(),
             &allow(),
             0,
             false,
             MAXD,
-            RED,
         );
-        assert_eq!(alive.hp_delta, 1);
-        assert_eq!(alive.state, DamageState::Dead);
+        assert_eq!(alive.hp_delta, 100);
     }
 
     #[test]
-    fn overkill_clamped_to_remaining_hp() {
-        // 500 incoming vs 50-HP target reports 50, not 500.
+    fn overkill_stays_uncommitted_until_object_owner() {
+        // Preparation retains500; the Object commit caps its mutable packet to50.
         let o = receive_damage(
             500,
             0.0,
             1.0,
             &verses(1.0),
             &tgt(300, 50),
-            &CombatMods::default(),
+            &DefenceDivisors::default(),
             &allow(),
             0,
             false,
             MAXD,
-            RED,
         );
-        assert_eq!(o.hp_delta, 50);
-        assert_eq!(o.state, DamageState::Dead);
-    }
-
-    #[test]
-    fn yellow_uses_integer_strength_halved() {
-        // Strength 100 => yellow at >>1 = 50. Full-HP target, 60 damage:
-        // prev=100, post=40, crosses 50 => Yellow (not the 0.25 ratio).
-        let o = receive_damage(
-            60,
-            0.0,
-            1.0,
-            &verses(1.0),
-            &tgt(100, 100),
-            &CombatMods::default(),
-            &allow(),
-            0,
-            false,
-            MAXD,
-            RED,
-        );
-        assert_eq!(o.hp_delta, 60);
-        assert_eq!(o.state, DamageState::Yellow);
-    }
-
-    #[test]
-    fn red_uses_double_condition_ratio() {
-        // Strength 100, red ratio 0.25 => red threshold 25.0 (double, no ftol).
-        // Target at 30 HP, 10 damage: post=20; 25<30 && 20<25 => Red.
-        let o = receive_damage(
-            10,
-            0.0,
-            1.0,
-            &verses(1.0),
-            &tgt(100, 30),
-            &CombatMods::default(),
-            &allow(),
-            0,
-            false,
-            MAXD,
-            RED,
-        );
-        assert_eq!(o.hp_delta, 10);
-        assert_eq!(o.state, DamageState::Red);
-    }
-
-    #[test]
-    fn veteran_armor_divides() {
-        // VeteranArmor 1.5: 60 incoming => ftol(60/1.5)=40.
-        let mods = CombatMods {
-            defender_vet_armor: 1.5,
-            ..CombatMods::default()
-        };
-        let o = receive_damage(
-            60,
-            0.0,
-            1.0,
-            &verses(1.0),
-            &tgt(300, 300),
-            &mods,
-            &allow(),
-            0,
-            false,
-            MAXD,
-            RED,
-        );
-        assert_eq!(o.hp_delta, 40);
-    }
-
-    #[test]
-    fn country_armor_mult_applies() {
-        // Country armor mult 2.0 (tougher): 80 incoming => ftol(80/2)=40.
-        let mods = CombatMods {
-            defender_country_armor: 2.0,
-            ..CombatMods::default()
-        };
-        let o = receive_damage(
-            80,
-            0.0,
-            1.0,
-            &verses(1.0),
-            &tgt(300, 300),
-            &mods,
-            &allow(),
-            0,
-            false,
-            MAXD,
-            RED,
-        );
-        assert_eq!(o.hp_delta, 40);
-    }
-
-    #[test]
-    fn min_one_floor_positive() {
-        // Country armor mult 100 makes a 50-incoming hit floor to 1 (defender
-        // min-1 after the divides), then Verses 1.0 keeps 1.
-        let mods = CombatMods {
-            defender_country_armor: 100.0,
-            ..CombatMods::default()
-        };
-        let o = receive_damage(
-            50,
-            0.0,
-            1.0,
-            &verses(1.0),
-            &tgt(300, 300),
-            &mods,
-            &allow(),
-            0,
-            false,
-            MAXD,
-            RED,
-        );
-        assert_eq!(o.hp_delta, 1);
-    }
-
-    #[test]
-    fn building_min_one_after_verses() {
-        // Building (no CanC4): tiny Verses collapses the kernel to 0, but the
-        // building floor (run BEFORE the zero-check) raises it to 1.
-        let bldg = TargetDamageView {
-            is_building: true,
-            ..tgt(1000, 1000)
-        };
-        let o = receive_damage(
-            10,
-            0.0,
-            1.0,
-            &verses(0.0001),
-            &bldg,
-            &CombatMods::default(),
-            &allow(),
-            0,
-            false,
-            MAXD,
-            RED,
-        );
-        assert_eq!(o.hp_delta, 1);
-        assert_eq!(o.state, DamageState::Damaged);
+        assert_eq!(o.hp_delta, 500);
     }
 
     #[test]
@@ -483,15 +430,13 @@ mod tests {
             1.0,
             &verses(0.0001),
             &tgt(1000, 1000),
-            &CombatMods::default(),
+            &DefenceDivisors::default(),
             &allow(),
             0,
             false,
             MAXD,
-            RED,
         );
         assert_eq!(o.hp_delta, 0);
-        assert_eq!(o.state, DamageState::Unaffected);
     }
 
     #[test]
@@ -507,15 +452,13 @@ mod tests {
             1.0,
             &verses(1.0),
             &tgt(300, 300),
-            &CombatMods::default(),
+            &DefenceDivisors::default(),
             &g,
             0,
             false,
             MAXD,
-            RED,
         );
         assert_eq!(o.hp_delta, 0);
-        assert_eq!(o.state, DamageState::Damaged);
         assert_eq!(o.psychedelic_value, Some(100));
     }
 
@@ -531,15 +474,13 @@ mod tests {
             1.0,
             &verses(1.0),
             &tgt(300, 300),
-            &CombatMods::default(),
+            &DefenceDivisors::default(),
             &g,
             0,
             false,
             MAXD,
-            RED,
         );
         assert_eq!(o.hp_delta, 0);
-        assert_eq!(o.state, DamageState::Unaffected);
         assert_eq!(o.invulnerability_impact_damage, Some(200));
     }
 }

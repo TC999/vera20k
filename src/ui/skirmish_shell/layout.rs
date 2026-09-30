@@ -1,9 +1,9 @@
 //! Dialog 0x102 shell layout recovered from gamemd.exe.
 
-use super::scroll::ScrollModel;
+use crate::ui::shell::descriptor::{AnchorRule, LOW_HEADING_ANCHOR, MAP_TEXT_ANCHOR};
 pub use crate::ui::shell::geom::{RectPx, RightPanelRects};
 use crate::ui::shell::geom::{
-    center_offset, dlu_rect, right_panel_rects, snap_button_biased_truncate,
+    center_offset, child_window, dlu_rect, right_panel_rects, snap_button_biased_truncate,
 };
 
 pub const SHELL_BASE_W: i32 = 800;
@@ -16,9 +16,6 @@ pub const SKIRMISH_CHECKBOX_COUNT: usize = 5;
 pub const CHECKBOX_ICON_W: i32 = 18;
 pub const CHECKBOX_ICON_H: i32 = 18;
 pub const CHECKBOX_TEXT_LEFT_OFFSET: i32 = 26;
-pub const TRACKBAR_PLAQUE_W: i32 = 50;
-pub const TRACKBAR_ACTIVE_WIDTH_SUBTRACT: i32 = 13;
-pub const TRACKBAR_THUMB_W: i32 = 12;
 pub const SKIRMISH_ROW_COUNT: usize = 8;
 pub const SKIRMISH_AI_ROW_COUNT: usize = 7;
 pub const COMBO_FACE_H: i32 = 24;
@@ -35,16 +32,6 @@ pub const PLAYER_NAME_EDIT_CLIENT_INSET: i32 = 1;
 pub const PLAYER_NAME_EDIT_TEXT_LEFT_INSET: i32 = 2;
 pub const CHOOSE_MAP_MODAL_W: i32 = 533;
 pub const CHOOSE_MAP_MODAL_H: i32 = 369;
-pub const CHOOSE_MAP_LIST_ROW_H: i32 = 19;
-pub const CHOOSE_MAP_LISTBOX_ROW_H: i32 = CHOOSE_MAP_LIST_ROW_H;
-pub const CHOOSE_MAP_LISTBOX_SCROLLBAR_W: i32 = 20;
-// Validation popup child pixel size, using the 6x13 dialog-unit base. The parent
-// chooser resource is a 533x369-DLU template; the exact post-creation client size
-// for this child popup (runtime DLU->pixel conversion) has not been captured, so
-// treat as unconfirmed pending a native GetClientRect/screenshot.
-pub const VALIDATION_MODAL_W: i32 = 450;
-pub const VALIDATION_MODAL_H: i32 = 325;
-
 // Random-map setup dialog 0x105. Same 533x369-DLU frame, font and background as
 // choose-map. Its right-column controls sit 2-3 DLU left of choose-map's in the
 // resource (and the preview 2 DLU right), but every right-column helper here is
@@ -81,8 +68,6 @@ const SETUP_USE_MAP_Y: i32 = 122;
 const SETUP_LOAD_Y: i32 = 149;
 const SETUP_SAVE_Y: i32 = 176;
 const SETUP_DELETE_Y: i32 = 203;
-/// Bottom status line, the one control whose x matches choose-map exactly.
-const SETUP_BLANK_RECT: (i32, i32, i32, i32) = (2, 355, 303, 12);
 /// Hidden until the generate block runs.
 const SETUP_PROGRESS_TEXT_RECT: (i32, i32, i32, i32) = (74, 219, 150, 11);
 const SETUP_PROGRESS_BAR_RECT: (i32, i32, i32, i32) = (229, 217, 100, 21);
@@ -198,6 +183,11 @@ pub struct SkirmishShellLayout {
     pub status_help: RectPx,
 }
 
+/// Heading `0x694` of Choose Map `0x6B`.
+pub const CHOOSE_MAP_TITLE_KEY: &str = "GUI:ChooseMap";
+/// The random-map dialog `0x105`'s heading (its template text).
+pub const RANDOM_MAP_TITLE_KEY: &str = "GUI:GenerateMap";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChooseMapModalButton {
     UseMap0x6c5,
@@ -221,12 +211,6 @@ pub enum RandomMapSetupControl {
     Save0x6c3,
     Delete0x6c4,
     Cancel0x5c0,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChooseMapListboxId {
-    Mode0x6eb,
-    Map0x553,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,17 +249,10 @@ pub struct RandomMapSetupLayout {
     pub save: RectPx,
     pub delete: RectPx,
     pub cancel: RectPx,
-    pub blank: RectPx,
+    /// Status line `0x695` (the family static, template 303x12 DLU).
+    pub status_help: RectPx,
     pub progress_text: RectPx,
     pub progress_bar: RectPx,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValidationModalLayout {
-    pub screen: RectPx,
-    pub dialog: RectPx,
-    pub message: RectPx,
-    pub ok_button: RectPx,
 }
 
 fn checkbox_dlu_rect(x: i32, y: i32, w: i32, h: i32) -> RectPx {
@@ -390,40 +367,6 @@ pub const fn player_name_edit_text_rect(rect: RectPx) -> RectPx {
     )
 }
 
-pub const fn trackbar_plaque_rect(rect: RectPx) -> RectPx {
-    RectPx::new(
-        rect.x + rect.w - TRACKBAR_PLAQUE_W + 1,
-        rect.y - 1,
-        TRACKBAR_PLAQUE_W,
-        rect.h,
-    )
-}
-
-pub const fn trackbar_value_text_rect(rect: RectPx) -> RectPx {
-    RectPx::new(rect.x + rect.w - 49, rect.y, 49, rect.h)
-}
-
-pub const fn trackbar_active_width(rect: RectPx) -> i32 {
-    rect.w - TRACKBAR_PLAQUE_W - TRACKBAR_ACTIVE_WIDTH_SUBTRACT
-}
-
-pub fn trackbar_pixel_offset(value: i32, min: i32, max: i32, step: i32, rect: RectPx) -> i32 {
-    let active_width = trackbar_active_width(rect).max(0);
-    let span = max.saturating_sub(min);
-    if active_width == 0 || span == 0 {
-        return 0;
-    }
-
-    let step = step.max(1);
-    let clamped = value.clamp(min, max);
-    let quantized = min + ((clamped - min) / step) * step;
-    ((quantized - min) * active_width) / span
-}
-
-pub const fn trackbar_thumb_rect(rect: RectPx, pixel_offset: i32) -> RectPx {
-    RectPx::new(rect.x + 1 + pixel_offset, rect.y, TRACKBAR_THUMB_W, rect.h)
-}
-
 pub const fn combo_face_rect(rect: RectPx) -> RectPx {
     RectPx::new(rect.x, rect.y, rect.w, COMBO_FACE_H)
 }
@@ -458,32 +401,19 @@ pub const fn combo_swatch_rect(rect: RectPx) -> RectPx {
     )
 }
 
-fn dialog_child(dialog: RectPx, local: RectPx) -> RectPx {
-    RectPx::new(dialog.x + local.x, dialog.y + local.y, local.w, local.h)
+/// A right-panel static by its template rect and anchor rule (`0x0060B1D0`).
+fn right_static(rule: AnchorRule, template: RectPx, screen_w: i32, screen_h: i32) -> RectPx {
+    crate::ui::shell::layout::anchor_rect(rule, template, screen_w, screen_h)
 }
 
-fn right_anchor(screen_w: i32, screen_h: i32, original: RectPx) -> RectPx {
-    let offset_x = center_offset(screen_w, SHELL_BASE_W);
-    let offset_y = center_offset(screen_h, SHELL_BASE_H);
-    let inset = (RIGHT_PANEL_WIDTH - original.w) / 2;
-    RectPx::new(
-        screen_w - offset_x - original.w - inset,
-        original.y + offset_y,
-        original.w,
-        original.h,
-    )
-}
-
+/// Status line `0x695` of `0x102`: the family static (template 410x12 DLU).
 fn status_help_rect(screen_w: i32, screen_h: i32) -> RectPx {
-    let offset_x = center_offset(screen_w, SHELL_BASE_W);
-    let offset_y = center_offset(screen_h, SHELL_BASE_H);
-    RectPx::new(offset_x + 10, screen_h - offset_y - 21, 615, 20)
+    crate::ui::shell::layout::status_line_rect(RectPx::new(2, 355, 410, 12), screen_w, screen_h)
 }
 
+/// Status line `0x695` of `0x6B`: the family static (template 303x12 DLU).
 fn choose_map_status_help_rect(screen_w: i32, screen_h: i32) -> RectPx {
-    let offset_x = center_offset(screen_w, SHELL_BASE_W);
-    let offset_y = center_offset(screen_h, SHELL_BASE_H);
-    RectPx::new(offset_x + 10, screen_h - offset_y - 21, 455, 20)
+    crate::ui::shell::layout::status_line_rect(RectPx::new(2, 355, 303, 12), screen_w, screen_h)
 }
 
 fn back_rect(screen_w: i32, panel: RightPanelRects) -> RectPx {
@@ -502,17 +432,34 @@ pub fn compute_layout(screen_w: u32, screen_h: u32) -> SkirmishShellLayout {
 
     let start_base = dlu_rect(425, 149, 108, 23);
     let choose_base = dlu_rect(425, 176, 108, 23);
-    let preview_base = dlu_rect(429, 23, 96, 69);
     let panel = right_panel_rects(screen_w, screen_h);
+    // The executed relayout places them at (635, 3, 163, 17), (650, 167, 136,
+    // 17) and (650, 189, 136, 34) at 800x600.
     let right_panel_text = SkirmishRightPanelTextRects {
-        title: RectPx::new(panel.top.x + 3, panel.top.y + 3, 162, 16),
-        game_type: RectPx::new(panel.top.x + 17, panel.top.y + 167, 135, 16),
-        map_label: RectPx::new(panel.top.x + 17, panel.top.y + 189, 135, 33),
+        title: right_static(
+            LOW_HEADING_ANCHOR,
+            RectPx::new(425, 1, 108, 10),
+            screen_w,
+            screen_h,
+        ),
+        game_type: right_static(
+            MAP_TEXT_ANCHOR,
+            RectPx::new(432, 103, 90, 10),
+            screen_w,
+            screen_h,
+        ),
+        map_label: right_static(
+            MAP_TEXT_ANCHOR,
+            RectPx::new(432, 116, 90, 20),
+            screen_w,
+            screen_h,
+        ),
     };
     let mut player_name = dlu_rect(38, 36, 100, 14);
     player_name.x += 1;
     player_name.w += 1;
-    let mut unit_count_trackbar = dlu_rect(269, 210, 85, 13);
+    // The fix-up pass `0x0060B950` lifts Unit Count one pixel.
+    let mut unit_count_trackbar = child_window(269, 210, 85, 13);
     unit_count_trackbar.y -= 1;
 
     let color_combos = [
@@ -592,7 +539,12 @@ pub fn compute_layout(screen_w: u32, screen_h: u32) -> SkirmishShellLayout {
             SDBTNANM_W,
         ),
         back_button: back_rect(screen_w, panel),
-        map_preview: right_anchor(screen_w, screen_h, preview_base),
+        map_preview: right_static(
+            AnchorRule::RightAnchor,
+            RectPx::new(429, 23, 96, 69),
+            screen_w,
+            screen_h,
+        ),
         column_labels: SkirmishColumnLabelRects {
             players: dlu_rect(39, 21, 97, 10),
             side: dlu_rect(191, 21, 73, 10),
@@ -605,8 +557,8 @@ pub fn compute_layout(screen_w: u32, screen_h: u32) -> SkirmishShellLayout {
         color_combos,
         flags,
         trackbars: SkirmishTrackbarRects {
-            game_speed: dlu_rect(269, 176, 85, 13),
-            credits: dlu_rect(269, 193, 85, 13),
+            game_speed: child_window(269, 176, 85, 13),
+            credits: child_window(269, 193, 85, 13),
             unit_count: unit_count_trackbar,
         },
         trackbar_labels: SkirmishTrackbarLabelRects {
@@ -646,14 +598,12 @@ pub fn compute_choose_map_modal_layout(screen_w: u32, screen_h: u32) -> ChooseMa
     let panel = right_panel_rects(screen_w, screen_h);
     let use_map_base = dlu_rect(425, 122, 108, 23);
     let create_random_map_base = dlu_rect(425, 149, 108, 23);
-    let preview_base = dlu_rect(428, 23, 96, 69);
-    let title_base = dlu_rect(425, 1, 108, 10);
 
     ChooseMapModalLayout {
         screen: RectPx::new(0, 0, screen_w, screen_h),
         dialog: RectPx::new(0, 0, screen_w, screen_h),
-        mode_list: dlu_rect(77, 78, 130, 211),
-        map_list: dlu_rect(225, 78, 130, 211),
+        mode_list: crate::ui::shell::geom::child_window(77, 78, 130, 211),
+        map_list: crate::ui::shell::geom::child_window(225, 78, 130, 211),
         use_map_button: snap_button_biased_truncate(
             screen_w,
             screen_h,
@@ -669,20 +619,23 @@ pub fn compute_choose_map_modal_layout(screen_w: u32, screen_h: u32) -> ChooseMa
             panel,
             SDBTNANM_W,
         ),
-        title: right_anchor(screen_w, screen_h, title_base).translate(0, 1),
+        title: right_static(
+            LOW_HEADING_ANCHOR,
+            RectPx::new(425, 1, 108, 10),
+            screen_w,
+            screen_h,
+        ),
         select_engagement: dlu_rect(80, 20, 257, 12),
         game_type_heading: dlu_rect(77, 60, 130, 10),
         game_map_heading: dlu_rect(225, 60, 130, 10),
         status_help: choose_map_status_help_rect(screen_w, screen_h),
-        preview: right_anchor(screen_w, screen_h, preview_base),
+        preview: right_static(
+            AnchorRule::RightAnchor,
+            RectPx::new(428, 23, 96, 69),
+            screen_w,
+            screen_h,
+        ),
     }
-}
-
-pub fn compute_fixed_800_choose_map_modal_layout(
-    screen_w: u32,
-    screen_h: u32,
-) -> ChooseMapModalLayout {
-    compute_choose_map_modal_layout(screen_w, screen_h)
 }
 
 /// Layout for the random-map setup dialog `0x105`.
@@ -708,8 +661,11 @@ pub fn compute_random_map_setup_layout(screen_w: u32, screen_h: u32) -> RandomMa
             SETUP_LABEL_H[row],
         )
     });
+    // The players trackbar takes its runtime window; the combos keep the
+    // resource conversion, which their face paint expects.
     let control_rects = std::array::from_fn(|row| {
-        dlu_rect(
+        let window = if row == 5 { child_window } else { dlu_rect };
+        window(
             SETUP_CONTROL_X,
             SETUP_ROW_Y[row],
             SETUP_CONTROL_W,
@@ -729,7 +685,6 @@ pub fn compute_random_map_setup_layout(screen_w: u32, screen_h: u32) -> RandomMa
     let (title_x, title_y, title_w, title_h) = SETUP_TITLE_RECT;
     let (preview_x, preview_y, preview_w, preview_h) = SETUP_PREVIEW_RECT;
     let (seed_x, seed_y, seed_w, seed_h) = SETUP_SEED_RECT;
-    let (blank_x, blank_y, blank_w, blank_h) = SETUP_BLANK_RECT;
     let (ptext_x, ptext_y, ptext_w, ptext_h) = SETUP_PROGRESS_TEXT_RECT;
     let (pbar_x, pbar_y, pbar_w, pbar_h) = SETUP_PROGRESS_BAR_RECT;
 
@@ -751,23 +706,28 @@ pub fn compute_random_map_setup_layout(screen_w: u32, screen_h: u32) -> RandomMa
             SETUP_ACTION_H,
         ),
         seed_field: dlu_rect(seed_x, seed_y, seed_w, seed_h),
-        title: right_anchor(
+        title: right_static(
+            LOW_HEADING_ANCHOR,
+            RectPx::new(title_x, title_y, title_w, title_h),
             screen_w,
             screen_h,
-            dlu_rect(title_x, title_y, title_w, title_h),
-        )
-        .translate(0, 1),
-        preview: right_anchor(
+        ),
+        preview: right_static(
+            AnchorRule::RightAnchor,
+            RectPx::new(preview_x, preview_y, preview_w, preview_h),
             screen_w,
             screen_h,
-            dlu_rect(preview_x, preview_y, preview_w, preview_h),
         ),
         use_map: right_button(SETUP_USE_MAP_Y),
         load: right_button(SETUP_LOAD_Y),
         save: right_button(SETUP_SAVE_Y),
         delete: right_button(SETUP_DELETE_Y),
         cancel: back_rect(screen_w, panel),
-        blank: dlu_rect(blank_x, blank_y, blank_w, blank_h),
+        status_help: crate::ui::shell::layout::status_line_rect(
+            RectPx::new(2, 355, 303, 12),
+            screen_w,
+            screen_h,
+        ),
         progress_text: dlu_rect(ptext_x, ptext_y, ptext_w, ptext_h),
         progress_bar: dlu_rect(pbar_x, pbar_y, pbar_w, pbar_h),
     }
@@ -1000,99 +960,6 @@ pub fn saved_seed_control_at(layout: &SavedSeedLayout, x: i32, y: i32) -> Option
     None
 }
 
-/// Which list row `(x, y)` falls on, given the row count.
-pub fn saved_seed_list_row_at(
-    layout: &SavedSeedLayout,
-    row_count: usize,
-    top_index: usize,
-    x: i32,
-    y: i32,
-) -> Option<usize> {
-    choose_map_listbox_row_at(layout.list, row_count, top_index, x, y)
-}
-
-pub const fn choose_map_listbox_rect(
-    layout: &ChooseMapModalLayout,
-    id: ChooseMapListboxId,
-) -> RectPx {
-    match id {
-        ChooseMapListboxId::Mode0x6eb => layout.mode_list,
-        ChooseMapListboxId::Map0x553 => layout.map_list,
-    }
-}
-
-pub fn choose_map_listbox_visible_row_count(rect: RectPx) -> usize {
-    ScrollModel::listbox().visible_rows(0, rect.h)
-}
-
-pub fn choose_map_listbox_needs_scrollbar(row_count: usize, rect: RectPx) -> bool {
-    row_count > choose_map_listbox_visible_row_count(rect)
-}
-
-pub fn choose_map_listbox_scrollbar_rect(row_count: usize, rect: RectPx) -> Option<RectPx> {
-    if !choose_map_listbox_needs_scrollbar(row_count, rect) {
-        return None;
-    }
-    Some(RectPx::new(
-        rect.x + rect.w - CHOOSE_MAP_LISTBOX_SCROLLBAR_W,
-        rect.y,
-        CHOOSE_MAP_LISTBOX_SCROLLBAR_W,
-        rect.h,
-    ))
-}
-
-pub fn choose_map_listbox_content_rect(row_count: usize, rect: RectPx) -> RectPx {
-    let scrollbar_w = if choose_map_listbox_needs_scrollbar(row_count, rect) {
-        CHOOSE_MAP_LISTBOX_SCROLLBAR_W
-    } else {
-        0
-    };
-    RectPx::new(rect.x, rect.y, (rect.w - scrollbar_w).max(0), rect.h)
-}
-
-pub fn choose_map_listbox_row_rect(content: RectPx, visible_row: usize) -> RectPx {
-    let y = content.y + visible_row as i32 * CHOOSE_MAP_LISTBOX_ROW_H;
-    RectPx::new(
-        content.x,
-        y,
-        content.w,
-        CHOOSE_MAP_LISTBOX_ROW_H
-            .min(content.y + content.h - y)
-            .max(0),
-    )
-}
-
-pub fn choose_map_listbox_max_top_index(row_count: usize, rect: RectPx) -> usize {
-    ScrollModel::listbox().max_top_index(row_count, choose_map_listbox_visible_row_count(rect))
-}
-
-pub fn choose_map_listbox_scroll_thumb_rect(
-    row_count: usize,
-    top_index: usize,
-    rect: RectPx,
-) -> Option<RectPx> {
-    let scrollbar = choose_map_listbox_scrollbar_rect(row_count, rect)?;
-    let visible_rows = choose_map_listbox_visible_row_count(rect);
-    let model = ScrollModel::listbox();
-    let thumb_h = model.thumb_height(visible_rows, row_count, scrollbar.h)?;
-    let max_top = choose_map_listbox_max_top_index(row_count, rect);
-    let thumb_y = model.thumb_y(scrollbar, thumb_h, top_index, max_top);
-    Some(RectPx::new(scrollbar.x, thumb_y, scrollbar.w, thumb_h))
-}
-
-pub fn choose_map_listbox_top_index_from_track_click(
-    row_count: usize,
-    top_index: usize,
-    rect: RectPx,
-    mouse_y: i32,
-) -> Option<usize> {
-    let scrollbar = choose_map_listbox_scrollbar_rect(row_count, rect)?;
-    let thumb = choose_map_listbox_scroll_thumb_rect(row_count, top_index, rect)?;
-    let max_top = choose_map_listbox_max_top_index(row_count, rect);
-    let model = ScrollModel::listbox();
-    Some(model.top_index_from_thumb_top(scrollbar, thumb.h, max_top, mouse_y - thumb.h / 2))
-}
-
 pub fn choose_map_modal_button_at(
     layout: &ChooseMapModalLayout,
     x: i32,
@@ -1110,73 +977,15 @@ pub fn choose_map_modal_button_at(
     None
 }
 
-pub fn choose_map_modal_list_row_at(list: RectPx, x: i32, y: i32) -> Option<usize> {
-    if !list.contains(x, y) {
-        return None;
-    }
-    Some(((y - list.y) / CHOOSE_MAP_LISTBOX_ROW_H) as usize)
-}
-
-pub fn choose_map_listbox_row_at(
-    list: RectPx,
-    row_count: usize,
-    top_index: usize,
-    x: i32,
-    y: i32,
-) -> Option<usize> {
-    let content = choose_map_listbox_content_rect(row_count, list);
-    if !content.contains(x, y) {
-        return None;
-    }
-    let idx = top_index + ((y - content.y) / CHOOSE_MAP_LISTBOX_ROW_H) as usize;
-    (idx < row_count).then_some(idx)
-}
-
-/// Center a native child dialog against the LIVE screen, matching the engine's
-/// child-window centering: x/y = max(0, ((screen - child) + 1) / 2). The +1 term
-/// biases odd-size centering by one pixel and the max(0) clamps negatives — both
-/// observable, so they are reproduced exactly. The validation popup parents to
-/// the top-level window, so it centers on the real screen, NOT inside the
-/// fixed 800x600 shell box.
-fn centered_live_screen_dialog(screen_w: i32, screen_h: i32, w: i32, h: i32) -> RectPx {
-    RectPx::new(
-        (((screen_w - w) + 1) / 2).max(0),
-        (((screen_h - h) + 1) / 2).max(0),
-        w,
-        h,
-    )
-}
-
-pub fn compute_validation_modal_layout(screen_w: u32, screen_h: u32) -> ValidationModalLayout {
-    let screen_w = screen_w as i32;
-    let screen_h = screen_h as i32;
-    let dialog =
-        centered_live_screen_dialog(screen_w, screen_h, VALIDATION_MODAL_W, VALIDATION_MODAL_H);
-
-    ValidationModalLayout {
-        screen: RectPx::new(0, 0, screen_w, screen_h),
-        dialog,
-        message: dialog_child(dialog, dlu_rect(40, 40, 220, 50)),
-        ok_button: dialog_child(dialog, dlu_rect(207, 175, 83, 15)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::RandomMapSetupControl;
     use super::{
-        CHOOSE_MAP_LIST_ROW_H, COMBO_DROPDOWN_SCROLLBAR_BUTTON_H, ChooseMapModalButton, RectPx,
-        SkirmishCheckboxId, checkbox_icon_rect, checkbox_text_rect,
-        choose_map_listbox_content_rect, choose_map_listbox_row_at,
-        choose_map_listbox_scroll_thumb_rect, choose_map_listbox_scrollbar_rect,
-        choose_map_listbox_top_index_from_track_click, choose_map_modal_button_at,
-        choose_map_modal_list_row_at, combo_arrow_rect, combo_face_rect, combo_swatch_rect,
-        combo_text_rect, compute_choose_map_modal_layout,
-        compute_fixed_800_choose_map_modal_layout, compute_fixed_800_layout, compute_layout,
-        compute_random_map_setup_layout, compute_validation_modal_layout, dlu_rect,
-        player_name_edit_client_rect, player_name_edit_text_rect, random_map_setup_control_at,
-        trackbar_active_width, trackbar_pixel_offset, trackbar_plaque_rect, trackbar_thumb_rect,
-        trackbar_value_text_rect,
+        ChooseMapModalButton, RectPx, SkirmishCheckboxId, checkbox_icon_rect, checkbox_text_rect,
+        choose_map_modal_button_at, combo_arrow_rect, combo_face_rect, combo_swatch_rect,
+        combo_text_rect, compute_choose_map_modal_layout, compute_fixed_800_layout, compute_layout,
+        compute_random_map_setup_layout, dlu_rect, player_name_edit_client_rect,
+        player_name_edit_text_rect, random_map_setup_control_at,
     };
 
     struct ExpectedRect {
@@ -1208,23 +1017,6 @@ mod tests {
             layout.rows.ai_type_combos[0],
             RectPx::new(171, 169, 150, 120)
         );
-    }
-
-    #[test]
-    fn fixed_800_choose_map_modal_uses_verified_0x6b_shell_helpers() {
-        let layout = compute_fixed_800_choose_map_modal_layout(1024, 768);
-
-        assert_eq!(layout.screen, RectPx::new(0, 0, 1024, 768));
-        assert_eq!(layout.dialog, RectPx::new(0, 0, 1024, 768));
-        assert_eq!(layout.mode_list, RectPx::new(116, 127, 195, 343));
-        assert_eq!(layout.map_list, RectPx::new(338, 127, 195, 343));
-        assert_eq!(layout.use_map_button, RectPx::new(756, 283, 156, 42));
-        assert_eq!(
-            layout.create_random_map_button,
-            RectPx::new(756, 325, 156, 42)
-        );
-        assert_eq!(layout.cancel_button, RectPx::new(756, 619, 156, 42));
-        assert_eq!(layout.status_help, RectPx::new(122, 663, 455, 20));
     }
 
     #[test]
@@ -1336,13 +1128,12 @@ mod tests {
         assert_eq!(setup.control_rects[2], dlu_rect(179, 90, 150, 103));
         assert_eq!(
             setup.control_rects[5],
-            dlu_rect(179, 163, 150, 13),
-            "players is a trackbar, not a combo"
+            RectPx::new(269, 265, 226, 22),
+            "players is a trackbar, in its runtime window"
         );
         assert_eq!(setup.randomize, dlu_rect(74, 257, 83, 15));
         assert_eq!(setup.generate, dlu_rect(246, 257, 83, 15));
         assert_eq!(setup.seed_field, dlu_rect(279, 287, 50, 12));
-        assert_eq!(setup.blank, dlu_rect(2, 355, 303, 12));
         assert_eq!(setup.progress_text, dlu_rect(74, 219, 150, 11));
         assert_eq!(setup.progress_bar, dlu_rect(229, 217, 100, 21));
     }
@@ -1417,23 +1208,19 @@ mod tests {
     }
 
     #[test]
-    fn trackbar_rects_match_800x600_final_geometry() {
-        let layout = compute_layout(800, 600);
-        assert_eq!(layout.trackbars.game_speed, RectPx::new(404, 286, 128, 21));
-        assert_eq!(layout.trackbars.credits, RectPx::new(404, 314, 128, 21));
-        assert_eq!(layout.trackbars.unit_count, RectPx::new(404, 340, 128, 21));
-        assert_eq!(
-            trackbar_plaque_rect(layout.trackbars.game_speed),
-            RectPx::new(483, 285, 50, 21)
-        );
-        assert_eq!(
-            trackbar_plaque_rect(layout.trackbars.credits),
-            RectPx::new(483, 313, 50, 21)
-        );
-        assert_eq!(
-            trackbar_plaque_rect(layout.trackbars.unit_count),
-            RectPx::new(483, 339, 50, 21)
-        );
+    fn trackbar_windows_match_the_executed_relayout() {
+        // One pixel wider and taller than the resource conversion, like every
+        // family child in the retail stills; the frames and the plaque sit
+        // around this window.
+        use crate::ui::shell::layout::tests::executed_child_window as executed;
+        for (w, h) in [(640, 480), (800, 600), (1024, 768)] {
+            let layout = compute_layout(w as u32, h as u32);
+            assert_eq!(layout.trackbars.game_speed, executed(0x102, 0x529, w, h));
+            assert_eq!(layout.trackbars.credits, executed(0x102, 0x511, w, h));
+            assert_eq!(layout.trackbars.unit_count, executed(0x102, 0x50C, w, h));
+            let setup = compute_random_map_setup_layout(w as u32, h as u32);
+            assert_eq!(setup.control_rects[5], executed(0x105, 0x3EB, w, h));
+        }
     }
 
     #[test]
@@ -1459,19 +1246,29 @@ mod tests {
     }
 
     #[test]
-    fn status_help_strip_0x695_bottom_left_rects() {
-        assert_eq!(
-            compute_layout(640, 480).status_help,
-            RectPx::new(10, 459, 615, 20)
-        );
-        assert_eq!(
-            compute_layout(800, 600).status_help,
-            RectPx::new(10, 579, 615, 20)
-        );
-        assert_eq!(
-            compute_layout(1024, 768).status_help,
-            RectPx::new(122, 663, 615, 20)
-        );
+    fn right_panel_statics_and_status_line_match_the_executed_relayout() {
+        use crate::ui::shell::layout::tests::executed_child_window as executed;
+        for (w, h) in [(640, 480), (800, 600), (1024, 768)] {
+            let layout = compute_layout(w as u32, h as u32);
+            assert_eq!(layout.right_panel_text.title, executed(0x102, 0x694, w, h));
+            assert_eq!(
+                layout.right_panel_text.game_type,
+                executed(0x102, 0x6EC, w, h)
+            );
+            assert_eq!(
+                layout.right_panel_text.map_label,
+                executed(0x102, 0x5A8, w, h)
+            );
+            assert_eq!(layout.status_help, executed(0x102, 0x695, w, h));
+        }
+        let chooser = compute_choose_map_modal_layout(800, 600);
+        assert_eq!(chooser.title, executed(0x6B, 0x694, 800, 600));
+        assert_eq!(chooser.status_help, executed(0x6B, 0x695, 800, 600));
+        for (w, h) in [(800, 600), (1024, 768)] {
+            let setup = compute_random_map_setup_layout(w as u32, h as u32);
+            assert_eq!(setup.title, executed(0x105, 0x694, w, h));
+            assert_eq!(setup.status_help, executed(0x105, 0x695, w, h));
+        }
     }
 
     #[test]
@@ -1481,11 +1278,11 @@ mod tests {
         assert_eq!(layout_1024.trackbars, layout_800.trackbars);
         assert_eq!(
             layout_800.trackbars.unit_count,
-            RectPx::new(404, 340, 128, 21)
+            RectPx::new(404, 340, 129, 22)
         );
         assert_eq!(
             layout_1024.trackbars.unit_count,
-            RectPx::new(404, 340, 128, 21)
+            RectPx::new(404, 340, 129, 22)
         );
     }
 
@@ -1547,42 +1344,12 @@ mod tests {
     }
 
     #[test]
-    fn trackbar_geometry_helpers_follow_owner_draw_constants() {
-        let rect = RectPx::new(404, 286, 128, 21);
-
-        assert_eq!(trackbar_active_width(rect), 65);
-        assert_eq!(
-            trackbar_plaque_rect(RectPx::new(0, 0, 128, 21)),
-            RectPx::new(79, -1, 50, 21)
-        );
-        assert_eq!(trackbar_plaque_rect(rect), RectPx::new(483, 285, 50, 21));
-        assert_eq!(
-            trackbar_value_text_rect(rect),
-            RectPx::new(483, 286, 49, 21)
-        );
-        assert_eq!(trackbar_thumb_rect(rect, 0), RectPx::new(405, 286, 12, 21));
-        assert_eq!(trackbar_thumb_rect(rect, 65), RectPx::new(470, 286, 12, 21));
-    }
-
-    #[test]
-    fn trackbar_pixel_offset_uses_integer_endpoints() {
-        let rect = RectPx::new(404, 286, 128, 21);
-
-        assert_eq!(trackbar_pixel_offset(0, 0, 6, 1, rect), 0);
-        assert_eq!(trackbar_pixel_offset(6, 0, 6, 1, rect), 65);
-        assert_eq!(trackbar_pixel_offset(10000, 5000, 10000, 100, rect), 65);
-    }
-
-    #[test]
     fn right_panel_globals_match_research_modes() {
         let a = compute_layout(800, 600);
         assert_eq!(a.right_panel.top, RectPx::new(632, 0, 168, 199));
         assert_eq!(a.right_panel.tile, RectPx::new(632, 199, 168, 42));
         assert_eq!(a.right_panel.tile_count, 9);
         assert_eq!(a.right_panel.bottom, RectPx::new(632, 577, 168, 23));
-        assert_eq!(a.right_panel_text.title, RectPx::new(635, 3, 162, 16));
-        assert_eq!(a.right_panel_text.game_type, RectPx::new(649, 167, 135, 16));
-        assert_eq!(a.right_panel_text.map_label, RectPx::new(649, 189, 135, 33));
 
         let b = compute_layout(1024, 768);
         assert_eq!(b.right_panel.top, RectPx::new(744, 84, 168, 199));
@@ -1595,9 +1362,6 @@ mod tests {
         assert_eq!(c.right_panel.tile, RectPx::new(472, 199, 168, 42));
         assert_eq!(c.right_panel.tile_count, 6);
         assert_eq!(c.right_panel.bottom, RectPx::new(472, 451, 168, 29));
-        assert_eq!(c.right_panel_text.title, RectPx::new(475, 3, 162, 16));
-        assert_eq!(c.right_panel_text.game_type, RectPx::new(489, 167, 135, 16));
-        assert_eq!(c.right_panel_text.map_label, RectPx::new(489, 189, 135, 33));
     }
 
     #[test]
@@ -1615,19 +1379,19 @@ mod tests {
 
         assert_eq!(layout.screen, RectPx::new(0, 0, 800, 600));
         assert_eq!(layout.dialog, RectPx::new(0, 0, 800, 600));
-        assert_eq!(layout.mode_list, RectPx::new(116, 127, 195, 343));
-        assert_eq!(layout.map_list, RectPx::new(338, 127, 195, 343));
+        assert_eq!(layout.mode_list, RectPx::new(116, 127, 196, 344));
+        assert_eq!(layout.map_list, RectPx::new(338, 127, 196, 344));
         assert_eq!(layout.use_map_button, RectPx::new(644, 199, 156, 42));
         assert_eq!(
             layout.create_random_map_button,
             RectPx::new(644, 241, 156, 42)
         );
         assert_eq!(layout.cancel_button, RectPx::new(644, 535, 156, 42));
-        assert_eq!(layout.title, RectPx::new(635, 3, 162, 16));
+        assert_eq!(layout.title, RectPx::new(635, 3, 163, 17));
         assert_eq!(layout.select_engagement, RectPx::new(120, 33, 386, 20));
         assert_eq!(layout.game_type_heading, RectPx::new(116, 98, 195, 16));
         assert_eq!(layout.game_map_heading, RectPx::new(338, 98, 195, 16));
-        assert_eq!(layout.status_help, RectPx::new(10, 579, 455, 20));
+        assert_eq!(layout.status_help, RectPx::new(10, 578, 456, 21));
         assert_eq!(layout.preview, RectPx::new(644, 37, 144, 112));
     }
 
@@ -1637,39 +1401,20 @@ mod tests {
 
         assert_eq!(layout.screen, RectPx::new(0, 0, 1024, 768));
         assert_eq!(layout.dialog, RectPx::new(0, 0, 1024, 768));
-        assert_eq!(layout.mode_list, RectPx::new(116, 127, 195, 343));
-        assert_eq!(layout.map_list, RectPx::new(338, 127, 195, 343));
+        assert_eq!(layout.mode_list, RectPx::new(116, 127, 196, 344));
+        assert_eq!(layout.map_list, RectPx::new(338, 127, 196, 344));
         assert_eq!(layout.use_map_button, RectPx::new(756, 283, 156, 42));
         assert_eq!(
             layout.create_random_map_button,
             RectPx::new(756, 325, 156, 42)
         );
         assert_eq!(layout.cancel_button, RectPx::new(756, 619, 156, 42));
-        assert_eq!(layout.title, RectPx::new(747, 87, 162, 16));
+        assert_eq!(layout.title, RectPx::new(747, 87, 163, 17));
         assert_eq!(layout.select_engagement, RectPx::new(120, 33, 386, 20));
         assert_eq!(layout.game_type_heading, RectPx::new(116, 98, 195, 16));
         assert_eq!(layout.game_map_heading, RectPx::new(338, 98, 195, 16));
-        assert_eq!(layout.status_help, RectPx::new(122, 663, 455, 20));
+        assert_eq!(layout.status_help, RectPx::new(122, 662, 456, 21));
         assert_eq!(layout.preview, RectPx::new(756, 121, 144, 112));
-    }
-
-    #[test]
-    fn validation_modal_layout_centers_ok_button() {
-        let layout = compute_validation_modal_layout(800, 600);
-
-        // Single-center against the live screen with the +1 odd-size bias:
-        // x = (800-450+1)/2 = 175, y = (600-325+1)/2 = 138.
-        assert_eq!(layout.dialog, RectPx::new(175, 138, 450, 325));
-        assert_eq!(layout.message, RectPx::new(235, 203, 330, 81));
-        assert_eq!(layout.ok_button, RectPx::new(486, 422, 125, 24));
-    }
-
-    #[test]
-    fn validation_modal_centers_against_live_screen_not_800_box() {
-        // At 1024x768 the modal centers on the real screen, not inside an 800x600
-        // sub-box: x = (1024-450+1)/2 = 287, y = (768-325+1)/2 = 222.
-        let layout = compute_validation_modal_layout(1024, 768);
-        assert_eq!(layout.dialog, RectPx::new(287, 222, 450, 325));
     }
 
     #[test]
@@ -1711,89 +1456,6 @@ mod tests {
     }
 
     #[test]
-    fn choose_map_modal_list_hit_test_uses_verified_owner_draw_row_height() {
-        let layout = compute_choose_map_modal_layout(800, 600);
-
-        assert_eq!(
-            choose_map_modal_list_row_at(layout.map_list, layout.map_list.x, layout.map_list.y),
-            Some(0)
-        );
-        assert_eq!(
-            choose_map_modal_list_row_at(
-                layout.map_list,
-                layout.map_list.x,
-                layout.map_list.y + CHOOSE_MAP_LIST_ROW_H
-            ),
-            Some(1)
-        );
-        assert_eq!(
-            choose_map_modal_list_row_at(
-                layout.map_list,
-                layout.map_list.x,
-                layout.map_list.y + layout.map_list.h
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn choose_map_modal_listbox_hit_testing_reserves_scrollbar_width() {
-        let layout = compute_choose_map_modal_layout(800, 600);
-        let rows = 20;
-        let scrollbar = choose_map_listbox_scrollbar_rect(rows, layout.map_list).unwrap();
-        let content = choose_map_listbox_content_rect(rows, layout.map_list);
-
-        assert_eq!(scrollbar, RectPx::new(513, 127, 20, 343));
-        assert_eq!(content, RectPx::new(338, 127, 175, 343));
-        assert_eq!(
-            choose_map_listbox_row_at(layout.map_list, rows, 5, content.x + 2, content.y),
-            Some(5)
-        );
-        assert_eq!(
-            choose_map_listbox_row_at(layout.map_list, rows, 5, scrollbar.x, scrollbar.y),
-            None
-        );
-    }
-
-    #[test]
-    fn choose_map_modal_scrollbar_thumb_and_track_map_to_top_index() {
-        let layout = compute_choose_map_modal_layout(800, 600);
-        let rows = 20;
-        let scrollbar = choose_map_listbox_scrollbar_rect(rows, layout.map_list).unwrap();
-        let thumb = choose_map_listbox_scroll_thumb_rect(rows, 3, layout.map_list).unwrap();
-
-        assert_eq!(thumb.w, scrollbar.w);
-        assert!(thumb.y >= scrollbar.y + COMBO_DROPDOWN_SCROLLBAR_BUTTON_H);
-        assert!(thumb.y + thumb.h <= scrollbar.y + scrollbar.h - COMBO_DROPDOWN_SCROLLBAR_BUTTON_H);
-        assert_eq!(
-            choose_map_listbox_top_index_from_track_click(
-                rows,
-                0,
-                layout.map_list,
-                scrollbar.y + COMBO_DROPDOWN_SCROLLBAR_BUTTON_H
-            ),
-            Some(0)
-        );
-        assert_eq!(
-            choose_map_listbox_top_index_from_track_click(
-                rows,
-                0,
-                layout.map_list,
-                scrollbar.y + scrollbar.h - COMBO_DROPDOWN_SCROLLBAR_BUTTON_H - 1
-            ),
-            Some(2)
-        );
-    }
-}
-
-#[cfg(test)]
-mod setup_bounds {
-    use super::*;
-
-    /// Every control of the setup dialog has to land inside the 800x600 shell
-    /// surface. The right column anchors to the panel rather than to its own
-    /// resource x, so an anchoring change is the plausible way this breaks.
-    #[test]
     fn random_map_setup_rects_stay_inside_the_screen() {
         let layout = compute_random_map_setup_layout(800, 600);
         let mut rects: Vec<(&str, RectPx)> = vec![
@@ -1807,7 +1469,7 @@ mod setup_bounds {
             ("save", layout.save),
             ("delete", layout.delete),
             ("cancel", layout.cancel),
-            ("blank", layout.blank),
+            ("status_help", layout.status_help),
             ("progress_text", layout.progress_text),
             ("progress_bar", layout.progress_bar),
         ];

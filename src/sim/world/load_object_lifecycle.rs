@@ -39,13 +39,13 @@ enum LoadOverlayTerminalPath {
     Constructed,
     UnrevealedSurvivor,
     CommonQueued,
+    #[cfg(test)]
     WallQueued,
     SlopeSurvivor,
 }
 
 #[derive(Debug)]
 struct LoadOverlayObject {
-    overlay_id: u8,
     cell: (u16, u16),
     world: [i32; 3],
     native_id: Option<i32>,
@@ -57,10 +57,10 @@ struct LoadOverlayObject {
     terminal_path: LoadOverlayTerminalPath,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LoadOverlayObjectSnapshot {
     pub(crate) stable_id: u64,
-    pub(crate) overlay_id: u8,
     pub(crate) cell: (u16, u16),
     pub(crate) world: [i32; 3],
     pub(crate) native_id: Option<i32>,
@@ -156,7 +156,6 @@ impl LoadObjectLifecycle {
     pub(crate) fn construct_overlay(
         &mut self,
         stable_id: u64,
-        overlay_id: u8,
         cell: (u16, u16),
         mut assign_native_id: impl FnMut() -> i32,
     ) -> Result<LoadOverlayHandle, LoadOverlayLifecycleError> {
@@ -169,7 +168,6 @@ impl LoadObjectLifecycle {
         self.objects.insert(
             handle,
             LoadOverlayObject {
-                overlay_id,
                 cell,
                 world: [0; 3],
                 native_id: None,
@@ -254,6 +252,7 @@ impl LoadObjectLifecycle {
 
     /// Wall rejection performs its ordinary UnInit broadcast and a full-Limbo
     /// broadcast before queueing; the destructor supplies the third broadcast.
+    #[cfg(test)]
     pub(crate) fn finish_wall_reject(
         &mut self,
         handle: LoadOverlayHandle,
@@ -301,6 +300,7 @@ impl LoadObjectLifecycle {
 
     /// Release the registered constructor survivors when the scene is
     /// torn down. Iteration order is intentionally not claimed as native parity.
+    #[cfg(test)]
     pub(crate) fn release_scene_survivors(&mut self) -> Result<usize, LoadOverlayLifecycleError> {
         let survivors: Vec<_> = self
             .objects
@@ -325,7 +325,6 @@ impl LoadObjectLifecycle {
         let object = self.objects.get(&handle)?;
         Some(LoadOverlayObjectSnapshot {
             stable_id: handle.0,
-            overlay_id: object.overlay_id,
             cell: object.cell,
             world: object.world,
             native_id: object.native_id,
@@ -339,6 +338,7 @@ impl LoadObjectLifecycle {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn object_count(&self) -> usize {
         self.objects.len()
     }
@@ -534,7 +534,7 @@ mod tests {
         native_id: i32,
     ) -> LoadOverlayHandle {
         lifecycle
-            .construct_overlay(stable_id, 0x18, (10, 11), || native_id)
+            .construct_overlay(stable_id, (10, 11), || native_id)
             .unwrap()
     }
 
@@ -652,7 +652,7 @@ mod tests {
             lifecycle.fail_next_join_for_test(registry);
             let mut id_calls = 0;
             let error = lifecycle
-                .construct_overlay(1, 0x18, (1, 2), || {
+                .construct_overlay(1, (1, 2), || {
                     id_calls += 1;
                     77
                 })

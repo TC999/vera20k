@@ -61,7 +61,6 @@ pub fn empty_map_file(options: &RmgOptions, gen_w: u32, gen_h: u32) -> MapFile {
     MapFile {
         header,
         basic: Default::default(),
-        briefing: Default::default(),
         preview: Default::default(),
         cells: Vec::new(),
         iso_map_pack_lookups: Vec::new(),
@@ -153,7 +152,7 @@ pub fn populate(
         map_file.entities.push(MapEntity {
             owner: NEUTRAL_OWNER.to_string(),
             type_id: name.clone(),
-            health: NEUTRAL_HEALTH,
+            health: i32::from(NEUTRAL_HEALTH),
             cell_x: *x as u16,
             cell_y: *y as u16,
             facing: 0,
@@ -165,6 +164,8 @@ pub fn populate(
             recruitable_a: true,
             recruitable_b: true,
             structure_upgrades: [None, None, None],
+            structure_ai_sellable: false,
+            structure_ai_repairable: false,
         });
     }
 

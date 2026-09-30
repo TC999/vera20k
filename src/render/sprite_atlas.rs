@@ -1,10 +1,12 @@
-//! SHP sprite atlas — pre-renders SHP sprites into a packed GPU texture.
+//! SHP sprite atlas — pre-renders SHP sprites into packed GPU texture pages.
 //!
-//! At map load time, all SpriteModel-tagged entities (infantry, buildings) are
-//! identified by (type_id, facing). Each unique combination has its SHP frame
-//! rendered to RGBA and packed into a single GPU texture atlas.
-//!
-//! Mirrors the unit_atlas.rs approach: one texture, one draw call per frame.
+//! At map load every SHP sprite the world can draw — infantry sequences,
+//! building bodies with their make and overlay animations, world effects — is
+//! rendered to RGBA and shelf-packed into as few pages as the GPU texture limit
+//! allows. When a new (type, house colour) appears mid-match, only its missing
+//! sprites are rendered and appended to a growth page (`atlas_growth`); the
+//! pages already resident are never repacked or re-uploaded. Keys with nothing
+//! to draw are remembered, so no refresh retries them.
 //!
 //! ## Frame selection
 //! - Buildings (Structure): always frame 0 (no rotation).
@@ -16,23 +18,24 @@
 //! - Reads from sim/ via EntityStore iteration (GameEntity fields).
 
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use crate::assets::asset_manager::AssetManager;
 use crate::assets::pal_file::Palette;
 use crate::assets::shp_file::ShpFile;
 use crate::map::entities::EntityCategory;
 use crate::map::houses::HouseColorMap;
+use crate::render::atlas_growth::{self, GrowthShelf, SPRITE_PADDING};
 use crate::render::batch::{BatchRenderer, BatchTexture};
-use crate::render::gpu::GpuContext;
 use crate::rules::art_data::{self, ArtRegistry};
 use crate::rules::effect_asset_catalog::available_effect_anim_frame_count;
 use crate::rules::house_colors::{HouseColorIndex, HouseColorRamps};
+use crate::rules::projectile_type::ProjectileType;
 use crate::rules::ruleset::RuleSet;
 
-/// Maximum atlas texture width for SHP sprites (pixels).
-
-/// Padding between sprites in the atlas to prevent texture bleeding.
-const SPRITE_PADDING: u32 = 1;
+/// Edge of a growth page: RGBA plus indices is 80 MB, room for the sprites
+/// of about ten new (type, house colour) pairs.
+const GROWTH_PAGE_SIZE: u32 = 4096;
 const INFANTRY_FACING_STEP: u8 = crate::util::direction::FACING_UNITS_PER_DIRECTION;
 const INFANTRY_FACING_BUCKETS: u8 = 8;
 
@@ -64,13 +67,35 @@ fn effect_anim_shp_candidates(
     theater_ext: &str,
     theater_name: &str,
 ) -> Vec<String> {
+    if art
+        .and_then(|registry| registry.anim_runtime_config(anim_type))
+        .is_some_and(|config| !config.art_body_read)
+    {
+        // AnimType::ReadINI @ 0x00427D22 exits before the image loader for an
+        // unread type. An orphan SHP must not create an atlas entry for it.
+        return Vec::new();
+    }
     let image_id = art.map_or_else(
         || anim_type.to_ascii_uppercase(),
-        |registry| registry.resolve_effective_image_id(anim_type, anim_type),
+        |registry| registry.resolve_anim_image_id(anim_type),
     );
     art_data::anim_shp_candidates(art, anim_type, &image_id, theater_ext, theater_name)
 }
 
+/// First existing file among `candidates`, with its bytes.
+fn find_shp<'a, 'n>(
+    asset_manager: &'a AssetManager,
+    candidates: &'n [String],
+) -> Option<(&'n str, &'a [u8])> {
+    candidates.iter().find_map(|name| {
+        asset_manager
+            .get_ref(name)
+            .map(|data| (name.as_str(), data))
+    })
+}
+
+/// A building animation's usable frame count and the file it was counted in,
+/// resolved as AnimTypeClass loads its image. Only the SHP header is read.
 fn scan_building_anim_frame_count(
     asset_manager: &AssetManager,
     art_reg: &ArtRegistry,
@@ -78,8 +103,8 @@ fn scan_building_anim_frame_count(
     loop_end: u16,
     theater_ext: &str,
     theater_name: &str,
-) -> Option<u16> {
-    let anim_image: String = art_reg.resolve_effective_image_id(anim_type, anim_type);
+) -> Option<(u16, String)> {
+    let anim_image: String = art_reg.resolve_anim_image_id(anim_type);
     let candidates: Vec<String> = art_data::anim_shp_candidates(
         Some(art_reg),
         anim_type,
@@ -87,18 +112,60 @@ fn scan_building_anim_frame_count(
         theater_ext,
         theater_name,
     );
-    let data = candidates.iter().find_map(|c| asset_manager.get_ref(c))?;
-    let shp = ShpFile::from_bytes(data).ok()?;
-    let raw_count = shp.frames.len() as u16;
+    let (file, data) = find_shp(asset_manager, &candidates)?;
+    let raw_count = ShpFile::frame_count_from_bytes(data).ok()?;
     let real: u16 = raw_count / 2;
     let required_count = loop_end.max(1);
-    Some(if real > 0 && real >= required_count {
+    let count = if real > 0 && real >= required_count {
         real
     } else if raw_count >= required_count {
         required_count
     } else {
         raw_count
-    })
+    };
+    Some((count, file.to_string()))
+}
+
+/// Register every frame of one building animation (ActiveAnim, IdleAnim and
+/// their damaged or garrisoned variants) for one house colour. `scanned`
+/// holds the counts this build has read, so each animation's SHP header is
+/// read once per build.
+#[allow(clippy::too_many_arguments)]
+fn register_building_anim(
+    needed: &mut HashSet<ShpSpriteKey>,
+    scanned: &mut HashMap<String, u16>,
+    shp_files: &mut HashMap<String, String>,
+    asset_manager: &AssetManager,
+    art: &ArtRegistry,
+    anim_type: &str,
+    loop_end: u16,
+    house_color: HouseColorIndex,
+    theater_ext: &str,
+    theater_name: &str,
+) {
+    let upper = anim_type.to_ascii_uppercase();
+    if !scanned.contains_key(&upper)
+        && let Some((count, file)) = scan_building_anim_frame_count(
+            asset_manager,
+            art,
+            anim_type,
+            loop_end,
+            theater_ext,
+            theater_name,
+        )
+    {
+        log::debug!("Building anim {anim_type}: {count} frames from {file}");
+        scanned.insert(upper.clone(), count);
+        shp_files.insert(upper.clone(), file);
+    }
+    let count = scanned.get(&upper).copied().unwrap_or(1);
+    insert_building_anim_frame_keys(
+        needed,
+        anim_type,
+        count,
+        house_color,
+        attached_anim_palette_context(art.anim_runtime_config(anim_type)),
+    );
 }
 
 fn insert_building_anim_frame_keys(
@@ -133,6 +200,59 @@ pub enum ShpPaletteContext {
     GlobalAnim,
     SelectedScheme,
     Cell,
+    /// BulletClass::Draw 46838D: global PALETTE.PAL Convert87F6C4.
+    BulletDefault,
+    /// Bullet AnimPalette selects ANIM.PAL without AnimType AltPalette logic.
+    BulletAnim,
+    /// Caller supplies BulletClass's retained ColorScheme identity (+114).
+    BulletFirer,
+}
+
+impl ShpPaletteContext {
+    fn is_projectile(self) -> bool {
+        matches!(
+            self,
+            Self::BulletDefault | Self::BulletAnim | Self::BulletFirer
+        )
+    }
+}
+
+/// BulletDraw46838D..468409 selects AnimPalette before FirersPalette. The
+/// latter requires the bullet's retained scheme, not its source's current house.
+pub fn projectile_key(
+    type_id: &str,
+    projectile_type: &ProjectileType,
+    frame: u16,
+    house_color: HouseColorIndex,
+) -> ShpSpriteKey {
+    let palette_context = if projectile_type.anim_palette {
+        ShpPaletteContext::BulletAnim
+    } else if projectile_type.firers_palette {
+        ShpPaletteContext::BulletFirer
+    } else {
+        ShpPaletteContext::BulletDefault
+    };
+    ShpSpriteKey {
+        palette_context,
+        type_id: type_id.to_ascii_uppercase(),
+        facing: 0,
+        frame,
+        house_color: if palette_context == ShpPaletteContext::BulletFirer {
+            house_color
+        } else {
+            HouseColorIndex(0)
+        },
+    }
+}
+
+fn unresolved_firer_key(
+    type_id: &str,
+    projectile_type: &ProjectileType,
+    frame: u16,
+) -> ShpSpriteKey {
+    let mut key = projectile_key(type_id, projectile_type, frame, HouseColorIndex(0));
+    key.palette_context = ShpPaletteContext::BulletAnim;
+    key
 }
 
 pub(crate) fn attached_anim_palette_context(
@@ -189,23 +309,15 @@ pub struct SpriteAtlasPage {
     pub texture: BatchTexture,
 }
 
-/// Per-building-type bounding box for selection brackets and click picking.
-///
-/// Computed by unioning all SHP frames (main sprite + animation overlays) of the
-/// building type.
-///
-/// Coordinates are relative to `(cell_center_x, screen_y)` where
-/// `cell_center_x = screen_x + TILE_WIDTH / 2`.
-#[derive(Debug, Clone, Copy)]
-pub struct BuildingBounds {
-    /// Left edge offset from cell center X.
-    pub min_x: f32,
-    /// Top edge offset from screen_y.
-    pub min_y: f32,
-    /// Total width in pixels.
-    pub width: f32,
-    /// Total height in pixels.
-    pub height: f32,
+/// World-effect and parachute animations, registered once per match by the
+/// map-load build; refreshes reuse them instead of re-reading the rules.
+#[derive(Default)]
+struct EffectRegistry {
+    /// Each registered name as the rules spell it and its frame count, by
+    /// upper-case name. AnimClass colour remaps expand through it.
+    frames: HashMap<String, (String, u16)>,
+    /// Registered names as the rules spell them; they take the effect palette.
+    type_ids: HashSet<String>,
 }
 
 /// A multi-page GPU texture atlas containing pre-rendered SHP sprites.
@@ -215,10 +327,11 @@ pub struct BuildingBounds {
 /// with its own bind group. The entry lookup returns a `page` index that
 /// identifies which page's texture to bind when drawing that sprite.
 ///
-/// Created once at map load, rebuilt incrementally when new entity types appear.
+/// Created once at map load; a refresh appends the sprites of newly seen
+/// (type, house colour) pairs to growth pages without touching the rest.
 pub struct SpriteAtlas {
-    /// Atlas pages — each is a separate GPU texture.
-    /// Most maps need only 1 page; large games with many building types may use 2+.
+    /// Atlas pages — each is a separate GPU texture. The map-load pack fills
+    /// as few as the texture limit allows; refreshes append growth pages.
     pub pages: Vec<SpriteAtlasPage>,
     /// Lookup: (type_id, facing, frame, house_color) → UV rectangle + offset + page.
     entries: HashMap<ShpSpriteKey, ShpSpriteEntry>,
@@ -227,41 +340,65 @@ pub struct SpriteAtlas {
     pub make_frame_counts: HashMap<String, u16>,
     /// Building/world-animation type → available non-shadow frame count.
     /// Building consumers use this only to ensure their live animation frame is
-    /// resident; world-effect systems also consume the same established map.
+    /// resident; the AnimClass and projectile-image presentation
+    /// (`app/presentation/instances/overlays.rs`) reads the same map.
     pub active_anim_frame_counts: HashMap<String, u16>,
-    /// Per-building-type bounding boxes for selection brackets and click picking.
-    /// Computed by unioning all SHP frame rects for each building type.
-    pub building_bounds: HashMap<String, BuildingBounds>,
-    /// Cached rendered sprites for incremental rebuild. On subsequent rebuilds,
-    /// only genuinely new sprite keys are rendered; cached sprites are reused
-    /// and everything is repacked.
-    rendered_cache: Vec<RenderedShpSprite>,
+    /// Keys with nothing to draw: the SHP is missing or fails to decode, or
+    /// the frame is empty. Remembered so a refresh never renders them again.
+    unrenderable: HashSet<ShpSpriteKey>,
+    /// House colours whose sprites have been collected, by object type.
+    covered_objects: HashMap<String, HashSet<HouseColorIndex>>,
+    /// AnimClass (type, ColorScheme) remaps whose sprites have been collected.
+    covered_anim_remaps: HashSet<(String, HouseColorIndex)>,
+    /// Whether the harvest overlay frames were rendered (or found missing).
+    harvest_overlay_loaded: bool,
+    /// The file each counted animation, make and parachute type's frames came
+    /// from (upper-case type), so its frames render from that file.
+    shp_files: HashMap<String, String>,
+    /// ProjectileType image binding is separate from AnimType frame sources.
+    projectile_files: HashMap<String, (String, u16)>,
+    effects: EffectRegistry,
+    /// Page refreshes append to; created when the first refresh needs room.
+    growth: Option<GrowthShelf>,
+    /// Palette-index textures of the growth pages, by page; each page's bind
+    /// group holds only a view of it.
+    growth_indices: HashMap<usize, wgpu::Texture>,
 }
 
-#[cfg(test)]
 fn push_effect_name(effect_names: &mut Vec<String>, name: &str) {
     if !effect_names.iter().any(|n| n.eq_ignore_ascii_case(name)) {
         effect_names.push(name.to_string());
     }
 }
 
-#[cfg(test)]
+/// Every world-effect SHP the atlas preloads under the effect palette
+/// (`anim.pal`), in first-mention order. Names come from the loaded rules,
+/// never from a hand-written list.
 fn collect_effect_names(rules: &RuleSet) -> Vec<String> {
     let mut effect_names: Vec<String> = Vec::new();
     push_effect_name(&mut effect_names, &rules.general.warp_in.name);
     push_effect_name(&mut effect_names, &rules.general.warp_out.name);
     push_effect_name(&mut effect_names, &rules.general.warp_away.name);
+    // [General] Wake= (WAKE1): an AnimClass spawned behind ships.
+    // Stock art sets no AltPalette= and its Theater= line is commented
+    // out, so it is an anim.pal draw like every other AnimType; left
+    // out of this set it fell through to unit.pal and drew green.
+    push_effect_name(&mut effect_names, &rules.general.wake.name);
+    // Damage fire types (FIRE01, FIRE02, FIRE03 by default).
     for fire_ref in &rules.general.damage_fire_types {
         push_effect_name(&mut effect_names, &fire_ref.name);
     }
-    for anim_name in rules.art_registry.scheduler_anim_types() {
+    for anim_name in rules.art().scheduler_anim_types() {
         push_effect_name(&mut effect_names, anim_name);
     }
+    // Explosion animations from every warhead's AnimList=.
     for wh in rules.warheads_iter() {
         for anim_name in &wh.anim_list {
             push_effect_name(&mut effect_names, anim_name);
         }
     }
+    // Weapon Anim= and OccupantAnim=. Bullet images have a separate binding
+    // and palette owner; they are not AnimType registrations.
     for weapon in rules.weapons_iter() {
         for anim_name in &weapon.anim {
             push_effect_name(&mut effect_names, anim_name);
@@ -270,6 +407,8 @@ fn collect_effect_names(rules: &RuleSet) -> Vec<String> {
             push_effect_name(&mut effect_names, anim_name);
         }
     }
+    // Particle SHPs: ParticleType.Image= goes through the ObjectTypeClass
+    // Image= path -> anim.pal palette. Register every distinct name.
     for pt in rules.particle_types_iter() {
         if let Some(image) = pt.image.as_deref() {
             push_effect_name(&mut effect_names, image);
@@ -279,11 +418,56 @@ fn collect_effect_names(rules: &RuleSet) -> Vec<String> {
 }
 
 impl SpriteAtlas {
+    fn new(pages: Vec<SpriteAtlasPage>, entries: HashMap<ShpSpriteKey, ShpSpriteEntry>) -> Self {
+        Self {
+            pages,
+            entries,
+            make_frame_counts: HashMap::new(),
+            active_anim_frame_counts: HashMap::new(),
+            unrenderable: HashSet::new(),
+            covered_objects: HashMap::new(),
+            covered_anim_remaps: HashSet::new(),
+            harvest_overlay_loaded: false,
+            shp_files: HashMap::new(),
+            projectile_files: HashMap::new(),
+            effects: EffectRegistry::default(),
+            growth: None,
+            growth_indices: HashMap::new(),
+        }
+    }
+
     /// Look up the atlas entry for a given sprite key.
     /// The returned entry includes a `page` field identifying which atlas page
     /// holds this sprite's texture data.
     pub fn get(&self, key: &ShpSpriteKey) -> Option<&ShpSpriteEntry> {
         self.entries.get(key)
+    }
+
+    /// Exact frame lookup; an absent frame is not substituted or wrapped.
+    ///
+    /// RESIDUAL: BulletConstruct466519..46653B snapshots source House+16054
+    /// into Bullet+114. VERA does not yet retain that House/scheme authority.
+    /// A missing retained scheme preserves the old ANIM.PAL appearance through
+    /// this same Bullet path; it does not pretend scheme zero is native state.
+    pub fn projectile_sprite(
+        &self,
+        type_id: &str,
+        projectile_type: &ProjectileType,
+        frame: u16,
+        retained_scheme: Option<HouseColorIndex>,
+    ) -> Option<&ShpSpriteEntry> {
+        if projectile_type.firers_palette
+            && !projectile_type.anim_palette
+            && retained_scheme.is_none()
+        {
+            return self.get(&unresolved_firer_key(type_id, projectile_type, frame));
+        }
+        self.get(&projectile_key(
+            type_id,
+            projectile_type,
+            frame,
+            retained_scheme.unwrap_or_default(),
+        ))
     }
 
     /// Number of unique sprites across all pages.
@@ -306,11 +490,129 @@ impl SpriteAtlas {
         self.entries.iter()
     }
 
-    /// Check whether the atlas already contains all sprite keys needed by the
-    /// current ECS world. Returns true if no rebuild is necessary.
-    pub fn has_all_keys(&self, needed: &HashSet<ShpSpriteKey>) -> bool {
-        needed.iter().all(|k| self.entries.contains_key(k))
+    /// Whether the atlas has collected every [`object_pairs`] pair the world
+    /// draws, every live AnimClass colour remap, and the harvest overlay once
+    /// a harvester exists. This runs on every tick with a spawn, death or
+    /// Limbo, so it allocates nothing per object and stops at the first miss.
+    /// Keys found unrenderable count as collected: a sprite with nothing to
+    /// draw never forces another refresh.
+    fn covers_world(
+        &self,
+        entities: &crate::sim::entity_store::EntityStore,
+        house_colors: &HouseColorMap,
+        extra_building_types: &[&str],
+        anim_remaps: &HashSet<(String, HouseColorIndex)>,
+        interner: Option<&crate::sim::intern::StringInterner>,
+    ) -> bool {
+        object_pairs(entities, house_colors, extra_building_types, interner)
+            .all(|(type_id, color)| self.covers_object(type_id, color))
+            && anim_remaps.is_subset(&self.covered_anim_remaps)
+            && (self.harvest_overlay_loaded || !entities.values().any(|e| e.miner.is_some()))
     }
+
+    fn covers_object(&self, type_id: &str, color: HouseColorIndex) -> bool {
+        self.covered_objects
+            .get(type_id)
+            .is_some_and(|colors| colors.contains(&color))
+    }
+
+    /// Place sprites rendered after the map-load pack on growth pages and
+    /// upload the rows they fill, one write per page and texture. A sprite
+    /// no page can hold is remembered as unrenderable.
+    fn append_sprites(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        batch: &BatchRenderer,
+        sprites: Vec<RenderedShpSprite>,
+    ) {
+        let max_dim = device.limits().max_texture_dimension_2d;
+        let (pages, growth_indices) = (&mut self.pages, &mut self.growth_indices);
+        let (placed, unplaced) = atlas_growth::place_on_growth_pages(
+            &mut self.growth,
+            sprites,
+            |sprite| [sprite.width, sprite.height],
+            max_dim,
+            |[width, height]| {
+                let size = [width, height].map(|side| GROWTH_PAGE_SIZE.max(side).min(max_dim));
+                let (texture, source_indices) =
+                    batch.create_blank_texture_with_indices(device, size[0], size[1]);
+                pages.push(SpriteAtlasPage { texture });
+                let page = pages.len() - 1;
+                growth_indices.insert(page, source_indices);
+                log::info!("Sprite atlas growth page {page} ({}x{})", size[0], size[1]);
+                (page, size)
+            },
+        );
+        for group in placed {
+            let texture = &self.pages[group.page].texture;
+            let rects = |texels: fn(&RenderedShpSprite) -> &[u8]| {
+                group
+                    .sprites
+                    .iter()
+                    .map(|(origin, sprite)| {
+                        (*origin, [sprite.width, sprite.height], texels(sprite))
+                    })
+                    .collect::<Vec<_>>()
+            };
+            atlas_growth::write_band(queue, texture.view.texture(), 4, &rects(|s| &s.rgba));
+            atlas_growth::write_band(
+                queue,
+                &self.growth_indices[&group.page],
+                1,
+                &rects(|s| &s.indices),
+            );
+            let page_size = [texture.width, texture.height];
+            for (origin, sprite) in group.sprites {
+                match atlas_entry(&sprite, origin, group.page, page_size) {
+                    Some(entry) => {
+                        self.entries.insert(sprite.key, entry);
+                    }
+                    None => {
+                        log::warn!("Sprite atlas page {} exceeds the u8 page index", group.page);
+                        self.unrenderable.insert(sprite.key);
+                    }
+                }
+            }
+        }
+        for sprite in unplaced {
+            log::warn!(
+                "{} frame {} ({}x{}) exceeds the texture limit {max_dim}",
+                sprite.key.type_id,
+                sprite.key.frame,
+                sprite.width,
+                sprite.height,
+            );
+            self.unrenderable.insert(sprite.key);
+        }
+    }
+}
+
+/// UV rectangle and draw offsets of `sprite` placed at `origin` on a page;
+/// None past the entry's u8 page index.
+fn atlas_entry(
+    sprite: &RenderedShpSprite,
+    origin: [u32; 2],
+    page: usize,
+    page_size: [u32; 2],
+) -> Option<ShpSpriteEntry> {
+    let [page_width, page_height] = page_size.map(|v| v as f32);
+    Some(ShpSpriteEntry {
+        uv_origin: [
+            origin[0] as f32 / page_width,
+            origin[1] as f32 / page_height,
+        ],
+        uv_size: [
+            sprite.width as f32 / page_width,
+            sprite.height as f32 / page_height,
+        ],
+        pixel_size: [sprite.width as f32, sprite.height as f32],
+        offset_x: sprite.offset_x,
+        offset_y: sprite.offset_y,
+        canvas_rect: sprite.canvas_rect,
+        extended: sprite.extended,
+        page: u8::try_from(page).ok()?,
+    })
 }
 
 /// Intermediate rendered sprite before atlas packing.
@@ -328,67 +630,76 @@ struct RenderedShpSprite {
     extended: bool,
 }
 
-/// End an incremental rebuild without invalidating the atlas that was already
-/// usable by the renderer.
+/// End a refresh without changing the atlas the renderer is already using.
 ///
-/// Some rebuild failures happen after `rendered_cache` has been moved out of
-/// the prior atlas and new sprites have been appended. Truncating to the exact
-/// extraction length before putting the vector back makes that move atomic from
-/// the caller's point of view. Initial construction deliberately has no fallback
-/// and keeps the existing fail-fast contract for required cell-drawer assets.
+/// A refresh mutates the prior atlas only after every fallible step has
+/// passed, so returning it here leaves it exactly as it was. Initial
+/// construction deliberately has no fallback and keeps the existing fail-fast
+/// contract for required cell-drawer assets.
 #[cold]
 fn abort_sprite_atlas_refresh(
     previous_atlas: Option<SpriteAtlas>,
-    extracted_cache: Option<Vec<RenderedShpSprite>>,
-    previous_cache_len: usize,
     failure: String,
 ) -> Option<SpriteAtlas> {
-    let Some(mut previous) = previous_atlas else {
+    let Some(previous) = previous_atlas else {
         panic!("{failure}");
     };
-
-    if let Some(mut cache) = extracted_cache {
-        cache.truncate(previous_cache_len);
-        previous.rendered_cache = cache;
-    }
     log::warn!("{failure}; keeping the previous valid sprite atlas");
     Some(previous)
 }
 
-/// Collect the base set of (type_id, house_color) pairs from the ECS world.
-///
-/// Returns the set of unique (type_id, color) combos that would trigger atlas entries.
-/// Used by the incremental rebuild path: if every combo already has entries in the
-/// existing atlas, we can skip the expensive full rebuild.
-pub fn collect_needed_base_keys(
+/// Whether `atlas` — None while no sprite atlas exists — already holds
+/// everything the world draws, so no refresh is needed.
+pub fn atlas_covers_world(
+    atlas: Option<&SpriteAtlas>,
     entities: &crate::sim::entity_store::EntityStore,
     house_colors: &HouseColorMap,
     extra_building_types: &[&str],
+    anim_remaps: &HashSet<(String, HouseColorIndex)>,
     interner: Option<&crate::sim::intern::StringInterner>,
-) -> HashSet<(String, HouseColorIndex)> {
-    let mut base_keys: HashSet<(String, HouseColorIndex)> = HashSet::new();
-    for entity in entities.values() {
-        if entity.is_voxel {
-            continue;
-        }
-        let owner_str = interner.map_or("", |i| i.resolve(entity.owner()));
-        let type_str = interner.map_or("", |i| i.resolve(entity.type_ref()));
-        let color_idx: HouseColorIndex = house_colors
-            .get(owner_str)
-            .copied()
-            .unwrap_or(crate::rules::house_colors::NO_REMAP);
-        base_keys.insert((type_str.to_string(), color_idx));
-    }
-    // Include extra building types (deployable ConYards etc.).
-    if !extra_building_types.is_empty() {
-        let all_colors: Vec<HouseColorIndex> = house_colors.values().copied().collect();
-        for &type_id in extra_building_types {
-            for &color in &all_colors {
-                base_keys.insert((type_id.to_string(), color));
-            }
+) -> bool {
+    match atlas {
+        Some(atlas) => atlas.covers_world(
+            entities,
+            house_colors,
+            extra_building_types,
+            anim_remaps,
+            interner,
+        ),
+        None => {
+            object_pairs(entities, house_colors, extra_building_types, interner)
+                .next()
+                .is_none()
+                && anim_remaps.is_empty()
         }
     }
-    base_keys
+}
+
+/// Every (type, house colour) pair the world's objects draw: each placed
+/// non-voxel object in its owner's colour, and every building a unit can
+/// deploy into in every house colour. Every sprite key an object needs
+/// derives from one of these pairs, so the atlas records coverage per pair.
+fn object_pairs<'a>(
+    entities: &'a crate::sim::entity_store::EntityStore,
+    house_colors: &'a HouseColorMap,
+    extra_building_types: &'a [&'a str],
+    interner: Option<&'a crate::sim::intern::StringInterner>,
+) -> impl Iterator<Item = (&'a str, HouseColorIndex)> + 'a {
+    let placed = entities
+        .values()
+        .filter(|entity| !entity.is_voxel)
+        .map(move |entity| {
+            let owner = interner.map_or("", |i| i.resolve(entity.owner()));
+            let color = house_colors
+                .get(owner)
+                .copied()
+                .unwrap_or(crate::rules::house_colors::NO_REMAP);
+            (interner.map_or("", |i| i.resolve(entity.type_ref())), color)
+        });
+    let deploy_targets = extra_building_types
+        .iter()
+        .flat_map(move |&type_id| house_colors.values().map(move |&color| (type_id, color)));
+    placed.chain(deploy_targets)
 }
 
 /// Live AnimClass palette variants that must exist in the atlas. Producers
@@ -407,46 +718,28 @@ pub fn collect_anim_remap_base_keys(
         .collect()
 }
 
+/// Every frame of each remapped AnimClass type the effect registry holds, in
+/// its ColorScheme. Other remapped types have no preloaded frames.
 fn insert_anim_remap_frame_keys(
     needed: &mut HashSet<ShpSpriteKey>,
-    type_id: &str,
-    frame_count: u16,
-    anim_remap_keys: &HashSet<(String, HouseColorIndex)>,
+    effects: &EffectRegistry,
+    anim_remaps: &HashSet<(String, HouseColorIndex)>,
 ) {
-    for &(_, color) in anim_remap_keys
-        .iter()
-        .filter(|(anim_type, _)| anim_type.eq_ignore_ascii_case(type_id))
-    {
-        for frame in 0..frame_count {
+    for (anim_type, color) in anim_remaps {
+        let Some((type_id, frame_count)) = effects.frames.get(&anim_type.to_ascii_uppercase())
+        else {
+            continue;
+        };
+        for frame in 0..*frame_count {
             needed.insert(ShpSpriteKey {
-                palette_context: crate::render::sprite_atlas::ShpPaletteContext::SelectedScheme,
-                type_id: type_id.to_string(),
+                palette_context: ShpPaletteContext::SelectedScheme,
+                type_id: type_id.clone(),
                 facing: 0,
                 frame,
-                house_color: color,
+                house_color: *color,
             });
         }
     }
-}
-
-/// Coverage is specific to the producer's palette context. A legacy entity
-/// entry cannot satisfy an explicit animation ColorScheme preload.
-pub fn atlas_covers_base_keys(
-    atlas: &SpriteAtlas,
-    base_keys: &HashSet<(String, HouseColorIndex)>,
-    palette_context: ShpPaletteContext,
-) -> bool {
-    base_keys.iter().all(|(type_id, color)| {
-        atlas
-            .get(&ShpSpriteKey {
-                palette_context,
-                type_id: type_id.clone(),
-                facing: 0,
-                frame: 0,
-                house_color: *color,
-            })
-            .is_some()
-    })
 }
 
 /// Which palette a sprite's frames are baked against.
@@ -459,6 +752,8 @@ pub(crate) enum SpritePaletteChoice {
     Anim,
     /// Active theater ISO palette, used by AnimClass +0x196 cell-drawer rows.
     CellIso,
+    /// BulletClass's ordinary global Convert, independent of the theater.
+    Bullet,
 }
 
 /// Pick the palette a sprite key's frames are baked against.
@@ -504,6 +799,9 @@ fn sprite_palette_for_key(
     cell_palette_type_ids: &HashSet<String>,
 ) -> SpritePaletteChoice {
     match key.palette_context {
+        ShpPaletteContext::BulletDefault => SpritePaletteChoice::Bullet,
+        ShpPaletteContext::BulletAnim => SpritePaletteChoice::Anim,
+        ShpPaletteContext::BulletFirer => SpritePaletteChoice::Unit,
         ShpPaletteContext::SelectedScheme => SpritePaletteChoice::Unit,
         ShpPaletteContext::Cell => SpritePaletteChoice::CellIso,
         ShpPaletteContext::GlobalAnim => {
@@ -522,25 +820,369 @@ fn sprite_palette_for_key(
     }
 }
 
-/// Build a SHP sprite atlas from all SpriteModel entities in the ECS world.
+/// Every sprite key one object (type, house colour) can be drawn with: a
+/// structure's body, source-bound raw Infantry records, or a generic layout.
+fn insert_object_keys(
+    needed: &mut HashSet<ShpSpriteKey>,
+    type_str: &str,
+    category: EntityCategory,
+    color_idx: HouseColorIndex,
+    rules: Option<&RuleSet>,
+    infantry_frames: Option<&[u16]>,
+) {
+    let mut insert = |frame: u16| {
+        needed.insert(ShpSpriteKey {
+            palette_context: ShpPaletteContext::Legacy,
+            type_id: type_str.to_string(),
+            facing: 0,
+            frame,
+            house_color: color_idx,
+        });
+    };
+    match category {
+        EntityCategory::Infantry => {
+            // Infantry518D80 indexes the full 42-record signed bank by Doing.
+            // The source-bound list was resolved once for this type, before
+            // expanding its house colours. No generic SequenceKind projection
+            // or invalid-frame standing fallback participates in this path.
+            for &frame in infantry_frames.unwrap_or_default() {
+                insert(frame);
+            }
+        }
+        EntityCategory::Structure => {
+            insert(0);
+            // CanBeOccupied buildings need frames 0..3 for the occupancy +
+            // damage-tier frame swap (see building_frame_index in
+            // app/presentation/instances/shp.rs). SHPs with fewer frames silently skip
+            // missing entries; the renderer falls back to frame 0.
+            let can_be_occupied = rules
+                .and_then(|r| r.object(type_str))
+                .is_some_and(|obj| obj.can_be_occupied);
+            if can_be_occupied {
+                for frame in 1u16..=3 {
+                    insert(frame);
+                }
+            }
+        }
+        _ => {
+            // Presentation consumes the same immutable per-type catalog as
+            // simulation. Image aliases, metadata fallback, voxel gating,
+            // and frame timing are resolved once when RuleSet is bound.
+            let seq_set = rules.and_then(|registry| registry.animation_sequence(type_str));
+
+            if let Some(set) = seq_set {
+                // Data-driven: iterate Stand + Walk sequences (and others)
+                // to collect exactly the right frames.
+                use crate::sim::animation::SequenceKind;
+                let relevant_kinds: &[SequenceKind] = &[
+                    SequenceKind::Stand,
+                    SequenceKind::Walk,
+                    SequenceKind::Attack,
+                    SequenceKind::Idle1,
+                    SequenceKind::Idle2,
+                    SequenceKind::Die1,
+                    SequenceKind::Die2,
+                    SequenceKind::Die3,
+                    SequenceKind::Die4,
+                    SequenceKind::Die5,
+                    SequenceKind::Prone,
+                    SequenceKind::Crawl,
+                    SequenceKind::FireProne,
+                    SequenceKind::Down,
+                    SequenceKind::Up,
+                    SequenceKind::Cheer,
+                    SequenceKind::Paradrop,
+                    SequenceKind::Panic,
+                    SequenceKind::Deploy,
+                    SequenceKind::Undeploy,
+                    SequenceKind::Deployed,
+                    SequenceKind::DeployedFire,
+                    SequenceKind::DeployedIdle,
+                    SequenceKind::SecondaryFire,
+                    SequenceKind::SecondaryProne,
+                    SequenceKind::Swim,
+                    SequenceKind::Fly,
+                    SequenceKind::FireFly,
+                    SequenceKind::Hover,
+                    SequenceKind::Tread,
+                    SequenceKind::WetAttack,
+                    SequenceKind::WetIdle1,
+                    SequenceKind::WetIdle2,
+                    SequenceKind::Shovel,
+                    SequenceKind::AirDeathStart,
+                    SequenceKind::AirDeathFalling,
+                    SequenceKind::AirDeathFinish,
+                ];
+                for kind in relevant_kinds {
+                    if let Some(seq_def) = set.get(kind) {
+                        for f_idx in 0..seq_def.facings {
+                            for frame_offset in 0..seq_def.frame_count {
+                                // Use facing=0 for all infantry keys — the absolute
+                                // frame index already encodes the facing direction.
+                                // House variants share these absolute frame keys.
+                                insert(
+                                    seq_def.start_frame
+                                        + f_idx as u16 * seq_def.facing_multiplier
+                                        + frame_offset,
+                                );
+                            }
+                        }
+                    }
+                }
+            } else {
+                // Fallback: hardcoded default layout (stand=0-7, walk=8-55).
+                // Use facing=0 for all keys — frame index encodes direction.
+                for bucket in 0..INFANTRY_FACING_BUCKETS {
+                    insert(bucket as u16);
+                    for walk_frame in 0..6u16 {
+                        insert(8 + bucket as u16 * 6 + walk_frame);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Frames an InfantryType's signed records can select in this actual SHP.
 ///
-/// Uses incremental rendering: if `existing` is provided, its cached rendered
-/// sprites are reused and only genuinely new keys are rendered. This avoids
-/// expensive SHP loading and frame blitting for sprites already in the atlas.
+/// Infantry518E08..1F and518F3B..88 retain signed Stage and DWORD composition.
+/// Iterate the asset, never a potentially enormous/negative sequence count.
+/// For each facing, invert the composed base with wrapping subtraction and
+/// let the sole frame resolver admit the candidate Stage. Every signed native
+/// remainder is smaller than i32::MAX, so this candidate is unique even when
+/// composition wraps. All 8 native facing slots have a representative byte.
+fn infantry_asset_frames(
+    actions: &[crate::rules::infantry_sequence::InfantrySequenceEntry],
+    frame_count: u16,
+) -> Vec<u16> {
+    let mut bases = Vec::with_capacity(actions.len() * usize::from(INFANTRY_FACING_BUCKETS));
+    for action in actions {
+        let facings = if action.facings > 0 {
+            INFANTRY_FACING_BUCKETS
+        } else {
+            1
+        };
+        for slot in 0..facings {
+            let facing = slot * INFANTRY_FACING_STEP;
+            bases.push((
+                action,
+                facing,
+                crate::sim::animation::resolve_shp_frame(action, facing, 0),
+            ));
+        }
+    }
+    (0..frame_count)
+        .filter(|&frame| {
+            let frame = i32::from(frame);
+            bases.iter().any(|&(action, facing, base)| {
+                crate::sim::animation::resolve_shp_frame(action, facing, frame.wrapping_sub(base))
+                    == frame
+            })
+        })
+        .collect()
+}
+
+/// The keys of `new_objects`, each drawn as the category of the placed objects
+/// of its type; a deploy target not on the map yet is a structure. A selected
+/// Infantry disguise type can be absent from the placed set; its rules class
+/// still supplies the Infantry source and signed record bank.
 ///
-/// 1. Queries the world for all (TypeRef, Facing, Category, SpriteModel) entities.
-/// 2. Collects unique (type_id, facing) pairs (facing=0 for structures).
-/// 3. Diffs against cached sprites — renders only new keys.
-/// 4. Shelf-packs all sprites (cached + new) into a single atlas texture.
+/// Return decoded Infantry sources for the render pass to consume, so every
+/// type is decoded once and its frame membership is computed once per refresh,
+/// independently of the number of entities or house colours.
+#[allow(clippy::too_many_arguments)]
+fn insert_new_object_keys(
+    needed: &mut HashSet<ShpSpriteKey>,
+    new_objects: &HashSet<(String, HouseColorIndex)>,
+    entities: &crate::sim::entity_store::EntityStore,
+    interner: Option<&crate::sim::intern::StringInterner>,
+    asset_manager: &AssetManager,
+    theater_ext: &str,
+    theater_name: &str,
+    rules: Option<&RuleSet>,
+    art: Option<&ArtRegistry>,
+) -> HashMap<String, Option<ShpSource>> {
+    let categories: HashMap<&str, EntityCategory> = entities
+        .values()
+        .filter(|entity| !entity.is_voxel)
+        .map(|entity| {
+            (
+                interner.map_or("", |i| i.resolve(entity.type_ref())),
+                entity.category,
+            )
+        })
+        .collect();
+    let mut sources = HashMap::new();
+    let mut frame_sets: HashMap<&str, Vec<u16>> = HashMap::new();
+    for (type_str, color_idx) in new_objects {
+        let category = categories
+            .get(type_str.as_str())
+            .copied()
+            .unwrap_or_else(|| {
+                if rules
+                    .and_then(|rules| rules.object(type_str))
+                    .is_some_and(|object| {
+                        object.category == crate::rules::object_type::ObjectCategory::Infantry
+                    })
+                {
+                    EntityCategory::Infantry
+                } else {
+                    EntityCategory::Structure
+                }
+            });
+        let infantry_frames = if category == EntityCategory::Infantry {
+            let frames = frame_sets.entry(type_str.as_str()).or_insert_with(|| {
+                let source = load_shp_source(
+                    asset_manager,
+                    type_str,
+                    None,
+                    theater_ext,
+                    theater_name,
+                    rules,
+                    art,
+                );
+                let actions = rules
+                    .and_then(|rules| rules.animation_sequence(type_str))
+                    .and_then(|set| set.infantry_actions());
+                let frames = match (source.as_ref(), actions) {
+                    (Some(source), Some(actions)) => {
+                        // ShpFile's parser reads the u16 header count. Keep
+                        // admission unavailable if that invariant is absent.
+                        u16::try_from(source.shp.frames.len())
+                            .map(|count| infantry_asset_frames(actions, count))
+                            .unwrap_or_default()
+                    }
+                    _ => Vec::new(),
+                };
+                sources.insert(type_str.clone(), source);
+                frames
+            });
+            Some(frames.as_slice())
+        } else {
+            None
+        };
+        insert_object_keys(
+            needed,
+            type_str,
+            category,
+            *color_idx,
+            rules,
+            infantry_frames,
+        );
+    }
+    sources
+}
+
+/// Groups keys by type, so each type's SHP is decoded once, in a stable order.
+fn sprite_key_order(key: &ShpSpriteKey) -> (&str, u8, u8, u16, u8) {
+    (
+        key.type_id.as_str(),
+        key.palette_context as u8,
+        key.house_color.0,
+        key.frame,
+        key.facing,
+    )
+}
+
+/// ObjectType LoadImage5F9070 uses BulletType's already resolved Image25,
+/// exact ART metadata and one second-character G retry. It does not follow an
+/// AnimType Image redirect or try both theater and SHP extensions.
+fn projectile_shp_candidates(
+    projectile: &ProjectileType,
+    theater_ext: &str,
+    theater_name: &str,
+) -> Vec<String> {
+    let Some(load) = &projectile.image_load else {
+        return Vec::new();
+    };
+    let theater = load.theater;
+    let upper = load.image.to_ascii_uppercase();
+    let [substituted, generic] = crate::rules::art_data::theater_shp_names(&upper, theater_name);
+    let first = if !theater && load.new_theater {
+        substituted
+    } else {
+        upper
+    };
+    let ext = if theater { theater_ext } else { "SHP" };
+    let mut candidates = vec![format!("{first}.{ext}")];
+    let fallback = format!("{generic}.{ext}");
+    if fallback != candidates[0] {
+        candidates.push(fallback);
+    }
+    candidates
+}
+
+fn register_projectile_frames(
+    needed: &mut HashSet<ShpSpriteKey>,
+    files: &mut HashMap<String, (String, u16)>,
+    assets: &AssetManager,
+    rules: Option<&RuleSet>,
+    theater_ext: &str,
+    theater_name: &str,
+) {
+    let Some(rules) = rules else {
+        return;
+    };
+    for weapon in rules.weapons_iter() {
+        let Some(projectile) = weapon
+            .projectile
+            .as_deref()
+            .and_then(|id| rules.projectile(id))
+        else {
+            continue;
+        };
+        if projectile.inviso || projectile.voxel {
+            continue;
+        }
+        let id = projectile.id.to_ascii_uppercase();
+        let (_, count) = files.entry(id.clone()).or_insert_with(|| {
+            let candidates = projectile_shp_candidates(projectile, theater_ext, theater_name);
+            find_shp(assets, &candidates)
+                .and_then(|(file, bytes)| {
+                    ShpFile::frame_count_from_bytes(bytes)
+                        .ok()
+                        .map(|count| (file.to_string(), count))
+                })
+                .unwrap_or_default()
+        });
+        for frame in 0..*count {
+            if projectile.firers_palette && !projectile.anim_palette {
+                // The production Bullet adapter has no retained House scheme
+                // yet and requests None. Register only its explicit ANIM.PAL
+                // fallback, not unused per-house variants. Native +114 capture
+                // remains the separate 466519..46653B House-authority residual.
+                needed.insert(unresolved_firer_key(&id, projectile, frame));
+            } else {
+                needed.insert(projectile_key(&id, projectile, frame, HouseColorIndex(0)));
+            }
+        }
+    }
+}
+
+/// Build or refresh the SHP sprite atlas for every object in the ECS world.
+///
+/// Without an `existing` atlas every key the world can draw is rendered and
+/// shelf-packed into new pages. With one, only the object (type, house
+/// colour) pairs and AnimClass colour remaps it has not collected are
+/// expanded to keys; those it neither holds nor has found unrenderable are
+/// rendered and appended to a growth page. Resident pages are not touched,
+/// and the world effects registered at map load are not read again.
+///
+/// 1. Collects the keys of new object pairs (bodies, infantry sequences,
+///    building and make animations) and new remaps, plus at map load the
+///    rules' world effects and the parachute.
+/// 2. Renders the keys not yet resolved, decoding each type's SHP once.
+/// 3. Packs them into new pages at map load, onto growth pages afterwards.
 ///
 /// Returns None if no sprite entities exist or all fail to load.
 ///
 /// `theater_ext` is the file extension for theater-specific SHP files
 /// (e.g., "tem" for TEMPERATE). Civilian buildings use `{TYPE_ID}.{ext}`
 /// instead of `{TYPE_ID}.SHP`. A supplied prior atlas is returned unchanged
-/// when no replacement sprite can be produced.
+/// when a required cell-drawer sprite cannot be produced.
 pub fn build_sprite_atlas(
-    gpu: &GpuContext,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
     batch: &BatchRenderer,
     entities: &crate::sim::entity_store::EntityStore,
     asset_manager: &AssetManager,
@@ -557,537 +1199,306 @@ pub fn build_sprite_atlas(
     existing: Option<SpriteAtlas>,
     interner: Option<&crate::sim::intern::StringInterner>,
 ) -> Option<SpriteAtlas> {
-    let mut previous_atlas = existing;
-    // Step 1: Collect unique (type_id, facing, frame, house_color) keys.
-    // Structures get facing=0 since buildings don't rotate.
+    let started = Instant::now();
+    let previous_atlas = existing;
+
+    // Step 1: object keys, for the (type, house colour) pairs the atlas has
+    // not collected — every pair at map load. Structures get facing 0 since
+    // buildings don't rotate.
+    let collected = |type_id: &str, color| {
+        previous_atlas
+            .as_ref()
+            .is_some_and(|atlas| atlas.covers_object(type_id, color))
+    };
+    let new_objects: HashSet<(String, HouseColorIndex)> =
+        object_pairs(entities, house_colors, extra_building_types, interner)
+            .filter(|&(type_id, color)| !collected(type_id, color))
+            .map(|(type_id, color)| (type_id.to_string(), color))
+            .collect();
+    let new_remaps: HashSet<(String, HouseColorIndex)> = anim_remap_keys
+        .iter()
+        .filter(|remap| {
+            !previous_atlas
+                .as_ref()
+                .is_some_and(|atlas| atlas.covered_anim_remaps.contains(*remap))
+        })
+        .cloned()
+        .collect();
     let mut needed: HashSet<ShpSpriteKey> = HashSet::new();
-    for entity in entities.values() {
-        if entity.is_voxel {
-            continue;
-        }
-        let owner_str = interner.map_or("", |i| i.resolve(entity.owner()));
-        let type_str = interner.map_or("", |i| i.resolve(entity.type_ref()));
-        let color_idx: HouseColorIndex = house_colors
-            .get(owner_str)
-            .copied()
-            .unwrap_or(crate::rules::house_colors::NO_REMAP);
-        match entity.category {
-            EntityCategory::Structure => {
-                needed.insert(ShpSpriteKey {
-                    palette_context: crate::render::sprite_atlas::ShpPaletteContext::Legacy,
-                    type_id: type_str.to_string(),
-                    facing: 0,
-                    frame: 0,
-                    house_color: color_idx,
-                });
-                // CanBeOccupied buildings need frames 0..3 for the occupancy +
-                // damage-tier frame swap (see building_frame_index in
-                // app/presentation/instances/shp.rs). SHPs with fewer frames silently skip
-                // missing entries; the renderer falls back to frame 0.
-                let can_be_occupied = rules
-                    .and_then(|r| r.object(type_str))
-                    .map(|obj| obj.can_be_occupied)
-                    .unwrap_or(false);
-                if can_be_occupied {
-                    for frame in 1u16..=3 {
-                        needed.insert(ShpSpriteKey {
-                            palette_context: crate::render::sprite_atlas::ShpPaletteContext::Legacy,
-                            type_id: type_str.to_string(),
-                            facing: 0,
-                            frame,
-                            house_color: color_idx,
-                        });
-                    }
-                }
-            }
-            _ => {
-                // Presentation consumes the same immutable per-type catalog as
-                // simulation. Image aliases, metadata fallback, voxel gating,
-                // and frame timing are resolved once when RuleSet is bound.
-                let seq_set = rules.and_then(|registry| registry.animation_sequence(type_str));
+    let mut infantry_sources = insert_new_object_keys(
+        &mut needed,
+        &new_objects,
+        entities,
+        interner,
+        asset_manager,
+        theater_ext,
+        theater_name,
+        rules,
+        art,
+    );
 
-                if let Some(set) = seq_set {
-                    // Data-driven: iterate Stand + Walk sequences (and others)
-                    // to collect exactly the right frames.
-                    use crate::sim::animation::SequenceKind;
-                    let relevant_kinds: &[SequenceKind] = &[
-                        SequenceKind::Stand,
-                        SequenceKind::Walk,
-                        SequenceKind::Attack,
-                        SequenceKind::Idle1,
-                        SequenceKind::Idle2,
-                        SequenceKind::Die1,
-                        SequenceKind::Die2,
-                        SequenceKind::Die3,
-                        SequenceKind::Die4,
-                        SequenceKind::Die5,
-                        SequenceKind::Prone,
-                        SequenceKind::Crawl,
-                        SequenceKind::FireProne,
-                        SequenceKind::Down,
-                        SequenceKind::Up,
-                        SequenceKind::Cheer,
-                        SequenceKind::Paradrop,
-                        SequenceKind::Panic,
-                        SequenceKind::Deploy,
-                        SequenceKind::Undeploy,
-                        SequenceKind::Deployed,
-                        SequenceKind::DeployedFire,
-                        SequenceKind::DeployedIdle,
-                        SequenceKind::SecondaryFire,
-                        SequenceKind::SecondaryProne,
-                        SequenceKind::Swim,
-                        SequenceKind::Fly,
-                        SequenceKind::FireFly,
-                        SequenceKind::Hover,
-                        SequenceKind::Tread,
-                        SequenceKind::WetAttack,
-                        SequenceKind::WetIdle1,
-                        SequenceKind::WetIdle2,
-                    ];
-                    for kind in relevant_kinds {
-                        if let Some(seq_def) = set.get(kind) {
-                            for f_idx in 0..seq_def.facings {
-                                for frame_offset in 0..seq_def.frame_count {
-                                    let frame: u16 = seq_def.start_frame
-                                        + f_idx as u16 * seq_def.facing_multiplier
-                                        + frame_offset;
-                                    // Use facing=0 for all infantry keys — the absolute
-                                    // frame index already encodes the facing direction.
-                                    // This avoids cache key mismatches for non-8-facing
-                                    // sequences (most RA2 infantry use 6 facings).
-                                    needed.insert(ShpSpriteKey {
-                                        palette_context:
-                                            crate::render::sprite_atlas::ShpPaletteContext::Legacy,
-                                        type_id: type_str.to_string(),
-                                        facing: 0,
-                                        frame,
-                                        house_color: color_idx,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    // Fallback: hardcoded default layout (stand=0-7, walk=8-55).
-                    // Use facing=0 for all keys — frame index encodes direction.
-                    for bucket in 0..INFANTRY_FACING_BUCKETS {
-                        needed.insert(ShpSpriteKey {
-                            palette_context: crate::render::sprite_atlas::ShpPaletteContext::Legacy,
-                            type_id: type_str.to_string(),
-                            facing: 0,
-                            frame: bucket as u16,
-                            house_color: color_idx,
-                        });
-                        for walk_frame in 0..6u16 {
-                            needed.insert(ShpSpriteKey {
-                                palette_context:
-                                    crate::render::sprite_atlas::ShpPaletteContext::Legacy,
-                                type_id: type_str.to_string(),
-                                facing: 0,
-                                frame: 8 + bucket as u16 * 6 + walk_frame,
-                                house_color: color_idx,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // Step 1a: Pre-load extra building types (e.g., ConYards for MCV deployment).
-    // These may not exist on the map initially but can be spawned at runtime.
-    if !extra_building_types.is_empty() {
-        let all_colors: Vec<HouseColorIndex> = house_colors.values().copied().collect();
-        for &type_id in extra_building_types {
-            for &color in &all_colors {
-                needed.insert(ShpSpriteKey {
-                    palette_context: crate::render::sprite_atlas::ShpPaletteContext::Legacy,
-                    type_id: type_id.to_string(),
-                    facing: 0,
-                    frame: 0,
-                    house_color: color,
-                });
-            }
-        }
-    }
+    // Frame counts and source files registered so far: a refresh extends the
+    // atlas's own and replaces them only once it has succeeded.
+    let (mut active_anim_frame_counts, mut make_frame_counts, mut shp_files) = previous_atlas
+        .as_ref()
+        .map(|atlas| {
+            (
+                atlas.active_anim_frame_counts.clone(),
+                atlas.make_frame_counts.clone(),
+                atlas.shp_files.clone(),
+            )
+        })
+        .unwrap_or_default();
+    let mut projectile_files = previous_atlas
+        .as_ref()
+        .map(|atlas| atlas.projectile_files.clone())
+        .unwrap_or_default();
+    register_projectile_frames(
+        &mut needed,
+        &mut projectile_files,
+        asset_manager,
+        rules,
+        theater_ext,
+        theater_name,
+    );
 
     // Step 1b: Collect every declared building animation frame required by art
     // metadata. Runtime owns timing; atlas construction only ensures that a
     // live `BuildingAnimOverlays` frame is drawable.
-    let mut active_anim_frame_counts: HashMap<String, u16> = HashMap::new();
+    //
+    // The keys follow this build's own count, never the atlas's: a name that
+    // is also a world effect (e.g. GAPOWR_A) holds the effect count there,
+    // shadow half included. Map load counts building animations before the
+    // effects, so a building on the map at load gets the same frames as one
+    // that appears later, and the effect keeps the presentation count.
+    let mut building_anim_counts: HashMap<String, u16> = HashMap::new();
     if let Some(art_reg) = art {
-        let building_keys: Vec<ShpSpriteKey> = needed
-            .iter()
-            .filter(|k| k.facing == 0) // structures only
-            .cloned()
-            .collect();
-        for key in &building_keys {
+        for (type_id, house_color) in &new_objects {
             let rules_image: String = rules
-                .and_then(|r| r.object(&key.type_id))
+                .and_then(|r| r.object(type_id))
                 .map(|o| o.image.clone())
-                .unwrap_or_else(|| key.type_id.clone());
-            let art_entry: Option<&crate::rules::art_data::ArtEntry> =
-                art_reg.resolve_metadata_entry(&key.type_id, &rules_image);
-            if let Some(entry) = art_entry {
-                for anim in &entry.building_anims {
-                    // Original location: `RA2-GAME.EXE-IDB` canon,
-                    // `assets.unitShpFrameSelection.ra2yr.json` and
-                    // `assets.buildingDrawOffsets.ra2yr.json`: declared
-                    // Idle/Super/Special frames are chosen by the live object
-                    // animation state, not collapsed to atlas frame zero.
-                    let anim_upper: String = anim.anim_type.to_uppercase();
-                    if !active_anim_frame_counts.contains_key(&anim_upper) {
-                        if let Some(count) = scan_building_anim_frame_count(
-                            asset_manager,
-                            art_reg,
-                            &anim.anim_type,
-                            anim.loop_end,
-                            theater_ext,
-                            theater_name,
-                        ) {
-                            active_anim_frame_counts.insert(anim_upper.clone(), count);
-                            log::info!(
-                                "Building anim {} for {}: {} frames (kind={:?}, loop_end={})",
-                                anim.anim_type,
-                                key.type_id,
-                                count,
-                                anim.kind,
-                                anim.loop_end,
-                            );
-                        }
-                    }
-                    let count = active_anim_frame_counts
-                        .get(&anim_upper)
-                        .copied()
-                        .unwrap_or(1);
-                    insert_building_anim_frame_keys(
+                .unwrap_or_else(|| type_id.clone());
+            let Some(entry) = art_reg.resolve_metadata_entry(type_id, &rules_image) else {
+                continue;
+            };
+            for anim in &entry.building_anims {
+                // Original location: `RA2-GAME.EXE-IDB` canon,
+                // `assets.unitShpFrameSelection.ra2yr.json` and
+                // `assets.buildingDrawOffsets.ra2yr.json`: declared
+                // Idle/Super/Special frames are chosen by the live object
+                // animation state, not collapsed to atlas frame zero.
+                let variants = [&anim.damaged_variant, &anim.garrisoned_variant];
+                let anims = std::iter::once((anim.anim_type.as_str(), anim.loop_end)).chain(
+                    variants
+                        .into_iter()
+                        .flatten()
+                        .map(|variant| (variant.anim_type.as_str(), variant.loop_end)),
+                );
+                for (anim_type, loop_end) in anims {
+                    register_building_anim(
                         &mut needed,
-                        &anim.anim_type,
-                        count,
-                        key.house_color,
-                        attached_anim_palette_context(art_reg.anim_runtime_config(&anim.anim_type)),
+                        &mut building_anim_counts,
+                        &mut shp_files,
+                        asset_manager,
+                        art_reg,
+                        anim_type,
+                        loop_end,
+                        *house_color,
+                        theater_ext,
+                        theater_name,
                     );
-
-                    for variant in [&anim.damaged_variant, &anim.garrisoned_variant] {
-                        let Some(variant) = variant.as_ref() else {
-                            continue;
-                        };
-                        let variant_type = variant.anim_type.as_str();
-                        let variant_upper: String = variant_type.to_uppercase();
-                        if !active_anim_frame_counts.contains_key(&variant_upper) {
-                            if let Some(count) = scan_building_anim_frame_count(
-                                asset_manager,
-                                art_reg,
-                                variant_type,
-                                variant.loop_end,
-                                theater_ext,
-                                theater_name,
-                            ) {
-                                active_anim_frame_counts.insert(variant_upper.clone(), count);
-                                log::info!(
-                                    "Building anim variant {} for {}: {} frames (loop_end={})",
-                                    variant_type,
-                                    key.type_id,
-                                    count,
-                                    variant.loop_end,
-                                );
-                            }
-                        }
-                        let count: u16 = active_anim_frame_counts
-                            .get(&variant_upper)
-                            .copied()
-                            .unwrap_or(1);
-                        insert_building_anim_frame_keys(
-                            &mut needed,
-                            variant_type,
-                            count,
-                            key.house_color,
-                            attached_anim_palette_context(
-                                art_reg.anim_runtime_config(variant_type),
-                            ),
-                        );
-                    }
                 }
-                // BibShape: ground-level pad SHP (e.g., refinery dock GAREFNBB).
-                // Use bib name directly as atlas key so render can look it up.
-                if let Some(ref bib) = entry.bib_shape {
-                    needed.insert(ShpSpriteKey {
-                        palette_context: if entry.terrain_palette {
-                            ShpPaletteContext::Cell
-                        } else {
-                            ShpPaletteContext::SelectedScheme
-                        },
-                        type_id: bib.to_uppercase(),
-                        facing: 0,
-                        frame: 0,
-                        house_color: key.house_color,
-                    });
-                    log::info!("BibShape for {}: {}", key.type_id, bib);
-                }
+            }
+            // BibShape: ground-level pad SHP (e.g., refinery dock GAREFNBB).
+            // Use bib name directly as atlas key so render can look it up.
+            if let Some(ref bib) = entry.bib_shape {
+                needed.insert(ShpSpriteKey {
+                    palette_context: if entry.terrain_palette {
+                        ShpPaletteContext::Cell
+                    } else {
+                        ShpPaletteContext::SelectedScheme
+                    },
+                    type_id: bib.to_uppercase(),
+                    facing: 0,
+                    frame: 0,
+                    house_color: *house_color,
+                });
             }
         }
     }
+    for (anim_type, count) in building_anim_counts {
+        active_anim_frame_counts.entry(anim_type).or_insert(count);
+    }
 
-    // Step 1c: Pre-scan for building "make" (build-up) SHPs and add all their frames.
-    // The make SHP is a separate file (e.g., GTCNSTMK.SHP) with N frames showing
-    // the building assembling. We need to load it briefly to count frames, then add
-    // keys for each frame so they get rendered into the atlas.
-    let mut make_frame_counts: HashMap<String, u16> = HashMap::new();
+    // Step 1c: every frame of each building's make (build-up) SHP, a separate
+    // file (e.g., GTCNSTMK.SHP) showing the building assembling.
     if let Some(art_reg) = art {
-        let building_type_ids: Vec<(String, HouseColorIndex)> = needed
-            .iter()
-            .filter(|k| k.facing == 0 && k.frame == 0)
-            .map(|k| (k.type_id.clone(), k.house_color))
-            .collect();
-        for (type_id, color) in &building_type_ids {
+        for (type_id, color) in &new_objects {
             // Skip anim overlay types (they don't have make SHPs).
             if type_id.contains('_') {
                 continue;
             }
             let make_key: String = format!("{}_MAKE", type_id);
-            if make_frame_counts.contains_key(&make_key) {
-                // Already scanned this type — just add keys for this color.
-                let count: u16 = make_frame_counts[&make_key];
-                for f in 0..count {
-                    needed.insert(ShpSpriteKey {
-                        palette_context: crate::render::sprite_atlas::ShpPaletteContext::Legacy,
-                        type_id: make_key.clone(),
-                        facing: 0,
-                        frame: f,
-                        house_color: *color,
-                    });
-                }
-                continue;
-            }
-            let rules_image: String = rules
-                .and_then(|r| r.object(type_id))
-                .map(|o| o.image.clone())
-                .unwrap_or_else(|| type_id.clone());
-            let image: String = art_reg.resolve_effective_image_id(type_id, &rules_image);
-            let candidates: Vec<String> =
-                art_data::make_shp_candidates(Some(art_reg), &image, theater_ext, theater_name);
-            let shp_data: Option<&[u8]> = candidates.iter().find_map(|c| asset_manager.get_ref(c));
-            if let Some(data) = shp_data {
-                if let Ok(shp) = ShpFile::from_bytes(data) {
-                    // RA2 make SHPs have shadow frames in the second half — only use the first half.
-                    let real_frames: u16 = (shp.frames.len() as u16) / 2;
-                    let frame_count: u16 = if real_frames > 0 {
-                        real_frames
-                    } else {
-                        shp.frames.len() as u16
-                    };
-                    log::info!(
-                        "Make SHP for {}: {} frames ({})",
-                        type_id,
-                        frame_count,
-                        candidates
-                            .iter()
-                            .find(|c| asset_manager.get_ref(c).is_some())
-                            .unwrap_or(&String::new()),
+            let count = match make_frame_counts.get(&make_key) {
+                Some(&count) => count,
+                None => {
+                    let rules_image: String = rules
+                        .and_then(|r| r.object(type_id))
+                        .map(|o| o.image.clone())
+                        .unwrap_or_else(|| type_id.clone());
+                    let image: String = art_reg.resolve_effective_image_id(type_id, &rules_image);
+                    let candidates: Vec<String> = art_data::make_shp_candidates(
+                        Some(art_reg),
+                        &image,
+                        theater_ext,
+                        theater_name,
                     );
-                    make_frame_counts.insert(make_key.clone(), frame_count);
-                    for f in 0..frame_count {
-                        needed.insert(ShpSpriteKey {
-                            palette_context: crate::render::sprite_atlas::ShpPaletteContext::Legacy,
-                            type_id: make_key.clone(),
-                            facing: 0,
-                            frame: f,
-                            house_color: *color,
-                        });
-                    }
+                    let Some((file, data)) = find_shp(asset_manager, &candidates) else {
+                        continue;
+                    };
+                    let Ok(raw_count) = ShpFile::frame_count_from_bytes(data) else {
+                        continue;
+                    };
+                    // RA2 make SHPs have shadow frames in the second half — only use the first half.
+                    let count = if raw_count / 2 > 0 {
+                        raw_count / 2
+                    } else {
+                        raw_count
+                    };
+                    log::debug!("Make SHP for {type_id}: {count} frames from {file}");
+                    shp_files.insert(make_key.to_ascii_uppercase(), file.to_string());
+                    make_frame_counts.insert(make_key.clone(), count);
+                    count
                 }
+            };
+            for frame in 0..count {
+                needed.insert(ShpSpriteKey {
+                    palette_context: ShpPaletteContext::Legacy,
+                    type_id: make_key.clone(),
+                    facing: 0,
+                    frame,
+                    house_color: *color,
+                });
             }
         }
     }
 
-    // Step 1d: Pre-load world effect SHPs (warp animations, explosions, etc.).
-    // Names come from rules.ini [General] WarpIn=/WarpOut=/WarpAway= — NOT hardcoded.
-    // These use anim.pal (effect palette), not unit.pal — tracked in effect_type_ids
-    // so step 2 can pick the correct palette.
-    let mut effect_type_ids: HashSet<String> = HashSet::new();
-    {
-        let mut effect_names: Vec<String> = Vec::new();
-        if let Some(r) = rules {
-            effect_names.push(r.general.warp_in.name.clone());
-            effect_names.push(r.general.warp_out.name.clone());
-            effect_names.push(r.general.warp_away.name.clone());
-            // [General] Wake= (WAKE1): spawned as a WorldEffect behind ships.
-            // Stock art sets no AltPalette= and its Theater= line is commented
-            // out, so it is an anim.pal draw like every other AnimType; left
-            // out of this set it fell through to unit.pal and drew green.
-            effect_names.push(r.general.wake.name.clone());
-            // Add damage fire types (FIRE01, FIRE02, FIRE03 by default).
-            for fire_ref in &r.general.damage_fire_types {
-                if !effect_names
-                    .iter()
-                    .any(|n| n.eq_ignore_ascii_case(&fire_ref.name))
-                {
-                    effect_names.push(fire_ref.name.clone());
+    // Step 1d: Pre-load world effect SHPs (warp animations, explosions, etc.)
+    // once, at map load. Names come from rules.ini [General]
+    // WarpIn=/WarpOut=/WarpAway= — NOT hardcoded. These use anim.pal (effect
+    // palette), not unit.pal — tracked in the effect registry so step 2 can
+    // pick the correct palette. Only the SHP header is read here.
+    let mut registered_effects = EffectRegistry::default();
+    let effect_names = match previous_atlas {
+        None => rules.map(collect_effect_names).unwrap_or_default(),
+        Some(_) => Vec::new(),
+    };
+    for name in &effect_names {
+        // Use the same resolved Image= and Theater=/NewTheater= filename
+        // authority as scheduler binding. Stock cell-drawer rows such as
+        // WA01X and TUNTOP01 are theater SHPs (`.TEM` on Temperate maps).
+        let candidates = effect_anim_shp_candidates(name, art, theater_ext, theater_name);
+        let required_cell_drawer = cell_drawer_type_ids.contains(&name.to_ascii_uppercase());
+        match find_shp(asset_manager, &candidates) {
+            Some((file, data)) => match ShpFile::frame_count_from_bytes(data) {
+                Ok(raw_count) => {
+                    let name_upper = name.to_ascii_uppercase();
+                    let scheduler_owned = art.is_some_and(|registry| {
+                        registry.scheduler_anim_types().contains(&name_upper)
+                    });
+                    let shadow = art
+                        .and_then(|registry| registry.anim_runtime_config(name))
+                        .is_some_and(|config| config.shadow);
+                    // Keep atlas keys and the presentation-facing count in one
+                    // registration so rendering cannot select an unloaded frame.
+                    let count = register_effect_anim_frames(
+                        &mut needed,
+                        &mut active_anim_frame_counts,
+                        name,
+                        raw_count,
+                        scheduler_owned,
+                        shadow,
+                    );
+                    registered_effects
+                        .frames
+                        .insert(name_upper.clone(), (name.clone(), count));
+                    registered_effects.type_ids.insert(name.clone());
+                    shp_files.insert(name_upper, file.to_string());
+                    log::debug!("Effect anim SHP {}: {} frames from {}", name, count, file);
                 }
-            }
-            for anim_name in r.art_registry.scheduler_anim_types() {
-                if !effect_names
-                    .iter()
-                    .any(|name| name.eq_ignore_ascii_case(anim_name))
-                {
-                    effect_names.push(anim_name.clone());
-                }
-            }
-            // Collect explosion animation names from all warhead AnimList= fields.
-            for wh in r.warheads_iter() {
-                for anim_name in &wh.anim_list {
-                    if !effect_names
-                        .iter()
-                        .any(|n| n.eq_ignore_ascii_case(anim_name))
-                    {
-                        effect_names.push(anim_name.clone());
-                    }
-                }
-            }
-            // Collect weapon Anim= and OccupantAnim names from weapons.
-            for weapon in r.weapons_iter() {
-                for anim_name in &weapon.anim {
-                    if !effect_names
-                        .iter()
-                        .any(|n| n.eq_ignore_ascii_case(anim_name))
-                    {
-                        effect_names.push(anim_name.clone());
-                    }
-                }
-                if let Some(ref anim_name) = weapon.occupant_anim {
-                    if !effect_names
-                        .iter()
-                        .any(|n| n.eq_ignore_ascii_case(anim_name))
-                    {
-                        effect_names.push(anim_name.clone());
-                    }
-                }
-                if let Some(projectile_id) = weapon.projectile.as_deref() {
-                    if let Some(projectile) = r.projectile(projectile_id) {
-                        if !projectile.inviso {
-                            if let Some(image) = projectile.image.as_deref() {
-                                if !effect_names.iter().any(|n| n.eq_ignore_ascii_case(image)) {
-                                    effect_names.push(image.to_string());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            // Particle SHPs: ParticleType.Image= goes through the ObjectTypeClass
-            // Image= path → anim.pal palette. Register every distinct name.
-            for pt in r.particle_types_iter() {
-                if let Some(image) = pt.image.as_deref() {
-                    if !effect_names.iter().any(|n| n.eq_ignore_ascii_case(image)) {
-                        effect_names.push(image.to_string());
-                    }
-                }
-            }
-        }
-        for name in &effect_names {
-            // Use the same resolved Image= and Theater=/NewTheater= filename
-            // authority as scheduler binding. Stock cell-drawer rows such as
-            // WA01X and TUNTOP01 are theater SHPs (`.TEM` on Temperate maps).
-            let candidates = effect_anim_shp_candidates(name, art, theater_ext, theater_name);
-            let required_cell_drawer = cell_drawer_type_ids.contains(&name.to_ascii_uppercase());
-            match candidates.iter().find_map(|c| asset_manager.get_ref(c)) {
-                Some(data) => match ShpFile::from_bytes(data) {
-                    Ok(shp) => {
-                        let raw_count = shp.frames.len() as u16;
-                        let name_upper = name.to_ascii_uppercase();
-                        let scheduler_owned = art.is_some_and(|registry| {
-                            registry.scheduler_anim_types().contains(&name_upper)
-                        });
-                        let shadow = art
-                            .and_then(|registry| registry.anim_runtime_config(name))
-                            .is_some_and(|config| config.shadow);
-                        // Keep atlas keys and the presentation-facing count in one
-                        // registration so rendering cannot select an unloaded frame.
-                        let count = register_effect_anim_frames(
-                            &mut needed,
-                            &mut active_anim_frame_counts,
-                            name,
-                            raw_count,
-                            scheduler_owned,
-                            shadow,
-                        );
-                        insert_anim_remap_frame_keys(&mut needed, name, count, anim_remap_keys);
-                        effect_type_ids.insert(name.clone());
-                        log::info!("WorldEffect SHP {}: {} frames loaded", name, count);
-                    }
-                    Err(error) if required_cell_drawer => {
-                        return abort_sprite_atlas_refresh(
-                            previous_atlas,
-                            None,
-                            0,
-                            format!(
-                                "bound cell-drawer animation [{name}] failed SHP decode: {error}"
-                            ),
-                        );
-                    }
-                    Err(_) => {}
-                },
-                None if required_cell_drawer => {
+                Err(error) if required_cell_drawer => {
                     return abort_sprite_atlas_refresh(
                         previous_atlas,
-                        None,
-                        0,
-                        format!("bound cell-drawer animation [{name}] has no SHP asset"),
+                        format!("bound cell-drawer animation [{name}] failed SHP decode: {error}"),
                     );
                 }
-                None => {}
+                Err(_) => {}
+            },
+            None if required_cell_drawer => {
+                return abort_sprite_atlas_refresh(
+                    previous_atlas,
+                    format!("bound cell-drawer animation [{name}] has no SHP asset"),
+                );
             }
+            None => {}
         }
     }
 
     // Step 1e: Pre-load the parachute SHP (`[General] Parachute=`).
-    // The parachute is reached through `[General] Parachute=` rather than the
-    // animation closure, so its frames need registering here. Its palette is not
+    // The canopy's frames are keyed on the unit-palette context the parachute
+    // pass draws with, so they are registered here as well as through the
+    // AnimClass closure `[General] Parachute=` now belongs to. Its palette is not
     // decided by this registration: `sprite_palette_choice` reads the art type's
     // `AltPalette=` flag, which PARACH sets, and that selects the unit palette.
-    if let Some(r) = rules {
-        if let Some(pc) = r.general.parachute_render.as_ref() {
-            let lower: String = pc.shp_name.to_ascii_lowercase();
-            let candidates: Vec<String> =
-                vec![format!("{}.shp", lower), format!("{}.SHP", pc.shp_name)];
-            if let Some(data) = candidates.iter().find_map(|c| asset_manager.get_ref(c)) {
-                if let Ok(shp) = ShpFile::from_bytes(data) {
-                    let frame_count: u16 = shp.frames.len() as u16;
-                    for f in 0..frame_count {
+    let parachute = rules
+        .filter(|_| previous_atlas.is_none())
+        .and_then(|r| r.general.parachute_shp.as_deref());
+    if let Some(shp_name) = parachute {
+        let candidates = [
+            format!("{}.shp", shp_name.to_ascii_lowercase()),
+            format!("{}.SHP", shp_name),
+        ];
+        match find_shp(asset_manager, &candidates) {
+            Some((file, data)) => match ShpFile::frame_count_from_bytes(data) {
+                Ok(frame_count) => {
+                    for frame in 0..frame_count {
                         needed.insert(ShpSpriteKey {
                             palette_context: ShpPaletteContext::GlobalAnim,
-                            type_id: pc.shp_name.clone(),
+                            type_id: shp_name.to_string(),
                             facing: 0,
-                            frame: f,
+                            frame,
                             house_color: HouseColorIndex(0),
                         });
                     }
-                    active_anim_frame_counts.insert(pc.shp_name.clone(), frame_count);
-                    log::info!(
+                    active_anim_frame_counts.insert(shp_name.to_string(), frame_count);
+                    shp_files.insert(shp_name.to_ascii_uppercase(), file.to_string());
+                    log::debug!(
                         "Parachute SHP {}: {} frames loaded (unit palette per AltPalette=yes)",
-                        pc.shp_name,
+                        shp_name,
                         frame_count
                     );
-                } else {
-                    log::warn!(
-                        "Parachute SHP {} found in MIX but failed to parse",
-                        pc.shp_name
-                    );
                 }
-            } else {
-                log::warn!(
-                    "Parachute SHP {} not found in MIX archives — chute will not render",
-                    pc.shp_name
-                );
-            }
+                Err(_) => log::warn!(
+                    "Parachute SHP {} found in MIX but failed to parse",
+                    shp_name
+                ),
+            },
+            None => log::warn!(
+                "Parachute SHP {} not found in MIX archives — chute will not render",
+                shp_name
+            ),
         }
     }
+
+    let effects = previous_atlas
+        .as_ref()
+        .map_or(&registered_effects, |atlas| &atlas.effects);
+    insert_anim_remap_frame_keys(&mut needed, effects, &new_remaps);
 
     let mut contextual = Vec::new();
     for key in &needed {
         if key.palette_context == ShpPaletteContext::Legacy
-            && effect_type_ids.contains(&key.type_id)
+            && effects.type_ids.contains(&key.type_id)
         {
             let mut global = key.clone();
             global.palette_context = ShpPaletteContext::GlobalAnim;
@@ -1101,26 +1512,29 @@ pub fn build_sprite_atlas(
     }
     needed.extend(contextual);
 
-    if needed.is_empty() {
-        log::info!("No SHP sprite entities found — keeping the current sprite atlas");
-        return previous_atlas;
+    if needed.is_empty() && previous_atlas.is_none() {
+        log::info!("No SHP sprite entities found");
+        return None;
     }
 
-    // Step 1e: Extract cached rendered sprites from existing atlas, diff against needed.
-    let previous_cache_len = previous_atlas
-        .as_ref()
-        .map_or(0, |atlas| atlas.rendered_cache.len());
-    let mut cached: Vec<RenderedShpSprite> = previous_atlas
-        .as_mut()
-        .map(|atlas| std::mem::take(&mut atlas.rendered_cache))
-        .unwrap_or_default();
-    let cached_keys: HashSet<ShpSpriteKey> = cached.iter().map(|s| s.key.clone()).collect();
-    let new_count: usize = needed.iter().filter(|k| !cached_keys.contains(k)).count();
-
+    // Step 2: the keys to render — every one at map load, afterwards only those
+    // the atlas neither holds nor has found unrenderable. Sorting groups each
+    // type's keys so its SHP is decoded once.
+    let resolved = |key: &ShpSpriteKey| {
+        previous_atlas.as_ref().is_some_and(|atlas| {
+            atlas.entries.contains_key(key) || atlas.unrenderable.contains(key)
+        })
+    };
+    let mut new_keys: Vec<ShpSpriteKey> = needed
+        .iter()
+        .filter(|key| !resolved(key))
+        .cloned()
+        .collect();
+    new_keys.sort_unstable_by(|a, b| sprite_key_order(a).cmp(&sprite_key_order(b)));
     log::info!(
-        "Sprite atlas: {} cached, {} new to render, {} total needed",
-        cached.len(),
-        new_count,
+        "Sprite atlas: {} already resolved, {} new to render, {} total needed",
+        needed.len() - new_keys.len(),
+        new_keys.len(),
         needed.len(),
     );
 
@@ -1129,15 +1543,19 @@ pub fn build_sprite_atlas(
     let effect_palette: Option<Palette> = asset_manager
         .get_ref("anim.pal")
         .and_then(|d| Palette::from_bytes(d).ok());
-    if effect_palette.is_none() && !effect_type_ids.is_empty() {
+    let bullet_palette = asset_manager
+        .get_ref("palette.pal")
+        .and_then(|data| Palette::from_bytes(data).ok());
+    if effect_palette.is_none() && !effects.type_ids.is_empty() {
         log::warn!("anim.pal not found — world effect SHPs will use unit.pal (wrong colors)");
     }
 
     // BuildingType TerrainPalette (004612B4, DrawSHP 00705EC7) has the same
     // palette owner as cell-drawer animations. Resolve the rules Image alias.
     let mut cell_palette_type_ids = cell_drawer_type_ids.clone();
-    for key in &needed {
-        let base = key.type_id.strip_suffix("_MAKE").unwrap_or(&key.type_id);
+    let new_types: HashSet<&str> = new_keys.iter().map(|key| key.type_id.as_str()).collect();
+    for type_id in new_types {
+        let base = type_id.strip_suffix("_MAKE").unwrap_or(type_id);
         let image = rules
             .and_then(|r| r.object(base))
             .map_or(base, |o| o.image.as_str());
@@ -1145,292 +1563,227 @@ pub fn build_sprite_atlas(
             .and_then(|a| a.resolve_metadata_entry(base, image))
             .is_some_and(|a| a.terrain_palette)
         {
-            cell_palette_type_ids.insert(key.type_id.to_ascii_uppercase());
+            cell_palette_type_ids.insert(type_id.to_ascii_uppercase());
         }
     }
-    if (!cell_palette_type_ids.is_empty()
-        || needed
-            .iter()
-            .any(|k| k.palette_context == ShpPaletteContext::Cell))
-        && cell_palette.is_none()
-    {
+    let palette_choices: Vec<SpritePaletteChoice> = new_keys
+        .iter()
+        .map(|key| sprite_palette_for_key(key, art, &effects.type_ids, &cell_palette_type_ids))
+        .collect();
+    if cell_palette.is_none() && palette_choices.contains(&SpritePaletteChoice::CellIso) {
         return abort_sprite_atlas_refresh(
             previous_atlas,
-            Some(cached),
-            previous_cache_len,
             "terrain-attached animations require the active theater ISO palette".to_string(),
         );
     }
+    if bullet_palette.is_none() && palette_choices.contains(&SpritePaletteChoice::Bullet) {
+        return abort_sprite_atlas_refresh(
+            previous_atlas,
+            "visible projectiles require PALETTE.PAL".to_string(),
+        );
+    }
+    if effect_palette.is_none()
+        && new_keys
+            .iter()
+            .any(|key| key.palette_context == ShpPaletteContext::BulletAnim)
+    {
+        return abort_sprite_atlas_refresh(
+            previous_atlas,
+            "AnimPalette projectiles require ANIM.PAL".to_string(),
+        );
+    }
 
-    // Step 2: Render only new sprites (skip cached ones).
-    for key in &needed {
-        if cached_keys.contains(key) {
-            continue;
+    let mut rendered: Vec<RenderedShpSprite> = Vec::with_capacity(new_keys.len());
+    let mut unrenderable: Vec<ShpSpriteKey> = Vec::new();
+    let mut source: Option<(&str, bool, Option<ShpSource>)> = None;
+    for (key, palette_choice) in new_keys.iter().zip(palette_choices) {
+        let projectile = key.palette_context.is_projectile();
+        if source.as_ref().is_none_or(|(type_id, was_projectile, _)| {
+            *type_id != key.type_id || *was_projectile != projectile
+        }) {
+            let file = if projectile {
+                projectile_files
+                    .get(&key.type_id)
+                    .map(|(file, _)| file.as_str())
+            } else {
+                shp_files
+                    .get(&key.type_id.to_ascii_uppercase())
+                    .map(String::as_str)
+            };
+            // The Infantry membership pass already decoded this exact source.
+            // Consume it here rather than decoding per colour or a second time.
+            let mut loaded = (!projectile)
+                .then(|| infantry_sources.remove(&key.type_id))
+                .flatten()
+                .unwrap_or_else(|| {
+                    load_shp_source(
+                        asset_manager,
+                        &key.type_id,
+                        file,
+                        theater_ext,
+                        theater_name,
+                        rules,
+                        art,
+                    )
+                });
+            if projectile && let Some(loaded) = &mut loaded {
+                // BulletDraw468090 has no AnimType/Techno XDrawOffset consumer.
+                loaded.draw_offsets = (0, 0);
+            }
+            source = Some((&key.type_id, projectile, loaded));
         }
-        let palette_choice =
-            sprite_palette_for_key(key, art, &effect_type_ids, &cell_palette_type_ids);
         let pal: &Palette = match palette_choice {
             SpritePaletteChoice::Anim => effect_palette.as_ref().unwrap_or(palette),
             SpritePaletteChoice::Unit => palette,
             SpritePaletteChoice::CellIso => {
                 cell_palette.expect("cell-drawer palette was validated before atlas rendering")
             }
+            SpritePaletteChoice::Bullet => {
+                bullet_palette.as_ref().expect("bullet palette validated")
+            }
         };
-        match render_shp_sprite(
-            asset_manager,
-            pal,
-            match key.palette_context {
-                ShpPaletteContext::Legacy => palette_choice != SpritePaletteChoice::CellIso,
-                _ => palette_choice == SpritePaletteChoice::Unit,
-            },
-            key,
-            theater_ext,
-            theater_name,
-            rules,
-            art,
-        ) {
-            Some(sprite) => cached.push(sprite),
+        let house_remap = match key.palette_context {
+            ShpPaletteContext::Legacy => palette_choice != SpritePaletteChoice::CellIso,
+            _ => palette_choice == SpritePaletteChoice::Unit,
+        };
+        let sprite = source
+            .as_ref()
+            .and_then(|(_, _, loaded)| loaded.as_ref())
+            .and_then(|loaded| render_shp_frame(loaded, pal, house_remap, key, rules));
+        match sprite {
+            Some(sprite) => rendered.push(sprite),
             None if cell_drawer_type_ids.contains(&key.type_id.to_ascii_uppercase()) => {
                 return abort_sprite_atlas_refresh(
                     previous_atlas,
-                    Some(cached),
-                    previous_cache_len,
                     format!(
                         "bound cell-drawer animation [{}] frame {} failed SHP rendering",
                         key.type_id, key.frame
                     ),
                 );
             }
-            None => log::debug!(
-                "No SHP for {} (facing {}, frame {})",
-                key.type_id,
-                key.facing,
-                key.frame
-            ),
+            None => unrenderable.push(key.clone()),
         }
     }
 
-    // Step 2b: Render oregath.shp harvest overlay frames (if any harvesters exist).
-    // Uses anim.pal (effect palette) — no house color remap. Skip if already cached.
-    let has_harvesters: bool = entities.values().any(|e| e.miner.is_some());
-    let oregath_cached: bool = cached_keys.contains(&ShpSpriteKey {
-        palette_context: crate::render::sprite_atlas::ShpPaletteContext::Legacy,
-        type_id: "OREGATH".to_string(),
-        facing: 0,
-        frame: 0,
-        house_color: HouseColorIndex::default(),
-    });
-    if has_harvesters && !oregath_cached {
+    // Step 2b: Render oregath.shp harvest overlay frames once harvesters exist.
+    // Uses anim.pal (effect palette) — no house color remap.
+    let load_harvest_overlay = !previous_atlas
+        .as_ref()
+        .is_some_and(|atlas| atlas.harvest_overlay_loaded)
+        && entities.values().any(|e| e.miner.is_some());
+    if load_harvest_overlay {
         let oregath_sprites: Vec<RenderedShpSprite> = render_harvest_overlay_frames(asset_manager);
         if !oregath_sprites.is_empty() {
             log::info!(
                 "Rendered {} oregath.shp harvest overlay frames",
                 oregath_sprites.len()
             );
-            cached.extend(oregath_sprites);
+            rendered.extend(oregath_sprites);
         }
     }
 
-    if cached.is_empty() {
-        log::warn!("No SHP sprites rendered");
-        if previous_atlas.is_some() {
-            return abort_sprite_atlas_refresh(
-                previous_atlas,
-                Some(cached),
-                previous_cache_len,
-                "sprite atlas refresh produced no rendered sprites".to_string(),
-            );
+    // Step 3: shelf-pack into new pages at map load; afterwards append to a
+    // growth page so resident sprites are never repacked or re-uploaded.
+    let added = rendered.len();
+    let mut atlas = match previous_atlas {
+        Some(mut atlas) => {
+            atlas.append_sprites(device, queue, batch, rendered);
+            atlas
         }
-        return None;
-    }
-
-    log::info!(
-        "Packing {} SHP sprites into atlas ({} reused from cache)",
-        cached.len(),
-        cached.len().saturating_sub(new_count),
-    );
-
-    // Step 3: Shelf-pack all sprites (cached + newly rendered) into atlas.
-    let mut atlas: SpriteAtlas = pack_sprites(gpu, batch, &cached);
+        None if rendered.is_empty() => {
+            log::warn!("No SHP sprites rendered");
+            return None;
+        }
+        None => {
+            let mut atlas = pack_sprites(device, queue, batch, &rendered);
+            atlas.effects = registered_effects;
+            atlas
+        }
+    };
+    atlas.unrenderable.extend(unrenderable);
     atlas.make_frame_counts = make_frame_counts;
     atlas.active_anim_frame_counts = active_anim_frame_counts;
-    atlas.building_bounds = compute_building_bounds(&atlas, entities, art, rules, interner);
-    atlas.rendered_cache = cached;
+    atlas.shp_files = shp_files;
+    atlas.projectile_files = projectile_files;
+    for (type_id, color) in new_objects {
+        atlas
+            .covered_objects
+            .entry(type_id)
+            .or_default()
+            .insert(color);
+    }
+    atlas.covered_anim_remaps.extend(new_remaps);
+    atlas.harvest_overlay_loaded |= load_harvest_overlay;
     log::info!(
-        "SHP sprite atlas built: {} sprites, {} pages, {} make anims, {} active anims, {} building bounds",
+        "SHP sprite atlas: {} sprites added in {:.1} ms; {} sprites on {} pages, {} unrenderable keys",
+        added,
+        started.elapsed().as_secs_f64() * 1000.0,
         atlas.sprite_count(),
         atlas.page_count(),
-        atlas.make_frame_counts.len(),
-        atlas.active_anim_frame_counts.len(),
-        atlas.building_bounds.len(),
+        atlas.unrenderable.len(),
     );
     Some(atlas)
 }
 
-/// Compute per-building-type bounding boxes by unioning all SHP frame rects.
-///
-/// For each structure type in the entity store, unions the main sprite rect with
-/// any building animation overlay rects (ActiveAnim, IdleAnim, etc. from art.ini).
-/// This matches the original engine's `BuildingTypeClass::CalculateBoundingBox`.
-fn compute_building_bounds(
-    atlas: &SpriteAtlas,
-    entities: &crate::sim::entity_store::EntityStore,
-    art: Option<&ArtRegistry>,
-    rules: Option<&RuleSet>,
-    interner: Option<&crate::sim::intern::StringInterner>,
-) -> HashMap<String, BuildingBounds> {
-    let mut bounds: HashMap<String, BuildingBounds> = HashMap::new();
-
-    // Collect unique building type_ids — include both existing structures and
-    // any buildings reachable via DeploysInto (e.g. MCV → ConYard) so they are
-    // clickable even if they didn't exist when the atlas was first built.
-    let mut building_types: HashSet<String> = entities
-        .values()
-        .filter(|e| e.category == EntityCategory::Structure && !e.is_voxel)
-        .map(|e| interner.map_or("".to_string(), |i| i.resolve(e.type_ref()).to_string()))
-        .collect();
-    if let Some(r) = rules {
-        let deploy_targets: Vec<String> = entities
-            .values()
-            .filter_map(|e| {
-                let t = interner.map_or("", |i| i.resolve(e.type_ref()));
-                r.object(t).and_then(|o| o.deploys_into.clone())
-            })
-            .collect();
-        building_types.extend(deploy_targets);
-    }
-
-    for type_id in &building_types {
-        // Find any atlas entry for the main building sprite (frame 0, any house color).
-        let main_entry = atlas
-            .entries_iter()
-            .find(|(k, _)| k.type_id == *type_id && k.frame == 0)
-            .map(|(_, v)| *v);
-        let Some(main) = main_entry else { continue };
-
-        // Initialize bbox from main sprite.
-        let mut min_x: f32 = main.canvas_rect[0];
-        let mut min_y: f32 = main.canvas_rect[1];
-        let mut max_x: f32 = main.canvas_rect[0] + main.canvas_rect[2];
-        let mut max_y: f32 = main.canvas_rect[1] + main.canvas_rect[3];
-
-        // Union all other frames of the main sprite (animation frames).
-        for (k, v) in atlas.entries_iter() {
-            if k.type_id == *type_id {
-                min_x = min_x.min(v.canvas_rect[0]);
-                min_y = min_y.min(v.canvas_rect[1]);
-                max_x = max_x.max(v.canvas_rect[0] + v.canvas_rect[2]);
-                max_y = max_y.max(v.canvas_rect[1] + v.canvas_rect[3]);
-            }
-        }
-
-        // Union with building animation overlay sprites (ActiveAnim, IdleAnim, etc.).
-        if let Some(art_reg) = art {
-            let rules_image: String = rules
-                .and_then(|r| r.object(type_id))
-                .map(|o| o.image.clone())
-                .unwrap_or_else(|| type_id.clone());
-            if let Some(art_entry) = art_reg.resolve_metadata_entry(type_id, &rules_image) {
-                for anim in &art_entry.building_anims {
-                    // Anim overlays are offset by (anim.x, anim.y) pixels from building origin.
-                    for anim_type in [
-                        Some(anim.anim_type.as_str()),
-                        anim.damaged_variant.as_ref().map(|v| v.anim_type.as_str()),
-                        anim.garrisoned_variant
-                            .as_ref()
-                            .map(|v| v.anim_type.as_str()),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    {
-                        for (k, v) in atlas.entries_iter() {
-                            if k.type_id == anim_type {
-                                let ax: f32 = anim.x as f32 + v.canvas_rect[0];
-                                let ay: f32 = anim.y as f32 + v.canvas_rect[1];
-                                min_x = min_x.min(ax);
-                                min_y = min_y.min(ay);
-                                max_x = max_x.max(ax + v.canvas_rect[2]);
-                                max_y = max_y.max(ay + v.canvas_rect[3]);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        bounds.insert(
-            type_id.clone(),
-            BuildingBounds {
-                min_x,
-                min_y,
-                width: max_x - min_x,
-                height: max_y - min_y,
-            },
-        );
-    }
-
-    bounds
+/// One type's decoded SHP and the draw offsets every key of it shares.
+struct ShpSource {
+    shp: ShpFile,
+    found_name: String,
+    /// DrawOffset from art.ini XDrawOffset/YDrawOffset for per-type fine-tuning.
+    draw_offsets: (i32, i32),
 }
 
-/// Load and render a single SHP sprite to RGBA pixels.
+/// Resolve and decode the SHP a type's keys are drawn from.
 ///
-/// Uses ArtRegistry to resolve the correct filename (with NewTheater substitution).
-/// Falls back to direct {TYPE_ID}.SHP if art data is unavailable.
-/// Selects the appropriate frame based on facing (8-direction for infantry).
-fn render_shp_sprite(
+/// `file` is the file registration counted the type's frames in (animation,
+/// make and parachute SHPs), so frames come from the file they were counted
+/// in. Other types resolve through rules/art `Image=` and the object naming
+/// (with NewTheater substitution), falling back to direct {TYPE_ID}.SHP when
+/// art data is unavailable.
+fn load_shp_source(
     asset_manager: &AssetManager,
-    palette: &Palette,
-    house_remap: bool,
-    key: &ShpSpriteKey,
+    type_id: &str,
+    file: Option<&str>,
     theater_ext: &str,
     theater_name: &str,
     rules: Option<&RuleSet>,
     art: Option<&ArtRegistry>,
-) -> Option<RenderedShpSprite> {
-    // Check if this is a make (build-up) SHP — type_id ends with "_MAKE".
-    let is_make: bool = key.type_id.ends_with("_MAKE");
-    let base_type_id: &str = if is_make {
-        &key.type_id[..key.type_id.len() - 5]
-    } else {
-        &key.type_id
-    };
-
-    // Resolve image name: type_id → rules.ini Image= → art.ini Image= override.
-    let rules_image: String = rules
-        .and_then(|r| r.object(base_type_id))
-        .map(|o| o.image.clone())
-        .unwrap_or_else(|| base_type_id.to_string());
-    let image: String = art
-        .map(|a| a.resolve_effective_image_id(base_type_id, &rules_image))
-        .unwrap_or_else(|| rules_image.to_uppercase());
-
-    // Build filename candidates — use make candidates for _MAKE types.
-    let candidates: Vec<String> = if is_make {
-        art_data::make_shp_candidates(art, &image, theater_ext, theater_name)
-    } else {
-        art_data::object_shp_candidates(art, &image, theater_ext, theater_name)
-    };
-
-    // Try each candidate in order until one is found.
-    let mut lookup_result: Option<(&[u8], String)> = None;
-    for name in &candidates {
-        if let Some(data) = asset_manager.get_ref(name) {
-            lookup_result = Some((data, name.clone()));
-            break;
-        }
-    }
-    let (shp_data, found_name) = match lookup_result {
-        Some(pair) => pair,
+) -> Option<ShpSource> {
+    let candidates: Vec<String> = match file {
+        Some(file) => vec![file.to_string()],
         None => {
-            log::warn!("SHP not found for {}: tried {:?}", key.type_id, candidates);
-            return None;
+            // Check if this is a make (build-up) SHP — type_id ends with "_MAKE".
+            let is_make: bool = type_id.ends_with("_MAKE");
+            let base_type_id: &str = if is_make {
+                &type_id[..type_id.len() - 5]
+            } else {
+                type_id
+            };
+            // Resolve image name: type_id → rules.ini Image= → art.ini Image= override.
+            let rules_image: String = rules
+                .and_then(|r| r.object(base_type_id))
+                .map(|o| o.image.clone())
+                .unwrap_or_else(|| base_type_id.to_string());
+            let image: String = art
+                .map(|a| a.resolve_effective_image_id(base_type_id, &rules_image))
+                .unwrap_or_else(|| rules_image.to_uppercase());
+            if is_make {
+                art_data::make_shp_candidates(art, &image, theater_ext, theater_name)
+            } else {
+                art_data::object_shp_candidates(art, &image, theater_ext, theater_name)
+            }
         }
+    };
+
+    let Some((found_name, shp_data)) = find_shp(asset_manager, &candidates) else {
+        log::warn!("SHP not found for {}: tried {:?}", type_id, candidates);
+        return None;
     };
     // Log when a non-first candidate was selected (generic 'G' fallback is normal).
     if candidates.len() > 2 && found_name != candidates[0] {
         log::debug!(
             "Theater fallback for {}: wanted '{}' but loaded '{}' (tried {:?})",
-            key.type_id,
+            type_id,
             candidates[0],
             found_name,
             candidates,
@@ -1457,9 +1810,65 @@ fn render_shp_sprite(
         shp.height,
         shp.frames.len()
     );
+    Some(ShpSource {
+        shp,
+        found_name: found_name.to_string(),
+        draw_offsets: art.map(|a| a.draw_offsets(type_id)).unwrap_or((0, 0)),
+    })
+}
 
-    // Frame selection: use facing to pick among the first 8 frames (standing pose).
-    // If SHP has fewer frames, use frame 0.
+/// Load and render a single SHP sprite to RGBA pixels.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn render_shp_sprite(
+    asset_manager: &AssetManager,
+    palette: &Palette,
+    house_remap: bool,
+    key: &ShpSpriteKey,
+    theater_ext: &str,
+    theater_name: &str,
+    rules: Option<&RuleSet>,
+    art: Option<&ArtRegistry>,
+) -> Option<RenderedShpSprite> {
+    let source = load_shp_source(
+        asset_manager,
+        &key.type_id,
+        None,
+        theater_ext,
+        theater_name,
+        rules,
+        art,
+    )?;
+    render_shp_frame(&source, palette, house_remap, key, rules)
+}
+
+/// Render one key's frame of a decoded SHP to RGBA pixels.
+///
+/// Selects the appropriate frame based on facing (8-direction for infantry).
+/// An empty (0x0) frame has nothing to draw and returns None.
+fn render_shp_frame(
+    source: &ShpSource,
+    palette: &Palette,
+    house_remap: bool,
+    key: &ShpSpriteKey,
+    rules: Option<&RuleSet>,
+) -> Option<RenderedShpSprite> {
+    let shp = &source.shp;
+    let found_name = source.found_name.as_str();
+
+    // Source-bound Infantry preparation never registers an invalid frame.
+    // Reject an out-of-asset key here too; this adapter's absent sprite does
+    // not establish native invalid-index shape access, which the frame
+    // selection receipts stop before. Other generic classes retain their
+    // existing standing fallback.
+    let infantry = rules
+        .and_then(|rules| rules.object(&key.type_id))
+        .is_some_and(|object| {
+            object.category == crate::rules::object_type::ObjectCategory::Infantry
+        });
+    if (key.palette_context.is_projectile() || infantry) && key.frame as usize >= shp.frames.len() {
+        return None;
+    }
     let frame_idx: usize = if (key.frame as usize) < shp.frames.len() {
         key.frame as usize
     } else if shp.frames.len() >= 8 {
@@ -1472,7 +1881,7 @@ fn render_shp_sprite(
 
     let frame = &shp.frames[frame_idx];
     if frame.frame_width == 0 || frame.frame_height == 0 {
-        log::warn!(
+        log::debug!(
             "{} frame {} is empty ({}x{})",
             found_name,
             frame_idx,
@@ -1540,7 +1949,7 @@ fn render_shp_sprite(
     // DrawOffset from art.ini XDrawOffset/YDrawOffset for per-type fine-tuning.
     // Uses integer division: -ShapeWidth/2 (truncated), to avoid sub-pixel drift
     // on odd-dimension SHPs.
-    let (xdo, ydo) = art.map(|a| a.draw_offsets(&key.type_id)).unwrap_or((0, 0));
+    let (xdo, ydo) = source.draw_offsets;
     let offset_x: f32 = -((full_w / 2) as f32) + xdo as f32;
     let offset_y: f32 = -((full_h / 2) as f32) + ydo as f32;
 
@@ -1699,7 +2108,8 @@ fn blit_sprite_pixels(
 pub(crate) use tests::native_palette_probe_page;
 
 fn pack_sprites(
-    gpu: &GpuContext,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
     batch: &BatchRenderer,
     sprites: &[RenderedShpSprite],
 ) -> SpriteAtlas {
@@ -1715,7 +2125,7 @@ fn pack_sprites(
         })
         .sum();
     let estimated_side: u32 = (total_area as f64).sqrt().ceil() as u32;
-    let max_texture_dim: u32 = gpu.device.limits().max_texture_dimension_2d;
+    let max_texture_dim: u32 = device.limits().max_texture_dimension_2d;
     let mut atlas_width: u32 = estimated_side.clamp(64, max_texture_dim);
 
     // Try widening atlas to fit everything in a single page.
@@ -1790,14 +2200,9 @@ fn pack_sprites(
 
         let mut rgba: Vec<u8> = vec![0u8; (atlas_width * page_height * 4) as usize];
         let mut source_indices = vec![0u8; (atlas_width * page_height) as usize];
-        let aw: f32 = atlas_width as f32;
-        let ah: f32 = page_height as f32;
 
         for p in placements.iter().filter(|p| p.page == page_idx) {
             let rs: &RenderedShpSprite = &sprites[p.idx];
-            let w: u32 = rs.width;
-            let h: u32 = rs.height;
-
             blit_sprite_pixels(
                 rs,
                 [p.px, p.py],
@@ -1805,24 +2210,19 @@ fn pack_sprites(
                 &mut rgba,
                 &mut source_indices,
             );
-
-            entries.insert(
-                rs.key.clone(),
-                ShpSpriteEntry {
-                    uv_origin: [p.px as f32 / aw, p.py as f32 / ah],
-                    uv_size: [w as f32 / aw, h as f32 / ah],
-                    pixel_size: [w as f32, h as f32],
-                    offset_x: rs.offset_x,
-                    offset_y: rs.offset_y,
-                    canvas_rect: rs.canvas_rect,
-                    extended: rs.extended,
-                    page: page_idx,
-                },
-            );
+            if let Some(entry) = atlas_entry(
+                rs,
+                [p.px, p.py],
+                usize::from(page_idx),
+                [atlas_width, page_height],
+            ) {
+                entries.insert(rs.key.clone(), entry);
+            }
         }
 
-        let texture: BatchTexture = batch.create_texture_with_indices(
-            gpu,
+        let texture: BatchTexture = batch.create_texture_on_device(
+            device,
+            queue,
             &rgba,
             atlas_width,
             page_height,
@@ -1831,14 +2231,7 @@ fn pack_sprites(
         pages.push(SpriteAtlasPage { texture });
     }
 
-    SpriteAtlas {
-        pages,
-        entries,
-        make_frame_counts: HashMap::new(),
-        active_anim_frame_counts: HashMap::new(),
-        building_bounds: HashMap::new(),
-        rendered_cache: Vec::new(), // caller sets this after packing
-    }
+    SpriteAtlas::new(pages, entries)
 }
 
 /// Simulate shelf-packing to determine total height without allocating buffers.
@@ -1869,15 +2262,12 @@ fn simulate_shelf_height(
 mod tests;
 
 #[cfg(test)]
+#[path = "sprite_atlas_projectile_tests.rs"]
+mod projectile_tests;
+
+#[cfg(test)]
 impl SpriteAtlas {
     pub(crate) fn from_test_pages(pages: Vec<SpriteAtlasPage>) -> Self {
-        Self {
-            pages,
-            entries: HashMap::new(),
-            make_frame_counts: HashMap::new(),
-            active_anim_frame_counts: HashMap::new(),
-            building_bounds: HashMap::new(),
-            rendered_cache: Vec::new(),
-        }
+        Self::new(pages, HashMap::new())
     }
 }

@@ -68,6 +68,8 @@ impl App {
             .as_mut()
         {
             modal.saved_seed_buttons_enabled = available;
+            // `0x105` is uncovered, not shown again: its statics repaint.
+            modal.statics.uncovered();
         }
     }
 
@@ -302,7 +304,10 @@ impl App {
             BrowserInputResult::PromptAnswer(answer) => {
                 Self::resolve_saved_seed_prompt(state, answer)
             }
-            BrowserInputResult::ButtonPressed => Self::play_main_menu_button_sound(state),
+            BrowserInputResult::ButtonPressed | BrowserInputResult::PromptButtonPressed => {
+                Self::play_main_menu_button_sound(state)
+            }
+            BrowserInputResult::RowClicked => Self::play_skirmish_shell_generic_click_sound(state),
         }
     }
 

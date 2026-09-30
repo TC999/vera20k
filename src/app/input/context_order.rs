@@ -15,7 +15,8 @@ use crate::app::input::dispatch::{
     is_alt_held, is_ctrl_held, is_shift_held, selected_stable_ids_in_order,
 };
 use crate::app::input::entity_pick::{
-    hover_target_at_point, pick_any_target_stable_id, pick_enemy_target_stable_id,
+    HoverTargetKindWithId, hover_target_at_point, pick_any_target_stable_id,
+    pick_enemy_target_stable_id,
 };
 use crate::app::types::{HoverTargetKind, OrderMode};
 use crate::map::entities::EntityCategory;
@@ -530,19 +531,15 @@ pub(crate) fn try_queue_context_order_at_screen_point(
 
         let mut selected_units: Vec<u64> = Vec::new();
         let mut selected_miner_ids: Vec<u64> = Vec::new();
-        let mut structure_owner: Option<String> = None;
+        let mut structure_selected = false;
         let mut mobile_count: usize = 0;
-        let mut _structure_count: usize = 0;
 
         for &sid in &selected_ids {
             let Some(entity) = sim.entities().get(sid) else {
                 continue;
             };
             if entity.category == EntityCategory::Structure {
-                _structure_count += 1;
-                if structure_owner.is_none() {
-                    structure_owner = Some(sim.interner.resolve(entity.owner()).to_string());
-                }
+                structure_selected = true;
             } else {
                 mobile_count += 1;
                 selected_units.push(sid);
@@ -591,13 +588,8 @@ pub(crate) fn try_queue_context_order_at_screen_point(
             &owner,
             state.match_state.sandbox_full_visibility,
             Some(&resources.rules),
-            &resources.height_map,
-            Some(
-                &state
-                    .match_state
-                    .match_presentation
-                    .tactical_bridge_inverse_map,
-            ),
+            &state.match_state.match_presentation.height_map,
+            crate::app::match_runtime::sim_tick::tactical_bridge_cells(sim),
         );
 
         let only_miners_selected = mobile_count > 0 && selected_miner_ids.len() == mobile_count;
@@ -618,7 +610,7 @@ pub(crate) fn try_queue_context_order_at_screen_point(
             .flatten();
         let clicked_friendly_refinery = clicked_friendly_refinery_id.is_some();
 
-        // Check if the clicked cell has a resource node (ore/gems).
+        // Check if the clicked cell holds tiberium (ore/gems).
         let clicked_ore = cell_context_enabled
             && match (
                 sim.overlay_grid.as_ref(),
@@ -667,82 +659,50 @@ pub(crate) fn try_queue_context_order_at_screen_point(
             // The harvest order commits mission Harvest, so its ack is the
             // VoiceHarvest slot (e.g. CMIN ChronoMinerHarvest); a non-miner in
             // the same selection commits Move and would speak VoiceMove.
-            // Non-miner units in selection just move to that cell.
+            // Non-miner units in selection just move to that cell, through the
+            // same 4DE1D0 cell receiver as an ordinary Move click.
             for &stable_id in &selected_units {
                 if !selected_miner_ids.contains(&stable_id) {
+                    let Some(goal) = crate::app::input::commands::ordinary_cell_move_goal(
+                        sim,
+                        &resources.rules,
+                        owner_id,
+                        stable_id,
+                        (target_rx, target_ry),
+                        !queue_mode,
+                    ) else {
+                        continue;
+                    };
                     queued.push(CommandEnvelope::new(
                         owner_id,
                         execute_tick,
                         Command::Move {
                             entity_id: stable_id,
-                            target_rx,
-                            target_ry,
+                            target_rx: goal.0,
+                            target_ry: goal.1,
                             queue: queue_mode,
-                            group_id: None,
                         },
                     ));
                 }
             }
-        } else if let Some(struct_own) = structure_owner {
+        } else if structure_selected {
             let clicked_friendly = hover.as_ref().is_some_and(|target| {
                 matches!(
                     target.kind,
                     HoverTargetKind::FriendlyUnit | HoverTargetKind::FriendlyStructure
                 )
             });
-            // Self-click on a deployable structure (garrisoned building → unload,
-            // ConYard → undeploy). Must run before the friendly-click fallthrough
-            // below — otherwise the click is treated as plain re-selection and the
-            // deploy cursor's action is lost.
-            if context_actions_enabled && clicked_friendly {
-                if let Some(target) = hover.as_ref() {
-                    if selected_ids.contains(&target.stable_id) {
-                        if let Some(entity) = sim.entities().get(target.stable_id) {
-                            // Self-click on a loaded transport → unload.
-                            if let Some(cmd) = super::transport_orders::transport_unload_command(
-                                entity,
-                                resources
-                                    .rules
-                                    .object(sim.interner.resolve(entity.type_ref())),
-                            ) {
-                                queued.push(CommandEnvelope::new(owner_id, execute_tick, cmd));
-                                return finish_order(state, queued, speaker_id);
-                            }
-                            if entity.category == EntityCategory::Structure {
-                                let obj = Some(&resources.rules).and_then(|r| {
-                                    r.object(sim.interner.resolve(entity.type_ref()))
-                                });
-                                let cmd = if obj.map_or(false, |o| o.can_be_occupied)
-                                    && entity.passenger_role.cargo().is_some_and(|c| !c.is_empty())
-                                {
-                                    Some(Command::UnloadPassengers {
-                                        transport_id: target.stable_id,
-                                    })
-                                } else if entity.bunker_occupant.is_some() {
-                                    // Own occupied tank bunker → eject the installed unit.
-                                    Some(Command::EjectBunker {
-                                        bunker_id: target.stable_id,
-                                    })
-                                } else if Some(&resources.rules).is_some_and(|rules| {
-                                    sim.should_show_undeploy_building_command(
-                                        target.stable_id,
-                                        rules,
-                                    )
-                                }) {
-                                    Some(Command::UndeployBuilding {
-                                        entity_id: target.stable_id,
-                                    })
-                                } else {
-                                    None
-                                };
-                                if let Some(cmd) = cmd {
-                                    queued.push(CommandEnvelope::new(owner_id, execute_tick, cmd));
-                                    return finish_order(state, queued, speaker_id);
-                                }
-                            }
-                        }
-                    }
-                }
+            if context_actions_enabled
+                && let Some(cmd) = self_click_command(
+                    sim,
+                    &resources.rules,
+                    owner_id,
+                    &selected_ids,
+                    hover.as_ref(),
+                )
+            {
+                queued.push(CommandEnvelope::new(owner_id, execute_tick, cmd));
+                return finish_order(state, queued, speaker_id);
             }
             if select_friendly_clicks && clicked_friendly && context_actions_enabled {
                 return false;
@@ -750,9 +710,14 @@ pub(crate) fn try_queue_context_order_at_screen_point(
             {
                 // Set rally point for the structures.
                 {
-                    let struct_owner_id = sim.interner.get(&struct_own).unwrap_or(owner_id);
+                    // `SetRallyPoint 0x00443860` sends the rally event as the
+                    // building's owner; the click names only the local
+                    // player's buildings that take a rally, so that owner is
+                    // the local player. A building without a rally point gets
+                    // `ACTION_NONE` on a cell (`0x0044762A`, `0x0044774F`):
+                    // with no such building the click orders nothing here.
                     let producer_ids =
-                        selected_rally_producer_ids(sim, &selected_ids, struct_owner_id);
+                        selected_rally_producer_ids(sim, &resources.rules, &selected_ids, owner_id);
                     // `BuildingClass::SetRallyPoint 0x00443A2B..0x00443A69`,
                     // called per selected factory with announce = 1 by the
                     // map-click handlers `FUN_00443410` / `FUN_004436F0`:
@@ -763,47 +728,96 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                     // a `ConstructionYard=` nor a `ResourceDestination=`.
                     // One `PlayEVA` per factory; VoxClass drops same-entry
                     // duplicates, so one request per click is equivalent.
-                    rally_announce = struct_owner_id == owner_id
-                        && producer_ids.iter().any(|id| {
-                            sim.entities().get(*id).is_some_and(|entity| {
-                                Some(&resources.rules)
+                    rally_announce = producer_ids.iter().any(|id| {
+                        sim.entities().get(*id).is_some_and(|entity| {
+                            Some(&resources.rules)
                                 .and_then(|r| r.object(sim.interner.resolve(entity.type_ref())))
                                 .is_some_and(
                                     crate::app::match_runtime::eva_producers::rally_point_announces,
                                 )
-                            })
-                        });
-                    queued.push(CommandEnvelope::new(
-                        struct_owner_id,
-                        execute_tick,
-                        Command::SetRally {
-                            owner: struct_owner_id,
-                            rx: target_rx,
-                            ry: target_ry,
-                            producer_ids,
-                        },
-                    ));
+                        })
+                    });
+                    if !producer_ids.is_empty() {
+                        queued.push(CommandEnvelope::new(
+                            owner_id,
+                            execute_tick,
+                            Command::SetRally {
+                                rx: target_rx,
+                                ry: target_ry,
+                                producer_ids,
+                            },
+                        ));
+                    }
                 }
                 // Also issue Move commands for any mobile units in the
                 // selection — RA2 moves units AND sets rally when both
                 // are selected.
                 if mobile_count > 0 {
                     for &stable_id in &selected_units {
+                        // Each mobile resolves the clicked cell through its
+                        // own 4DE1D0 receiver, as for an ordinary Move click.
+                        let Some(goal) = crate::app::input::commands::ordinary_cell_move_goal(
+                            sim,
+                            &resources.rules,
+                            owner_id,
+                            stable_id,
+                            (target_rx, target_ry),
+                            !queue_mode,
+                        ) else {
+                            continue;
+                        };
                         queued.push(CommandEnvelope::new(
                             owner_id,
                             execute_tick,
                             Command::Move {
                                 entity_id: stable_id,
-                                target_rx,
-                                target_ry,
+                                target_rx: goal.0,
+                                target_ry: goal.1,
                                 queue: queue_mode,
-                                group_id: None,
                             },
                         ));
                     }
                 }
             }
         } else {
+            // An Engineer's DisarmBomb is its first action over a bombed object.
+            // Every selected object takes its own action
+            // (`Selection__DispatchMultiUnitOrder` 0x004AE844 re-derives it per
+            // object): the Engineers defuse, and over an enemy the rest go on to
+            // their own orders below. Over a friend the rest have nothing to do,
+            // and the dispatch happens only when the object that owns the cursor
+            // is one of the Engineers; otherwise the click selects.
+            if context_actions_enabled && let Some(target) = hover.as_ref() {
+                let friendly = matches!(
+                    target.kind,
+                    HoverTargetKind::FriendlyUnit | HoverTargetKind::FriendlyStructure
+                );
+                let engineers = disarm_bomb_engineers(
+                    sim,
+                    &resources.rules,
+                    &selected_units,
+                    target.stable_id,
+                    owner_id,
+                );
+                let dispatched = !engineers.is_empty()
+                    && (!friendly
+                        || cursor_owner(sim, &resources.rules, &selected_ids, target.stable_id)
+                            .is_some_and(|best| engineers.contains(&best)));
+                if dispatched {
+                    for &attacker_id in &engineers {
+                        queued.push(CommandEnvelope::new(
+                            owner_id,
+                            execute_tick,
+                            bomb_order(attacker_id, target.stable_id, friendly),
+                        ));
+                    }
+                    selected_units.retain(|id| !engineers.contains(id));
+                    if friendly || selected_units.is_empty() {
+                        return finish_order(state, queued, speaker_id);
+                    }
+                }
+            }
+
             // Garrison entry uses the shared CanDock-equivalent predicate before
             // issuing EnterTransport commands.
             // are classified as EnemyStructure but are still garrisonable —
@@ -820,7 +834,6 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                                     rules,
                                     sid,
                                     transport_id,
-                                    sim.path_grid(),
                                 )
                             })
                         })
@@ -968,7 +981,10 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                         .filter(|&sid| {
                             sim.entities().get(sid).is_some_and(|e| {
                                 e.category == EntityCategory::Unit
-                                    && e.health.current < e.health.max
+                                    && resources
+                                        .rules
+                                        .object(sim.interner.resolve(e.type_ref()))
+                                        .is_some_and(|obj| e.health.current < obj.strength)
                                     && !e.is_deployed()
                             })
                         })
@@ -1028,62 +1044,38 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                     HoverTargetKind::FriendlyUnit | HoverTargetKind::FriendlyStructure
                 )
             });
-            // Deploy-on-self-click: clicking a selected deployable entity deploys/undeploys it.
-            if clicked_friendly && context_actions_enabled {
-                if let Some(target) = hover.as_ref() {
-                    if selected_ids.contains(&target.stable_id) {
-                        if let Some(entity) = sim.entities().get(target.stable_id) {
-                            let obj = Some(&resources.rules)
-                                .and_then(|r| r.object(sim.interner.resolve(entity.type_ref())));
-                            let cmd = if entity.category == EntityCategory::Structure {
-                                // Garrisoned building → unload occupants.
-                                if obj.map_or(false, |o| o.can_be_occupied)
-                                    && entity.passenger_role.cargo().is_some_and(|c| !c.is_empty())
-                                {
-                                    Some(Command::UnloadPassengers {
-                                        transport_id: target.stable_id,
-                                    })
-                                // ConYard → MCV
-                                } else if Some(&resources.rules).is_some_and(|rules| {
-                                    sim.should_show_undeploy_building_command(
-                                        target.stable_id,
-                                        rules,
-                                    )
-                                }) {
-                                    Some(Command::UndeployBuilding {
-                                        entity_id: target.stable_id,
-                                    })
-                                } else {
-                                    None
-                                }
-                            } else if entity.category == EntityCategory::Infantry
-                                && obj.map_or(false, |o| o.deploy_fire)
-                            {
-                                // Deploy-fire infantry (GI, GGI, etc.) → toggle deploy.
-                                Some(Command::ToggleInfantryDeploy {
-                                    entity_id: target.stable_id,
-                                })
-                            } else if let Some(cmd) =
-                                super::transport_orders::transport_unload_command(entity, obj)
-                            {
-                                // Loaded transport → unload passengers.
-                                Some(cmd)
-                            } else {
-                                // MCV → ConYard
-                                if obj.map_or(false, |o| o.deploys_into.is_some() || o.deployer) {
-                                    Some(Command::DeployMcv {
-                                        entity_id: target.stable_id,
-                                    })
-                                } else {
-                                    None
-                                }
-                            };
-                            if let Some(cmd) = cmd {
-                                queued.push(CommandEnvelope::new(owner_id, execute_tick, cmd));
-                                return finish_order(state, queued, speaker_id);
-                            }
-                        }
+            if context_actions_enabled
+                && let Some(cmd) = self_click_command(
+                    sim,
+                    &resources.rules,
+                    owner_id,
+                    &selected_ids,
+                    hover.as_ref(),
+                )
+            {
+                queued.push(CommandEnvelope::new(owner_id, execute_tick, cmd));
+                return finish_order(state, queued, speaker_id);
+            }
+            // A Crazy Ivan bombs a friend by a plain click, when the object that
+            // owns the cursor is one of the bombing Ivans.
+            if clicked_friendly
+                && context_actions_enabled
+                && !force_move
+                && let Some(target) = hover.as_ref()
+            {
+                let ivans =
+                    friendly_bomb_ivans(sim, &resources.rules, &selected_units, target.stable_id);
+                if cursor_owner(sim, &resources.rules, &selected_ids, target.stable_id)
+                    .is_some_and(|best| ivans.contains(&best))
+                {
+                    for attacker_id in ivans {
+                        queued.push(CommandEnvelope::new(
+                            owner_id,
+                            execute_tick,
+                            bomb_order(attacker_id, target.stable_id, true),
+                        ));
                     }
+                    return finish_order(state, queued, speaker_id);
                 }
             }
             if select_friendly_clicks && clicked_friendly && context_actions_enabled {
@@ -1116,13 +1108,8 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                     world_y,
                     state.match_state.sandbox_full_visibility,
                     Some(&resources.rules),
-                    &resources.height_map,
-                    Some(
-                        &state
-                            .match_state
-                            .match_presentation
-                            .tactical_bridge_inverse_map,
-                    ),
+                    &state.match_state.match_presentation.height_map,
+                    crate::app::match_runtime::sim_tick::tactical_bridge_cells(sim),
                 )
             } else {
                 pick_enemy_target_stable_id(
@@ -1132,24 +1119,10 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                     &owner,
                     state.match_state.sandbox_full_visibility,
                     Some(&resources.rules),
-                    &resources.height_map,
-                    Some(
-                        &state
-                            .match_state
-                            .match_presentation
-                            .tactical_bridge_inverse_map,
-                    ),
+                    &state.match_state.match_presentation.height_map,
+                    crate::app::match_runtime::sim_tick::tactical_bridge_cells(sim),
                 )
             };
-            // Assign a shared group_id when multiple units move together.
-            // The movement system uses this to sync speed to the slowest member.
-            let move_group_id: Option<u32> = if selected_units.len() > 1 && attack_target.is_none()
-            {
-                Some(execute_tick as u32)
-            } else {
-                None
-            };
-
             // VERA-internal: force-fire on a shrouded cell is rejected here.
             // gamemd equivalent CONTRADICTS this — the FootClass shroud wrapper
             // around What_Action_OnCell explicitly preserves the force-fire
@@ -1170,6 +1143,11 @@ pub(crate) fn try_queue_context_order_at_screen_point(
             };
 
             for stable_id in selected_units {
+                if let Some(target_id) = attack_target
+                    && ivan_cannot_bomb(sim, &resources.rules, stable_id, target_id)
+                {
+                    continue;
+                }
                 let payload = if let Some(target_id) = attack_target {
                     // Retail promotes the *committed* mission and keeps the
                     // object as the destination, so the attack-move goal is the
@@ -1241,7 +1219,6 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                             target_rx: goal.0,
                             target_ry: goal.1,
                             queue: queue_mode,
-                            group_id: None,
                         }
                     }
                 } else {
@@ -1278,7 +1255,6 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                                     target_rx: goal.0,
                                     target_ry: goal.1,
                                     queue: queue_mode,
-                                    group_id: move_group_id,
                                 }
                             }
                         }
@@ -1299,6 +1275,20 @@ pub(crate) fn try_queue_context_order_at_screen_point(
                         },
                     }
                 };
+                if let Command::Attack {
+                    attacker_id,
+                    target_id,
+                } = payload
+                    && click_attack_refused(
+                        sim,
+                        &resources.rules,
+                        &resources.overlay_registry,
+                        attacker_id,
+                        target_id,
+                    )
+                {
+                    continue;
+                }
                 queued.push(CommandEnvelope::new(owner_id, execute_tick, payload));
             }
             if !queued.is_empty() {
@@ -1322,19 +1312,239 @@ pub(crate) fn try_queue_context_order_at_screen_point(
     finish_order(state, queued, speaker_id)
 }
 
+/// The command a click on the one selected object issues when it clicks
+/// itself. `TechnoClass::What_Action_OnObject` returns ACTION_SELF only when
+/// the target is the acting object, exactly one object is selected
+/// (`[0xA8ECC8] == 1`, `0x007000C1`) and its owner is the current player
+/// (`0x007000B9..0x007000DF`). With more selected, a click on one of them
+/// resolves to ACTION_SELECT, which the left-up handler turns into a fresh
+/// selection of the clicked object (`0x004ABE18..`); the caller's friendly-click
+/// path does that.
+///
+/// VERA picks the command from the clicked object's own capabilities. The
+/// class overrides' post-processing of ACTION_SELF (`UnitClass` `0x0073FD50`,
+/// `InfantryClass` `0x0051E3B0`, `BuildingClass` `0x00447210`) is not ported,
+/// and the cursor decides its self-hover separately (refactor issue #605).
+fn self_click_command(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    local_owner: InternedId,
+    selected_ids: &[u64],
+    hover: Option<&HoverTargetKindWithId>,
+) -> Option<Command> {
+    let target = hover?;
+    if selected_ids != [target.stable_id] {
+        return None;
+    }
+    let entity = sim
+        .entities()
+        .get(target.stable_id)
+        .filter(|entity| entity.owner() == local_owner)?;
+    let obj = rules.object(sim.interner.resolve(entity.type_ref()));
+    if entity.category == EntityCategory::Structure {
+        // A garrisoned building unloads its occupants, a tank bunker ejects
+        // its unit, and a building that undeploys (a Construction Yard)
+        // packs up.
+        return if obj.is_some_and(|o| o.can_be_occupied)
+            && entity.passenger_role.cargo().is_some_and(|c| !c.is_empty())
+        {
+            Some(Command::UnloadPassengers {
+                transport_id: target.stable_id,
+            })
+        } else if entity.bunker_occupant.is_some() {
+            Some(Command::EjectBunker {
+                bunker_id: target.stable_id,
+            })
+        } else if sim.should_show_undeploy_building_command(target.stable_id, rules) {
+            Some(Command::UndeployBuilding {
+                entity_id: target.stable_id,
+            })
+        } else {
+            None
+        };
+    }
+    if entity.category == EntityCategory::Infantry && obj.is_some_and(|o| o.deploy_fire) {
+        return Some(Command::ToggleInfantryDeploy {
+            entity_id: target.stable_id,
+        });
+    }
+    if let Some(cmd) = super::transport_orders::transport_unload_command(entity, obj) {
+        return Some(cmd);
+    }
+    obj.is_some_and(|o| o.deploys_into.is_some() || o.deployer)
+        .then_some(Command::DeployMcv {
+            entity_id: target.stable_id,
+        })
+}
+
+/// The selected Engineers whose click on `target` is DisarmBomb
+/// (`InfantryClass::What_Action_OnObject`, 0x0051E462): their first action
+/// over an object carrying a bomb their player sees, whoever owns it.
+/// `InfantryClass::ClickedAction_Object` (0x0051F190) sends it as Attack, so
+/// the DefuseKit shot defuses the bomb; it refuses the Engineer's own body.
+fn disarm_bomb_engineers(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    selected: &[u64],
+    target: u64,
+    player: InternedId,
+) -> Vec<u64> {
+    let bombed = sim
+        .entities()
+        .get(target)
+        .is_some_and(|entity| entity.bomb.is_some());
+    if !bombed || !sim.bomb_seen_by(target, player) {
+        return Vec::new();
+    }
+    selected
+        .iter()
+        .copied()
+        .filter(|&id| {
+            id != target
+                && sim.entities().get(id).is_some_and(|e| {
+                    e.category == EntityCategory::Infantry
+                        && rules
+                            .object(sim.interner.resolve(e.type_ref()))
+                            .is_some_and(|o| o.engineer)
+                })
+        })
+        .collect()
+}
+
+/// The object whose action owns the cursor over `target` for the selection
+/// (gamemd's DetermineAction, shared with the cursor): the click dispatches
+/// its orders only when that object's action is one.
+fn cursor_owner(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    selected: &[u64],
+    target: u64,
+) -> Option<u64> {
+    crate::app::input::cursor::select_best_for_action(
+        sim,
+        selected,
+        crate::app::input::cursor::ActionDistanceTarget::Object(target),
+        Some(rules),
+    )
+}
+
+/// The selected Crazy Ivans whose click on the own or allied `target` plants a
+/// bomb. AttackCursorOnFriendlies (stock: IVAN and CIVAN only) grants Attack
+/// on a friend without passengers (`TechnoClass::What_Action_OnObject`,
+/// 0x00700314..0x007003D6), the Ivan makes it IvanBomb on a Bombable target
+/// without a bomb (0x0051EB24), and `FootClass::ClickedAction_Object`
+/// (0x004D74E0) sends that as Attack. A bombed friend stays a selection click.
+/// A lone selected Ivan over himself has the self action (4) instead; in a
+/// larger selection nothing stops him bombing himself, as natively.
+fn friendly_bomb_ivans(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    selected: &[u64],
+    target: u64,
+) -> Vec<u64> {
+    let bombable = sim.entities().get(target).is_some_and(|entity| {
+        entity.bomb.is_none()
+            && rules
+                .object(sim.interner.resolve(entity.type_ref()))
+                .is_some_and(|o| o.bombable && o.passengers == 0)
+    });
+    if !bombable {
+        return Vec::new();
+    }
+    selected
+        .iter()
+        .copied()
+        .filter(|&id| {
+            (id != target || selected.len() > 1)
+                && sim.entities().get(id).is_some_and(|e| {
+                    rules
+                        .object(sim.interner.resolve(e.type_ref()))
+                        .is_some_and(|o| o.ivan && o.attack_cursor_on_friendlies)
+                })
+        })
+        .collect()
+}
+
+/// The Attack order an Engineer's DisarmBomb or a Crazy Ivan's IvanBomb click
+/// sends. Native's Attack event has no alliance test; VERA's plain `Attack`
+/// command refuses friends, so an own or allied target goes as `ForceAttack`,
+/// the same Attack mission without that gate.
+fn bomb_order(attacker_id: u64, target_id: u64, friendly: bool) -> Command {
+    if friendly {
+        Command::ForceAttack {
+            attacker_id,
+            target_id,
+        }
+    } else {
+        Command::Attack {
+            attacker_id,
+            target_id,
+        }
+    }
+}
+
+/// A Crazy Ivan's Attack over a target it cannot bomb becomes NoIvanBomb
+/// (`InfantryClass::What_Action_OnObject`, `0x0051EB24`: the target carries
+/// a bomb (`+0x38`) or is `Bombable=no`), which
+/// `FootClass::ClickedAction_Object` (0x004D74E0) ignores. An unforced click
+/// on a bombed target never gets that far: its GetFireError is ILLEGAL
+/// (`0x006FCBAD`), which [`click_attack_refused`] answers.
+fn ivan_cannot_bomb(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    actor_id: u64,
+    target_id: u64,
+) -> bool {
+    let is_ivan = sim
+        .entities()
+        .get(actor_id)
+        .and_then(|e| rules.object(sim.interner.resolve(e.type_ref())))
+        .is_some_and(|o| o.ivan);
+    is_ivan
+        && sim.entities().get(target_id).is_some_and(|target| {
+            target.bomb.is_some()
+                || !rules
+                    .object(sim.interner.resolve(target.type_ref()))
+                    .is_some_and(|o| o.bombable)
+        })
+}
+
+/// `TechnoClass::What_Action_OnObject @ 0x00700548`: an unforced click on
+/// an object stays Attack only while the object's GetFireError for it
+/// ([`Simulation::selected_weapon_fire_error`]) is not ILLEGAL. Otherwise the action
+/// is None or Select (`0x0070056C`), and the object takes no order.
+///
+/// RESIDUAL: the Infiltrate arm (`0x007004A0..0x00700531`) keeps Attack
+/// despite ILLEGAL for an `Infiltrate=` infantryman over a building its flags
+/// admit. VERA issues capture and C4 through their own orders before this,
+/// and has no spy infiltration order; a spy's click on a building it cannot
+/// shoot gets no order here, where retail enters it.
+fn click_attack_refused(
+    sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
+    overlay_registry: &crate::rules::overlay_types::OverlayTypeRegistry,
+    actor_id: u64,
+    target_id: u64,
+) -> bool {
+    sim.selected_weapon_fire_error(
+        rules,
+        actor_id,
+        crate::sim::combat::TargetKind::Entity(target_id),
+        Some(overlay_registry),
+    ) == crate::sim::combat::fire_error::FireError::Illegal
+}
+
 fn selected_rally_producer_ids(
     sim: &crate::sim::world::Simulation,
+    rules: &crate::rules::ruleset::RuleSet,
     selected_ids: &[u64],
     owner: InternedId,
 ) -> Vec<u64> {
+    let owner = sim.interner.resolve(owner);
     let mut producer_ids: Vec<u64> = selected_ids
         .iter()
         .copied()
-        .filter(|stable_id| {
-            sim.entities().get(*stable_id).is_some_and(|entity| {
-                entity.category == EntityCategory::Structure && entity.owner() == owner
-            })
-        })
+        .filter(|&stable_id| sim.takes_rally_point(stable_id, owner, rules))
         .collect();
     producer_ids.sort_unstable();
     producer_ids.dedup();
@@ -1348,50 +1558,102 @@ mod tests {
     use crate::sim::game_entity::GameEntity;
     use crate::sim::world::Simulation;
 
+    /// `TechnoClass::What_Action_OnObject @ 0x00700548`: an unforced click
+    /// orders Attack only to the objects whose GetFireError for the target is
+    /// not ILLEGAL. Out of range is RANGE (T61, the last test), not ILLEGAL.
+    /// A Crazy Ivan's bombed target is ILLEGAL at any distance (T55,
+    /// `0x006FCBAD`, comes first).
     #[test]
-    fn right_click_structure_selection_sends_rally_producer_ids() {
+    fn an_unforced_click_refuses_only_an_illegal_shot() {
+        let rules =
+            crate::rules::ruleset::RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(
+                "[InfantryTypes]\n0=IVAN\n1=GI\n[VehicleTypes]\n0=HTNK\n\
+                 [CombatDamage]\nIvanTimedDelay=450\n\
+                 [IVAN]\nStrength=125\nPrimary=IvanBomber\nIvan=yes\n\
+                 [GI]\nStrength=125\nPrimary=Pea\n\
+                 [HTNK]\nStrength=900\nArmor=heavy\nPrimary=120mm\n\
+                 [IvanBomber]\nRange=1.5\nProjectile=Invisible\nWarhead=IvanBomb\n\
+                 [Pea]\nDamage=10\nRange=5\nProjectile=Invisible\nWarhead=Soft\n\
+                 [120mm]\nDamage=90\nRange=5.75\nProjectile=Invisible\nWarhead=AP\n\
+                 [Invisible]\nInviso=yes\n\
+                 [IvanBomb]\nIvanBomb=yes\n\
+                 [AP]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n\
+                 [Soft]\nVerses=100%,100%,100%,100%,100%,0%,100%,100%,100%,100%,100%\n",
+            ))
+            .unwrap();
+        let mut sim = Simulation::new();
+        sim.resolve_type_handles(&rules);
+        for house in ["Americans", "Soviets"] {
+            let id = sim.interner.intern(house);
+            sim.session.house_order.push(id);
+        }
+        let mut spawn = |kind: &str, owner: &str, rx: u16| {
+            sim.spawn_object(kind, owner, rx, 5, 0, &rules).unwrap()
+        };
+        let tank = spawn("HTNK", "Americans", 3);
+        let gi = spawn("GI", "Americans", 4);
+        let ivan = spawn("IVAN", "Americans", 5);
+        let near = spawn("HTNK", "Soviets", 6);
+        let far = spawn("HTNK", "Soviets", 20);
+        let overlays = crate::rules::overlay_types::OverlayTypeRegistry::empty();
+        let refused = |sim: &Simulation, actor: u64, target: u64| {
+            click_attack_refused(sim, &rules, &overlays, actor, target)
+        };
+
+        assert!(refused(&sim, gi, near), "0% Verses against heavy armour");
+        assert!(!refused(&sim, tank, near));
+        assert!(!refused(&sim, tank, far), "out of range");
+        assert!(!refused(&sim, ivan, near));
+
+        sim.bomb_attach(ivan, Some(near), &rules);
+        sim.bomb_attach(ivan, Some(far), &rules);
+        assert!(refused(&sim, ivan, near), "a bombed target");
+        assert!(
+            refused(&sim, ivan, far),
+            "the bomb gate precedes the range test"
+        );
+    }
+
+    /// The rally click names the local player's selected buildings that take
+    /// a rally: not their power plant, not another house's factory, not units.
+    #[test]
+    fn rally_click_names_only_the_players_rally_buildings() {
+        let rules =
+            crate::rules::ruleset::RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(
+                "[BuildingTypes]\n0=GAWEAP\n1=GAPOWR\n[VehicleTypes]\n0=MTNK\n\
+                 [GAWEAP]\nFactory=UnitType\n[GAPOWR]\nPower=100\n[MTNK]\nStrength=300\n",
+            ))
+            .unwrap();
         let mut sim = Simulation::new();
         let owner = sim.interner.intern("Americans");
+        let other = sim.interner.intern("Russians");
         let factory_type = sim.interner.intern("GAWEAP");
+        let power_type = sim.interner.intern("GAPOWR");
         let tank_type = sim.interner.intern("MTNK");
-        sim.entities_mut()
-            .insert(GameEntity::new_at_frame_zero_for_test(
-                1,
-                10,
-                10,
-                0,
-                0,
-                owner,
-                Health {
-                    current: 1000,
-                    max: 1000,
-                },
-                factory_type,
-                EntityCategory::Structure,
-                0,
-                5,
-                false,
-            ));
-        sim.entities_mut()
-            .insert(GameEntity::new_at_frame_zero_for_test(
-                2,
-                11,
-                10,
-                0,
-                0,
-                owner,
-                Health {
-                    current: 300,
-                    max: 300,
-                },
-                tank_type,
-                EntityCategory::Unit,
-                0,
-                5,
-                true,
-            ));
+        for (id, rx, house, kind, category) in [
+            (1, 10, owner, factory_type, EntityCategory::Structure),
+            (2, 11, owner, tank_type, EntityCategory::Unit),
+            (3, 12, owner, power_type, EntityCategory::Structure),
+            (4, 13, other, factory_type, EntityCategory::Structure),
+        ] {
+            sim.entities_mut()
+                .insert(GameEntity::new_at_frame_zero_for_test(
+                    id,
+                    rx,
+                    10,
+                    0,
+                    0,
+                    house,
+                    Health { current: 300 },
+                    kind,
+                    category,
+                    0,
+                    5,
+                    category == EntityCategory::Unit,
+                ));
+        }
 
-        let producer_ids = selected_rally_producer_ids(&sim, &[2, 1], owner);
+        let producer_ids = selected_rally_producer_ids(&sim, &rules, &[4, 3, 2, 1], owner);
 
         assert_eq!(producer_ids, vec![1]);
     }
@@ -1458,7 +1720,6 @@ mod tests {
                 target_rx: 0,
                 target_ry: 0,
                 queue: false,
-                group_id: None,
             }),
             Some("VoiceMove")
         );
@@ -1657,10 +1918,7 @@ mod tests {
                 0,
                 0,
                 owner,
-                Health {
-                    current: 300,
-                    max: 300,
-                },
+                Health { current: 300 },
                 type_ref,
                 category,
                 0,
@@ -1677,23 +1935,21 @@ mod tests {
     /// while the Chrono Miner is refused for having no primary weapon.
     #[test]
     fn attack_move_eligibility_follows_the_primary_weapon() {
-        let mut rules = chord_rules();
+        let rules = chord_rules();
         let mut sim = Simulation::new();
         sim.resolve_type_handles(&rules);
-        let height_map: std::collections::BTreeMap<(u16, u16), u8> =
-            std::collections::BTreeMap::new();
 
         let tank = sim
-            .spawn_object("MTNK", "Americans", 5, 5, 0, &rules, &height_map)
+            .spawn_object("MTNK", "Americans", 5, 5, 0, &rules)
             .expect("tank");
         let war_miner = sim
-            .spawn_object("HARV", "Americans", 6, 5, 0, &rules, &height_map)
+            .spawn_object("HARV", "Americans", 6, 5, 0, &rules)
             .expect("armed miner");
         let chrono_miner = sim
-            .spawn_object("CMIN", "Americans", 8, 5, 0, &rules, &height_map)
+            .spawn_object("CMIN", "Americans", 8, 5, 0, &rules)
             .expect("unarmed miner");
         let arty = sim
-            .spawn_object("SECONLY", "Americans", 7, 5, 0, &rules, &height_map)
+            .spawn_object("SECONLY", "Americans", 7, 5, 0, &rules)
             .expect("secondary-only unit");
 
         assert!(entity_can_attack_move(&sim, Some(&rules), tank));
@@ -1720,14 +1976,12 @@ mod tests {
         let rules = chord_rules();
         let mut sim = Simulation::new();
         sim.resolve_type_handles(&rules);
-        let height_map: std::collections::BTreeMap<(u16, u16), u8> =
-            std::collections::BTreeMap::new();
 
         let prism = sim
-            .spawn_object("SREF", "Americans", 7, 6, 0, &rules, &height_map)
+            .spawn_object("SREF", "Americans", 7, 6, 0, &rules)
             .expect("TurretCount type");
         let tank = sim
-            .spawn_object("MTNK", "Americans", 5, 5, 0, &rules, &height_map)
+            .spawn_object("MTNK", "Americans", 5, 5, 0, &rules)
             .expect("tank");
 
         assert!(entity_can_attack_move(&sim, Some(&rules), prism));
@@ -1748,11 +2002,9 @@ mod tests {
         let rules = chord_rules();
         let mut sim = Simulation::new();
         sim.resolve_type_handles(&rules);
-        let height_map: std::collections::BTreeMap<(u16, u16), u8> =
-            std::collections::BTreeMap::new();
 
         let nighthawk = sim
-            .spawn_object("SHAD", "Americans", 5, 6, 0, &rules, &height_map)
+            .spawn_object("SHAD", "Americans", 5, 6, 0, &rules)
             .expect("helicopter carrying PreventAttackMove=yes");
         assert!(!entity_can_attack_move(&sim, Some(&rules), nighthawk));
     }
@@ -1777,20 +2029,18 @@ mod tests {
     /// the first member that refuses.
     #[test]
     fn attack_move_chord_requires_every_selected_object() {
-        let mut rules = chord_rules();
+        let rules = chord_rules();
         let mut sim = Simulation::new();
         sim.resolve_type_handles(&rules);
-        let height_map: std::collections::BTreeMap<(u16, u16), u8> =
-            std::collections::BTreeMap::new();
 
         let tank = sim
-            .spawn_object("MTNK", "Americans", 5, 5, 0, &rules, &height_map)
+            .spawn_object("MTNK", "Americans", 5, 5, 0, &rules)
             .expect("tank");
         let war_miner = sim
-            .spawn_object("HARV", "Americans", 6, 5, 0, &rules, &height_map)
+            .spawn_object("HARV", "Americans", 6, 5, 0, &rules)
             .expect("armed miner");
         let chrono_miner = sim
-            .spawn_object("CMIN", "Americans", 8, 5, 0, &rules, &height_map)
+            .spawn_object("CMIN", "Americans", 8, 5, 0, &rules)
             .expect("unarmed miner");
         let factory = insert_typed(&mut sim, 900, "GAWEAP", EntityCategory::Structure);
 
@@ -1858,5 +2108,134 @@ mod tests {
                 target_id: Some(2),
             }
         );
+    }
+    /// A click on the selected object itself is its self action only while it
+    /// is the one selected object and the local player's
+    /// (`TechnoClass::What_Action_OnObject`, `0x007000B9..0x007000DF`); a click
+    /// on one of several selected objects is a plain selection click.
+    #[test]
+    fn self_click_needs_the_one_selected_own_object() {
+        let rules =
+            crate::rules::ruleset::RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(
+                "[InfantryTypes]\n0=E1\n[VehicleTypes]\n0=AMCV\n\
+                 [BuildingTypes]\n0=GACNST\n\
+                 [E1]\nStrength=125\nDeployFire=yes\nDeployer=yes\n\
+                 [AMCV]\nStrength=1000\nDeploysInto=GACNST\n\
+                 [GACNST]\nStrength=1000\n",
+            ))
+            .unwrap();
+        let mut sim = Simulation::new();
+        sim.resolve_type_handles(&rules);
+        for house in ["Americans", "Soviets"] {
+            let id = sim.interner.intern(house);
+            sim.session.house_order.push(id);
+        }
+        let americans = sim.interner.get("Americans").unwrap();
+        let mut spawn = |kind: &str, owner: &str, rx: u16| {
+            sim.spawn_object(kind, owner, rx, 5, 0, &rules).unwrap()
+        };
+        let gi = spawn("E1", "Americans", 5);
+        let other_gi = spawn("E1", "Americans", 7);
+        let mcv = spawn("AMCV", "Americans", 9);
+        let enemy_mcv = spawn("AMCV", "Soviets", 20);
+        let hover = |stable_id| HoverTargetKindWithId {
+            kind: HoverTargetKind::FriendlyUnit,
+            stable_id,
+        };
+        let click = |selected: &[u64], target: u64| {
+            self_click_command(&sim, &rules, americans, selected, Some(&hover(target)))
+        };
+
+        assert_eq!(
+            click(&[gi], gi),
+            Some(Command::ToggleInfantryDeploy { entity_id: gi })
+        );
+        assert_eq!(
+            click(&[mcv], mcv),
+            Some(Command::DeployMcv { entity_id: mcv })
+        );
+        assert_eq!(click(&[gi, other_gi], gi), None, "a group click selects");
+        assert_eq!(click(&[mcv, gi], mcv), None, "a group click selects");
+        assert_eq!(click(&[gi], other_gi), None, "not the selected object");
+        assert_eq!(click(&[enemy_mcv], enemy_mcv), None, "not the player's");
+    }
+
+    /// The click side of the bomb actions: an Engineer's DisarmBomb and a
+    /// Crazy Ivan's IvanBomb on a friend are Attack orders (ForceAttack past
+    /// VERA's alliance gate), and an Ivan never attacks a bombed target.
+    #[test]
+    fn bomb_click_orders() {
+        let rules =
+            crate::rules::ruleset::RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(
+                "[InfantryTypes]\n0=IVAN\n1=ENGINEER\n[VehicleTypes]\n0=HTNK\n\
+                 [CombatDamage]\nIvanTimedDelay=450\n\
+                 [IVAN]\nStrength=125\nIvan=yes\nAttackCursorOnFriendlies=yes\n\
+                 [ENGINEER]\nStrength=75\nEngineer=yes\nBombSight=4\n\
+                 [HTNK]\nStrength=900\n",
+            ))
+            .unwrap();
+        let mut sim = Simulation::new();
+        sim.resolve_type_handles(&rules);
+        for house in ["Americans", "Soviets"] {
+            let id = sim.interner.intern(house);
+            sim.session.house_order.push(id);
+        }
+        let americans = sim.interner.get("Americans").unwrap();
+        let mut spawn = |kind: &str, owner: &str, rx: u16| {
+            sim.spawn_object(kind, owner, rx, 5, 0, &rules).unwrap()
+        };
+        let ivan = spawn("IVAN", "Americans", 5);
+        let engineer = spawn("ENGINEER", "Americans", 7);
+        let own_tank = spawn("HTNK", "Americans", 9);
+        let spare_tank = spawn("HTNK", "Americans", 11);
+        let enemy_ivan = spawn("IVAN", "Soviets", 20);
+        let far_tank = spawn("HTNK", "Soviets", 22);
+        let selected = [ivan, engineer];
+
+        assert_eq!(
+            friendly_bomb_ivans(&sim, &rules, &selected, own_tank),
+            vec![ivan]
+        );
+        assert!(disarm_bomb_engineers(&sim, &rules, &selected, own_tank, americans).is_empty());
+        assert!(!ivan_cannot_bomb(&sim, &rules, ivan, own_tank));
+
+        sim.bomb_attach(ivan, Some(own_tank), &rules);
+        sim.bomb_attach(enemy_ivan, Some(far_tank), &rules);
+        sim.bomb_list_update(&rules);
+        sim.bomb_list_update(&rules);
+
+        assert_eq!(
+            disarm_bomb_engineers(&sim, &rules, &selected, own_tank, americans),
+            vec![engineer]
+        );
+        assert!(
+            disarm_bomb_engineers(&sim, &rules, &selected, far_tank, americans).is_empty(),
+            "an unseen bomb"
+        );
+        assert!(
+            friendly_bomb_ivans(&sim, &rules, &selected, own_tank).is_empty(),
+            "a bombed friend stays a selection click"
+        );
+        assert_eq!(
+            friendly_bomb_ivans(&sim, &rules, &selected, spare_tank),
+            vec![ivan]
+        );
+        assert!(ivan_cannot_bomb(&sim, &rules, ivan, own_tank));
+        assert!(!ivan_cannot_bomb(&sim, &rules, engineer, own_tank));
+
+        // The Engineer carrying a bomb itself is no target of its own click.
+        sim.bomb_attach(ivan, Some(engineer), &rules);
+        sim.bomb_list_update(&rules);
+        sim.bomb_list_update(&rules);
+        assert!(disarm_bomb_engineers(&sim, &rules, &[engineer], engineer, americans).is_empty());
+
+        assert!(matches!(
+            bomb_order(engineer, own_tank, true),
+            Command::ForceAttack { .. }
+        ));
+        assert!(matches!(
+            bomb_order(engineer, far_tank, false),
+            Command::Attack { .. }
+        ));
     }
 }

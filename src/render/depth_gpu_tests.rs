@@ -829,7 +829,7 @@ fn stock_cliff_decoder_and_terrain_instances_occlude_shp_and_indexed_voxels() {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
-    use crate::assets::asset_manager::AssetManager;
+    use crate::assets::asset_manager::{AssetManager, MediaArchiveMode};
     use crate::map::terrain::{TerrainCell, TerrainGrid, TilePlacement};
     use crate::map::theater::{TileKey, load_theater, load_tile_images};
 
@@ -841,7 +841,8 @@ fn stock_cliff_decoder_and_terrain_instances_occlude_shp_and_indexed_voxels() {
                 .paths
                 .ra2_dir
         });
-    let mut assets = AssetManager::new(&asset_root).expect("load installed YR archive stack");
+    let mut assets = AssetManager::new(&asset_root, MediaArchiveMode::STOCK_DIGITAL)
+        .expect("load installed YR archive stack");
     let theater = load_theater(&mut assets, "TEMPERATE").expect("activate stock temperate assets");
     let tile_id = (0..theater.lookup.len())
         .find(|index| {
@@ -912,7 +913,7 @@ fn stock_cliff_decoder_and_terrain_instances_occlude_shp_and_indexed_voxels() {
         origin_x: 0.0,
         origin_y: -100.0,
         local_bounds: None,
-        anchor_variant_table: None,
+        bridge_middle_tiles: None,
     };
     let lookup = |id, sub, variant| {
         assert_eq!((id, sub, variant), (tile_id, 2, 0));
@@ -926,7 +927,6 @@ fn stock_cliff_decoder_and_terrain_instances_occlude_shp_and_indexed_voxels() {
         60.0,
         60.0,
         Some(&lookup),
-        None,
         None,
     )
     .normal;

@@ -8,19 +8,12 @@ use super::{SimFireEvent, SimSoundEvent, Simulation};
 use crate::map::entities::EntityCategory;
 use crate::map::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
-use crate::sim::combat::{DeathEffects, RevealEvent, UnderAttackEvent};
+use crate::sim::combat::{DeathEffects, UnderAttackEvent};
 use crate::sim::intern::InternedId;
-use crate::sim::pathfinding::PathGrid;
-use crate::sim::production;
-use crate::sim::radar::RadarEventType;
-use std::sync::Arc;
 
 enum DamageDelivery {
     Immediate,
-    Ordinary {
-        reveal_events: Vec<RevealEvent>,
-        fire_events: Vec<SimFireEvent>,
-    },
+    Ordinary { fire_events: Vec<SimFireEvent> },
 }
 
 /// Pending work has one owner and is consumed once by its world commit.
@@ -31,13 +24,39 @@ pub(crate) struct DamageConsequences {
     delivery: DamageDelivery,
 }
 
-pub(super) struct DamageCommitReceipt {
+pub(crate) struct DamageCommitReceipt {
+    pub(crate) area_result: Option<crate::sim::combat::world_receiver::AreaDamageResult>,
+    pub(crate) fatal_ids: Vec<u64>,
     pub(super) structure_destroyed: bool,
-    pub(super) bridge_state_changed: bool,
-    pub(super) path_grid: Option<Arc<PathGrid>>,
+    pub(crate) bridge_state_changed: bool,
 }
 
 impl DamageConsequences {
+    /// Assemble pure receiver fixtures from the same per-actor production
+    /// firing host. Consequences retain their actual actor-before-tail order.
+    #[cfg(test)]
+    pub(crate) fn prepend_actor_fire_for_test(&mut self, mut earlier: Self) {
+        earlier.effects.append(std::mem::take(&mut self.effects));
+        self.effects = earlier.effects;
+        earlier
+            .terrain_navigation_changed_cells
+            .append(&mut self.terrain_navigation_changed_cells);
+        self.terrain_navigation_changed_cells = earlier.terrain_navigation_changed_cells;
+        let (
+            DamageDelivery::Ordinary {
+                fire_events: previous,
+            },
+            DamageDelivery::Ordinary {
+                fire_events: current,
+            },
+        ) = (&mut earlier.delivery, &mut self.delivery)
+        else {
+            panic!("actor fire fixture requires ordinary delivery");
+        };
+        previous.append(current);
+        *current = std::mem::take(previous);
+    }
+
     pub(super) fn finish_navigation(&mut self, cells: Vec<(u16, u16)>) {
         self.terrain_navigation_changed_cells = cells;
     }
@@ -45,6 +64,17 @@ impl DamageConsequences {
     #[cfg(test)]
     pub(crate) fn effects(&self) -> &DeathEffects {
         &self.effects
+    }
+
+    /// Fold a combat fixture's tail detonations into this frame's effects.
+    #[cfg(test)]
+    pub(crate) fn append_tail_for_test(
+        &mut self,
+        mut effects: DeathEffects,
+        under_attack_events: Vec<UnderAttackEvent>,
+    ) {
+        effects.under_attack_events = under_attack_events;
+        self.effects.append(effects);
     }
 
     #[cfg(test)]
@@ -73,7 +103,6 @@ impl DamageConsequences {
         mut effects: DeathEffects,
         under_attack_events: Vec<UnderAttackEvent>,
         terrain_navigation_changed_cells: Vec<(u16, u16)>,
-        reveal_events: Vec<RevealEvent>,
         fire_events: Vec<SimFireEvent>,
     ) -> Self {
         // Ordinary radiation and death sounds already crossed their earlier
@@ -81,14 +110,28 @@ impl DamageConsequences {
         // carrying the accumulator whole must not replay those leftovers here.
         effects.rad_detonations.clear();
         effects.death_sounds.clear();
+        Self::live_fire(
+            effects,
+            under_attack_events,
+            terrain_navigation_changed_cells,
+            fire_events,
+        )
+    }
+
+    /// A shot committed inside its actor's Logic visit. No earlier global
+    /// combat phase has delivered its radiation/death sounds; preserve those
+    /// alongside the same ordinary fire-event and effect delivery owner.
+    pub(crate) fn live_fire(
+        mut effects: DeathEffects,
+        under_attack_events: Vec<UnderAttackEvent>,
+        terrain_navigation_changed_cells: Vec<(u16, u16)>,
+        fire_events: Vec<SimFireEvent>,
+    ) -> Self {
         effects.under_attack_events = under_attack_events;
         Self {
             effects,
             terrain_navigation_changed_cells,
-            delivery: DamageDelivery::Ordinary {
-                reveal_events,
-                fire_events,
-            },
+            delivery: DamageDelivery::Ordinary { fire_events },
         }
     }
 
@@ -97,7 +140,6 @@ impl DamageConsequences {
         world: &mut Simulation,
         rules: &RuleSet,
         overlay_registry: Option<&OverlayTypeRegistry>,
-        fallback_path_grid: Option<&PathGrid>,
     ) -> DamageCommitReceipt {
         let Self {
             mut effects,
@@ -120,7 +162,6 @@ impl DamageConsequences {
             .collect();
 
         for &dead_id in &effects.immediate_uninit_ids {
-            world.undock_refinery_unit_on_death(rules, dead_id);
             if world
                 .substrate
                 .entities
@@ -134,12 +175,10 @@ impl DamageConsequences {
             world.uninit_with_rules(dead_id, rules);
         }
 
-        let bridge_state_changed = crate::sim::world::bridge_orchestrator::apply_bridge_damage_events_with_overlay_registry(
-            world,
-            rules,
-            &effects.bridge_damage_events,
-            overlay_registry,
-        );
+        // Apply_area_damage already completed its bridge callbacks before
+        // returning to the caller's animation/cluster tail. Delivery carries
+        // only the resulting frame notification, never deferred gameplay.
+        let bridge_state_changed = effects.bridge_state_changed;
         debug_assert!(effects.tiberium_reduction_requests.is_empty());
         for request in &effects.tiberium_reduction_requests {
             world.reduce_tiberium_at_with_native_context(
@@ -158,33 +197,7 @@ impl DamageConsequences {
             );
         }
 
-        let path_grid = world.finish_terrain_navigation_changes(
-            fallback_path_grid,
-            &terrain_navigation_changed_cells,
-        );
-        if let DamageDelivery::Ordinary { reveal_events, .. } = &delivery {
-            for event in reveal_events {
-                crate::sim::vision::reveal_radius(
-                    &mut world.fog,
-                    event.owner,
-                    event.rx,
-                    event.ry,
-                    event.radius,
-                );
-            }
-        }
-
-        for building in &effects.destroyed_crewed_buildings {
-            production::eject_destruction_survivors(
-                world,
-                rules,
-                building.type_id,
-                building.owner,
-                building.rx,
-                building.ry,
-                building.z,
-            );
-        }
+        world.finish_terrain_navigation_changes(rules, &terrain_navigation_changed_cells);
         if world.session.game_options.super_weapons && effects.structure_destroyed {
             let mut refreshed = Vec::new();
             for &(owner, category) in &dead_infos {
@@ -202,33 +215,22 @@ impl DamageConsequences {
         // plays the art type's `Report=`/`StartSound=`, and only the real
         // AnimType carries its `Translucent=` and `Rate=`.
         for fx in std::mem::take(&mut effects.explosion_effects) {
-            world.spawn_combat_explosion_anim(
-                rules,
-                fx.shp_name,
-                fx.rx,
-                fx.ry,
-                fx.sub_x,
-                fx.sub_y,
-                fx.z,
-            );
+            admit_explosion_effect(world, rules, fx);
         }
         if let DamageDelivery::Ordinary { fire_events, .. } = &delivery {
             admit_electric_sparks(world, rules, fire_events);
         }
         world
-            .invulnerability_impact_effects
-            .append(&mut effects.invulnerability_impact_effects);
-        if let DamageDelivery::Ordinary {
-            fire_events,
-            reveal_events,
-        } = delivery
-        {
+            .combat_light_requests
+            .append(&mut effects.combat_light_requests);
+        // RevealOnFire only lifts the shooter's shroud above. gamemd reaches
+        // `CreateRadarEvent @ 0x0065FA70` from no weapon-fire path: its 24
+        // constant-type call sites never pass type 0 (the 25th,
+        // `TriggerAction::Execute`, takes its type from map data), and the one
+        // in `BulletClass::AI` (`0x00467EA7`) is the silent type 13 of the
+        // `NUKE` payload.
+        if let DamageDelivery::Ordinary { fire_events, .. } = delivery {
             world.fire_events.extend(fire_events);
-            for event in reveal_events {
-                world
-                    .radar_events
-                    .push(RadarEventType::Combat, event.rx, event.ry);
-            }
         }
         for (die_sound_id, rx, ry) in effects.death_sounds.drain(..) {
             world.sound_events.push(SimSoundEvent::EntityDied {
@@ -250,10 +252,92 @@ impl DamageConsequences {
                 .append(&mut effects.smudge_spawn_requests);
         }
         DamageCommitReceipt {
+            area_result: None,
+            fatal_ids: effects.despawned_ids,
             structure_destroyed: effects.structure_destroyed,
             bridge_state_changed,
-            path_grid,
         }
+    }
+}
+
+/// One constructor authority for immediate native tails and deferred receiver
+/// packets. Bullet469C40 calls this before its next Cluster draw469057.
+pub(crate) fn admit_explosion_effect(
+    world: &mut Simulation,
+    rules: &RuleSet,
+    fx: crate::sim::combat::ExplosionEffect,
+) {
+    match fx.death {
+        Some(spawn) => world.admit_death_anim(rules, fx.shp_name, spawn),
+        None => {
+            world.spawn_combat_explosion_anim(
+                rules,
+                fx.shp_name,
+                fx.rx,
+                fx.ry,
+                fx.sub_x,
+                fx.sub_y,
+                fx.z,
+                fx.world_z,
+            );
+        }
+    }
+}
+
+/// `AnimClass` draw flags of a muzzle animation (`PUSH 0x600`, `0x006FF3B1`).
+const MUZZLE_ANIM_DRAW_FLAGS: u32 = 0x600;
+
+/// Construct one shot's muzzle animation, inside FireAt after GetROF.
+///
+/// gamemd-derived, the tail of `TechnoClass::Fire_At` (`0x006FF394..0x006FF43F`):
+/// `AnimClass(type, &fireCoord, delay 0, loopCount 1, drawFlags 0x600,
+/// zAdjust 0, reverse 0)` at `0x006FF3C2`. A building firer (`WhatAmI == 6`)
+/// then stores the anim's `ZAdjust` (`+0x100`); every other firer becomes the
+/// anim's owner through `AnimClass::SetOwnerObject @ 0x00424B50`, so the flash
+/// rides a moving or airborne firer. Weapon `Anim=` and occupant
+/// `OccupantAnim=` flashes are this one block; the type is chosen by
+/// `fire_coord::muzzle_anim_name`.
+///
+/// An art type that never bound constructs nothing, as elsewhere in the store.
+///
+pub(crate) fn admit_muzzle_anim(world: &mut Simulation, rules: &RuleSet, event: &SimFireEvent) {
+    let Some(type_name) = event.muzzle_anim else {
+        return;
+    };
+    let coord = crate::sim::anim_class::AnimWorldCoord {
+        x: event.fire_coord.x,
+        y: event.fire_coord.y,
+        z: event.fire_coord.z,
+    };
+    let is_building = event.firer_category == EntityCategory::Structure;
+    let (rx, ry, sub_x, sub_y, level) = coord.to_cell_sub_z();
+    let descriptor = crate::sim::components::AnimClassSpawnDescriptor {
+        delay: 0,
+        loop_count: 1,
+        draw_flags: MUZZLE_ANIM_DRAW_FLAGS,
+        z_adjust: if is_building {
+            crate::sim::combat::fire_coord::building_muzzle_z_adjust(
+                event.fire_offset_y,
+                event.occupied_building,
+            )
+        } else {
+            0
+        },
+        reverse: false,
+        ..crate::sim::components::AnimClassSpawnDescriptor::new(
+            type_name, rx, ry, sub_x, sub_y, level,
+        )
+    };
+    match world.spawn_anim_at_world(rules, descriptor, coord) {
+        Ok(anim_id) => {
+            if !is_building {
+                world.set_anim_owner_object(anim_id, Some(event.attacker_id), rules);
+            }
+        }
+        Err(error) => log::debug!(
+            "muzzle anim [{}] did not construct: {error}",
+            world.interner.resolve(type_name)
+        ),
     }
 }
 
@@ -334,5 +418,163 @@ fn admit_electric_sparks(world: &mut Simulation, rules: &RuleSet, fire_events: &
                 rules,
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod muzzle_anim_tests {
+    use super::*;
+    use crate::rules::art_data::ArtRegistry;
+    use crate::rules::ini_parser::IniFile;
+    use crate::sim::anim_class::AnimWorldCoord;
+    use crate::sim::components::Health;
+    use crate::sim::game_entity::GameEntity;
+    use crate::sim::projectile::ProjectileCoord;
+
+    fn fixture(category: EntityCategory) -> (Simulation, RuleSet, u64) {
+        let mut rules = RuleSet::from_ini(&IniFile::from_str(
+            "[VehicleTypes]\n0=TANK\n[BuildingTypes]\n0=TOWER\n[TANK]\nStrength=100\n[TOWER]\nStrength=100\n",
+        ))
+        .expect("rules");
+        let mut art = ArtRegistry::from_ini(&IniFile::from_str("[GUNFIRE]\nRate=900\n"));
+        art.bind_anim_frame_count_for_test("GUNFIRE", 6);
+        // Synthetic fixture supplies ART directly, without native read-admission replay.
+        rules.install_art_fixture(art);
+
+        let mut sim = Simulation::new();
+        let owner = sim.interner.intern("A");
+        let type_ref = sim
+            .interner
+            .intern(if category == EntityCategory::Structure {
+                "TOWER"
+            } else {
+                "TANK"
+            });
+        let id = sim.allocate_stable_id();
+        sim.substrate
+            .entities
+            .insert(GameEntity::new_at_frame_zero_for_test(
+                id,
+                10,
+                10,
+                0,
+                0,
+                owner,
+                Health { current: 100 },
+                type_ref,
+                category,
+                0,
+                5,
+                false,
+            ));
+        (sim, rules, id)
+    }
+
+    fn shot(sim: &mut Simulation, attacker_id: u64, category: EntityCategory) -> SimFireEvent {
+        let mut event = SimFireEvent::for_test(attacker_id);
+        event.firer_category = category;
+        event.muzzle_anim = Some(sim.interner.intern("GUNFIRE"));
+        event.fire_coord = ProjectileCoord::new(10 * 256 + 200, 10 * 256 + 60, 105);
+        event
+    }
+
+    /// `0x006FF3C2` then `0x006FF43A`: the constructor row, then
+    /// `SetOwnerObject(firer)` for anything that is not a building.
+    #[test]
+    fn a_units_muzzle_anim_is_built_at_the_fire_coordinate_and_rides_the_firer() {
+        let (mut sim, rules, tank) = fixture(EntityCategory::Unit);
+        let event = shot(&mut sim, tank, EntityCategory::Unit);
+        admit_muzzle_anim(&mut sim, &rules, &event);
+
+        let (id, anim) = sim.substrate.anims.iter().next().expect("one muzzle anim");
+        let id = *id;
+        assert_eq!(sim.interner.resolve(anim.type_id), "GUNFIRE");
+        assert_eq!((anim.draw_flags, anim.z_adjust), (0x600, 0));
+        assert_eq!(anim.runtime.loop_remaining, 1);
+        assert_eq!(anim.owner_entity, Some(tank));
+        let at_fire = AnimWorldCoord {
+            x: 10 * 256 + 200,
+            y: 10 * 256 + 60,
+            z: 105,
+        };
+        assert_eq!(sim.anim_absolute_coord(id), Some(at_fire));
+
+        // The firer drives one cell east and climbs: the flash goes with it.
+        {
+            let firer = sim.substrate.entities.get_mut(tank).unwrap();
+            firer.position.rx += 1;
+            firer.position.exact_z_leptons = Some(70);
+        }
+        assert_eq!(
+            sim.anim_absolute_coord(id),
+            Some(AnimWorldCoord {
+                x: at_fire.x + 256,
+                y: at_fire.y,
+                z: at_fire.z + 70,
+            })
+        );
+    }
+
+    /// `0x006FF3D9..0x006FF427`: a building's anim is not attached; it takes a
+    /// `ZAdjust` from the fire offset, or -200 when occupants fired.
+    #[test]
+    fn a_buildings_muzzle_anim_stays_put_and_takes_the_native_z_adjust() {
+        let (mut sim, rules, tower) = fixture(EntityCategory::Structure);
+        let mut own_weapon = shot(&mut sim, tower, EntityCategory::Structure);
+        own_weapon.fire_offset_y = 130;
+        let mut occupants = own_weapon.clone();
+        occupants.occupied_building = true;
+        for event in [own_weapon, occupants] {
+            admit_muzzle_anim(&mut sim, &rules, &event);
+        }
+
+        let anims: Vec<_> = sim.substrate.anims.iter().map(|(_, anim)| anim).collect();
+        assert_eq!(anims.len(), 2);
+        assert!(anims.iter().all(|anim| anim.owner_entity.is_none()));
+        assert_eq!(anims[0].z_adjust, -32);
+        assert_eq!(anims[1].z_adjust, -200);
+    }
+
+    /// Firer expiry425150 removes Display and clears ownership without
+    /// converting stored relative coordinates. The hidden flash remains in
+    /// storage until its own AI reaches Destroy. Native owner histories are
+    /// preserved in tools/spatial_oracle/display_anim_owner.json.
+    #[test]
+    fn firer_expiry_hides_the_flash_without_converting_its_relative_coordinate() {
+        let (mut sim, rules, tank) = fixture(EntityCategory::Unit);
+        sim.reveal(tank);
+        let event = shot(&mut sim, tank, EntityCategory::Unit);
+        admit_muzzle_anim(&mut sim, &rules, &event);
+        let id = *sim.substrate.anims.iter().next().expect("muzzle anim").0;
+        let relative = sim.anim(id).unwrap().world_coord;
+
+        sim.uninit_with_rules(tank, &rules);
+
+        let anim = sim.anim(id).expect("the anim is still stored this frame");
+        assert_eq!(anim.owner_entity, None, "the teardown detached it");
+        assert!(
+            anim.runtime.inactive,
+            "native19B requests expiry on its next AI"
+        );
+        assert!(!sim.substrate.pending_delete.contains(&id));
+        assert_eq!(
+            sim.anim_absolute_coord(id),
+            Some(relative),
+            "expiry preserves the stored delta after clearing the owner"
+        );
+        assert_eq!(sim.substrate.display.layer_of(id), None);
+    }
+
+    #[test]
+    fn a_shot_without_a_bound_muzzle_type_constructs_nothing() {
+        let (mut sim, rules, tank) = fixture(EntityCategory::Unit);
+        let mut unbound = shot(&mut sim, tank, EntityCategory::Unit);
+        unbound.muzzle_anim = Some(sim.interner.intern("NOSUCHANIM"));
+        let mut none = unbound.clone();
+        none.muzzle_anim = None;
+        for event in [unbound, none] {
+            admit_muzzle_anim(&mut sim, &rules, &event);
+        }
+        assert_eq!(sim.substrate.anims.iter().count(), 0);
     }
 }

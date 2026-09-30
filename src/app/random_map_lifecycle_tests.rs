@@ -60,12 +60,13 @@ fn launch_session(seed_name: &str) -> SkirmishLaunchSession {
 fn start_production_worker(
     assets: &mut crate::assets::asset_manager::AssetManager,
     options: &RmgOptions,
+    native_rules: &crate::rules::process_owner::NativeRulesProcessOwner,
     runtime: &mut OfflineSkirmishRuntime,
     retention: &mut RandomMapGenerationRetention,
     shared_cell_dummy: &crate::map::resolved_terrain::SharedCellDummy,
 ) -> std::sync::mpsc::Receiver<RandomMapUpdate> {
     begin_random_map_generation_owners(runtime, retention, options);
-    let prepared = prepare_random_map_generation(assets, options)
+    let prepared = prepare_random_map_generation(assets, options, Some(native_rules))
         .expect("production retail generation preparation");
     let decision = retention.map_storage_decision(options);
     let receiver = spawn_random_map_generation_worker(
@@ -117,8 +118,19 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
     );
     assert!(retail_dir.join("gamemd.exe").is_file());
     crate::map::rmg::trig::install_from_dir(&retail_dir);
-    let mut assets = crate::assets::asset_manager::AssetManager::new(&retail_dir)
-        .expect("active-retail AssetManager");
+    let mut assets = crate::assets::asset_manager::AssetManager::new(
+        &retail_dir,
+        crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+    )
+    .expect("active-retail AssetManager");
+    let (_, _, native_rules) = crate::rules::retail_sources::load_startup_rules(
+        &assets,
+        std::sync::Arc::clone(
+            crate::rules::audio_sources::AudioDefinitions::select(&assets).sounds(),
+        ),
+    )
+    .expect("retail startup Rules")
+    .into_parts();
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock after epoch")
@@ -175,6 +187,7 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
     let receiver = start_production_worker(
         &mut assets,
         &options,
+        &native_rules,
         &mut runtime,
         &mut retention,
         &shared_cell_dummy,
@@ -204,6 +217,7 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
     let receiver = start_production_worker(
         &mut assets,
         &options,
+        &native_rules,
         &mut runtime,
         &mut retention,
         &shared_cell_dummy,
@@ -258,6 +272,7 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
     let receiver = start_production_worker(
         &mut assets,
         &options,
+        &native_rules,
         &mut runtime,
         &mut retention,
         &shared_cell_dummy,
@@ -306,6 +321,7 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
     let receiver = start_production_worker(
         &mut assets,
         &options,
+        &native_rules,
         &mut runtime,
         &mut retention,
         &shared_cell_dummy,
@@ -373,6 +389,7 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
     let direct_initial = super::loading::init::load_map_initial_with_assets(
         seed_dir.clone(),
         &mut assets,
+        Some(&native_rules),
         Some(seed_name),
         &mut SilentProgress,
     )
@@ -420,11 +437,15 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
             source: crate::match_bootstrap::MatchSeedSource::Controlled,
             seed_authority_certifying: false,
         },
-        crate::ui::main_menu::SkirmishSettings::default(),
     )
     .with_accepted_random_map(Some(accepted_poison));
     let ui_launch = ui_request
-        .load_random_map_snapshot_for_test(seed_dir.clone(), &mut assets, &mut SilentProgress)
+        .load_random_map_snapshot_for_test(
+            seed_dir.clone(),
+            &mut assets,
+            Some(&native_rules),
+            &mut SilentProgress,
+        )
         .expect("accepted UI .SED regeneration and admitted bundle transfer");
 
     // The reference arm must cross the same accepted-staging admission seam;
@@ -450,7 +471,6 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
             source: crate::match_bootstrap::MatchSeedSource::Controlled,
             seed_authority_certifying: false,
         },
-        crate::ui::main_menu::SkirmishSettings::default(),
     )
     .with_accepted_random_map(Some(direct_accepted));
     let direct_launch = direct_request
@@ -504,10 +524,6 @@ fn gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges() {
     assert!(
         ui_launch.post_map_output.navigation_published,
         "shared Post_Map_Init must publish first navigation authority"
-    );
-    assert!(
-        ui_launch.post_map_output.tiberium_queues.is_some(),
-        "shared Post_Map_Init must rebuild the generated overlay queues"
     );
     assert_eq!(
         ui_launch.post_map_output.crates,

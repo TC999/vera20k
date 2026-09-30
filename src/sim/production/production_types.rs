@@ -9,15 +9,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::rules::object_type::ObjectCategory;
 use crate::sim::intern::InternedId;
-use crate::sim::miner::ResourceNode;
-use crate::sim::miner::miner_dock::RefineryDockContacts;
 use crate::sim::ore_growth::{OreGrowthConfig, OreGrowthState};
 use crate::sim::production::factory::FactoryRegistry;
 
 /// Initial credits for the local player.
 pub const STARTING_CREDITS: i32 = 5000;
-/// Fixed-point precision for dynamic production-rate application.
-pub(super) const PRODUCTION_RATE_SCALE: u64 = 1_000_000;
 
 /// One queued item formatted for UI rendering.
 #[derive(Debug, Clone)]
@@ -26,8 +22,9 @@ pub struct QueueItemView {
     pub display_name: String,
     pub queue_category: ProductionCategory,
     pub state: BuildQueueState,
-    pub remaining_ms: u32,
-    pub total_ms: u32,
+    /// Factory progress in steps (`0..=PRODUCTION_STEPS`, Factory `+0x24`, read by
+    /// the sidebar through `0x004CA120`); `0` for a queued item.
+    pub progress: u16,
 }
 
 /// One completed building waiting for placement.
@@ -75,8 +72,6 @@ pub enum BuildDisabledReason {
     MissingPrerequisite(String),
     NoFactory,
     AtBuildLimit,
-    InsufficientCredits,
-    PlacementModeUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,25 +91,6 @@ impl BuildingPlacementError {
             Self::BlockedTerrain => "Blocked terrain",
             Self::OverlapsStructure => "Overlaps structure",
             Self::OutOfBuildArea => "Outside build radius",
-        }
-    }
-}
-
-pub fn disabled_reason_text(reason: &BuildDisabledReason) -> String {
-    match reason {
-        BuildDisabledReason::UnbuildableTechLevel => "Unbuildable (TechLevel)".to_string(),
-        BuildDisabledReason::WrongOwner => "Wrong owner".to_string(),
-        BuildDisabledReason::WrongHouse => "Wrong house".to_string(),
-        BuildDisabledReason::ForbiddenHouse => "Forbidden for this house".to_string(),
-        BuildDisabledReason::RequiresStolenTech => {
-            "Requires stolen tech (spy infiltration)".to_string()
-        }
-        BuildDisabledReason::MissingPrerequisite(p) => format!("Missing prerequisite: {}", p),
-        BuildDisabledReason::NoFactory => "No production building".to_string(),
-        BuildDisabledReason::AtBuildLimit => "Build limit reached".to_string(),
-        BuildDisabledReason::InsufficientCredits => "Insufficient credits".to_string(),
-        BuildDisabledReason::PlacementModeUnavailable => {
-            "Building placement not implemented yet".to_string()
         }
     }
 }
@@ -142,7 +118,6 @@ pub enum ProductionCategory {
 pub enum BuildQueueState {
     Queued,
     Building,
-    NoFunds,
     Paused,
     Done,
 }
@@ -152,7 +127,6 @@ impl BuildQueueState {
         match self {
             Self::Queued => "Queued",
             Self::Building => "Building",
-            Self::NoFunds => "On Hold",
             Self::Paused => "Paused",
             Self::Done => "Done",
         }
@@ -177,6 +151,7 @@ impl ProductionCategory {
 pub struct BuildOption {
     pub type_id: InternedId,
     pub display_name: String,
+    /// The type's Cost_Of for the owner (TechnoType virtual `+0x84`).
     pub cost: i32,
     pub object_category: ObjectCategory,
     pub queue_category: ProductionCategory,
@@ -188,23 +163,13 @@ impl BuildOption {
     /// Whether the sidebar should show a cameo for this option.
     ///
     /// Tech-tree, faction, and factory failures hide the item entirely — the
-    /// player never sees a cameo they cannot act on. A credit shortfall or a
-    /// reached build limit keeps the cameo visible (greyed): the item is still
-    /// part of the player's tech tree, it just can't start right now.
+    /// player never sees a cameo they cannot act on. A reached build limit keeps
+    /// the cameo visible (greyed): the item is still part of the player's tech
+    /// tree, it just can't start right now. Money never greys a cameo: a build
+    /// the house cannot pay for starts and waits on hold.
     pub fn visible_in_sidebar(&self) -> bool {
-        self.enabled
-            || matches!(
-                self.reason,
-                Some(BuildDisabledReason::InsufficientCredits)
-                    | Some(BuildDisabledReason::AtBuildLimit)
-            )
+        self.enabled || self.reason == Some(BuildDisabledReason::AtBuildLimit)
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum BuildMode {
-    Strict,
-    PrototypeRelaxed,
 }
 
 /// Player production state.
@@ -213,19 +178,10 @@ pub struct ProductionState {
     pub ready_by_owner: BTreeMap<InternedId, VecDeque<InternedId>>,
     pub active_producer_by_owner: BTreeMap<InternedId, BTreeMap<ProductionCategory, u64>>,
     pub next_enqueue_order: u64,
-    /// Legacy test/save compatibility only. Live YR maps derive resource type
-    /// and raw quantity from `Simulation::overlay_grid`; this map is neither
-    /// seeded nor read/hashed when the production registries are available.
-    pub resource_nodes: BTreeMap<(u16, u16), ResourceNode>,
-    /// Refinery dock reservation state — one dock per refinery, FIFO queue.
-    pub dock_reservations: RefineryDockContacts,
     /// Ore growth/spread configuration resolved from merged INI sources.
     pub ore_growth_config: OreGrowthConfig,
-    /// Incremental scan state for ore growth/spread system.
+    /// Per-TiberiumClass growth and spread queues, bitmaps and timers.
     pub ore_growth_state: OreGrowthState,
-    /// Slave Miner bindings: master entity stable_id → vec of slave entity stable_ids.
-    /// Used to track which SLAV infantry belong to which deployed SMIN/YAREFN.
-    pub slave_bindings: BTreeMap<u64, Vec<u64>>,
     /// TIBTRE-style ore-spawning terrain objects, keyed by map cell.
     /// Derived from live `terrain_objects`; removal/limbo must remove this index.
     pub terrain_spawners: BTreeMap<(u16, u16), crate::sim::terrain_spawn::TerrainSpawnerState>,
@@ -240,10 +196,6 @@ pub struct ProductionState {
     /// This is broader than `terrain_spawners`: non-animated legacy spawners do
     /// not tick, but still reject new Tiberium placement in the native gate.
     pub tiberium_spawning_terrain_cells: BTreeSet<(u16, u16)>,
-    /// Fallback overlay_id used for new ore cells when no overlay registry is
-    /// available. Runtime placement prefers the data-driven `TIB01..TIB12`
-    /// registry set and uses this only for headless/fallback contexts.
-    pub default_ore_overlay_id: Option<u8>,
     /// Airfield dock reservations — multi-slot (NumberOfDocks per airfield).
     pub airfield_docks: crate::sim::docking::aircraft_dock::AirfieldDocks,
     /// Per-(house, category) factory registry — the authoritative production state
@@ -261,17 +213,13 @@ impl Default for ProductionState {
             ready_by_owner: BTreeMap::new(),
             active_producer_by_owner: BTreeMap::new(),
             next_enqueue_order: 1,
-            resource_nodes: BTreeMap::new(),
-            dock_reservations: RefineryDockContacts::default(),
             ore_growth_config: OreGrowthConfig::disabled(),
             ore_growth_state: OreGrowthState::new(0, 0),
-            slave_bindings: BTreeMap::new(),
             terrain_spawners: BTreeMap::new(),
             terrain_objects: BTreeMap::new(),
             terrain_object_cells: BTreeMap::new(),
             terrain_occupation_bits: BTreeMap::new(),
             tiberium_spawning_terrain_cells: BTreeSet::new(),
-            default_ore_overlay_id: None,
             airfield_docks: crate::sim::docking::aircraft_dock::AirfieldDocks::default(),
             factory_shadow: FactoryRegistry::default(),
         }

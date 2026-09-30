@@ -8,13 +8,16 @@
 //!
 //! This retains the proven TileAtlas pre-render/cache approach while paging only
 //! the texture storage and ordered draw submission needed for lossless capacity.
+//! A voxel model that first appears mid-match has only its own sprites rendered,
+//! appended to a growth page (`atlas_growth`); resident pages are not repacked.
 //!
 //! ## Dependency rules
 //! - Part of render/ — depends on assets/ (VXL/HVA/Palette), render/batch (GPU upload),
 //!   render/vxl_raster (software rendering).
 //! - Reads from sim/ via EntityStore iteration (GameEntity fields).
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::time::Instant;
 
 #[path = "unit_shadow_cache.rs"]
 mod shadow_cache;
@@ -23,17 +26,15 @@ use crate::assets::asset_manager::AssetManager;
 use crate::assets::hva_file::HvaFile;
 use crate::assets::vpl_file::VplFile;
 use crate::assets::vxl_file::VxlFile;
+use crate::render::atlas_growth::{self, GrowthShelf, SPRITE_PADDING};
 use crate::render::batch::{BatchRenderer, BatchTexture};
-use crate::render::gpu::GpuContext;
-use crate::render::vxl_compute::VxlComputeRenderer;
 use crate::render::vxl_raster::{self, VxlRenderParams, VxlSlopeBlend, VxlSprite};
-use crate::rules::art_data::{self, ArtRegistry};
+use crate::rules::art_data;
 use crate::rules::ruleset::RuleSet;
 
-/// Maximum atlas texture width for unit sprites (pixels).
-
-/// Padding between sprites in the atlas to prevent texture bleeding.
-const SPRITE_PADDING: u32 = 1;
+/// Edge of a growth page. One byte per texel makes it 64 MB, room for the
+/// every-slope sprite set of a few new vehicle types.
+const GROWTH_PAGE_SIZE: u32 = 8192;
 /// Body/composite facing quantization step: 8 = 32 buckets (11.25° per bucket).
 ///
 /// This is not an atlas-size compromise — it is the renderer's real resolution. The
@@ -61,6 +62,16 @@ const TURRET_FACING_BUCKETS: u16 = crate::render::vxl_raster::VOXEL_FACING_STEPS
 // VxlLayer lives in sim::components — re-exported here for convenience.
 pub use crate::sim::components::VxlLayer;
 
+/// The locomotor Draw_Matrix arm a tilted body's pose comes from, with its roll
+/// and pitch in radians (`TechnoClass+0x328`, `+0x32C`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CrashTilt {
+    /// `FlyLocomotionClass`'s crashing arm (`0x004CF610`).
+    Fly([f32; 2]),
+    /// `JumpjetLocomotionClass`'s `TiltCrashJumpjet=` arm (`0x0054DCC0`).
+    Jumpjet([f32; 2]),
+}
+
 /// Cache key: unique combination of object type, facing, layer, frame, and slope.
 ///
 /// Note: house color is NOT in the key. Atlas tiles store house-neutral palette
@@ -83,6 +94,77 @@ pub struct UnitSpriteKey {
     /// clamps any value ≥ 17 to 0 before constructing this key. Different
     /// slopes produce distinct pre-rendered sprites with tilted models.
     pub slope_type: u8,
+    /// A barrel's pitch step, `d32 - 8` of the unit's barrel elevation
+    /// (`TechnoClass+0x370`); 0 for every other layer.
+    pub barrel_pitch: i8,
+}
+
+/// The pitch each unit type's barrel image was first drawn at.
+///
+/// `TechnoClass::DrawVoxel @ 0x00706640` keeps a unit's turret and barrel
+/// images per type (`TechnoType+0x258`, `+0x280`), stored on a miss and blitted
+/// on a hit, under the turret's key: its step, the hull's step when the type
+/// has a `TurretOffset=`, the locomotor's key and the turret frame
+/// (`0x0073B748..0x0073B79F`). The barrel elevation is not in it, and when both
+/// images are cached `UnitClass::DrawVoxelBody` skips the turret and barrel
+/// matrices (`0x0073BA12..0x0073BA47`). So a key's barrel keeps the elevation of
+/// the first unit drawn under it: level for a unit drawn while its elevation
+/// still rounds level (the first two frames after Unlimbo at the default
+/// `FireAngle=`).
+///
+/// Not modelled here:
+/// - Every cached body, turret, barrel and shadow image shares one 4,000,000
+///   byte pool (`0x00887460`, sized at `0x0040F270`). Running it out frees every
+///   type's caches (`0x005F99E0`, called at `0x00706AE0` and from the shadow
+///   draw at `0x00706E38`), and later draws cache the pitch of the moment. VERA
+///   keeps first-drawn pitches until the scenario ends; how often retail games
+///   run the pool out is not measured.
+/// - `DisableVoxelCache=` (`Type+0xDBE`, tested at `0x00706806`) bypasses the
+///   cache; retail sets it only on SHAD, PDPLANE and SPYP, none of which has a
+///   barrel.
+/// - The turret index native keys above the frame (`TurretCount=` types): no
+///   retail barrel belongs to one.
+#[derive(Default)]
+pub struct BarrelImagePitches {
+    by_type: HashMap<String, HashMap<BarrelImageKey, i8>>,
+}
+
+/// The parts of a turret key a unit's barrel image varies by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct BarrelImageKey {
+    turret_facing: u8,
+    /// The hull's facing, keyed only for a type with a `TurretOffset=`.
+    body_facing: Option<u8>,
+    slope_type: u8,
+    turret_frame: u32,
+}
+
+impl BarrelImagePitches {
+    /// The pitch the barrel image cached with `turret`'s image holds: the
+    /// first `drawn` pitch for that key.
+    pub fn pitch(&mut self, turret: &UnitSpriteKey, body_facing: Option<u8>, drawn: i8) -> i8 {
+        let key = BarrelImageKey {
+            turret_facing: turret.facing,
+            body_facing,
+            slope_type: turret.slope_type,
+            turret_frame: turret.frame,
+        };
+        if let Some(pitches) = self.by_type.get_mut(turret.type_id.as_str()) {
+            return *pitches.entry(key).or_insert(drawn);
+        }
+        self.by_type
+            .entry(turret.type_id.clone())
+            .or_default()
+            .insert(key, drawn);
+        drawn
+    }
+
+    /// Each scenario and loaded game starts empty, as a freshly started
+    /// gamemd does; whether gamemd's type caches outlive a scenario within one
+    /// process is not established.
+    pub fn clear(&mut self) {
+        self.by_type.clear();
+    }
 }
 
 /// UV and offset data for one sprite within the unit atlas.
@@ -113,9 +195,33 @@ pub struct UnitAtlasPage {
     pub texture: BatchTexture,
 }
 
+/// Observation of resident palette-index textures, including unused page space.
+/// This excludes CPU caches, pose/slope caches, other atlases and driver overhead.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct UnitAtlasStatistics {
+    pub resident_sprite_count: usize,
+    /// Last non-no-op build's rasterized sprites, including shadow sprites;
+    /// this is not the number successfully admitted to pages.
+    pub last_build_rasterized_sprite_count: u32,
+    pub pages: Vec<UnitAtlasPageStatistics>,
+    pub total_texel_payload_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct UnitAtlasPageStatistics {
+    pub extent: [u32; 3],
+    pub format: &'static str,
+    pub dimension: &'static str,
+    pub mip_level_count: u32,
+    pub sample_count: u32,
+    pub texel_payload_bytes: u64,
+}
+
 /// A paged GPU texture atlas containing pre-rendered unit voxel sprites.
 ///
-/// Created once at map load. Queried per-frame to build unit SpriteInstances.
+/// Created once at map load and queried per-frame to build unit
+/// SpriteInstances. A refresh appends the sprites of newly seen voxel models to
+/// growth pages without touching the rest.
 pub struct UnitAtlas {
     /// Lossless texture pages containing all unit sprites.
     pub pages: Vec<UnitAtlasPage>,
@@ -124,17 +230,139 @@ pub struct UnitAtlas {
     /// HVA frame counts per (type_id, layer). Missing entries have 1 frame.
     /// Used at spawn time to initialize VoxelAnimation components.
     pub frame_counts: BTreeMap<(String, VxlLayer), u32>,
-    /// Cached rendered sprites for incremental rebuild. On subsequent rebuilds,
-    /// only genuinely new sprite keys are rendered; cached sprites are reused
-    /// and everything is repacked.
+    /// Palette indices of every resident sprite; native shadow masks are
+    /// composed from them.
     rendered_cache: Vec<CachedUnitSprite>,
-    /// How many sprites were rendered via GPU compute in the last build.
-    pub gpu_rendered: u32,
-    /// How many sprites were rendered via CPU rasterizer in the last build.
-    pub cpu_rendered: u32,
+    /// How many sprites the last build or refresh rendered.
+    pub rendered: u32,
     /// First eligible composed-body mask for each supported shadow key.
-    /// Atlas repacking retains these pixels; it does not regenerate the mask.
+    /// Pages are never repacked, so an uploaded mask stays where it was written.
     shadow_masks: std::cell::RefCell<HashMap<UnitSpriteKey, Vec<u8>>>,
+    /// Voxel models whose sprites have been collected. Every key derives from
+    /// a model, so coverage is checked per model, never per key.
+    covered: UnitAtlasDemand,
+    /// Page refreshes append to; created when the first refresh needs room.
+    growth: Option<GrowthShelf>,
+}
+
+/// The voxel models a world can draw: vehicle types seeded as ground units
+/// (every slope) or as aircraft (flat only), and building voxel turrets. A
+/// model's sprite keys depend on nothing else, so this is what coverage and
+/// refreshes are decided on.
+#[derive(Debug, Default)]
+pub struct UnitAtlasDemand {
+    ground: BTreeSet<String>,
+    air: BTreeSet<String>,
+    turrets: BTreeSet<String>,
+}
+
+/// One voxel model an object draws with.
+#[derive(Clone, Copy)]
+enum VoxelModel<'a> {
+    Ground(&'a str),
+    Air(&'a str),
+    Turret(&'a str),
+}
+
+/// The voxel model of every object in the world, one per object: vehicles
+/// and aircraft by type, and SHP buildings with TurretAnimIsVoxel=true by
+/// their turret VXL (e.g., SAM.VXL for NASAM), drawn on top of the SHP body.
+fn world_voxel_models<'a>(
+    entities: &'a crate::sim::entity_store::EntityStore,
+    rules: Option<&'a RuleSet>,
+    interner: Option<&'a crate::sim::intern::StringInterner>,
+) -> impl Iterator<Item = VoxelModel<'a>> + 'a {
+    use crate::map::entities::EntityCategory;
+    entities.values().filter_map(move |entity| {
+        let type_str = interner.map_or("", |i| i.resolve(entity.type_ref()));
+        if entity.is_voxel {
+            return Some(if entity.category == EntityCategory::Aircraft {
+                VoxelModel::Air(type_str)
+            } else {
+                VoxelModel::Ground(type_str)
+            });
+        }
+        if entity.category != EntityCategory::Structure {
+            return None;
+        }
+        let obj = rules?.object(type_str)?;
+        obj.turret_anim_is_voxel
+            .then_some(obj.turret_anim.as_deref()?)
+            .map(VoxelModel::Turret)
+    })
+}
+
+/// Whether `atlas` — None while no unit atlas exists — already holds every
+/// voxel model the world draws, so no refresh is needed. This runs on every
+/// tick with a spawn, death or Limbo, so it allocates nothing and stops at
+/// the first miss.
+pub fn atlas_covers_world(
+    atlas: Option<&UnitAtlas>,
+    entities: &crate::sim::entity_store::EntityStore,
+    rules: Option<&RuleSet>,
+    interner: Option<&crate::sim::intern::StringInterner>,
+) -> bool {
+    let mut models = world_voxel_models(entities, rules, interner);
+    match atlas {
+        Some(atlas) => models.all(|model| atlas.covered.contains(model)),
+        None => models.next().is_none(),
+    }
+}
+
+impl UnitAtlasDemand {
+    /// Every voxel model the world's objects draw with.
+    pub fn of_world(
+        entities: &crate::sim::entity_store::EntityStore,
+        rules: Option<&RuleSet>,
+        interner: Option<&crate::sim::intern::StringInterner>,
+    ) -> Self {
+        let mut demand = Self::default();
+        for model in world_voxel_models(entities, rules, interner) {
+            if !demand.contains(model) {
+                let (set, type_id) = match model {
+                    VoxelModel::Ground(type_id) => (&mut demand.ground, type_id),
+                    VoxelModel::Air(type_id) => (&mut demand.air, type_id),
+                    VoxelModel::Turret(type_id) => (&mut demand.turrets, type_id),
+                };
+                set.insert(type_id.to_string());
+            }
+        }
+        demand
+    }
+
+    fn contains(&self, model: VoxelModel<'_>) -> bool {
+        match model {
+            VoxelModel::Ground(type_id) => self.ground.contains(type_id),
+            VoxelModel::Air(type_id) => self.air.contains(type_id),
+            VoxelModel::Turret(type_id) => self.turrets.contains(type_id),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ground.is_empty() && self.air.is_empty() && self.turrets.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.ground.len() + self.air.len() + self.turrets.len()
+    }
+
+    /// The models in `self` that `covered` does not hold.
+    fn without(&self, covered: &Self) -> Self {
+        let missing = |mine: &BTreeSet<String>, theirs: &BTreeSet<String>| {
+            mine.difference(theirs).cloned().collect()
+        };
+        Self {
+            ground: missing(&self.ground, &covered.ground),
+            air: missing(&self.air, &covered.air),
+            turrets: missing(&self.turrets, &covered.turrets),
+        }
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.ground.extend(other.ground);
+        self.air.extend(other.air);
+        self.turrets.extend(other.turrets);
+    }
 }
 
 impl UnitAtlas {
@@ -146,6 +374,52 @@ impl UnitAtlas {
     /// Number of unique sprites in the atlas.
     pub fn sprite_count(&self) -> usize {
         self.entries.len()
+    }
+
+    /// Derive capture evidence from the actual resources. No simulation state
+    /// or per-frame counters are maintained for this observation.
+    pub(crate) fn statistics(&self) -> anyhow::Result<UnitAtlasStatistics> {
+        let mut pages = Vec::with_capacity(self.pages.len());
+        let mut total_texel_payload_bytes = 0_u64;
+        for page in &self.pages {
+            // wgpu 27 exposes the original descriptor through TextureView's
+            // texture handle. Do not estimate from sprite sizes or roster keys.
+            let texture = page.texture.view.texture();
+            let extent = texture.size();
+            anyhow::ensure!(
+                texture.format() == wgpu::TextureFormat::R8Uint
+                    && texture.dimension() == wgpu::TextureDimension::D2
+                    && texture.mip_level_count() == 1
+                    && texture.sample_count() == 1
+                    && extent.depth_or_array_layers == 1
+                    && extent.width > 0
+                    && extent.height > 0,
+                "UnitAtlas payload accounting requires a single-layer/mip/sample D2 R8Uint texture: {:?}, {:?}, {:?}, mips={}, samples={}",
+                extent,
+                texture.format(),
+                texture.dimension(),
+                texture.mip_level_count(),
+                texture.sample_count(),
+            );
+            let texel_payload_bytes = u64::from(extent.width) * u64::from(extent.height);
+            total_texel_payload_bytes = total_texel_payload_bytes
+                .checked_add(texel_payload_bytes)
+                .ok_or_else(|| anyhow::anyhow!("UnitAtlas texture payload total overflow"))?;
+            pages.push(UnitAtlasPageStatistics {
+                extent: [extent.width, extent.height, extent.depth_or_array_layers],
+                format: "R8Uint",
+                dimension: "D2",
+                mip_level_count: texture.mip_level_count(),
+                sample_count: texture.sample_count(),
+                texel_payload_bytes,
+            });
+        }
+        Ok(UnitAtlasStatistics {
+            resident_sprite_count: self.entries.len(),
+            last_build_rasterized_sprite_count: self.rendered,
+            pages,
+            total_texel_payload_bytes,
+        })
     }
 
     /// Number of texture pages in the atlas.
@@ -163,19 +437,147 @@ impl UnitAtlas {
         self.page(page).map(|atlas_page| &atlas_page.texture)
     }
 
-    /// Get the HVA frame count for a (type_id, layer) pair. Returns 1 if unknown.
-    pub fn frame_count_for(&self, type_id: &str, layer: VxlLayer) -> u32 {
-        self.frame_counts
-            .get(&(type_id.to_string(), layer))
-            .copied()
-            .unwrap_or(1)
+    fn new(pages: Vec<UnitAtlasPage>, entries: HashMap<UnitSpriteKey, UnitSpriteEntry>) -> Self {
+        Self {
+            pages,
+            entries,
+            frame_counts: BTreeMap::new(),
+            rendered_cache: Vec::new(),
+            rendered: 0,
+            shadow_masks: Default::default(),
+            covered: UnitAtlasDemand::default(),
+            growth: None,
+        }
     }
 
-    /// Check whether the atlas already contains all sprite keys needed by the
-    /// current ECS world. Returns true if no rebuild is necessary.
-    pub fn has_all_keys(&self, needed: &HashSet<UnitSpriteKey>) -> bool {
-        needed.iter().all(|k| self.entries.contains_key(k))
+    /// Place sprites rendered after the map-load pack on growth pages and
+    /// upload the rows they fill, one write per page.
+    fn append_sprites(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        batch: &BatchRenderer,
+        sprites: Vec<CachedUnitSprite>,
+    ) {
+        let (sprites, malformed): (Vec<_>, Vec<_>) = sprites
+            .into_iter()
+            .partition(|sprite| sprite.pixels.len() == (sprite.width * sprite.height) as usize);
+        for sprite in malformed {
+            log::warn!(
+                "{} VXL sprite has {} pixels for {}x{}",
+                sprite.key.type_id,
+                sprite.pixels.len(),
+                sprite.width,
+                sprite.height,
+            );
+        }
+        let max_dim = device.limits().max_texture_dimension_2d;
+        let pages = &mut self.pages;
+        let (placed, unplaced) = atlas_growth::place_on_growth_pages(
+            &mut self.growth,
+            sprites,
+            |sprite| [sprite.width, sprite.height],
+            max_dim,
+            |[width, height]| {
+                let size = [width, height].map(|side| GROWTH_PAGE_SIZE.max(side).min(max_dim));
+                let texture = batch.create_blank_unit_atlas_texture(device, size[0], size[1]);
+                pages.push(UnitAtlasPage { texture });
+                let page = pages.len() - 1;
+                log::info!("Unit atlas growth page {page} ({}x{})", size[0], size[1]);
+                (page, size)
+            },
+        );
+        for group in placed {
+            let texture = &self.pages[group.page].texture;
+            let rects: Vec<_> = group
+                .sprites
+                .iter()
+                .map(|(origin, sprite)| {
+                    (
+                        *origin,
+                        [sprite.width, sprite.height],
+                        sprite.pixels.as_slice(),
+                    )
+                })
+                .collect();
+            atlas_growth::write_band(queue, texture.view.texture(), 1, &rects);
+            let page_size = [texture.width, texture.height];
+            for (origin, sprite) in group.sprites {
+                let entry = unit_entry(&sprite, origin, group.page, page_size);
+                self.entries.insert(sprite.key.clone(), entry);
+                self.rendered_cache.push(sprite);
+            }
+        }
+        for sprite in unplaced {
+            log::warn!(
+                "{} VXL sprite ({}x{}) exceeds the texture limit {max_dim}",
+                sprite.key.type_id,
+                sprite.width,
+                sprite.height,
+            );
+        }
     }
+}
+
+/// UV rectangle and draw data of `sprite` placed at `origin` on a page.
+fn unit_entry(
+    sprite: &CachedUnitSprite,
+    origin: [u32; 2],
+    page: usize,
+    page_size: [u32; 2],
+) -> UnitSpriteEntry {
+    let [page_width, page_height] = page_size.map(|v| v as f32);
+    UnitSpriteEntry {
+        uv_origin: [
+            origin[0] as f32 / page_width,
+            origin[1] as f32 / page_height,
+        ],
+        uv_size: [
+            sprite.width as f32 / page_width,
+            sprite.height as f32 / page_height,
+        ],
+        pixel_size: [sprite.width as f32, sprite.height as f32],
+        offset_x: sprite.offset_x,
+        offset_y: sprite.offset_y,
+        native_draw_bounds: sprite.native_draw_bounds,
+        page,
+    }
+}
+
+/// One key's rendered sprite and, for a prepared native shadow, its companion
+/// with the legacy shadow geometry (keyed at `LEGACY_SHADOW_FRAME`).
+struct RenderedKey {
+    sprite: CachedUnitSprite,
+    legacy_shadow: Option<CachedUnitSprite>,
+}
+
+fn render_unit_key(
+    model: &UnitModel,
+    key: &UnitSpriteKey,
+    vpl: Option<&VplFile>,
+    pose: &mut Option<PoseParts>,
+) -> Option<RenderedKey> {
+    let (sprite, native_draw_bounds) = model.render(key, vpl, None, pose)?;
+    let legacy_shadow = (key.layer == VxlLayer::Shadow && native_draw_bounds.is_some())
+        .then(|| {
+            let mut fallback_key = key.clone();
+            fallback_key.frame = LEGACY_SHADOW_FRAME;
+            let (fallback, _) = model.render(&fallback_key, vpl, None, pose)?;
+            Some(CachedUnitSprite::from_rendered(RenderedSprite {
+                key: fallback_key,
+                sprite: fallback,
+                native_draw_bounds: None,
+            }))
+        })
+        .flatten();
+    Some(RenderedKey {
+        sprite: CachedUnitSprite::from_rendered(RenderedSprite {
+            key: key.clone(),
+            sprite,
+            native_draw_bounds,
+        }),
+        legacy_shadow,
+    })
 }
 
 /// Intermediate rendered sprite before atlas packing (temporary, during build).
@@ -219,6 +621,7 @@ impl CachedUnitSprite {
 pub(crate) use crate::sim::voxel_frame_catalog::{
     UnitAtlasVariant, detect_hva_frame_count, seed_layers_for, unit_atlas_variants,
 };
+use crate::sim::voxel_frame_catalog::{has_gun_parts, voxel_image_id};
 
 fn insert_unit_layer_keys(
     needed: &mut HashSet<UnitSpriteKey>,
@@ -226,23 +629,52 @@ fn insert_unit_layer_keys(
     layer: VxlLayer,
     num_frames: u32,
     is_ground_vehicle: bool,
+    barrel_pitches: &[i8],
 ) {
     let (step, buckets) = facing_config_for_layer(layer);
     let slope_range = if is_ground_vehicle { 0..=16 } else { 0..=0 };
+    let pitches: &[i8] = if layer == VxlLayer::Barrel {
+        barrel_pitches
+    } else {
+        &[0]
+    };
     for bucket in 0..buckets {
         let facing = (bucket * u16::from(step)) as u8;
         for frame in 0..num_frames {
             for slope_type in slope_range.clone() {
-                needed.insert(UnitSpriteKey {
-                    type_id: type_id.to_string(),
-                    facing,
-                    layer,
-                    frame,
-                    slope_type,
-                });
+                for &barrel_pitch in pitches {
+                    needed.insert(UnitSpriteKey {
+                        type_id: type_id.to_string(),
+                        facing,
+                        layer,
+                        frame,
+                        slope_type,
+                        barrel_pitch,
+                    });
+                }
             }
         }
     }
+}
+
+/// Every pitch step a unit's barrel is drawn at. Unlimbo is the only writer
+/// of a unit's barrel elevation: it snaps it level and turns it toward the
+/// `FireAngle=` target ([`crate::sim::game_entity::unlimbo_barrel_target`]),
+/// so the steps are those along that turn's short arc, `d32 - 8` of each
+/// heading.
+pub(crate) fn unit_barrel_pitches(fire_angle: i32) -> Vec<i8> {
+    use crate::sim::game_entity::{BARREL_LEVEL, unlimbo_barrel_target};
+    let arc = i32::from(unlimbo_barrel_target(fire_angle).wrapping_sub(BARREL_LEVEL) as i16);
+    let mut pitches = Vec::new();
+    // One step spans 0x800; sampling every 0x100 visits each one.
+    for turned in (0..=arc.abs()).step_by(0x100) {
+        let heading = BARREL_LEVEL.wrapping_add((turned * arc.signum()) as u16);
+        let pitch = vxl_raster::voxel_facing_step_u16(heading) as i8 - 8;
+        if !pitches.contains(&pitch) {
+            pitches.push(pitch);
+        }
+    }
+    pitches
 }
 
 fn seed_unit_variant_keys(
@@ -252,19 +684,15 @@ fn seed_unit_variant_keys(
     is_ground_vehicle: bool,
     asset_manager: &AssetManager,
     rules: Option<&RuleSet>,
-    art: Option<&ArtRegistry>,
 ) {
-    let layers = seed_layers_for(
-        asset_manager,
-        &variant.type_id,
-        variant.has_turret,
-        rules,
-        art,
-    );
+    let layers = seed_layers_for(asset_manager, &variant.type_id, variant.has_turret, rules);
+    let barrel_pitches = rules
+        .and_then(|rules| rules.object(&variant.type_id))
+        .map_or_else(|| vec![0], |object| unit_barrel_pitches(object.fire_angle));
     for &layer in layers {
         let frame_key = (variant.type_id.clone(), layer);
         let num_frames = *frame_counts.entry(frame_key).or_insert_with(|| {
-            detect_hva_frame_count(asset_manager, &variant.type_id, layer, rules, art)
+            detect_hva_frame_count(asset_manager, &variant.type_id, layer, rules)
         });
         insert_unit_layer_keys(
             needed,
@@ -272,198 +700,138 @@ fn seed_unit_variant_keys(
             layer,
             num_frames,
             is_ground_vehicle,
+            &barrel_pitches,
         );
     }
     // Ground vehicles and ships cast a voxel shadow (one frame, every facing
     // and slope). Aircraft use FlyLocomotion's own shadow matrix and point,
     // which are not modelled yet, so they get none (recorded residual).
     if is_ground_vehicle {
-        insert_unit_layer_keys(needed, &variant.type_id, VxlLayer::Shadow, 1, true);
+        insert_unit_layer_keys(needed, &variant.type_id, VxlLayer::Shadow, 1, true, &[0]);
     }
 }
 
-/// Collect the set of unit sprite keys needed by the current ECS world.
+/// Every unit sprite key the voxel models in `demand` can draw, with their
+/// HVA frame counts.
 ///
-/// Used by the incremental rebuild path to diff against the existing atlas.
 /// Ground vehicles get all 17 slope variants (0-16) pre-rendered so that no
 /// atlas rebuild is needed when they drive onto any populated ramp.
-pub fn collect_needed_unit_keys(
-    entities: &crate::sim::entity_store::EntityStore,
+fn needed_unit_keys(
+    demand: &UnitAtlasDemand,
     asset_manager: &AssetManager,
     rules: Option<&RuleSet>,
-    art: Option<&ArtRegistry>,
-    interner: Option<&crate::sim::intern::StringInterner>,
-) -> HashSet<UnitSpriteKey> {
-    use crate::map::entities::EntityCategory;
+) -> (HashSet<UnitSpriteKey>, BTreeMap<(String, VxlLayer), u32>) {
     let mut needed: HashSet<UnitSpriteKey> = HashSet::new();
     let mut frame_counts: BTreeMap<(String, VxlLayer), u32> = BTreeMap::new();
-    for entity in entities.values() {
-        if !entity.is_voxel {
-            continue;
-        }
-        let type_str = interner.map_or("", |i| i.resolve(entity.type_ref()));
-        let is_ground_vehicle: bool = entity.category != EntityCategory::Aircraft;
-        for variant in unit_atlas_variants(type_str, rules) {
-            seed_unit_variant_keys(
-                &mut needed,
-                &mut frame_counts,
-                &variant,
-                is_ground_vehicle,
-                asset_manager,
-                rules,
-                art,
-            );
-        }
-    }
-
-    // Step 1b: Building turret VXLs — non-voxel buildings with TurretAnimIsVoxel=true.
-    // Buildings don't tilt on slopes, so slope_type is always 0.
-    {
-        for entity in entities.values() {
-            if entity.is_voxel || entity.category != EntityCategory::Structure {
-                continue;
-            }
-            let btype_str = interner.map_or("", |i| i.resolve(entity.type_ref()));
-            let obj = match rules.and_then(|r| r.object(btype_str)) {
-                Some(o) => o,
-                None => continue,
-            };
-            if !obj.turret_anim_is_voxel {
-                continue;
-            }
-            let turret_id = match &obj.turret_anim {
-                Some(id) => id,
-                None => continue,
-            };
-            for bucket in 0..TURRET_FACING_BUCKETS {
-                let facing: u8 = (bucket * u16::from(TURRET_FACING_STEP)) as u8;
-                needed.insert(UnitSpriteKey {
-                    type_id: turret_id.clone(),
-                    facing,
-                    layer: VxlLayer::Composite,
-                    frame: 0,
-                    slope_type: 0,
-                });
+    for (types, is_ground_vehicle) in [(&demand.ground, true), (&demand.air, false)] {
+        for type_str in types {
+            for variant in unit_atlas_variants(type_str, rules) {
+                seed_unit_variant_keys(
+                    &mut needed,
+                    &mut frame_counts,
+                    &variant,
+                    is_ground_vehicle,
+                    asset_manager,
+                    rules,
+                );
             }
         }
     }
 
-    needed
+    // Building turret VXLs (e.g., SAM.VXL for NASAM) drawn on top of SHP
+    // buildings. Buildings don't tilt on slopes, so slope_type is always 0.
+    for turret_id in &demand.turrets {
+        for bucket in 0..TURRET_FACING_BUCKETS {
+            let facing: u8 = (bucket * u16::from(TURRET_FACING_STEP)) as u8;
+            needed.insert(UnitSpriteKey {
+                type_id: turret_id.clone(),
+                facing,
+                layer: VxlLayer::Composite,
+                frame: 0,
+                slope_type: 0,
+                barrel_pitch: 0,
+            });
+        }
+    }
+
+    (needed, frame_counts)
 }
 
-/// Build a unit sprite atlas from all VoxelModel entities in the ECS world.
+/// Build or refresh the unit sprite atlas for every voxel model in the world.
 ///
-/// Uses incremental rendering: if `existing` is provided, its cached rendered
-/// sprites are reused and only genuinely new keys are rendered. This avoids
-/// the expensive VXL software rasterization for sprites already in the atlas.
-///
-/// 1. Queries the world for all (TypeRef, Facing, VoxelModel) entities.
-/// 2. Collects unique (type_id, facing) pairs.
-/// 3. Diffs against cached sprites — renders only new keys.
-/// 4. Shelf-packs all sprites (cached + new) into a single atlas texture.
+/// Without an `existing` atlas every model's sprites are rendered and
+/// shelf-packed into new pages. With one, only the models it has not collected
+/// yet are rendered, and their sprites are appended to a growth page; the
+/// resident pages are not touched and the rasterizer only runs for the new
+/// models. Sprites come from the CPU replay of the native visibility writes
+/// (`PreparedDraw::render_cpu`), each model's poses spread over the cores.
 ///
 /// Returns `None` only when no prior atlas exists and no voxel sprite can be
-/// produced. A supplied prior atlas is returned unchanged on ordinary failure.
+/// produced.
 pub fn build_unit_atlas(
-    gpu: &GpuContext,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
     batch: &BatchRenderer,
     entities: &crate::sim::entity_store::EntityStore,
     asset_manager: &AssetManager,
     rules: Option<&RuleSet>,
-    art: Option<&ArtRegistry>,
     existing: Option<UnitAtlas>,
-    mut compute: Option<&mut VxlComputeRenderer>,
     interner: Option<&crate::sim::intern::StringInterner>,
 ) -> Option<UnitAtlas> {
-    use crate::map::entities::EntityCategory;
-    let mut previous_atlas = existing;
-    // Step 1: Collect unique (type_id, facing, house_color, layer, frame, slope_type) keys.
-    // For turret units, insert separate Body/Turret/Barrel entries per facing.
-    // For non-turret units, insert a single Composite entry per facing.
-    // Multi-frame HVA units get entries for each frame.
-    let mut needed: HashSet<UnitSpriteKey> = HashSet::new();
-    let mut frame_counts: BTreeMap<(String, VxlLayer), u32> = BTreeMap::new();
-    for entity in entities.values() {
-        if !entity.is_voxel {
-            continue;
-        }
-        let type_str = interner.map_or("", |i| i.resolve(entity.type_ref()));
-        let is_ground_vehicle: bool = entity.category != EntityCategory::Aircraft;
-        for variant in unit_atlas_variants(type_str, rules) {
-            seed_unit_variant_keys(
-                &mut needed,
-                &mut frame_counts,
-                &variant,
-                is_ground_vehicle,
-                asset_manager,
-                rules,
-                art,
-            );
-        }
+    let started = Instant::now();
+    // Step 1: the voxel models the atlas has not collected yet — every one at
+    // map load — and the keys they draw with. For turret units, separate
+    // Body/Turret/Barrel entries per facing; for the rest a single Composite
+    // entry per facing. Multi-frame HVA units get entries for each frame.
+    let demand = UnitAtlasDemand::of_world(entities, rules, interner);
+    let missing = match &existing {
+        Some(atlas) => demand.without(&atlas.covered),
+        None => demand,
+    };
+    if missing.is_empty() {
+        log::info!("No new voxel models — keeping the current unit atlas");
+        return existing;
     }
-
-    // Step 1b: Building turret VXLs — non-voxel buildings with TurretAnimIsVoxel=true.
-    // These are separate VXL models (e.g., SAM.VXL for NASAM) drawn on top of SHP buildings.
-    {
-        for entity in entities.values() {
-            if entity.is_voxel || entity.category != EntityCategory::Structure {
-                continue;
-            }
-            let btype_str = interner.map_or("", |i| i.resolve(entity.type_ref()));
-            let obj = match rules.and_then(|r| r.object(btype_str)) {
-                Some(o) => o,
-                None => continue,
-            };
-            if !obj.turret_anim_is_voxel {
-                continue;
-            }
-            let turret_id = match &obj.turret_anim {
-                Some(id) => id,
-                None => continue,
-            };
-            for bucket in 0..TURRET_FACING_BUCKETS {
-                let facing: u8 = (bucket * u16::from(TURRET_FACING_STEP)) as u8;
-                needed.insert(UnitSpriteKey {
-                    type_id: turret_id.clone(),
-                    facing,
-                    layer: VxlLayer::Composite,
-                    frame: 0,
-                    slope_type: 0,
-                });
-            }
-        }
-    }
-
-    if needed.is_empty() {
-        log::info!("No voxel entities found — keeping the current unit atlas");
-        return previous_atlas;
-    }
-
-    // Step 1.5: Extract cached sprites from existing atlas, diff against needed keys.
-    let previous_cache_len = previous_atlas
-        .as_ref()
-        .map_or(0, |atlas| atlas.rendered_cache.len());
-    let mut cached: Vec<CachedUnitSprite> = previous_atlas
-        .as_mut()
-        .map(|atlas| std::mem::take(&mut atlas.rendered_cache))
-        .unwrap_or_default();
-    let cached_keys: HashSet<UnitSpriteKey> = cached.iter().map(|s| s.key.clone()).collect();
-    let new_keys: Vec<UnitSpriteKey> = needed
-        .iter()
-        .filter(|k| !cached_keys.contains(k))
-        .cloned()
+    let (needed, frame_counts) = needed_unit_keys(&missing, asset_manager, rules);
+    // A type seeded as an aircraft after its ground variant (or the reverse)
+    // shares its flat keys with the resident ones.
+    let mut new_keys: Vec<UnitSpriteKey> = needed
+        .into_iter()
+        .filter(|key| {
+            existing
+                .as_ref()
+                .is_none_or(|atlas| !atlas.entries.contains_key(key))
+        })
         .collect();
-
+    // By model, then pose: each model is parsed once, and each pose's body,
+    // turret and barrel are rasterized once for its three part keys.
+    new_keys.sort_unstable_by(|a, b| {
+        (
+            &a.type_id,
+            a.frame,
+            a.facing,
+            a.slope_type,
+            a.layer,
+            a.barrel_pitch,
+        )
+            .cmp(&(
+                &b.type_id,
+                b.frame,
+                b.facing,
+                b.slope_type,
+                b.layer,
+                b.barrel_pitch,
+            ))
+    });
     log::info!(
-        "Unit atlas: {} cached, {} new to render, {} total needed",
-        cached.len(),
+        "Unit atlas: {} new sprites to render for {} new voxel models",
         new_keys.len(),
-        needed.len(),
+        missing.len(),
     );
 
-    // Step 2: Render only new sprites (skip cached ones).
-    let mut gpu_rendered: u32 = 0;
-    let mut cpu_rendered: u32 = 0;
+    // Step 2: Render the new sprites.
+    let mut rendered: Vec<CachedUnitSprite> = Vec::with_capacity(new_keys.len());
+    let mut failed: BTreeMap<&str, usize> = BTreeMap::new();
     if !new_keys.is_empty() {
         // Load VPL file for Blinn-Phong lighting lookup (optional).
         let vpl: Option<VplFile> =
@@ -483,93 +851,85 @@ pub fn build_unit_atlas(
                     }
                 });
 
-        for key in &new_keys {
-            match render_unit_sprite(
-                asset_manager,
-                key,
-                rules,
-                art,
-                vpl.as_ref(),
-                compute.as_deref_mut(),
-                gpu,
-            ) {
-                Some((sprite, used_gpu, native_draw_bounds)) => {
-                    if key.layer == VxlLayer::Shadow && native_draw_bounds.is_some() {
-                        let mut fallback_key = key.clone();
-                        fallback_key.frame = LEGACY_SHADOW_FRAME;
-                        if let Some((fallback, _, _)) = render_unit_sprite(
-                            asset_manager,
-                            &fallback_key,
-                            rules,
-                            art,
-                            vpl.as_ref(),
-                            None,
-                            gpu,
-                        ) {
-                            cached.push(CachedUnitSprite::from_rendered(RenderedSprite {
-                                key: fallback_key,
-                                sprite: fallback,
-                                native_draw_bounds: None,
-                            }));
-                            cpu_rendered += 1;
-                        }
-                    }
-                    if used_gpu {
-                        gpu_rendered += 1;
-                    } else {
-                        cpu_rendered += 1;
-                    }
-                    cached.push(CachedUnitSprite::from_rendered(RenderedSprite {
-                        key: key.clone(),
+        // One model at a time, its poses spread over the cores. Each worker
+        // takes whole poses, so a pose's parts still share one render, and
+        // results are merged back in key order.
+        let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+        for type_keys in new_keys.chunk_by(|a, b| a.type_id == b.type_id) {
+            let type_id = type_keys[0].type_id.as_str();
+            let Some(model) = UnitModel::load(asset_manager, type_id, rules) else {
+                *failed.entry(type_id).or_default() += type_keys.len();
+                continue;
+            };
+            let poses: Vec<&[UnitSpriteKey]> = type_keys
+                .chunk_by(|a, b| {
+                    (a.frame, a.facing, a.slope_type) == (b.frame, b.facing, b.slope_type)
+                })
+                .collect();
+            let (model, vpl) = (&model, vpl.as_ref());
+            let results: Vec<Option<RenderedKey>> = std::thread::scope(|scope| {
+                let jobs: Vec<_> = poses
+                    .chunks(poses.len().div_ceil(workers))
+                    .map(|chunk| {
+                        scope.spawn(move || {
+                            let mut pose = None;
+                            chunk
+                                .iter()
+                                .flat_map(|keys| keys.iter())
+                                .map(|key| render_unit_key(model, key, vpl, &mut pose))
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                jobs.into_iter()
+                    .flat_map(|job| job.join().expect("VXL render worker panicked"))
+                    .collect()
+            });
+            for (key, result) in type_keys.iter().zip(results) {
+                match result {
+                    Some(RenderedKey {
                         sprite,
-                        native_draw_bounds,
-                    }));
-                }
-                None => {
-                    log::warn!("Failed to render VXL for {}", key.type_id);
+                        legacy_shadow,
+                    }) => {
+                        rendered.extend(legacy_shadow);
+                        rendered.push(sprite);
+                    }
+                    None => *failed.entry(key.type_id.as_str()).or_default() += 1,
                 }
             }
         }
-        if gpu_rendered > 0 || cpu_rendered > 0 {
-            log::info!(
-                "VXL render: {} GPU compute, {} CPU rasterizer",
-                gpu_rendered,
-                cpu_rendered,
-            );
+        log::info!("VXL render: {} sprites", rendered.len());
+        for (type_id, count) in failed {
+            log::warn!("Failed to render {count} VXL sprites for {type_id}");
         }
     }
 
-    if cached.is_empty() {
-        log::warn!("No unit sprites rendered");
-        if let Some(mut previous) = previous_atlas {
-            cached.truncate(previous_cache_len);
-            previous.rendered_cache = cached;
-            log::warn!("Keeping the previous valid unit atlas after render failure");
-            return Some(previous);
+    // Step 3: shelf-pack into new pages at map load; afterwards append to a
+    // growth page so resident sprites are never repacked or re-uploaded.
+    let added = rendered.len();
+    let mut atlas = match existing {
+        Some(mut atlas) => {
+            atlas.append_sprites(device, queue, batch, rendered);
+            atlas
         }
-        return None;
-    }
-
-    // Step 3: Shelf-pack all sprites (cached + newly rendered) into atlas.
-    let mut atlas: UnitAtlas = match pack_sprites(gpu, batch, &cached, frame_counts) {
-        Ok(atlas) => atlas,
-        Err(err) => {
-            log::error!("Unit atlas packing failed: {err}");
-            if let Some(mut previous) = previous_atlas {
-                cached.truncate(previous_cache_len);
-                previous.rendered_cache = cached;
-                log::error!("Keeping the previous valid unit atlas after packing failure");
-                return Some(previous);
-            }
+        None if rendered.is_empty() => {
+            log::warn!("No unit sprites rendered");
             return None;
         }
+        None => match pack_sprites_on_device(device, queue, batch, &rendered) {
+            Ok(mut atlas) => {
+                atlas.rendered_cache = rendered;
+                atlas
+            }
+            Err(err) => {
+                log::error!("Unit atlas packing failed: {err}");
+                return None;
+            }
+        },
     };
-    atlas.rendered_cache = cached;
-    atlas.gpu_rendered = gpu_rendered;
-    atlas.cpu_rendered = cpu_rendered;
-    if let Some(previous) = previous_atlas.as_ref() {
-        atlas.restore_shadow_masks(&gpu.queue, previous.shadow_masks.borrow().clone());
-    }
+    atlas.frame_counts.extend(frame_counts);
+    atlas.covered.extend(missing);
+    atlas.rendered = u32::try_from(added).unwrap_or(u32::MAX);
     let page_dimensions = atlas
         .pages
         .iter()
@@ -577,7 +937,9 @@ pub fn build_unit_atlas(
         .collect::<Vec<_>>()
         .join(", ");
     log::info!(
-        "Unit atlas built: {} sprites across {} page(s): {}",
+        "Unit atlas: {} sprites added in {:.1} ms; {} sprites across {} page(s): {}",
+        added,
+        started.elapsed().as_secs_f64() * 1000.0,
         atlas.sprite_count(),
         atlas.page_count(),
         page_dimensions,
@@ -585,243 +947,309 @@ pub fn build_unit_atlas(
     Some(atlas)
 }
 
-/// Load and render a single VXL model to a 2D sprite.
-///
-/// Uses ArtRegistry to resolve the correct VXL/HVA filenames.
-/// Falls back to direct {TYPE_ID}.VXL if art data is unavailable.
-pub(crate) fn render_unit_sprite(
-    asset_manager: &AssetManager,
-    key: &UnitSpriteKey,
-    rules: Option<&RuleSet>,
-    art: Option<&ArtRegistry>,
-    vpl: Option<&VplFile>,
-    compute: Option<&mut VxlComputeRenderer>,
-    gpu: &GpuContext,
-) -> Option<(VxlSprite, bool, Option<[i32; 4]>)> {
-    render_unit_sprite_with_slope_blend(asset_manager, key, rules, art, vpl, compute, gpu, None)
+/// A turret or barrel part: `{image}TUR` or `{image}BARL`.
+pub(crate) struct VoxelPart {
+    vxl: VxlFile,
+    hva: Option<HvaFile>,
 }
 
-pub(crate) fn render_unit_sprite_with_slope_blend(
-    asset_manager: &AssetManager,
-    key: &UnitSpriteKey,
-    rules: Option<&RuleSet>,
-    art: Option<&ArtRegistry>,
-    vpl: Option<&VplFile>,
-    mut compute: Option<&mut VxlComputeRenderer>,
-    gpu: &GpuContext,
-    slope_blend: Option<VxlSlopeBlend>,
-) -> Option<(VxlSprite, bool, Option<[i32; 4]>)> {
-    // Resolve image name: type_id → rules.ini Image= → art.ini Image= override.
-    let rules_image: String = rules
-        .and_then(|r| r.object(&key.type_id))
-        .map(|o| o.image.clone())
-        .unwrap_or_else(|| key.type_id.clone());
-    let image: String = art
-        .map(|a| a.resolve_effective_image_id(&key.type_id, &rules_image))
-        .unwrap_or_else(|| rules_image.to_uppercase());
+impl VoxelPart {
+    /// `{base}.VXL` with its optional HVA; None when the VXL is missing or
+    /// does not parse, which omits the part.
+    fn load(asset_manager: &AssetManager, base: &str) -> Option<Self> {
+        let vxl = VxlFile::from_bytes(asset_manager.get_ref(&format!("{base}.VXL"))?).ok()?;
+        let hva = asset_manager
+            .get_ref(&format!("{base}.HVA"))
+            .and_then(|data| HvaFile::from_bytes(data).ok());
+        Some(Self { vxl, hva })
+    }
 
-    let (vxl_name, hva_name): (String, String) = art_data::voxel_asset_names(&image);
+    fn render(&self, params: &VxlRenderParams, vpl: Option<&VplFile>) -> VxlSprite {
+        vxl_raster::render_vxl(&self.vxl, self.hva.as_ref(), params, vpl)
+    }
 
-    let vxl_data = asset_manager.get_ref(&vxl_name)?;
-    let vxl: VxlFile = match VxlFile::from_bytes(vxl_data) {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("Failed to parse {}: {}", vxl_name, e);
-            return None;
-        }
-    };
+    /// `Ok(None)` for an omitted part; `Err` when a present part has no
+    /// native draw bounds.
+    fn native_draw_bounds(
+        part: Option<&Self>,
+        params: &VxlRenderParams,
+    ) -> Result<Option<[i32; 4]>, ()> {
+        let Some(part) = part else {
+            return Ok(None);
+        };
+        vxl_raster::native_vxl_draw_bounds(&part.vxl, part.hva.as_ref(), params)
+            .map(Some)
+            .ok_or(())
+    }
+}
 
-    // HVA is optional — some models don't have animation files.
-    let hva: Option<HvaFile> =
-        asset_manager
-            .get_ref(&hva_name)
-            .and_then(|data| match HvaFile::from_bytes(data) {
-                Ok(h) => Some(h),
-                Err(e) => {
-                    log::trace!("No HVA for {} ({}), using default pose", key.type_id, e);
-                    None
-                }
-            });
+/// A voxel model's files, parsed once and shared by every sprite drawn from
+/// it. They are named from [`voxel_image_id`].
+pub(crate) struct UnitModel {
+    type_id: String,
+    body: VxlFile,
+    body_hva: Option<HvaFile>,
+    /// The gun parts, present only where [`has_gun_parts`] holds.
+    turret: Option<VoxelPart>,
+    barrel: Option<VoxelPart>,
+    /// Ordinary ground Drive units cast the prepared native shadow.
+    drive_shadow: bool,
+}
 
-    let params: VxlRenderParams = VxlRenderParams {
-        frame: if key.layer == VxlLayer::Shadow && key.frame == LEGACY_SHADOW_FRAME {
-            0
-        } else {
-            key.frame
-        },
-        facing: key.facing, // already quantized by atlas key generation
-        slope_type: key.slope_type,
-        slope_blend,
-        ..VxlRenderParams::default()
-    };
-    // Ordinary ground, single-section ShadowIndex/frame-zero geometry. Keep
-    // aircraft scaling and unsupported callers on the existing path.
-    if key.layer == VxlLayer::Shadow
-        && key.frame == 0
-        && rules.and_then(|r| r.object(&key.type_id)).is_some_and(|o| {
-            o.locomotor == crate::rules::locomotor_type::LocomotorKind::Drive
-                && !o.considered_aircraft
+/// The body, turret and barrel of one pose, rendered once for all three of
+/// its part keys.
+pub(crate) struct PoseParts {
+    pose: (u32, u8, u8, Option<VxlSlopeBlend>),
+    body: VxlSprite,
+    turret: Option<VxlSprite>,
+    barrel: Option<VxlSprite>,
+}
+
+impl UnitModel {
+    pub(crate) fn load(
+        asset_manager: &AssetManager,
+        type_id: &str,
+        rules: Option<&RuleSet>,
+    ) -> Option<Self> {
+        let image = voxel_image_id(type_id, rules);
+        let (vxl_name, hva_name): (String, String) = art_data::voxel_asset_names(&image);
+
+        let vxl_data = asset_manager.get_ref(&vxl_name)?;
+        let body: VxlFile = match VxlFile::from_bytes(vxl_data) {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("Failed to parse {}: {}", vxl_name, e);
+                return None;
+            }
+        };
+
+        // HVA is optional — some models don't have animation files.
+        let body_hva: Option<HvaFile> =
+            asset_manager
+                .get_ref(&hva_name)
+                .and_then(|data| match HvaFile::from_bytes(data) {
+                    Ok(h) => Some(h),
+                    Err(e) => {
+                        log::trace!("No HVA for {} ({}), using default pose", type_id, e);
+                        None
+                    }
+                });
+        let gun_parts = has_gun_parts(type_id, rules);
+        let part = |suffix: &str| {
+            gun_parts
+                .then(|| VoxelPart::load(asset_manager, &format!("{image}{suffix}")))
+                .flatten()
+        };
+        Some(Self {
+            type_id: type_id.to_string(),
+            body,
+            body_hva,
+            turret: part("TUR"),
+            barrel: part("BARL"),
+            drive_shadow: rules.and_then(|r| r.object(type_id)).is_some_and(|o| {
+                o.locomotor == crate::rules::locomotor_type::LocomotorKind::Drive
+                    && !o.considered_aircraft
+            }),
         })
-    {
-        if let Some(sprite) = vxl_raster::shadow::render(&vxl, hva.as_ref(), &params) {
+    }
+
+    /// Render one key's sprite with its native draw bounds. `pose` keeps the
+    /// last body/turret/barrel render, so a model's Body, Turret and Barrel
+    /// keys of one pose, rendered in a row, rasterize it once.
+    pub(crate) fn render(
+        &self,
+        key: &UnitSpriteKey,
+        vpl: Option<&VplFile>,
+        slope_blend: Option<VxlSlopeBlend>,
+        pose: &mut Option<PoseParts>,
+    ) -> Option<(VxlSprite, Option<[i32; 4]>)> {
+        let params: VxlRenderParams = VxlRenderParams {
+            frame: if key.layer == VxlLayer::Shadow && key.frame == LEGACY_SHADOW_FRAME {
+                0
+            } else {
+                key.frame
+            },
+            facing: key.facing, // already quantized by atlas key generation
+            slope_type: key.slope_type,
+            slope_blend,
+            ..VxlRenderParams::default()
+        };
+        // Ordinary ground, single-section ShadowIndex/frame-zero geometry. Keep
+        // aircraft scaling and unsupported callers on the existing path.
+        if key.layer == VxlLayer::Shadow
+            && key.frame == 0
+            && self.drive_shadow
+            && let Some(sprite) =
+                vxl_raster::shadow::render(&self.body, self.body_hva.as_ref(), &params)
+        {
             let bounds = [
                 sprite.offset_x as i32,
                 sprite.offset_y as i32,
                 sprite.width as i32,
                 sprite.height as i32,
             ];
-            return Some((sprite, false, Some(bounds)));
+            return Some((sprite, Some(bounds)));
         }
-    }
-    let native_draw_bounds = native_unit_sprite_draw_bounds(
-        asset_manager,
-        &vxl,
-        hva.as_ref(),
-        &image,
-        &params,
-        key.layer,
-    );
+        // A barrel key draws its part at its pitch; the pose's other parts,
+        // and every other key, stay level.
+        let part_params = VxlRenderParams {
+            barrel_pitch: key.barrel_pitch,
+            ..params.clone()
+        };
+        let native_draw_bounds = self.native_draw_bounds(&part_params, key.layer);
 
-    // House remap is no longer applied at bake time — the fragment shader
-    // does it via per-instance DrawState::remap_row + house_ramp texture lookup.
-    // The rasterizer outputs post-VPL palette indices directly.
-
-    // One native VXL draw has one center and section order. Parts keep their
-    // independent native crops and existing CPU composition; merging their
-    // sections into one GPU center has no established native equivalent.
-    let has_parts = ["TUR", "BARL", "BARREL"].iter().any(|suffix| {
-        asset_manager
-            .get_ref(&format!("{image}{suffix}.VXL"))
-            .is_some()
-    });
-    let mut used_gpu = false;
-    let gpu_sprite = if key.layer == VxlLayer::Composite && !has_parts {
-        compute.as_deref_mut().and_then(|renderer| {
-            let draw = vxl_raster::prepare_native_draw(&vxl, hva.as_ref(), &params, vpl)?;
-            renderer.render_native(&gpu.device, &gpu.queue, &draw)
-        })
-    } else {
-        None
-    };
-    let sprite: VxlSprite = if let Some(sprite) = gpu_sprite {
-        used_gpu = true;
-        sprite
-    } else {
-        // CPU fallback path.
-        match key.layer {
-            VxlLayer::Composite => {
-                composite_unit_vxl_cpu(asset_manager, &vxl, hva.as_ref(), &image, &params, vpl)
+        // House remap is no longer applied at bake time — the fragment shader
+        // does it via per-instance DrawState::remap_row + house_ramp texture lookup.
+        // The rasterizer outputs post-VPL palette indices directly.
+        let sprite: VxlSprite = match key.layer {
+            VxlLayer::Composite => composite_parts(
+                &self.body,
+                self.body_hva.as_ref(),
+                self.turret.as_ref(),
+                self.barrel.as_ref(),
+                &params,
+                vpl,
+            ),
+            VxlLayer::Shadow => {
+                vxl_raster::render_legacy_vxl_shadow(&self.body, self.body_hva.as_ref(), &params)
             }
-            VxlLayer::Shadow => vxl_raster::render_legacy_vxl_shadow(&vxl, hva.as_ref(), &params),
             VxlLayer::Body | VxlLayer::Turret | VxlLayer::Barrel => {
-                let body_sprite: VxlSprite =
-                    vxl_raster::render_vxl(&vxl, hva.as_ref(), &params, vpl);
-                let turret_sprite: Option<VxlSprite> =
-                    render_optional_layer(asset_manager, &format!("{}TUR", image), &params, vpl);
-                let barrel_sprite: Option<VxlSprite> =
-                    render_optional_layer(asset_manager, &format!("{}BARL", image), &params, vpl)
-                        .or_else(|| {
-                            render_optional_layer(
-                                asset_manager,
-                                &format!("{}BARREL", image),
-                                &params,
-                                vpl,
-                            )
-                        });
-
-                let all_layers: Vec<&VxlSprite> = [Some(&body_sprite)]
+                let key_pose = (params.frame, params.facing, params.slope_type, slope_blend);
+                if pose.as_ref().is_none_or(|parts| parts.pose != key_pose) {
+                    *pose = Some(PoseParts {
+                        pose: key_pose,
+                        body: vxl_raster::render_vxl(
+                            &self.body,
+                            self.body_hva.as_ref(),
+                            &params,
+                            vpl,
+                        ),
+                        turret: self.turret.as_ref().map(|part| part.render(&params, vpl)),
+                        barrel: self.barrel.as_ref().map(|part| part.render(&params, vpl)),
+                    });
+                }
+                let parts = pose.as_ref().expect("the pose was just rendered");
+                let pitched_barrel = self
+                    .barrel
+                    .as_ref()
+                    .filter(|_| key.barrel_pitch != 0)
+                    .map(|part| part.render(&part_params, vpl));
+                let barrel = pitched_barrel.as_ref().or(parts.barrel.as_ref());
+                let all_layers: Vec<&VxlSprite> = [Some(&parts.body)]
                     .into_iter()
-                    .chain([turret_sprite.as_ref(), barrel_sprite.as_ref()])
+                    .chain([parts.turret.as_ref(), barrel])
                     .flatten()
                     .collect();
 
-                let requested: Option<&VxlSprite> = match key.layer {
-                    VxlLayer::Body => Some(&body_sprite),
-                    VxlLayer::Turret => turret_sprite.as_ref(),
-                    VxlLayer::Barrel => barrel_sprite.as_ref(),
+                let requested: &VxlSprite = match key.layer {
+                    VxlLayer::Body => &parts.body,
+                    VxlLayer::Turret => parts.turret.as_ref()?,
+                    VxlLayer::Barrel => barrel?,
                     _ => unreachable!(),
                 };
-                let requested: &VxlSprite = match requested {
-                    Some(s) => s,
-                    None => return None,
-                };
-
                 pad_layer_to_union_bounds(requested, &all_layers)
             }
-        }
-    };
+        };
 
-    // Skip tiny/empty sprites (degenerate models).
-    if sprite.width <= 1 && sprite.height <= 1 {
-        log::trace!(
-            "VXL {} produced empty sprite at facing {}",
-            key.type_id,
-            key.facing
-        );
-        return None;
+        // Skip tiny/empty sprites (degenerate models).
+        if sprite.width <= 1 && sprite.height <= 1 {
+            log::trace!(
+                "VXL {} produced empty sprite at facing {}",
+                self.type_id,
+                key.facing
+            );
+            return None;
+        }
+
+        Some((sprite, native_draw_bounds))
     }
 
-    Some((sprite, used_gpu, native_draw_bounds))
+    /// One tilted body's composite at its locomotor arm's pose, rendered afresh
+    /// because both arms key their draw -1 and native never caches it. The
+    /// Jumpjet arm's half sizes come from this model's main voxel; one that
+    /// never loaded leaves them at the constructor's zero (`0x00710C4E`).
+    pub(crate) fn render_crash_pose(
+        &self,
+        key: &UnitSpriteKey,
+        vpl: Option<&VplFile>,
+        tilt: CrashTilt,
+    ) -> (VxlSprite, Option<[i32; 4]>) {
+        let body_tilt = match tilt {
+            CrashTilt::Fly(angles) => vxl_raster::BodyTilt::Fly(angles),
+            CrashTilt::Jumpjet(angles) => vxl_raster::BodyTilt::Jumpjet {
+                angles,
+                half_sizes: vxl_raster::jumpjet_tilt_half_sizes(&self.body).unwrap_or([0.0; 2]),
+            },
+        };
+        let params = VxlRenderParams {
+            frame: key.frame,
+            facing: key.facing,
+            slope_type: key.slope_type,
+            body_tilt: Some(body_tilt),
+            ..VxlRenderParams::default()
+        };
+        let sprite = composite_parts(
+            &self.body,
+            self.body_hva.as_ref(),
+            self.turret.as_ref(),
+            self.barrel.as_ref(),
+            &params,
+            vpl,
+        );
+        (
+            sprite,
+            self.native_draw_bounds(&params, VxlLayer::Composite),
+        )
+    }
+
+    /// Metadata follows the requested VXL, not the union-sized texture canvas
+    /// used to store each separate layer. Composite keys retain their actual
+    /// body/turret/barrel bake order; live independently facing parts are united
+    /// later by presentation at their actual anchors and draw order.
+    fn native_draw_bounds(&self, params: &VxlRenderParams, layer: VxlLayer) -> Option<[i32; 4]> {
+        let body =
+            || vxl_raster::native_vxl_draw_bounds(&self.body, self.body_hva.as_ref(), params);
+        let part = |part: &Option<VoxelPart>| VoxelPart::native_draw_bounds(part.as_ref(), params);
+        match layer {
+            VxlLayer::Shadow => None,
+            VxlLayer::Body => body(),
+            VxlLayer::Turret => part(&self.turret).ok().flatten(),
+            VxlLayer::Barrel => part(&self.barrel).ok().flatten(),
+            VxlLayer::Composite => {
+                let mut bounds = Some(body()?);
+                let turret = part(&self.turret).ok()?;
+                let barrel = part(&self.barrel).ok()?;
+                for part in [turret, barrel].into_iter().flatten() {
+                    vxl_raster::union_native_voxel_draw_bounds(&mut bounds, part);
+                }
+                bounds
+            }
+        }
+    }
 }
 
-/// Metadata follows the requested VXL, not the union-sized texture canvas
-/// used to store each separate layer. Composite keys retain their actual
-/// body/turret/barrel bake order; live independently facing parts are united
-/// later by presentation at their actual anchors and draw order.
-fn native_unit_sprite_draw_bounds(
-    assets: &AssetManager,
-    body: &VxlFile,
-    hva: Option<&HvaFile>,
-    image: &str,
-    params: &VxlRenderParams,
-    layer: VxlLayer,
-) -> Option<[i32; 4]> {
-    let optional = |base: &str| -> Result<Option<[i32; 4]>, ()> {
-        let Some(data) = assets.get_ref(&format!("{base}.VXL")) else {
-            return Ok(None);
-        };
-        let Ok(vxl) = VxlFile::from_bytes(data) else {
-            // render_optional_layer also omits an unparseable optional file.
-            return Ok(None);
-        };
-        let hva = assets
-            .get_ref(&format!("{base}.HVA"))
-            .and_then(|data| HvaFile::from_bytes(data).ok());
-        vxl_raster::native_vxl_draw_bounds(&vxl, hva.as_ref(), params)
-            .map(Some)
-            .ok_or(())
-    };
-    match layer {
-        VxlLayer::Shadow => None,
-        VxlLayer::Body => vxl_raster::native_vxl_draw_bounds(body, hva, params),
-        VxlLayer::Turret => optional(&format!("{image}TUR")).ok().flatten(),
-        VxlLayer::Barrel => optional(&format!("{image}BARL"))
-            .ok()?
-            .or_else(|| optional(&format!("{image}BARREL")).ok().flatten()),
-        VxlLayer::Composite => {
-            let mut bounds = Some(vxl_raster::native_vxl_draw_bounds(body, hva, params)?);
-            let turret = optional(&format!("{image}TUR")).ok()?;
-            let barrel = match optional(&format!("{image}BARL")).ok()? {
-                Some(bounds) => Some(bounds),
-                None => optional(&format!("{image}BARREL")).ok()?,
-            };
-            for part in [turret, barrel].into_iter().flatten() {
-                vxl_raster::union_native_voxel_draw_bounds(&mut bounds, part);
-            }
-            bounds
-        }
-    }
+/// Load a unit's voxel model and render one key's sprite (slope-transition
+/// frames are rendered one at a time, so no pose is shared).
+pub(crate) fn render_unit_sprite_with_slope_blend(
+    asset_manager: &AssetManager,
+    key: &UnitSpriteKey,
+    rules: Option<&RuleSet>,
+    vpl: Option<&VplFile>,
+    slope_blend: Option<VxlSlopeBlend>,
+) -> Option<(VxlSprite, Option<[i32; 4]>)> {
+    UnitModel::load(asset_manager, &key.type_id, rules)?.render(key, vpl, slope_blend, &mut None)
 }
 
 /// Body plus optional turret and barrel, depth-composited on the CPU.
 ///
 /// Split out of the atlas bake path so headless callers can produce the same
-/// composited sprite the game does. The bake path's own CPU branch calls this,
-/// so the two cannot drift apart.
+/// composited sprite the game does. The bake path composites through the same
+/// `composite_parts`, so the two cannot drift apart.
 ///
-/// Pure CPU: no `GpuContext`, no atlas state, no wgpu. The turret and barrel are
-/// found by the conventional `TUR` / `BARL` / `BARREL` suffixes on the effective
-/// image id; a model without them composites to just its body.
+/// Pure CPU: no `GpuContext`, no atlas state, no wgpu. This works on an image,
+/// not a type: it composites whichever `{image}TUR` and `{image}BARL` files
+/// exist, as a type with [`has_gun_parts`] draws them. A vehicle type without
+/// `Turret=` draws its body alone.
 pub fn composite_unit_vxl_cpu(
     asset_manager: &AssetManager,
     body: &VxlFile,
@@ -830,37 +1258,31 @@ pub fn composite_unit_vxl_cpu(
     params: &VxlRenderParams,
     vpl: Option<&VplFile>,
 ) -> VxlSprite {
-    let body_sprite: VxlSprite = vxl_raster::render_vxl(body, body_hva, params, vpl);
-    let mut layers: Vec<VxlSprite> = vec![body_sprite];
-
-    if let Some(turret) = render_optional_layer(asset_manager, &format!("{image}TUR"), params, vpl)
-    {
-        layers.push(turret);
-    }
-    // BARL is the common spelling; a handful of models use BARREL.
-    if let Some(barrel) = render_optional_layer(asset_manager, &format!("{image}BARL"), params, vpl)
-        .or_else(|| render_optional_layer(asset_manager, &format!("{image}BARREL"), params, vpl))
-    {
-        layers.push(barrel);
-    }
-
-    composite_vxl_layers(&layers)
+    let part = |suffix: &str| VoxelPart::load(asset_manager, &format!("{image}{suffix}"));
+    let turret = part("TUR");
+    let barrel = part("BARL");
+    composite_parts(
+        body,
+        body_hva,
+        turret.as_ref(),
+        barrel.as_ref(),
+        params,
+        vpl,
+    )
 }
 
-fn render_optional_layer(
-    asset_manager: &AssetManager,
-    layer_base: &str,
+fn composite_parts(
+    body: &VxlFile,
+    body_hva: Option<&HvaFile>,
+    turret: Option<&VoxelPart>,
+    barrel: Option<&VoxelPart>,
     params: &VxlRenderParams,
     vpl: Option<&VplFile>,
-) -> Option<VxlSprite> {
-    let vxl_name = format!("{}.VXL", layer_base);
-    let vxl_data = asset_manager.get_ref(&vxl_name)?;
-    let vxl = VxlFile::from_bytes(vxl_data).ok()?;
-    let hva_name = format!("{}.HVA", layer_base);
-    let hva = asset_manager
-        .get_ref(&hva_name)
-        .and_then(|data| HvaFile::from_bytes(data).ok());
-    Some(vxl_raster::render_vxl(&vxl, hva.as_ref(), params, vpl))
+) -> VxlSprite {
+    let mut layers: Vec<VxlSprite> = vec![vxl_raster::render_vxl(body, body_hva, params, vpl)];
+    layers.extend(turret.map(|part| part.render(params, vpl)));
+    layers.extend(barrel.map(|part| part.render(params, vpl)));
+    composite_vxl_layers(&layers)
 }
 
 /// Composite body/turret/barrel layers using depth-correct Z-buffer merging.
@@ -1214,21 +1636,11 @@ fn simulate_shelf_height(indices: &[usize], dimensions: &[(u32, u32)], page_widt
 }
 
 /// Shelf-pack cached sprites into lossless GPU texture pages.
-fn pack_sprites(
-    gpu: &GpuContext,
-    batch: &BatchRenderer,
-    sprites: &[CachedUnitSprite],
-    frame_counts: BTreeMap<(String, VxlLayer), u32>,
-) -> Result<UnitAtlas, UnitAtlasPackError> {
-    pack_sprites_on_device(&gpu.device, &gpu.queue, batch, sprites, frame_counts)
-}
-
 fn pack_sprites_on_device(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     batch: &BatchRenderer,
     sprites: &[CachedUnitSprite],
-    frame_counts: BTreeMap<(String, VxlLayer), u32>,
 ) -> Result<UnitAtlas, UnitAtlasPackError> {
     let max_texture_dim: u32 = device.limits().max_texture_dimension_2d;
     let plan = plan_cached_sprite_pages(sprites, max_texture_dim)?;
@@ -1244,8 +1656,6 @@ fn pack_sprites_on_device(
     let mut entries = HashMap::with_capacity(plan.placements.len());
     for (page_index, &page_height) in plan.page_heights.iter().enumerate() {
         let mut pixels = vec![0u8; (plan.page_width * page_height) as usize];
-        let page_width_f32 = plan.page_width as f32;
-        let page_height_f32 = page_height as f32;
         for placement in plan
             .placements
             .iter()
@@ -1269,21 +1679,12 @@ fn pack_sprites_on_device(
             }
             entries.insert(
                 rs.key.clone(),
-                UnitSpriteEntry {
-                    uv_origin: [
-                        placement.x as f32 / page_width_f32,
-                        placement.y as f32 / page_height_f32,
-                    ],
-                    uv_size: [
-                        rs.width as f32 / page_width_f32,
-                        rs.height as f32 / page_height_f32,
-                    ],
-                    pixel_size: [rs.width as f32, rs.height as f32],
-                    offset_x: rs.offset_x,
-                    offset_y: rs.offset_y,
-                    native_draw_bounds: rs.native_draw_bounds,
-                    page: page_index,
-                },
+                unit_entry(
+                    rs,
+                    [placement.x, placement.y],
+                    page_index,
+                    [plan.page_width, page_height],
+                ),
             );
         }
         let texture = batch.create_unit_atlas_texture_on_device(
@@ -1296,15 +1697,7 @@ fn pack_sprites_on_device(
         pages.push(UnitAtlasPage { texture });
     }
 
-    Ok(UnitAtlas {
-        pages,
-        entries,
-        frame_counts,
-        rendered_cache: Vec::new(), // caller sets this after packing
-        gpu_rendered: 0,            // caller sets after rendering
-        cpu_rendered: 0,
-        shadow_masks: Default::default(),
-    })
+    Ok(UnitAtlas::new(pages, entries))
 }
 
 fn plan_cached_sprite_pages(
@@ -1326,14 +1719,6 @@ mod tests;
 #[cfg(test)]
 impl UnitAtlas {
     pub(crate) fn from_test_pages(pages: Vec<UnitAtlasPage>) -> Self {
-        Self {
-            pages,
-            entries: HashMap::new(),
-            frame_counts: BTreeMap::new(),
-            rendered_cache: Vec::new(),
-            gpu_rendered: 0,
-            cpu_rendered: 0,
-            shadow_masks: Default::default(),
-        }
+        Self::new(pages, HashMap::new())
     }
 }

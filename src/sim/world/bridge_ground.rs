@@ -14,12 +14,7 @@ use crate::sim::occupancy::CellObjectMember;
 use crate::sim::world::Simulation;
 
 fn members(sim: &Simulation, rx: u16, ry: u16) -> impl Iterator<Item = CellObjectMember> + '_ {
-    sim.substrate.occupancy.cell_objects(
-        rx,
-        ry,
-        MovementLayer::Ground,
-        sim.production.terrain_object_cells.get(&(rx, ry)).copied(),
-    )
+    sim.cell_objects((rx, ry), MovementLayer::Ground)
 }
 
 pub(super) fn apply(
@@ -36,9 +31,9 @@ pub(super) fn apply(
         // captured successor removed by nested effects has no next link when
         // its own iteration begins; do not resume from a precollected vector.
         let next = {
-            let mut live = members(sim, rx, ry);
-            live.find(|candidate| *candidate == member)
-                .and_then(|_| live.next())
+            let mut current_list = members(sim, rx, ry);
+            current_list.find(|candidate| *candidate == member);
+            current_list.next()
         };
         match member {
             CellObjectMember::Entity(stable_id) => {
@@ -114,12 +109,18 @@ mod tests {
 
     fn stock_cascade_rules() -> RuleSet {
         // Retail RULESMD TERROR/TerrorBomb/TerrorBombWH, E1 and MTNK damage
-        // inputs; unrelated art/voice/debris definitions are omitted.
-        RuleSet::from_ini(&IniFile::from_str(
+        // inputs and their physical GI/TRST action records. Presentation
+        // defaults cannot supply a native death clock or action admission.
+        let art = IniFile::from_str(&format!(
+            "{}\n{}",
+            crate::rules::retail_ini_fixture::GI_ART_EXCERPT,
+            crate::rules::retail_ini_fixture::TRST_ART_EXCERPT
+        ));
+        let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&IniFile::from_str(
             "[InfantryTypes]\n0=E1\n1=TERROR\n[VehicleTypes]\n0=MTNK\n\
              [AircraftTypes]\n[BuildingTypes]\n0=BUNK\n[CombatDamage]\nC4Warhead=Super\n\
-             [E1]\nStrength=125\nArmor=none\nSpeed=4\nDieSound=GIDie\n\
-             [TERROR]\nStrength=75\nArmor=flak\nSpeed=6\nExplodes=yes\nDeathWeapon=TerrorBomb\n\
+             [E1]\nImage=GI\nStrength=125\nArmor=none\nSpeed=4\nDieSound=GIDie\n\
+             [TERROR]\nImage=TRST\nStrength=75\nArmor=flak\nSpeed=6\nExplodes=yes\nDeathWeapon=TerrorBomb\n\
              [MTNK]\nStrength=300\nArmor=heavy\nSpeed=6\n\
              [BUNK]\nStrength=1000\nFoundation=1x1\nDieSound=BuildingDie\n\
              [TerrorBomb]\nDamage=225\nWarhead=TerrorBombWH\nSuicide=yes\n\
@@ -128,8 +129,12 @@ mod tests {
              Verses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n\
              [TerrorBombWH]\nInfDeath=4\nCellSpread=2\nPercentAtMax=.5\n\
              Verses=150%,100%,100%,90%,50%,50%,100%,150%,30%,100%,100%\n",
-        ))
-        .unwrap()
+        ), &art).unwrap();
+        rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
+        rules.bind_animation_sequences(
+            &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art),
+        );
+        rules
     }
 
     #[test]
@@ -172,41 +177,51 @@ mod tests {
             1 + repeat["rng_draws"].as_u64().unwrap() as usize,
             "initial fatal receiver plus the native zero-HP successor revisit"
         );
+        // Object5F579A calls RecordKill before Destroy5F57AF; Infantry's
+        // original vtable7EB058 +E0 is Techno702D40, whose UnitsLost store is
+        // 7031AC. object_health.json executes the exact-zero E0/DC order and
+        // the entry-HP0 no-callback arm; the Infantry repeat above reaches
+        // only its later death tail. Both first deaths therefore count now,
+        // including TERROR while its Die2 sequence remains in Logic.
         assert_eq!(
-            sim.houses[&owner].stats.units_lost, 1,
-            "the retired GI is counted once; Terrorist still has its death sequence"
+            sim.houses[&owner].stats.units_lost, 2,
+            "both fatal callbacks count; the zero-health GI revisit adds no loss"
         );
         assert_eq!(
             sim.houses[&owner].stats.units_killed, 1,
             "only TerrorBomb's first GI kill is credited"
         );
-        assert!(sim.substrate.entities.get(gi).unwrap().owned_count_released);
+        assert!(sim.substrate.entities.get(gi).unwrap().destruction_recorded);
         assert!(!sim.live_object_order_snapshot().contains(&gi));
         let head = sim.substrate.entities.get(terror).unwrap();
         assert!(head.infantry_terminal.is_some());
-        assert!(!head.owned_count_released);
-        // The rules catalog supplies a default Die2 even without art input.
-        // Drive its normal terminal visits through retirement before checking
-        // the eventual total; this test does not assert animation duration.
-        for _ in 0..120 {
+        assert!(head.destruction_recorded);
+        assert!(sim.live_object_order_snapshot().contains(&terror));
+        // Drive its actual Die2 clock through terminal visits and confirm
+        // UnInit does not count either fatal callback again. This test does
+        // not assert animation duration (completion calls UnInit520CAD).
+        for frame in 1..=120 {
             if sim
                 .substrate
                 .entities
                 .get(terror)
                 .unwrap()
-                .owned_count_released
+                .infantry_terminal
+                .is_none()
             {
                 break;
             }
-            assert!(sim.visit_infantry_terminal(terror, Some(&rules)));
+            sim.session.binary_frame = frame;
+            assert!(
+                sim.visit_infantry_terminal(terror, Some(&rules), Default::default())
+                    .visited
+            );
         }
-        assert!(
-            sim.substrate
-                .entities
-                .get(terror)
-                .unwrap()
-                .owned_count_released
-        );
+        let head = sim.substrate.entities.get(terror).unwrap();
+        assert!(head.infantry_terminal.is_none());
+        assert!(!head.lifecycle.object_alive);
+        assert!(head.destruction_recorded);
+        assert!(!sim.live_object_order_snapshot().contains(&terror));
         assert_eq!(sim.houses[&owner].stats.units_lost, 2);
         assert_eq!(sim.houses[&owner].stats.units_killed, 1);
     }
@@ -264,35 +279,32 @@ mod tests {
 
     #[test]
     fn bridge_ground_infantry_action_preserves_same_sequence_and_retired_membership() {
-        use crate::sim::animation::{Animation, SequenceKind};
         use crate::sim::world::InfantryDeathSequence;
         let rules = stock_cascade_rules();
         let mut sim = world(&rules);
         let gi = place(&mut sim, &rules, "E1", 4);
-        let mut animation = Animation::new(SequenceKind::Die2);
-        animation.frame_index = 7;
-        sim.substrate.entities.get_mut(gi).unwrap().animation = Some(animation);
-        sim.begin_infantry_death_sequence(gi, InfantryDeathSequence::Die2);
+        assert!(sim.infantry_do_action(gi, 12, true, &rules).unwrap());
+        sim.substrate
+            .entities
+            .get_mut(gi)
+            .unwrap()
+            .set_native_stage_value(7);
+        sim.begin_infantry_death_sequence(gi, InfantryDeathSequence::Die2, &rules);
         assert_eq!(
             sim.substrate
                 .entities
                 .get(gi)
                 .unwrap()
-                .animation
-                .as_ref()
-                .unwrap()
-                .frame_index,
+                .native_stage()
+                .value(),
             7
         );
         sim.uninit_with_rules(gi, &rules);
         let pending = sim.substrate.pending_delete.clone();
-        sim.begin_infantry_death_sequence(gi, InfantryDeathSequence::Die1);
+        sim.begin_infantry_death_sequence(gi, InfantryDeathSequence::Die1, &rules);
         let object = sim.substrate.entities.get(gi).unwrap();
-        assert_eq!(
-            object.animation.as_ref().unwrap().sequence,
-            SequenceKind::Die1
-        );
-        assert_eq!(object.animation.as_ref().unwrap().frame_index, 0);
+        assert_eq!(object.mission_leaf.as_infantry().unwrap().doing(), 11);
+        assert_eq!(object.native_stage().value(), 0);
         assert!(object.infantry_terminal.is_none());
         assert!(!object.lifecycle.object_alive);
         assert!(!sim.live_object_order_snapshot().contains(&gi));
@@ -353,7 +365,6 @@ mod tests {
                     name: "TREE".into(),
                 }],
                 &rules,
-                &OverlayTypeRegistry::empty(),
                 false,
             );
             let id = sim.production.terrain_object_cells[&(4, 4)];

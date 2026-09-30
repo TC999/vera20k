@@ -2,11 +2,10 @@
 //!
 //! Owns the Rust equivalents of gamemd's cell-level tiberium view and mutation
 //! boundaries. In a loaded YR map, `OverlayGrid` is the authority for both the
-//! tiberium type and its raw 0..=11 density byte. `ResourceNode` remains only as
-//! a compatibility seam for isolated tests that do not construct the native
-//! overlay/type context.
+//! tiberium type and its raw 0..=11 density byte; there is no second store.
 
-use std::collections::BTreeMap;
+#[cfg(test)]
+pub(crate) mod test_support;
 
 use crate::map::bridge_facts::{BRIDGE_FLAG_DESTROYED_OR_RAMP, BRIDGE_FLAG_STRUCTURAL};
 use crate::map::entities::EntityCategory;
@@ -16,21 +15,14 @@ use crate::rules::ruleset::RuleSet;
 use crate::rules::tiberium_type::{TiberiumTypeId, TiberiumTypeRegistry};
 use crate::sim::entity_store::EntityStore;
 use crate::sim::intern::StringInterner;
-use crate::sim::miner::{ResourceNode, ResourceType};
+use crate::sim::miner::ResourceType;
 use crate::sim::occupancy::OccupancyGrid;
 use crate::sim::ore_growth::OreGrowthState;
 use crate::sim::overlay_grid::OverlayGrid;
-use crate::sim::pathfinding::PathGrid;
 use crate::sim::rng::SimRng;
-
-#[cfg(test)]
-const ORE_STOCK_PER_DENSITY: u16 = 120;
-#[cfg(test)]
-const GEM_STOCK_PER_DENSITY: u16 = 180;
 
 /// Mutable state needed to apply a shared tiberium reduction.
 pub struct ReduceTiberiumContext<'a> {
-    pub resource_nodes: &'a mut BTreeMap<(u16, u16), ResourceNode>,
     pub overlay_grid: Option<&'a mut OverlayGrid>,
     pub ore_growth_state: &'a mut OreGrowthState,
     pub overlay_registry: Option<&'a OverlayTypeRegistry>,
@@ -174,46 +166,27 @@ impl<'a> NativeCellObjectView<'a> {
     }
 }
 
-/// Proof that a caller selected an explicit new-cell admission policy.
-///
-/// Runtime placement can only construct this from both resolved map terrain
-/// and the live CellClass-style object view. The crate-private compatibility
-/// constructor keeps old non-native fixtures explicit without weakening the
-/// production boundary.
+/// What a new tiberium cell is admitted against: the resolved map terrain and
+/// the live CellClass-style object view. There is no admission without both.
 #[derive(Clone, Copy)]
 pub struct NewTiberiumAdmission<'a> {
-    resolved_terrain: Option<&'a ResolvedTerrainGrid>,
-    path_grid: Option<&'a PathGrid>,
-    live_objects: Option<TiberiumPlacementObjectContext<'a>>,
+    resolved_terrain: &'a ResolvedTerrainGrid,
+    live_objects: TiberiumPlacementObjectContext<'a>,
 }
 
 impl<'a> NewTiberiumAdmission<'a> {
     pub fn runtime(
         resolved_terrain: &'a ResolvedTerrainGrid,
-        path_grid: Option<&'a PathGrid>,
         live_objects: TiberiumPlacementObjectContext<'a>,
     ) -> Self {
         Self {
-            resolved_terrain: Some(resolved_terrain),
-            path_grid,
-            live_objects: Some(live_objects),
-        }
-    }
-
-    pub(crate) fn compatibility_without_native_context(
-        resolved_terrain: Option<&'a ResolvedTerrainGrid>,
-        path_grid: Option<&'a PathGrid>,
-        live_objects: Option<TiberiumPlacementObjectContext<'a>>,
-    ) -> Self {
-        Self {
             resolved_terrain,
-            path_grid,
             live_objects,
         }
     }
 
-    /// The live CellClass-style object view this admission carries, if any.
-    pub(crate) fn live_objects(&self) -> Option<TiberiumPlacementObjectContext<'a>> {
+    /// The live CellClass-style object view this admission carries.
+    pub(crate) fn live_objects(&self) -> TiberiumPlacementObjectContext<'a> {
         self.live_objects
     }
 }
@@ -266,22 +239,11 @@ pub(crate) fn can_place_new_tiberium(
     {
         return false;
     }
-    if let Some(terrain) = admission.resolved_terrain {
-        let Some(terrain_cell) = terrain.cell(cell.0, cell.1) else {
-            return false;
-        };
-        if !resolved_cell_accepts_tiberium(terrain_cell) {
-            return false;
-        }
-    } else if admission
-        .path_grid
-        .is_some_and(|grid| grid.cell(cell.0, cell.1).is_none())
-    {
+    let Some(terrain_cell) = admission.resolved_terrain.cell(cell.0, cell.1) else {
         return false;
-    }
-    !admission
-        .live_objects
-        .is_some_and(|objects| live_cell_rejects_tiberium(cell, objects))
+    };
+    resolved_cell_accepts_tiberium(terrain_cell)
+        && !live_cell_rejects_tiberium(cell, admission.live_objects)
 }
 
 /// Mutable state for the native `CellClass::PlaceTiberium` boundary.
@@ -453,8 +415,7 @@ pub fn reduce_tiberium(
         ctx.tiberium_types,
     ) {
         (Some(grid), Some(registry), Some(types)) => {
-            // A complete production context never falls back to ResourceNode:
-            // a non-tiberium overlay is an invalid reduction target.
+            // A non-tiberium overlay is an invalid reduction target.
             let Some(view) = tiberium_cell_view(grid, registry, types, cell) else {
                 return ReduceTiberiumOutcome::none();
             };
@@ -462,9 +423,8 @@ pub fn reduce_tiberium(
         }
         _ => None,
     }) else {
-        // Cell overlay identity plus raw OverlayData is the only production
-        // authority. An incompletely initialized caller cannot substitute the
-        // serialized compatibility node map.
+        // Cell overlay identity plus raw OverlayData is the only authority; an
+        // incompletely initialized caller reduces nothing.
         return ReduceTiberiumOutcome::none();
     };
     let current = view.overlay_data;
@@ -515,12 +475,7 @@ pub fn reduce_tiberium(
         {
             // Retail recalculates cell attributes synchronously inside the full
             // removal boundary, before any later sim system can observe it.
-            grid.recalculate_runtime_cell(
-                terrain,
-                registry,
-                cell,
-                crate::sim::overlay_grid::NavigationPublication::FrameBoundary,
-            );
+            grid.recalculate_runtime_cell(terrain, registry, cell);
         }
     }
 
@@ -560,70 +515,6 @@ pub fn reduce_tiberium(
     }
 }
 
-/// Preserve the old stock-map abstraction only for tests/fixtures that do not
-/// provide the production overlay + registry context.
-#[cfg(test)]
-pub(crate) fn reduce_legacy_resource_node_for_tests(
-    ctx: &mut ReduceTiberiumContext<'_>,
-    cell: (u16, u16),
-    amount: i32,
-) -> ReduceTiberiumOutcome {
-    let Some(node) = ctx.resource_nodes.get(&cell).copied() else {
-        return ReduceTiberiumOutcome::none();
-    };
-    let base = stock_per_density(node.resource_type);
-    let current_density = ctx
-        .overlay_grid
-        .as_deref()
-        .and_then(|grid| {
-            let overlay = grid.cell(cell.0, cell.1);
-            overlay.overlay_id.map(|_| u16::from(overlay.overlay_data))
-        })
-        .unwrap_or_else(|| node.remaining / base);
-    if current_density == 0 {
-        return ReduceTiberiumOutcome::none();
-    }
-    let amount = u16::try_from(amount).unwrap_or(u16::MAX);
-    if amount < current_density {
-        let remaining_density = current_density - amount;
-        if let Some(grid) = ctx.overlay_grid.as_deref_mut() {
-            grid.set_overlay_data(cell.0, cell.1, remaining_density.min(11) as u8);
-        }
-        if let Some(node) = ctx.resource_nodes.get_mut(&cell) {
-            node.remaining = remaining_density.saturating_mul(base);
-        }
-        mark_radar_dirty(ctx, cell);
-        mark_tactical_dirty(ctx, cell);
-        return ReduceTiberiumOutcome {
-            removed_amount: amount,
-            resource_type: Some(node.resource_type),
-            fully_removed: false,
-        };
-    }
-
-    if let Some(grid) = ctx.overlay_grid.as_deref_mut() {
-        grid.clear_overlay(cell.0, cell.1);
-    }
-    ctx.resource_nodes.remove(&cell);
-    ctx.ore_growth_state
-        .reseed_spread_neighbors_after_reduction(node.resource_type, cell, ctx.resource_nodes);
-    mark_radar_dirty(ctx, cell);
-    mark_tactical_dirty(ctx, cell);
-    ReduceTiberiumOutcome {
-        removed_amount: current_density,
-        resource_type: Some(node.resource_type),
-        fully_removed: true,
-    }
-}
-
-#[cfg(test)]
-fn stock_per_density(resource_type: ResourceType) -> u16 {
-    match resource_type {
-        ResourceType::Ore => ORE_STOCK_PER_DENSITY,
-        ResourceType::Gem => GEM_STOCK_PER_DENSITY,
-    }
-}
-
 fn mark_radar_dirty(ctx: &mut ReduceTiberiumContext<'_>, cell: (u16, u16)) {
     if let Some(cells) = ctx.radar_dirty_cells.as_deref_mut()
         && !cells.contains(&cell)
@@ -646,14 +537,14 @@ fn mark_tactical_dirty(ctx: &mut ReduceTiberiumContext<'_>, cell: (u16, u16)) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use crate::map::overlay::{OverlayDataPack, OverlayEntry};
     use crate::map::overlay_types::OverlayTypeRegistry;
-    use crate::map::resolved_terrain::{ResolvedTerrainCell, ResolvedTerrainGrid, zone_class};
+    use crate::map::resolved_terrain::{ResolvedTerrainCell, ResolvedTerrainGrid};
     use crate::rules::ini_parser::IniFile;
     use crate::rules::ruleset::RuleSet;
-    use crate::rules::terrain_rules::{LandType, SpeedCostProfile, TerrainClass};
+    use crate::rules::terrain_rules::LandType;
     use crate::rules::tiberium_type::TiberiumTypeRegistry;
     use crate::sim::entity_store::EntityStore;
     use crate::sim::intern::StringInterner;
@@ -696,20 +587,6 @@ mod tests {
             None,
             (5, 5)
         ));
-    }
-
-    fn ore_node(density: u16) -> ResourceNode {
-        ResourceNode {
-            resource_type: ResourceType::Ore,
-            remaining: density * ORE_STOCK_PER_DENSITY,
-        }
-    }
-
-    fn gem_node(density: u16) -> ResourceNode {
-        ResourceNode {
-            resource_type: ResourceType::Gem,
-            remaining: density * GEM_STOCK_PER_DENSITY,
-        }
     }
 
     fn native_tiberium_fixture() -> (OverlayTypeRegistry, TiberiumTypeRegistry) {
@@ -777,82 +654,14 @@ SpreadPercentage=.06
     }
 
     fn flat_clear_terrain() -> ResolvedTerrainGrid {
-        let land_type = LandType::Clear.as_index();
-        let speed_costs = SpeedCostProfile::default();
-        ResolvedTerrainGrid::from_cells(
-            1,
-            1,
-            vec![ResolvedTerrainCell {
-                rx: 0,
-                ry: 0,
-                source_tile_index: 0,
-                source_sub_tile: 0,
-                final_tile_index: 0,
-                final_sub_tile: 0,
-                is_wood_bridge_repair_tile: false,
-                level: 0,
-                filled_clear: true,
-                tileset_index: None,
-                land_type,
-                yr_cell_land_type: land_type,
-                slope_type: 0,
-                template_height: 0,
-                render_offset_x: 0,
-                render_offset_y: 0,
-                terrain_class: TerrainClass::Clear,
-                speed_costs,
-                is_water: false,
-                is_cliff_like: false,
-                is_rough: false,
-                is_road: false,
-                accepts_smudge: true,
-                allows_tiberium: true,
-                height_in_pixels: 0,
-                variant: 0,
-                has_ramp: false,
-                canonical_ramp: None,
-                ground_walk_blocked: false,
-                terrain_object_blocks: false,
-                terrain_object_occupation: None,
-                overlay_blocks: false,
-                overlay_zone_type: None,
-                outside_playfield: false,
-                zone_type: zone_class::GROUND,
-                base_ground_walk_blocked: false,
-                base_build_blocked: false,
-                base_land_type: land_type,
-                base_yr_cell_land_type: land_type,
-                base_terrain_class: TerrainClass::Clear,
-                base_speed_costs: speed_costs,
-                build_blocked: false,
-                has_bridge_deck: false,
-                bridge_walkable: false,
-                bridge_transition: false,
-                bridge_deck_level: 0,
-                bridge_layer: None,
-                bridge_facts: crate::map::bridge_facts::BridgeCellFacts::default(),
-                tube_index: None,
-                radar_left: [0; 3],
-                radar_right: [0; 3],
-                has_damaged_data: false,
-                bridgehead_anchor_class_at_load: None,
-            }],
-        )
+        flat_clear_terrain_grid(1, 1)
     }
 
     fn flat_clear_terrain_grid(width: u16, height: u16) -> ResolvedTerrainGrid {
-        let mut seed = flat_clear_terrain();
-        let template = seed.cells.remove(0);
-        let mut cells = Vec::with_capacity(usize::from(width) * usize::from(height));
-        for ry in 0..height {
-            for rx in 0..width {
-                let mut cell = template.clone();
-                cell.rx = rx;
-                cell.ry = ry;
-                cells.push(cell);
-            }
-        }
-        ResolvedTerrainGrid::from_cells(width, height, cells)
+        crate::map::resolved_terrain::test_grid(width, height, |rx, ry| ResolvedTerrainCell {
+            allows_tiberium: true,
+            ..crate::map::resolved_terrain::test_loader_clear_cell(rx, ry)
+        })
     }
 
     #[test]
@@ -875,7 +684,7 @@ SpreadPercentage=.06
             &interner,
             &terrain_object_cells,
         );
-        let runtime_admission = NewTiberiumAdmission::runtime(&terrain, None, live_objects);
+        let runtime_admission = NewTiberiumAdmission::runtime(&terrain, live_objects);
 
         let mut overlay = OverlayGrid::new(1, 1);
         let mut growth = OreGrowthState::new(1, 1);
@@ -935,8 +744,9 @@ SpreadPercentage=.06
         let expected_overlay = variants[expected_rng.next_range_u32(12) as usize];
         expected_rng.next_u32(); // AddToGrowthQueue priority.
         let source_cells = BTreeSet::new();
-        let compatibility_admission =
-            NewTiberiumAdmission::compatibility_without_native_context(None, None, None);
+        let terrain = test_support::flat_terrain(8, 8);
+        let no_objects = test_support::NoLiveObjects::new();
+        let admission = NewTiberiumAdmission::runtime(&terrain, no_objects.context());
         let mut radar_dirty = Vec::new();
         let mut radar_generation = 0;
         let mut tactical_dirty = Vec::new();
@@ -946,10 +756,10 @@ SpreadPercentage=.06
                 ore_growth_state: &mut growth,
                 overlay_registry: &overlay_registry,
                 tiberium_types: &tiberium_types,
-                resolved_terrain: None,
+                resolved_terrain: Some(&terrain),
                 source_object_cells: &source_cells,
-                new_cell_admission: Some(compatibility_admission),
-                live_objects: None,
+                new_cell_admission: Some(admission),
+                live_objects: Some(admission.live_objects().object_view()),
                 rng: &mut rng,
                 binary_frame: 40,
                 growth_enabled: true,
@@ -980,10 +790,10 @@ SpreadPercentage=.06
             ore_growth_state: &mut growth,
             overlay_registry: &overlay_registry,
             tiberium_types: &tiberium_types,
-            resolved_terrain: None,
+            resolved_terrain: Some(&terrain),
             source_object_cells: &source_cells,
-            new_cell_admission: Some(compatibility_admission),
-            live_objects: None,
+            new_cell_admission: Some(admission),
+            live_objects: Some(admission.live_objects().object_view()),
             rng: &mut rng,
             binary_frame: 40,
             growth_enabled: true,
@@ -1004,7 +814,11 @@ SpreadPercentage=.06
 
     #[test]
     fn gsi_04_09_existing_growth_honors_threshold_clamp_and_tactical_only_dirty() {
-        for (growth_percentage, succeeds) in [(".000009", false), (".00001", true)] {
+        // ReadDouble scans a float: `.00001` widens to 9.99999974737875e-06,
+        // just under the 1e-05 gate; `.000011` clears it.
+        for (growth_percentage, succeeds) in
+            [(".000009", false), (".00001", false), (".000011", true)]
+        {
             let (overlay_registry, tiberium_types) =
                 native_tiberium_fixture_with_riparius_growth(growth_percentage);
             let tib01 = overlay_registry.id_for_name("TIB01").expect("TIB01");
@@ -1189,14 +1003,13 @@ SpreadPercentage=.06
             "unallocated native slot receives neither pack"
         );
         assert_eq!(
-            grid.take_dirty_cells_with_passability_signal(),
-            (Vec::new(), false),
+            grid.take_dirty_cells(),
+            Vec::new(),
             "map initialization creates no runtime mutation trace"
         );
 
         let mut sim = Simulation::new();
         sim.overlay_grid = Some(grid);
-        assert!(sim.production.resource_nodes.is_empty());
         // Native in-scenario load restarts Scenario RNG from Seed0; isolate
         // packed-overlay persistence on that same post-load cursor.
         sim.scenario_rng = crate::sim::rng::SimRng::new(0);
@@ -1227,14 +1040,12 @@ SpreadPercentage=.06
     }
 
     #[test]
-    fn gsi_04_09_missing_reducer_context_fails_closed_over_legacy_node() {
-        let mut nodes = BTreeMap::from([((5, 5), gem_node(4))]);
+    fn gsi_04_09_missing_reducer_context_fails_closed() {
         let mut growth = OreGrowthState::new(10, 10);
         let mut radar_dirty = Vec::new();
         let mut radar_generation = 0;
         let mut tactical_dirty = Vec::new();
         let mut ctx = ReduceTiberiumContext {
-            resource_nodes: &mut nodes,
             overlay_grid: None,
             ore_growth_state: &mut growth,
             overlay_registry: None,
@@ -1254,7 +1065,6 @@ SpreadPercentage=.06
             reduce_tiberium(&mut ctx, (5, 5), 2),
             ReduceTiberiumOutcome::none()
         );
-        assert_eq!(nodes.get(&(5, 5)).copied(), Some(gem_node(4)));
         assert!(radar_dirty.is_empty());
         assert_eq!(radar_generation, 0);
         assert!(tactical_dirty.is_empty());
@@ -1272,10 +1082,6 @@ SpreadPercentage=.06
         ];
 
         for (data, amount, removed, fully_removed, remaining_data) in cases {
-            let mut nodes = BTreeMap::new();
-            // Deliberately contradictory legacy state proves it is not read or
-            // mirrored when the production overlay context is complete.
-            nodes.insert((4, 4), gem_node(4));
             let mut overlay = OverlayGrid::new(8, 8);
             overlay.place_overlay(4, 4, tib01, data);
             let mut growth = OreGrowthState::new(8, 8);
@@ -1284,7 +1090,6 @@ SpreadPercentage=.06
             let mut radar_generation = 0;
             let mut tactical_dirty = Vec::new();
             let mut ctx = ReduceTiberiumContext {
-                resource_nodes: &mut nodes,
                 overlay_grid: Some(&mut overlay),
                 ore_growth_state: &mut growth,
                 overlay_registry: Some(&overlay_registry),
@@ -1328,19 +1133,12 @@ SpreadPercentage=.06
                 }
             }
             assert_eq!(tactical_dirty, vec![(4, 4)]);
-            assert_eq!(
-                nodes.get(&(4, 4)).copied(),
-                Some(gem_node(4)),
-                "native mutation never consults or mirrors the compatibility seam"
-            );
         }
 
-        let mut nodes = BTreeMap::new();
         let mut overlay = OverlayGrid::new(8, 8);
         overlay.place_overlay(4, 4, tib01, 6);
         let mut growth = OreGrowthState::new(8, 8);
         let mut ctx = ReduceTiberiumContext {
-            resource_nodes: &mut nodes,
             overlay_grid: Some(&mut overlay),
             ore_growth_state: &mut growth,
             overlay_registry: Some(&overlay_registry),
@@ -1364,7 +1162,6 @@ SpreadPercentage=.06
     fn gsi_04_09_max_density_reduction_runs_the_growth_admission_without_rng() {
         let (overlay_registry, tiberium_types) = native_tiberium_fixture();
         let tib01 = overlay_registry.id_for_name("TIB01").expect("TIB01");
-        let mut nodes = BTreeMap::new();
         let mut overlay = OverlayGrid::new(8, 8);
         overlay.place_overlay(4, 4, tib01, 11);
         let mut growth = OreGrowthState::new(8, 8);
@@ -1372,7 +1169,6 @@ SpreadPercentage=.06
         let mut rng = SimRng::new(0x480a80);
         let expected_rng = rng.clone();
         let mut ctx = ReduceTiberiumContext {
-            resource_nodes: &mut nodes,
             overlay_grid: Some(&mut overlay),
             ore_growth_state: &mut growth,
             overlay_registry: Some(&overlay_registry),
@@ -1409,7 +1205,6 @@ SpreadPercentage=.06
     #[test]
     fn gsi_04_09_full_reduction_propagates_synchronous_path_refresh() {
         use crate::rules::locomotor_type::SpeedType;
-        use crate::sim::overlay_grid::NavigationPublication;
         use crate::sim::world::TickLane;
         use std::sync::Arc;
 
@@ -1469,66 +1264,55 @@ SpreadPercentage=.06
             sim.resolved_terrain.as_mut().unwrap(),
             &overlay_registry,
             (0, 0),
-            NavigationPublication::FrameBoundary,
         );
         assert!(!repeated.navigation_changed);
 
         let deferred = sim
-            .advance_app_frame(
-                &[],
-                Some(&rules),
-                &BTreeMap::new(),
-                None,
-                67,
-                TickLane::Ordinary,
-                None,
-            )
+            .advance_app_frame(&[], Some(&rules), None, 67, TickLane::Ordinary, None)
             .expect("fixture frame must complete");
         assert!(deferred.overlay_updates.is_empty());
-        assert!(Arc::ptr_eq(&before, &sim.path_grid_snapshot().unwrap()));
         assert_eq!(
-            sim.overlay_grid
-                .as_ref()
-                .unwrap()
-                .clone()
-                .take_dirty_cells_with_passability_signal(),
-            (vec![(0, 0)], true),
-            "missing registry retains the first true result despite the false repeat"
+            sim.terrain_costs[&SpeedType::Foot].cost_at(0, 0),
+            37,
+            "the next path reader publishes the Recalc without an overlay registry"
         );
+        let published = sim.path_grid_snapshot().unwrap();
+        assert!(
+            Arc::ptr_eq(&before, &published),
+            "the walkable path cell is current; only its costs change"
+        );
+        let mut pending = sim.overlay_grid.as_ref().unwrap().clone();
+        assert_eq!(
+            pending.take_dirty_cells(),
+            vec![(0, 0)],
+            "presentation dirtiness waits for the registry"
+        );
+        assert!(pending.take_synchronous_navigation_cells().is_empty());
 
         let first = sim
             .advance_app_frame(
                 &[],
                 Some(&rules),
-                &BTreeMap::new(),
                 Some(&overlay_registry),
                 67,
                 TickLane::Ordinary,
                 None,
             )
             .expect("fixture frame must complete");
-        assert_eq!(sim.terrain_costs[&SpeedType::Foot].cost_at(0, 0), 37);
         assert!(sim.zone_grid.is_some());
         assert!(
             first.overlay_updates.is_empty(),
             "erased tiberium has no overlay upsert"
         );
         assert_eq!(first.tick.state_hash, sim.state_hash());
-        let published = sim.path_grid_snapshot().unwrap();
-        assert!(!Arc::ptr_eq(&before, &published));
-        assert_eq!(
-            sim.overlay_grid
-                .as_ref()
-                .unwrap()
-                .clone()
-                .take_dirty_cells_with_passability_signal(),
-            (Vec::new(), false)
-        );
+        assert!(Arc::ptr_eq(&published, &sim.path_grid_snapshot().unwrap()));
+        let mut pending = sim.overlay_grid.as_ref().unwrap().clone();
+        assert!(pending.take_dirty_cells().is_empty());
+        assert!(pending.take_synchronous_navigation_cells().is_empty());
         let second = sim
             .advance_app_frame(
                 &[],
                 Some(&rules),
-                &BTreeMap::new(),
                 Some(&overlay_registry),
                 67,
                 TickLane::Ordinary,
@@ -1541,134 +1325,6 @@ SpreadPercentage=.06
             "no duplicate navigation publication"
         );
         assert_eq!(second.tick.state_hash, sim.state_hash());
-    }
-
-    #[test]
-    fn partial_reduction_updates_overlay_node_and_dirty_lists() {
-        let mut nodes = BTreeMap::new();
-        nodes.insert((5, 5), ore_node(8));
-        let mut overlay = OverlayGrid::new(10, 10);
-        overlay.place_overlay(5, 5, 1, 8);
-        let mut growth = OreGrowthState::new(10, 10);
-        let mut radar_dirty = Vec::new();
-        let mut radar_generation = 0;
-        let mut tactical_dirty = Vec::new();
-
-        let mut ctx = ReduceTiberiumContext {
-            resource_nodes: &mut nodes,
-            overlay_grid: Some(&mut overlay),
-            ore_growth_state: &mut growth,
-            overlay_registry: None,
-            tiberium_types: None,
-            resolved_terrain: None,
-            source_object_cells: None,
-            live_objects: None,
-            rng: None,
-            binary_frame: 0,
-            spread_enabled: false,
-            radar_dirty_cells: Some(&mut radar_dirty),
-            radar_dirty_generation: Some(&mut radar_generation),
-            tactical_dirty_cells: Some(&mut tactical_dirty),
-        };
-
-        let outcome = reduce_legacy_resource_node_for_tests(&mut ctx, (5, 5), 2);
-
-        assert_eq!(outcome.removed_amount, 2);
-        assert_eq!(outcome.resource_type, Some(ResourceType::Ore));
-        assert!(!outcome.fully_removed);
-        assert_eq!(overlay.cell(5, 5).overlay_data, 6);
-        assert_eq!(
-            nodes.get(&(5, 5)).unwrap().remaining,
-            6 * ORE_STOCK_PER_DENSITY
-        );
-        assert_eq!(radar_dirty, vec![(5, 5)]);
-        assert_eq!(radar_generation, 1);
-        assert_eq!(tactical_dirty, vec![(5, 5)]);
-    }
-
-    #[test]
-    fn full_reduction_uses_overlay_density_caps_harvest_and_clears_overlay() {
-        let mut nodes = BTreeMap::new();
-        nodes.insert((5, 5), ore_node(12));
-        let mut overlay = OverlayGrid::new(10, 10);
-        overlay.place_overlay(5, 5, 1, 11);
-        let mut growth = OreGrowthState::new(10, 10);
-        let mut radar_dirty = Vec::new();
-        let mut radar_generation = 0;
-        let mut tactical_dirty = Vec::new();
-
-        let mut ctx = ReduceTiberiumContext {
-            resource_nodes: &mut nodes,
-            overlay_grid: Some(&mut overlay),
-            ore_growth_state: &mut growth,
-            overlay_registry: None,
-            tiberium_types: None,
-            resolved_terrain: None,
-            source_object_cells: None,
-            live_objects: None,
-            rng: None,
-            binary_frame: 0,
-            spread_enabled: false,
-            radar_dirty_cells: Some(&mut radar_dirty),
-            radar_dirty_generation: Some(&mut radar_generation),
-            tactical_dirty_cells: Some(&mut tactical_dirty),
-        };
-
-        let outcome = reduce_legacy_resource_node_for_tests(&mut ctx, (5, 5), 12);
-
-        assert_eq!(outcome.removed_amount, 11);
-        assert_eq!(outcome.resource_type, Some(ResourceType::Ore));
-        assert!(outcome.fully_removed);
-        assert!(nodes.get(&(5, 5)).is_none());
-        assert_eq!(overlay.cell(5, 5).overlay_id, None);
-        assert_eq!(radar_dirty, vec![(5, 5)]);
-        assert_eq!(radar_generation, 1);
-        assert_eq!(tactical_dirty, vec![(5, 5)]);
-    }
-
-    #[test]
-    fn full_reduction_reseeds_same_type_spread_neighbors() {
-        let mut nodes = BTreeMap::new();
-        nodes.insert((5, 5), ore_node(3));
-        nodes.insert((6, 5), ore_node(4));
-        nodes.insert((5, 6), ore_node(4));
-        nodes.insert((4, 5), gem_node(4));
-        let mut overlay = OverlayGrid::new(10, 10);
-        overlay.place_overlay(5, 5, 1, 3);
-        let mut growth = OreGrowthState::new(10, 10);
-        let mut radar_dirty = Vec::new();
-        let mut radar_generation = 0;
-        let mut tactical_dirty = Vec::new();
-
-        let mut ctx = ReduceTiberiumContext {
-            resource_nodes: &mut nodes,
-            overlay_grid: Some(&mut overlay),
-            ore_growth_state: &mut growth,
-            overlay_registry: None,
-            tiberium_types: None,
-            resolved_terrain: None,
-            source_object_cells: None,
-            live_objects: None,
-            rng: None,
-            binary_frame: 0,
-            spread_enabled: false,
-            radar_dirty_cells: Some(&mut radar_dirty),
-            radar_dirty_generation: Some(&mut radar_generation),
-            tactical_dirty_cells: Some(&mut tactical_dirty),
-        };
-
-        let outcome = reduce_legacy_resource_node_for_tests(&mut ctx, (5, 5), 3);
-
-        assert!(outcome.fully_removed);
-        let queued: Vec<_> = growth
-            .spread_queue_entries()
-            .iter()
-            .map(|entry| (entry.resource_type, entry.rx, entry.ry))
-            .collect();
-        assert_eq!(
-            queued,
-            vec![(ResourceType::Ore, 6, 5), (ResourceType::Ore, 5, 6)]
-        );
     }
 
     /// `Reduce_Tiberium @ 0x00480A80` full removal calls the REMOVED class's
@@ -1685,9 +1341,6 @@ SpreadPercentage=.06
         let (overlay_registry, tiberium_types) = native_tiberium_fixture();
         let tib01 = overlay_registry.id_for_name("TIB01").expect("TIB01");
         let gem01 = overlay_registry.id_for_name("GEM01").expect("GEM01");
-        let mut nodes = BTreeMap::new();
-        nodes.insert((5, 5), gem_node(1));
-        nodes.insert((6, 5), ore_node(4));
         let mut overlay = OverlayGrid::new(10, 10);
         overlay.place_overlay(5, 5, gem01, 1);
         overlay.place_overlay(6, 5, tib01, 4);
@@ -1699,7 +1352,6 @@ SpreadPercentage=.06
         let source_object_cells = BTreeSet::new();
 
         let mut ctx = ReduceTiberiumContext {
-            resource_nodes: &mut nodes,
             overlay_grid: Some(&mut overlay),
             ore_growth_state: &mut growth,
             overlay_registry: Some(&overlay_registry),
@@ -1746,10 +1398,6 @@ SpreadPercentage=.06
         let gem01 = overlay_registry.id_for_name("GEM01").expect("GEM01");
         let tib2_20 = overlay_registry.id_for_name("TIB2_20").expect("TIB2_20");
         assert_eq!(tib2_20, 146);
-        let mut nodes = BTreeMap::new();
-        nodes.insert((5, 5), ore_node(3));
-        nodes.insert((6, 5), ore_node(4));
-        nodes.insert((5, 6), ore_node(4));
         let mut overlay = OverlayGrid::new(10, 10);
         overlay.place_overlay(6, 5, tib2_20, 4);
         overlay.place_overlay(5, 6, tib2_20, 4);
@@ -1792,7 +1440,6 @@ SpreadPercentage=.06
         expected_rng.next_u32();
 
         let mut ctx = ReduceTiberiumContext {
-            resource_nodes: &mut nodes,
             overlay_grid: Some(&mut overlay),
             ore_growth_state: &mut growth,
             overlay_registry: Some(&overlay_registry),
@@ -1811,7 +1458,6 @@ SpreadPercentage=.06
         let outcome = reduce_tiberium(&mut ctx, (5, 5), 4);
 
         assert!(outcome.fully_removed);
-        assert!(growth.spread_queue_entries().is_empty());
         let class = &growth.native_tiberium_state().classes[2];
         assert!(class.spread_bitmap.contains(&(6, 5)));
         assert!(class.spread_bitmap.contains(&(5, 6)));
@@ -1860,39 +1506,6 @@ SpreadPercentage=.06
             rng.logical_state(),
             expected_rng.logical_state(),
             "reseed consumes exactly one raw draw per accepted neighbor"
-        );
-    }
-
-    #[test]
-    fn gem_partial_reduction_uses_gem_density_base_without_overlay() {
-        let mut nodes = BTreeMap::new();
-        nodes.insert((5, 5), gem_node(4));
-        let mut growth = OreGrowthState::new(10, 10);
-
-        let mut ctx = ReduceTiberiumContext {
-            resource_nodes: &mut nodes,
-            overlay_grid: None,
-            ore_growth_state: &mut growth,
-            overlay_registry: None,
-            tiberium_types: None,
-            resolved_terrain: None,
-            source_object_cells: None,
-            live_objects: None,
-            rng: None,
-            binary_frame: 0,
-            spread_enabled: false,
-            radar_dirty_cells: None,
-            radar_dirty_generation: None,
-            tactical_dirty_cells: None,
-        };
-
-        let outcome = reduce_legacy_resource_node_for_tests(&mut ctx, (5, 5), 2);
-
-        assert_eq!(outcome.removed_amount, 2);
-        assert_eq!(outcome.resource_type, Some(ResourceType::Gem));
-        assert_eq!(
-            nodes.get(&(5, 5)).unwrap().remaining,
-            2 * GEM_STOCK_PER_DENSITY
         );
     }
 }

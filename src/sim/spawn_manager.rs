@@ -37,17 +37,14 @@
 //! Background: `docs/research/SPAWN_MANAGER_CLASS_GHIDRA_REPORT.md`,
 //! `docs/research/ROCKET_LOCOMOTION_CLASS_GHIDRA_REPORT.md`.
 //!
-//! ## Deliberately not parsed
+//! ## `Spawned=`
 //!
-//! `Spawned=` (`TechnoTypeClass+0xD54`) is a live flag with four verified
-//! consumers — `search_instructions operand_pattern=0xd54]` finds it read by
+//! `Spawned=` (`TechnoTypeClass+0xD54`, `ObjectType::spawned`) has four
+//! verified readers — `search_instructions operand_pattern=0xd54]` finds
 //! `AircraftClass::Is_Cell_Free_For_Landing` (two sites),
-//! `TechnoClass::GetFireError` (`0x006FC67B`),
+//! `TechnoClass::GetFireError` (`0x006FC67B`, T36 in `combat::fire_error`),
 //! `TechnoClass::Set_ArchiveTarget` and `TechnoClass::IsIdleForAutoTarget`.
-//! None of those four behaviours are implemented by this slice, and the
-//! auto-target one lives in the techno-AI host rather than here, so the key is
-//! left unparsed rather than parsed-and-ignored. Whoever wires the first of
-//! those consumers should add it then.
+//! Only GetFireError's is ported; the other three are not this slice's.
 //!
 //! ## Dependency rules
 //! - Part of sim/ — depends on sim/world, sim/combat, sim/movement, rules/.
@@ -59,13 +56,14 @@ use crate::rules::missile_spawn::MissileFamily;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::combat::TargetKind;
 use crate::sim::intern::InternedId;
+use crate::sim::timer::CdTimer;
 use crate::sim::world::{Simulation, UninitContext};
 
 /// Frames the manager waits before its very first AI pass
 /// (`UpdateTimer.Duration = 0x14` at construction).
-const FIRST_UPDATE_DELAY_FRAMES: u32 = 20;
+const FIRST_UPDATE_DELAY_FRAMES: i32 = 20;
 /// Frames between AI passes once the manager has run at least once.
-const UPDATE_PERIOD_FRAMES: u32 = 10;
+const UPDATE_PERIOD_FRAMES: i32 = 10;
 /// Per-launch delay written to the manager's reload timer when the *parent*
 /// type does not set `MissileSpawn=`. No stock YR parent sets it, so this is
 /// the only branch reachable in stock play.
@@ -75,43 +73,6 @@ const LAUNCH_DELAY_FRAMES: u32 = 20;
 const LAUNCH_DELAY_FRAMES_MISSILE_PARENT: u32 = 9;
 /// Height difference (leptons) under which a returning child counts as docked.
 const DOCK_HEIGHT_EPSILON_LEPTONS: i32 = 0x14;
-
-/// Native `RateTimerClass` pair: an anchor frame plus a duration.
-///
-/// `start_frame == None` models the native `-1` sentinel ("never anchored"),
-/// in which case the timer is due only when its duration is zero. Otherwise the
-/// timer is due once `duration` frames have elapsed since the anchor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SpawnTimer {
-    pub start_frame: Option<u32>,
-    pub duration: u32,
-}
-
-impl SpawnTimer {
-    /// A timer that is already due (native `{ -1, 0 }`).
-    pub const fn ready() -> Self {
-        Self {
-            start_frame: None,
-            duration: 0,
-        }
-    }
-
-    /// Anchor at `frame` for `duration` frames.
-    pub const fn armed(frame: u32, duration: u32) -> Self {
-        Self {
-            start_frame: Some(frame),
-            duration,
-        }
-    }
-
-    /// Native expiry test: remaining time has reached zero.
-    pub fn due(self, now: u32) -> bool {
-        match self.start_frame {
-            None => self.duration == 0,
-            Some(start) => now.wrapping_sub(start) >= self.duration,
-        }
-    }
-}
 
 /// Per-slot state. Native uses 0..7 with no case 5; the gap is preserved by
 /// simply not having a variant for it.
@@ -140,7 +101,10 @@ pub struct SpawnSlot {
     /// Stable id of the child, or `None` while regenerating.
     pub spawn: Option<u64>,
     pub state: SpawnSlotState,
-    pub timer: SpawnTimer,
+    /// The slot's timer. A ready slot's is left paused with no time left
+    /// ([`CdTimer::default`]); native restarts it at the current frame with
+    /// none, which reads the same.
+    pub timer: CdTimer,
     /// Set when the pool's child type is one of the three hardcoded rocket
     /// families. Drives the launch stationary-gate and the kamikaze path.
     pub is_missile_spawn: bool,
@@ -174,9 +138,9 @@ pub struct SpawnManagerState {
     pub kamikaze_wait_frames: u32,
     pub slots: Vec<SpawnSlot>,
     /// Gates the whole AI pass (20 frames, then 10).
-    pub update_timer: SpawnTimer,
+    pub update_timer: CdTimer,
     /// Gates launches across the pool, not per slot.
-    pub reload_timer: SpawnTimer,
+    pub reload_timer: CdTimer,
     pub current_target: Option<TargetKind>,
     pub queued_target: Option<TargetKind>,
     pub mode: SpawnManagerMode,
@@ -204,6 +168,31 @@ impl SpawnManagerState {
                     slot.state,
                     SpawnSlotState::ReadyDocked | SpawnSlotState::Reloading
                 )
+            })
+            .count()
+    }
+
+    /// Native `0x006B7D80`, read by the Drive/Ship Process_Movement gate
+    /// (0x4B272C / 0x6A1D49) before its no-queue path request: slots waiting
+    /// out a kamikaze launch (state 1), plus in-flight children (state 2)
+    /// outside limbo (+81) whose own type sets `MissileSpawn=` (+D68).
+    pub(crate) fn count_launched_missiles(
+        &self,
+        entities: &crate::sim::entity_store::EntityStore,
+        rules: &RuleSet,
+        interner: &crate::sim::intern::StringInterner,
+    ) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| match slot.state {
+                SpawnSlotState::KamikazeWait => true,
+                SpawnSlotState::InFlight => slot
+                    .spawn
+                    .and_then(|id| entities.get(id))
+                    .filter(|child| !child.lifecycle.in_limbo)
+                    .and_then(|child| rules.object(interner.resolve(child.type_ref())))
+                    .is_some_and(|kind| kind.missile_spawn),
+                _ => false,
             })
             .count()
     }
@@ -267,7 +256,7 @@ pub fn init_spawn_manager(
             // world-owned constructor transaction can fill them. Native fills
             // them in the manager constructor.
             state: SpawnSlotState::Regenerating,
-            timer: SpawnTimer::ready(),
+            timer: CdTimer::default(),
             is_missile_spawn,
         })
         .collect();
@@ -281,8 +270,8 @@ pub fn init_spawn_manager(
             .map(|family| rules.missile_spawn.kamikaze_wait_frames(family))
             .unwrap_or(0),
         slots,
-        update_timer: SpawnTimer::armed(frame, FIRST_UPDATE_DELAY_FRAMES),
-        reload_timer: SpawnTimer::ready(),
+        update_timer: CdTimer::started(frame as i32, FIRST_UPDATE_DELAY_FRAMES),
+        reload_timer: CdTimer::default(),
         current_target: None,
         queued_target: None,
         mode: SpawnManagerMode::Idle,
@@ -321,11 +310,11 @@ pub fn tick_spawn_managers(
 ) {
     let frame = sim.session.binary_frame;
     for &owner_id in order {
-        let has_manager = sim
-            .substrate
-            .entities
-            .get(owner_id)
-            .is_some_and(|e| e.spawn_manager.is_some() && e.lifecycle.object_alive);
+        // A warped owner's AI_Update does not run (`GameEntity::ai_frozen`),
+        // so the spawns its warp start killed wait for its release.
+        let has_manager = sim.substrate.entities.get(owner_id).is_some_and(|e| {
+            e.spawn_manager.is_some() && e.lifecycle.object_alive && !e.ai_frozen()
+        });
         if !has_manager {
             continue;
         }
@@ -348,10 +337,10 @@ fn tick_one_manager(
         let Some(manager) = entity.spawn_manager.as_mut() else {
             return;
         };
-        if !manager.update_timer.due(frame) {
+        if !manager.update_timer.expired(frame as i32) {
             return;
         }
-        manager.update_timer = SpawnTimer::armed(frame, UPDATE_PERIOD_FRAMES);
+        manager.update_timer = CdTimer::started(frame as i32, UPDATE_PERIOD_FRAMES);
     }
 
     // Reap children that no longer exist before the slot walk, so a slot whose
@@ -414,7 +403,7 @@ fn reap_expired_spawns(sim: &mut Simulation, owner_id: u64, frame: u32) {
         let slot = &mut manager.slots[index];
         slot.spawn = None;
         slot.state = SpawnSlotState::Regenerating;
-        slot.timer = SpawnTimer::armed(frame, regen_rate);
+        slot.timer = CdTimer::started(frame as i32, regen_rate as i32);
     }
 }
 
@@ -433,13 +422,13 @@ fn step_slot(sim: &mut Simulation, rules: &RuleSet, owner_id: u64, slot_index: u
     match slot.state {
         SpawnSlotState::ReadyDocked => step_ready_docked(sim, rules, owner_id, slot_index, frame),
         SpawnSlotState::KamikazeWait => {
-            if slot.timer.due(frame) {
+            if slot.timer.expired(frame as i32) {
                 // The missile is on its own now; free the slot to regenerate.
                 let regen_rate = manager_field(sim, owner_id, |m| m.regen_rate).unwrap_or(0);
                 with_slot(sim, owner_id, slot_index, |slot| {
                     slot.spawn = None;
                     slot.state = SpawnSlotState::Regenerating;
-                    slot.timer = SpawnTimer::armed(frame, regen_rate);
+                    slot.timer = CdTimer::started(frame as i32, regen_rate as i32);
                 });
             }
         }
@@ -447,12 +436,12 @@ fn step_slot(sim: &mut Simulation, rules: &RuleSet, owner_id: u64, slot_index: u
         SpawnSlotState::ReturningToDock => step_returning(sim, rules, owner_id, slot_index),
         SpawnSlotState::LandingAtDock => step_landing(sim, rules, owner_id, slot_index, frame),
         SpawnSlotState::Reloading => {
-            if slot.timer.due(frame) {
+            if slot.timer.expired(frame as i32) {
                 restore_docked_child(sim, rules, owner_id, slot_index);
             }
         }
         SpawnSlotState::Regenerating => {
-            if slot.timer.due(frame) {
+            if slot.timer.expired(frame as i32) {
                 regenerate_child(sim, rules, owner_id, slot_index);
             }
         }
@@ -475,7 +464,7 @@ fn step_ready_docked(
         .map(|m| {
             (
                 m.current_target,
-                m.reload_timer.due(frame),
+                m.reload_timer.expired(frame as i32),
                 m.mode,
                 m.slots[slot_index].is_missile_spawn,
                 m.slots[slot_index].spawn,
@@ -496,7 +485,8 @@ fn step_ready_docked(
     // Missile slots only launch from a fully stationary parent — the native
     // gate calls ILocomotor::Is_Moving and Is_Moving_Now on the owner. Aircraft
     // slots skip it, so Hornets launch from a moving Carrier.
-    if is_missile_slot && (owner.movement_target.is_some() || owner.facing_target.is_some()) {
+    if is_missile_slot && (owner.movement_target.is_some() || owner.body_facing.is_rotating(frame))
+    {
         return;
     }
     // A deployed parent does not launch (native reads owner+0x6AD).
@@ -508,8 +498,8 @@ fn step_ready_docked(
     let launch_rx = owner.position.rx;
     let launch_ry = owner.position.ry;
     let launch_z = owner.position.z;
-    let launch_facing = owner.facing;
-    let owner_veterancy = owner.veterancy;
+    let launch_facing = owner.body_facing_byte(frame);
+    let owner_veterancy = owner.veterancy();
     let parent_missile_spawn = rules
         .object(&owner_type)
         .map(|o| o.missile_spawn)
@@ -544,15 +534,16 @@ fn step_ready_docked(
         None
     };
 
-    // Place the child in the world at the launcher.
+    // Place the child in the world at the launcher; its Unlimbo snaps the
+    // body to the launch direction (`0x006F6DAA`).
     if let Some(child) = sim.substrate.entities.get_mut(child_id) {
         child.position.rx = launch_rx;
         child.position.ry = launch_ry;
         child.position.z = launch_z;
-        child.facing = launch_facing;
+        child.body_facing.snap(u16::from(launch_facing) << 8, frame);
     }
     let revealed = matches!(
-        sim.reveal(child_id),
+        sim.reveal_entity_with_rules(child_id, rules),
         crate::sim::world::RevealOutcome::Revealed { .. }
     );
     if !revealed {
@@ -580,7 +571,7 @@ fn step_ready_docked(
     }
 
     with_manager(sim, owner_id, |m| {
-        m.reload_timer = SpawnTimer::armed(frame, launch_delay);
+        m.reload_timer = CdTimer::started(frame as i32, launch_delay as i32);
         m.slots[slot_index].state = SpawnSlotState::InFlight;
     });
 }
@@ -685,7 +676,7 @@ fn step_landing(
         let reload_rate = manager_field(sim, owner_id, |m| m.reload_rate).unwrap_or(0);
         with_slot(sim, owner_id, slot_index, |slot| {
             slot.state = SpawnSlotState::Reloading;
-            slot.timer = SpawnTimer::armed(frame, reload_rate);
+            slot.timer = CdTimer::started(frame as i32, reload_rate as i32);
         });
     } else {
         recall_child_to_owner(sim, rules, owner_id, child_id);
@@ -707,17 +698,17 @@ fn restore_docked_child(sim: &mut Simulation, rules: &RuleSet, owner_id: u64, sl
     if let Some(obj) = child_type.as_deref().and_then(|name| rules.object(name))
         && let Some(child) = sim.substrate.entities.get_mut(child_id)
     {
-        // Native state 6 writes Health (and its smoothed mirror) from the
+        // Native state 6 writes Health and retained estimated health from the
         // child type's `Strength=`, and Ammo from the child type's `Ammo=`.
-        child.health.current = obj.strength.max(1) as u16;
-        child.health.max = obj.strength.max(1) as u16;
+        child.health.current = obj.strength;
+        child.estimated_health.reset(child.health.current);
         if let Some(ammo) = child.aircraft_ammo.as_mut() {
             ammo.current = ammo.max;
         }
     }
     with_slot(sim, owner_id, slot_index, |slot| {
         slot.state = SpawnSlotState::ReadyDocked;
-        slot.timer = SpawnTimer::ready();
+        slot.timer = CdTimer::default();
     });
 }
 
@@ -735,7 +726,7 @@ fn regenerate_child(sim: &mut Simulation, rules: &RuleSet, owner_id: u64, slot_i
                 owner.position.rx,
                 owner.position.ry,
                 owner.position.z,
-                owner.facing,
+                owner.body_facing_byte(sim.session.binary_frame),
             )
         })
     else {
@@ -756,7 +747,7 @@ fn regenerate_child(sim: &mut Simulation, rules: &RuleSet, owner_id: u64, slot_i
         slot.spawn = Some(child_id);
         slot.is_missile_spawn = missile_family.is_some();
         slot.state = SpawnSlotState::ReadyDocked;
-        slot.timer = SpawnTimer::ready();
+        slot.timer = CdTimer::default();
     });
 }
 
@@ -779,9 +770,10 @@ fn step_manager_mode(
             };
             // gamemd-derived: `SpawnManagerClass::AI` @ 0x006B7230 mode 0
             // promotes +0x6C to +0x68, then Unit's vslot +0x3AC reaches
-            // `TechnoClass::CanFireAtTarget` @ 0x006F7780. A false result calls
-            // `ClearAllTargets` @ 0x006B7BB0 and returns before Launching.
-            let target_is_legal = sim.resolved_terrain.as_ref().is_some_and(|terrain| {
+            // `TechnoClass::CanFireAtTarget` @ 0x006F7780 (InRange with the
+            // selected weapon). A false result calls `ClearAllTargets` @
+            // 0x006B7BB0 and returns before Launching.
+            let can_fire_at = sim.resolved_terrain.as_ref().is_some_and(|terrain| {
                 crate::sim::combat::can_fire_at_target(
                     &sim.substrate.entities,
                     rules,
@@ -797,7 +789,7 @@ fn step_manager_mode(
                     },
                 )
             });
-            if !target_is_legal {
+            if !can_fire_at {
                 with_manager(sim, owner_id, SpawnManagerState::clear_all_targets);
                 return;
             }
@@ -865,7 +857,7 @@ fn step_manager_mode(
                     if is_missile_family {
                         with_slot(sim, owner_id, index, |slot| {
                             slot.state = SpawnSlotState::KamikazeWait;
-                            slot.timer = SpawnTimer::armed(frame, kamikaze_frames);
+                            slot.timer = CdTimer::started(frame as i32, kamikaze_frames as i32);
                         });
                     } else {
                         // No kamikaze window: the slot starts regenerating now.
@@ -874,7 +866,7 @@ fn step_manager_mode(
                         with_slot(sim, owner_id, index, |slot| {
                             slot.spawn = None;
                             slot.state = SpawnSlotState::Regenerating;
-                            slot.timer = SpawnTimer::armed(frame, regen_rate);
+                            slot.timer = CdTimer::started(frame as i32, regen_rate as i32);
                         });
                     }
                 } else {
@@ -976,25 +968,57 @@ fn child_ammo(sim: &Simulation, child_id: u64) -> i32 {
         .get(child_id)
         .and_then(|c| c.aircraft_ammo.as_ref())
         .map(|a| a.current)
-        // No finite-ammo tracking means unlimited; native reads Ammo=-1 the
-        // same way and never sends such a child home to rearm.
+        // Real Aircraft now retain their signed count, including -1. This
+        // fallback applies only to incomplete/non-Aircraft compatibility data.
         .unwrap_or(i32::MAX)
 }
 
+/// `child.vt+0x3C8 Assign_Target(target)` then `vt+0x1E8 Queue_Mission(Attack,
+/// 0)` (slot states 3 and 4, and the send-out, `0x006B7718`/`0x006B772C`).
+/// Re-issued every manager pass, both are no-ops on a child already attacking
+/// that target: Assign_Target returns on the same target (`0x006FCDCC`) and
+/// Queue_Mission skips the mission already current (`0x005B35E0`). A new
+/// target mid-run is Assign_Target's aircraft arm (`0x006FCE27`).
+///
+/// The queue goes through the mission owner: `AircraftClass::AI` pays a
+/// pending release (`0x0041505E`) whenever the current mission is not Attack,
+/// so a child whose mission owner never saw Attack paid its pass's ammo the
+/// frame after its first bomb and was recalled.
 fn assign_child_attack(sim: &mut Simulation, child_id: u64, target: TargetKind) {
+    let commits = crate::sim::mission::concrete_effects::assign_target_commits(
+        &sim.substrate.entities,
+        Some(target),
+    );
     if let Some(child) = sim.substrate.entities.get_mut(child_id) {
-        child.attack_target = Some(match target {
-            TargetKind::Entity(id) => crate::sim::combat::AttackTarget::new(id),
-            TargetKind::Cell(rx, ry) => crate::sim::combat::AttackTarget::for_cell(rx, ry),
-        });
-        if let Some(mission) = child.aircraft_mission.as_mut() {
-            *mission = crate::sim::aircraft::AircraftMission::Attack {
-                sub_state: 0,
-                has_fired: false,
-                is_strafe: false,
-            };
-        }
+        crate::sim::mission::concrete_effects::represented_assign_target_admitted(
+            child,
+            Some(target),
+            commits,
+        );
     }
+    queue_child_mission(sim, child_id, crate::sim::mission::MissionType::Attack);
+    if let Some(child) = sim.substrate.entities.get_mut(child_id)
+        && let Some(mission) = child.aircraft_mission.as_mut()
+        && !mission.is_attacking()
+    {
+        *mission = crate::sim::aircraft::AircraftMission::Attack { sub_state: 0 };
+    }
+}
+
+/// The manager's `child.vt+0x1E8 Queue_Mission(mission, 0)` through the
+/// child's mission owner (the aircraft override's guards included).
+fn queue_child_mission(
+    sim: &mut Simulation,
+    child_id: u64,
+    mission: crate::sim::mission::MissionType,
+) {
+    let _ = sim.mission_queue_exact(
+        child_id,
+        crate::sim::mission::MissionId::from_known(mission),
+        0,
+        sim.session.binary_frame,
+        &crate::sim::mission::authority::EntityReadyInputProvider,
+    );
 }
 
 /// Native state 3/4 issue `Assign_Destination(target)` + `Assign_Mission(Move)`
@@ -1040,12 +1064,9 @@ fn hold_child_over_owner(
             *mission = crate::sim::aircraft::AircraftMission::Move { sub_state: 0 };
         }
     }
-    crate::sim::movement::air_movement::issue_air_move_command(
-        &mut sim.substrate.entities,
-        child_id,
-        (rx, ry),
-        speed,
-    );
+    // `Queue_Mission(Move, 0)` (`0x006B7608`, `0x006B76D8`).
+    queue_child_mission(sim, child_id, crate::sim::mission::MissionType::Move);
+    sim.issue_air_cell_destination(child_id, (rx, ry), speed, Some(rules));
 }
 
 /// The eight-direction cell step native uses for the owner-relative hold cell.
@@ -1078,9 +1099,9 @@ fn child_air_speed(
     sim.substrate
         .entities
         .get(child_id)
-        .map(|c| sim.interner.resolve(c.type_ref()).to_string())
-        .and_then(|name| rules.object(&name))
-        .map(|obj| crate::util::fixed_math::ra2_speed_to_leptons_per_second(obj.speed.max(1)))
+        .map(|c| {
+            crate::sim::movement::order_speed(c, sim.object_type(c.type_ref(), rules), Some(rules))
+        })
         .unwrap_or(crate::util::fixed_math::SimFixed::from_num(8))
 }
 
@@ -1101,12 +1122,9 @@ fn recall_child_to_owner(sim: &mut Simulation, rules: &RuleSet, owner_id: u64, c
             *mission = crate::sim::aircraft::AircraftMission::Move { sub_state: 0 };
         }
     }
-    crate::sim::movement::air_movement::issue_air_move_command(
-        &mut sim.substrate.entities,
-        child_id,
-        (rx, ry),
-        speed,
-    );
+    // `Queue_Mission(Move, 0)` (`0x006B7687`, `0x006B785C`).
+    queue_child_mission(sim, child_id, crate::sim::mission::MissionType::Move);
+    sim.issue_air_cell_destination(child_id, (rx, ry), speed, Some(rules));
 }
 
 /// Hand a launched missile child to the rocket locomotor with the impact
@@ -1177,6 +1195,7 @@ fn launch_missile_child(
         (target_rx, target_ry),
         speed,
         Some(payload),
+        sim.session.binary_frame,
     );
 }
 
@@ -1201,6 +1220,10 @@ pub struct MissileDetonation {
     pub firer_id: u64,
     /// House the missile carried, for the area-damage owner argument.
     pub owner: InternedId,
+    /// The exact impact coordinate (world leptons) of a missile that
+    /// exploded in flight ([`detonate_dead_missile`]); `None` detonates on
+    /// the ground of the target cell `(rx, ry)`.
+    pub impact: Option<crate::sim::projectile::ProjectileCoord>,
 }
 
 /// Consume every missile that reached its target during this tick's movement
@@ -1238,58 +1261,70 @@ pub fn detonate_missiles(sim: &mut Simulation, detonated: &[u64]) {
                 damage: payload.damage,
                 firer_id: payload.firer_id,
                 owner,
+                impact: None,
             });
         }
         sim.uninit(missile_id);
     }
 }
 
-/// Tear down a parent's whole pool.
+/// `RocketLocomotion::Detonate` (`0x00663030`) for a missile that lost its
+/// Health in flight. `ILoco::Process` checks its owner after the flight step
+/// (`0x00662FD5..0x00662FE1`), so a missile shot down by AA — latched
+/// crashing by `FootClass::Crash`, which only a Fly locomotor then drops —
+/// explodes where it is on its next turn instead of flying on to its target.
+/// The payload is the one its launch selected, and the impact joins the
+/// arrival queue ([`detonate_missiles`], with the same within-tick drift).
 ///
-/// `SpawnManagerClass::Kill_All_Spawns` (`decompile_function 0x006B7100`,
-/// re-read 2026-08-03) walks the slots backwards, skips any already in
-/// `Regenerating`, and has exactly three arms:
+/// RESIDUAL: native explodes `BodyLength=` ahead of the missile along its nose
+/// (`0x006630F7..0x006631C7`: X and Y by the facing, Z by the pitch `+0x54`);
+/// VERA's rocket flight keeps no native pitch, so the blast is at the
+/// missile's own coordinate. Trigger: AA kills a V3, Dreadnought or Boomer
+/// missile. Effect: the blast centre sits up to BodyLength behind native
+/// (stock 256 leptons for V3, 128 for the others). Frequency: every such
+/// shot-down. Downstream: the area damage's reach shifts by that distance.
 ///
-/// - **`ReadyDocked` / `Reloading`** — call the child's destroy slot
-///   (`vtable+0xF8`), null the slot pointer, arm the regen timer.
-/// - **`KamikazeWait`** — a missile that has *already left the launcher*:
-///   remove it from the retreat list, then call the same destroy slot. The
-///   in-flight missile dies with its launcher; the salvo does **not** land.
-/// - **everything else** (`InFlight` / `ReturningToDock` / `LandingAtDock`,
-///   i.e. the aircraft states) — push the child onto the global retreat list so
-///   it keeps flying toward the last target. This is the "Hornets keep going
-///   after the Carrier sinks" behaviour.
-///
-/// The regen duration is `SpawnRegenRate` when the owner is dead
-/// (`owner.Health < 1 || !owner.IsAlive`) and **zero** when it is still alive —
-/// so an ownership change or a deploy rebuilds the pool on the next AI pass
-/// rather than after a full regen wait.
-///
-/// VERA has no global retreat list, so the aircraft arm releases the child
-/// (clears `spawn_owner_id`) and leaves it flying instead of re-issuing a
-/// destination each tick. **VERA-internal; the retreat list's per-tick
-/// re-issue and its `HP = 1` marking are UNCHECKED.**
-///
-/// This routine never touches `CurrentTarget`/`QueuedTarget`; the caller
-/// decides. `Simulation::uninit` pairs it with `ClearAllTargets`, matching the
-/// owner arm of `SpawnManagerClass::PointerExpired`, while
-/// `Simulation::change_owner` calls only this one. The *target* arm of the same
-/// native routine also clears targets and is a separate path entirely — see
-/// [`notify_pointer_expired`].
-///
-/// Native callers of this routine, and which are wired here:
-/// - `SpawnManagerClass::PointerExpired(owner)` — WIRED, via
-///   `Simulation::uninit`, together with the `ClearAllTargets` it pairs with.
-/// - `TechnoClass::ChangeOwner` (`0x0070157E`) — WIRED, via
-///   `Simulation::change_owner`; this is the mind-control path.
-/// - `TemporalClass::InitiateWarp` (`0x0071AF39`) — **not wired.** A
-///   chrono-warped V3/Dreadnought keeps its pool across the warp. Fires only
-///   when a Chrono Legionnaire targets one of the five spawner units.
-/// - `TechnoClass::PerformDeploy` (`0x00710021`) — **not wired.** No stock
-///   spawner unit sets `DeploysInto=`, so this arm is unreachable in stock YR.
-/// - `FootClass::StopFiring` → `FUN_006fcd40` — **not wired**, and gated on
-///   `owner+0x6AD` which was not traced. UNCHECKED.
-/// - The destructor — covered by the `uninit` hook.
+/// RESIDUAL: the area damage's source is the launcher (the queued impact's
+/// owner, for kill credit), where native passes the missile itself
+/// (`0x006632B8`); `Apply_area_damage` leaves its source out of the ground
+/// list. Trigger: a missile shot down within its warhead's CellSpread of its
+/// launcher. Effect: the launcher is spared the blast. Frequency: rare (AA
+/// covering the launcher). Downstream: that launcher's health.
+pub(crate) fn detonate_dead_missile(sim: &mut Simulation, missile_id: u64) {
+    let Some((impact, rx, ry, payload, owner)) =
+        sim.substrate.entities.get(missile_id).and_then(|entity| {
+            let coord = crate::sim::movement::ground_pose::position_world_coord(&entity.position);
+            entity.rocket_state.as_ref().map(|rocket| {
+                (
+                    crate::sim::projectile::ProjectileCoord {
+                        x: coord.x,
+                        y: coord.y,
+                        z: coord.z,
+                    },
+                    entity.position.rx,
+                    entity.position.ry,
+                    rocket.payload,
+                    entity.owner(),
+                )
+            })
+        })
+    else {
+        return;
+    };
+    if let Some(payload) = payload {
+        sim.pending_missile_detonations.push(MissileDetonation {
+            rx,
+            ry,
+            warhead: payload.warhead,
+            damage: payload.damage,
+            firer_id: payload.firer_id,
+            owner,
+            impact: Some(impact),
+        });
+    }
+    sim.uninit(missile_id);
+}
+
 /// `SpawnManagerClass::PointerExpired` (`decompile_function 0x006B7C60`) for
 /// one listening manager, minus the owner arm.
 ///
@@ -1303,7 +1338,8 @@ pub fn detonate_missiles(sim: &mut Simulation, detonated: &[u64]) {
 /// if      (expired == CurrentTarget) { CurrentTarget = 0;
 ///                                      if (QueuedTarget == 0) ClearAllTargets(); }
 /// else if (expired == QueuedTarget)  { QueuedTarget = 0; }
-/// else if (expired is a slot child)  { slot.Spawn = 0; slot.State = 7;
+/// else if (expired is a slot child)  { if (child alive) return;  // see below
+///                                      slot.Spawn = 0; slot.State = 7;
 ///                                      slot.Timer = SpawnRegenRate; }
 /// else if (expired == Owner)         { Kill_All_Spawns(); ClearAllTargets(); }
 /// ```
@@ -1314,22 +1350,26 @@ pub fn detonate_missiles(sim: &mut Simulation, detonated: &[u64]) {
 /// their ammo never reaches zero, so the recall condition never fires and they
 /// hover until the player issues a fresh order.
 ///
-/// The owner arm is handled at `Simulation::uninit`, which calls
-/// [`kill_all_spawns`] and [`clear_all_spawn_targets`] directly.
+/// The owner arm is handled by `Simulation::spawn_manager_owner_expired`, which
+/// calls [`kill_all_spawns_with_context`] and [`clear_all_spawn_targets`] directly.
 ///
-/// **Slot-arm difference.** Native guards the slot arm with an *alive-child*
-/// test — `child+0x6C > 0 && child+0x6CA == 0 && node+0x14 != 1`, i.e. health
-/// above zero, not already on the retreat list, and not a missile slot.
-/// `+0x6C` is Health, proven by state 6 writing `childType+0xA0` (`Strength=`)
-/// into `+0x6C`/`+0x70`. The guard exists because native delivers
-/// `PointerExpired` for *living* children too, on limbo — a Hornet docking
-/// would otherwise expire its own slot. Omitting it is safe here only because
-/// `Simulation::techno_limbo` does not run the expiry broadcast, so this
-/// function is never called for a child that is merely being limboed.
-/// Recorded, not implemented.
+/// **Slot-arm alive-child guard** (`0x006B7CDD..0x006B7CF2`): the slot is
+/// kept, and nothing else happens, while `child+0x6C > 0 && child+0x6CA == 0
+/// && node+0x14 != 1`, i.e. the child has Health, is not on the retreat
+/// tracker, and the slot is not a missile slot. `+0x6C` is Health, proven by
+/// state 6 writing `childType+0xA0` (`Strength=`) into `+0x6C`/`+0x70`. The
+/// guard exists because `ObjectClass::Limbo` broadcasts (`0x005F4D61`), and a
+/// Hornet docking through `step_landing`'s Limbo would otherwise expire its own
+/// slot and strand itself in limbo. `+0x6CA` needs no VERA field: on an
+/// aircraft the constructor clears it (`0x00413D4E`) and only
+/// `SpawnRetreat__Push` sets it (`0x0054E47D`, a `MissileSpawn=` child), and
+/// every Push caller frees the slot right after — Kill_All_Spawns directly
+/// (`0x006B71C2`), the launch and ClearAllTargets through this routine
+/// (`0x006B7ACD`, `0x006B7C16`) — except a missile slot's launch, and a
+/// missile slot is freed on any expiry by the `is_missile_spawn` test.
 pub fn notify_pointer_expired(sim: &mut Simulation, listener_id: u64, expired_id: u64) {
     if listener_id == expired_id {
-        // The owner arm; `Simulation::uninit` already ran it.
+        // The owner arm; `Simulation::spawn_manager_owner_expired` already ran it.
         return;
     }
     let Some((current, queued, slot_index, regen_rate)) = sim
@@ -1365,18 +1405,28 @@ pub fn notify_pointer_expired(sim: &mut Simulation, listener_id: u64, expired_id
         return;
     }
     if let Some(index) = slot_index {
+        let child_alive = sim
+            .substrate
+            .entities
+            .get(expired_id)
+            .is_some_and(|child| child.health.current > 0);
+        let missile_slot =
+            manager_field(sim, listener_id, |m| m.slots[index].is_missile_spawn).unwrap_or(false);
+        if child_alive && !missile_slot {
+            return;
+        }
         let frame = sim.session.binary_frame;
         with_slot(sim, listener_id, index, |slot| {
             slot.spawn = None;
             slot.state = SpawnSlotState::Regenerating;
-            slot.timer = SpawnTimer::armed(frame, regen_rate);
+            slot.timer = CdTimer::started(frame as i32, regen_rate as i32);
         });
     }
 }
 
 /// `SpawnManagerClass::ClearAllTargets` (`0x006B7BB0`) as a standalone call.
 ///
-/// Kept separate from [`kill_all_spawns`] because the two are separate native
+/// Kept separate from [`kill_all_spawns_with_context`] because the two are separate native
 /// calls: the owner-expired path makes both, the ownership-change path makes
 /// only the kill.
 ///
@@ -1401,10 +1451,65 @@ pub fn clear_all_spawn_targets(sim: &mut Simulation, owner_id: u64) {
     with_manager(sim, owner_id, |m| m.clear_all_targets());
 }
 
-pub fn kill_all_spawns(sim: &mut Simulation, owner_id: u64) {
-    kill_all_spawns_with_context(sim, owner_id, UninitContext::default());
-}
-
+/// Tear down a parent's whole pool.
+///
+/// `SpawnManagerClass::Kill_All_Spawns` (`decompile_function 0x006B7100`,
+/// re-read 2026-08-03) walks the slots backwards, skips any already in
+/// `Regenerating`, and has exactly three arms:
+///
+/// - **`ReadyDocked` / `Reloading`** — call the child's destroy slot
+///   (`vtable+0xF8`), null the slot pointer, arm the regen timer.
+/// - **`KamikazeWait`** — a missile that has *already left the launcher*:
+///   remove it from the retreat list, then call the same destroy slot. The
+///   in-flight missile dies with its launcher; the salvo does **not** land.
+/// - **everything else** (`InFlight` / `ReturningToDock` / `LandingAtDock`,
+///   i.e. the aircraft states) — the slot is marked regenerating, then
+///   `SpawnRetreat__Push @ 0x0054E3B0` (`0x006B71B7`). A child whose type is
+///   not `MissileSpawn=` (`+0xD68`, read at `0x00714F37`) crashes there
+///   (`Crash(0)`, `0x0054E3CA..0x0054E3D2`): the Hornets of a sunk Carrier
+///   fall out of the sky like shot-down aircraft (`Simulation::foot_crash`),
+///   and one already on the ground is refused and stays. A missile joins the
+///   global retreat list and flies on toward the last target.
+///
+/// The regen duration is `SpawnRegenRate` when the owner is dead
+/// (`owner.Health < 1 || !owner.IsAlive`) and **zero** when it is still alive —
+/// so an ownership change or a deploy rebuilds the pool on the next AI pass
+/// rather than after a full regen wait.
+///
+/// VERA has no global retreat list, so the missile arm releases the child
+/// (clears `spawn_owner_id`) and leaves it flying instead of re-issuing a
+/// destination each tick. **VERA-internal; the retreat list's per-tick
+/// re-issue and its `HP = 1` marking are UNCHECKED.** Crash needs the rules;
+/// the rules-less UnInit adapters (tests and fixtures only) release a crashing
+/// child the same way.
+///
+/// This routine never touches `CurrentTarget`/`QueuedTarget`; the caller
+/// decides. `Simulation::spawn_manager_owner_expired` pairs it with
+/// `ClearAllTargets`, matching the owner arm of
+/// `SpawnManagerClass::PointerExpired`, while
+/// `Simulation::change_owner` calls only this one. The *target* arm of the same
+/// native routine also clears targets and is a separate path entirely — see
+/// [`notify_pointer_expired`].
+///
+/// Native callers of this routine, and which are wired here:
+/// - `SpawnManagerClass::PointerExpired(owner)` — WIRED, via
+///   `Simulation::spawn_manager_owner_expired` at the killing hit's Destroy
+///   broadcast and again at UnInit, together with the `ClearAllTargets` it
+///   pairs with. Conceal's Destroy(1) broadcast would reach it too; VERA's
+///   conceal does not run it (RESIDUAL, see `object_conceal_with_context`).
+/// - `TechnoClass::ChangeOwner` (`0x0070157E`) — WIRED, via
+///   `Simulation::change_owner`; this is the mind-control path.
+/// - `TemporalClass::InitiateWarp` (`0x0071AF39`) — WIRED, via
+///   `sim::temporal`: a chrono-warped spawner loses its pool first.
+/// - `TechnoClass::ImbueLocomotor` (`0x00710021`), the Magnetron lift reached
+///   only from the IsLocomotor arm of `BulletClass::DetonateAtCoord`
+///   (`0x004696FB`) — **not wired**; VERA does not port that arm. A Magnetron
+///   lifting a V3 Launcher reaches it.
+/// - `TechnoClass::Stun` (`0x006FCD40`, entered from `FootClass::Stun @
+///   0x004D5660`) — WIRED for the death arm via `Simulation::techno_death_stun`.
+///   Its gate, Foot+0x6AD, is set only by `TechnoClass::ImbueLocomotor @
+///   0x00710000` (a Magnetron lift), which VERA does not port.
+/// - The destructor — covered by the `uninit` hook.
 pub(crate) fn kill_all_spawns_with_context(
     sim: &mut Simulation,
     owner_id: u64,
@@ -1430,7 +1535,9 @@ pub(crate) fn kill_all_spawns_with_context(
     // not touched at all. Nothing in this routine reads or writes the manager's
     // targets either — `ClearAllTargets` is a separate call that only the
     // owner-expired path makes alongside this one.
-    for (index, slot) in slots.into_iter().enumerate() {
+    // Backwards, as native (`0x006B7123` from the last slot, `0x006B7218`):
+    // each crashing Hornet takes its three Scenario draws in that order.
+    for (index, slot) in slots.into_iter().enumerate().rev() {
         if slot.state == SpawnSlotState::Regenerating {
             continue;
         }
@@ -1443,12 +1550,23 @@ pub(crate) fn kill_all_spawns_with_context(
                 | SpawnSlotState::KamikazeWait => {
                     sim.uninit_with_context(child_id, context);
                 }
-                // Aircraft already out: released, not destroyed.
+                // Aircraft already out: `SpawnRetreat__Push`, which crashes
+                // anything but a missile.
                 SpawnSlotState::InFlight
                 | SpawnSlotState::ReturningToDock
                 | SpawnSlotState::LandingAtDock => {
                     if let Some(child) = sim.substrate.entities.get_mut(child_id) {
                         child.spawn_owner_id = None;
+                    }
+                    if let Some(rules) = context.rules()
+                        && sim
+                            .substrate
+                            .entities
+                            .get(child_id)
+                            .and_then(|child| sim.object_type(child.type_ref(), rules))
+                            .is_some_and(|child_type| !child_type.missile_spawn)
+                    {
+                        sim.foot_crash(child_id, None, rules);
                     }
                 }
                 SpawnSlotState::Regenerating => unreachable!("skipped above"),
@@ -1457,7 +1575,7 @@ pub(crate) fn kill_all_spawns_with_context(
         with_slot(sim, owner_id, index, |slot| {
             slot.spawn = None;
             slot.state = SpawnSlotState::Regenerating;
-            slot.timer = SpawnTimer::armed(frame, regen_duration);
+            slot.timer = CdTimer::started(frame as i32, regen_duration as i32);
         });
     }
 }

@@ -31,7 +31,7 @@ impl App {
     }
 
     pub(super) fn return_to_main_menu(state: &mut AppState) {
-        state.match_state.paused = false;
+        state.match_state.debug_pause = false;
         state.match_state.match_presentation.in_game_menu =
             crate::ui::pause_menu::InGameMenuState::Closed;
         state.match_state.match_presentation.in_game_options_anchor = None;
@@ -39,6 +39,9 @@ impl App {
         state.match_state.match_presentation.abort_buttons = Default::default();
         state.match_state.match_presentation.sound_dialog = None;
         state.match_state.match_presentation.saved_game_browser = None;
+        // The dev save/load panel belongs to the match; nothing draws or
+        // closes it at the main menu.
+        state.match_state.match_presentation.show_save_load_panel = false;
         // Persist the deterministic diagnostic log before leaving the scenario.
         // Runtime and presentation resources remain retained in the shell.
         crate::app::match_runtime::sim_tick::flush_replay_log(state);
@@ -53,18 +56,16 @@ impl App {
         // bypasses drive_scenario_exit entirely).
         if let Some(ref mut sfx) = state.audio.sfx_player {
             sfx.stop_all();
-            sfx.set_output_scale(1.0);
         }
-        if let Some(ref mut player) = state.audio.music_player {
-            player.set_output_scale(1.0);
-        }
+        state.audio.set_master_output_scale(1.0);
         state.match_state.match_audio.reset_for_new_match();
         state.frontend.screen = GameScreen::MainMenu;
         Self::enter_shell_window_mode(state);
         state.match_state.input.zoom_level = 1.0;
         state.match_state.input.zoom_target = 1.0;
         state.platform.window.set_cursor_visible(true);
-        log::info!("Returned to main menu");
+        Self::resume_shell_after_match(state);
+        log::info!("Returned to the shell");
     }
 
     /// Apply one foreground-activation edge.
@@ -145,22 +146,23 @@ impl App {
         )
     }
 
-    /// Route one Escape press through the in-scenario modal machine.
+    /// Route one Escape press, or the Options Back control, through the
+    /// in-scenario modal machine.
     pub(super) fn route_in_game_menu_escape(state: &mut AppState) {
         use crate::ui::pause_menu::InGameMenuState;
 
-        // Backing out of Options takes the same exit its Back control does —
-        // apply and persist the touched `[Options]` values — so the two ways of
-        // leaving the dialog cannot disagree about what was saved.
-        if state.match_state.match_presentation.in_game_menu == InGameMenuState::Options {
-            crate::app::persistence::options::in_game_options_close(state);
+        let current = state.match_state.match_presentation.in_game_menu;
+        // Escape and Back leave Options the same way — apply and persist the
+        // touched `[Options]` values, then return to the menu — so the two
+        // cannot disagree about what was saved.
+        if current == InGameMenuState::Options {
+            crate::app::persistence::options::accept_in_game_options(state);
+            log::info!(
+                "In-game Options closed at {} tps",
+                state.match_state.sim_speed_tps
+            );
         }
-        let next = state
-            .match_state
-            .match_presentation
-            .in_game_menu
-            .on_escape();
-        Self::enter_in_game_menu_state(state, next);
+        Self::enter_in_game_menu_state(state, current.on_escape());
     }
 
     /// Commit an in-scenario modal transition and the app-layer effects that
@@ -202,7 +204,8 @@ impl App {
         state.match_state.match_presentation.abort_buttons = Default::default();
         state.match_state.match_presentation.sound_dialog = None;
         if next == InGameMenuState::Menu {
-            state.match_state.match_presentation.pause_menu_has_saves = !state.persistence.repository.browser_entries().is_empty();
+            state.match_state.match_presentation.pause_menu_has_saves =
+                !state.persistence.repository.browser_entries().is_empty();
         }
 
         // Leaving Options: drop the cached `0xBBB` hit-test anchor so the
@@ -211,7 +214,11 @@ impl App {
             state.match_state.match_presentation.in_game_options_anchor = None;
         }
         if next == InGameMenuState::Options {
-            state.match_state.match_presentation.in_game_options.sound_enabled=state.audio.launcher_audio_available;
+            state
+                .match_state
+                .match_presentation
+                .in_game_options
+                .sound_enabled = state.audio.launcher_audio_available;
             // Reset the transient interaction flags so the drag-gated
             // value-label quirk resets on every open.
             state
@@ -221,7 +228,9 @@ impl App {
                 .on_open();
         }
 
-        state.match_state.paused = next.is_open();
+        // An open modal is the pause (`MatchState::paused`); any transition
+        // ends the debug pause.
+        state.match_state.debug_pause = false;
         if next.is_open() {
             // Show the OS cursor so the modal is clickable.
             if state
@@ -249,8 +258,8 @@ impl App {
 
     /// Draw whichever in-scenario modal card is open and commit its route.
     ///
-    /// Options is the native `0xBBB` overlay, drawn earlier in the frame; this
-    /// only reconciles the machine when that overlay closes itself.
+    /// Options is the native `0xBBB` overlay, drawn earlier in the frame, which
+    /// commits its own routes.
     pub(super) fn handle_in_game_menu(state: &mut AppState) {
         use crate::ui::pause_menu::{self, InGameMenuState, ModalOutcome};
 
@@ -267,39 +276,27 @@ impl App {
                     &leave_label,
                 ))
             }
-            // Options is the native `0xBBB` overlay, drawn earlier in the frame
-            // and reconciled by `sync_in_game_menu_with_options_overlay`.
-            InGameMenuState::Options | InGameMenuState::Sound | InGameMenuState::Keyboard | InGameMenuState::SavedGame(_) => ModalOutcome::Stay,
+            // Options is the native `0xBBB` overlay, drawn earlier in the frame;
+            // its Back control returns to the menu through the owner.
+            InGameMenuState::Options
+            | InGameMenuState::Sound
+            | InGameMenuState::Keyboard
+            | InGameMenuState::SavedGame(_) => ModalOutcome::Stay,
         };
 
         Self::apply_in_game_modal_outcome(state, outcome);
     }
 
     /// Every physical or fallback modal commits through the same state/exit owner.
-    pub(crate) fn apply_in_game_modal_outcome(state: &mut AppState, outcome: crate::ui::pause_menu::ModalOutcome) {
+    pub(crate) fn apply_in_game_modal_outcome(
+        state: &mut AppState,
+        outcome: crate::ui::pause_menu::ModalOutcome,
+    ) {
         use crate::ui::pause_menu::ModalOutcome;
         match outcome {
             ModalOutcome::Stay => {}
             ModalOutcome::Enter(next) => Self::enter_in_game_menu_state(state, next),
             ModalOutcome::LeaveMatch => Self::exit_match_to_shell(state),
-        }
-    }
-
-    /// Re-enter the in-game menu when the Options overlay closes itself.
-    ///
-    /// gamemd's Options dialog is a **child** of the in-game menu: when it
-    /// returns, the state machine writes state 1, so closing Options puts the
-    /// player back on the menu rather than back into the mission. The `0xBBB`
-    /// overlay in this port owns its own Back handler and clears `paused`
-    /// there, so the parent state is re-asserted here — before the frame's
-    /// simulation advance, so the child's close cannot leak a stray tick.
-    pub(super) fn sync_in_game_menu_with_options_overlay(state: &mut AppState) {
-        use crate::ui::pause_menu::InGameMenuState;
-
-        if state.match_state.match_presentation.in_game_menu == InGameMenuState::Options
-            && !state.match_state.paused
-        {
-            Self::enter_in_game_menu_state(state, InGameMenuState::Menu);
         }
     }
 
@@ -387,9 +384,11 @@ impl App {
         state.match_state.scenario_outcome = None;
         let _ = state.match_state.scenario_elapsed_clock.stop(wall_ms);
         // gamemd provenance: battle abort teardown; verified
-        // GameExit__BattleControlTerminated @ 0x00686570 starts Theme's fade,
-        // then fades the independent audio master, bounds its voice pump to
-        // 300 timer buckets, and finally hard-stops audio.
+        // GameExit__BattleControlTerminated @ 0x00686570 starts Theme's fade
+        // (`ThemeClass::Stop(1)` @ 0x006865FA), then fades the independent
+        // audio master, bounds its voice pump to 300 timer buckets, and
+        // finally hard-stops audio.
+        state.audio.fade_out_theme(wall_ms);
         let mut scenario_exit =
             crate::app::match_runtime::scenario_exit::ScenarioExitCascade::start(
                 wall_ms,
@@ -494,7 +493,7 @@ impl App {
 
         let mut info = DevOverlayInfo {
             sim_speed_tps: state.match_state.sim_speed_tps,
-            paused: state.match_state.paused,
+            paused: state.match_state.paused(),
             music_volume: state
                 .audio
                 .music_player
@@ -567,10 +566,12 @@ impl App {
                 dispatch::toggle_debug_pause(state);
             }
             DevOverlayAction::ReturnToMenu => {
+                // The developer overlay always returns to the main menu.
+                state.frontend.shell_route = crate::app::shell_route::ShellRoute::MainMenu;
                 Self::return_to_main_menu(state);
             }
             DevOverlayAction::StepOneTick => {
-                if state.match_state.paused {
+                if state.match_state.paused() {
                     state.diag.debug_frame_step_requested = true;
                 }
             }
@@ -656,12 +657,14 @@ impl App {
             .as_ref()
             .is_some_and(|exit| exit.needs_voice_poll(wall_ms));
         let voices_active = poll_voices
-            && match (&mut state.audio.sfx_player, state.process_assets.manager()) {
-                (Some(sfx), Some(assets)) => sfx.pump_and_check_voices(
-                    &state.audio.sound_registry,
-                    assets,
-                    &state.audio.audio_indices,
-                ),
+            && match (
+                &mut state.audio.sfx_player,
+                state.process_assets.manager(),
+                state.process_assets.audio_catalog(),
+            ) {
+                (Some(sfx), Some(assets), Some(catalog)) => {
+                    sfx.pump_and_check_voices(catalog.sounds(), assets, catalog.index())
+                }
                 _ => false,
             };
         let tick = state
@@ -671,25 +674,15 @@ impl App {
             .expect("scenario exit remains present")
             .tick(wall_ms, voices_active);
 
-        if let Some(scale) = tick.music_output_scale {
-            if let Some(player) = state.audio.music_player.as_mut() {
-                player.set_output_scale(scale);
-            }
-        }
-        if let Some(scale) = tick.sfx_output_scale {
-            if let Some(player) = state.audio.sfx_player.as_mut() {
-                player.set_output_scale(scale);
-            }
+        if let Some(scale) = tick.master_output_scale {
+            state.audio.set_master_output_scale(scale);
         }
         if tick.stop_audio {
             state.audio.stop_theme();
-            if let Some(player) = state.audio.music_player.as_mut() {
-                player.set_output_scale(1.0);
-            }
             if let Some(player) = state.audio.sfx_player.as_mut() {
                 player.stop_all();
-                player.set_output_scale(1.0);
             }
+            state.audio.set_master_output_scale(1.0);
         }
         // ScoreDialog__WndProc @ 0x005C9B10 resolves the literal SCORE theme
         // and starts it immediately on WM_INITDIALOG. Keep this after the
@@ -715,12 +708,10 @@ impl App {
                 detail,
                 model,
             }) => {
-                state.frontend.score_screen = Some(model);
-                state.frontend.score_shell_state = Default::default();
-                state.frontend.screen = GameScreen::MissionResult { title, detail };
                 // Victory 006857AE restores the shell pair before score
                 // construction/run at 00685884/0068588B, not after Continue.
                 Self::enter_shell_window_mode(state);
+                Self::open_score_page(state, model, title, detail);
             }
             Some(crate::app::match_runtime::scenario_exit::ScenarioExitDestination::MainMenu) => {
                 Self::return_to_main_menu(state);
@@ -735,7 +726,7 @@ impl App {
     ) {
         match action {
             crate::app::match_runtime::scenario_exit::ScenarioExitVoiceAction::InterruptBattleControlTerminated => {
-                if state.match_state.local_player_owner.is_none() {
+                if state.match_state.local_player_owner().is_none() {
                     log::warn!("Battle-control termination EVA has no pinned local owner");
                     return;
                 }
@@ -743,15 +734,15 @@ impl App {
                 // `VoxClass::PlayEVA("EVA_BattleControlTerminated", 2)` — the
                 // INTERRUPT override; the entry itself is STANDARD CRITICAL.
                 let eva_side = crate::app::presentation::building_anim::local_eva_side(state);
-                if let (Some(sfx), Some(assets)) = (&mut state.audio.sfx_player, state.process_assets.manager()) {
+                if let (Some(sfx), Some(assets), Some(catalog)) = (&mut state.audio.sfx_player, state.process_assets.manager(), state.process_assets.audio_catalog()) {
                     let _ = sfx.play_eva(
                         "EVA_BattleControlTerminated",
                         Some(crate::rules::sound_ini::EvaType::Interrupt),
-                        &state.audio.eva_registry,
+                        catalog.eva(),
                         eva_side,
-                        &state.audio.sound_registry,
+                        catalog.sounds(),
                         assets,
-                        &state.audio.audio_indices,
+                        catalog.index(),
                     );
                 }
             }

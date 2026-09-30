@@ -17,10 +17,13 @@ use crate::util::lepton;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DepartureRoute {
-    Garrison,
     Vehicle,
     LandedAircraft,
     Paradrop,
+    /// A dying Unit's passenger (`UnitClass::ReceiveDamage` `0x00737FD4`,
+    /// `FootClass::RemoveFirstPassenger @ 0x004DE710`). Its attempt never
+    /// fails: a refused passenger dies instead of re-boarding.
+    DeathEscape,
 }
 
 /// The phase which refused departure, rather than a caller-owned rollback plan.
@@ -55,21 +58,40 @@ pub(crate) fn depart_cargo_head(
         .ok_or(DepartureFailure::NoCargo)?;
     let (passenger_id, passenger_size) = cargo.unload_first().ok_or(DepartureFailure::NoCargo)?;
     // FUN_004DE710's empty-hold weapon reset occurs before placement for these
-    // two callers. Garrison resets only after successful scatter; paradrop does
-    // not reset the carrier override at all.
-    if matches!(
+    // callers. Paradrop does not reset the carrier override at all.
+    let emptied = matches!(
         route,
-        DepartureRoute::Vehicle | DepartureRoute::LandedAircraft
-    ) && cargo.is_empty()
-    {
+        DepartureRoute::Vehicle | DepartureRoute::LandedAircraft | DepartureRoute::DeathEscape
+    ) && cargo.is_empty();
+    if emptied {
         transport.weapon_override = None;
+        // The same pop's `+0x4D8` for a `Gunner=` type (`0x004DE72E..
+        // 0x004DE742` -> `0x007464E0`): an IFV's TemporalClass returns to the
+        // gunner, which lets its target go.
+        let gunner = sim
+            .substrate
+            .entities
+            .get(transport_id)
+            .and_then(|transport| sim.object_type(transport.type_ref(), rules))
+            .is_some_and(|object| object.gunner);
+        if gunner {
+            sim.temporal_remove_gunner(transport_id, passenger_id);
+        }
     }
+    // A failed Unlimbo re-attaches the passenger with `+0x82` untouched; only
+    // a successful unload clears it (`0x0073DB98`).
+    let open_topped = sim
+        .substrate
+        .entities
+        .get(passenger_id)
+        .is_some_and(|passenger| passenger.passenger_role.in_open_transport());
     let result = attempt(sim, passenger_id);
     if let Err(failure) = result.as_ref() {
         restore_departure(
             sim,
             rules,
             transport_id,
+            open_topped,
             passenger_id,
             passenger_size,
             route,
@@ -83,6 +105,7 @@ fn restore_departure(
     sim: &mut Simulation,
     rules: &RuleSet,
     transport_id: u64,
+    open_topped: bool,
     passenger_id: u64,
     passenger_size: u32,
     route: DepartureRoute,
@@ -109,7 +132,10 @@ fn restore_departure(
                     if matches!(failure, DepartureFailure::ParachuteReveal(..)) {
                         passenger.parachute_state = None;
                     }
-                    passenger.passenger_role = PassengerRole::Inside { transport_id };
+                    passenger.passenger_role = PassengerRole::Inside {
+                        transport_id,
+                        open_topped,
+                    };
                     if let Some(locomotor) = passenger.locomotor.as_mut() {
                         locomotor.layer = prior_layer;
                     }
@@ -119,7 +145,10 @@ fn restore_departure(
                 unreachable!("invalid paradrop departure phase")
             }
         },
-        DepartureRoute::Garrison | DepartureRoute::Vehicle | DepartureRoute::LandedAircraft => {
+        DepartureRoute::DeathEscape => {
+            unreachable!("a dying transport's passenger never re-boards")
+        }
+        DepartureRoute::Vehicle | DepartureRoute::LandedAircraft => {
             assert!(
                 matches!(
                     failure,
@@ -130,7 +159,10 @@ fn restore_departure(
                 "invalid ground departure phase"
             );
             if let Some(passenger) = sim.substrate.entities.get_mut(passenger_id) {
-                passenger.passenger_role = PassengerRole::Inside { transport_id };
+                passenger.passenger_role = PassengerRole::Inside {
+                    transport_id,
+                    open_topped,
+                };
             }
         }
     }
@@ -155,8 +187,11 @@ fn restore_departure(
 
 /// Reveal a cargo passenger at an exit cell. The passenger's `sub_cell` and
 /// `facing` must already be written by the caller; its role is cleared here.
+/// The Reveal runs without rules, so the barrel elevation Unlimbo writes
+/// follow it here.
 pub(crate) fn reveal_unloaded_passenger(
     sim: &mut Simulation,
+    rules: &RuleSet,
     transport_id: u64,
     passenger_id: u64,
     rx: u16,
@@ -173,7 +208,8 @@ pub(crate) fn reveal_unloaded_passenger(
         debug_assert!(matches!(
             passenger.passenger_role,
             PassengerRole::Inside {
-                transport_id: current_transport
+                transport_id: current_transport,
+                ..
             } if current_transport == transport_id
         ));
         passenger.passenger_role = PassengerRole::None;
@@ -195,7 +231,10 @@ pub(crate) fn reveal_unloaded_passenger(
         },
     );
     match outcome {
-        RevealOutcome::Revealed { .. } => Ok(()),
+        RevealOutcome::Revealed { .. } => {
+            sim.unlimbo_barrel_elevation(passenger_id, rules);
+            Ok(())
+        }
         other => Err(DepartureFailure::GroundReveal(other)),
     }
 }
@@ -205,9 +244,8 @@ pub(crate) fn reveal_unloaded_passenger(
 /// and applies InfantryType+0x688 (IFVMode) through `FUN_0070DC70`. It reverses
 /// the empty-pop `+0x4D8` (`0x007464E0`). Aircraft/Techno bind those slots to
 /// stubs `0x004DE750`/`0x004DE760`; preserve the represented Rust Gunner gate.
-/// UnitClass `+0x4D4` (`0x00746420`) for a `Gunner=yes` transport: the
-/// re-added head passenger's `IFVMode=` becomes the transport's weapon slot
-/// again. VERA's representation of that swap is `weapon_override`.
+/// Gates UnitClass `+0x4D4` ([`super::receive_gunner`]) on a `Gunner=yes`
+/// transport for the re-added head passenger.
 fn reapply_gunner_weapon(sim: &mut Simulation, rules: &RuleSet, transport_id: u64, pax_id: u64) {
     let Some(transport) = sim.substrate.entities.get(transport_id) else {
         return;
@@ -224,9 +262,5 @@ fn reapply_gunner_weapon(sim: &mut Simulation, rules: &RuleSet, transport_id: u6
     let ifv_mode = sim
         .object_type(passenger.type_ref(), rules)
         .map_or(0, |obj| obj.ifv_mode);
-    if let Some(transport) = sim.substrate.entities.get_mut(transport_id) {
-        transport.weapon_override = Some(
-            crate::sim::combat::combat_weapon::WeaponOverride::IfvSlot(ifv_mode),
-        );
-    }
+    super::receive_gunner(sim, transport_id, pax_id, ifv_mode);
 }

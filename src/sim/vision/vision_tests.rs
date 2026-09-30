@@ -15,10 +15,7 @@ fn spawn_with_vision(store: &mut EntityStore, id: u64, owner: &str, rx: u16, ry:
         0,
         0,
         intern::test_intern(owner),
-        Health {
-            current: 100,
-            max: 100,
-        },
+        Health { current: 100 },
         intern::test_intern("E1"),
         EntityCategory::Infantry,
         0,
@@ -395,10 +392,7 @@ fn gsi_08_12_veteran_sight_multiplies_only_for_sight_ability_holders() {
             0,
             0,
             intern::test_intern("Americans"),
-            Health {
-                current: 100,
-                max: 100,
-            },
+            Health { current: 100 },
             intern::test_intern(type_id),
             EntityCategory::Infantry,
             100, // veteran
@@ -455,10 +449,7 @@ fn elevation_grants_no_sight_bonus_at_any_reachable_terrain_level() {
         8,
         0,
         intern::test_intern("Americans"),
-        Health {
-            current: 100,
-            max: 100,
-        },
+        Health { current: 100 },
         intern::test_intern("E1"),
         EntityCategory::Infantry,
         0,
@@ -501,10 +492,7 @@ fn test_elevation_sight_bonus_z0_gives_no_bonus() {
         0,
         0,
         intern::test_intern("Americans"),
-        Health {
-            current: 100,
-            max: 100,
-        },
+        Health { current: 100 },
         intern::test_intern("E1"),
         EntityCategory::Infantry,
         0,
@@ -543,10 +531,7 @@ fn test_elevation_sight_bonus_disabled_when_zero() {
         16,
         0,
         intern::test_intern("Americans"),
-        Health {
-            current: 100,
-            max: 100,
-        },
+        Health { current: 100 },
         intern::test_intern("E1"),
         EntityCategory::Infantry,
         0,
@@ -1971,10 +1956,9 @@ fn shroud_current_sight_provenance_changes_future_conceal_and_hash() {
         &sim.interner,
     );
     let sight_hash = sim.state_hash();
-    let historical_hash = sim.state_hash_without_sustained_gap_sight_v142();
     let mut mapped = sim.fog.clone();
     // Keep the public observation identical, but replace the source's selected
-    // state with a past mapping receipt. Historical projections remain equal.
+    // state with a past mapping receipt.
     mapped.sight_admissions.clear();
     for state in &mut mapped.by_owner.get_mut(&owner).unwrap().shroud_knowledge {
         if state.local_sources > 0 {
@@ -1985,10 +1969,6 @@ fn shroud_current_sight_provenance_changes_future_conceal_and_hash() {
     }
     let sight = std::mem::replace(&mut sim.fog, mapped);
     assert_ne!(sim.state_hash(), sight_hash);
-    assert_eq!(
-        sim.state_hash_without_sustained_gap_sight_v142(),
-        historical_hash
-    );
     apply_gap_generators(&mut sim.fog, &[(gapper, 10, 10, 3)], &sim.interner);
     assert!(!sim.fog.is_cell_revealed(owner, 10, 10));
     sim.fog = sight;

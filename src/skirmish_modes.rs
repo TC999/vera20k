@@ -5,16 +5,39 @@
 //! tick logic by themselves.
 
 use crate::assets::asset_manager::AssetManager;
-use crate::rules::ini_parser::IniFile;
+use crate::rules::ini_parser::{IniFile, IniSection};
 
-const STOCK_MODE_CATEGORIES: [&str; 6] = [
-    "Battle",
-    "ManBattle",
-    "Siege",
-    "Unholy",
-    "FreeForAll",
-    "Cooperative",
-];
+/// The mode class an `MPModesMD.ini` section builds. The loader `0x005D7CE0`
+/// reads the sections in this order, each through its own factory
+/// (`0x005D8170..0x005D82B0`), and inserts every mode by id (`0x005D7590`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MpModeClass {
+    Battle,
+    ManBattle,
+    Siege,
+    Unholy,
+    FreeForAll,
+    Cooperative,
+}
+
+impl MpModeClass {
+    const SECTIONS: [(Self, &'static str); 6] = [
+        (Self::Battle, "Battle"),
+        (Self::ManBattle, "ManBattle"),
+        (Self::Siege, "Siege"),
+        (Self::Unholy, "Unholy"),
+        (Self::FreeForAll, "FreeForAll"),
+        (Self::Cooperative, "Cooperative"),
+    ];
+
+    /// Vtable `+0x40`, which Skirmish's game-type list requires
+    /// (`0x005D6130` at `0x005D6263`). Battle (`0x005C0E20`) and FreeForAll
+    /// (`0x005C5E30`) answer true; ManBattle, Siege, Unholy and Cooperative
+    /// keep the base `0x005D6360` (false).
+    pub const fn lists_in_skirmish(self) -> bool {
+        matches!(self, Self::Battle | Self::FreeForAll)
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum SkirmishModeLoadError {
@@ -28,6 +51,7 @@ pub enum SkirmishModeLoadError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkirmishGameMode {
+    pub class: MpModeClass,
     pub id: i32,
     pub ui_name_key: String,
     pub tooltip_key: String,
@@ -39,14 +63,25 @@ pub struct SkirmishGameMode {
 }
 
 impl SkirmishGameMode {
-    fn from_roster_row_native_defaults(id: i32, value: &str) -> Option<Self> {
-        let fields: Vec<&str> = value.split(',').map(str::trim).collect();
+    /// `0x005D7590`: the row is ReadString into a CString (`0x00528C00`,
+    /// 0x3FE bytes), then `CString::Tokenize(",")` fields trimmed of spaces
+    /// ([`IniSection::read_trimmed_list`]).
+    fn from_roster_row_native_defaults(
+        class: MpModeClass,
+        id: i32,
+        section: &IniSection,
+        key: &str,
+    ) -> Option<Self> {
+        let fields = section.read_trimmed_list(key, 0x3FF)?;
         if fields.len() < 5 {
             return None;
         }
 
-        let random_maps_allowed = parse_bool(fields[4]).unwrap_or(false);
+        // Any fifth field but `false` allows random maps (`_stricmp` at
+        // `0x005D796C`).
+        let random_maps_allowed = !fields[4].eq_ignore_ascii_case("false");
         Some(Self {
+            class,
             id,
             ui_name_key: fields[0].to_string(),
             tooltip_key: fields[1].to_string(),
@@ -59,24 +94,11 @@ impl SkirmishGameMode {
     }
 }
 
-fn parse_bool(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "yes" | "true" | "1" => Some(true),
-        "no" | "false" | "0" => Some(false),
-        _ => None,
-    }
-}
-
 fn apply_common_override(mode: &mut SkirmishGameMode, ini: &IniFile) {
-    let Some(section) = ini.section("MultiplayerDialogSettings") else {
-        return;
-    };
-    if let Some(allies_allowed) = section.get_bool("AlliesAllowed") {
-        mode.allies_allowed = allies_allowed;
-    }
-    if let Some(must_ally) = section.get_bool("MustAlly") {
-        mode.must_ally = must_ally;
-    }
+    // ReadBool over each current value (`0x005D5CE5`, `0x005D5D00`).
+    let section = ini.section_or_empty("MultiplayerDialogSettings");
+    mode.allies_allowed = section.read_bool("AlliesAllowed", mode.allies_allowed);
+    mode.must_ally = section.read_bool("MustAlly", mode.must_ally);
     if !mode.allies_allowed {
         mode.must_ally = false;
     }
@@ -87,18 +109,15 @@ where
     F: FnMut(&str) -> Option<IniFile>,
 {
     let mut modes = Vec::new();
-    for category in STOCK_MODE_CATEGORIES {
+    for (class, category) in MpModeClass::SECTIONS {
         let Some(section) = ini.section(category) else {
             continue;
         };
         for key in section.keys() {
-            let Ok(id) = key.parse::<i32>() else {
-                continue;
-            };
-            let Some(value) = section.get(key) else {
-                continue;
-            };
-            let Some(mut mode) = SkirmishGameMode::from_roster_row_native_defaults(id, value)
+            // The id is the key's atoi (`CString` to int `0x007B6280`).
+            let id = crate::rules::ini_value::crt_atoi(key);
+            let Some(mut mode) =
+                SkirmishGameMode::from_roster_row_native_defaults(class, id, section, key)
             else {
                 continue;
             };
@@ -133,7 +152,17 @@ pub fn skirmish_modes_from_assets(
             message: err.to_string(),
         })?;
 
-    let modes = parse_mpmodes_ini_with_overrides(&roster_ini, |name| {
+    skirmish_modes_from_selected_ini(assets, &roster_ini, &source)
+}
+
+/// Consume the same selected roster in the app and provenance-bearing tools.
+/// Mode body interpretation stays here; callers supply source identity only.
+pub(crate) fn skirmish_modes_from_selected_ini(
+    assets: &AssetManager,
+    roster_ini: &IniFile,
+    source: &str,
+) -> Result<Vec<SkirmishGameMode>, SkirmishModeLoadError> {
+    let modes = parse_mpmodes_ini_with_overrides(roster_ini, |name| {
         let Some((data, override_source)) = assets.get_with_source(name) else {
             log::warn!(
                 "Skirmish MPMode override {name} is missing; using native constructor defaults"
@@ -157,7 +186,9 @@ pub fn skirmish_modes_from_assets(
     });
 
     if modes.is_empty() {
-        Err(SkirmishModeLoadError::EmptyRoster { archive: source })
+        Err(SkirmishModeLoadError::EmptyRoster {
+            archive: source.to_owned(),
+        })
     } else {
         Ok(modes)
     }
@@ -195,6 +226,26 @@ mod tests {
         assert_eq!(modes[0].ui_name_key, "GUI:Battle");
         assert_eq!(modes[0].map_filter, "standard");
         assert!(modes[0].random_maps_allowed);
+    }
+
+    #[test]
+    fn retail_skirmish_lists_battle_free_for_all_and_team_alliance() {
+        let Some(ini) = crate::rules::retail_ini_fixture::retail_ini("mpmodesmd.ini") else {
+            return;
+        };
+        let listed: Vec<(i32, String)> = parse_mpmodes_ini(&ini)
+            .into_iter()
+            .filter(|mode| mode.class.lists_in_skirmish())
+            .map(|mode| (mode.id, mode.ui_name_key))
+            .collect();
+        assert_eq!(
+            listed,
+            [
+                (1, "GUI:Battle".to_string()),
+                (2, "GUI:FreeForAll".to_string()),
+                (9, "GUI:TeamGame".to_string()),
+            ]
+        );
     }
 
     #[test]
@@ -293,5 +344,25 @@ mod tests {
 
         assert!(modes[0].allies_allowed);
         assert!(modes[0].must_ally);
+    }
+    #[test]
+    fn stock_contract_modes_match_selected_retail_roster_and_overrides() {
+        let Some((_, assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+            return;
+        };
+        let modes = skirmish_modes_from_assets(&assets).expect("selected retail MPModes roster");
+        // Fixture coverage must not silently accept the production reader's
+        // tolerant missing/malformed override fallback as retail evidence.
+        for mode in &modes {
+            if !mode.override_file.is_empty() {
+                crate::rules::retail_sources::select_ini(&assets, &mode.override_file)
+                    .expect("every stock roster override is present and parseable");
+            }
+        }
+        assert_eq!(
+            modes,
+            stock_skirmish_modes(),
+            "every consumed roster and override field"
+        );
     }
 }

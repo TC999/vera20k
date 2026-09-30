@@ -4,7 +4,9 @@
 //! node selection, and placement-result classification remain deliberately
 //! outside this module.
 
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
+#[cfg(test)]
+use std::hash::Hasher;
 
 /// One native 16-byte BasePlan node represented without pointer aliases.
 #[derive(
@@ -43,6 +45,7 @@ impl BasePlanState {
     /// PercentBuilt, filled latches, and retry counters are intentionally not
     /// part of this native compatibility helper. Rust's authoritative world
     /// hash covers them separately.
+    #[cfg(test)]
     pub(crate) fn hash_native_checksum_fields(&self, hasher: &mut impl Hasher) {
         (self.nodes.len() as i32).hash(hasher);
         for node in &self.nodes {
@@ -110,44 +113,62 @@ impl BasePlanState {
         Some(matched)
     }
 
-    /// Clear every cached site equal to one failed ordinary coordinate.
-    ///
-    /// Native `BuildingClass__ExitObject_Main @ 0x00443C60` performs this
-    /// ordinary-node clear at `0x0044552D..0x004455A2`.
-    pub(crate) fn clear_failed_site(&mut self, packed_cell: u32) -> usize {
-        let mut cleared = 0;
+    /// Forget a site the Construction Yard's exit could not use: every node
+    /// whose cell is the failed one loses it
+    /// (`BuildingClass::Exit_Object @ 0x00443C60`, `0x0044552D..0x004455A2`).
+    pub(crate) fn clear_failed_site(&mut self, packed_cell: u32) {
         for node in &mut self.nodes {
             if node.packed_cell == packed_cell {
                 node.packed_cell = 0;
-                cleared += 1;
             }
         }
-        cleared
     }
 
-    /// Apply the normalized Building-exit result to one referenced node.
-    ///
-    /// `FUN_0042F380 @ 0x0042F380` increments the signed retry field first; the
-    /// `BuildingClass__ExitObject_Main` result block at
-    /// `0x00445237..0x004452C3` then applies the mode/strict-threshold gates
-    /// and ordered shift-left removal. `Vec::remove` preserves that tail order.
-    pub(crate) fn apply_normalized_placement_result(
+    /// Count a try-later exit against node `index` (`0x0042F380` returns the
+    /// incremented signed count); a skirmish drops the node once the count
+    /// exceeds `maximum_failures` (`0x00445249..0x004452C3`, the ordered
+    /// shift-left removal). Returns whether the node was dropped.
+    pub(crate) fn count_placement_failure(
         &mut self,
-        node_index: usize,
-        normalized_final_result: i32,
+        index: usize,
         game_mode_nonzero: bool,
         maximum_failures: i32,
     ) -> bool {
-        if normalized_final_result != 1 || node_index >= self.nodes.len() {
+        let Some(node) = self.nodes.get_mut(index) else {
             return false;
-        }
-        let retry_count = self.nodes[node_index].retry_count.wrapping_add(1);
-        self.nodes[node_index].retry_count = retry_count;
-        if game_mode_nonzero && retry_count > maximum_failures {
-            self.nodes.remove(node_index);
+        };
+        node.retry_count = node.retry_count.wrapping_add(1);
+        if game_mode_nonzero && node.retry_count > maximum_failures {
+            self.nodes.remove(index);
             return true;
         }
         false
+    }
+
+    /// `DynamicVector<BaseNodeClass>::InsertAfter @ 0x0050EB70`: `node` goes
+    /// right after node `index`. The vector grows by 10 (`0x0042E709`), so
+    /// the insert never fails.
+    pub(crate) fn insert_after(&mut self, index: usize, node: BasePlanNode) {
+        self.nodes.insert(index + 1, node);
+    }
+
+    /// The ordered shift-left removal every caller inlines (`DynamicVector`
+    /// `Delete` of one 16-byte node); nothing past the end.
+    pub(crate) fn remove(&mut self, index: usize) {
+        if index < self.nodes.len() {
+            self.nodes.remove(index);
+        }
+    }
+
+    /// `DynamicVector<BaseNodeClass>::FindIndex @ 0x0042F5E0`, then the
+    /// ordered removal: the first node whose type and both cell words equal
+    /// `copy`'s goes.
+    pub(crate) fn remove_equal(&mut self, copy: BasePlanNode) {
+        if let Some(index) = self.nodes.iter().position(|node| {
+            node.type_or_control == copy.type_or_control && node.packed_cell == copy.packed_cell
+        }) {
+            self.nodes.remove(index);
+        }
     }
 }
 
@@ -272,14 +293,14 @@ mod tests {
                 node(7, -9, 14, false, 11),
             ],
         };
-        assert_eq!(plan.clear_failed_site(target), 2);
+        plan.clear_failed_site(target);
         assert_eq!(plan.nodes[0], node(-3, 0, 0, true, -6));
         assert_eq!(plan.nodes[1], node(5, 8, 8, false, 2));
         assert_eq!(plan.nodes[2], node(7, 0, 0, false, 11));
     }
 
     #[test]
-    fn gsi_04_05_retry_is_postincrement_signed_strict_and_stable() {
+    fn gsi_04_05_retry_counts_before_the_signed_strict_limit() {
         let source = BasePlanState {
             percent_built: 0,
             nodes: vec![
@@ -290,9 +311,9 @@ mod tests {
         };
 
         let mut retail = source.clone();
-        assert!(!retail.apply_normalized_placement_result(1, 1, true, 3));
+        assert!(!retail.count_placement_failure(1, true, 3));
         assert_eq!(retail.nodes[1].retry_count, 3);
-        assert!(retail.apply_normalized_placement_result(1, 1, true, 3));
+        assert!(retail.count_placement_failure(1, true, 3));
         assert_eq!(
             retail
                 .nodes
@@ -304,16 +325,16 @@ mod tests {
 
         let mut equality = source.clone();
         equality.nodes[1].retry_count = 2;
-        assert!(!equality.apply_normalized_placement_result(1, 1, true, 3));
+        assert!(!equality.count_placement_failure(1, true, 3));
         assert_eq!(equality.nodes[1].retry_count, 3);
 
         let mut campaign = source.clone();
-        assert!(!campaign.apply_normalized_placement_result(1, 1, false, -100));
+        assert!(!campaign.count_placement_failure(1, false, -100));
         assert_eq!(campaign.nodes[1].retry_count, 3);
 
         let mut negative = source.clone();
         negative.nodes[0].retry_count = 0;
-        assert!(negative.apply_normalized_placement_result(0, 1, true, -1));
+        assert!(negative.count_placement_failure(0, true, -1));
         assert_eq!(
             negative
                 .nodes
@@ -325,9 +346,8 @@ mod tests {
 
         let mut wrapping = source;
         wrapping.nodes[0].retry_count = i32::MAX;
-        assert!(!wrapping.apply_normalized_placement_result(0, 1, true, 3));
+        assert!(!wrapping.count_placement_failure(0, true, 3));
         assert_eq!(wrapping.nodes[0].retry_count, i32::MIN);
-        assert!(!wrapping.apply_normalized_placement_result(99, 1, true, 3));
-        assert!(!wrapping.apply_normalized_placement_result(0, 0, true, -1));
+        assert!(!wrapping.count_placement_failure(99, true, 3));
     }
 }

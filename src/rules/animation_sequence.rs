@@ -107,6 +107,18 @@ pub enum SequenceKind {
     WetIdle1,
     /// Idle fidget while swimming variant 2 (WetIdle2= in INI).
     WetIdle2,
+    /// A slave digging ore (Shovel= in INI, native action 38): the Doing its
+    /// `InfantryClass::Mission_Harvest @ 0x00522E70` requests while it cuts.
+    Shovel,
+    /// A shot-down Jumpjet infantryman starting to fall (AirDeathStart= in INI,
+    /// native action 34): the crash latch requests it (`0x0054B02C`).
+    AirDeathStart,
+    /// Its fall once AirDeathStart has played out (AirDeathFalling= in INI,
+    /// native action 35, `0x00520BB9`).
+    AirDeathFalling,
+    /// Its landing (AirDeathFinish= in INI, native action 36): the impact
+    /// notice forces it (`0x00522B9B`), and its end UnInits the infantryman.
+    AirDeathFinish,
 }
 
 /// How a sequence behaves when it reaches its last frame.
@@ -192,6 +204,10 @@ pub struct SequenceDef {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SequenceSet {
     sequences: BTreeMap<SequenceKind, SequenceDef>,
+    /// Signed42-action InfantryType records. Generic SHP definitions are only
+    /// a presentation projection; action admission never reads narrowed counts.
+    #[serde(default)]
+    infantry_actions: Option<Vec<crate::rules::infantry_sequence::InfantrySequenceEntry>>,
     /// Derived type configuration for UnitClass SHP bodies. This is not
     /// per-entity animation state; the persistent native state is the Foot
     /// body-frame counter on `GameEntity`.
@@ -226,8 +242,36 @@ impl SequenceSet {
     pub fn new() -> Self {
         Self {
             sequences: BTreeMap::new(),
+            infantry_actions: None,
             shp_vehicle_cadence: None,
         }
+    }
+
+    pub(crate) fn set_infantry_actions(
+        &mut self,
+        actions: Vec<crate::rules::infantry_sequence::InfantrySequenceEntry>,
+    ) {
+        assert_eq!(actions.len(), 42);
+        self.infantry_actions = Some(actions);
+    }
+
+    /// The type's native record for an action id (Type `+0xE3C`), as the
+    /// original ReadSequenceData stores it; `None` for a set without them.
+    pub(crate) fn infantry_action(
+        &self,
+        action: i32,
+    ) -> Option<&crate::rules::infantry_sequence::InfantrySequenceEntry> {
+        self.infantry_actions
+            .as_ref()?
+            .get(usize::try_from(action).ok()?)
+    }
+
+    /// Read the retained native bank for atlas preparation. Rules binding owns
+    /// construction, rereads and invalidation; consumers cannot mutate it.
+    pub(crate) fn infantry_actions(
+        &self,
+    ) -> Option<&[crate::rules::infantry_sequence::InfantrySequenceEntry]> {
+        self.infantry_actions.as_deref()
     }
 
     /// Mark this as a UnitClass SHP frame layout and attach its rules-owned
@@ -277,13 +321,12 @@ pub(crate) fn build_animation_sequence_catalog(
             continue;
         };
         let sequence_name = rules
-            .art_registry
+            .art()
             .resolve_metadata_entry(&object.id, &object.image)
             .and_then(|entry| entry.sequence.as_deref());
         let sequence_set = sequence_name
             .and_then(|name| infantry_sequences?.get(&name.to_ascii_uppercase()))
             .map(crate::rules::infantry_sequence::build_sequence_set)
-            .filter(|set| !set.is_empty())
             .unwrap_or_else(default_infantry_sequences);
         catalog.insert(object.id.clone(), sequence_set);
     }
@@ -300,7 +343,7 @@ pub(crate) fn build_animation_sequence_catalog(
             continue;
         };
         let Some(art) = rules
-            .art_registry
+            .art()
             .resolve_metadata_entry(&object.id, &object.image)
         else {
             continue;
@@ -332,6 +375,12 @@ pub(crate) fn build_animation_sequence_catalog(
 /// - Die2: frames 101–115 (15 frames, non-directional)
 pub fn default_infantry_sequences() -> SequenceSet {
     let mut set: SequenceSet = SequenceSet::new();
+    // InfantryType52392C constructs all 42 action records with zero counts.
+    // The legacy SHP layout below is a presentation fallback, never gameplay
+    // admission for an unbound/missing Sequence section.
+    set.set_infantry_actions(vec![
+        crate::rules::infantry_sequence::InfantrySequenceEntry::default(); 42
+    ]);
 
     set.insert(
         SequenceKind::Stand,

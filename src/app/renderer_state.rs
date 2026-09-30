@@ -25,11 +25,13 @@ pub(crate) struct RendererState {
     pub(crate) upscale_pass: Option<crate::render::upscale_pass::UpscalePass>,
     /// egui integration — input handling + GPU rendering.
     pub(super) egui: EguiIntegration,
-    pub(crate) vxl_compute: Option<crate::render::vxl_compute::VxlComputeRenderer>,
     /// GAME.FNT bitmap font (falls back to the built-in 5x7 face).
     pub(crate) bit_font: BitFont,
     pub(crate) vxl_slope_transition_cache:
         std::cell::RefCell<crate::render::unit_slope_transition_cache::VxlSlopeTransitionCache>,
+    /// This frame's crashing Fly bodies (`render::unit_pose_cache`).
+    pub(crate) vxl_pose_frame_cache:
+        std::cell::RefCell<crate::render::unit_pose_cache::VxlPoseFrameCache>,
     /// Previous presented pre-cursor composition, retained for input-time
     /// screenshot parity.
     pub(crate) retail_screenshot_frame_cache: crate::render::screenshot::PresentedFrameCache,

@@ -17,6 +17,10 @@ use crate::sim::occupancy::RawCellOccupationGrid;
 use crate::sim::production::ProductionState;
 use crate::sim::terrain_spawn::TerrainSpawnerState;
 
+#[cfg(test)]
+#[path = "terrain_coordinate_tests.rs"]
+mod coordinate_tests;
+
 const TERRAIN_LIMBO_CLEAR_BIT: u8 = 0x40;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -40,6 +44,10 @@ pub struct TerrainObjectState {
     pub type_ref: InternedId,
     pub rx: u16,
     pub ry: u16,
+    /// Retained ObjectClass Location.Z after TerrainType+6C (71E0D0)
+    /// clamps the constructor coordinate to Map578080 ground height.
+    /// Ground changes do not relocate the object. See terrain_coordinate.json.
+    world_z_leptons: i32,
     pub health: i32,
     pub max_health: i32,
     pub occupation_bits: u8,
@@ -52,6 +60,7 @@ impl std::hash::Hash for TerrainObjectState {
         self.type_ref.hash(state);
         self.rx.hash(state);
         self.ry.hash(state);
+        self.world_z_leptons.hash(state);
         self.health.hash(state);
         self.max_health.hash(state);
         self.occupation_bits.hash(state);
@@ -63,11 +72,43 @@ impl TerrainObjectState {
     pub fn new(
         stable_id: u64,
         type_ref: InternedId,
-        rx: u16,
-        ry: u16,
+        cell: (u16, u16),
         terrain_type: &TerrainObjectType,
         snow_theater: bool,
+        terrain: Option<&ResolvedTerrainGrid>,
     ) -> Self {
+        let [x, y] = terrain_cell_center(cell);
+        // Terrain ctor71BC4A..71BC76 passes centered signed XY and Z0;
+        // Object Unlimbo5F4F9C dispatches TerrainType71E0D0 before the raw
+        // coordinate write5F6940. The type callback retains max(0, ground).
+        let world_z_leptons =
+            crate::sim::movement::ground_pose::ground_surface_z_at([x, y], false, terrain, None)
+                .unwrap_or(0)
+                .max(0);
+        Self {
+            stable_id,
+            native_unique_id: None,
+            in_logic_vector: false,
+            type_ref,
+            rx: cell.0,
+            ry: cell.1,
+            world_z_leptons,
+            health: terrain_type.strength,
+            max_health: terrain_type.strength,
+            occupation_bits: occupation_bits_for(terrain_type, snow_theater),
+            lifecycle: TerrainObjectLifecycle::Live,
+        }
+    }
+
+    /// Terrain VT7F522C+48 inherits Object GetCoords5F65A0. Its XY is
+    /// the authored cell center; Z is the coordinate retained at construction.
+    pub(crate) fn world_coord(&self) -> crate::sim::projectile::ProjectileCoord {
+        let [x, y] = terrain_cell_center(self.cell());
+        crate::sim::projectile::ProjectileCoord::new(x, y, self.world_z_leptons)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(stable_id: u64, type_ref: InternedId, rx: u16, ry: u16) -> Self {
         Self {
             stable_id,
             native_unique_id: None,
@@ -75,9 +116,10 @@ impl TerrainObjectState {
             type_ref,
             rx,
             ry,
-            health: terrain_type.strength,
-            max_health: terrain_type.strength,
-            occupation_bits: occupation_bits_for(terrain_type, snow_theater),
+            world_z_leptons: 0,
+            health: 100,
+            max_health: 100,
+            occupation_bits: 0,
             lifecycle: TerrainObjectLifecycle::Live,
         }
     }
@@ -89,6 +131,14 @@ impl TerrainObjectState {
     pub fn is_live(&self) -> bool {
         self.lifecycle == TerrainObjectLifecycle::Live
     }
+}
+
+fn terrain_cell_center(cell: (u16, u16)) -> [i32; 2] {
+    use crate::util::lepton::{CELL_CENTER_LEPTON_I32, LEPTONS_PER_CELL_I32};
+    [
+        i32::from(cell.0 as i16) * LEPTONS_PER_CELL_I32 + CELL_CENTER_LEPTON_I32,
+        i32::from(cell.1 as i16) * LEPTONS_PER_CELL_I32 + CELL_CENTER_LEPTON_I32,
+    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,14 +255,6 @@ impl TerrainAreaState {
         self.navigation_changed_cells
     }
 
-    pub(crate) fn terrain_objects(&self) -> &BTreeMap<u64, TerrainObjectState> {
-        &self.terrain_objects
-    }
-
-    pub(crate) fn terrain_object_cells(&self) -> &BTreeMap<(u16, u16), u64> {
-        &self.terrain_object_cells
-    }
-
     pub(crate) fn navigation_changed_cells(&self) -> &[(u16, u16)] {
         &self.navigation_changed_cells
     }
@@ -307,25 +349,6 @@ fn unmark_terrain_raw_occupation(
     source_mask: u8,
 ) {
     raw_occupation.clear_ground(cell.0, cell.1, terrain_raw_occupation_mask(source_mask));
-}
-
-pub fn sync_spawner_indices_from_live_terrain(production: &mut ProductionState) {
-    let live_spawning_cells: BTreeSet<(u16, u16)> = production
-        .terrain_objects
-        .values()
-        .filter(|terrain| terrain.is_live())
-        .filter_map(|terrain| {
-            let cell = terrain.cell();
-            production
-                .tiberium_spawning_terrain_cells
-                .contains(&cell)
-                .then_some(cell)
-        })
-        .collect();
-    production
-        .terrain_spawners
-        .retain(|cell, _| live_spawning_cells.contains(cell));
-    production.tiberium_spawning_terrain_cells = live_spawning_cells;
 }
 
 pub fn mark_terrain_occupation(
@@ -469,19 +492,18 @@ pub(crate) fn damage_terrain_object_at_cell(
 mod tests {
     use super::*;
     use crate::map::overlay::TerrainObject;
-    use crate::map::overlay_types::OverlayTypeRegistry;
     use crate::map::resolved_terrain::{ResolvedTerrainCell, zone_class};
     use crate::rules::ini_parser::IniFile;
     use crate::rules::locomotor_type::MovementZone;
     use crate::rules::ruleset::RuleSet;
-    use crate::rules::terrain_rules::{LandType, SpeedCostProfile, TerrainClass};
+    use crate::rules::terrain_rules::LandType;
     use crate::sim::movement::bump_crush::{
         CrushCapability, build_blocker_neighbor_counts, collect_crush_victims,
     };
     use crate::sim::movement::locomotor::MovementLayer;
     use crate::sim::pathfinding::PathGrid;
     use crate::sim::pathfinding::cell_entry::{
-        CanEnterCellContext, CanEnterCellResult, TerrainEntryMode, evaluate_can_enter_cell,
+        CanEnterCellContext, CanEnterCellResult, evaluate_can_enter_cell,
     };
     use crate::sim::terrain_spawn::seed_terrain_spawners;
     use crate::sim::world::Simulation;
@@ -645,7 +667,6 @@ mod tests {
                 name: type_name.to_string(),
             }],
             rules,
-            &OverlayTypeRegistry::empty(),
             false,
         );
     }
@@ -659,17 +680,11 @@ mod tests {
             .cell(0, 0)
             .expect("clear template")
             .clone();
-        let mut cells = Vec::with_capacity(9);
-        for ry in 0..3 {
-            for rx in 0..3 {
-                cells.push(ResolvedTerrainCell {
-                    rx,
-                    ry,
-                    ..template.clone()
-                });
-            }
-        }
-        ResolvedTerrainGrid::from_cells(3, 3, cells)
+        crate::map::resolved_terrain::test_grid(3, 3, |rx, ry| ResolvedTerrainCell {
+            rx,
+            ry,
+            ..template.clone()
+        })
     }
 
     #[test]
@@ -713,7 +728,6 @@ mod tests {
                     resolved_terrain: Some(&resolved),
                     terrain_costs: None,
                     bypass_grid: false,
-                    mode: TerrainEntryMode::RuntimeTransition,
                     is_infantry: false,
                     mover_is_crusher: false,
                 }),
@@ -733,6 +747,14 @@ mod tests {
                     MovementLayer::Ground,
                     capability,
                     &sim.substrate.entities,
+                    // A terrain object is never a crush victim whoever asks, so
+                    // the ally gate is irrelevant here; a neutral crusher keeps
+                    // the assertion about terrain rather than about alliance.
+                    crate::sim::movement::bump_crush::CrushAllyGate::new(
+                        "Neutral",
+                        &crate::map::houses::HouseAllianceMap::new(),
+                        &sim.interner,
+                    ),
                 )
                 .is_empty(),
                 "Terrain never enters the Techno crush-victim list"
@@ -919,7 +941,7 @@ mod tests {
             .expect("terrain type");
         let mut interner = StringInterner::default();
         let type_ref = interner.intern("TIBTRE01");
-        let mut terrain = TerrainObjectState::new(1, type_ref, 0, 0, terrain_type, false);
+        let mut terrain = TerrainObjectState::new(1, type_ref, (0, 0), terrain_type, false, None);
         let mut production = ProductionState::default();
         let mut grid = resolved_clear_grid();
 
@@ -1129,7 +1151,6 @@ mod tests {
         assert_eq!(cell.terrain_object_occupation, None);
         assert!(!cell.terrain_object_blocks);
         assert!(!cell.ground_walk_blocked);
-        assert!(!cell.build_blocked);
         assert_eq!(cell.zone_type, zone_class::GROUND);
     }
 

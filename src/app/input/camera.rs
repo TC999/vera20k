@@ -247,6 +247,25 @@ pub(crate) fn edge_scroll_intent(
         .then(|| scroll_dir_from_octant(edge_scroll_octant(x, y, view_w, view_h)))
 }
 
+/// No wall-clock-driven camera input is active in an accepted map capture.
+/// Keep this observation beside the private coast/pan state it checks.
+pub(crate) fn camera_input_idle(state: &AppState) -> bool {
+    let input = &state.match_state.input;
+    input.keys_held.is_empty()
+        && !input.minimap_dragging
+        && !input.tactical_mouse.captured
+        && !input.tactical_mouse.left_held
+        && !input.tactical_mouse.right_held
+        && !input.tactical_mouse.right_pan_engaged
+        && input.edge_scroll.coasting_direction().is_none()
+        && edge_scroll_intent(
+            (input.cursor_x, input.cursor_y),
+            state.render_width() as i32,
+            state.render_height() as i32,
+        )
+        .is_none()
+}
+
 /// One edge-scroll step. Returns the camera delta in **window pixels**.
 ///
 /// `view_w`/`view_h` are the full window, sidebar included: gamemd's at-edge
@@ -403,7 +422,9 @@ pub(crate) fn tactical_centre_cell(state: &AppState) -> (u16, u16) {
         world_x,
         world_y,
         &state.height_map(),
-        Some(&state.match_state.match_presentation.tactical_bridge_inverse_map),
+        state.sim_view().and_then(|view| {
+            crate::app::match_runtime::sim_tick::tactical_bridge_cells(view.simulation())
+        }),
     )
 }
 
@@ -423,8 +444,8 @@ pub(crate) fn recall_view_bookmark(state: &mut AppState, slot: usize) {
 }
 
 /// Seed all four bookmarks with the cell the view is currently centred on.
-/// Called from the map-load and spawn-pick paths, which are where gamemd's
-/// scenario reader fills the four slots with the opening view.
+/// Called from the map-load path, which is where gamemd's scenario reader
+/// fills the four slots with the opening view.
 pub(crate) fn seed_view_bookmarks_from_current_view(state: &mut AppState) {
     let (rx, ry) = tactical_centre_cell(state);
     state.match_state.input.view_bookmarks.seed_all(rx, ry);
@@ -1033,7 +1054,7 @@ pub(crate) fn center_view_on_selection(state: &mut AppState) {
         ordered
             .iter()
             .filter_map(|id| sim.entities().get(*id))
-            .map(|entity| entity_lepton_coord(entity))
+            .map(|entity| entity_lepton_coord(sim, entity))
             .collect()
     };
     let Some((cx, cy, cz)) = selection_view_centre_leptons(&coords) else {
@@ -1068,7 +1089,7 @@ pub(crate) fn toggle_follow_target(state: &mut AppState) {
 /// easing and no dead zone, so the followed unit stays pinned to the centre and
 /// the player cannot scroll away while the latch is held.
 ///
-/// The pair is cleared from two lifecycle points — `ObjectClass__Destroy`
+/// The pair is cleared from two lifecycle points — `ObjectClass__Detach_All`
 /// 0x005F5306 and `ObjectClass__Deselect` 0x005F4513 — so the camera is handed
 /// back when the followed object dies or leaves the selection.
 pub(crate) fn update_follow_camera(state: &mut AppState) {
@@ -1080,9 +1101,12 @@ pub(crate) fn update_follow_camera(state: &mut AppState) {
         .sim_runtime
         .as_ref()
         .map(|rt| &rt.simulation)
-        .and_then(|sim| sim.entities().get(id))
-        .filter(|entity| entity.lifecycle.object_alive && entity.selected)
-        .map(entity_lepton_coord);
+        .and_then(|sim| {
+            sim.entities()
+                .get(id)
+                .filter(|entity| entity.lifecycle.object_alive && entity.selected)
+                .map(|entity| entity_lepton_coord(sim, entity))
+        });
     let Some((x, y, z)) = coord else {
         state.match_state.input.follow_target = None;
         return;
@@ -1096,11 +1120,13 @@ pub(crate) fn update_follow_camera(state: &mut AppState) {
 /// stock `FlightLevel` sits about six cells up in coordinate space, and the
 /// straggler search is a 3D distance, so feeding it ground height would drop a
 /// different object and move the centre on X and Y as well as Y-by-Z.
-fn entity_lepton_coord(entity: &crate::sim::game_entity::GameEntity) -> (i32, i32, i32) {
-    let cell = crate::util::lepton::LEPTONS_PER_CELL_I32;
-    let x = i32::from(entity.position.rx) * cell + entity.position.sub_x.to_num::<i32>();
-    let y = i32::from(entity.position.ry) * cell + entity.position.sub_y.to_num::<i32>();
-    (x, y, crate::render::locomotor_visual::world_z_leptons(entity))
+fn entity_lepton_coord(
+    sim: &crate::sim::world::Simulation,
+    entity: &crate::sim::game_entity::GameEntity,
+) -> (i32, i32, i32) {
+    let coord =
+        crate::sim::movement::ground_pose::object_location(entity, sim.resolved_terrain.as_ref());
+    (coord.x, coord.y, coord.z)
 }
 
 pub(crate) fn center_camera_on_cell(state: &mut AppState, rx: u16, ry: u16) {

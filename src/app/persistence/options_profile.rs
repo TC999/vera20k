@@ -10,7 +10,7 @@ use std::io;
 use std::path::Path;
 
 use crate::app::frontend::startup_options::{RetailStartupOptions, ScreenSize};
-use crate::rules::ini_parser::IniFile;
+use crate::rules::ini_parser::{IniFile, IniSection};
 use crate::util::ini_writer::set_ini_values;
 
 pub(crate) const RA2MD_INI_FILENAME: &str = "RA2MD.INI";
@@ -18,6 +18,10 @@ pub(crate) const RA2MD_INI_FILENAME: &str = "RA2MD.INI";
 const OPTIONS_SECTION: &str = "Options";
 const VIDEO_SECTION: &str = "Video";
 const AUDIO_SECTION: &str = "Audio";
+const WONLINE_SECTION: &str = "WOnline";
+const NETWORK_SECTION: &str = "Network";
+/// Destination units `OptionsClass__ReadFromINI` passes for NetID (`push 0xC8`).
+const NET_ID_UNITS: usize = 0xC8;
 const SCREEN_SIZE_UNSET: i32 = -1;
 const DEFAULT_SCREEN_WIDTH: i32 = 800;
 const DEFAULT_SCREEN_HEIGHT: i32 = 600;
@@ -68,6 +72,18 @@ pub(crate) struct RetailOptionsProfile {
     pub(crate) is_score_shuffle: bool,
     pub(crate) sound_latency: u16,
     pub(crate) in_game_music: bool,
+
+    // [Network] NetID: campaign movie unlock progress (OptionsClass +0x4C
+    // Soviet, +0x50 Allied), -1 when none. The obfuscated key is decoded by
+    // `ReadFromINI` `0x005FABA6..0x005FAC54` and written by `WriteToINI`
+    // `0x005FAF9E`; Play_Movie raises it through `0x005FBF80`.
+    pub(crate) movie_progress: crate::ui::movies_credits_shell::MovieProgress,
+
+    // [WOnline] LobMusic: read by `WOL_Main`'s settings reader `0x0077DED0`
+    // (`ReadInt`, default 1) from the same RA2MD.INI object into
+    // `[0x00B7690C]`, outside OptionsClass. Read-only here; this route never
+    // writes it back.
+    pub(crate) wol_lobby_music: i32,
 }
 
 /// The two process-start products obtained from one physical `RA2MD.INI`
@@ -113,6 +129,8 @@ impl Default for RetailOptionsProfile {
             is_score_shuffle: false,
             sound_latency: 9,
             in_game_music: true,
+            movie_progress: crate::ui::movies_credits_shell::MovieProgress::default(),
+            wol_lobby_music: 1,
         }
     }
 }
@@ -127,6 +145,9 @@ pub(crate) struct FormattedProfileSections {
     pub(crate) options: [(&'static str, String); 11],
     pub(crate) video: [(&'static str, String); 3],
     pub(crate) audio: [(&'static str, String); 7],
+    /// `[Network] NetID` only. Native also writes Socket/NetCard/DestNet from
+    /// network fields this profile does not model; their bytes are preserved.
+    pub(crate) network: [(&'static str, String); 1],
 }
 
 impl RetailOptionsLoad {
@@ -295,6 +316,11 @@ impl RetailOptionsProfile {
             self.sound_latency =
                 audio.read_int("SoundLatency", i32::from(self.sound_latency)) as u16;
         }
+
+        self.movie_progress = decode_net_id(ini.section_or_empty(NETWORK_SECTION));
+        if let Some(wonline) = ini.section(WONLINE_SECTION) {
+            self.wol_lobby_music = wonline.read_int("LobMusic", self.wol_lobby_music);
+        }
     }
 
     /// Mutate the early-read live pair through startup fallback and return its
@@ -372,6 +398,7 @@ impl RetailOptionsProfile {
                 ("SoundLatency", self.sound_latency.to_string()),
                 ("InGameMusic", format_bool(self.in_game_music).to_string()),
             ],
+            network: [("NetID", encode_net_id(self.movie_progress))],
         }
     }
 
@@ -380,7 +407,8 @@ impl RetailOptionsProfile {
         let formatted = self.formatted_sections();
         let output = apply_formatted_section(input, OPTIONS_SECTION, &formatted.options);
         let output = apply_formatted_section(&output, VIDEO_SECTION, &formatted.video);
-        apply_formatted_section(&output, AUDIO_SECTION, &formatted.audio)
+        let output = apply_formatted_section(&output, AUDIO_SECTION, &formatted.audio);
+        apply_formatted_section(&output, NETWORK_SECTION, &formatted.network)
     }
 
     /// Commit the complete modeled profile with one read and one write.
@@ -441,11 +469,98 @@ fn apply_formatted_section<const N: usize>(
     set_ini_values(input, section, &borrowed)
 }
 
+/// The NetID obfuscation: every UTF-16 unit is bitwise-NOT'd, and a unit
+/// that becomes zero is stored as `0xFFFF` so the string keeps its length
+/// (`0x005FABD2..0x005FABEC`, `0x005FAFC6..0x005FAFE0`).
+fn flip_net_id_units(units: &[u16]) -> Vec<u16> {
+    units
+        .iter()
+        .map(|unit| match !unit {
+            0 => 0xFFFF,
+            flipped => flipped,
+        })
+        .collect()
+}
+
+/// CRT `wcstol(token, NULL, 10)`: leading wide whitespace, optional sign,
+/// decimal digits; no digits yields 0 and overflow saturates.
+fn wcstol_decimal(token: &[u16]) -> i32 {
+    let is_space = |unit: u16| matches!(unit, 0x09..=0x0D | 0x20);
+    let mut rest = token;
+    while let Some((&first, tail)) = rest.split_first() {
+        if !is_space(first) {
+            break;
+        }
+        rest = tail;
+    }
+    let negative = rest.first() == Some(&u16::from(b'-'));
+    if matches!(rest.first(), Some(&unit) if unit == u16::from(b'-') || unit == u16::from(b'+')) {
+        rest = &rest[1..];
+    }
+    let mut value: i64 = 0;
+    for &unit in rest {
+        if !(u16::from(b'0')..=u16::from(b'9')).contains(&unit) {
+            break;
+        }
+        value = value * 10 + i64::from(unit - u16::from(b'0'));
+        if value > i64::from(i32::MAX) + 1 {
+            break;
+        }
+    }
+    let value = if negative { -value } else { value };
+    value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+}
+
+/// Decode `[Network] NetID` into movie progress. Both fields start at -1, the
+/// first two `wcstok(L" ")` tokens are read with `wcstol` minus one, and a
+/// value outside -1..=7 falls back to -1.
+fn decode_net_id(network: &IniSection) -> crate::ui::movies_credits_shell::MovieProgress {
+    let units = network.read_comma_hex_utf16("NetID", &[], NET_ID_UNITS);
+    let text = flip_net_id_units(&units);
+    let mut tokens = text
+        .split(|unit| *unit == u16::from(b' '))
+        .filter(|token| !token.is_empty());
+    let mut progress = crate::ui::movies_credits_shell::MovieProgress::default();
+    if let Some(token) = tokens.next() {
+        progress.soviet = wcstol_decimal(token).wrapping_sub(1);
+        if let Some(token) = tokens.next() {
+            progress.allied = wcstol_decimal(token).wrapping_sub(1);
+        }
+    }
+    let clamp = |value: i32| if (-1..8).contains(&value) { value } else { -1 };
+    progress.soviet = clamp(progress.soviet);
+    progress.allied = clamp(progress.allied);
+    progress
+}
+
+/// Encode movie progress the way `WriteToINI` does: `swprintf(L"%d %d",
+/// soviet + 1, allied + 1)`, flipped, then written as comma hex.
+fn encode_net_id(progress: crate::ui::movies_credits_shell::MovieProgress) -> String {
+    let text = format!(
+        "{} {}",
+        progress.soviet.wrapping_add(1),
+        progress.allied.wrapping_add(1)
+    );
+    let units: Vec<u16> = text.encode_utf16().collect();
+    crate::rules::ini_value::encode_comma_hex_utf16(&flip_net_id_units(&units))
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
 
     use super::*;
+
+    /// `CRCEngine::operator()` @ `0x004A1DE0` over `"Network"`, executed
+    /// natively under Unicorn: the scratch `INIClass__ReadCommaHexUTF16`
+    /// leaves for a failed first `%x` conversion on the fresh-file cache miss.
+    #[test]
+    fn network_section_crc_is_the_crc_engine_of_its_name() {
+        assert_eq!(
+            crate::assets::mix_hash::crc_engine(NETWORK_SECTION.as_bytes()),
+            0x70CA_A741
+        );
+    }
 
     fn load_snapshot(startup: &RetailStartupOptions, bytes: &[u8]) -> RetailOptionsLoad {
         RetailOptionsLoad::from_ra2md_with(Path::new("C:/retail"), startup, |_| Ok(bytes.to_vec()))
@@ -478,6 +593,17 @@ mod tests {
         assert!(!profile.is_score_shuffle);
         assert_eq!(profile.sound_latency, 9);
         assert!(profile.in_game_music);
+    }
+
+    #[test]
+    fn wol_lobby_music_reads_wonline_lobmusic_as_readint_default_one() {
+        let mut profile = RetailOptionsProfile::default();
+        profile.apply_ini(&IniFile::from_str("[WOnline]\nNick=x\n"));
+        assert_eq!(profile.wol_lobby_music, 1, "absent key keeps the default");
+        profile.apply_ini(&IniFile::from_str("[WOnline]\nLobMusic=0\n"));
+        assert_eq!(profile.wol_lobby_music, 0);
+        profile.apply_ini(&IniFile::from_str("[WOnline]\nLobMusic=$2\n"));
+        assert_eq!(profile.wol_lobby_music, 2, "ReadInt takes $ hex");
     }
 
     #[test]
@@ -935,11 +1061,12 @@ IsScoreRepeat=no\r\nIsScoreShuffle=no\r\nSoundLatency=9\r\nInGameMusic=yes\r\n\
             (OPTIONS_SECTION, formatted.options.as_slice()),
             (VIDEO_SECTION, formatted.video.as_slice()),
             (AUDIO_SECTION, formatted.audio.as_slice()),
+            (NETWORK_SECTION, formatted.network.as_slice()),
         ] {
             let section = parsed.section(section_name).unwrap();
             for (key, expected) in values {
                 assert_eq!(
-                    section.get(key),
+                    section.get_for_test(key),
                     Some(expected.as_str()),
                     "{section_name}/{key}"
                 );
@@ -960,10 +1087,11 @@ IsScoreRepeat=no\r\nIsScoreShuffle=no\r\nSoundLatency=9\r\nInGameMusic=yes\r\n\
                 .windows(b"UnknownOption=keep\r\n".len())
                 .any(|w| w == b"UnknownOption=keep\r\n")
         );
+        // WriteToINI always rewrites NetID from the movie progress (-1, -1).
         assert!(
             output
-                .windows(b"[Network]\r\nNetID=ffff,ffff,ffff,\r\n".len())
-                .any(|w| w == b"[Network]\r\nNetID=ffff,ffff,ffff,\r\n")
+                .windows(b"[Network]\r\nNetID=ffcf,ffdf,ffcf,\r\n".len())
+                .any(|w| w == b"[Network]\r\nNetID=ffcf,ffdf,ffcf,\r\n")
         );
         assert!(
             output
@@ -1027,5 +1155,42 @@ IsScoreRepeat=no\r\nIsScoreShuffle=no\r\nSoundLatency=9\r\nInGameMusic=yes\r\n\
         assert!(output.starts_with("[Options]\r\nGameSpeed=3\r\n"));
         assert!(output.contains("[Video]\r\nScreenWidth=-1\r\n"));
         assert!(output.contains("[Audio]\r\nSoundVolume=0.700000\r\n"));
+    }
+
+    #[test]
+    fn net_id_decodes_movie_progress_like_read_from_ini() {
+        use crate::ui::movies_credits_shell::MovieProgress;
+        let progress = |soviet, allied| MovieProgress { soviet, allied };
+        let decode_net_id = |raw: Option<&str>| {
+            let mut network = IniSection::new(NETWORK_SECTION.to_string());
+            if let Some(raw) = raw {
+                network.set("NetID", raw);
+            }
+            decode_net_id(&network)
+        };
+        // Retail default "0 0" and the obfuscated all-0xFFFF form.
+        assert_eq!(decode_net_id(Some("ffcf,ffdf,ffcf,")), progress(-1, -1));
+        assert_eq!(decode_net_id(Some("ffff,ffff,ffff,")), progress(-1, -1));
+        assert_eq!(decode_net_id(None), progress(-1, -1));
+        // "3 1": Soviet rows 0..=2, Allied row 0.
+        assert_eq!(decode_net_id(Some("ffcc,ffdf,ffce,")), progress(2, 0));
+        // Extra spaces are skipped by wcstok; one token leaves Allied at -1.
+        assert_eq!(decode_net_id(Some("ffdf,ffc8,ffdf,ffdf,")), progress(6, -1));
+        // "9 8": Soviet 8 is outside -1..=7 and falls back to -1; Allied 7 stays.
+        assert_eq!(decode_net_id(Some("ffc6,ffdf,ffc7,")), progress(-1, 7));
+    }
+
+    #[test]
+    fn net_id_encodes_like_write_to_ini_and_round_trips() {
+        use crate::ui::movies_credits_shell::MovieProgress;
+        assert_eq!(encode_net_id(MovieProgress::default()), "ffcf,ffdf,ffcf,");
+        for soviet in -1..8 {
+            for allied in -1..8 {
+                let value = MovieProgress { soviet, allied };
+                let mut network = IniSection::new(NETWORK_SECTION.to_string());
+                network.set("NetID", &encode_net_id(value));
+                assert_eq!(decode_net_id(&network), value);
+            }
+        }
     }
 }

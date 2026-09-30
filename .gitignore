@@ -15,23 +15,23 @@ Thumbs.db
 *.png
 *.log
 *.txt
+!tools/requirements-test.txt
 *.tmp
 *.map
 *_todo.md
 
-/ini/
+# No trailing slash: a linked worktree reaches the retail INIs through an
+# `ini` symlink, which a directory-only pattern does not match.
+/ini
 
 /infodocs/
 
 /docs/*
 !/docs/_config.yml
 !/docs/index.md
-!/docs/module-map.md
 !/docs/images/
 !/docs/images/**
-!/docs/system-map/
-!/docs/system-map/**
-# research corpus and plans are tracked so forks and worktrees get them
+# Focused evidence and task plans are tracked; historical research is archived.
 !/docs/research/
 !/docs/research/**
 !/docs/plans/
@@ -50,14 +50,12 @@ Thumbs.db
 /replays/
 
 tools/vendor-eval/
-# research-index code is tracked so it works in worktrees; the built index is not
-tools/research_index/.cache/
 
 /*.md
 !/README.md
 !/CLAUDE.md
-!/ENGINE.md
 !/AGENTS.md
+!/CONTRIBUTING.md
 
 /*.js
 /*.py

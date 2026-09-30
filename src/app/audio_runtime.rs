@@ -1,11 +1,6 @@
-//! Process-wide audio runtime (F12 `AppAudioRuntime`): output players and
-//! sound/EVA registries that live for the whole process.
-//!
-//! The per-match event queue lives in
-//! `app::match_audio::MatchAudioState`; gameplay EVA latches live in sim.
-//! This process audio owner survives matches. The registries are reloaded on
-//! each map load today (redundant but harmless —
-//! they consume no map-specific input); that behavior is unchanged here.
+//! Process-wide audio output and Theme runtime. Immutable SFX/EVA definitions
+//! and the selected sample index belong to `ProcessAssets`; match event queues
+//! belong to `MatchAudioState`. Output state survives scenario transitions.
 
 use crate::assets::asset_manager::AssetManager;
 use crate::audio::music::MusicPlayer;
@@ -17,7 +12,6 @@ use crate::audio::theme::{
 /// `AudioSystem__Pump @ 0x00406F70` runs its services only when more than
 /// 0x21 ms elapsed since the previous pass.
 const THEME_POLL_GATE_MS: u64 = 0x21;
-use crate::rules::sound_ini::{EvaRegistry, SoundRegistry};
 
 pub(crate) const fn derive_launcher_audio_available(
     audio_requested: bool,
@@ -80,22 +74,12 @@ pub(crate) struct AppAudioRuntime {
     pub(crate) music_player: Option<MusicPlayer>,
     /// Sound effect player (rodio) — one-shot SFX (weapons, voices, UI).
     pub(crate) sfx_player: Option<SfxPlayer>,
-    /// sound.ini / soundmd.ini registry mapping IDs to .wav filenames.
-    pub(crate) sound_registry: SoundRegistry,
-    /// audio.idx/bag indices for bag-based sound lookup (voices, EVA).
-    /// Searched in order (YR audiomd first, then base audio).
-    pub(crate) audio_indices: Vec<crate::assets::audio_bag::AudioIndex>,
-    /// The process-start audio decision persisted for later scenario reloads.
-    pub(crate) audio_indices_enabled: bool,
     /// Rust-native substitute for native's one shared DirectSound-device gate.
     /// Frozen after both process-start output constructor attempts.
     pub(crate) launcher_audio_available: bool,
     /// Native has a startup-suppression gate. Current Rust has no non-default
     /// route, so production initializes this false and keeps one explicit seam.
     pub(crate) theme_startup_suppressed: bool,
-    /// EVA announcement registry from eva.ini / evamd.ini.
-    /// Maps EVA event names to per-faction audio.bag sound IDs.
-    pub(crate) eva_registry: EvaRegistry,
 }
 
 /// gamemd-derived: Theme admission and logical/physical command ordering come
@@ -205,12 +189,58 @@ impl AppAudioRuntime {
         self.apply_theme_action(action);
     }
 
+    /// `Queue_Song(From_Name(track))` @ `0x00720B20`; Theme AI starts it.
+    pub(crate) fn queue_theme(&mut self, track: &str, wall_ms: u64) {
+        let index = self.theme.from_name(track);
+        let gates = self.theme_gates();
+        let physical = self.music_output_state();
+        let action = self.theme.queue_song(index, gates, physical, wall_ms);
+        self.apply_theme_action(action);
+    }
+
+    /// `WOL_Main` entry: INTRO gives way to the shuffled lobby music
+    /// (`ThemeRuntime::enter_wol_lobby`). Returns the shuffle flag to restore.
+    pub(crate) fn enter_wol_lobby_music(&mut self, lobby_music: bool, wall_ms: u64) -> bool {
+        let gates = self.theme_gates();
+        let physical = self.music_output_state();
+        let (action, saved_shuffle) =
+            self.theme
+                .enter_wol_lobby(lobby_music, gates, physical, wall_ms);
+        self.apply_theme_action(action);
+        saved_shuffle
+    }
+
+    /// `WOL_Main` exit: the saved shuffle flag returns.
+    pub(crate) fn leave_wol_lobby_music(&mut self, saved_shuffle: bool) {
+        self.theme.leave_wol_lobby(saved_shuffle);
+    }
+
     /// `ThemeClass::Stop(fade=0)`.
     pub(crate) fn stop_theme(&mut self) {
         let gates = self.theme_gates();
         let physical = self.music_output_state();
         let action = self.theme.stop(gates, false, physical, 0);
         self.apply_theme_action(action);
+    }
+
+    /// `ThemeClass::Stop(fade=1)`: Theme ramps its own stream to silence and
+    /// Theme AI stops it when the ramp ends.
+    pub(crate) fn fade_out_theme(&mut self, wall_ms: u64) {
+        let gates = self.theme_gates();
+        let physical = self.music_output_state();
+        let action = self.theme.stop(gates, true, physical, wall_ms);
+        self.apply_theme_action(action);
+    }
+
+    /// The audio master (`[0x0087E758]`), one multiplier over the music and
+    /// sound outputs; the scenario exits fade it to zero and restore it.
+    pub(crate) fn set_master_output_scale(&mut self, scale: f64) {
+        if let Some(player) = self.music_player.as_mut() {
+            player.set_output_scale(scale);
+        }
+        if let Some(player) = self.sfx_player.as_mut() {
+            player.set_output_scale(scale);
+        }
     }
 
     /// B8 user commands preserve Theme fade/queue ordering and output ownership.
@@ -299,12 +329,8 @@ mod tests {
             last_theme_poll_ms: None,
             music_player: None,
             sfx_player: None,
-            sound_registry: SoundRegistry::default(),
-            audio_indices: Vec::new(),
-            audio_indices_enabled: false,
             launcher_audio_available: true,
             theme_startup_suppressed: false,
-            eva_registry: EvaRegistry::default(),
         };
         runtime.update_theme(&assets, 100);
         assert_eq!(runtime.last_theme_poll_ms, Some(100));

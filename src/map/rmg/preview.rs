@@ -251,6 +251,7 @@ impl PreviewPalette {
     }
 
     /// The terrain colour pair for a raw cell identity.
+    #[cfg(test)]
     pub fn tile_colours(&self, tile_index: i32, sub_tile: u8) -> ([u8; 3], [u8; 3]) {
         self.tiles
             .get(&(tile_index, sub_tile))
@@ -259,6 +260,7 @@ impl PreviewPalette {
     }
 
     /// The overlay colour for an id and growth stage, already channel-ordered.
+    #[cfg(test)]
     pub fn overlay_colour(&self, overlay_id: u8, density: u8) -> Option<[u8; 3]> {
         self.overlays
             .get(&(overlay_id, density))
@@ -270,38 +272,6 @@ impl PreviewPalette {
     pub fn tile_count(&self) -> usize {
         self.tiles.len()
     }
-}
-
-/// Collect the playfield cells of a map using a pre-built palette.
-///
-/// Same result as [`preview_cells_from_map`], but needs no assets — this is the
-/// form a worker thread can run.
-pub fn preview_cells_from_palette(
-    map: &crate::map::map_file::MapFile,
-    palette: &PreviewPalette,
-) -> Vec<PreviewCell> {
-    let playfield = Playfield::from_header(&map.header);
-    let overlays = overlay_densities(map);
-    let mut cells = Vec::with_capacity(map.cells.len());
-    for cell in &map.cells {
-        if !playfield.contains(cell.rx, cell.ry) {
-            continue;
-        }
-        let overlay = overlays
-            .get(&(cell.rx, cell.ry))
-            .and_then(|(id, density)| palette.overlay_colour(*id, *density));
-        let (left, right) = match overlay {
-            Some(rgb) => (rgb, rgb),
-            None => palette.tile_colours(cell.tile_index, cell.sub_tile),
-        };
-        cells.push(PreviewCell {
-            x: cell.rx,
-            y: cell.ry,
-            left,
-            right,
-        });
-    }
-    cells
 }
 
 /// `overlay_radar` resolves an ore/gem overlay's colour from its id and growth

@@ -7,21 +7,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use super::load_rules_with_merged_ini;
-use crate::assets::asset_manager::AssetManager;
+use crate::assets::asset_manager::{AssetManager, MediaArchiveMode};
 use crate::map::entities::EntityCategory;
 use crate::map::map_file::{self, MapFile};
 use crate::map::overlay_types::OverlayTypeRegistry;
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::map::theater;
 use crate::sim::command::{Command, CommandEnvelope};
-use crate::sim::miner::ResourceNode;
 use crate::sim::movement::locomotor::MovementLayer;
 use crate::sim::overlay_grid::OverlayGrid;
 use crate::sim::pathfinding::PathGrid;
 use crate::sim::power_system::tick_power_states;
 use crate::sim::production::{
     foundation_dimensions, placement_preview_for_owner_without_overlays, ready_buildings_for_owner,
-    seed_resource_nodes_from_overlays,
 };
 use crate::sim::world::Simulation;
 
@@ -66,7 +64,7 @@ fn rect_cells(origin: (u16, u16), width: u16, height: u16) -> Vec<(u16, u16)> {
 
 fn ordinary_surface_cell(resolved: &ResolvedTerrainGrid, rx: u16, ry: u16) -> bool {
     resolved.cell(rx, ry).is_some_and(|cell| {
-        !cell.build_blocked
+        !cell.base_build_blocked
             && !cell.overlay_blocks
             && !cell.terrain_object_blocks
             && !cell.has_bridge_deck
@@ -267,15 +265,15 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
     assert_eq!(map.header.theater, "TEMPERATE");
     assert_eq!((map.header.width, map.header.height), (70, 76));
 
-    let mut assets = AssetManager::new(&retail_dir).expect("open retail MIX archives");
+    let mut assets = AssetManager::new(&retail_dir, MediaArchiveMode::STOCK_DIGITAL)
+        .expect("open retail MIX archives");
     let theater =
         theater::load_theater(&mut assets, &map.header.theater).expect("load retail theater");
-    let (mut rules, rules_ini, _native_type_construction_trace, art_ini) =
+    let (mut rules, rules_ini, art_ini, _receipt) =
         load_rules_with_merged_ini(&assets, None, Some(&map.ini))
-            .expect("load production merged rules")
-            .into_parts();
+            .expect("load production merged rules");
     let art = crate::rules::art_data::ArtRegistry::from_ini(&art_ini);
-    rules.merge_art_data(&art);
+    rules.install_art_data(art);
     let overlay_registry = OverlayTypeRegistry::from_ini(&rules_ini, Some(&art_ini));
 
     let conyard = rules.object(CONYARD).expect("stock GACNST");
@@ -296,7 +294,6 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
         false,
         rules.general.cliff_back_impassability,
     );
-    let height_map = resolved.build_height_map();
     let path_grid = PathGrid::from_resolved_terrain(&resolved);
     let overlay_grid =
         OverlayGrid::from_overlay_entries(&map.overlays, resolved.width(), resolved.height());
@@ -309,16 +306,12 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
     )
     .expect("Dustbowl must provide clear GACNST/valid GAPOWR cells beside nonblocking ore");
 
-    let overlay_names: BTreeMap<u8, String> = (0..overlay_registry.len())
-        .filter_map(|index| {
-            let id = u8::try_from(index).ok()?;
-            Some((id, overlay_registry.name(id)?.to_string()))
-        })
-        .collect();
     let mut sim = Simulation::new();
     sim.resolved_terrain = Some(resolved);
     sim.overlay_grid = Some(overlay_grid);
-    seed_resource_nodes_from_overlays(&mut sim, &map.overlays, &overlay_names);
+    sim.playfield_bounds = Some(crate::sim::cell_rect::PlayfieldBounds::from_map_header(
+        &map.header,
+    ));
     let provider_id = sim
         .spawn_object(
             CONYARD,
@@ -327,7 +320,6 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
             fixture.provider.1,
             0,
             &rules,
-            &height_map,
         )
         .expect("spawn stock GACNST through lifecycle authority");
     let provider = sim
@@ -340,6 +332,12 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
     assert_eq!(provider.foundation, "4x4");
 
     let owner_id = sim.interner.intern(OWNER);
+    // `HouseClass::CanBuild @ 0x004F7870` runs for a real house only.
+    sim.houses.insert(
+        owner_id,
+        crate::sim::house_state::HouseState::new(owner_id, 0, None, true, 10_000, 10),
+    );
+    sim.session.house_order.push(owner_id);
     let gapowr_id = sim.interner.intern(POWER_PLANT);
     assert!(crate::sim::production::enqueue_by_type(
         &mut sim,
@@ -369,8 +367,6 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
         !crate::sim::production::tick_production_with_overlay_registry(
             &mut sim,
             &rules,
-            &height_map,
-            Some(&path_grid),
             Some(&overlay_registry),
         )
     );
@@ -388,20 +384,6 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
     assert!(held.lifecycle.in_limbo && !held.lifecycle.cell_marked);
 
     let blocked_cells = rect_cells(fixture.blocked, 2, 2);
-    let resource_before: BTreeMap<(u16, u16), ResourceNode> = blocked_cells
-        .iter()
-        .filter_map(|cell| {
-            sim.production
-                .resource_nodes
-                .get(cell)
-                .copied()
-                .map(|node| (*cell, node))
-        })
-        .collect();
-    assert!(
-        !resource_before.is_empty(),
-        "blocked retail footprint must contain a seeded ore resource"
-    );
     let overlay_before: BTreeMap<(u16, u16), (Option<u8>, u8)> = blocked_cells
         .iter()
         .map(|cell| {
@@ -413,6 +395,14 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
             (*cell, (overlay.overlay_id, overlay.overlay_data))
         })
         .collect();
+    assert!(
+        overlay_before.values().any(|(overlay_id, _)| {
+            overlay_id
+                .and_then(|id| overlay_registry.flags(id))
+                .is_some_and(|flags| flags.tiberium)
+        }),
+        "blocked retail footprint must contain a map ore overlay"
+    );
     let preview = placement_preview_for_owner_without_overlays(
         &sim,
         &rules,
@@ -420,8 +410,6 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
         POWER_PLANT,
         fixture.blocked.0,
         fixture.blocked.1,
-        Some(&path_grid),
-        &height_map,
     )
     .expect("stock GAPOWR preview");
     assert!(!preview.valid);
@@ -437,20 +425,12 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
         owner_id,
         sim.session.tick + 1,
         Command::PlaceReadyBuilding {
-            owner: owner_id,
             type_id: gapowr_id,
             rx: fixture.blocked.0,
             ry: fixture.blocked.1,
         },
     );
-    let tick = sim.advance_tick(
-        &[rejected],
-        Some(&rules),
-        &height_map,
-        Some(&path_grid),
-        None,
-        67,
-    );
+    let tick = sim.advance_tick(&[rejected], Some(&rules), Some(&path_grid), None, 67);
     assert_eq!(tick.executed_commands, 1);
     assert!(!tick.spawned_entities);
     assert_eq!(sim.substrate.entities.len(), entities_before);
@@ -474,19 +454,6 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
     assert_eq!(
         blocked_cells
             .iter()
-            .filter_map(|cell| {
-                sim.production
-                    .resource_nodes
-                    .get(cell)
-                    .copied()
-                    .map(|node| (*cell, node))
-            })
-            .collect::<BTreeMap<_, _>>(),
-        resource_before
-    );
-    assert_eq!(
-        blocked_cells
-            .iter()
             .map(|cell| {
                 let overlay = sim
                     .overlay_grid
@@ -506,8 +473,6 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
         POWER_PLANT,
         fixture.valid.0,
         fixture.valid.1,
-        Some(&path_grid),
-        &height_map,
     )
     .expect("stock GAPOWR valid preview");
     assert!(preview.valid);
@@ -517,20 +482,12 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
         owner_id,
         sim.session.tick + 1,
         Command::PlaceReadyBuilding {
-            owner: owner_id,
             type_id: gapowr_id,
             rx: fixture.valid.0,
             ry: fixture.valid.1,
         },
     );
-    let tick = sim.advance_tick(
-        &[accepted],
-        Some(&rules),
-        &height_map,
-        Some(&path_grid),
-        None,
-        67,
-    );
+    let tick = sim.advance_tick(&[accepted], Some(&rules), Some(&path_grid), None, 67);
     assert_eq!(tick.executed_commands, 1);
     assert!(tick.spawned_entities);
     assert!(ready_buildings_for_owner(&sim, &rules, OWNER).is_empty());
@@ -547,7 +504,8 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
         .expect("accepted command spawned stock GAPOWR");
     assert_eq!(placed.category, EntityCategory::Structure);
     assert_eq!(placed.foundation, "2x2");
-    assert_eq!((placed.health.current, placed.health.max), (750, 750));
+    assert_eq!(placed.health.current, 750);
+    assert_eq!(rules.object("GAPOWR").unwrap().strength, 750);
     assert!(placed.lifecycle.cell_marked);
     assert!(placed.in_logic_vector);
     assert!(placed.building_up.is_some());

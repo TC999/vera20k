@@ -13,38 +13,30 @@ use crate::sim::projectile::{
     TargetExpiryPolicy,
 };
 use crate::sim::snapshot::{GameSnapshot, SnapshotRestoreError};
-use crate::sim::terrain_object::{TerrainObjectLifecycle, TerrainObjectState};
+use crate::sim::terrain_object::TerrainObjectState;
 use crate::sim::terrain_spawn::construct_terrain_objects;
 use crate::sim::wave::Wave;
 use crate::sim::world::Simulation;
 
 fn terrain(stable_id: u64) -> TerrainObjectState {
-    TerrainObjectState {
-        stable_id,
-        native_unique_id: None,
-        in_logic_vector: false,
-        type_ref: InternedId::from_index(0),
-        rx: 3,
-        ry: 4,
-        health: 10,
-        max_health: 10,
-        occupation_bits: 0,
-        lifecycle: TerrainObjectLifecycle::Live,
+    {
+        let mut terrain = TerrainObjectState::for_test(stable_id, InternedId::from_index(0), 3, 4);
+        terrain.health = 10;
+        terrain.max_health = 10;
+        terrain
     }
 }
 
 fn projectile(source_id: u64) -> ProjectileSpawn {
     ProjectileSpawn {
+        native_unique_id: 0,
+        line_trail: None,
+        flat: false,
         source_id,
         origin: ProjectileCoord::new(0, 0, 0),
         target: ProjectileTarget::Cell { rx: 2, ry: 0 },
         initial_target_position: ProjectileCoord::new(512, 0, 0),
-        payload: ProjectilePayload {
-            base_damage: 10,
-            warhead: InternedId::from_index(0),
-            weapon: InternedId::from_index(0),
-            owner: InternedId::from_index(0),
-        },
+        payload: ProjectilePayload::new(10, InternedId::from_index(0), InternedId::from_index(0)),
         speed_leptons_per_frame: 64,
         velocity: ProjectileVelocity::new(64, 0, 0),
         trajectory: ProjectileTrajectory::Straight,
@@ -128,10 +120,22 @@ fn gsi_05_01_runtime_objects_share_identity_and_continue_after_roundtrip() {
 
     assert_eq!(restored.state_hash(), hash_before);
     assert!(restored.substrate.entities.contains(entity_id));
-    assert!(restored.production.terrain_objects.contains_key(&terrain_id));
-    assert_eq!(restored.projectiles.get(projectile_id).unwrap().id, projectile_id);
+    assert!(
+        restored
+            .production
+            .terrain_objects
+            .contains_key(&terrain_id)
+    );
     assert_eq!(
-        restored.waves.iter().next().map(|(&id, wave)| (id, wave.id)),
+        restored.projectiles.get(projectile_id).unwrap().id,
+        projectile_id
+    );
+    assert_eq!(
+        restored
+            .waves
+            .iter()
+            .next()
+            .map(|(&id, wave)| (id, wave.id)),
         Some((wave_id, wave_id))
     );
     assert_eq!(restored.substrate.next_stable_object_id, next_id);

@@ -10,49 +10,46 @@ use crate::rules::ruleset::RuleSet;
 use crate::sim::entity_store::EntityStore;
 use crate::sim::world::Simulation;
 
-use super::production_queue::credits_for_owner;
 use super::production_types::*;
 
-/// Maximum tech level available in standard skirmish/multiplayer.
-/// Units with TechLevel > this are not buildable.
-const MATCH_TECH_LEVEL: i32 = 10;
-
+/// Whether `owner` may build `type_id` now, and why not. No money check: a
+/// build starts without the funds and stalls its steps instead
+/// (`SelectClass::Action @ 0x006AAD00` and `HouseClass::Begin_Production
+/// @ 0x004FA350` test none).
 pub(super) fn build_option_for_owner(
     sim: &Simulation,
     rules: &RuleSet,
     owner: &str,
     type_id: &str,
-    mode: BuildMode,
 ) -> Option<BuildOption> {
     let obj = rules.object(type_id)?;
     let queue_category = production_category_for_object(obj);
 
+    // `HouseClass::CanBuild @ 0x004F7870` compares the type's TechLevel
+    // (`TechnoTypeClass+0x634`) with the house's (`HouseClass+0x1D4`).
+    let house_tech_level =
+        crate::sim::house_state::house_state_for_owner(&sim.houses, owner, &sim.interner)
+            .map(|house| house.tech_level);
     let mut reason: Option<BuildDisabledReason> = None;
-    if obj.tech_level < 0 || obj.tech_level > MATCH_TECH_LEVEL {
+    if obj.tech_level < 0 || house_tech_level.is_none_or(|level| obj.tech_level > level) {
         reason = Some(BuildDisabledReason::UnbuildableTechLevel);
-    } else if mode == BuildMode::Strict
-        && !obj.owner.is_empty()
-        && !owner_matches_any_build_identity(sim, owner, &obj.owner)
-    {
+    } else if !obj.owner.is_empty() && !owner_matches_any_build_identity(sim, owner, &obj.owner) {
         reason = Some(BuildDisabledReason::WrongOwner);
-    } else if mode == BuildMode::Strict
-        && !obj.required_houses.is_empty()
+    } else if !obj.required_houses.is_empty()
         && !owner_matches_any_build_identity(sim, owner, &obj.required_houses)
     {
         reason = Some(BuildDisabledReason::WrongHouse);
-    } else if mode == BuildMode::Strict
-        && !obj.forbidden_houses.is_empty()
+    } else if !obj.forbidden_houses.is_empty()
         && owner_matches_any_build_identity(sim, owner, &obj.forbidden_houses)
     {
         reason = Some(BuildDisabledReason::ForbiddenHouse);
-    } else if mode == BuildMode::Strict
-        && (obj.requires_stolen_allied_tech
-            || obj.requires_stolen_soviet_tech
-            || obj.requires_stolen_third_tech)
+    } else if obj.requires_stolen_allied_tech
+        || obj.requires_stolen_soviet_tech
+        || obj.requires_stolen_third_tech
     {
         // Spy infiltration not yet implemented — always block stolen-tech units.
         reason = Some(BuildDisabledReason::RequiresStolenTech);
-    } else if mode == BuildMode::Strict {
+    } else {
         // PrerequisiteOverride: if owner has ANY override building, skip normal prereqs.
         let override_satisfied = !obj.prerequisite_override.is_empty()
             && has_any_override_building(sim, owner, &obj.prerequisite_override);
@@ -63,7 +60,6 @@ pub(super) fn build_option_for_owner(
         }
     }
     if reason.is_none()
-        && mode == BuildMode::Strict
         && !has_factory_for_owner(
             &sim.substrate.entities,
             rules,
@@ -75,21 +71,21 @@ pub(super) fn build_option_for_owner(
         reason = Some(BuildDisabledReason::NoFactory);
     }
     // BuildLimit check: count owned entities + queued + ready-for-placement.
-    if reason.is_none() && mode == BuildMode::Strict {
-        if let Some(limit) = effective_build_limit(obj.build_limit) {
-            if count_owned_and_queued(sim, owner, &obj.id) >= limit {
-                reason = Some(BuildDisabledReason::AtBuildLimit);
-            }
-        }
-    }
-    if reason.is_none() && (obj.cost <= 0 || credits_for_owner(sim, owner) < obj.cost) {
-        reason = Some(BuildDisabledReason::InsufficientCredits);
+    if reason.is_none()
+        && let Some(limit) = effective_build_limit(obj.build_limit)
+        && count_owned_and_queued(sim, owner, &obj.id) >= limit
+    {
+        reason = Some(BuildDisabledReason::AtBuildLimit);
     }
     let type_interned = sim.interner.get(type_id).unwrap_or_default();
+    let cost = match sim.interner.get(owner) {
+        Some(owner_id) => sim.cost_of(owner_id, obj, rules),
+        None => rules.cost_of(obj, None),
+    };
     Some(BuildOption {
         type_id: type_interned,
         display_name: obj.name.clone().unwrap_or_else(|| obj.id.clone()),
-        cost: obj.cost,
+        cost,
         object_category: obj.category,
         queue_category,
         enabled: reason.is_none(),
@@ -99,17 +95,35 @@ pub(super) fn build_option_for_owner(
 
 /// P6 revalidation classifier: re-check an active/queued build's eligibility AFTER enqueue,
 /// so a build whose prerequisites / producing factory were lost is disposed of. Reproduces
-/// gamemd's `FindFactoryBuilding(1,0,1)` gate (the embedded `HouseClass::CanBuild` scan across
-/// the owner's candidate factory buildings): a tech-tree / owner / factory-presence failure ->
-/// `PermanentlyBlocked` (abandon); a pure credit stall (`on_hold`, handled per-step) or a
-/// build-limit "busy" is NOT a mid-build abandon -> `Buildable` (keep charging).
+/// gamemd's `FindFactory(1,0,1)` gate (the embedded `HouseClass::CanBuild` scan across the
+/// owner's candidate factory buildings): a tech-tree / owner / factory-presence failure ->
+/// `PermanentlyBlocked` (abandon); a build-limit "busy" is NOT a mid-build abandon ->
+/// `Buildable` (keep charging).
 ///
-/// `TemporarilyBlocked` (gamemd's `(1,0,1)` passes but `(1,1,1)` fails = a factory building
-/// exists but is UNPOWERED via an EMP/spy/trigger GoOffline event) is intentionally
-/// UNREACHABLE here: the Rust power model is per-house low-power, which gamemd applies as a
-/// RATE penalty (already modeled in `prepare_step_inputs`), NOT a suspend — gamemd SLOWS,
-/// it does not halt, production on a grid deficit. Per-building powered-down (EMP) is not yet
-/// modeled, so this arm is a forward seam for the EMP slice.
+/// gamemd makes this check in three places. `HouseClass::Update_Factory_Queue @ 0x00509140`
+/// drops each queued build that fails it (`0x005091B0..0x005091EF`) and abandons a failing
+/// active one (`0x0050921C`); a factory building runs it for its own `Factory=` kind only
+/// (`0x00445DFA..0x00445E14`) when it goes offline or online, into or out of limbo, is read
+/// from a map, or at `0x00449267`/`0x00449284`. The local player's strip abandons a cameo
+/// whose type `CanBuild(type, 0, 1)` refuses, through ABANDON / ABANDON_ALL events
+/// (`StripClass::Recalculate @ 0x006AA600`, `0x006AA781`). A dying factory building abandons
+/// its own factory (`BuildingClass::Detach_All`, see `FactoryRegistry::plan_revalidation`).
+///
+/// Residual: VERA revalidates every house's builds every tick. Trigger: a build loses a
+/// prerequisite. Effect: a human player's abandon lands earlier than gamemd's events do; a
+/// computer house that loses it through a building other than a factory (a Battle Lab)
+/// keeps building in gamemd until a factory building of that kind changes state, and VERA
+/// abandons and refunds at once (instruction reading; the computer paths are untraced).
+/// Frequency: occasional.
+///
+/// Residual: the pass also holds an active build that only offline factories could build
+/// (`FindFactory(1,1,1)` fails: `Suspend(0)` at `0x0050924D`, lifted at `0x00509283`).
+/// VERA has no such hold. Its only offline factory is one in a temporal warp
+/// (`GameEntity::building_online`), whose start runs no update (`0x004521C0`). GoOffline's
+/// callers are not ported: the power toggle event (`0x004C6D9A`), a trigger action
+/// (`0x006DDFB9`) and a map's powered-down building (`0x0044FD23`). Trigger: a building
+/// event while every factory of the kind is offline. Effect: VERA keeps building.
+/// Frequency: rare.
 pub(in crate::sim) fn revalidate_eligibility(
     sim: &Simulation,
     rules: &RuleSet,
@@ -117,69 +131,46 @@ pub(in crate::sim) fn revalidate_eligibility(
     type_id: &str,
 ) -> super::factory::BuildEligibility {
     use super::factory::BuildEligibility;
-    match build_option_for_owner(sim, rules, owner, type_id, BuildMode::Strict) {
+    match build_option_for_owner(sim, rules, owner, type_id) {
         None => BuildEligibility::PermanentlyBlocked,
-        Some(opt) if opt.enabled => BuildEligibility::Buildable,
-        Some(opt) => match opt.reason {
-            // Credit stall + build-limit "busy" are not abandons in gamemd — keep building.
-            Some(BuildDisabledReason::InsufficientCredits)
-            | Some(BuildDisabledReason::AtBuildLimit)
-            | None => BuildEligibility::Buildable,
-            // Tech-tree / owner / factory loss -> CanBuild fails -> abandon.
-            Some(_) => BuildEligibility::PermanentlyBlocked,
-        },
+        // A build-limit "busy" is not an abandon in gamemd — keep building.
+        Some(opt) if matches!(opt.reason, None | Some(BuildDisabledReason::AtBuildLimit)) => {
+            BuildEligibility::Buildable
+        }
+        // Tech-tree / owner / factory loss -> CanBuild fails -> abandon.
+        Some(_) => BuildEligibility::PermanentlyBlocked,
     }
 }
 
-pub(super) fn build_options_for_owner_mode(
+/// Every rules type's build option for `owner`, by category.
+pub(super) fn all_build_options_for_owner(
     sim: &Simulation,
     rules: &RuleSet,
     owner: &str,
-    mode: BuildMode,
 ) -> Vec<BuildOption> {
     let mut out: Vec<BuildOption> = Vec::new();
     for id in &rules.building_ids {
-        if let Some(opt) = build_option_for_owner(sim, rules, owner, id, mode) {
+        if let Some(opt) = build_option_for_owner(sim, rules, owner, id) {
             out.push(opt);
         }
     }
     for id in &rules.infantry_ids {
-        if let Some(opt) = build_option_for_owner(sim, rules, owner, id, mode) {
+        if let Some(opt) = build_option_for_owner(sim, rules, owner, id) {
             out.push(opt);
         }
     }
     for id in &rules.vehicle_ids {
-        if let Some(opt) = build_option_for_owner(sim, rules, owner, id, mode) {
+        if let Some(opt) = build_option_for_owner(sim, rules, owner, id) {
             out.push(opt);
         }
     }
     for id in &rules.aircraft_ids {
-        if let Some(opt) = build_option_for_owner(sim, rules, owner, id, mode) {
+        if let Some(opt) = build_option_for_owner(sim, rules, owner, id) {
             out.push(opt);
         }
     }
     out.sort_by_key(|opt| opt.queue_category);
     out
-}
-
-pub(super) fn should_use_relaxed_build_mode(
-    sim: &Simulation,
-    rules: &RuleSet,
-    owner: &str,
-) -> bool {
-    if !prototype_fallback_enabled() {
-        return false;
-    }
-    let strict = build_options_for_owner_mode(sim, rules, owner, BuildMode::Strict);
-    !strict.iter().any(|o| o.enabled)
-}
-
-/// Prototype build fallback — disabled by default.
-/// If needed in the future, move to GameOptions (synced across multiplayer peers).
-const PROTOTYPE_BUILD_FALLBACK: bool = false;
-
-pub(super) fn prototype_fallback_enabled() -> bool {
-    PROTOTYPE_BUILD_FALLBACK
 }
 
 pub(super) fn owner_matches_any_build_identity(
@@ -217,9 +208,10 @@ fn has_any_override_building(sim: &Simulation, owner: &str, overrides: &[String]
     })
 }
 
-/// Interpret BuildLimit value. Returns None if no limit applies (0 = unlimited).
+/// Interpret BuildLimit value. Returns None if no limit applies (the
+/// constructor's `0x7FFFFFFF`, or 0).
 fn effective_build_limit(build_limit: i32) -> Option<u32> {
-    if build_limit == 0 {
+    if build_limit == 0 || build_limit == i32::MAX {
         return None;
     }
     Some(build_limit.unsigned_abs())
@@ -349,7 +341,7 @@ pub(super) fn supports_live_production(obj: &crate::rules::object_type::ObjectTy
     )
 }
 
-fn has_factory_for_owner(
+pub(super) fn has_factory_for_owner(
     entities: &EntityStore,
     rules: &RuleSet,
     owner: &str,
@@ -383,11 +375,15 @@ pub(super) fn is_production_factory(
         ProductionCategory::Infantry => factory_type == FactoryType::InfantryType,
         ProductionCategory::Vehicle => {
             factory_type == FactoryType::UnitType
-                && rules.object(structure_id).is_some_and(|object| !object.naval)
+                && rules
+                    .object(structure_id)
+                    .is_some_and(|object| !object.naval)
         }
         ProductionCategory::Ship => {
             factory_type == FactoryType::UnitType
-                && rules.object(structure_id).is_some_and(|object| object.naval)
+                && rules
+                    .object(structure_id)
+                    .is_some_and(|object| object.naval)
         }
         ProductionCategory::Aircraft => factory_type == FactoryType::AircraftType,
         ProductionCategory::Building | ProductionCategory::Defense => {
@@ -396,236 +392,12 @@ pub(super) fn is_production_factory(
     }
 }
 
-const RA2_QUEUE_FRAME_MS: u64 = 66;
-
-/// Lower floor on production speed, matching the original `if speed == 0.0 { 0.01 }`
-/// guard in the f64 chain — expressed in PPM (10_000 = 0.01×).
-const MIN_PRODUCTION_SPEED_PPM: u64 = PRODUCTION_RATE_SCALE / 100;
-
-pub(in crate::sim) fn build_time_base_frames(
-    rules: &RuleSet,
-    obj: &crate::rules::object_type::ObjectType,
-) -> u32 {
-    if obj.cost <= 0 {
-        return 0;
-    }
-    // Integer-only build-time calculation (replaces f64 chain for determinism):
-    //   base = trunc(cost * BuildSpeed * 0.9)
-    //   frames = trunc(base * BuildTimeMultiplier)
-    //
-    // Using x1000 pre-scaled integers: cost * speed_x1000 * 9 / 10000
-    // then frames = base * btm_x1000 / 1000
-    //
-    // Use i64 to prevent overflow (cost up to ~50000, speed_x1000 up to ~500).
-    let cost = obj.cost.max(0) as i64;
-    let speed_x1000 = rules.production.build_speed_x1000.max(1) as i64;
-    let base_value = (cost * speed_x1000 * 9 / 10000) as i32;
-    let btm_x1000 = obj.build_time_multiplier_x1000.max(1) as i64;
-    let raw_frames = (base_value as i64 * btm_x1000 / 1000).max(0) as i32;
-    raw_frames as u32
-}
-
-// Legacy frames-rate family — retired from the production path at the authority flip
-// (completion is now driven by the registry per-step charge). Kept test-only as the
-// pinned spec of the per-owner/category rate differentiation.
-#[cfg(test)]
-pub(in crate::sim) fn effective_progress_rate_ppm_for_type(
-    sim: &Simulation,
-    rules: &RuleSet,
-    owner: &str,
-    type_id: &str,
-) -> u64 {
-    let Some(obj) = rules.object(type_id) else {
-        return PRODUCTION_RATE_SCALE;
-    };
-    effective_progress_rate_ppm_for_category(
-        sim,
-        rules,
-        owner,
-        production_category_for_object(obj),
-    )
-}
-
-#[cfg(test)]
-pub(super) fn effective_progress_rate_ppm_for_category(
-    sim: &Simulation,
-    rules: &RuleSet,
-    owner: &str,
-    category: ProductionCategory,
-) -> u64 {
-    // power_speed and queue_time are both scaled by PRODUCTION_RATE_SCALE (1M).
-    // effective_rate = power_speed / queue_time, also at 1M scale.
-    let power_speed: u64 = owner_effective_production_speed_ppm(sim, rules, owner);
-    let queue_time: u64 = matching_factory_time_multiplier_ppm(
-        &sim.substrate.entities,
-        rules,
-        owner,
-        category,
-        &sim.interner,
-    );
-    // (power_speed / queue_time) * PRODUCTION_RATE_SCALE
-    // = power_speed * PRODUCTION_RATE_SCALE / queue_time
-    let rate: u64 = (u128::from(power_speed) * u128::from(PRODUCTION_RATE_SCALE)
-        / u128::from(queue_time.max(1))) as u64;
-    rate.max(1)
-}
-
-pub(super) fn estimated_real_time_ms(base_frames: u32, rate_ppm: u64) -> u32 {
-    if base_frames == 0 {
-        return 0;
-    }
-    let denom = u128::from(rate_ppm.max(1));
-    let numer = u128::from(base_frames)
-        * u128::from(RA2_QUEUE_FRAME_MS)
-        * u128::from(PRODUCTION_RATE_SCALE);
-    let rounded_up = numer.div_ceil(denom);
-    rounded_up.min(u128::from(u32::MAX)) as u32
-}
-
-pub(in crate::sim) fn effective_time_to_build_frames_for_type(
-    sim: &Simulation,
-    rules: &RuleSet,
-    owner: &str,
-    type_id: &str,
-    base_frames: u32,
-) -> u32 {
-    let Some(obj) = rules.object(type_id) else {
-        return base_frames;
-    };
-    effective_time_to_build_frames_for_object(sim, rules, owner, obj, base_frames)
-}
-
-fn effective_time_to_build_frames_for_object(
-    sim: &Simulation,
-    rules: &RuleSet,
-    owner: &str,
-    obj: &crate::rules::object_type::ObjectType,
-    base_frames: u32,
-) -> u32 {
-    // time = base_frames / speed = base_frames * PRODUCTION_RATE_SCALE / speed_ppm.
-    let speed_ppm =
-        owner_effective_production_speed_ppm(sim, rules, owner).max(MIN_PRODUCTION_SPEED_PPM);
-    let mut time_to_build: u64 = ((u128::from(base_frames) * u128::from(PRODUCTION_RATE_SCALE))
-        / u128::from(speed_ppm)) as u64;
-    time_to_build = apply_multiple_factory_scaling_ppm(
-        time_to_build,
-        rules.production.multiple_factory_ppm,
-        matching_factory_count_for_owner(
-            &sim.substrate.entities,
-            rules,
-            owner,
-            production_category_for_object(obj),
-            &sim.interner,
-        ),
-    );
-    if obj.category == ObjectCategory::Building && obj.wall {
-        // Wall coefficient is f32 in rules and only consumed by this UI-display
-        // helper. The conversion `(f32 as f64 * 1e6) as u64` is bit-exact on
-        // every IEEE-754 platform; sim-hashed state never reads this branch.
-        let coef_ppm = (rules.production.wall_build_speed_coefficient.max(0.0) as f64
-            * PRODUCTION_RATE_SCALE as f64) as u64;
-        time_to_build = (u128::from(time_to_build) * u128::from(coef_ppm)
-            / u128::from(PRODUCTION_RATE_SCALE)) as u64;
-    }
-    time_to_build.min(u32::MAX as u64) as u32
-}
-
-/// Integer port of the original `MultipleFactory` exponential damp. Each extra
-/// matching factory multiplies the time-to-build by `multiple_factory_ppm /
-/// PRODUCTION_RATE_SCALE`, so for `n` factories the time is scaled by
-/// `mf^(n-1)`. Computed via repeated PPM-domain multiply+divide so the result
-/// is bit-exact across machines.
-fn apply_multiple_factory_scaling_ppm(
-    time_to_build: u64,
-    multiple_factory_ppm: u64,
-    queue_factory_count: u32,
-) -> u64 {
-    if multiple_factory_ppm == 0 || queue_factory_count <= 1 {
-        return time_to_build;
-    }
-    let mut scaled = time_to_build;
-    for _ in 1..queue_factory_count {
-        scaled = (u128::from(scaled) * u128::from(multiple_factory_ppm)
-            / u128::from(PRODUCTION_RATE_SCALE)) as u64;
-    }
-    scaled
-}
-
-/// Effective production speed as PPM (PRODUCTION_RATE_SCALE = 1.0×). Integer
-/// port of gamemd's LowPowerPenaltyModifier formula:
-///
-/// ```text
-///   speed = 1 - (1 - power_pct) * low_power_penalty_modifier
-///   speed = max(speed, min_low_power_production_speed)
-///   if power_pct < 1.0: speed = min(speed, max_low_power_production_speed)
-///   if speed == 0: speed = 0.01
-/// ```
-///
-/// All inputs are PPM-scaled at INI parse time (`*_ppm` fields on
-/// `ProductionRules`), so the entire chain is deterministic.
-fn owner_effective_production_speed_ppm(sim: &Simulation, rules: &RuleSet, owner: &str) -> u64 {
-    let power_pct_ppm = owner_power_percentage_ppm(sim, owner);
-    let deficit_ppm = PRODUCTION_RATE_SCALE.saturating_sub(power_pct_ppm);
-    let penalty_ppm = ((u128::from(deficit_ppm)
-        * u128::from(rules.production.low_power_penalty_modifier_ppm))
-        / u128::from(PRODUCTION_RATE_SCALE)) as u64;
-    let mut speed_ppm = PRODUCTION_RATE_SCALE.saturating_sub(penalty_ppm);
-    speed_ppm = speed_ppm.max(rules.production.min_low_power_production_speed_ppm);
-    if power_pct_ppm < PRODUCTION_RATE_SCALE {
-        speed_ppm = speed_ppm.min(rules.production.max_low_power_production_speed_ppm);
-    }
-    if speed_ppm == 0 {
-        MIN_PRODUCTION_SPEED_PPM
-    } else {
-        speed_ppm
-    }
-}
-
-/// Owner power ratio as PPM, clamped to `[0, PRODUCTION_RATE_SCALE]`. Returns
-/// `PRODUCTION_RATE_SCALE` (1.0×) when no power is drained (matches the
-/// original `if drained <= 0 { 1.0 }` short-circuit).
-pub(in crate::sim::production) fn owner_power_percentage_ppm(sim: &Simulation, owner: &str) -> u64 {
-    let (produced, drained) = sim
-        .interner
-        .get(owner)
-        .and_then(|id| sim.power_states.get(&id))
-        .map(|state| (state.total_output, state.total_drain))
-        .unwrap_or((0, 0));
-    if drained <= 0 {
-        return PRODUCTION_RATE_SCALE;
-    }
-    let produced_u = u128::from(produced.max(0) as u64);
-    let drained_u = u128::from(drained as u64);
-    let ratio_ppm = (produced_u * u128::from(PRODUCTION_RATE_SCALE)) / drained_u;
-    ratio_ppm.min(u128::from(PRODUCTION_RATE_SCALE)) as u64
-}
-
-/// Factory time multiplier scaled by PRODUCTION_RATE_SCALE (1M = 1.0×).
-/// MultipleFactory^(n-1) computed via repeated integer multiply.
-/// Test-only: sole caller is the retired `effective_progress_rate_ppm_for_category`.
-#[cfg(test)]
-fn matching_factory_time_multiplier_ppm(
-    entities: &EntityStore,
-    rules: &RuleSet,
-    owner: &str,
-    category: ProductionCategory,
-    interner: &crate::sim::intern::StringInterner,
-) -> u64 {
-    let factory_count: u32 =
-        matching_factory_count_for_owner(entities, rules, owner, category, interner);
-    if factory_count <= 1 {
-        return PRODUCTION_RATE_SCALE; // 1.0×
-    }
-    // Use pre-computed PPM value from rules (converted at INI parse time).
-    let mf_ppm: u64 = rules.production.multiple_factory_ppm;
-    // Compute mf_ppm^(n-1) / PRODUCTION_RATE_SCALE^(n-2) via repeated multiply+divide.
-    let mut result: u64 = mf_ppm;
-    for _ in 1..(factory_count - 1) {
-        result = result * mf_ppm / PRODUCTION_RATE_SCALE;
-    }
-    result.max(1)
-}
-
+/// The owner's live factories for `category`, as the House factory counters
+/// hold them for `Time_To_Build`'s MultipleFactory loop (`0x00500910`): a
+/// factory counts from `BuildingClass::Unlimbo` (`0x00440D13`, through
+/// `0x004FFA50`) until Limbo (`0x00445D8E`, through `0x004FF980`), so a factory
+/// still in its build-up animation counts. VERA drops a dying factory at once;
+/// whether gamemd's Limbo lags a building's death is untraced.
 pub(in crate::sim::production) fn matching_factory_count_for_owner(
     entities: &EntityStore,
     rules: &RuleSet,
@@ -640,7 +412,6 @@ pub(in crate::sim::production) fn matching_factory_count_for_owner(
                 && !e.lifecycle.in_limbo
                 && interner.resolve(e.owner()).eq_ignore_ascii_case(owner)
                 && e.category == EntityCategory::Structure
-                && e.building_up.is_none()
                 && is_production_factory(rules, interner.resolve(e.type_ref()), category)
         })
         .count() as u32
@@ -781,231 +552,24 @@ pub fn building_footprint_cells(
 /// is outside the base foundation.
 ///
 /// `NumberImpassableRows` is deliberately not applied here. That field is a
-/// live `UnitClass::Can_Enter_Cell` object-list skip, not static terrain data.
+/// live `UnitClass::Can_Enter_Cell` object-list skip (`0x0073F57C..5A2` radio
+/// contact, `0x0073F74B..774` UnitRepair/Bunker through `0x00458A00`), which
+/// the Unit Find_Path search reaches through `Simulation::foot_can_enter`; it
+/// is not static terrain data.
 pub fn building_movement_blocking_cells(
     base_foundation: &[(u16, u16)],
     has_bib: bool,
 ) -> Vec<(u16, u16)> {
-    building_movement_blocking_cells_for_state(base_foundation, 0, has_bib, -1, false, true, false)
-}
-
-/// Movement-blocking cells for an actual building object-list occupant.
-///
-/// `NumberImpassableRows` is only active in gamemd's live helper after a
-/// radio/contact or the UnitRepair/Bunker branch reaches that helper. Ordinary
-/// buildings outside those branches block their full base foundation, subject
-/// to the bib edge relaxation.
-pub fn building_movement_blocking_cells_for_state(
-    base_foundation: &[(u16, u16)],
-    foundation_origin_rx: u16,
-    has_bib: bool,
-    number_impassable_rows: i32,
-    is_bunker: bool,
-    bunker_occupied: bool,
-    number_rows_active: bool,
-) -> Vec<(u16, u16)> {
     use std::collections::BTreeSet;
+    if !has_bib {
+        return base_foundation.to_vec();
+    }
     let set: BTreeSet<(u16, u16)> = base_foundation.iter().copied().collect();
-    let apply_number_rows = number_rows_active && (!is_bunker || !bunker_occupied);
-    let impassable_row_limit = if apply_number_rows && number_impassable_rows >= 0 {
-        Some(foundation_origin_rx.saturating_add(number_impassable_rows as u16))
-    } else {
-        None
-    };
     base_foundation
         .iter()
         .copied()
-        .filter(|&(x, _)| match impassable_row_limit {
-            Some(limit_x) => x < limit_x,
-            None => true,
-        })
-        .filter(|&(x, y)| {
-            if !has_bib {
-                return true;
-            }
-            let east = x.checked_add(1).map(|nx| (nx, y));
-            east.is_some_and(|neighbor| set.contains(&neighbor))
-        })
+        .filter(|&(x, y)| x.checked_add(1).is_some_and(|nx| set.contains(&(nx, y))))
         .collect()
-}
-
-#[cfg(test)]
-mod production_speed_ppm_tests {
-    use super::*;
-    use crate::rules::ini_parser::IniFile;
-    use crate::rules::ruleset::RuleSet;
-    use crate::sim::world::Simulation;
-
-    /// f64 reference for the OLD chain. Used by tests to confirm the integer
-    /// PPM port matches the original formula to within 1 PPM (the rounding
-    /// budget of `f64.trunc() as u64` at the 1M scale).
-    fn reference_speed_f64(
-        produced: i32,
-        drained: i32,
-        lppm: f32,
-        min_lp: f32,
-        max_lp: f32,
-    ) -> f64 {
-        let power_pct: f64 = if drained <= 0 {
-            1.0
-        } else {
-            ((produced.max(0) as f64) / (drained as f64)).clamp(0.0, 1.0)
-        };
-        let mut speed = 1.0 - (1.0 - power_pct) * lppm as f64;
-        speed = speed.max(min_lp as f64);
-        if power_pct < 1.0 {
-            speed = speed.min(max_lp as f64);
-        }
-        if speed == 0.0 { 0.01 } else { speed }
-    }
-
-    fn rules_with_power(lppm: &str, min_lp: &str, max_lp: &str) -> RuleSet {
-        let ini = IniFile::from_str(&format!(
-            "[General]\nBuildSpeed=0.05\nLowPowerPenaltyModifier={lppm}\n\
-             MinLowPowerProductionSpeed={min_lp}\nMaxLowPowerProductionSpeed={max_lp}\n\
-             [InfantryTypes]\n[AircraftTypes]\n[BuildingTypes]\n[VehicleTypes]\n"
-        ));
-        RuleSet::from_ini(&ini).expect("should parse")
-    }
-
-    /// Direct unit test of the math: build a power state for the owner, run
-    /// `owner_effective_production_speed_ppm`, compare to the f64 reference.
-    fn assert_ppm_matches_f64(
-        produced: i32,
-        drained: i32,
-        rules: &RuleSet,
-        lppm_f: f32,
-        min_lp_f: f32,
-        max_lp_f: f32,
-    ) {
-        let mut sim = Simulation::new();
-        let owner_id = sim.interner.intern("Americans");
-        sim.power_states.insert(
-            owner_id,
-            crate::sim::power_system::PowerState {
-                total_output: produced,
-                total_drain: drained,
-                ..Default::default()
-            },
-        );
-        let got_ppm = owner_effective_production_speed_ppm(&sim, rules, "Americans");
-        let want_f64 = reference_speed_f64(produced, drained, lppm_f, min_lp_f, max_lp_f);
-        let want_ppm = (want_f64 * PRODUCTION_RATE_SCALE as f64).trunc() as u64;
-        // Integer PPM port can disagree with f64 trunc by at most 1 PPM due
-        // to rounding-vs-truncation order in the intermediate steps.
-        let diff = got_ppm.abs_diff(want_ppm);
-        assert!(
-            diff <= 1,
-            "produced={}, drained={}: got {} ppm, want {} ppm (f64 ref {})",
-            produced,
-            drained,
-            got_ppm,
-            want_ppm,
-            want_f64
-        );
-    }
-
-    #[test]
-    fn full_power_returns_one() {
-        let rules = rules_with_power("1.0", "0.5", "0.9");
-        assert_ppm_matches_f64(100, 100, &rules, 1.0, 0.5, 0.9);
-    }
-
-    #[test]
-    fn no_drain_returns_one() {
-        let rules = rules_with_power("1.0", "0.5", "0.9");
-        assert_ppm_matches_f64(50, 0, &rules, 1.0, 0.5, 0.9);
-    }
-
-    #[test]
-    fn brownout_clamps_to_max_lp() {
-        // 80% power, lppm=1.0, max_lp=0.9 → speed = 1 - 0.2 = 0.8, then min(0.8, 0.9) = 0.8.
-        let rules = rules_with_power("1.0", "0.5", "0.9");
-        assert_ppm_matches_f64(80, 100, &rules, 1.0, 0.5, 0.9);
-    }
-
-    #[test]
-    fn deep_brownout_clamps_to_min_lp() {
-        // 10% power, lppm=1.0 → speed = 1 - 0.9 = 0.1, then max(0.1, 0.5) = 0.5.
-        let rules = rules_with_power("1.0", "0.5", "0.9");
-        assert_ppm_matches_f64(10, 100, &rules, 1.0, 0.5, 0.9);
-    }
-
-    #[test]
-    fn zero_power_clamps_to_min_lp() {
-        let rules = rules_with_power("1.0", "0.5", "0.9");
-        assert_ppm_matches_f64(0, 100, &rules, 1.0, 0.5, 0.9);
-    }
-
-    #[test]
-    fn aggressive_penalty_modifier() {
-        // lppm=1.5 means each percentage-point of power loss costs 1.5pp of speed.
-        let rules = rules_with_power("1.5", "0.25", "1.0");
-        assert_ppm_matches_f64(60, 100, &rules, 1.5, 0.25, 1.0);
-        assert_ppm_matches_f64(33, 100, &rules, 1.5, 0.25, 1.0);
-        assert_ppm_matches_f64(0, 100, &rules, 1.5, 0.25, 1.0);
-    }
-
-    #[test]
-    fn over_powered_clamps_ratio_to_one() {
-        // produced > drained: power_pct must still cap at 1.0.
-        let rules = rules_with_power("1.0", "0.5", "0.9");
-        assert_ppm_matches_f64(200, 100, &rules, 1.0, 0.5, 0.9);
-    }
-}
-
-#[cfg(test)]
-mod build_time_integer_tests {
-    use super::*;
-    use crate::rules::ini_parser::IniFile;
-    use crate::rules::ruleset::RuleSet;
-
-    fn rules_with_units(speed: &str) -> RuleSet {
-        let ini = IniFile::from_str(&format!(
-            "[General]\nBuildSpeed={speed}\n\
-             [InfantryTypes]\n[AircraftTypes]\n[BuildingTypes]\n\
-             [VehicleTypes]\n0=GRIZZLY\n1=PRISM\n2=CHEAP\n3=STANDARD\n\
-             [GRIZZLY]\nCost=700\nStrength=100\nArmor=heavy\n\
-             [PRISM]\nCost=1500\nStrength=100\nArmor=light\nBuildTimeMultiplier=1.15\n\
-             [CHEAP]\nCost=0\nStrength=100\nArmor=none\n\
-             [STANDARD]\nCost=1000\nStrength=100\nArmor=none\n"
-        ));
-        RuleSet::from_ini(&ini).expect("should parse")
-    }
-
-    #[test]
-    fn grizzly_tank_build_time() {
-        // cost=700, BuildSpeed=0.05, BTM=1.0
-        // Float: trunc(700*0.05*0.9) = 31. Integer: 700*50*9/10000 = 31.
-        let rules = rules_with_units("0.05");
-        let obj = rules.object("GRIZZLY").unwrap();
-        assert_eq!(build_time_base_frames(&rules, obj), 31);
-    }
-
-    #[test]
-    fn prism_tower_build_time() {
-        // cost=1500, BuildSpeed=0.05, BTM=1.15 (x1000=1150)
-        // Float: trunc(67.5)=67, trunc(67*1.15)=77. Integer: 67*1150/1000=77.
-        let rules = rules_with_units("0.05");
-        let obj = rules.object("PRISM").unwrap();
-        assert_eq!(build_time_base_frames(&rules, obj), 77);
-    }
-
-    #[test]
-    fn zero_cost_returns_zero() {
-        let rules = rules_with_units("0.05");
-        let obj = rules.object("CHEAP").unwrap();
-        assert_eq!(build_time_base_frames(&rules, obj), 0);
-    }
-
-    #[test]
-    fn existing_test_parity_buildspeed_1() {
-        // Matches production_queue_tests: cost=1000, BuildSpeed=1.0, BTM=1.0
-        // Float: trunc(1000*1.0*0.9)=900. Integer: 1000*1000*9/10000=900.
-        let rules = rules_with_units("1.0");
-        let obj = rules.object("STANDARD").unwrap();
-        assert_eq!(build_time_base_frames(&rules, obj), 900);
-    }
 }
 
 #[cfg(test)]

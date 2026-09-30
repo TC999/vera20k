@@ -1,9 +1,9 @@
-//! Force-fire-on-cell unit tests for `issue_attack_cell_command`.
+//! Force-fire-on-cell unit tests for `install_cell_attack_target_for_test`.
 //!
 //! Verifies the sim-side entry point for `Command::ForceAttackCell` —
 //! Ctrl + left-click on empty terrain.
 
-use super::{AttackTarget, TargetKind, issue_attack_cell_command};
+use super::{AttackTarget, TargetKind, install_cell_attack_target_for_test};
 use crate::rules::ini_parser::IniFile;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::components::{Health, MovementTarget};
@@ -26,12 +26,9 @@ fn ff_rules() -> RuleSet {
     RuleSet::from_ini(&ini).expect("ff_rules should parse")
 }
 
-fn make_unit(id: u64, type_ref: &str, rx: u16, ry: u16, hp: u16) -> GameEntity {
+fn make_unit(id: u64, type_ref: &str, rx: u16, ry: u16, hp: i32) -> GameEntity {
     let mut e = GameEntity::test_default(id, type_ref, "Americans", rx, ry);
-    e.health = Health {
-        current: hp,
-        max: hp,
-    };
+    e.health = Health { current: hp };
     e
 }
 
@@ -39,19 +36,25 @@ fn make_unit(id: u64, type_ref: &str, rx: u16, ry: u16, hp: u16) -> GameEntity {
 fn issue_attack_cell_sets_cell_target_for_armed_unit() {
     let mut store = EntityStore::new();
     store.insert(make_unit(1, "MTNK", 5, 5, 300));
+    let rearm = crate::sim::timer::CdTimer::started(0, 40);
+    store.get_mut(1).unwrap().rearm_timer = rearm;
     let interner = test_interner();
     let rules = ff_rules();
 
-    let ok = issue_attack_cell_command(&mut store, 1, 50, 50, Some(&rules), &interner);
+    let ok = install_cell_attack_target_for_test(&mut store, 1, 50, 50, Some(&rules), &interner);
 
     assert!(
         ok,
-        "issue_attack_cell_command should succeed for armed unit"
+        "install_cell_attack_target_for_test should succeed for armed unit"
     );
     let attack = store.get(1).unwrap().attack_target.as_ref().unwrap();
     assert!(matches!(attack.target, TargetKind::Cell(50, 50)));
-    assert_eq!(attack.cooldown_ticks, 0);
-    assert_eq!(attack.burst_remaining, 0);
+    assert_eq!(
+        store.get(1).unwrap().rearm_timer,
+        rearm,
+        "a force-fire order does not reload the weapon"
+    );
+    assert_eq!(store.get(1).unwrap().weapon_burst.index(), 0);
 }
 
 #[test]
@@ -61,7 +64,7 @@ fn issue_attack_cell_rejects_unarmed_attacker() {
     let interner = test_interner();
     let rules = ff_rules();
 
-    let ok = issue_attack_cell_command(&mut store, 1, 50, 50, Some(&rules), &interner);
+    let ok = install_cell_attack_target_for_test(&mut store, 1, 50, 50, Some(&rules), &interner);
 
     assert!(!ok, "ForceAttackCell on unarmed unit must return false");
     assert!(store.get(1).unwrap().attack_target.is_none());
@@ -75,7 +78,7 @@ fn issue_attack_cell_clears_movement_target() {
     let interner = test_interner();
     let rules = ff_rules();
 
-    let ok = issue_attack_cell_command(&mut store, 1, 50, 50, Some(&rules), &interner);
+    let ok = install_cell_attack_target_for_test(&mut store, 1, 50, 50, Some(&rules), &interner);
 
     assert!(ok);
     assert!(store.get(1).unwrap().movement_target.is_none());
@@ -87,7 +90,7 @@ fn issue_attack_cell_returns_false_for_missing_attacker() {
     let interner = test_interner();
     let rules = ff_rules();
 
-    let ok = issue_attack_cell_command(&mut store, 999, 50, 50, Some(&rules), &interner);
+    let ok = install_cell_attack_target_for_test(&mut store, 999, 50, 50, Some(&rules), &interner);
 
     assert!(
         !ok,
@@ -99,9 +102,6 @@ fn issue_attack_cell_returns_false_for_missing_attacker() {
 fn for_cell_constructor_creates_cell_variant() {
     let at = AttackTarget::for_cell(42, 17);
     assert!(matches!(at.target, TargetKind::Cell(42, 17)));
-    assert_eq!(at.cooldown_ticks, 0);
-    assert_eq!(at.burst_remaining, 0);
-    assert_eq!(at.burst_delay_ticks, 0);
 }
 
 #[test]
@@ -123,7 +123,6 @@ fn force_fire_detonation_builds_an_anim_instance_and_plays_its_report() {
     use crate::sim::command::{Command, CommandEnvelope};
     use crate::sim::pathfinding::PathGrid;
     use crate::sim::world::{SimSoundEvent, Simulation};
-    use std::collections::BTreeMap;
 
     let mut rules = RuleSet::from_ini(&IniFile::from_str(
         "[VehicleTypes]\n0=MTNK\n\n\
@@ -138,7 +137,7 @@ fn force_fire_detonation_builds_an_anim_instance_and_plays_its_report() {
         "[TWLT036]\nTranslucent=yes\nReport=Explosion06\nEnd=8\n",
     ));
     art.bind_anim_frame_count_for_test("TWLT036", 8);
-    rules.art_registry = art;
+    rules.replace_art_registry_for_test(art);
 
     let mut sim = Simulation::new();
     sim.input_delay_ticks = 0;
@@ -152,7 +151,6 @@ fn force_fire_detonation_builds_an_anim_instance_and_plays_its_report() {
         crate::sim::world::RevealOutcome::Revealed { .. }
     ));
     let grid = PathGrid::test_all_passable(64, 64);
-    let height_map: BTreeMap<(u16, u16), u8> = BTreeMap::new();
 
     // In range from the start, so the shot lands without a pursuit walk.
     sim.queue_command(CommandEnvelope::new(
@@ -169,7 +167,7 @@ fn force_fire_detonation_builds_an_anim_instance_and_plays_its_report() {
     let mut explosion = None;
     for _ in 0..60 {
         let pending = sim.take_due_commands();
-        sim.advance_tick(&pending, Some(&rules), &height_map, Some(&grid), None, 100);
+        sim.advance_tick(&pending, Some(&rules), Some(&grid), None, 100);
         if let Some((&id, _)) = sim.anims().find(|(_, anim)| anim.type_id == explosion_type) {
             explosion = Some(id);
             break;
@@ -181,10 +179,6 @@ fn force_fire_detonation_builds_an_anim_instance_and_plays_its_report() {
     assert_eq!(anim.draw_flags, COMBAT_EXPLOSION_DRAW_FLAGS);
     assert_eq!(anim.z_adjust, COMBAT_EXPLOSION_Z_ADJUST);
     assert!(anim.start_sound_active);
-    assert!(
-        sim.world_effects.is_empty(),
-        "combat explosions no longer take the legacy world-effect path"
-    );
 
     let report = sim.interner.intern("EXPLOSION06");
     assert!(
@@ -205,14 +199,18 @@ fn force_fire_cell_pursuit_then_fire_integration() {
     use crate::sim::command::{Command, CommandEnvelope};
     use crate::sim::pathfinding::PathGrid;
     use crate::sim::world::Simulation;
-    use std::collections::BTreeMap;
 
     let rules = ff_rules();
     let mut sim = Simulation::new();
     sim.input_delay_ticks = 0;
-    sim.substrate
-        .entities
-        .insert(make_unit(1, "MTNK", 5, 5, 300));
+    // A Foot always has a locomotor: `FootClass::AI` calls its Process.
+    let mut tank = make_unit(1, "MTNK", 5, 5, 300);
+    tank.locomotor = Some(
+        crate::sim::movement::locomotor::LocomotorState::for_test_kind(
+            crate::rules::locomotor_type::LocomotorKind::Drive,
+        ),
+    );
+    sim.substrate.entities.insert(tank);
     // Replace sim interner with the test interner so type_ref/owner IDs from
     // GameEntity::test_default resolve correctly.
     sim.interner = crate::sim::intern::test_interner();
@@ -222,7 +220,6 @@ fn force_fire_cell_pursuit_then_fire_integration() {
         crate::sim::world::RevealOutcome::Revealed { .. }
     ));
     let grid = PathGrid::test_all_passable(64, 64);
-    let height_map: BTreeMap<(u16, u16), u8> = BTreeMap::new();
 
     sim.queue_command(CommandEnvelope::new(
         owner_id,
@@ -237,7 +234,7 @@ fn force_fire_cell_pursuit_then_fire_integration() {
     // Tick 1: EventClass applies the command at the native Main_Tick tail,
     // after this frame's pursuit/object walk has already completed.
     let pending = sim.take_due_commands();
-    sim.advance_tick(&pending, Some(&rules), &height_map, Some(&grid), None, 100);
+    sim.advance_tick(&pending, Some(&rules), Some(&grid), None, 100);
 
     let entity = sim.substrate.entities.get(1).unwrap();
     assert!(
@@ -250,7 +247,7 @@ fn force_fire_cell_pursuit_then_fire_integration() {
     );
 
     // Tick 2: the next object walk observes the target and starts pursuit.
-    sim.advance_tick(&[], Some(&rules), &height_map, Some(&grid), None, 100);
+    sim.advance_tick(&[], Some(&rules), Some(&grid), None, 100);
     assert!(
         sim.substrate
             .entities
@@ -263,7 +260,7 @@ fn force_fire_cell_pursuit_then_fire_integration() {
     let mut fired = false;
     for _ in 0..400 {
         let pending = sim.take_due_commands();
-        sim.advance_tick(&pending, Some(&rules), &height_map, Some(&grid), None, 100);
+        sim.advance_tick(&pending, Some(&rules), Some(&grid), None, 100);
         if !sim.fire_events.is_empty() {
             fired = true;
             break;
@@ -281,4 +278,90 @@ fn force_fire_cell_pursuit_then_fire_integration() {
         fired,
         "unit should walk into range and fire within 400 ticks"
     );
+}
+
+/// End to end through the production tick: a force-fired shot constructs the
+/// weapon's `Anim=` as an `AnimClass` in the store, at the shot's fire
+/// coordinate, owned by the firer (`TechnoClass::Fire_At`, `0x006FF3C2` and
+/// `0x006FF43A`).
+#[test]
+fn a_fired_shot_constructs_its_muzzle_anim_in_the_store() {
+    use crate::rules::art_data::ArtRegistry;
+    use crate::sim::command::{Command, CommandEnvelope};
+    use crate::sim::pathfinding::PathGrid;
+    use crate::sim::world::Simulation;
+
+    let mut rules = RuleSet::from_ini(&IniFile::from_str(
+        "[VehicleTypes]\n0=MTNK\n[InfantryTypes]\n[BuildingTypes]\n[AircraftTypes]\n\n\
+         [Animations]\n0=GUNFIRE\n\n\
+         [MTNK]\nStrength=300\nArmor=heavy\nSpeed=6\nPrimary=105mm\n\n\
+         [105mm]\nDamage=65\nROF=50\nRange=6\nWarhead=AP\nAnim=GUNFIRE\n\n\
+         [AP]\nVerses=100%,100%,90%,75%,75%,75%,60%,30%,20%,0%,0%\n",
+    ))
+    .expect("rules");
+    let mut art = ArtRegistry::from_ini(&IniFile::from_str(
+        "[MTNK]\nPrimaryFireFLH=150,0,100\n[GUNFIRE]\nRate=900\n",
+    ));
+    art.bind_anim_frame_count_for_test("GUNFIRE", 6);
+    // Synthetic fixture supplies ART directly, without native read-admission replay.
+    rules.install_art_fixture(art);
+
+    let mut sim = Simulation::new();
+    sim.input_delay_ticks = 0;
+    // The tank takes its id from the shared counter, so the anim's id is free.
+    let tank = sim.allocate_stable_id();
+    assert_eq!(tank, 1);
+    sim.substrate
+        .entities
+        .insert(make_unit(tank, "MTNK", 5, 5, 300));
+    sim.interner = crate::sim::intern::test_interner();
+    let owner_id = sim.interner.intern("Americans");
+    sim.reveal(tank);
+    let grid = PathGrid::test_all_passable(64, 64);
+    sim.queue_command(CommandEnvelope::new(
+        owner_id,
+        sim.session.tick + 1,
+        Command::ForceAttackCell {
+            attacker_id: tank,
+            target_rx: 8,
+            target_ry: 5,
+        },
+    ));
+
+    let mut shot = None;
+    for _ in 0..200 {
+        let pending = sim.take_due_commands();
+        sim.advance_tick(&pending, Some(&rules), Some(&grid), None, 100);
+        if let Some(event) = sim.fire_events.first() {
+            shot = Some(event.clone());
+            break;
+        }
+    }
+    let shot = shot.expect("the tank fires at a cell three cells away");
+    assert_eq!(
+        shot.muzzle_anim
+            .map(|id| sim.interner.resolve(id).to_string()),
+        Some("GUNFIRE".to_string())
+    );
+
+    let muzzle: Vec<_> = sim
+        .substrate
+        .anims
+        .iter()
+        .filter(|(_, anim)| sim.interner.resolve(anim.type_id) == "GUNFIRE")
+        .map(|(id, anim)| (*id, anim.owner_entity, anim.draw_flags))
+        .collect();
+    assert_eq!(muzzle.len(), 1, "one shot, one muzzle anim");
+    let (anim_id, owner, draw_flags) = muzzle[0];
+    assert_eq!((owner, draw_flags), (Some(1), 0x600));
+    let absolute = sim.anim_absolute_coord(anim_id).expect("anim coordinate");
+    assert_eq!(
+        (absolute.x, absolute.y, absolute.z),
+        (shot.fire_coord.x, shot.fire_coord.y, shot.fire_coord.z),
+        "the flash sits on the coordinate the shot left from"
+    );
+    // The FLH put the muzzle off the hull centre and 100 leptons up.
+    let centre = (5 * 256 + 128, 5 * 256 + 128);
+    assert_ne!((shot.fire_coord.x, shot.fire_coord.y), centre);
+    assert_eq!(shot.fire_coord.z, 100);
 }

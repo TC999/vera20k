@@ -3,6 +3,141 @@
 use super::*;
 
 #[test]
+fn native_discharge_art_reader_matches_original_signed_independent_keys() {
+    // Original InfantryType ART reads 5246BE..52473A call ReadInt5276D0
+    // independently over E40/E44/E48/E4C. Replay every cached-input row
+    // through the production read owner, then fresh file/registry inputs.
+    let corpus: serde_json::Value = serde_json::from_str(include_str!(
+        "../../tools/spatial_oracle/infantry_discharge_rules.json"
+    ))
+    .unwrap();
+    let rows = corpus["cases"].as_array().unwrap();
+    assert_eq!(rows.len(), 150);
+    let mut compared = 0;
+    for row in rows {
+        let layers = row["layers"].as_array().unwrap();
+        let section = row["section"].as_str().unwrap();
+        let mut retained: [i32; 4] = serde_json::from_value(row["before"].clone()).unwrap();
+        for (index, layer) in layers.iter().enumerate() {
+            // The original oracle supplies cached values. `set` preserves
+            // present-empty/raw text, unlike physical INI loading, which
+            // omits empty entries and trims values before these reads.
+            let mut cached = IniSection::new(section.to_owned());
+            for (key, value) in layer.as_object().unwrap() {
+                if let Some(raw) = value.as_str() {
+                    cached.set(key, raw);
+                }
+            }
+            read_infantry_discharge_frames(&cached, &mut retained);
+            let expected: [i32; 4] =
+                serde_json::from_value(row["after_layers"][index].clone()).unwrap();
+            assert_eq!(
+                retained, expected,
+                "original row {} pass{index}",
+                row["case"]
+            );
+        }
+        if !row["initial"].is_null() || layers.len() != 1 {
+            continue;
+        }
+        // A harmless unknown key keeps all-absent/empty sections in the
+        // physical loader; it is never a discharge read input.
+        let mut text = format!("[{section}]\nFixtureOnly=1\n");
+        for (key, value) in layers[0].as_object().unwrap() {
+            if let Some(raw) = value.as_str() {
+                text.push_str(&format!("{key}={raw}\n"));
+            }
+        }
+        let registry = ArtRegistry::from_ini(&IniFile::from_str(&text));
+        let entry = registry.get(section).unwrap();
+        let actual = [
+            entry.fire_up,
+            entry.fire_prone,
+            entry.secondary_fire,
+            entry.secondary_prone,
+        ];
+        let expected: [i32; 4] = serde_json::from_value(row["after"].clone()).unwrap();
+        assert_eq!(actual, expected, "original row {}", row["case"]);
+        compared += 1;
+    }
+    assert_eq!(compared, 75);
+}
+
+#[test]
+fn animation_layer_matches_original_name_reader() {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+        "../../tools/spatial_oracle/anim_layer_rules.json"
+    ))
+    .unwrap();
+    assert_eq!(rows.len(), 19);
+    for row in rows {
+        let mut text = "[A]\nLoopCount=1\n".to_owned();
+        if let Some(raw) = row["raw"].as_str() {
+            text.push_str(&format!("Layer={raw}\n"));
+        }
+        let ini = IniFile::from_str(&text);
+        let actual = match AnimLayer::from_ini(ini.section("A").unwrap()) {
+            AnimLayer::Ground => 2,
+            AnimLayer::Top => 4,
+            AnimLayer::Other(value) => value,
+        };
+        assert_eq!(actual, row["layer"].as_i64().unwrap() as i32, "{row}");
+    }
+}
+
+#[test]
+fn original_1080_building_slot_power_reads_preserve_native_defaults() {
+    #[derive(serde::Deserialize)]
+    struct Row {
+        slot: usize,
+        flag: usize,
+        name: String,
+        raw: Option<String>,
+        initial: bool,
+        output: bool,
+    }
+    let rows: Vec<Row> = serde_json::from_str(include_str!(
+        "../../tools/spatial_oracle/building_slot_power_rules.json"
+    ))
+    .unwrap();
+    assert_eq!(rows.len(), 1080);
+    for (index, row) in rows.into_iter().enumerate() {
+        let mut section = IniSection::new("B".into());
+        if let Some(raw) = row.raw {
+            section.set(&row.name, &raw);
+        }
+        let initial = BuildingAnimPowerFlags {
+            powered: row.initial,
+            powered_light: row.initial,
+            powered_effect: row.initial,
+            powered_special: row.initial,
+        };
+        let mut records = [initial; 21];
+        read_building_anim_power(&section, &mut records);
+        let actual = records[row.slot];
+        assert_eq!(
+            [
+                actual.powered,
+                actual.powered_light,
+                actual.powered_effect,
+                actual.powered_special
+            ][row.flag],
+            row.output,
+            "native row {index}"
+        );
+    }
+    let registry = ArtRegistry::from_ini(&IniFile::from_str(
+        "[B]\nTurretAnimPowered=no\nActiveAnimPowered=no\n",
+    ));
+    let records = &registry.get("B").unwrap().building_anim_power;
+    assert_eq!(records[9], BuildingAnimPowerFlags::default());
+    assert!(
+        !records[3].powered,
+        "power metadata exists without an animation name"
+    );
+}
+
+#[test]
 fn test_apply_theater_letter() {
     assert_eq!(apply_theater_letter("GAPOWR", "TEMPERATE"), "GTPOWR");
     assert_eq!(apply_theater_letter("GAPOWR", "SNOW"), "GAPOWR");
@@ -98,9 +233,9 @@ fn test_from_ini_parses_entries() {
     let gi: &ArtEntry = reg.get("GI").expect("GI exists");
     assert!(gi.crawls);
     assert_eq!(gi.fire_up, 2);
-    assert_eq!(gi.fire_prone, 2);
+    assert_eq!(gi.fire_prone, 0);
     assert_eq!(gi.secondary_fire, 4);
-    assert_eq!(gi.secondary_prone, 4);
+    assert_eq!(gi.secondary_prone, 0);
 }
 
 #[test]
@@ -419,16 +554,43 @@ fn test_anim_candidates_use_anim_section_flags() {
     let image_id: String = reg.resolve_effective_image_id("CAOILD_A", "CAOILD_A");
     let candidates: Vec<String> =
         anim_shp_candidates(Some(&reg), "CAOILD_A", &image_id, "urb", "NEWURBAN");
+    // Native order: the theater-letter name, then the forced `G` name. The
+    // rest is VERA leniency.
     assert_eq!(
         candidates,
         vec![
             "CNOILDX.SHP",
-            "CNOILDX.URB",
             "CGOILDX.SHP",
+            "CNOILDX.URB",
             "CAOILDX.SHP",
             "CAOILDX.URB",
         ]
     );
+}
+
+/// `[GAPOWR_AD] Image=GAPOWR_A` authors no `NewTheater=`. The per-theater
+/// reload (`0x00428CD6`) then skips the theater letter, fails on
+/// `GAPOWR_A.SHP`, and `FUN_005F9710` forces the second letter to `G`
+/// unconditionally, which is the file retail ships.
+#[test]
+fn anim_candidates_force_the_generic_letter_without_new_theater() {
+    let reg = ArtRegistry::from_ini(&IniFile::from_str("[GAPOWR_AD]\nImage=GAPOWR_A\n"));
+    let image_id = reg.resolve_effective_image_id("GAPOWR_AD", "GAPOWR_AD");
+    let candidates = anim_shp_candidates(Some(&reg), "GAPOWR_AD", &image_id, "tem", "TEMPERATE");
+    assert_eq!(&candidates[..2], ["GAPOWR_A.SHP", "GGPOWR_A.SHP"]);
+}
+
+/// `FUN_005F96B0` substitutes only `[GNCY][AT]` names, so a `NewTheater=yes`
+/// type outside that pattern keeps its name before the `G` fallback.
+#[test]
+fn anim_theater_letter_needs_the_native_name_pattern() {
+    let reg = ArtRegistry::from_ini(&IniFile::from_str(
+        "[XAFOO]\nNewTheater=yes\n[YAGRND_B]\nNewTheater=yes\n",
+    ));
+    let plain = anim_shp_candidates(Some(&reg), "XAFOO", "XAFOO", "tem", "TEMPERATE");
+    assert_eq!(&plain[..2], ["XAFOO.SHP", "XGFOO.SHP"]);
+    let yuri = anim_shp_candidates(Some(&reg), "YAGRND_B", "YAGRND_B", "tem", "TEMPERATE");
+    assert_eq!(&yuri[..2], ["YTGRND_B.SHP", "YGGRND_B.SHP"]);
 }
 
 #[test]
@@ -660,12 +822,20 @@ fn test_sequence_frames_partial_some_missing() {
 }
 
 #[test]
-fn test_parse_sequence_frames_helper() {
-    assert_eq!(parse_sequence_frames("300,15,0"), Some(15));
-    assert_eq!(parse_sequence_frames(" 8 , 6 , 6 "), Some(6));
-    assert_eq!(parse_sequence_frames("only-one"), None);
-    assert_eq!(parse_sequence_frames("a,b,c"), None);
-    assert_eq!(parse_sequence_frames(""), None);
+fn test_sequence_frames_follow_the_native_sequence_scan() {
+    // 0x00523D00 scans `%d,%d,%d,%s` over the constructor's zero record; a
+    // literal comma skips no whitespace, so `8 , 6` stops after one field.
+    let deploy_frames = |value: &str| {
+        let ini = IniFile::from_str(&format!("[E1]\nSequence=S\n[S]\nDeploy={value}\n"));
+        ArtRegistry::from_ini(&ini)
+            .get("E1")
+            .expect("E1 entry")
+            .deploy_frames
+    };
+    assert_eq!(deploy_frames("300,15,0"), Some(15));
+    assert_eq!(deploy_frames(" 8 , 6 , 6 "), Some(0));
+    assert_eq!(deploy_frames("only-one"), Some(0));
+    assert_eq!(deploy_frames("a,b,c"), Some(0));
 }
 
 #[test]
@@ -749,5 +919,80 @@ impl AnimDimTestRoot {
 impl Drop for AnimDimTestRoot {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[test]
+fn animation_binding_keeps_literal_types_and_exact_image_sections() {
+    use crate::rules::{native_processing::RulesLayerStack, ruleset::RuleSet};
+    let root = AnimDimTestRoot::new();
+    for name in ["REAL", "WRONG", "D"] {
+        std::fs::write(
+            root.path().join(format!("{name}.SHP")),
+            single_frame_shp(3, 5),
+        )
+        .unwrap();
+    }
+    let assets = crate::assets::asset_manager::AssetManager::from_loose_root_for_test(root.path());
+    let art_ini = IniFile::from_str("[ FX]\nImage=REAL\n[FX]\nImage=WRONG\n");
+    let processed = RulesLayerStack::new(IniFile::from_str(
+        "[General]\nMetallicDebris=FX, FX,D, none\n",
+    ))
+    .process_with_fixed_art(&art_ini)
+    .unwrap();
+    let rules = RuleSet::from_processed_rules(&processed).unwrap();
+    let mut art = ArtRegistry::from_ini(&art_ini);
+    art.apply_anim_type_read_states(&rules.anim_type_art_read_states);
+    assert_eq!(art.resolve_anim_image_id(" FX"), "REAL");
+    assert_eq!(art.resolve_anim_image_id("FX"), "WRONG");
+    // Generic object resolution intentionally retains its established behavior.
+    assert_eq!(art.resolve_effective_image_id(" FX", " FX"), "WRONG");
+    let roots = rules.general.metallic_debris.clone();
+    art.bind_scheduler_anim_assets(&roots, &assets, "TEM", "TEMPERATE")
+        .unwrap();
+    for name in ["FX", " FX", "D", " NONE"] {
+        assert!(art.scheduler_anim_types().contains(name));
+    }
+    assert_eq!(
+        art.anim_runtime_config(" FX").unwrap().raw_shp_frame_count,
+        Some(1)
+    );
+    let d = art.anim_runtime_config("D").unwrap();
+    assert!(!d.art_body_read);
+    assert!(!d.bouncer);
+    assert_eq!(d.raw_shp_frame_count, None, "orphan D.SHP must not bind");
+    assert_eq!((d.end, d.loop_end, d.rate_logic_frames), (0, 0, 1));
+    let mut tolerant = ArtRegistry::from_ini(&art_ini);
+    tolerant.apply_anim_type_read_states(&rules.anim_type_art_read_states);
+    assert_eq!(
+        tolerant.bind_anim_class_assets(&roots, &assets, "TEM", "TEMPERATE"),
+        0
+    );
+    assert_eq!(tolerant.scheduler_anim_types(), art.scheduler_anim_types());
+}
+
+#[test]
+fn animation_image25_matches_original_reader_and_loader_selection() {
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("../../tools/rules_oracle/anim_image.json")).unwrap();
+    for row in rows {
+        let name = row["type"].as_str().unwrap();
+        let mut section = IniSection::new(name.to_owned());
+        if let Some(raw) = row["raw"].as_str() {
+            section.set("Image", raw);
+        }
+        let mut ini = IniFile::empty();
+        ini.replace_first_section(section);
+        let art = ArtRegistry::from_ini(&ini);
+        assert_eq!(
+            art.anim_runtime_config(name).unwrap().image,
+            row["image"].as_str().unwrap(),
+            "{row}"
+        );
+        assert_eq!(
+            art.resolve_anim_image_id(name),
+            row["selected"].as_str().unwrap().to_ascii_uppercase(),
+            "{row}"
+        );
     }
 }

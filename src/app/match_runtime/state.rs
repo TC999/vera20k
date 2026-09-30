@@ -23,13 +23,14 @@ pub(crate) struct MatchState {
     pub(crate) match_diagnostics: crate::app::match_diagnostics::MatchDiagnosticsState,
     pub(crate) map_basic: BasicSection,
     /// Exact source whose bytes produced the active parsed map.
-    pub(crate) loaded_map_source: Option<crate::app::frontend::list_maps::LoadedMapSource>,
+    pub(crate) loaded_map_source: Option<crate::map::source::LoadedMapSource>,
     /// Deterministic digest of the parsed source map INI. `None` only for
     /// generated/fallback worlds without an authoritative source-map payload.
     pub(crate) loaded_map_hash: Option<u64>,
     /// App-owned wall-clock outcome-EVA drain. The deterministic accepted
     /// result and SavourDelay target live in serialized `HouseState`.
-    pub(crate) scenario_outcome: Option<crate::app::match_runtime::scenario_exit::ScenarioOutcomeVoiceWait>,
+    pub(crate) scenario_outcome:
+        Option<crate::app::match_runtime::scenario_exit::ScenarioOutcomeVoiceWait>,
     /// Active running-scenario audio teardown. While present the tactical
     /// frame remains visible but simulation is frozen; its destination is
     /// committed only after the retail fade/voice-wait sequence completes.
@@ -39,24 +40,42 @@ pub(crate) struct MatchState {
     pub(crate) scenario_elapsed_clock: crate::app::match_runtime::frame_pacer::ScenarioElapsedClock,
     /// Config-sourced input delay — copied to each new Simulation instance at game start.
     pub(crate) configured_input_delay_ticks: u64,
-    /// Match-scoped local player identity, pinned ONCE at match launch
-    /// (skirmish session / spawn-pick) and never rewritten mid-match. All
-    /// command/HUD owner resolution reads this first — selection must never
-    /// repoint the local player (lockstep: each client issues commands as its
-    /// fixed house). `None` only in dev/sandbox flows with no launch identity,
-    /// where the legacy heuristic + debug override below take over.
-    pub(crate) local_player_owner: Option<String>,
-    /// Explicit local owner preference for HUD/commands (set by debug actions).
-    /// Only consulted when `local_player_owner` is `None` (sandbox/dev flows).
+    /// Explicit development HUD/command preference. Only consulted when the
+    /// live scenario has no current House; ordinary matches derive their
+    /// identity from serialized `Simulation.session.current_house`.
     pub(crate) local_owner_override: Option<String>,
     /// Seeded empty-map sandbox keeps full map visibility while still locking control.
     pub(crate) sandbox_full_visibility: bool,
-    /// True when the game is paused (an in-scenario modal is open, sim frozen).
-    ///
-    /// Derived from `in_game_menu` for every player-driven modal; the debug
-    /// pause (dev overlay / hotkey) also sets it without opening a menu.
-    pub(crate) paused: bool,
+    /// The debug pause (`J` hotkey / dev overlay): the simulation is frozen
+    /// without an in-scenario modal. Every modal transition ends it.
+    pub(crate) debug_pause: bool,
     /// Effective simulation ticks per second — controls game speed.
     /// Default follows retail/YR skirmish stored game speed 1.
     pub(crate) sim_speed_tps: u32,
+}
+
+impl MatchState {
+    /// True when the game is paused and the simulation frozen: an in-scenario
+    /// modal is open, or the debug pause is on.
+    pub(crate) fn paused(&self) -> bool {
+        self.match_presentation.in_game_menu.is_open() || self.debug_pause
+    }
+
+    /// The live scenario's pinned player, including a successfully restored save.
+    pub(crate) fn local_player_owner(&self) -> Option<&str> {
+        self.sim_runtime
+            .as_ref()
+            .and_then(|runtime| scenario_local_owner(&runtime.simulation))
+    }
+}
+
+/// Native current House A83D4C is saved67F802, loaded67F9F3 and swizzled67FA0E.
+/// Do not retain a separate app owner across Simulation replacement or infer it
+/// from selection/human flags. Save validation owns reference validity.
+/// Evidence: docs/research/PHASE3_CURRENT_HOUSE_IDENTITY_GHIDRA_REPORT.md.
+pub(crate) fn scenario_local_owner(simulation: &crate::sim::world::Simulation) -> Option<&str> {
+    simulation
+        .session
+        .current_house
+        .map(|owner| simulation.interner.resolve(owner))
 }

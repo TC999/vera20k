@@ -1,20 +1,17 @@
-//! Production hut-collapse membership and restoration regressions.
+//! Structural fallout membership/restoration and concrete hut caller regressions.
 use super::{
-    dispatch_bridge_collapse_from_hut_with_overlay_registry,
-    tests::{seed_bridge_cell, water_below_bridge_terrain},
+    blow_up_bridge_cell_fallout,
+    tests::{seed_bridge_overlay, water_below_bridge_terrain},
 };
 use crate::rules::{ini_parser::IniFile, ruleset::RuleSet};
 use crate::sim::{
-    bridge_state::{BridgeRuntimeState, DamageState},
-    movement::locomotor::MovementLayer,
-    world::Simulation,
+    bridge_state::BridgeRuntimeState, movement::locomotor::MovementLayer, world::Simulation,
 };
 
 #[test]
-fn infantry_terminal_hut_collapse_retires_effect_only_ground_victim() {
+fn structural_fallout_retires_effect_only_ground_victim() {
     use crate::sim::house_state::HouseState;
     use crate::sim::world::{LifecycleTestEvent, SimSoundEvent};
-    use std::collections::BTreeMap;
     let rules = RuleSet::from_ini(&IniFile::from_str(
         "[InfantryTypes]\n0=E1\n[VehicleTypes]\n[AircraftTypes]\n[BuildingTypes]\n\
          [E1]\nStrength=100\nSpeed=4\n[CombatDamage]\nC4Warhead=KILL\n\
@@ -25,11 +22,12 @@ fn infantry_terminal_hut_collapse_retires_effect_only_ground_victim() {
     sim.intern_rule_type_ids(&rules);
     sim.resolve_type_handles(&rules);
     sim.resolved_terrain = Some(water_below_bridge_terrain(4));
-    let mut bridge = BridgeRuntimeState::default();
-    for y in [3, 4, 5] {
-        bridge.test_seed_cell(4, y, seed_bridge_cell(0xD4));
-    }
-    sim.bridge_state = Some(bridge);
+    seed_bridge_overlay(
+        sim.resolved_terrain.as_mut().unwrap(),
+        &[(4, 3), (4, 4), (4, 5)],
+        0xD4,
+    );
+    sim.bridge_state = Some(BridgeRuntimeState::default());
     let owner = sim.interner.intern("Americans");
     sim.houses
         .insert(owner, HouseState::new(owner, 0, None, true, 1000, 10));
@@ -39,12 +37,9 @@ fn infantry_terminal_hut_collapse_retires_effect_only_ground_victim() {
         .unwrap();
     assert!(!sim.substrate.entities.get(victim).unwrap().on_bridge);
     sim.substrate.entities.get_mut(victim).unwrap().selected = true;
-    assert!(dispatch_bridge_collapse_from_hut_with_overlay_registry(
-        &mut sim,
-        &rules,
-        (4, 4),
-        None
-    ));
+    // Supplied structural47DD70 callback. Concrete ground overlays205..232
+    // do not call this owner; the former hut fixture invented that dependency.
+    blow_up_bridge_cell_fallout(&mut sim, &rules, 4, 4, None);
     let object = sim.substrate.entities.get(victim).unwrap();
     assert!(object.infantry_terminal.is_none());
     assert!(!object.lifecycle.object_alive);
@@ -55,11 +50,11 @@ fn infantry_terminal_hut_collapse_retires_effect_only_ground_victim() {
         sim.sound_events
             .iter()
             .filter(|event| matches!(event,
-        SimSoundEvent::UnitLost { owner: lost } if *lost == owner))
+        SimSoundEvent::UnitLost { owner: lost, .. } if *lost == owner))
             .count(),
         1
     );
-    sim.advance_tick(&[], Some(&rules), &BTreeMap::new(), None, None, 100);
+    sim.advance_tick(&[], Some(&rules), None, None, 100);
     assert!(!sim.substrate.entities.contains(victim));
     assert!(!sim.substrate.occupancy.contains_entity(4, 4, victim));
     assert!(!sim.live_object_order_snapshot().contains(&victim));
@@ -74,7 +69,7 @@ fn infantry_terminal_hut_collapse_retires_effect_only_ground_victim() {
 }
 
 #[test]
-fn hut_drop_in_owns_order_footprints_and_restore_without_teardown_side_effects() {
+fn structural_drop_in_owns_order_footprints_and_restore_without_teardown_side_effects() {
     let rules = RuleSet::from_ini(&IniFile::from_str(
         "[InfantryTypes]\n[VehicleTypes]\n0=MTNK\n[AircraftTypes]\n[BuildingTypes]\n0=BIG\n\
          [MTNK]\nStrength=300\nSpeed=6\n[BIG]\nStrength=1000\nFoundation=2x1\n",
@@ -97,11 +92,12 @@ fn hut_drop_in_owns_order_footprints_and_restore_without_teardown_side_effects()
         cell.bridge_walkable = true;
         cell.bridge_deck_level = 4;
     }
-    let mut bridge = BridgeRuntimeState::default();
-    for y in [3, 4, 5] {
-        bridge.test_seed_cell(4, y, seed_bridge_cell(0xD4));
-    }
-    sim.bridge_state = Some(bridge);
+    seed_bridge_overlay(
+        sim.resolved_terrain.as_mut().unwrap(),
+        &[(4, 3), (4, 4), (4, 5)],
+        0xD4,
+    );
+    sim.bridge_state = Some(BridgeRuntimeState::default());
     let mut construct = |name: &str, x: u16, marked: bool| {
         let id = sim
             .construct_object_limbo_at_height(name, "Americans", x, 4, 0, 4, &rules)
@@ -169,7 +165,7 @@ fn hut_drop_in_owns_order_footprints_and_restore_without_teardown_side_effects()
     sim.substrate
         .cell_occupation
         .reconcile_entity(sim.substrate.entities.get(newer).unwrap());
-    let next_order = sim.substrate.next_occupancy_enter_order.current();
+    let next_order = sim.substrate.next_air_tracker_order.current();
     let raw_before = sim.substrate.raw_cell_occupation.clone();
     let mut smudge = crate::sim::smudge_grid::SmudgeGrid::new(10, 10);
     let decal = crate::sim::smudge_grid::SmudgeCell {
@@ -180,36 +176,24 @@ fn hut_drop_in_owns_order_footprints_and_restore_without_teardown_side_effects()
     smudge.test_force_set(3, 4, decal);
     sim.smudge_grid = Some(smudge);
 
-    assert!(dispatch_bridge_collapse_from_hut_with_overlay_registry(
-        &mut sim,
-        &rules,
-        (4, 4),
-        None
-    ));
-    for y in [3, 4, 5] {
-        let cell = sim.bridge_state.as_ref().unwrap().cell(4, y).unwrap();
-        assert_eq!(cell.overlay_byte, 0xE7);
-        assert_eq!(cell.damage_state, DamageState::Destroyed);
-    }
+    // Supplied structural47DD70 callback. Concrete ground overlays205..232
+    // do not call this owner; the former hut fixture invented that dependency.
+    blow_up_bridge_cell_fallout(&mut sim, &rules, 4, 4, None);
     let ground = vec![older, newer, building];
     for (x, expected) in [(4, ground.clone()), (3, vec![building])] {
         let cell = sim.substrate.occupancy.get(x, 4).unwrap();
         assert!(cell.snapshot_layer(MovementLayer::Bridge).is_empty());
         assert_eq!(cell.snapshot_layer(MovementLayer::Ground), expected);
     }
-    for (offset, id) in [newer, older, building].into_iter().enumerate() {
+    for id in [newer, older, building] {
         let object = sim.substrate.entities.get(id).unwrap();
         assert!(!object.on_bridge && object.lifecycle.cell_marked);
         assert_eq!(
             object.position.z, 0,
             "existing represented ground snap retained"
         );
-        assert_eq!(object.occupancy_enter_order, next_order + offset as u64);
     }
-    assert_eq!(
-        sim.substrate.next_occupancy_enter_order.current(),
-        next_order + 3
-    );
+    assert_eq!(sim.substrate.next_air_tracker_order.current(), next_order);
     let twin = sim.substrate.entities.get(unmarked).unwrap();
     assert!(twin.on_bridge && twin.lifecycle.in_limbo && !twin.lifecycle.cell_marked);
     assert_eq!(twin.position.z, 4);
@@ -305,8 +289,9 @@ fn hut_drop_in_owns_order_footprints_and_restore_without_teardown_side_effects()
     );
     assert_eq!(restored.substrate.raw_cell_occupation, raw_before);
     assert_eq!(
-        restored.substrate.next_occupancy_enter_order.current(),
-        next_order + 3
+        restored.substrate.next_air_tracker_order.current(),
+        next_order,
+        "ground list entries do not draw AirTracker orders"
     );
     for (x, y, layer) in [
         (4, 4, MovementLayer::Ground),
@@ -317,5 +302,95 @@ fn hut_drop_in_owns_order_footprints_and_restore_without_teardown_side_effects()
             restored.substrate.cell_occupation.vehicle_bits(x, y, layer),
             sim.substrate.cell_occupation.vehicle_bits(x, y, layer)
         );
+    }
+}
+
+/// A bomb on a bridge-repair hut drops the hut's bridge after its blast
+/// (`BombClass::Detonate`, `0x00438982`), whether its fuse runs out or the hut
+/// dies carrying it (`0x00702672`); the same death without a bomb leaves the
+/// bridge standing.
+#[test]
+fn a_bombed_bridge_hut_drops_its_bridge() {
+    use crate::sim::house_state::HouseState;
+    let ini = "[InfantryTypes]\n0=IVAN\n[VehicleTypes]\n[AircraftTypes]\n[BuildingTypes]\n0=CABHUT\n\
+         [IVAN]\nStrength=125\nSpeed=4\n[CABHUT]\nStrength=1000\nFoundation=1x1\n\
+         BridgeRepairHut=yes\n[CombatDamage]\nIvanWarhead=IvanWH\nIvanDamage=450\n\
+         IvanTimedDelay=450\n[Warheads]\n0=IvanWH\n1=Super\n\
+         [IvanWH]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n\
+         CellSpread=1.5\n[Super]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n";
+    for (bombed, killed) in [(true, false), (true, true), (false, true)] {
+        let (mut sim, rules, registry) =
+            crate::sim::world::entry_test_fixture::fixture_with_rules(ini);
+        for y in [14, 15, 16] {
+            sim.resolved_terrain
+                .as_mut()
+                .unwrap()
+                .cell_mut(17, y)
+                .unwrap()
+                .bridge_facts
+                .overlay_id = Some(0xD4);
+            sim.overlay_grid
+                .as_mut()
+                .unwrap()
+                .place_overlay(17, y, 0xD4, 0);
+        }
+        sim.bridge_state = Some(BridgeRuntimeState::from_resolved_terrain_with_map_size(
+            sim.resolved_terrain.as_ref().unwrap(),
+            true,
+            300,
+            (16, 16),
+        ));
+        for (side, name) in ["Americans", "Russians"].into_iter().enumerate() {
+            let house = sim.interner.intern(name);
+            sim.houses.insert(
+                house,
+                HouseState::new(house, side as u8, None, false, 1000, 10),
+            );
+            sim.session.house_order.push(house);
+        }
+        // Beside the span, inside its 5x5 scan.
+        let hut = sim
+            .spawn_object_at_height("CABHUT", "Americans", 15, 15, 0, 0, &rules)
+            .unwrap();
+        let ivan = sim
+            .spawn_object_at_height("IVAN", "Russians", 12, 15, 0, 0, &rules)
+            .unwrap();
+        sim.session.binary_frame = 100;
+        if bombed {
+            sim.bomb_attach(ivan, Some(hut), &rules);
+        }
+        if killed {
+            let super_wh = sim.interner.intern("Super");
+            let hit = crate::sim::combat::EntityDamageEvent::direct_receiver(
+                hut,
+                1000,
+                0,
+                crate::sim::combat::RAD_NO_ATTACKER,
+                None,
+                super_wh,
+                crate::sim::combat::ReceiverCallFlags {
+                    ignore_defenses: true,
+                    arg6: false,
+                },
+            );
+            sim.commit_direct_damage_receiver(&rules, Some(&registry), hit);
+        } else {
+            sim.session.binary_frame = 100 + 451;
+            sim.bomb_fuse_step(hut, &rules, Some(&registry));
+            assert_eq!(
+                sim.substrate.entities.get(hut).unwrap().health.current,
+                1000 - 450,
+                "the hut takes the blast"
+            );
+        }
+        assert!(sim.bomb_carriers().is_empty());
+        for y in [14, 15, 16] {
+            let cell = sim.resolved_terrain.as_ref().unwrap().cell(17, y).unwrap();
+            assert_eq!(
+                cell.bridge_facts.overlay_id == Some(0xE7),
+                bombed,
+                "bombed {bombed}, killed {killed}: cell (17, {y})"
+            );
+        }
     }
 }

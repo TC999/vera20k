@@ -81,11 +81,47 @@ pub fn dlu_rect(x: i32, y: i32, w: i32, h: i32) -> RectPx {
     )
 }
 
+/// A family dialog's template child window: the 6x13 conversion one pixel
+/// wider and taller, as the `0x10E` and `0x6B` children measure in the retail
+/// captures (`0x0060C42E` keeps the template place). The `0x129` movie list
+/// measured at the plain conversion.
+pub fn child_window(x: i32, y: i32, w: i32, h: i32) -> RectPx {
+    let rect = dlu_rect(x, y, w, h);
+    RectPx::new(rect.x, rect.y, rect.w + 1, rect.h + 1)
+}
+
+/// The dialog origin `[0xB0FC1C]` (`0x0072EC70`): half the screen beyond
+/// 800x600, from 1024x768 up only. A dialog's own background is drawn there
+/// (`Background_Overlay` `0x0072E730`).
+pub fn dialog_origin(screen_w: i32, screen_h: i32) -> (i32, i32) {
+    (
+        if screen_w > 1023 {
+            (screen_w - 800) / 2
+        } else {
+            0
+        },
+        if screen_h > 767 {
+            (screen_h - 600) / 2
+        } else {
+            0
+        },
+    )
+}
+
 /// `(screen - base) / 2` clamped to >= 0. Canonical form; algebraically equal to
 /// the single-player `if screen > base` guard and the main-menu inline guard for
 /// every i32.
 pub fn center_offset(screen: i32, base: i32) -> i32 {
     ((screen - base) / 2).max(0)
+}
+
+/// Where an image static paints a `w`x`h` image in its window: centred only
+/// along an axis where the window is larger, else at the window edge (kind 2
+/// `0x00615831..0x006158F3`, kind 4 `0x0061595E..0x0061597E`).
+pub fn centred_in_window(window: RectPx, w: i32, h: i32) -> (i32, i32) {
+    let dx = if window.w > w { (window.w - w) / 2 } else { 0 };
+    let dy = if window.h > h { (window.h - h) / 2 } else { 0 };
+    (window.x + dx, window.y + dy)
 }
 
 /// Right-panel layout (SDTP top cap / SDBTNBKGD tile column / SDBTM bottom cap).
@@ -194,6 +230,16 @@ pub fn snap_button_biased_truncate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dialog_origin_letterboxes_only_from_1024x768() {
+        assert_eq!(dialog_origin(640, 480), (0, 0));
+        assert_eq!(dialog_origin(800, 600), (0, 0));
+        assert_eq!(dialog_origin(1023, 767), (0, 0));
+        // Executed 0x0072EC70 (research origin.out.txt).
+        assert_eq!(dialog_origin(1024, 768), (112, 84));
+        assert_eq!(dialog_origin(1280, 1024), (240, 212));
+    }
 
     #[test]
     fn mul_div_round_matches_round_half_up_muldiv_all_odd_dlu() {

@@ -1,5 +1,11 @@
 # LightConvert row selection and active MMX RGB565 palette conversion
 
+> Maintenance note: the current [palette oracle](../../tools/palette_oracle/README.md)
+> now uses the shared verified PE loader and checked execution runner. Native replay
+> is read-only by default; candidate export requires `--write --output NEW_DIRECTORY`.
+> The older commands and private-loader description below document the original
+> investigation. Historical fixture/provenance bytes and runtime claims are retained.
+
 Read-only native investigation, 2026-09-09. This resolves the row-selection gap
 recorded in `src/render/palette_light.rs`, and finds two additional differences:
 normal YR x87 arithmetic produces base scale **65535**, not 65536, for input 1000;
@@ -79,7 +85,7 @@ byte pairs, even though normal brightness clamps `q` to 254.
 Clear A-buffer value is 127: tactical full redraw calls
 `CircBuf__FillAll(g_ABuffer, 0x7F)` at `0x006D3F9F..0x006D3FA7`; dirty rectangles
 also reset to 127. See the directly sourced
-[A-buffer report](building-selection-brackets/TACTICAL_ABUFFER_SHROUD_VALUES_FOR_BRACKET_LINES_GHIDRA_REPORT.md).
+[A-buffer report](https://github.com/YuriPlanet/vera20k/blob/108924bc237d14342b68b8bb78f2bba0400d2443/docs/research/building-selection-brackets/TACTICAL_ABUFFER_SHROUD_VALUES_FOR_BRACKET_LINES_GHIDRA_REPORT.md).
 
 At clear A=127:
 
@@ -168,7 +174,7 @@ an exhaustive proof over every possible palette/profile.
 
 Cell Convert cache `0x00544E70` chooses N=27 when the normalized RGB key sums
 to less than 2000; otherwise N=53. See the established
-[cache contract](MAP_LIGHTCONVERT_CACHE_00483E30_00544E70_GHIDRA_REPORT.md).
+[cache contract](https://github.com/YuriPlanet/vera20k/blob/108924bc237d14342b68b8bb78f2bba0400d2443/docs/research/MAP_LIGHTCONVERT_CACHE_00483E30_00544E70_GHIDRA_REPORT.md).
 Its default mask `0x00829C20` is 256 bytes of 1 in the retail executable.
 
 Ordinary house palettes have their own Convert. `Init_Color_Schemes_INI

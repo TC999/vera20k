@@ -43,15 +43,16 @@ use crate::map::tube_facts::{NativeTubeCellIndex, TubeFact, TubeId};
 use crate::map::tubes::NativeMapTubeReceipt;
 use crate::rules::terrain_object_type::TerrainObjectType;
 use crate::rules::terrain_rules::{LandType, SpeedCostProfile, TerrainClass, TerrainRules};
+use crate::util::pixel_conversion::PixelConversionBounds;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{
     Arc,
-    atomic::{AtomicI16, AtomicU32, AtomicU64, Ordering},
+    atomic::{AtomicI16, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering},
 };
 #[cfg(test)]
 pub(crate) use tests::{
     bridge_constructor_terrain, install_bridge_batch_test_catalog,
-    install_ordinary_repair_test_catalog,
+    install_ordinary_repair_test_catalog, install_tunnel_repair_test_catalog,
 };
 
 #[path = "resolved_terrain_mutation.rs"]
@@ -311,7 +312,6 @@ pub struct ResolvedTerrainCell {
     /// on overlay removal so harvested ore cells revert to the original
     /// terrain's per-locomotor speed table.
     pub base_speed_costs: SpeedCostProfile,
-    pub build_blocked: bool,
     pub has_bridge_deck: bool,
     pub bridge_walkable: bool,
     pub bridge_transition: bool,
@@ -331,17 +331,6 @@ pub struct ResolvedTerrainCell {
     /// cells with baked damage art may initiate propagation) and the render-side
     /// substitution that swaps in variant=1 when the bridge sim flags the cell.
     pub has_damaged_data: bool,
-    /// Author-damaged anchor pre-classification: `Some(class)` if this
-    /// cell's `final_tile_index` matches one of the 8 bridgehead anchor
-    /// variant tile_ids in the current theater's BridgeAnchorVariantTable.
-    /// `None` when not a variant tile (the common case for both
-    /// non-bridge cells and pristine anchor cells).
-    ///
-    /// Sim's `BridgeRuntimeState::from_resolved_terrain` reads this to
-    /// initialize `BridgeRuntimeCell.bridgehead_anchor_class` instead of
-    /// the unconditional Variant0 default. None defaults to Variant0
-    /// sim-side.
-    pub bridgehead_anchor_class_at_load: Option<crate::map::bridge_facts::BridgeheadAnchorClass>,
 }
 
 impl ResolvedTerrainCell {
@@ -485,6 +474,7 @@ pub(crate) struct LoadCellRecalcState<'a> {
     metadata_cache: HashMap<TileKey, TileMetadata>,
     warned_unknown_land_types: HashSet<u8>,
     terrain_anim_latched: Vec<bool>,
+    pixel_conversion_bounds: PixelConversionBounds,
 }
 
 impl<'a> LoadCellRecalcState<'a> {
@@ -497,6 +487,7 @@ impl<'a> LoadCellRecalcState<'a> {
         lat_enabled: bool,
         cliff_back_impassability: u8,
         cell_count: usize,
+        pixel_conversion_bounds: PixelConversionBounds,
     ) -> Self {
         let lat_config = lat_enabled
             .then(|| lat::parse_lat_config(&theater_data.ini_data, &theater_data.lookup));
@@ -517,6 +508,7 @@ impl<'a> LoadCellRecalcState<'a> {
             metadata_cache: HashMap::new(),
             warned_unknown_land_types: HashSet::new(),
             terrain_anim_latched: vec![false; cell_count],
+            pixel_conversion_bounds,
         }
     }
 
@@ -538,6 +530,7 @@ impl<'a> LoadCellRecalcState<'a> {
             metadata_cache: HashMap::new(),
             warned_unknown_land_types: HashSet::new(),
             terrain_anim_latched: vec![false; cell_count],
+            pixel_conversion_bounds: PixelConversionBounds::default(),
         }
     }
 
@@ -644,6 +637,7 @@ impl<'a> LoadCellRecalcState<'a> {
             metadata_cache: HashMap::new(),
             warned_unknown_land_types: HashSet::new(),
             terrain_anim_latched: Vec::new(),
+            pixel_conversion_bounds: PixelConversionBounds::default(),
         }
     }
 
@@ -700,6 +694,8 @@ pub(crate) struct AutomaticTubeRequest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AutomaticTubeAllocation {
+    /// Native's failed allocation; only test hosts answer it.
+    #[cfg(test)]
     AllocationNull,
     Allocated {
         native_unique_id: i32,
@@ -751,29 +747,12 @@ pub(crate) struct LoadCellRecalcOutcome {
     pub(crate) finalized: FinalizedOverlayCell,
     pub(crate) zone_before: u8,
     pub(crate) zone_after: u8,
-    pub(crate) navigation_changed: bool,
 }
 
 /// Leptons per cell along one map axis.
 const LEPTONS_PER_CELL: i32 = crate::util::lepton::LEPTONS_PER_CELL_I32;
 /// Cell-centre offset used by the tile-animation spawn coordinate.
 const CELL_CENTRE_LEPTONS: i32 = LEPTONS_PER_CELL / 2;
-
-/// Numerator of the exact screen-pixel → world-lepton scale used by the
-/// tactical pixel-to-world transform, over `PIXEL_TO_LEPTON_DENOMINATOR`.
-///
-/// The native matrix row is `[ +s, 2s, 0, 0 ]` / `[ -s, 2s, 0, 0 ]` where `s` is
-/// the single-precision constant `4.2667` — an authored decimal approximation of
-/// 256/60, i.e. leptons per cell over the isometric diamond half-width in
-/// pixels. The `Y` coefficient is exactly `2s` (same mantissa, exponent + 1),
-/// so both output axes reduce to `s * k` for an integer `k` and the whole
-/// transform is exact rational arithmetic followed by one truncation.
-///
-/// Working in integers rather than `f32` keeps this off the float path; the
-/// equivalence over the reachable offset range is pinned by
-/// `gsi_13_04_tile_anim_offset_matches_native_float_transform`.
-const PIXEL_TO_LEPTON_NUMERATOR: i64 = 4_473_959;
-const PIXEL_TO_LEPTON_DENOMINATOR: i64 = 1_048_576;
 
 /// Live contents of MapClass's one process-global fallback `CellClass`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -856,93 +835,6 @@ impl RealCellBridgeFlags0x1180 {
     }
 }
 
-/// Ephemeral mutable view of the represented live `CellClass+0x140` bridge
-/// bits during one native state-machine transaction.
-///
-/// Ramp helpers recurse before their caller can project a returned outcome.
-/// This value seam mirrors allocated real cells and retains the actual shared
-/// dummy identity while the transaction is being constructed. Each native
-/// setter call updates the real-cell mirror and synchronously stamps/mutates
-/// that live dummy, so later recursive GetCell frames observe exact flag and
-/// coordinate interleaving. The ordered setter transcript subsequently
-/// commits only allocated real-cell values and serialized authority; replaying
-/// it through the dummy would duplicate and reorder already-live effects.
-#[derive(Debug, Clone)]
-pub(crate) struct CellClassBridgeFlagState {
-    width: u16,
-    height: u16,
-    native_allocated: Option<Vec<bool>>,
-    flags: Vec<u16>,
-    shared_cell_dummy: SharedCellDummy,
-}
-
-impl CellClassBridgeFlagState {
-    fn from_grid(grid: &ResolvedTerrainGrid) -> Self {
-        Self {
-            width: grid.width,
-            height: grid.height,
-            native_allocated: grid.native_allocated.clone(),
-            flags: grid
-                .cells
-                .iter()
-                .map(|cell| {
-                    (cell.bridge_facts.raw_flags & RETAINED_CELLCLASS_BRIDGE_FLAG_MASK) as u16
-                })
-                .collect(),
-            shared_cell_dummy: grid.shared_cell_dummy.clone(),
-        }
-    }
-
-    pub(crate) fn flags_at(&self, coord: (u16, u16)) -> u32 {
-        native_resolved_cell_index(
-            self.width,
-            self.height,
-            self.native_allocated.as_deref(),
-            self.flags.len(),
-            i32::from(coord.0),
-            i32::from(coord.1),
-        )
-        .and_then(|index| self.flags.get(index).copied())
-        .map(u32::from)
-        .unwrap_or_else(|| self.shared_cell_dummy.bridge_flags_0x1180())
-    }
-
-    pub(crate) fn apply_stamp(&mut self, stamp: BridgeFlagStamp) {
-        let Some(slots) = stamp.slots() else {
-            return;
-        };
-        for (slot, requested) in slots {
-            let Some((x, y)) = requested else {
-                continue;
-            };
-            if let Some(index) = native_resolved_cell_index(
-                self.width,
-                self.height,
-                self.native_allocated.as_deref(),
-                self.flags.len(),
-                x,
-                y,
-            ) {
-                let mut flags = u32::from(self.flags[index]);
-                crate::map::bridge_facts::apply_retained_cellclass_bridge_slot(
-                    &mut flags,
-                    slot,
-                    stamp.set,
-                    stamp.direction,
-                );
-                self.flags[index] = flags as u16;
-            } else {
-                self.shared_cell_dummy.stamp_coord(x, y);
-                self.shared_cell_dummy.apply_retained_bridge_flag_slot(
-                    slot,
-                    stamp.set,
-                    stamp.direction,
-                );
-            }
-        }
-    }
-}
-
 /// Serialized behavior authority for a CellClass whose isometric tile was
 /// replaced after map construction. The live ResolvedTerrainGrid is derived
 /// and skipped by Simulation snapshots, so collapse projects these exact
@@ -983,7 +875,6 @@ pub(crate) struct DynamicTerrainCellState {
     pub base_yr_cell_land_type: u8,
     pub base_terrain_class: TerrainClass,
     pub base_speed_costs: SpeedCostProfile,
-    pub build_blocked: bool,
     pub has_bridge_deck: bool,
     pub bridge_walkable: bool,
     pub bridge_transition: bool,
@@ -993,7 +884,6 @@ pub(crate) struct DynamicTerrainCellState {
     pub radar_left: [u8; 3],
     pub radar_right: [u8; 3],
     pub has_damaged_data: bool,
-    pub bridgehead_anchor_class_at_load: Option<crate::map::bridge_facts::BridgeheadAnchorClass>,
 }
 
 impl DynamicTerrainCellState {
@@ -1033,7 +923,6 @@ impl DynamicTerrainCellState {
             base_yr_cell_land_type: cell.base_yr_cell_land_type,
             base_terrain_class: cell.base_terrain_class,
             base_speed_costs: cell.base_speed_costs,
-            build_blocked: cell.build_blocked,
             has_bridge_deck: cell.has_bridge_deck,
             bridge_walkable: cell.bridge_walkable,
             bridge_transition: cell.bridge_transition,
@@ -1043,7 +932,6 @@ impl DynamicTerrainCellState {
             radar_left: cell.radar_left,
             radar_right: cell.radar_right,
             has_damaged_data: cell.has_damaged_data,
-            bridgehead_anchor_class_at_load: cell.bridgehead_anchor_class_at_load,
         }
     }
 
@@ -1082,7 +970,6 @@ impl DynamicTerrainCellState {
         cell.base_yr_cell_land_type = self.base_yr_cell_land_type;
         cell.base_terrain_class = self.base_terrain_class;
         cell.base_speed_costs = self.base_speed_costs;
-        cell.build_blocked = self.build_blocked;
         cell.has_bridge_deck = self.has_bridge_deck;
         cell.bridge_walkable = self.bridge_walkable;
         cell.bridge_transition = self.bridge_transition;
@@ -1092,7 +979,6 @@ impl DynamicTerrainCellState {
         cell.radar_left = self.radar_left;
         cell.radar_right = self.radar_right;
         cell.has_damaged_data = self.has_damaged_data;
-        cell.bridgehead_anchor_class_at_load = self.bridgehead_anchor_class_at_load;
     }
 }
 
@@ -1128,7 +1014,9 @@ pub(crate) enum DestroyableCliffFamily {
 
 #[derive(Debug, Clone)]
 pub(crate) struct DestroyableCliffMutation {
+    #[cfg(test)]
     pub family: DestroyableCliffFamily,
+    #[cfg(test)]
     pub origin: (i16, i16),
     pub original_footprint: Vec<(u16, u16)>,
     pub animation_cells: Vec<(i16, i16)>,
@@ -1140,10 +1028,11 @@ pub(crate) struct DestroyableCliffMutation {
 /// Active YR owns one object at `0x00ABDC50`. `MapClass::Get_CellClass` at
 /// `0x005657A0` and `0x00565730` overwrite only its packed coordinate words at
 /// `+0x24`; the independently writable level/slope bytes at `+0x11B/+0x11C`
-/// survive those misses. Coordinate/level/slope and overlay identity/state
-/// each occupy an atomic word; the full flag word has its own authority. Their
-/// shared allocation keeps one live identity safe to carry through app loading
-/// workers without copying native's global mutable object architecture.
+/// survive those misses. Coordinate/level/slope, overlay identity/state and
+/// smudge identity/data each occupy an atomic word; the full flag word has its
+/// own authority. Their shared allocation keeps one live identity safe to carry
+/// through app loading workers without copying native's global mutable object
+/// architecture.
 #[derive(Debug, Clone)]
 pub struct SharedCellDummy {
     state: Arc<SharedCellDummyState>,
@@ -1152,14 +1041,22 @@ pub struct SharedCellDummy {
 #[derive(Debug)]
 struct SharedCellDummyState {
     cell: AtomicU64,
+    /// CellClass+0xEC; ctor47BC93 sets Clear0, ordinary misses retain it.
+    land_type: AtomicI32,
     /// Complete CellClass+0x140, including the setter's bit0x10000.
     raw_flags: AtomicU32,
     /// CellClass+0x2C: 0=null, 1=shared dummy, real storage index+2 otherwise.
     native_anchor: AtomicU64,
     /// Low dword is signed Cell+0x44 identity; bits 32..39 are Cell+0x11E.
     overlay: AtomicU64,
+    /// Low dword is signed Cell+0x48 SmudgeTypeIndex; bits 32..39 are
+    /// Cell+0x11F SmudgeData, as `SmudgeTypeClass::Place @ 0x006B6080`
+    /// (`SmudgeGrid::write_footprint`) leaves them.
+    smudge: AtomicU64,
     /// CellClass+0x116, written even when ReadTubesINI resolves a dummy cell.
     tube_index: AtomicI16,
+    /// Retained wrapping CellClass+122; ctor47BD34 initializes zero.
+    neighbor_count: AtomicU8,
 }
 
 /// One native map-query identity domain. Bulk terrain is borrowed; input
@@ -1250,6 +1147,17 @@ impl<'a> NativeCellQuery<'a> {
         }
     }
 
+    /// CellClass+EC through an already retained allocation identity. Reading
+    /// Land must not perform another lookup or replace the shared Dummy.
+    pub(crate) fn land_type(&self, cell: NativeCellIdentity) -> i32 {
+        match cell {
+            NativeCellIdentity::Real(index) => {
+                i32::from(self.terrain.cells[index].yr_cell_land_type)
+            }
+            NativeCellIdentity::Dummy => self.dummy.land_type(),
+        }
+    }
+
     pub(crate) fn projection_view(&self, x: i32, y: i32) -> CellClassProjectionView {
         let cell = self.lookup((x as i16, y as i16));
         CellClassProjectionView {
@@ -1260,6 +1168,8 @@ impl<'a> NativeCellQuery<'a> {
 }
 
 const SHARED_DUMMY_DEFAULT_OVERLAY: u64 = u32::MAX as u64;
+/// Constructor `0x0047BC24` (+0x48 = -1) and `0x0047BD22` (+0x11F = 0).
+const SHARED_DUMMY_DEFAULT_SMUDGE: u64 = u32::MAX as u64;
 
 impl Default for SharedCellDummy {
     fn default() -> Self {
@@ -1272,10 +1182,13 @@ impl SharedCellDummy {
         Self {
             state: Arc::new(SharedCellDummyState {
                 cell: AtomicU64::new(0),
+                land_type: AtomicI32::new(0),
                 raw_flags: AtomicU32::new(0),
                 native_anchor: AtomicU64::new(0),
                 overlay: AtomicU64::new(SHARED_DUMMY_DEFAULT_OVERLAY),
+                smudge: AtomicU64::new(SHARED_DUMMY_DEFAULT_SMUDGE),
                 tube_index: AtomicI16::new(-1),
+                neighbor_count: AtomicU8::new(0),
             }),
         }
     }
@@ -1287,10 +1200,13 @@ impl SharedCellDummy {
         Self {
             state: Arc::new(SharedCellDummyState {
                 cell: AtomicU64::new(self.state.cell.load(Ordering::Relaxed)),
+                land_type: AtomicI32::new(self.land_type()),
                 raw_flags: AtomicU32::new(self.state.raw_flags.load(Ordering::Relaxed)),
                 native_anchor: AtomicU64::new(self.state.native_anchor.load(Ordering::Relaxed)),
                 overlay: AtomicU64::new(self.state.overlay.load(Ordering::Relaxed)),
+                smudge: AtomicU64::new(self.state.smudge.load(Ordering::Relaxed)),
                 tube_index: AtomicI16::new(self.state.tube_index.load(Ordering::Relaxed)),
+                neighbor_count: AtomicU8::new(self.neighbor_count()),
             }),
         }
     }
@@ -1303,19 +1219,26 @@ impl SharedCellDummy {
     /// coordinate `+0x24`, level `+0x11B`, slope `+0x11C`, and modeled
     /// `+0x140 & 0x1180` bridge bits return to zero, while overlay identity
     /// returns to signed `-1` and OverlayData to zero. Raw Tube index+0x116
-    /// returns to-1 at47BC48 (PHASE3_TUBE_HIERARCHY_20260910.md). Other constructor-owned
-    /// fields are not represented by this handle yet.
+    /// returns to-1 at47BC48 (PHASE3_TUBE_HIERARCHY_20260910.md). SmudgeTypeIndex
+    /// +0x48 returns to `-1` (`0x0047BC24`) and SmudgeData +0x11F to zero
+    /// (`0x0047BD22`). Other constructor-owned fields are not represented by
+    /// this handle yet.
     pub(crate) fn reconstruct_for_map_resize(&self) {
         self.state.cell.store(0, Ordering::Relaxed);
+        self.state.land_type.store(0, Ordering::Relaxed);
         // Constructor47BBF0: AND FF800000 at47BCE1; preserve upper residue.
         self.state
             .raw_flags
             .fetch_and(0xff80_0000, Ordering::Relaxed);
         self.state.native_anchor.store(0, Ordering::Relaxed);
         self.state.tube_index.store(-1, Ordering::Relaxed);
+        self.state.neighbor_count.store(0, Ordering::Relaxed);
         self.state
             .overlay
             .store(SHARED_DUMMY_DEFAULT_OVERLAY, Ordering::Relaxed);
+        self.state
+            .smudge
+            .store(SHARED_DUMMY_DEFAULT_SMUDGE, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self) -> SharedCellDummySnapshot {
@@ -1331,6 +1254,25 @@ impl SharedCellDummy {
         }
     }
 
+    pub(crate) fn neighbor_count(&self) -> u8 {
+        self.state.neighbor_count.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn land_type(&self) -> i32 {
+        self.state.land_type.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_land_type(&self, land_type: i32) {
+        self.state.land_type.store(land_type, Ordering::Relaxed);
+    }
+
+    pub(crate) fn adjust_neighbor_count(&self, add: bool) {
+        self.state
+            .neighbor_count
+            .fetch_add(if add { 1 } else { u8::MAX }, Ordering::Relaxed);
+    }
+
     pub(crate) fn raw_tube_index(&self) -> i16 {
         self.state.tube_index.load(Ordering::Relaxed)
     }
@@ -1342,6 +1284,9 @@ impl SharedCellDummy {
     /// Publish an already validated post-Resize candidate onto the retained
     /// process identity. Preserve its later lookup effects; do not reset twice.
     pub(crate) fn adopt_prepared_load_state(&self, prepared: &Self) {
+        self.state
+            .land_type
+            .store(prepared.land_type(), Ordering::Relaxed);
         self.state.cell.store(
             prepared.state.cell.load(Ordering::Relaxed),
             Ordering::Relaxed,
@@ -1350,10 +1295,17 @@ impl SharedCellDummy {
             prepared.state.overlay.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
+        self.state.smudge.store(
+            prepared.state.smudge.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         self.state
             .raw_flags
             .store(prepared.raw_flags(), Ordering::Relaxed);
         self.write_native_anchor(prepared.native_anchor());
+        self.state
+            .neighbor_count
+            .store(prepared.neighbor_count(), Ordering::Relaxed);
         self.state
             .tube_index
             .store(prepared.raw_tube_index(), Ordering::Relaxed);
@@ -1429,6 +1381,21 @@ impl SharedCellDummy {
     pub(crate) fn write_overlay_identity_state(&self, identity: i32, state: u8) {
         self.state.overlay.store(
             u64::from(identity as u32) | (u64::from(state) << 32),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// The fallback CellClass's signed SmudgeTypeIndex (+0x48) and SmudgeData
+    /// (+0x11F), as smudge CanPlace reads them.
+    pub(crate) fn smudge_identity_data(&self) -> (i32, u8) {
+        let packed = self.state.smudge.load(Ordering::Relaxed);
+        (packed as u32 as i32, (packed >> 32) as u8)
+    }
+
+    /// `SmudgeTypeClass::Place @ 0x006B6080` on the fallback cell.
+    pub(crate) fn write_smudge_identity_data(&self, identity: i32, data: u8) {
+        self.state.smudge.store(
+            u64::from(identity as u32) | (u64::from(data) << 32),
             Ordering::Relaxed,
         );
     }
@@ -1663,51 +1630,12 @@ fn apply_native_bridge_flag_stamp_to_parts(
     real_cell_updates
 }
 
-/// Project a setter transcript that already executed against the live dummy
-/// through [`CellClassBridgeFlagState`]. Only allocated real CellClass values
-/// are deferred; missing slots must have no second lookup or dummy mutation.
-fn apply_planned_bridge_flag_stamp_to_real_parts(
-    cells: &mut [ResolvedTerrainCell],
-    width: u16,
-    height: u16,
-    native_allocated: Option<&[bool]>,
-    stamp: BridgeFlagStamp,
-) -> Vec<(usize, u32)> {
-    let Some(slots) = stamp.slots() else {
-        return Vec::new();
-    };
-    let mut real_cell_updates = Vec::with_capacity(slots.len());
-    for (slot, requested) in slots {
-        let Some((x, y)) = requested else {
-            continue;
-        };
-        let Some(index) =
-            native_resolved_cell_index(width, height, native_allocated, cells.len(), x, y)
-        else {
-            continue;
-        };
-        let facts = &mut cells[index].bridge_facts;
-        crate::map::bridge_facts::apply_retained_cellclass_bridge_slot(
-            &mut facts.raw_flags,
-            slot,
-            stamp.set,
-            stamp.direction,
-        );
-        real_cell_updates.push((index, facts.raw_flags & RETAINED_CELLCLASS_BRIDGE_FLAG_MASK));
-    }
-    real_cell_updates
-}
-
 fn refresh_runtime_bridge_projection(cell: &mut ResolvedTerrainCell, structural_removed: bool) {
     let facts = cell.bridge_facts;
     if facts.has_structural_bridge() {
         cell.has_bridge_deck = true;
         cell.bridge_walkable = !cell.terrain_object_blocks && !cell.overlay_blocks;
         cell.bridge_deck_level = cell.level.saturating_add(4);
-        cell.build_blocked = cell.base_build_blocked
-            || cell.terrain_object_blocks
-            || cell.overlay_blocks
-            || cell.bridge_walkable;
     } else if structural_removed
         || (facts.family != BridgeStampFamily::None
             && cell
@@ -1718,27 +1646,10 @@ fn refresh_runtime_bridge_projection(cell: &mut ResolvedTerrainCell, structural_
         cell.has_bridge_deck = false;
         cell.bridge_walkable = false;
         cell.bridge_deck_level = cell.level;
-        cell.build_blocked =
-            cell.base_build_blocked || cell.terrain_object_blocks || cell.overlay_blocks;
     }
     if facts.has_transition_flag() {
         cell.bridge_transition = true;
     }
-}
-
-/// Convert a `Tile%02dXOffset` / `YOffset` screen-pixel pair into the world
-/// lepton offset the animation spawn adds to the cell centre.
-///
-/// The native helper bails out to a zero coordinate when either offset is at or
-/// beyond the tactical viewport extent; every stock offset is under 64 pixels,
-/// so that guard is unreachable here and is deliberately not reproduced.
-/// Truncation is toward zero, matching the native float-to-long conversion.
-pub fn tile_anim_pixel_offset_to_leptons(x_offset: i32, y_offset: i32) -> (i32, i32) {
-    let scale =
-        |k: i64| -> i32 { ((PIXEL_TO_LEPTON_NUMERATOR * k) / PIXEL_TO_LEPTON_DENOMINATOR) as i32 };
-    let px = i64::from(x_offset);
-    let py = i64::from(y_offset);
-    (scale(px + 2 * py), scale(2 * py - px))
 }
 
 #[derive(Debug, Clone)]
@@ -1803,6 +1714,11 @@ pub struct ResolvedTerrainGrid {
     /// Active theater tile registry length. Positive out-of-range ids present
     /// as ClearTile while their stored semantic id remains untouched.
     tile_registry_len: Option<usize>,
+    /// Smudge CanPlace's Morphable read of the shared dummy's constructor
+    /// tile 0xFFFF, derived once from the active theater registry: every
+    /// index below 0 or at least the count reads theater tile 0. False
+    /// without a theater.
+    dummy_accepts_smudge: bool,
     /// First flat tile id of the active theater's concrete high-bridge set.
     bridge_set_start: Option<u16>,
     /// Immutable signed ReadTheater545150 identities for high-rim selection.
@@ -1848,6 +1764,160 @@ impl AuthoredTerrainFill {
     }
 }
 
+/// A `size` x `size` flat level-0 grid whose land rows admit Foot, Track and
+/// Wheel at 100%: the inputs the native Foot `Can_Enter_Cell` reads.
+#[cfg(test)]
+pub(crate) fn test_flat_ground_grid(size: u16) -> ResolvedTerrainGrid {
+    let costs = SpeedCostProfile {
+        foot: Some(100),
+        track: Some(100),
+        wheel: Some(100),
+        ..Default::default()
+    };
+    test_grid(size, size, |rx, ry| ResolvedTerrainCell {
+        speed_costs: costs,
+        base_speed_costs: costs,
+        ..test_flat_cell(rx, ry)
+    })
+}
+
+/// A `width` x `height` grid of `cell(rx, ry)`, in row-major order.
+#[cfg(test)]
+pub(crate) fn test_grid(
+    width: u16,
+    height: u16,
+    mut cell: impl FnMut(u16, u16) -> ResolvedTerrainCell,
+) -> ResolvedTerrainGrid {
+    let mut cells = Vec::with_capacity(usize::from(width) * usize::from(height));
+    for ry in 0..height {
+        for rx in 0..width {
+            cells.push(cell(rx, ry));
+        }
+    }
+    ResolvedTerrainGrid::from_cells(width, height, cells)
+}
+
+/// Every SpeedType at 100%.
+#[cfg(test)]
+pub(crate) const TEST_OPEN_SPEED_COSTS: SpeedCostProfile = SpeedCostProfile {
+    foot: Some(100),
+    track: Some(100),
+    wheel: Some(100),
+    float: Some(100),
+    amphibious: Some(100),
+    float_beach: Some(100),
+    hover: Some(100),
+};
+
+/// [`test_flat_cell`] whose base terrain class is Clear.
+#[cfg(test)]
+pub(crate) fn test_clear_cell(rx: u16, ry: u16) -> ResolvedTerrainCell {
+    ResolvedTerrainCell {
+        base_terrain_class: TerrainClass::Clear,
+        ..test_flat_cell(rx, ry)
+    }
+}
+
+/// [`test_clear_cell`] that accepts smudges.
+#[cfg(test)]
+pub(crate) fn test_smudge_cell(rx: u16, ry: u16) -> ResolvedTerrainCell {
+    ResolvedTerrainCell {
+        accepts_smudge: true,
+        ..test_clear_cell(rx, ry)
+    }
+}
+
+/// [`test_smudge_cell`] that also allows tiberium.
+#[cfg(test)]
+pub(crate) fn test_tiberium_cell(rx: u16, ry: u16) -> ResolvedTerrainCell {
+    ResolvedTerrainCell {
+        allows_tiberium: true,
+        ..test_smudge_cell(rx, ry)
+    }
+}
+
+/// [`test_flat_cell`] that is `filled_clear`, has an Unknown terrain class
+/// (`TerrainClass`'s default) and accepts smudges.
+#[cfg(test)]
+pub(crate) fn test_unclassified_cell(rx: u16, ry: u16) -> ResolvedTerrainCell {
+    ResolvedTerrainCell {
+        filled_clear: true,
+        terrain_class: TerrainClass::default(),
+        accepts_smudge: true,
+        ..test_flat_cell(rx, ry)
+    }
+}
+
+/// [`test_smudge_cell`] as the map loader fills a clear cell: `filled_clear`
+/// and no tileset.
+#[cfg(test)]
+pub(crate) fn test_loader_clear_cell(rx: u16, ry: u16) -> ResolvedTerrainCell {
+    ResolvedTerrainCell {
+        filled_clear: true,
+        tileset_index: None,
+        ..test_smudge_cell(rx, ry)
+    }
+}
+
+/// A fully-populated flat `ResolvedTerrainCell`, for tests in other modules that
+/// need a grid and should not carry a 47-field copy of this literal.
+#[cfg(test)]
+pub(crate) fn test_flat_cell(rx: u16, ry: u16) -> ResolvedTerrainCell {
+    ResolvedTerrainCell {
+        rx,
+        ry,
+        source_tile_index: 0,
+        source_sub_tile: 0,
+        final_tile_index: 0,
+        final_sub_tile: 0,
+        is_wood_bridge_repair_tile: false,
+        level: 0,
+        filled_clear: false,
+        tileset_index: Some(0),
+        land_type: 0,
+        yr_cell_land_type: 0,
+        slope_type: 0,
+        template_height: 0,
+        render_offset_x: 0,
+        render_offset_y: 0,
+        terrain_class: TerrainClass::Clear,
+        speed_costs: SpeedCostProfile::default(),
+        is_water: false,
+        is_cliff_like: false,
+        height_in_pixels: 0,
+        variant: 0,
+        is_rough: false,
+        is_road: false,
+        accepts_smudge: false,
+        allows_tiberium: false,
+        has_ramp: false,
+        canonical_ramp: None,
+        ground_walk_blocked: false,
+        terrain_object_blocks: false,
+        terrain_object_occupation: None,
+        overlay_blocks: false,
+        overlay_zone_type: None,
+        outside_playfield: false,
+        zone_type: 0,
+        base_ground_walk_blocked: false,
+        base_build_blocked: false,
+        base_land_type: 0,
+        base_yr_cell_land_type: 0,
+        base_terrain_class: Default::default(),
+        base_speed_costs: Default::default(),
+        has_bridge_deck: false,
+        bridge_walkable: false,
+        bridge_transition: false,
+        bridge_deck_level: 0,
+        bridge_layer: None,
+        bridge_facts: crate::map::bridge_facts::BridgeCellFacts::default(),
+        tube_index: None,
+        radar_left: [0, 0, 0],
+        radar_right: [0, 0, 0],
+        has_damaged_data: false,
+    }
+}
+
 impl ResolvedTerrainGrid {
     pub fn from_cells(width: u16, height: u16, cells: Vec<ResolvedTerrainCell>) -> Self {
         Self::from_cells_with_tubes(width, height, cells, Vec::new())
@@ -1890,6 +1960,7 @@ impl ResolvedTerrainGrid {
             clear_tile_id: 0,
             projectile_water_set_base: -1,
             tile_registry_len: None,
+            dummy_accepts_smudge: false,
             bridge_set_start: None,
             high_bridge_rim_tiles: None,
             wood_bridge_set_start: None,
@@ -2078,6 +2149,42 @@ impl ResolvedTerrainGrid {
         }
     }
 
+    /// Read retained CellClass+11A, the iso sub-tile. Constructor 47BBF0
+    /// gives the shared fallback 0; live dummy tile replacement is not
+    /// modeled, so no malformed-map parity is claimed.
+    pub(crate) fn native_cell_sub_tile(&self, cell: NativeCellIdentity) -> u8 {
+        match cell {
+            NativeCellIdentity::Real(index) => self.cells[index].final_sub_tile,
+            NativeCellIdentity::Dummy => 0,
+        }
+    }
+
+    /// Smudge CanPlace's Morphable read (`0x006B601A..0x006B603A`) on one
+    /// resolved cell: a real cell's current-tile query; the shared dummy keeps
+    /// the constructor's 0xFFFF tile, which reads theater tile 0.
+    pub(crate) fn native_cell_accepts_smudge(&self, cell: NativeCellIdentity) -> bool {
+        match cell {
+            NativeCellIdentity::Real(index) => self.cells[index].accepts_smudge,
+            NativeCellIdentity::Dummy => self.dummy_accepts_smudge,
+        }
+    }
+
+    /// Give every fixture deck the CellClass bit0x100 a loaded deck carries.
+    #[cfg(test)]
+    pub(crate) fn test_mark_decks_structural(mut self) -> Self {
+        for cell in &mut self.cells {
+            if cell.has_bridge_deck {
+                cell.bridge_facts.raw_flags |= BRIDGE_FLAG_STRUCTURAL;
+            }
+        }
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_set_dummy_accepts_smudge(&mut self, accepts: bool) {
+        self.dummy_accepts_smudge = accepts;
+    }
+
     /// Cell47B3A0 samples the receiver's own signed level and slope; unlike
     /// Map578080 it neither resolves a new cell nor restamps the shared Dummy.
     pub(crate) fn native_cell_ground_fields(&self, cell: NativeCellIdentity) -> (u8, u8) {
@@ -2230,7 +2337,6 @@ impl ResolvedTerrainGrid {
             return Err(LoadCellRecalcError::CellIndexOutOfBounds { index });
         };
         let zone_before = snapshot.zone_type;
-        let navigation_before = load_navigation_signature(&snapshot);
         let source_overlay_id = match overlay.identity() {
             NO_OVERLAY_IDENTITY => None,
             identity @ 0..=254 => Some(identity as u8),
@@ -2249,7 +2355,6 @@ impl ResolvedTerrainGrid {
         let early_overlay_branch = source_flags.is_some_and(uses_early_recalc_land_branch);
         let mut finalized = overlay;
         let mut current_land_ground_blocked;
-        let mut current_land_build_blocked;
         let mut current_cliff_eligible;
         let mut base_cliff_eligible = cliff_back_normal_reclass_applies(snapshot.base_land_type);
         let run_lat;
@@ -2269,7 +2374,6 @@ impl ResolvedTerrainGrid {
                 flags.land_ground_blocked,
             );
             current_land_ground_blocked = flags.land_ground_blocked;
-            current_land_build_blocked = flags.land_build_blocked;
             // `CellClass::RecalcAttributes @ 0x0047D2B0` re-reads the current
             // pristine TMP slope before the early overlay branch validates a
             // sloped resource. A registered sparse/missing TMP yields flat 0;
@@ -2295,16 +2399,13 @@ impl ResolvedTerrainGrid {
             if state.cliff_back_impassability != 0 {
                 let behind_cliff = self.authored_load_cell_is_behind_cliff(index);
                 if behind_cliff && state.cliff_back_impassability == 2 {
-                    if let Some((ground_blocked, build_blocked)) = self
-                        .apply_authored_load_cliff_back_rock(
-                            state,
-                            index,
-                            base_cliff_eligible,
-                            current_cliff_eligible,
-                        )
-                    {
+                    if let Some(ground_blocked) = self.apply_authored_load_cliff_back_rock(
+                        state,
+                        index,
+                        base_cliff_eligible,
+                        current_cliff_eligible,
+                    ) {
                         current_land_ground_blocked = ground_blocked;
-                        current_land_build_blocked = build_blocked;
                     }
                 }
             }
@@ -2362,7 +2463,6 @@ impl ResolvedTerrainGrid {
                 cliff_back_normal_reclass_applies(self.cells[index].land_type)
             };
             current_land_ground_blocked = self.cells[index].base_ground_walk_blocked;
-            current_land_build_blocked = self.cells[index].base_build_blocked;
             run_lat = valid_entry;
         }
 
@@ -2412,10 +2512,8 @@ impl ResolvedTerrainGrid {
                     flags.land_ground_blocked,
                 );
                 current_land_ground_blocked = flags.land_ground_blocked;
-                current_land_build_blocked = flags.land_build_blocked;
             } else {
                 current_land_ground_blocked = self.cells[index].base_ground_walk_blocked;
-                current_land_build_blocked = self.cells[index].base_build_blocked;
             }
             base_cliff_eligible = if sparse_entry {
                 self.cells[index].base_land_type == LandType::Clear.as_index()
@@ -2443,6 +2541,7 @@ impl ResolvedTerrainGrid {
                         .allocate_automatic_tube(request)
                         .map_err(LoadCellRecalcError::Effect)?
                     {
+                        #[cfg(test)]
                         AutomaticTubeAllocation::AllocationNull => {}
                         AutomaticTubeAllocation::Allocated {
                             native_unique_id,
@@ -2483,8 +2582,9 @@ impl ResolvedTerrainGrid {
                     && let Some(anim) = theater.lookup.tile_anim(tile_id)
                     && anim.attaches_to == i32::from(animation_sub_tile)
                 {
-                    let (offset_x, offset_y) =
-                        tile_anim_pixel_offset_to_leptons(anim.x_offset, anim.y_offset);
+                    let (offset_x, offset_y) = state
+                        .pixel_conversion_bounds
+                        .offset_to_leptons(anim.x_offset, anim.y_offset);
                     let cell = &self.cells[index];
                     anim_request = Some(TerrainTileAnimation {
                         rx: cell.rx,
@@ -2514,16 +2614,13 @@ impl ResolvedTerrainGrid {
         if !early_overlay_branch && state.cliff_back_impassability != 0 {
             let behind_cliff = self.authored_load_cell_is_behind_cliff(index);
             if behind_cliff && state.cliff_back_impassability == 2 {
-                if let Some((ground_blocked, build_blocked)) = self
-                    .apply_authored_load_cliff_back_rock(
-                        state,
-                        index,
-                        base_cliff_eligible,
-                        current_cliff_eligible,
-                    )
-                {
+                if let Some(ground_blocked) = self.apply_authored_load_cliff_back_rock(
+                    state,
+                    index,
+                    base_cliff_eligible,
+                    current_cliff_eligible,
+                ) {
                     current_land_ground_blocked = ground_blocked;
-                    current_land_build_blocked = build_blocked;
                 }
             }
         }
@@ -2533,15 +2630,12 @@ impl ResolvedTerrainGrid {
             index,
             finalized,
             current_land_ground_blocked,
-            current_land_build_blocked,
         );
         let cell = &self.cells[index];
-        let navigation_after = load_navigation_signature(cell);
         Ok(LoadCellRecalcOutcome {
             finalized,
             zone_before,
             zone_after: cell.zone_type,
-            navigation_changed: navigation_before != navigation_after,
         })
     }
 
@@ -2623,7 +2717,7 @@ impl ResolvedTerrainGrid {
         index: usize,
         apply_base: bool,
         apply_current: bool,
-    ) -> Option<(bool, bool)> {
+    ) -> Option<bool> {
         if state.cliff_back_impassability != 2 || (!apply_base && !apply_current) {
             return None;
         }
@@ -2657,7 +2751,7 @@ impl ResolvedTerrainGrid {
             cell.is_rough = false;
             cell.is_road = false;
         }
-        apply_current.then_some((ground_blocked, build_blocked))
+        apply_current.then_some(ground_blocked)
     }
 
     fn finish_authored_load_cell_projection(
@@ -2666,7 +2760,6 @@ impl ResolvedTerrainGrid {
         index: usize,
         finalized: FinalizedOverlayCell,
         land_ground_blocked: bool,
-        land_build_blocked: bool,
     ) {
         let overlay_id = finalized.overlay_id();
         let flags = overlay_id.and_then(|overlay_id| state.overlay_types.flags(overlay_id));
@@ -2710,10 +2803,6 @@ impl ResolvedTerrainGrid {
         cell.bridge_transition = cell.bridge_facts.has_transition_flag();
         cell.ground_walk_blocked =
             land_ground_blocked || cell.terrain_object_blocks || cell.overlay_blocks;
-        cell.build_blocked = land_build_blocked
-            || cell.terrain_object_blocks
-            || cell.overlay_blocks
-            || cell.has_bridge_deck;
         cell.outside_playfield = state.playfield.is_some_and(|playfield| {
             !playfield.contains_raised(cell.rx, cell.ry, cell.level as i8, cell.slope_type)
         });
@@ -2736,16 +2825,13 @@ impl ResolvedTerrainGrid {
         self.native_allocated.as_deref()
     }
 
-    pub(crate) fn bridge_flag_execution_state(&self) -> CellClassBridgeFlagState {
-        CellClassBridgeFlagState::from_grid(self)
-    }
-
     pub(crate) fn bind_shared_cell_dummy(&mut self, shared_cell_dummy: SharedCellDummy) {
         self.shared_cell_dummy = shared_cell_dummy;
     }
 
     /// Apply one represented runtime `SetBridgeDirection_*` flag transaction
     /// through the same real-or-dummy seam used by map load.
+    #[cfg(test)]
     pub(crate) fn apply_runtime_bridge_flag_stamp(
         &mut self,
         stamp: BridgeFlagStamp,
@@ -2871,10 +2957,6 @@ impl ResolvedTerrainGrid {
             && !cell.terrain_object_blocks
             && !cell.overlay_blocks;
         cell.bridge_deck_level = deck_level;
-        cell.build_blocked = cell.base_build_blocked
-            || cell.terrain_object_blocks
-            || cell.overlay_blocks
-            || cell.has_bridge_deck;
     }
 
     /// Project a direct `CellClass::OverlayData` write into the derived bridge
@@ -2910,22 +2992,6 @@ impl ResolvedTerrainGrid {
         cell.bridge_facts.overlay_id = None;
         cell.bridge_facts.state_byte = 0;
         true
-    }
-
-    /// Project only allocated real-cell values for a setter that already ran
-    /// synchronously through [`CellClassBridgeFlagState`]. This performs no
-    /// GetCell fallback and cannot stamp or mutate the shared dummy.
-    pub(crate) fn apply_planned_bridge_flag_stamp_to_real_cells(
-        &mut self,
-        stamp: BridgeFlagStamp,
-    ) -> Vec<(usize, u32)> {
-        apply_planned_bridge_flag_stamp_to_real_parts(
-            &mut self.cells,
-            self.width,
-            self.height,
-            self.native_allocated.as_deref(),
-            stamp,
-        )
     }
 
     pub(crate) fn capture_real_cell_bridge_flags_0x1180(&self) -> RealCellBridgeFlags0x1180 {
@@ -3065,6 +3131,7 @@ impl ResolvedTerrainGrid {
     /// `y*512+x` slot and directly tests its pointer. Its active save-table and
     /// EMP callers establish valid coordinates; Rust therefore returns `false`
     /// outside the fixed array instead of reproducing native out-of-array UB.
+    #[cfg(test)]
     pub(crate) fn cellclass_allocation_probe(&self, x: i32, y: i32) -> bool {
         let Some((rx, ry)) = crate::map::cell_index::canonical_cell_coord(x, y) else {
             return false;
@@ -3417,7 +3484,9 @@ impl ResolvedTerrainGrid {
             }
         }
         Some(DestroyableCliffMutation {
+            #[cfg(test)]
             family,
+            #[cfg(test)]
             origin,
             original_footprint,
             animation_cells,
@@ -3733,6 +3802,7 @@ impl ResolvedTerrainGrid {
         Some((nx as u16, ny as u16))
     }
 
+    #[cfg(test)]
     pub fn walk_directions_from(&self, start: (u16, u16), directions: &[u8]) -> Option<(u16, u16)> {
         let mut coord = start;
         for &direction in directions {
@@ -3747,6 +3817,7 @@ impl ResolvedTerrainGrid {
     /// optional so tests can exercise bridge facts without retail theater data;
     /// when it is absent, theater membership fields are `None` and the
     /// comparator must keep that group `UNCHECKED`.
+    #[cfg(test)]
     pub fn bridge_oracle_cell_facts(
         &self,
         coords: &[(u16, u16)],
@@ -3782,6 +3853,7 @@ impl ResolvedTerrainGrid {
             None,
             None,
             None,
+            PixelConversionBounds::default(),
         )
     }
 
@@ -3803,6 +3875,7 @@ impl ResolvedTerrainGrid {
             None,
             None,
             None,
+            PixelConversionBounds::default(),
         )
     }
 
@@ -3833,6 +3906,7 @@ impl ResolvedTerrainGrid {
             Some(scenario_fill_ranged),
             Some(variant_selector),
             None,
+            PixelConversionBounds::default(),
         )
     }
 
@@ -3854,6 +3928,7 @@ impl ResolvedTerrainGrid {
         variant_selector: &mut TileVariantSelectionContext<'_, '_>,
         shared_cell_dummy: SharedCellDummy,
         overlay_load_source: OverlayLoadSource,
+        pixel_conversion_bounds: PixelConversionBounds,
     ) -> Self {
         Self::build_inner(
             map,
@@ -3869,6 +3944,7 @@ impl ResolvedTerrainGrid {
             Some(scenario_fill_ranged),
             Some(variant_selector),
             Some(shared_cell_dummy),
+            pixel_conversion_bounds,
         )
     }
 
@@ -3903,6 +3979,7 @@ impl ResolvedTerrainGrid {
             Some(scenario_fill_ranged),
             Some(variant_selector),
             Some(shared_cell_dummy),
+            PixelConversionBounds::default(),
         ))
     }
 
@@ -3920,6 +3997,7 @@ impl ResolvedTerrainGrid {
         mut scenario_fill_ranged: Option<&mut dyn FnMut(u32, u32) -> u32>,
         mut variant_selector: Option<&mut TileVariantSelectionContext<'_, '_>>,
         shared_cell_dummy: Option<SharedCellDummy>,
+        pixel_conversion_bounds: PixelConversionBounds,
     ) -> Self {
         let shared_cell_dummy = shared_cell_dummy.unwrap_or_default();
         let clear_tile_id = theater_data
@@ -3964,6 +4042,8 @@ impl ResolvedTerrainGrid {
                     .and_then(|td| td.rmg_tiles.water_set)
                     .map_or(-1, i32::from),
                 tile_registry_len: theater_data.map(|td| td.lookup.len()),
+                dummy_accepts_smudge: theater_data
+                    .is_some_and(|td| current_tile_permissions(&td.lookup, 0xFFFF).0),
                 high_bridge_rim_tiles: theater_data
                     .map(super::bridge_rim_tiles::HighBridgeRimTiles::from_theater),
                 bridge_set_start: theater_data.and_then(|td| {
@@ -4233,18 +4313,18 @@ impl ResolvedTerrainGrid {
                         theater_data.and_then(|td| td.lookup.tile_anim(presentation_tile_id))
                     {
                         if anim.attaches_to == i32::from(presentation_sub_tile) {
-                            let (offset_x, offset_y) =
-                                tile_anim_pixel_offset_to_leptons(anim.x_offset, anim.y_offset);
+                            let (offset_x, offset_y) = pixel_conversion_bounds
+                                .offset_to_leptons(anim.x_offset, anim.y_offset);
                             tile_animations.push(TerrainTileAnimation {
                                 rx,
                                 ry,
                                 anim_name: anim.anim_name.clone(),
                                 world_x: offset_x
-                                    + i32::from(rx) * LEPTONS_PER_CELL
-                                    + CELL_CENTRE_LEPTONS,
+                                    .wrapping_add(i32::from(rx).wrapping_mul(LEPTONS_PER_CELL))
+                                    .wrapping_add(CELL_CENTRE_LEPTONS),
                                 world_y: offset_y
-                                    + i32::from(ry) * LEPTONS_PER_CELL
-                                    + CELL_CENTRE_LEPTONS,
+                                    .wrapping_add(i32::from(ry).wrapping_mul(LEPTONS_PER_CELL))
+                                    .wrapping_add(CELL_CENTRE_LEPTONS),
                                 world_z: i32::from(level as i8)
                                     * crate::util::lepton::GROUND_LEVEL_HEIGHT_LEPTONS,
                                 z_adjust: anim.z_adjust,
@@ -4336,10 +4416,6 @@ impl ResolvedTerrainGrid {
                 // the A* can switch Bridge→Ground mid-span and units clip
                 // through the bridge.
                 let bridge_transition = false;
-                let build_blocked = base_build_blocked
-                    || terrain_object_blocks
-                    || overlay_effects.overlay_blocks
-                    || overlay_effects.has_bridge_deck;
                 let stored_final_tile_index = if sparse_subtile_fallback {
                     0xFFFF
                 } else {
@@ -4396,7 +4472,6 @@ impl ResolvedTerrainGrid {
                     base_yr_cell_land_type,
                     base_terrain_class,
                     base_speed_costs,
-                    build_blocked,
                     has_bridge_deck: overlay_effects.has_bridge_deck,
                     bridge_walkable,
                     bridge_transition,
@@ -4411,7 +4486,6 @@ impl ResolvedTerrainGrid {
                     radar_left: metadata.radar_left,
                     radar_right: metadata.radar_right,
                     has_damaged_data: metadata.has_damaged_data,
-                    bridgehead_anchor_class_at_load: None,
                 });
             }
         }
@@ -4501,10 +4575,6 @@ impl ResolvedTerrainGrid {
                 cell.has_bridge_deck = true;
                 cell.bridge_walkable = !cell.terrain_object_blocks && !cell.overlay_blocks;
                 cell.bridge_deck_level = cell.level.saturating_add(4);
-                cell.build_blocked = cell.base_build_blocked
-                    || cell.terrain_object_blocks
-                    || cell.overlay_blocks
-                    || cell.bridge_walkable;
             } else if facts.family != crate::map::bridge_facts::BridgeStampFamily::None
                 && cell
                     .bridge_layer
@@ -4514,48 +4584,10 @@ impl ResolvedTerrainGrid {
                 cell.has_bridge_deck = false;
                 cell.bridge_walkable = false;
                 cell.bridge_deck_level = cell.level;
-                cell.build_blocked =
-                    cell.base_build_blocked || cell.terrain_object_blocks || cell.overlay_blocks;
             }
 
             if facts.has_transition_flag() {
                 cell.bridge_transition = true;
-            }
-        }
-
-        if projection.is_eager()
-            && let Some(td) = theater_data
-        {
-            if let (Some(bs_idx), Some(ramp_table)) = (
-                td.bridge_set,
-                crate::map::theater::BridgeRampTileTable::from_theater(td),
-            ) {
-                if let Some(bridge_set_bounds) = td.lookup.bounds().get(bs_idx as usize) {
-                    let bridge_set_start = bridge_set_bounds.start;
-                    let mut ramp_count = 0usize;
-                    for cell in &mut cells {
-                        if cell.final_tile_index < 0 {
-                            continue;
-                        }
-                        let tile_id = normalize_tile_id(cell.final_tile_index);
-                        let Some(ramp_tile) = ramp_table.match_tile_id(
-                            tile_id,
-                            bridge_set_start,
-                            bridge_set_bounds.count,
-                            cell.template_height,
-                        ) else {
-                            continue;
-                        };
-                        cell.bridge_facts.ramp_tile = Some(ramp_tile);
-                        ramp_count += 1;
-                    }
-                    if ramp_count > 0 {
-                        log::info!(
-                            "ResolvedTerrain: {} exact high bridge ramp cells detected",
-                            ramp_count,
-                        );
-                    }
-                }
             }
         }
 
@@ -4682,10 +4714,6 @@ impl ResolvedTerrainGrid {
                         cell.ground_walk_blocked = rock_ground_blocked
                             || cell.terrain_object_blocks
                             || cell.overlay_blocks;
-                        cell.build_blocked = rock_build_blocked
-                            || cell.terrain_object_blocks
-                            || cell.overlay_blocks
-                            || cell.has_bridge_deck;
                         cell.zone_type = recalc_zone_type(
                             cell.outside_playfield,
                             cell.overlay_zone_type,
@@ -4732,7 +4760,7 @@ impl ResolvedTerrainGrid {
             })
             .collect();
 
-        let mut grid = Self {
+        let grid = Self {
             width,
             height,
             cells,
@@ -4750,6 +4778,8 @@ impl ResolvedTerrainGrid {
                 .and_then(|td| td.rmg_tiles.water_set)
                 .map_or(-1, i32::from),
             tile_registry_len: theater_data.map(|td| td.lookup.len()),
+            dummy_accepts_smudge: theater_data
+                .is_some_and(|td| current_tile_permissions(&td.lookup, 0xFFFF).0),
             high_bridge_rim_tiles: theater_data
                 .map(super::bridge_rim_tiles::HighBridgeRimTiles::from_theater),
             bridge_set_start: theater_data.and_then(|td| {
@@ -4784,44 +4814,7 @@ impl ResolvedTerrainGrid {
                 _ => None,
             },
         };
-        if projection.is_eager()
-            && let Some(theater) = theater_data
-        {
-            grid.rebuild_bridgehead_anchor_classes_from_final_tiles(theater);
-        }
         grid
-    }
-
-    /// Rebuild the authored bridgehead classification from the current,
-    /// finalized tile surface. Pending authored Fill deliberately leaves this
-    /// empty because LAT/Recalc has not established final tile authority yet.
-    pub(crate) fn rebuild_bridgehead_anchor_classes_from_final_tiles(
-        &mut self,
-        theater: &TheaterData,
-    ) {
-        for cell in &mut self.cells {
-            cell.bridgehead_anchor_class_at_load = None;
-        }
-        let Some(table) = crate::map::theater::BridgeAnchorVariantTable::from_theater(theater)
-        else {
-            return;
-        };
-        let Some(bridge_set) = theater.bridge_set else {
-            return;
-        };
-        for cell in &mut self.cells {
-            if cell.tileset_index != Some(bridge_set) || cell.final_tile_index < 0 {
-                continue;
-            }
-            let tile_id = if cell.final_tile_index == 0xFFFF {
-                0
-            } else {
-                cell.final_tile_index as u16
-            };
-            if let Some((_axis, class)) = table.match_tile_id(tile_id) {
-                cell.bridgehead_anchor_class_at_load = Some(class);
-            }
-        }
     }
 
     pub fn build_height_map(&self) -> BTreeMap<(u16, u16), u8> {
@@ -4847,36 +4840,19 @@ impl ResolvedTerrainGrid {
             .map(|cell| ((cell.rx, cell.ry), cell.bridge_deck_level))
             .collect()
     }
+}
 
-    /// Build bridge metadata for the tactical screen-to-cell inverse.
-    ///
-    /// This keeps the existing deck-height map intact for render/debug users,
-    /// while exposing the structural and direction-zero flags consumed by the
-    /// verified gamemd tactical inverse branch.
-    pub fn build_tactical_bridge_inverse_map(
-        &self,
-    ) -> BTreeMap<(u16, u16), crate::map::terrain::TacticalBridgeCell> {
-        self.cells
-            .iter()
-            .filter(|cell| {
-                cell.has_bridge_deck
-                    && !cell
-                        .bridge_layer
-                        .as_ref()
-                        .is_some_and(|bl| bl.direction == BridgeDirection::Low)
-            })
-            .map(|cell| {
-                (
-                    (cell.rx, cell.ry),
-                    crate::map::terrain::TacticalBridgeCell {
-                        structural: cell.bridge_facts.has_structural_bridge(),
-                        direction_zero: cell
-                            .bridge_facts
-                            .has_flag(crate::map::bridge_facts::BRIDGE_FLAG_DIRECTION_ZERO),
-                    },
-                )
-            })
-            .collect()
+impl crate::map::terrain::TacticalBridgeLookup for ResolvedTerrainGrid {
+    fn bridge_cell(&self, rx: u16, ry: u16) -> Option<crate::map::terrain::TacticalBridgeCell> {
+        let facts = &self.cell(rx, ry)?.bridge_facts;
+        // Original6D6760/6D6793 reads raw100/800, independent of inferred
+        // topology or deck-walkability. Collapse and restore already update
+        // this authoritative cell word; retaining a second map makes it stale.
+        // Executed reader: tools/bridge_click_state_oracle/README.md.
+        Some(crate::map::terrain::TacticalBridgeCell {
+            structural: facts.has_structural_bridge(),
+            direction_zero: facts.has_flag(crate::map::bridge_facts::BRIDGE_FLAG_DIRECTION_ZERO),
+        })
     }
 }
 
@@ -5106,7 +5082,7 @@ fn restore_load_base_land(cell: &mut ResolvedTerrainCell) {
 /// CanPlaceTiberium4839C0..4839E9 admits that index at its final tile gate.
 /// Other placement gates are outside this projection. Original-block witnesses:
 /// tools/spatial_oracle/terrain_tile_permissions.
-fn current_tile_permissions(lookup: &TilesetLookup, tile: i32) -> (bool, bool) {
+pub(crate) fn current_tile_permissions(lookup: &TilesetLookup, tile: i32) -> (bool, bool) {
     if tile < 0 || tile as usize >= lookup.len() {
         (lookup.is_morphable(0), true)
     } else {
@@ -5144,30 +5120,6 @@ fn apply_pristine_load_metadata(
     cell.base_speed_costs = metadata.speed_costs;
     cell.base_ground_walk_blocked = cell.canonical_ramp.is_none() && metadata.ground_blocked;
     cell.base_build_blocked = metadata.build_blocked || cell.canonical_ramp.is_some();
-}
-
-fn load_navigation_signature(
-    cell: &ResolvedTerrainCell,
-) -> (
-    bool,
-    Option<u8>,
-    u8,
-    u8,
-    TerrainClass,
-    SpeedCostProfile,
-    bool,
-    bool,
-) {
-    (
-        cell.overlay_blocks,
-        cell.overlay_zone_type,
-        cell.zone_type,
-        cell.land_type,
-        cell.terrain_class,
-        cell.speed_costs,
-        cell.ground_walk_blocked,
-        cell.build_blocked,
-    )
 }
 
 fn ordinary_variant_selection_enabled(
@@ -5540,7 +5492,6 @@ fn recalc_dynamic_tile_attributes(
     cell.base_terrain_class = metadata.terrain_class;
     cell.base_speed_costs = metadata.speed_costs;
     cell.ground_walk_blocked = metadata.ground_blocked || cell.terrain_object_blocks;
-    cell.build_blocked = metadata.build_blocked || cell.terrain_object_blocks;
     cell.zone_type = recalc_zone_type(
         cell.outside_playfield,
         None,
@@ -5557,7 +5508,6 @@ fn recalc_dynamic_tile_attributes(
     cell.radar_left = metadata.radar_left;
     cell.radar_right = metadata.radar_right;
     cell.has_damaged_data = metadata.has_damaged_data;
-    cell.bridgehead_anchor_class_at_load = None;
 }
 
 fn load_tile_metadata(
@@ -6134,7 +6084,7 @@ mod tests {
             directory.write(name, &empty_mix);
         }
         directory.write(tmp_filename, tmp_bytes);
-        let manager = AssetManager::new_with_media_mode(
+        let manager = AssetManager::new(
             directory.path(),
             MediaArchiveMode::Numbered { media_index: 2 },
         )
@@ -6210,7 +6160,7 @@ mod tests {
         for &(name, bytes) in files {
             directory.write(name, bytes);
         }
-        let manager = AssetManager::new_with_media_mode(
+        let manager = AssetManager::new(
             directory.path(),
             MediaArchiveMode::Numbered { media_index: 2 },
         )
@@ -6236,7 +6186,6 @@ mod tests {
                 local_height: 4,
             },
             basic: crate::map::basic::BasicSection::default(),
-            briefing: crate::map::briefing::BriefingSection::default(),
             preview: crate::map::preview::PreviewSection::default(),
             cells,
             iso_map_pack_lookups: Vec::new(),
@@ -6509,14 +6458,6 @@ mod tests {
             wood_bridge_set: Some(1),
             slope_set_pieces: None,
             slope_set_pieces2: None,
-            bridge_top_left_1: None,
-            bridge_top_left_2: None,
-            bridge_bottom_right_1: None,
-            bridge_bottom_right_2: None,
-            bridge_top_right_1: None,
-            bridge_top_right_2: None,
-            bridge_bottom_left_1: None,
-            bridge_bottom_left_2: None,
             bridge_middle_1: None,
             bridge_middle_2: None,
             tunnels: None,
@@ -6544,14 +6485,6 @@ mod tests {
             wood_bridge_set: None,
             slope_set_pieces: None,
             slope_set_pieces2: None,
-            bridge_top_left_1: None,
-            bridge_top_left_2: None,
-            bridge_bottom_right_1: None,
-            bridge_bottom_right_2: None,
-            bridge_top_right_1: None,
-            bridge_top_right_2: None,
-            bridge_bottom_left_1: None,
-            bridge_bottom_left_2: None,
             bridge_middle_1: None,
             bridge_middle_2: None,
             tunnels: None,
@@ -6725,16 +6658,14 @@ mod tests {
             sim.admit_projectile(
                 100,
                 ProjectileSpawn {
+                    native_unique_id: 0,
+                    line_trail: None,
+                    flat: false,
                     source_id: 999,
                     origin: ProjectileCoord::new(896, 896, 500),
                     target: ProjectileTarget::None,
                     initial_target_position: ProjectileCoord::new(1408, 896, 0),
-                    payload: ProjectilePayload {
-                        base_damage: 0,
-                        warhead: key,
-                        weapon: key,
-                        owner: key,
-                    },
+                    payload: ProjectilePayload::new(0, key, key),
                     speed_leptons_per_frame: 16,
                     velocity: ProjectileVelocity::new(16, 0, 0),
                     trajectory: ProjectileTrajectory::Ballistic,
@@ -6779,61 +6710,7 @@ mod tests {
     }
 
     fn make_test_cell(rx: u16, ry: u16) -> ResolvedTerrainCell {
-        ResolvedTerrainCell {
-            rx,
-            ry,
-            source_tile_index: 0,
-            source_sub_tile: 0,
-            final_tile_index: 0,
-            final_sub_tile: 0,
-            is_wood_bridge_repair_tile: false,
-            level: 0,
-            filled_clear: false,
-            tileset_index: Some(0),
-            land_type: 0,
-            yr_cell_land_type: 0,
-            slope_type: 0,
-            template_height: 0,
-            render_offset_x: 0,
-            render_offset_y: 0,
-            terrain_class: TerrainClass::Clear,
-            speed_costs: SpeedCostProfile::default(),
-            is_water: false,
-            is_cliff_like: false,
-            height_in_pixels: 0,
-            variant: 0,
-            is_rough: false,
-            is_road: false,
-            accepts_smudge: false,
-            allows_tiberium: false,
-            has_ramp: false,
-            canonical_ramp: None,
-            ground_walk_blocked: false,
-            terrain_object_blocks: false,
-            terrain_object_occupation: None,
-            overlay_blocks: false,
-            overlay_zone_type: None,
-            outside_playfield: false,
-            zone_type: 0,
-            base_ground_walk_blocked: false,
-            base_build_blocked: false,
-            base_land_type: 0,
-            base_yr_cell_land_type: 0,
-            base_terrain_class: Default::default(),
-            base_speed_costs: Default::default(),
-            build_blocked: false,
-            has_bridge_deck: false,
-            bridge_walkable: false,
-            bridge_transition: false,
-            bridge_deck_level: 0,
-            bridge_layer: None,
-            bridge_facts: crate::map::bridge_facts::BridgeCellFacts::default(),
-            tube_index: None,
-            radar_left: [0, 0, 0],
-            radar_right: [0, 0, 0],
-            has_damaged_data: false,
-            bridgehead_anchor_class_at_load: None,
-        }
+        test_flat_cell(rx, ry)
     }
 
     #[derive(Default)]
@@ -7255,10 +7132,8 @@ mod tests {
 
     #[test]
     fn gsi_04_01_runtime_setter_uses_native_real_or_dummy_order() {
-        let cells = (0..3)
-            .flat_map(|ry| (0..3).map(move |rx| make_test_cell(rx, ry)))
-            .collect();
-        let mut grid = ResolvedTerrainGrid::from_cells(3, 3, cells);
+        let mut grid =
+            crate::map::resolved_terrain::test_grid(3, 3, |rx, ry| make_test_cell(rx, ry));
         grid.test_set_native_allocated_cells(&[(1, 1)]);
         let dummy = grid.shared_cell_dummy();
         let stamp = BridgeFlagStamp::new((1, 1), 0, true);
@@ -7303,10 +7178,8 @@ mod tests {
 
     #[test]
     fn bridge_publication_retains_allocation_identity_across_other_lookups() {
-        let cells = (0..3)
-            .flat_map(|y| (0..3).map(move |x| make_test_cell(x, y)))
-            .collect();
-        let mut terrain = ResolvedTerrainGrid::from_cells(3, 3, cells);
+        let mut terrain =
+            crate::map::resolved_terrain::test_grid(3, 3, |x, y| make_test_cell(x, y));
         terrain.test_set_native_allocated_cells(&[(1, 1)]);
         let real = terrain.native_cell_identity((-511, 2));
         assert_eq!(real, NativeCellIdentity::Real(4));
@@ -7333,10 +7206,8 @@ mod tests {
 
     #[test]
     fn bridge_publication_overlapping_mark_preserves_literal_anchor_pointer() {
-        let cells = (0..7)
-            .flat_map(|y| (0..7).map(move |x| make_test_cell(x, y)))
-            .collect();
-        let mut terrain = ResolvedTerrainGrid::from_cells(7, 7, cells);
+        let mut terrain =
+            crate::map::resolved_terrain::test_grid(7, 7, |x, y| make_test_cell(x, y));
         let first = terrain.native_cell_identity((3, 3));
         let second = terrain.native_cell_identity((4, 3));
         terrain.apply_runtime_bridge_mark_stamp(
@@ -7489,6 +7360,7 @@ mod tests {
                 &mut selector,
                 SharedCellDummy::fresh(),
                 OverlayLoadSource::Authored,
+                PixelConversionBounds::default(),
             );
             let metrics = (
                 selector.generated_table(),
@@ -7503,10 +7375,6 @@ mod tests {
         assert!(eager_cell.bridge_facts.has_structural_bridge());
         assert_eq!(eager_cell.bridge_facts.state_byte, 99);
         assert_eq!(eager_cell.terrain_object_occupation, Some(7));
-        assert_eq!(
-            eager_cell.bridgehead_anchor_class_at_load,
-            Some(crate::map::bridge_facts::BridgeheadAnchorClass::Variant0)
-        );
         assert!(!eager.tile_animations().is_empty());
         assert!(!eager.tube_facts().is_empty());
 
@@ -7580,7 +7448,6 @@ mod tests {
         assert!(pending_grid.tile_animations().is_empty());
         assert!(pending_grid.tube_facts().is_empty());
         assert_eq!(pending_cell.tube_index, None);
-        assert_eq!(pending_cell.bridgehead_anchor_class_at_load, None);
         assert_eq!(dummy.snapshot().bridge_flags_0x1180, 0);
         assert_eq!(
             map.overlay_data_pack()
@@ -7623,6 +7490,7 @@ mod tests {
             None,
             None,
             None,
+            PixelConversionBounds::default(),
         );
         assert_eq!(pending_lat.cell(5, 5).unwrap().final_tile_index, 5);
 
@@ -7645,6 +7513,7 @@ mod tests {
             None,
             None,
             None,
+            PixelConversionBounds::default(),
         );
         let cliff_cell = pending_cliff.cell(1, 1).unwrap();
         assert_eq!(cliff_cell.land_type, LandType::Clear.as_index());
@@ -7697,6 +7566,7 @@ mod tests {
                 &mut selector,
                 dummy.clone(),
                 OverlayLoadSource::Authored,
+                PixelConversionBounds::default(),
             )
         };
 
@@ -7756,6 +7626,7 @@ mod tests {
             None,
             None,
             None,
+            PixelConversionBounds::default(),
         );
         let generated = ResolvedTerrainGrid::build_inner(
             &map,
@@ -7771,6 +7642,7 @@ mod tests {
             None,
             None,
             None,
+            PixelConversionBounds::default(),
         );
 
         assert!(
@@ -8211,6 +8083,7 @@ mod tests {
             false,
             0,
             grid.cells.len(),
+            PixelConversionBounds::default(),
         );
         let mut effects = LoadRecalcTestEffects {
             tube_allocation: Some(AutomaticTubeAllocation::Allocated {
@@ -8311,10 +8184,7 @@ mod tests {
 
     #[test]
     fn invalid_non_8_direction_does_not_wrap() {
-        let cells = (0..3)
-            .flat_map(|ry| (0..3).map(move |rx| make_test_cell(rx, ry)))
-            .collect();
-        let grid = ResolvedTerrainGrid::from_cells(3, 3, cells);
+        let grid = crate::map::resolved_terrain::test_grid(3, 3, |rx, ry| make_test_cell(rx, ry));
 
         assert_eq!(grid.step_coord_by_direction((1, 1), 9), None);
         assert_eq!(grid.step_coord_by_direction((1, 1), 255), None);
@@ -8621,7 +8491,6 @@ mod tests {
         assert!(!cell.is_cliff_like);
         assert!(!cell.base_ground_walk_blocked);
         assert!(!cell.ground_walk_blocked);
-        assert!(!cell.build_blocked);
         assert_eq!(cell.terrain_class, TerrainClass::Clear);
     }
 
@@ -9350,6 +9219,7 @@ SnowOccupationBits=0
             None,
             None,
             None,
+            PixelConversionBounds::default(),
         );
         let temperate_tree = temperate.cell(0, 0).unwrap();
         assert_eq!(temperate_tree.terrain_object_occupation, Some(4));
@@ -9376,6 +9246,7 @@ SnowOccupationBits=0
             None,
             None,
             None,
+            PixelConversionBounds::default(),
         );
         let snow_tree = snow.cell(0, 0).unwrap();
         assert_eq!(snow_tree.terrain_object_occupation, Some(7));
@@ -9797,65 +9668,21 @@ NoUseTileLandType=no
             1,
             1,
             vec![ResolvedTerrainCell {
-                rx: 0,
-                ry: 0,
-                source_tile_index: 0,
-                source_sub_tile: 0,
-                final_tile_index: 0,
-                final_sub_tile: 0,
-                is_wood_bridge_repair_tile: false,
-                level: 0,
-                filled_clear: false,
-                tileset_index: Some(0),
                 land_type: metadata.land_type,
                 yr_cell_land_type: metadata.yr_cell_land_type,
                 slope_type: metadata.slope_type,
-                template_height: 0,
-                render_offset_x: 0,
-                render_offset_y: 0,
                 terrain_class: metadata.terrain_class,
                 speed_costs: metadata.speed_costs,
-                is_water: false,
                 is_cliff_like: true,
-                is_rough: false,
-                is_road: false,
-                accepts_smudge: false,
-                allows_tiberium: false,
-                height_in_pixels: 0,
-                variant: 0,
                 has_ramp: true,
                 canonical_ramp,
-                ground_walk_blocked: false,
-                terrain_object_blocks: false,
-                terrain_object_occupation: None,
-                overlay_blocks: false,
-                overlay_zone_type: None,
-                outside_playfield: false,
-                zone_type: 0,
-                base_ground_walk_blocked: false,
                 base_build_blocked: true,
-                base_land_type: 0,
-                base_yr_cell_land_type: 0,
-                base_terrain_class: Default::default(),
-                base_speed_costs: Default::default(),
-                build_blocked: true,
-                has_bridge_deck: false,
-                bridge_walkable: false,
-                bridge_transition: false,
-                bridge_deck_level: 0,
-                bridge_layer: None,
-                bridge_facts: crate::map::bridge_facts::BridgeCellFacts::default(),
-                tube_index: None,
-                radar_left: [0, 0, 0],
-                radar_right: [0, 0, 0],
-                has_damaged_data: false,
-                bridgehead_anchor_class_at_load: None,
+                ..crate::map::resolved_terrain::test_flat_cell(0, 0)
             }],
         );
         let cell = grid.cell(0, 0).expect("resolved ramp cell");
         assert_eq!(cell.canonical_ramp, Some(RampDirection::North));
         assert!(!cell.ground_walk_blocked);
-        assert!(cell.build_blocked);
         assert_eq!(map.header.width, 4);
     }
 
@@ -10070,6 +9897,7 @@ NoUseTileLandType=no
             false,
             0,
             1,
+            PixelConversionBounds::default(),
         );
 
         let outcome = grid
@@ -10119,6 +9947,7 @@ NoUseTileLandType=no
             false,
             0,
             1,
+            PixelConversionBounds::default(),
         );
         let outcome = sparse
             .recalc_authored_load_cell(
@@ -10173,7 +10002,6 @@ NoUseTileLandType=no
             "copy-1 reclasses the claimed current land without widening the base gate"
         );
         assert!(early.cells[4].ground_walk_blocked);
-        assert!(early.cells[4].build_blocked);
         assert_eq!(early.cells[4].zone_type, zone_class::IMPASSABLE);
         assert!(!early.cells[4].base_build_blocked);
 
@@ -10231,6 +10059,7 @@ NoUseTileLandType=no
             false,
             2,
             sparse.cells.len(),
+            PixelConversionBounds::default(),
         );
         sparse
             .recalc_authored_load_cell(
@@ -10680,14 +10509,6 @@ Tile03ZAdjust=-10
             wood_bridge_set: None,
             slope_set_pieces: None,
             slope_set_pieces2: None,
-            bridge_top_left_1: None,
-            bridge_top_left_2: None,
-            bridge_bottom_right_1: None,
-            bridge_bottom_right_2: None,
-            bridge_top_right_1: None,
-            bridge_top_right_2: None,
-            bridge_bottom_left_1: None,
-            bridge_bottom_left_2: None,
             bridge_middle_1: None,
             bridge_middle_2: None,
             tunnels: None,
@@ -10711,6 +10532,109 @@ Tile03ZAdjust=-10
     }
 
     #[test]
+    fn tile_anim_live_and_eager_use_bounds_and_wrapping_world_adds() {
+        let tmp = gsi_04_02_last_tiles_tmp_bytes(0, [1, 2, 3], [4, 5, 6]);
+        let (_directory, assets) = gsi_04_04_asset_manager_with_loose_tmp("wf01.tem", &tmp);
+        let terrain_rules = TerrainRules::from_ini(&IniFile::from_str(""));
+        let registry = OverlayTypeRegistry::from_ini(&IniFile::from_str(""), None);
+        // Bounds are match inputs. Rejection zeroes only the offset; the Anim
+        // still attaches at the cell centre. Negative offsets have no lower guard.
+        for (x, y, bounds, expected) in [
+            (
+                -30,
+                59,
+                PixelConversionBounds {
+                    width: 1,
+                    height: 59,
+                },
+                (128, 128),
+            ),
+            (
+                -30,
+                59,
+                PixelConversionBounds {
+                    width: 1,
+                    height: 60,
+                },
+                (503, 759),
+            ),
+            (
+                -30,
+                59,
+                PixelConversionBounds {
+                    width: -30,
+                    height: 60,
+                },
+                (128, 128),
+            ),
+            // Deterministic rational policy, then signed32 wrapping world add.
+            (
+                -503_312_600,
+                0,
+                PixelConversionBounds::default(),
+                (-2_147_483_637, -2_147_483_403),
+            ),
+        ] {
+            let mut theater = theater_with_tile_anims();
+            let ini = format!(
+                "[TileSet0000]\nTilesInSet=4\nFileName=wf\nSetName=Waterfalls\n[Waterfalls]\nTile01Anim=WA01X\nTile01XOffset={x}\nTile01YOffset={y}\nTile01AttachesTo=0\n"
+            );
+            theater.lookup = theater::parse_tileset_ini(ini.as_bytes(), "tem").unwrap();
+            let map = make_map(vec![anim_cell(0, 0, 0, 0, 0)], Vec::new(), Vec::new());
+            let eager = ResolvedTerrainGrid::build_inner(
+                &map,
+                Some(&theater),
+                Some(&assets),
+                Some(&terrain_rules),
+                Some(&registry),
+                None,
+                false,
+                0,
+                OverlayLoadSource::Authored,
+                TerrainBuildProjection::EagerCompatibility,
+                None,
+                None,
+                None,
+                bounds,
+            );
+            assert_eq!(eager.tile_animations().len(), 1);
+            let eager_anim = &eager.tile_animations()[0];
+            assert_eq!(
+                (eager_anim.world_x, eager_anim.world_y),
+                expected,
+                "eager {x},{y} {bounds:?}"
+            );
+            let mut live = ResolvedTerrainGrid::from_cells(1, 1, vec![make_test_cell(0, 0)]);
+            let mut state = LoadCellRecalcState::for_authored_load(
+                &map,
+                &theater,
+                &assets,
+                &terrain_rules,
+                &registry,
+                false,
+                0,
+                1,
+                bounds,
+            );
+            let mut effects = LoadRecalcTestEffects::default();
+            live.recalc_authored_load_cell(
+                &mut state,
+                0,
+                FinalizedOverlayCell::default(),
+                &mut effects,
+            )
+            .unwrap();
+            assert_eq!(effects.requests.len(), 1);
+            let live_anim = &effects.requests[0];
+            assert_eq!(
+                (live_anim.world_x, live_anim.world_y),
+                expected,
+                "live {x},{y} {bounds:?}"
+            );
+        }
+    }
+
+    #[test]
     fn authored_load_recalc_latches_tile_anim_only_after_synchronous_success() {
         let theater = theater_with_tile_anims();
         let tmp = gsi_04_02_last_tiles_tmp_bytes(0, [1, 2, 3], [4, 5, 6]);
@@ -10729,6 +10653,7 @@ Tile03ZAdjust=-10
             false,
             0,
             grid.cells.len(),
+            PixelConversionBounds::default(),
         );
         let mut effects = LoadRecalcTestEffects {
             fail: true,
@@ -10823,7 +10748,7 @@ Tile03ZAdjust=-10
                 let reference_x = (S * px as f32 + S2 * py as f32).trunc() as i32;
                 let reference_y = (S2 * py as f32 - S * px as f32).trunc() as i32;
                 assert_eq!(
-                    tile_anim_pixel_offset_to_leptons(px, py),
+                    PixelConversionBounds::default().offset_to_leptons(px, py),
                     (reference_x, reference_y),
                     "pixel offset ({px}, {py})"
                 );
@@ -10863,7 +10788,7 @@ Tile03ZAdjust=-10
         let map = make_map(vec![anim_cell(2, 3, 0, 0, 5)], Vec::new(), Vec::new());
         let grid = ResolvedTerrainGrid::build(&map, Some(&theater), None, None, None, false, 0);
         let anim = &grid.tile_animations()[0];
-        let (offset_x, offset_y) = tile_anim_pixel_offset_to_leptons(-30, 59);
+        let (offset_x, offset_y) = PixelConversionBounds::default().offset_to_leptons(-30, 59);
         assert_eq!(anim.world_x, offset_x + 2 * 256 + 128);
         assert_eq!(anim.world_y, offset_y + 3 * 256 + 128);
         assert_eq!(
@@ -11074,62 +10999,15 @@ impl ResolvedTerrainCell {
     /// template the terrain-object tests build by hand; `zone_type` and the
     /// overlay fields are the knobs a test turns.
     pub(crate) fn clear_for_test(rx: u16, ry: u16) -> Self {
-        let mut speed_costs = SpeedCostProfile::default();
-        speed_costs.wheel = Some(100);
+        let speed_costs = SpeedCostProfile {
+            wheel: Some(100),
+            ..Default::default()
+        };
         Self {
-            rx,
-            ry,
-            source_tile_index: 0,
-            source_sub_tile: 0,
-            final_tile_index: 0,
-            final_sub_tile: 0,
-            is_wood_bridge_repair_tile: false,
-            level: 0,
-            filled_clear: false,
             tileset_index: None,
-            land_type: LandType::Clear.as_index(),
-            yr_cell_land_type: LandType::Clear.as_index(),
-            slope_type: 0,
-            template_height: 0,
-            render_offset_x: 0,
-            render_offset_y: 0,
-            terrain_class: TerrainClass::Clear,
             speed_costs,
-            is_water: false,
-            is_cliff_like: false,
-            is_rough: false,
-            is_road: false,
-            accepts_smudge: false,
-            allows_tiberium: false,
-            height_in_pixels: 0,
-            variant: 0,
-            has_ramp: false,
-            canonical_ramp: None,
-            ground_walk_blocked: false,
-            terrain_object_blocks: false,
-            terrain_object_occupation: None,
-            overlay_blocks: false,
-            overlay_zone_type: None,
-            outside_playfield: false,
-            zone_type: zone_class::GROUND,
-            base_ground_walk_blocked: false,
-            base_build_blocked: false,
-            base_land_type: LandType::Clear.as_index(),
-            base_yr_cell_land_type: LandType::Clear.as_index(),
-            base_terrain_class: TerrainClass::Clear,
             base_speed_costs: speed_costs,
-            build_blocked: false,
-            has_bridge_deck: false,
-            bridge_walkable: false,
-            bridge_transition: false,
-            bridge_deck_level: 0,
-            bridge_layer: None,
-            bridge_facts: crate::map::bridge_facts::BridgeCellFacts::default(),
-            tube_index: None,
-            radar_left: [0; 3],
-            radar_right: [0; 3],
-            has_damaged_data: false,
-            bridgehead_anchor_class_at_load: None,
+            ..test_clear_cell(rx, ry)
         }
     }
 }
@@ -11147,11 +11025,17 @@ mod mutation_epoch_tests {
             ResolvedTerrainGrid::from_cells(1, 1, vec![ResolvedTerrainCell::clear_for_test(0, 0)]);
         let before = grid.mutation_epoch();
         grid.set_terrain_object_occupation((0, 0), Some(1));
-        assert!(grid.mutation_epoch() > before, "occupation write must bump the epoch");
+        assert!(
+            grid.mutation_epoch() > before,
+            "occupation write must bump the epoch"
+        );
         assert!(grid.cell(0, 0).unwrap().terrain_object_blocks);
         let marked = grid.mutation_epoch();
         grid.set_terrain_object_occupation((0, 0), None);
-        assert!(grid.mutation_epoch() > marked, "occupation clear must bump the epoch");
+        assert!(
+            grid.mutation_epoch() > marked,
+            "occupation clear must bump the epoch"
+        );
         // A miss leaves the epoch alone.
         let stable = grid.mutation_epoch();
         grid.set_terrain_object_occupation((5, 5), Some(1));

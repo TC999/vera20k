@@ -38,7 +38,6 @@ fn gap_fixture(case: &serde_json::Value) -> (ResolvedTerrainGrid, Vec<BridgeEndp
         .map(|r| BridgeEndpointRecord {
             endpoint_a: (int(&r[0]) as u16, int(&r[1]) as u16),
             endpoint_b: (int(&r[2]) as u16, int(&r[3]) as u16),
-            group_id: 0,
             active: int(&r[4]) != 0,
             bridge_kind: if int(&r[5]) == 0 {
                 BridgeRecordKind::High
@@ -114,8 +113,7 @@ fn gap_flags_snapshot_hash_and_later_setter_preserve_value_authority() {
     let mut bridge_state = super::BridgeRuntimeState::from_resolved_terrain(&terrain, true, 100);
     bridge_state.test_set_endpoint_records(records.clone());
     sim.bridge_state = Some(bridge_state);
-    sim.overlay_grid =
-        Some(crate::sim::overlay_grid::OverlayGrid::new_with_retained_wall_plane(12, 12));
+    sim.overlay_grid = Some(crate::sim::overlay_grid::OverlayGrid::new(12, 12));
     sim.install_resolved_terrain_for_new_map(terrain);
     let before = sim.state_hash();
     let updates = &mut sim.real_cell_bridge_flags_0x1180;
@@ -158,17 +156,15 @@ fn gap_flags_snapshot_hash_and_later_setter_preserve_value_authority() {
     let bytes = GameSnapshot::save(&sim, 0, 0, "gap.map", 0);
     let mut restored = GameSnapshot::load(&bytes).unwrap().sim;
     restored.restore_after_snapshot_load().unwrap();
-    restored.rebuild_caches_after_load(
-        pristine,
-        crate::sim::pathfinding::terrain_speed::TerrainSpeedConfig::default(),
-        Vec::new(),
-        Vec::new(),
-        std::collections::BTreeMap::new(),
-    );
     let ini = crate::rules::ini_parser::IniFile::from_str(
         "[InfantryTypes]\n[VehicleTypes]\n[AircraftTypes]\n[BuildingTypes]\n[OverlayTypes]\n",
     );
     let rules = crate::rules::ruleset::RuleSet::from_ini(&ini).unwrap();
+    restored.rebuild_caches_after_load(
+        pristine,
+        crate::sim::pathfinding::terrain_speed::TerrainSpeedConfig::default(),
+        &rules,
+    );
     restored
         .restore_map_authority_after_snapshot_load(
             &rules,

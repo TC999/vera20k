@@ -31,29 +31,26 @@ fn pursuit_rules() -> RuleSet {
     RuleSet::from_ini(&ini).expect("pursuit_rules should parse")
 }
 
-/// Construct a Simulation with a flat 64x64 PathGrid and the given entities
-/// pre-inserted. Returns the sim plus the path grid (kept alive separately
-/// because tick_attack_pursuit borrows it).
+/// Construct a Simulation with a flat 64x64 canonical PathGrid and the given
+/// entities pre-inserted.
 ///
 /// Replaces the sim's interner with the thread-local test interner so the
 /// type_ref / owner IDs that `GameEntity::test_default` baked in via
 /// `test_intern()` resolve correctly.
-fn make_sim(entities: Vec<GameEntity>) -> (Simulation, PathGrid) {
+fn make_sim(entities: Vec<GameEntity>) -> Simulation {
     let mut sim = Simulation::new();
     for e in entities {
         sim.substrate.entities.insert(e);
     }
     sim.interner = crate::sim::intern::test_interner();
     let grid = PathGrid::test_all_passable(64, 64);
-    (sim, grid)
+    sim.install_fixture_path_grid(Some(&grid));
+    sim
 }
 
-fn make_unit(id: u64, type_ref: &str, owner: &str, rx: u16, ry: u16, hp: u16) -> GameEntity {
+fn make_unit(id: u64, type_ref: &str, owner: &str, rx: u16, ry: u16, hp: i32) -> GameEntity {
     let mut e = GameEntity::test_default(id, type_ref, owner, rx, ry);
-    e.health = Health {
-        current: hp,
-        max: hp,
-    };
+    e.health = Health { current: hp };
     e
 }
 
@@ -62,10 +59,10 @@ fn cell_target_out_of_range_issues_movement() {
     // Grizzly at (5,5), force-fire Cell(15,15). Range=6, distance=10 → out of range.
     let mut grizzly = make_unit(1, "MTNK", "Americans", 5, 5, 300);
     grizzly.attack_target = Some(AttackTarget::for_cell(15, 15));
-    let (mut sim, grid) = make_sim(vec![grizzly]);
+    let mut sim = make_sim(vec![grizzly]);
     let rules = pursuit_rules();
 
-    sim.tick_attack_pursuit(&rules, Some(&grid));
+    sim.tick_attack_pursuit(&rules);
 
     let entity = sim.substrate.entities.get(1).unwrap();
     assert!(
@@ -85,10 +82,10 @@ fn cell_target_in_range_clears_movement() {
     let mut grizzly = make_unit(1, "MTNK", "Americans", 8, 5, 300);
     grizzly.attack_target = Some(AttackTarget::for_cell(10, 5));
     grizzly.movement_target = Some(crate::sim::components::MovementTarget::default());
-    let (mut sim, grid) = make_sim(vec![grizzly]);
+    let mut sim = make_sim(vec![grizzly]);
     let rules = pursuit_rules();
 
-    sim.tick_attack_pursuit(&rules, Some(&grid));
+    sim.tick_attack_pursuit(&rules);
 
     let entity = sim.substrate.entities.get(1).unwrap();
     assert!(
@@ -107,10 +104,10 @@ fn entity_target_out_of_range_pursues() {
     let mut grizzly = make_unit(1, "MTNK", "Americans", 0, 0, 300);
     grizzly.attack_target = Some(AttackTarget::new(2));
     let rhino = make_unit(2, "HTNK", "Soviet", 10, 0, 400);
-    let (mut sim, grid) = make_sim(vec![grizzly, rhino]);
+    let mut sim = make_sim(vec![grizzly, rhino]);
     let rules = pursuit_rules();
 
-    sim.tick_attack_pursuit(&rules, Some(&grid));
+    sim.tick_attack_pursuit(&rules);
 
     let entity = sim.substrate.entities.get(1).unwrap();
     assert!(entity.attack_target.is_some());
@@ -129,10 +126,10 @@ fn entity_target_dying_pursuit_skips() {
     let mut rhino = make_unit(2, "HTNK", "Soviet", 10, 0, 0);
     rhino.dying = true;
     rhino.health.current = 0;
-    let (mut sim, grid) = make_sim(vec![grizzly, rhino]);
+    let mut sim = make_sim(vec![grizzly, rhino]);
     let rules = pursuit_rules();
 
-    sim.tick_attack_pursuit(&rules, Some(&grid));
+    sim.tick_attack_pursuit(&rules);
     assert!(
         sim.substrate
             .entities
@@ -149,17 +146,13 @@ fn aircraft_attack_target_skipped_by_pursuit() {
     // touch its movement.
     let mut orca = make_unit(1, "ORCA", "Americans", 0, 0, 150);
     orca.attack_target = Some(AttackTarget::new(2));
-    orca.aircraft_mission = Some(AircraftMission::Attack {
-        sub_state: 3,
-        has_fired: false,
-        is_strafe: false,
-    });
+    orca.aircraft_mission = Some(AircraftMission::Attack { sub_state: 3 });
     orca.aircraft_ammo = Some(AircraftAmmo::new(2));
     let rhino = make_unit(2, "HTNK", "Soviet", 30, 0, 400);
-    let (mut sim, grid) = make_sim(vec![orca, rhino]);
+    let mut sim = make_sim(vec![orca, rhino]);
     let rules = pursuit_rules();
 
-    sim.tick_attack_pursuit(&rules, Some(&grid));
+    sim.tick_attack_pursuit(&rules);
 
     let entity = sim.substrate.entities.get(1).unwrap();
     assert!(
@@ -175,10 +168,10 @@ fn structure_attack_target_skipped_by_pursuit() {
     pillbox.category = crate::map::entities::EntityCategory::Structure;
     pillbox.attack_target = Some(AttackTarget::new(2));
     let rhino = make_unit(2, "HTNK", "Soviet", 30, 5, 400);
-    let (mut sim, grid) = make_sim(vec![pillbox, rhino]);
+    let mut sim = make_sim(vec![pillbox, rhino]);
     let rules = pursuit_rules();
 
-    sim.tick_attack_pursuit(&rules, Some(&grid));
+    sim.tick_attack_pursuit(&rules);
 
     let entity = sim.substrate.entities.get(1).unwrap();
     assert!(
@@ -192,13 +185,16 @@ fn deployed_infantry_skipped_by_pursuit() {
     // Deploy-fire infantry (e.g., GI in deployed state) cannot move.
     let mut gi = make_unit(1, "ENGI", "Americans", 5, 5, 75);
     gi.category = crate::map::entities::EntityCategory::Infantry;
-    gi.deploy_state = Some(crate::sim::deploy::DeployPhase::Deployed);
+    gi.mission_leaf = crate::sim::mission::MissionLeafState::for_entity_category(
+        crate::map::entities::EntityCategory::Infantry,
+    );
+    gi.mission_leaf.set_infantry_doing_verified(28).unwrap();
     gi.attack_target = Some(AttackTarget::new(2));
     let rhino = make_unit(2, "HTNK", "Soviet", 30, 5, 400);
-    let (mut sim, grid) = make_sim(vec![gi, rhino]);
+    let mut sim = make_sim(vec![gi, rhino]);
     let rules = pursuit_rules();
 
-    sim.tick_attack_pursuit(&rules, Some(&grid));
+    sim.tick_attack_pursuit(&rules);
 
     let entity = sim.substrate.entities.get(1).unwrap();
     assert!(
@@ -218,10 +214,10 @@ fn pursuit_uses_same_range_as_combat_no_oscillation() {
     let mut grizzly = make_unit(1, "MTNK", "Americans", 0, 0, 300);
     grizzly.attack_target = Some(AttackTarget::for_cell(6, 0));
     grizzly.movement_target = Some(crate::sim::components::MovementTarget::default());
-    let (mut sim, grid) = make_sim(vec![grizzly]);
+    let mut sim = make_sim(vec![grizzly]);
     let rules = pursuit_rules();
 
-    sim.tick_attack_pursuit(&rules, Some(&grid));
+    sim.tick_attack_pursuit(&rules);
 
     let entity = sim.substrate.entities.get(1).unwrap();
     // is_within_range_leptons is inclusive at the boundary. Pursuit should
@@ -245,6 +241,7 @@ fn pursuit_uses_same_range_as_combat_no_oscillation() {
 fn sticky_drops_the_target_instead_of_chasing_it() {
     let mut civilian = make_unit(1, "MTNK", "Americans", 0, 0, 300);
     civilian.attack_target = Some(AttackTarget::new(2));
+    civilian.weapon_burst.complete_shot(2);
     civilian
         .mission
         .apply_test_fixture(crate::sim::mission::state::MissionTestFixture {
@@ -261,10 +258,10 @@ fn sticky_drops_the_target_instead_of_chasing_it() {
         });
     // 105mm Range=6; the Rhino sits at 10 cells, so the can-fire-at query fails.
     let rhino = make_unit(2, "HTNK", "Soviet", 10, 0, 400);
-    let (mut sim, grid) = make_sim(vec![civilian, rhino]);
+    let mut sim = make_sim(vec![civilian, rhino]);
     let rules = pursuit_rules();
 
-    sim.tick_attack_pursuit(&rules, Some(&grid));
+    sim.tick_attack_pursuit(&rules);
 
     let entity = sim.substrate.entities.get(1).unwrap();
     assert!(
@@ -276,13 +273,15 @@ fn sticky_drops_the_target_instead_of_chasing_it() {
         "Sticky produces no pursuit cell"
     );
     assert!(entity.navigation.nav_com.is_none());
+    assert_eq!(entity.weapon_burst.index(), 0);
 }
 
 /// The same object on Guard — the mission Sticky shares its handler with —
-/// still pursues. This is the tripwire proving the clause keys on the mission
-/// id and not on something both missions share.
+/// keeps its target but does not approach: `FootClass::Mission_Guard @
+/// 0x004D5070` never calls the approach search (vt+0x53C). The Sticky clause
+/// keys on the mission id, so Guard does not drop the target either.
 #[test]
-fn guard_still_chases_where_sticky_would_not() {
+fn guard_keeps_its_target_without_approaching() {
     let mut guard = make_unit(1, "MTNK", "Americans", 0, 0, 300);
     guard.attack_target = Some(AttackTarget::new(2));
     guard
@@ -300,17 +299,93 @@ fn guard_still_chases_where_sticky_would_not() {
             dispatch_timer: crate::sim::mission::MissionDispatchTimer::at_frame(0),
         });
     let rhino = make_unit(2, "HTNK", "Soviet", 10, 0, 400);
-    let (mut sim, grid) = make_sim(vec![guard, rhino]);
+    let mut sim = make_sim(vec![guard, rhino]);
     let rules = pursuit_rules();
 
-    sim.tick_attack_pursuit(&rules, Some(&grid));
+    sim.tick_attack_pursuit(&rules);
 
     let entity = sim.substrate.entities.get(1).unwrap();
-    assert!(entity.attack_target.is_some());
+    assert!(entity.attack_target.is_some(), "Guard keeps the target");
     assert!(
-        entity.movement_target.is_some(),
-        "Guard is not short-circuited"
+        entity.movement_target.is_none(),
+        "Guard produces no pursuit cell"
     );
+}
+
+/// The range stop in `FootClass::Per_Cell_Process` calls the class
+/// SetDestination(NULL, 1) (`0x004D8968`), so a vehicle that halts in range
+/// holds no NavCom, and GetFireError's U9 (`0x007411D9`) refuses a spark or
+/// flame weapon only while NavCom is set. The IFV's engineer fires
+/// `RepairBullet` (`UseSparkParticles=yes`): a halt that kept NavCom left it in
+/// range, never firing.
+#[test]
+fn a_spark_weapon_fires_once_its_pursuit_halts() {
+    use crate::sim::combat::tick_combat;
+    use crate::sim::components::{MovementTarget, NavTargetRef};
+    let rules = RuleSet::from_ini(&IniFile::from_str(
+        "[VehicleTypes]\n0=SPRK\n1=HTNK\n\
+         [InfantryTypes]\n[BuildingTypes]\n[AircraftTypes]\n\
+         [SPRK]\nStrength=300\nArmor=heavy\nSpeed=6\nPrimary=Sparks\n\
+         [HTNK]\nStrength=400\nArmor=heavy\nSpeed=5\n\
+         [Sparks]\nDamage=40\nROF=30\nRange=6\nWarhead=AP\nOmniFire=yes\n\
+         UseSparkParticles=yes\n\
+         [AP]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
+    ))
+    .expect("spark rules");
+    let scene = || {
+        let mut sparker = make_unit(1, "SPRK", "Americans", 8, 5, 300);
+        sparker.category = crate::map::entities::EntityCategory::Unit;
+        sparker.lifecycle.in_limbo = false;
+        sparker.attack_target = Some(AttackTarget::new(2));
+        sparker.movement_target = Some(MovementTarget::default());
+        sparker.navigation.nav_com = Some(NavTargetRef::Cell { rx: 10, ry: 5 });
+        sparker
+            .mission
+            .apply_test_fixture(crate::sim::mission::state::MissionTestFixture {
+                current: crate::sim::mission::MissionId::from_known(
+                    crate::sim::mission::MissionType::Attack,
+                ),
+                suspended: crate::sim::mission::MissionId::NONE,
+                queued: crate::sim::mission::MissionId::NONE,
+                movement_bypass_latch: 0,
+                handler_state: 0,
+                mission_start_frame: 0,
+                ai_counter: 0,
+                dispatch_timer: crate::sim::mission::MissionDispatchTimer::at_frame(0),
+            });
+        let mut victim = make_unit(2, "HTNK", "Soviet", 10, 5, 400);
+        victim.lifecycle.in_limbo = false;
+        make_sim(vec![sparker, victim])
+    };
+    let shoot = |sim: &mut Simulation| {
+        let mut occupancy = crate::sim::occupancy::OccupancyGrid::rebuild(&sim.substrate.entities);
+        let mut rng = crate::sim::rng::SimRng::new(7);
+        tick_combat(
+            &mut sim.substrate.entities,
+            &mut occupancy,
+            &rules,
+            &mut sim.interner,
+            1,
+            67,
+            1,
+            &mut rng,
+        );
+        sim.substrate.entities.get(2).unwrap().health.current
+    };
+
+    // Still driving: U9 holds the spark weapon.
+    let mut moving = scene();
+    assert_eq!(shoot(&mut moving), 400, "no spark shot on the move");
+
+    let mut sim = scene();
+    sim.tick_attack_pursuit(&rules);
+    let halted = sim.substrate.entities.get(1).unwrap();
+    assert!(halted.movement_target.is_none());
+    assert_eq!(
+        halted.navigation.nav_com, None,
+        "the range stop takes NavCom with the path"
+    );
+    assert!(shoot(&mut sim) < 400, "halted, it fires");
 }
 
 // ---------------------------------------------------------------------------
@@ -364,59 +439,10 @@ const WALL_TEST_GAWALL_ID: u8 = 2;
 
 fn wall_test_cell(rx: u16, ry: u16) -> crate::map::resolved_terrain::ResolvedTerrainCell {
     crate::map::resolved_terrain::ResolvedTerrainCell {
-        rx,
-        ry,
-        source_tile_index: 0,
-        source_sub_tile: 0,
-        final_tile_index: 0,
-        final_sub_tile: 0,
-        is_wood_bridge_repair_tile: false,
-        level: 0,
         filled_clear: true,
-        tileset_index: Some(0),
-        land_type: 0,
-        yr_cell_land_type: 0,
-        slope_type: 0,
-        template_height: 0,
-        render_offset_x: 0,
-        render_offset_y: 0,
         terrain_class: Default::default(),
-        speed_costs: Default::default(),
-        is_water: false,
-        is_cliff_like: false,
-        is_rough: false,
-        is_road: false,
-        height_in_pixels: 0,
-        variant: 0,
-        has_ramp: false,
-        canonical_ramp: None,
-        ground_walk_blocked: false,
-        terrain_object_blocks: false,
-        terrain_object_occupation: None,
-        overlay_blocks: false,
-        overlay_zone_type: None,
-        outside_playfield: false,
-        zone_type: 0,
-        base_ground_walk_blocked: false,
-        base_build_blocked: false,
-        base_land_type: 0,
-        base_yr_cell_land_type: 0,
-        base_terrain_class: Default::default(),
-        base_speed_costs: Default::default(),
-        build_blocked: false,
-        has_bridge_deck: false,
-        bridge_walkable: false,
-        bridge_transition: false,
-        bridge_deck_level: 0,
-        bridge_layer: None,
-        bridge_facts: crate::map::bridge_facts::BridgeCellFacts::default(),
-        tube_index: None,
-        radar_left: [0; 3],
-        radar_right: [0; 3],
         accepts_smudge: true,
-        allows_tiberium: false,
-        has_damaged_data: false,
-        bridgehead_anchor_class_at_load: None,
+        ..crate::map::resolved_terrain::test_flat_cell(rx, ry)
     }
 }
 
@@ -454,14 +480,13 @@ fn a_wall_on_the_line_keeps_pursuit_closing_instead_of_freezing() {
     let mut grizzly = make_unit(1, "MTNK", "Americans", 2, 5, 300);
     grizzly.attack_target = Some(AttackTarget::new(2));
     let rhino = make_unit(2, "HTNK", "Soviet", 6, 5, 400);
-    let (mut sim, grid) = make_sim(vec![grizzly, rhino]);
+    let mut sim = make_sim(vec![grizzly, rhino]);
     install_wall_map(&mut sim, &[(4, 5)]);
     let rules = wall_pursuit_rules();
     let registry = wall_pursuit_registry();
 
     sim.tick_attack_pursuit_with_overlay_registry(
         &rules,
-        Some(&grid),
         Some(&registry),
         &std::collections::BTreeSet::new(),
     );
@@ -485,14 +510,13 @@ fn without_the_wall_the_same_shot_halts_pursuit() {
     grizzly.attack_target = Some(AttackTarget::new(2));
     grizzly.movement_target = Some(crate::sim::components::MovementTarget::default());
     let rhino = make_unit(2, "HTNK", "Soviet", 6, 5, 400);
-    let (mut sim, grid) = make_sim(vec![grizzly, rhino]);
+    let mut sim = make_sim(vec![grizzly, rhino]);
     install_wall_map(&mut sim, &[]);
     let rules = wall_pursuit_rules();
     let registry = wall_pursuit_registry();
 
     sim.tick_attack_pursuit_with_overlay_registry(
         &rules,
-        Some(&grid),
         Some(&registry),
         &std::collections::BTreeSet::new(),
     );
@@ -530,15 +554,10 @@ fn inside_minimum_range_pursuit_holds_instead_of_closing() {
     let mut lobber = make_unit(1, "MTNK", "Americans", 2, 5, 300);
     lobber.attack_target = Some(AttackTarget::new(2));
     let rhino = make_unit(2, "HTNK", "Soviet", 6, 5, 400);
-    let (mut sim, grid) = make_sim(vec![lobber, rhino]);
+    let mut sim = make_sim(vec![lobber, rhino]);
     install_wall_map(&mut sim, &[]);
 
-    sim.tick_attack_pursuit_with_overlay_registry(
-        &rules,
-        Some(&grid),
-        None,
-        &std::collections::BTreeSet::new(),
-    );
+    sim.tick_attack_pursuit_with_overlay_registry(&rules, None, &std::collections::BTreeSet::new());
 
     let entity = sim.substrate.entities.get(1).unwrap();
     assert!(
@@ -593,41 +612,21 @@ fn walk_pursuit_scene() -> (Simulation, RuleSet, u64, u64) {
         crate::map::resolved_terrain::ResolvedTerrainGrid::from_cells(64, 64, cells),
     );
     assert!(sim.rebuild_dynamic_navigation(&rules));
-    let heights = std::collections::BTreeMap::new();
-    let actor = sim
-        .spawn_object("E1", "Local", 10, 10, 0, &rules, &heights)
-        .unwrap();
+    let actor = sim.spawn_object("E1", "Local", 10, 10, 0, &rules).unwrap();
     // Production visibility is recomputed by the frame host, not by spawn.
     // Establish the actor's sight before introducing an enemy or an order.
     walk_frame(&mut sim, &rules);
-    let victim = sim
-        .spawn_object("E1", "Enemy", 16, 10, 0, &rules, &heights)
-        .unwrap();
+    let victim = sim.spawn_object("E1", "Enemy", 16, 10, 0, &rules).unwrap();
     (sim, rules, actor, victim)
 }
 
 fn walk_frame(sim: &mut Simulation, rules: &RuleSet) {
     let grid = sim.path_grid_snapshot();
-    sim.advance_tick(
-        &[],
-        Some(rules),
-        &std::collections::BTreeMap::new(),
-        grid.as_deref(),
-        None,
-        67,
-    );
+    sim.advance_tick(&[], Some(rules), grid.as_deref(), None, 67);
 }
 
 fn walk_command(sim: &mut Simulation, rules: &RuleSet, command: crate::sim::command::Command) {
-    let grid = sim.path_grid_snapshot();
-    assert!(sim.apply_command_with_overlays(
-        "Local",
-        &command,
-        Some(rules),
-        grid.as_deref(),
-        &std::collections::BTreeMap::new(),
-        None,
-    ));
+    assert!(sim.apply_command_with_overlays("Local", &command, Some(rules), None));
 }
 
 fn wait_for_walk_head(
@@ -667,6 +666,9 @@ fn walk_destination_search_observes_route_opened_before_process() {
         closed_grid.set_blocked(12, y, true);
         assert!(!closed_grid.is_any_layer_walkable(12, y));
     }
+    // The order reads the canonical grid, so publish the closed one for the
+    // command and restore the open one for the object turn.
+    sim.path_grid = Some(std::sync::Arc::new(closed_grid));
     assert!(sim.apply_command_with_overlays(
         "Local",
         &crate::sim::command::Command::Move {
@@ -674,13 +676,11 @@ fn walk_destination_search_observes_route_opened_before_process() {
             target_rx: 14,
             target_ry: 10,
             queue: false,
-            group_id: None,
         },
         Some(&rules),
-        Some(&closed_grid),
-        &std::collections::BTreeMap::new(),
         None,
     ));
+    sim.path_grid = Some(open_grid.clone());
     let e = sim.substrate.entities.get(actor).unwrap();
     assert!(e.movement_target.as_ref().unwrap().path.is_empty());
     assert_eq!(
@@ -699,17 +699,17 @@ fn walk_destination_search_observes_route_opened_before_process() {
     // Scatter's prepublished setter must also leave an execution request,
     // even though its caller ignores the helper's return value.
     let (mut sim, _rules, actor, _) = walk_pursuit_scene();
-    assert!(crate::sim::movement::prepare_walk_cell_destination(
+    let destination_coord =
+        crate::sim::movement::target_cell_coord(14, 10, sim.resolved_terrain.as_ref());
+    assert!(crate::sim::movement::prepare_walk_destination(
         &mut sim.substrate.entities,
-        &closed_grid,
         actor,
-        (14, 10),
+        (
+            crate::sim::components::NavTargetRef::cell(14, 10),
+            destination_coord
+        ),
         crate::util::fixed_math::SimFixed::from_num(4),
-        None,
         sim.resolved_terrain.as_ref(),
-        sim.zone_grid.as_ref(),
-        sim.playfield_bounds,
-        &mut sim.substrate.cell_occupation,
         crate::sim::movement::DestinationTiming::new(0, 60),
     ));
     let e = sim.substrate.entities.get(actor).unwrap();
@@ -729,6 +729,7 @@ fn walk_cell_order_defers_queue_publication_and_first_head_motion() {
     };
     let entity = sim.substrate.entities.get_mut(actor).unwrap();
     entity.navigation.path_replay = queue.clone();
+    entity.locomotor.as_mut().unwrap().powered = false;
     entity.navigation.nav_queue = vec![NavTargetRef::Cell { rx: 25, ry: 10 }];
     let before = crate::sim::movement::ground_pose::position_world_coord(&entity.position);
     walk_command(
@@ -739,10 +740,13 @@ fn walk_cell_order_defers_queue_publication_and_first_head_motion() {
             target_rx: 14,
             target_ry: 10,
             queue: false,
-            group_id: None,
         },
     );
     let entity = sim.substrate.entities.get(actor).unwrap();
+    assert!(
+        !entity.locomotor.as_ref().unwrap().powered,
+        "ordinary Walk destination also preserves native power state"
+    );
     let mut invalidated = queue;
     invalidated.clear_live_head();
     assert_eq!(
@@ -775,7 +779,7 @@ fn walk_cell_order_defers_queue_publication_and_first_head_motion() {
     );
     assert_eq!(entity.navigation.path_replay.reference_cell, Some((10, 10)));
     assert_eq!(
-        entity.foot_speed.applied_fraction,
+        entity.foot_speed.applied_fraction(),
         crate::util::fixed_math::SIM_ONE
     );
     walk_frame(&mut sim, &rules);
@@ -827,8 +831,7 @@ fn walk_pursuit_range_entry_finishes_paid_head_then_accepts_new_move() {
         e.position.exact_z_leptons = Some(0);
     }
     sim.add_entity_occupancy(victim);
-    let grid = sim.path_grid_snapshot();
-    sim.tick_attack_pursuit(&rules, grid.as_deref());
+    sim.tick_attack_pursuit(&rules);
     let e = sim.substrate.entities.get(actor).unwrap();
     assert_eq!(e.locomotor.as_ref().unwrap().step_head(), Some(head));
     assert!(
@@ -887,7 +890,6 @@ fn walk_pursuit_range_entry_finishes_paid_head_then_accepts_new_move() {
             target_rx: from.0,
             target_ry: from.1 + 4,
             queue: false,
-            group_id: None,
         },
     );
     let next_head = wait_for_walk_head(&mut sim, &rules, actor);
@@ -911,7 +913,6 @@ fn ordered_walk_attack_nulls_destination_but_preserves_paid_head_and_queues() {
                 target_rx: 20,
                 target_ry: 10,
                 queue: false,
-                group_id: None,
             },
         );
         let head = wait_for_walk_head(&mut sim, &rules, actor);
@@ -1030,8 +1031,8 @@ fn walk_null_setter_matches_original_caller_rows() {
             e.radio_contacts.insert(victim);
         }
         e.movement_target = Some(MovementTarget::default());
-        e.navigation.path_runtime.start_movement(0, 5, false);
-        e.navigation.path_runtime.start_blocked(0, 6, false);
+        e.navigation.path_runtime.start_movement(0, 5);
+        e.navigation.path_runtime.start_blocked(0, 6);
         e.navigation.path_runtime.path_blocked = true;
         let loco = e.locomotor.as_mut().unwrap();
         loco.set_walk_destination(Some(DriveCoord {

@@ -1,7 +1,5 @@
 //! Production DecloakToFire gate acceptance for stock Boomer-shaped units.
 
-use std::collections::BTreeMap;
-
 use super::*;
 use crate::rules::ini_parser::IniFile;
 use crate::sim::cloak_disguise::CloakRuntime;
@@ -32,13 +30,16 @@ fn entities(target_type: &str) -> EntityStore {
     // (`UnitClass::GetFireError @ 0x00740FD0` step 17) compares its HULL
     // `+0x388` against the target. Face it east at the target one cell away so
     // this fixture exercises the DecloakToFire arm rather than turn-to-fire.
-    bsub.facing = 64;
+    bsub.body_facing.snap(0x4000, 0);
     bsub.attack_target = Some(AttackTarget::new(2));
     let mut cloak = CloakRuntime::new(0, 9);
     cloak.establish_unlimbo_fully_cloaked();
     bsub.cloak = Some(cloak);
     store.insert(bsub);
-    store.insert(GameEntity::test_default(2, target_type, "Americans", 11, 10));
+    // On the map: GetFireError refuses a target in limbo (T12, `0x006FC1BE`).
+    let mut target = GameEntity::test_default(2, target_type, "Americans", 11, 10);
+    target.lifecycle.in_limbo = false;
+    store.insert(target);
     store
 }
 
@@ -51,17 +52,7 @@ fn resolve_once(
 ) {
     let attacker = entities.get(1).unwrap();
     let attack = attacker.attack_target.as_ref().unwrap();
-    let snap = build_attacker_snapshot(
-        attacker,
-        attack.target,
-        attack.cooldown_ticks,
-        attack.burst_remaining,
-        attack.burst_delay_ticks,
-        attack.pending_infantry_fire,
-        None,
-        None,
-    );
-    let mut resources = BTreeMap::new();
+    let snap = build_attacker_snapshot(attacker, attack.target, None);
     let mut rng = SimRng::new(0xC10A_F1AE);
     let mut hooks: Option<&mut FixtureTrace> = None;
     resolve_attacker_fire(
@@ -70,7 +61,6 @@ fn resolve_once(
         rules,
         interner,
         None,
-        &mut resources,
         None,
         &OccupancyGrid::new(),
         None,
@@ -78,7 +68,6 @@ fn resolve_once(
         None,
         None,
         None,
-        false,
         false,
         77,
         67,
@@ -94,22 +83,36 @@ fn resolve_once(
 fn bsub_cruise_launcher_uncloaks_without_same_tick_fire_then_retry_fires() {
     let rules = boomer_rules();
     let mut entities = entities("TGTWOOD");
+    let rearm_before = entities.get(1).unwrap().rearm_timer;
     let mut interner = test_interner();
     let mut sounds = Vec::new();
     let mut blocked = CombatEmit::default();
 
-    resolve_once(&mut entities, &rules, &mut interner, &mut sounds, &mut blocked);
+    resolve_once(
+        &mut entities,
+        &rules,
+        &mut interner,
+        &mut sounds,
+        &mut blocked,
+    );
 
     assert_eq!(
         entities.get(1).unwrap().cloak.as_ref().unwrap().state,
         3,
         "0x736DF0 case 9 calls StartUncloaking"
     );
-    assert!(entities.get(1).unwrap().attack_target.is_some(), "target is retained for retry");
+    assert!(
+        entities.get(1).unwrap().attack_target.is_some(),
+        "target is retained for retry"
+    );
     assert!(blocked.fire_events.is_empty());
     assert!(blocked.damage_events.is_empty());
     assert!(blocked.projectile_spawns.is_empty());
-    assert!(blocked.burst_updates.is_empty(), "no ROF/burst write on the surfacing visit");
+    assert_eq!(
+        entities.get(1).unwrap().rearm_timer,
+        rearm_before,
+        "no ROF/burst write on the surfacing visit"
+    );
     assert!(matches!(
         sounds.as_slice(),
         [SimSoundEvent::CloakSound {
@@ -137,20 +140,43 @@ fn bsub_cruise_launcher_uncloaks_without_same_tick_fire_then_retry_fires() {
         &mut sounds,
         &mut repeated,
     );
-    assert_eq!(sounds.len(), 1, "state 3 rejects repeated StartUncloaking sound");
-    assert!(repeated.fire_events.is_empty(), "the deferred visit remains shot-free");
+    assert_eq!(
+        sounds.len(),
+        1,
+        "state 3 rejects repeated StartUncloaking sound"
+    );
+    assert!(
+        repeated.fire_events.is_empty(),
+        "the deferred visit remains shot-free"
+    );
 
     // Represent completion of StartUncloaking's ordinary state-3 progression.
     let cloak = entities.get_mut(1).unwrap().cloak.as_mut().unwrap();
     cloak.state = 0;
     cloak.visual_phase = None;
     let mut retry = CombatEmit::default();
-    resolve_once(&mut entities, &rules, &mut interner, &mut sounds, &mut retry);
+    resolve_once(
+        &mut entities,
+        &rules,
+        &mut interner,
+        &mut sounds,
+        &mut retry,
+    );
     assert_eq!(retry.fire_events.len(), 1);
-    assert_eq!(interner.resolve(retry.fire_events[0].weapon_id), "CruiseLauncher");
+    assert_eq!(
+        interner.resolve(retry.fire_events[0].weapon_id),
+        "CruiseLauncher"
+    );
     assert_eq!(retry.fire_events[0].weapon_slot, WeaponSlot::Secondary);
-    assert!(!retry.burst_updates.is_empty(), "normal retry owns rearm state");
-    assert_eq!(sounds.len(), 1, "retry fire does not replay the transition cue");
+    assert!(
+        entities.get(1).unwrap().rearm_timer.duration() > 0,
+        "normal retry owns rearm state"
+    );
+    assert_eq!(
+        sounds.len(),
+        1,
+        "retry fire does not replay the transition cue"
+    );
 }
 
 #[test]
@@ -165,7 +191,13 @@ fn bsub_boomer_torpedo_explicit_no_fires_while_fully_cloaked() {
 
     assert_eq!(entities.get(1).unwrap().cloak.as_ref().unwrap().state, 2);
     assert_eq!(out.fire_events.len(), 1);
-    assert_eq!(interner.resolve(out.fire_events[0].weapon_id), "BoomerTorpedo");
+    assert_eq!(
+        interner.resolve(out.fire_events[0].weapon_id),
+        "BoomerTorpedo"
+    );
     assert_eq!(out.fire_events[0].weapon_slot, WeaponSlot::Primary);
-    assert!(sounds.is_empty(), "DecloakToFire=no never enters StartUncloaking");
+    assert!(
+        sounds.is_empty(),
+        "DecloakToFire=no never enters StartUncloaking"
+    );
 }

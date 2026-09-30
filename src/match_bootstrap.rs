@@ -114,16 +114,13 @@ impl LoadingStartup {
         }
     }
 
+    #[cfg(test)]
     pub fn seed_or_else(&self, unverified_fallback: impl FnOnce() -> u32) -> u32 {
         match self {
             Self::Accepted(startup) => startup.seed.value,
             Self::UnverifiedLegacy { seed, .. } => seed.value,
             Self::Generic { .. } => unverified_fallback(),
         }
-    }
-
-    pub fn is_accepted(&self) -> bool {
-        matches!(self, Self::Accepted(_))
     }
 }
 
@@ -300,7 +297,6 @@ pub struct RustL0Observation<'a> {
     pub active_correlation: MatchCorrelationId,
     pub prior_receipt: Option<&'a RustL0Receipt>,
     pub screen_is_loading: bool,
-    pub spawn_pick_active: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -332,8 +328,6 @@ pub enum RustL0Error {
     NonzeroBinaryFrame,
     #[error("the acknowledgement was not observed on the Loading screen")]
     ScreenNotLoading,
-    #[error("SpawnPick cannot produce an accepted direct-start receipt")]
-    SpawnPickActive,
 }
 
 impl RustL0Observation<'_> {
@@ -358,9 +352,6 @@ impl RustL0Observation<'_> {
         }
         if !self.screen_is_loading {
             return Err(RustL0Error::ScreenNotLoading);
-        }
-        if self.spawn_pick_active {
-            return Err(RustL0Error::SpawnPickActive);
         }
 
         Ok(RustL0Receipt {
@@ -496,7 +487,6 @@ mod tests {
             active_correlation: startup.correlation,
             prior_receipt: None,
             screen_is_loading: true,
-            spawn_pick_active: false,
         }
         .acknowledge()
     }
@@ -732,8 +722,8 @@ mod tests {
     fn rust_l0_receipt_captures_each_rng_stream_exactly() {
         let startup = prepared(7);
         let mut simulation = Simulation::with_seed(7);
-        simulation.scatter_rng().next_u32();
-        simulation.weapon_spread_rng().next_u32();
+        simulation.scenario_rng.next_u32();
+        simulation.main_rng.next_u32();
         simulation.mapgen_rng.next_u32();
         let expected = simulation.rng_state();
         let receipt = RustL0Observation {
@@ -742,7 +732,6 @@ mod tests {
             active_correlation: startup.correlation,
             prior_receipt: None,
             screen_is_loading: true,
-            spawn_pick_active: false,
         }
         .acknowledge()
         .unwrap();
@@ -762,7 +751,6 @@ mod tests {
                 active_correlation: startup.correlation,
                 prior_receipt: None,
                 screen_is_loading: false,
-                spawn_pick_active: false,
             }
             .acknowledge(),
             Err(RustL0Error::ScreenNotLoading)
@@ -784,7 +772,6 @@ mod tests {
                 active_correlation: startup.correlation,
                 prior_receipt: Some(&receipt),
                 screen_is_loading: true,
-                spawn_pick_active: false,
             }
             .acknowledge(),
             Err(RustL0Error::DuplicateReceipt)
@@ -825,24 +812,6 @@ mod tests {
     }
 
     #[test]
-    fn rust_l0_rejects_spawn_pick() {
-        let startup = prepared(15);
-        let simulation = Simulation::with_seed(15);
-        assert_eq!(
-            RustL0Observation {
-                startup: &startup,
-                simulation: &simulation,
-                active_correlation: startup.correlation,
-                prior_receipt: None,
-                screen_is_loading: true,
-                spawn_pick_active: true,
-            }
-            .acknowledge(),
-            Err(RustL0Error::SpawnPickActive)
-        );
-    }
-
-    #[test]
     fn rust_l0_rejects_seed_or_active_correlation_mismatch() {
         let startup = prepared(16);
         let wrong_seed_simulation = Simulation::with_seed(17);
@@ -861,7 +830,6 @@ mod tests {
                 active_correlation: other,
                 prior_receipt: None,
                 screen_is_loading: true,
-                spawn_pick_active: false,
             }
             .acknowledge(),
             Err(RustL0Error::CorrelationMismatch)

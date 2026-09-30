@@ -1,26 +1,27 @@
-//! Pure damage-math service: armor/Verses/distance kernel + receiver pipeline +
-//! attacker build. Reproduces gamemd's ftol-truncated multi-stage damage math
-//! over caller-built value-types.
+//! Damage math over caller-built views: the shared warhead numeric receiver,
+//! the surrounding receiver stages and FireAt's damage build.
 //!
 //! ## Dependency rules
-//! - sim/ submodule: depends on rules/ (WarheadType) + util/fixed_math only.
+//! - sim/ submodule: uses shared util arithmetic and caller-resolved rule inputs.
 //! - NEVER depends on render/ui/sidebar/audio/net. No EntityStore/GameEntity
 //!   reach-in: callers extract inputs into the value-types below.
-//! - Verses is carried as f64 (the single documented float exception); every
-//!   stage boundary truncates toward zero via `f64 as i32` (gamemd ftol).
+//! - The kernel, the defence divides and the attacker's damage build use native
+//!   PC53/chop, binary32 spills and signed64 conversion's low32 through
+//!   util/native_x87. A host `f64 as i32` is not that conversion.
 //!
-//! ## Verification status (2026-06-04 adversarial Ghidra pass)
-//! The kernel/receiver/attacker contract was re-verified against gamemd.exe
-//! before transcription. The pre-plan numbers had two factor-errors that were
-//! corrected here: leptons/cell = 256.0 (read_memory 0x007e2224 = 0x43800000),
-//! and the running MaxDamage = 10000 (stock `ini/rulesmd.ini` overrides the
-//! legacy 1000). The attacker mult chain (`fire_damage`) was redesigned from the
-//! verified Fire_At stages. See each submodule for the inline citations.
+//! Original `489180` kernel comparisons live in spatial_oracle/estimated_damage;
+//! the defence divides and the damage build in spatial_oracle/damage_build;
+//! shared hardware primitive comparisons live in spatial_oracle/x87_masked_hardware.
+//! These bounded comparisons do not establish complete receiver/attacker parity.
+//! See docs/research/SHARED_WARHEAD_NUMERIC_COMPARISON.md and local citations.
 //!
 //! Ordered Apply_area_damage records use the receiver service live. Legacy
 //! direct/radiation routes still arrive as precomputed damage amounts.
 
+use crate::util::native_x87::{NativeF32Bits, NativeF64Bits};
+
 pub(crate) mod attacker;
+pub(crate) mod estimate;
 pub(crate) mod gates;
 pub(crate) mod kernel;
 pub(crate) mod receive;
@@ -30,67 +31,29 @@ pub(crate) mod receive;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ArmorClass(pub u8);
 
-/// Attacker (Fire_At) + defender (ReceiveDamage) modifiers, gathered by the
-/// caller. All default 1.0 => no-op. Carried as f64 because gamemd applies each
-/// as a double multiply/divide with an ftol truncation per stage.
-///
-/// Attacker stages are gamemd's verified Fire_At chain (not the pre-plan
-/// guess): FirePower fold -> VeteranCombat -> Occupy -> TankBunker -> OpenTopped.
-/// Each stage is gated in gamemd by a *condition flag*; the caller resolves the
-/// flag into either the rules mult (stage active) or 1.0 (stage inactive), so
-/// `fire_damage` can multiply unconditionally (ftol(d*1.0) == d).
+/// `TechnoClass::ReceiveDamage @ 0x00701900`'s defence divisors for one
+/// target, gathered by the caller (`0x00701939..0x007019E3`, see
+/// [`receive::defence_divides`]).
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct CombatMods {
-    // --- Attacker side (Fire_At), folded/truncated in this order ---
-    // These verified inputs remain staged until the authoritative fire path
-    // adopts `attacker::fire_damage`; production currently reads only defender fields.
-    /// Country FirePower mult (House+0x188).
-    #[allow(dead_code)]
-    pub attacker_country_firepower: f64,
-    /// Per-unit Firepower mult (Techno+0x160); folded with country + base damage
-    /// into ONE ftol stage.
-    #[allow(dead_code)]
-    pub attacker_unit_firepower: f64,
-    /// VeteranCombat (Rules+0x670, ~1.1, double) when the attacker has the
-    /// firepower vet/elite ability, else 1.0.
-    #[allow(dead_code)]
-    pub attacker_vet_combat: f64,
-    /// Occupy/garrison damage mult (Rules+0xf40, float) when the attacker is an
-    /// occupant firing from a garrisonable building, else 1.0.
-    #[allow(dead_code)]
-    pub attacker_occupy: f64,
-    /// Tank-bunker mult (Rules+0xf4c) when the attacker is a tank-bunker
-    /// occupant (this+0x2e4 link, non-building), else 1.0.
-    #[allow(dead_code)]
-    pub attacker_tank_bunker: f64,
-    /// Open-topped transport mult (Rules+0xf58) when the attacker fires from an
-    /// OpenTopped transport (this+0x82), else 1.0.
-    #[allow(dead_code)]
-    pub attacker_open_topped: f64,
-
-    // --- Defender side (ReceiveDamage) — DIVIDE, each ftol-truncated ---
-    /// Country armor mult (GetArmorMultForType(target)); larger => tougher.
-    pub defender_country_armor: f64,
-    /// Per-unit ArmorMultiplier (Techno+0x158); folded with country into ONE
-    /// divide stage.
-    pub defender_unit_armor: f64,
-    /// VeteranArmor (Rules+0x688, ~1.5) when the target has the armor vet/elite
-    /// ability, else 1.0.
-    pub defender_vet_armor: f64,
+pub(crate) struct DefenceDivisors {
+    /// `HouseClass::GetArmorMultForType @ 0x0050BD30`: the owner's HouseType
+    /// float for the target's category (`ArmorInfantryMult=`, `ArmorUnitsMult=`,
+    /// `ArmorAircraftMult=`, `ArmorBuildingsMult=`, or `ArmorDefensesMult=` for
+    /// a `BuildCat=Combat` building). Difficulty and country `Armor=` never
+    /// reach it: `House+0x1A0` has no damage reader.
+    pub house_type_armor: NativeF32Bits,
+    /// `Techno+0x158`, the per-object ArmorMultiplier.
+    pub unit_armor: NativeF64Bits,
+    /// `Rules+0x688` `VeteranArmor=` when the target's rank holds STRONGER.
+    pub rank_armor: Option<NativeF64Bits>,
 }
 
-impl Default for CombatMods {
+impl Default for DefenceDivisors {
     fn default() -> Self {
         Self {
-            attacker_country_firepower: 1.0,
-            attacker_unit_firepower: 1.0,
-            attacker_vet_combat: 1.0,
-            attacker_occupy: 1.0,
-            attacker_tank_bunker: 1.0,
-            attacker_open_topped: 1.0,
-            defender_country_armor: 1.0,
-            defender_unit_armor: 1.0,
-            defender_vet_armor: 1.0,
+            house_type_armor: NativeF32Bits::from_bits(1.0_f32.to_bits()),
+            unit_armor: NativeF64Bits::ONE,
+            rank_armor: None,
         }
     }
 }
@@ -138,12 +101,9 @@ pub(crate) struct ImmunityInputs {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TargetDamageView {
     pub armor: ArmorClass,
-    pub strength: i32,
     pub current_hp: i32,
     /// ObjectType `Immune=` entry gate in ObjectClass::ReceiveDamage.
     pub object_immune: bool,
-    pub is_building: bool,
-    pub can_c4: bool,
 }
 
 /// What the receiver-side gates decide before the kernel runs.
@@ -167,19 +127,20 @@ pub(crate) enum DamageState {
     Yellow,
     Red,
     Dead,
+    /// ObjectAlive was already false after the positive HP write (native5).
+    AlreadyDead,
 }
 
-/// Result of the full receiver pipeline.
+/// Prepared receiver packet, before the Object HP transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DamageOutcome {
-    /// > 0 = damage to subtract; < 0 = heal.
+    /// Object entry admitted the packet before its kernel (which may yield0).
+    pub apply_object_damage: bool,
+    /// Prepared signed kernel result; Object owns the final cap and HP write.
     pub hp_delta: i32,
-    /// Final signed value left in ObjectClass's `int *damage` packet. This is
-    /// normally the HP delta, but an ObjectType `Immune=` early return leaves
-    /// the transformed incoming value intact while applying no health change.
-    /// TechnoClass uses this exact value for House anger feedback.
+    /// Packet retained when Object entry is skipped (for example Immune).
+    /// Accepted commits replace it with their actual mutated packet for anger.
     pub post_object_damage: Option<i32>,
-    pub state: DamageState,
     /// Accepted `Psychedelic=yes` receiver value. TechnoClass stores this
     /// signed distance-zero kernel result as its berserk timer and returns
     /// before ObjectClass mutates HP.

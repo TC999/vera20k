@@ -68,9 +68,9 @@ pub fn scheme_hsv_by_entry(schemes: &[ColorSchemeEntry], entry: usize) -> Option
 
 /// Parse the `[Colors]` section into entries in declaration order.
 ///
-/// Values are `H,S,V`; a malformed/short line is skipped rather than aborting so
-/// one bad entry can't desync the rest of the list (which would shift every
-/// later scheme index).
+/// Values are `H,S,V`, read by `0x00474C70`: ReadString 0x40, then
+/// `sscanf("%d,%d,%d")` over zeroed fields, each narrowed to a byte. A short
+/// line still makes a scheme, with its unscanned channels zero.
 pub fn parse_color_schemes(ini: &IniFile) -> Vec<ColorSchemeEntry> {
     let Some(section) = ini.section("Colors") else {
         return Vec::new();
@@ -82,25 +82,15 @@ pub fn parse_color_schemes(ini: &IniFile) -> Vec<ColorSchemeEntry> {
             if !seen.insert(key.to_ascii_uppercase()) {
                 return None;
             }
-            let value = section.get(key)?;
-            let hsv = parse_hsv_triple(value)?;
+            let hsv = section
+                .read_int_fields(key, 0x40, [0; 3])
+                .map(|channel| channel as u8);
             Some(ColorSchemeEntry {
                 name: key.to_string(),
                 hsv,
             })
         })
         .collect()
-}
-
-/// Parse `H,S,V` (three 0..=255 bytes). The INI parser already strips inline
-/// comments, but cut at `;` defensively in case a raw value reaches here.
-fn parse_hsv_triple(value: &str) -> Option<[u8; 3]> {
-    let head = value.split(';').next().unwrap_or(value);
-    let mut parts = head.split(',').map(str::trim);
-    let h = parts.next()?.parse::<u8>().ok()?;
-    let s = parts.next()?.parse::<u8>().ok()?;
-    let v = parts.next()?.parse::<u8>().ok()?;
-    Some([h, s, v])
 }
 
 /// Resolve the loading-bar color scheme for a player color priority.
@@ -148,6 +138,7 @@ pub fn hsv_to_rgb(hsv: [u8; 3]) -> [u8; 3] {
 /// Resolve a player color priority to the loading-bar backing color in RGB,
 /// applying the priority table, the scheme-doubling, and HSV→RGB. Returns `None`
 /// when the `[Colors]` list is empty or the index is out of range.
+#[cfg(test)]
 pub fn backing_rgb_for_priority(schemes: &[ColorSchemeEntry], priority: i32) -> Option<[u8; 3]> {
     scheme_for_priority(schemes, priority).map(|scheme| hsv_to_rgb(scheme.hsv))
 }

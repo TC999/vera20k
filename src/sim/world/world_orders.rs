@@ -7,7 +7,7 @@
 
 use std::collections::BTreeSet;
 
-use super::{SimSoundEvent, Simulation};
+use super::{GroundMove, SimSoundEvent, Simulation};
 use crate::map::entities::EntityCategory;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::combat;
@@ -15,10 +15,7 @@ use crate::sim::components::OrderIntent;
 use crate::sim::intern::InternedId;
 use crate::sim::mission::MissionType;
 use crate::sim::movement;
-use crate::sim::movement::bump_crush;
 use crate::sim::movement::locomotor::MovementLayer;
-use crate::sim::pathfinding::PathGrid;
-use crate::util::fixed_math::SimFixed;
 use crate::util::fixed_math::ra2_speed_to_leptons_per_second;
 
 /// Result of one `apply_c4_damage_to_building` call.
@@ -41,6 +38,20 @@ pub(crate) struct C4TickOutcome {
     pub bridge_state_changed: bool,
 }
 
+/// Interior PerCell519948..519B58 result, before Engineer/hut type checks.
+/// The one-cell Undeploy target enters a separate conversion receiver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InfantryPerCellBuildingAdmission {
+    MissionNotAdmitted,
+    NoMatchingGroundBuilding,
+    UndeployBuilding,
+    GroundBuilding(u64),
+}
+
+#[cfg(test)]
+#[path = "bridge_engineer_admission_tests.rs"]
+mod bridge_engineer_admission_tests;
+
 impl Simulation {
     fn bridge_repair_notification_allowed(&self, owner: InternedId) -> bool {
         // House50B6F0: nonzero session mode compares exactly to LocalPlayer;
@@ -62,17 +73,18 @@ impl Simulation {
         cell: (u16, u16),
         building_cell: (u16, u16),
     ) {
-        let eva_allowed = self.bridge_repair_notification_allowed(owner)
-            && self.radar_events.push(
+        let radar = self.bridge_repair_notification_allowed(owner).then(|| {
+            crate::sim::radar::RadarEventRequest::new(
                 crate::sim::radar::RadarEventType::BridgeRepaired,
                 cell.0,
                 cell.1,
-            );
+            )
+        });
         self.sound_events.push(SimSoundEvent::BridgeRepaired {
             rx: building_cell.0,
             ry: building_cell.1,
             owner,
-            eva_allowed,
+            radar,
         });
     }
 
@@ -97,7 +109,13 @@ impl Simulation {
                 continue;
             }
             if let Some(entity) = self.substrate.entities.get(id) {
-                if entity.order_intent.is_some() && entity.attack_target.is_none() {
+                // A warped object's missions do not run (`ai_frozen`), nor
+                // does a Health-0 wreck's (`MissionClass::AI @ 0x005B30A7`).
+                if entity.order_intent.is_some()
+                    && entity.attack_target.is_none()
+                    && !entity.ai_frozen()
+                    && super::techno_ai::mission_handlers_run(self, id)
+                {
                     attacker_ids.push(id);
                 }
             }
@@ -112,34 +130,20 @@ impl Simulation {
             else {
                 continue;
             };
-            let Some(target_sid) = combat::acquire_best_target_for_entity(
-                &self.substrate.entities,
-                &self.substrate.occupancy,
+            let Some(target_sid) = self.greatest_threat_represented(
                 rules,
-                &self.interner,
+                overlay_registry,
                 attacker_id,
-                Some(&self.fog),
-                self.resolved_terrain.as_ref(),
-                self.playfield_bounds.is_some(),
-                // VERA-internal entry with no single native counterpart, so it
-                // keeps the passive block's mask — `1`, or `2` for a player
-                // "guard this spot" order. gamemd equivalent UNCHECKED.
                 scan_mask,
-                self.zone_grid.as_ref(),
-                combat::line_of_fire::LineOfFireInputs {
-                    overlay_grid: self.overlay_grid.as_ref(),
-                    overlay_registry,
-                    alliances: Some(&self.fog.alliances),
-                },
+                None,
+                combat::acquire_best_target_for_entity,
             ) else {
                 continue;
             };
-            let _ = combat::issue_attack_command(
-                &mut self.substrate.entities,
+            let _ = self.assign_target_represented(
                 attacker_id,
-                target_sid,
+                Some(combat::TargetKind::Entity(target_sid)),
                 Some(rules),
-                &self.interner,
             );
         }
     }
@@ -149,27 +153,19 @@ impl Simulation {
     /// coords stay on `OrderIntent` — the `mission` substrate has no goal field
     /// yet (Slice-8 follow-up); only the busy-signalling role moved off it.
     #[cfg(test)]
-    pub(crate) fn tick_order_intents_post_combat(
-        &mut self,
-        path_grid: Option<&PathGrid>,
-        rules: Option<&RuleSet>,
-    ) {
-        self.tick_order_intents_post_combat_with_overlay_registry(
-            path_grid,
-            rules,
-            None,
-            &BTreeSet::new(),
-        );
+    pub(crate) fn tick_order_intents_post_combat(&mut self, rules: Option<&RuleSet>) {
+        self.tick_order_intents_post_combat_except(rules, &BTreeSet::new());
     }
 
-    pub(crate) fn tick_order_intents_post_combat_with_overlay_registry(
+    pub(crate) fn tick_order_intents_post_combat_except(
         &mut self,
-        path_grid: Option<&PathGrid>,
         rules: Option<&RuleSet>,
-        overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
         turn_suppressed: &BTreeSet<u64>,
     ) {
-        let Some(grid) = path_grid else { return };
+        // Without a published grid no order resumes (air resumes included).
+        if self.path_grid().is_none() {
+            return;
+        }
         // Collect (stable_id, goal) for entities that need to resume movement.
         let keys: Vec<u64> = self.substrate.entities.keys_sorted();
         let mut resumes: Vec<(u64, u16, u16)> = Vec::new();
@@ -182,7 +178,11 @@ impl Simulation {
                     Some(ref i) => *i,
                     None => continue,
                 };
-                if entity.attack_target.is_some() || entity.movement_target.is_some() {
+                if entity.attack_target.is_some()
+                    || entity.movement_target.is_some()
+                    || entity.ai_frozen()
+                    || !super::techno_ai::mission_handlers_run(self, id)
+                {
                     continue;
                 }
                 match intent {
@@ -203,80 +203,36 @@ impl Simulation {
         }
 
         for (stable_id, goal_rx, goal_ry) in resumes {
-            let (base_speed, loco_multiplier, is_air) = self
+            let (speed, is_air) = self
                 .substrate
                 .entities
                 .get(stable_id)
                 .map(|e| {
-                    // `FootClass::GetCurrentSpeed @ 0x004DB1A0`: a resumed order
-                    // re-queries the getter like any other, so the FASTER stage
-                    // runs here too.
+                    // A resumed order re-queries the getter like any other.
                     let obj = rules.and_then(|r| self.object_type(e.type_ref(), r));
-                    let bs: SimFixed =
-                        crate::sim::combat::veterancy::entity_mover_speed_leptons_per_second(
-                            e,
-                            obj,
-                            obj.map_or(4, |o| o.speed),
-                            rules.map_or(1.0, |r| r.general.veteran_speed),
-                        );
-                    let lm: SimFixed = e
-                        .locomotor
-                        .as_ref()
-                        .map(|l| l.speed_multiplier)
-                        .unwrap_or(SimFixed::from_num(1));
                     let air: bool = e
                         .locomotor
                         .as_ref()
                         .is_some_and(|l| l.layer == MovementLayer::Air);
-                    (bs, lm, air)
+                    (crate::sim::movement::order_speed(e, obj, rules), air)
                 })
-                .unwrap_or((
-                    ra2_speed_to_leptons_per_second(4),
-                    SimFixed::from_num(1),
-                    false,
-                ));
-            let speed: SimFixed = (base_speed * loco_multiplier).max(SimFixed::lit("25"));
+                .unwrap_or((ra2_speed_to_leptons_per_second(4), false));
 
             if is_air {
                 let _ =
                     self.issue_air_cell_destination(stable_id, (goal_rx, goal_ry), speed, rules);
             } else {
-                let blocker_neighbor_counts =
-                    bump_crush::build_blocker_neighbor_counts_with_overlays(
-                        &self.substrate.entities,
-                        grid.width(),
-                        grid.height(),
-                        self.resolved_terrain.as_ref(),
-                        self.overlay_grid.as_ref(),
-                        overlay_registry,
-                        &self.interner,
-                        rules,
-                    );
-                let mover_is_crusher = self.substrate.entities.get(stable_id).is_some_and(|e| {
-                    crate::sim::movement::bump_crush::CrushCapability::of(e).can_crush_units()
-                });
-                let _ = movement::issue_move_command_with_layered(
-                    &mut self.substrate.entities,
-                    grid,
-                    stable_id,
-                    (goal_rx, goal_ry),
-                    speed,
-                    false,
-                    None,
-                    None,
-                    self.resolved_terrain.as_ref(),
-                    self.zone_grid.as_ref(),
-                    None,
-                    mover_is_crusher, // mover_is_crusher
-                    Some(&blocker_neighbor_counts),
-                    self.playfield_bounds,
-                    Some(&mut self.substrate.cell_occupation),
-                    crate::sim::movement::DestinationTiming::new(
-                        self.session.binary_frame,
-                        rules.map_or(self.blockage_path_delay_ticks, |r| {
-                            r.general.blockage_path_delay_ticks
-                        }),
-                    ),
+                let _ = self.issue_ground_move(
+                    GroundMove {
+                        entity_id: stable_id,
+                        target: (goal_rx, goal_ry),
+                        speed,
+                        queue: false,
+                        speed_type: None,
+                        owner_blocks: false,
+                        object_destination: None,
+                    },
+                    rules,
                 );
             }
         }
@@ -286,10 +242,9 @@ impl Simulation {
     /// has arrived adjacent to its target building. If so, transfer ownership and
     /// consume the engineer.
     ///
-    /// Engineers targeting `BridgeRepairHut=yes` buildings are skipped here —
-    /// they are consumed earlier in the tick by `tick_bridge_repair_orders`.
-    /// This skip is defense in depth in case ordering ever changes; the
-    /// original game never captures CABHUTs.
+    /// `BridgeRepairHut=yes` targets belong to the ordinary Walk/Infantry
+    /// PerCell2 receiver, which repairs and consumes the Engineer inside the
+    /// hut. This adjacent capture pass cannot capture or move toward a hut.
     /// Returns true if any capture occurred (triggers atlas rebuild for new owner color).
     pub(crate) fn tick_capture_orders(
         &mut self,
@@ -303,7 +258,11 @@ impl Simulation {
             .entities
             .values()
             .filter(|e| {
-                e.capture_target.is_some() && !e.dying && !turn_suppressed.contains(&e.stable_id())
+                e.capture_target.is_some()
+                    && !e.dying
+                    // A warped engineer never reaches PerCellProcess.
+                    && !e.ai_frozen()
+                    && !turn_suppressed.contains(&e.stable_id())
             })
             .map(|e| (e.stable_id(), e.capture_target.unwrap(), e.owner()))
             .collect();
@@ -353,10 +312,17 @@ impl Simulation {
             let dx = (eng_rx as i32 - bld_rx as i32).abs();
             let dy = (eng_ry as i32 - bld_ry as i32).abs();
 
-            if dx <= 1 && dy <= 1 {
+            // InfantryClass::PerCellProcess turns the engineer away from a
+            // building being warped (`0x00519EF2`): no capture.
+            let target_warped = self
+                .substrate
+                .entities
+                .get(building_id)
+                .is_some_and(crate::sim::game_entity::GameEntity::is_warped_out);
+            if dx <= 1 && dy <= 1 && !target_warped {
                 self.announce_engineer_capture(building_id, engineer_owner, rules);
-                // CAPTURE: the ownership chokepoint moves HouseState counts,
-                // the by-owner index, and the entity owner exactly once.
+                // CAPTURE: the ownership chokepoint moves HouseState counts
+                // and the entity owner exactly once.
                 self.change_owner_with_rules(building_id, engineer_owner, rules);
                 // Destroy engineer (consumed on capture).
                 self.uninit_with_rules(engineer_id, rules);
@@ -422,60 +388,78 @@ impl Simulation {
             .map(|obj| (obj.needs_engineer, obj.capture_eva_event.clone()))
             .unwrap_or((false, None));
         let capture_eva_event = capture_eva_event.map(|name| self.interner.intern(&name));
-        let radar_accepted = !tech_building
-            && self.radar_events.push_owned(
+        let radar = (!tech_building).then(|| {
+            crate::sim::radar::RadarEventRequest::new(
                 crate::sim::radar::RadarEventType::BuildingCaptured,
                 rx,
                 ry,
-                None,
-            );
+            )
+        });
         self.sound_events.push(SimSoundEvent::BuildingCaptured {
             old_owner,
             new_owner,
             tech_building,
-            radar_accepted,
+            radar,
             capture_eva_event,
         });
     }
 
-    /// Legacy order-intent preparation: an adjacent idle engineer still needs
-    /// an ordinary move into the hut. Actual repair belongs exclusively to
-    /// Infantry PerCell2 inside the live object turn (519B58..519D12).
-    pub(crate) fn tick_bridge_repair_orders_with_overlay_registry(
-        &mut self,
+    /// Original519948 uses Mission+184 (5B3040), then Building+80, then the
+    /// first GROUND Building47C520, then NavCom/attack identity. This is the
+    /// ordinary active-frame prefix; native A8E9A0=false loading/termination
+    /// queries are not represented by OccupancyGrid. Native cases and bounds:
+    /// tools/spatial_oracle/engineer_repair_admission.{py,json,meta.json}.
+    fn infantry_per_cell_building_admission(
+        &self,
+        infantry: &crate::sim::game_entity::GameEntity,
         rules: &RuleSet,
-        _overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
-        turn_suppressed: &BTreeSet<u64>,
-    ) -> bool {
-        for id in self.substrate.entities.keys_sorted() {
-            if turn_suppressed.contains(&id) {
-                continue;
-            }
-            let Some((target, cell)) = self.substrate.entities.get(id).and_then(|e| {
-                (!e.dying).then_some((e.capture_target?, (e.position.rx, e.position.ry)))
-            }) else {
-                continue;
-            };
-            if !self
-                .substrate
-                .entities
-                .get(target)
-                .and_then(|b| self.object_type(b.type_ref(), rules))
-                .is_some_and(|t| t.bridge_repair_hut)
-            {
-                continue;
-            }
-            let Some(footprint) = self.building_entry_target_footprint(target, rules) else {
-                continue;
-            };
-            if !footprint.contains(&cell)
-                && self.adjacent_to_target_footprint(cell, &footprint)
-                && !self.infantry_has_active_movement(id)
-            {
-                self.issue_building_enter_target_cell(id, cell, &footprint, rules);
-            }
+    ) -> InfantryPerCellBuildingAdmission {
+        use crate::sim::components::NavTargetRef;
+        if !matches!(
+            infantry.mission.effective().known(),
+            Some(MissionType::Capture | MissionType::AreaGuard | MissionType::Patrol)
+        ) {
+            return InfantryPerCellBuildingAdmission::MissionNotAdmitted;
         }
-        false
+        let nav_object = match infantry.navigation.nav_com {
+            Some(
+                NavTargetRef::Entity { id }
+                | NavTargetRef::Object { id }
+                | NavTargetRef::Building { id },
+            ) => Some(id),
+            _ => None,
+        };
+        //519987 tests Techno RTTI bit1, not cell_marked. Building+80 is
+        //457620 ->465D40;5199B8 also requires Building RTTI6 before the
+        //separate5199A6 conversion/destination continuation can proceed,
+        //which must not be treated as ordinary bridge repair. Stock CABHUT
+        //has no UndeploysInto. Existing regular capture remains separately
+        //owned by tick_capture_orders; this does not port that native branch.
+        if let Some(target) = nav_object.and_then(|id| self.substrate.entities.get(id))
+            && target.category == EntityCategory::Structure
+            && self
+                .object_type(target.type_ref(), rules)
+                .is_some_and(|object| object.is_1x1_with_undeploy())
+        {
+            return InfantryPerCellBuildingAdmission::UndeployBuilding;
+        }
+        let cell = (infantry.position.rx, infantry.position.ry);
+        let Some(building_id) =
+            self.substrate
+                .occupancy
+                .first_building_on_layer(cell.0, cell.1, MovementLayer::Ground)
+        else {
+            return InfantryPerCellBuildingAdmission::NoMatchingGroundBuilding;
+        };
+        if nav_object == Some(building_id)
+            || infantry.attack_target.as_ref().is_some_and(|attack| {
+                matches!(attack.target, crate::sim::combat::TargetKind::Entity(id) if id == building_id)
+            })
+        {
+            InfantryPerCellBuildingAdmission::GroundBuilding(building_id)
+        } else {
+            InfantryPerCellBuildingAdmission::NoMatchingGroundBuilding
+        }
     }
 
     /// Ordinary Infantry PerCell2 engineer receiver. The active object cursor
@@ -486,39 +470,28 @@ impl Simulation {
         rules: &RuleSet,
         registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
     ) -> Result<bool, super::FrameAdvanceError> {
-        use crate::rules::mission_data::MissionType;
-        use crate::sim::components::NavTargetRef;
         let Some(engineer) = self.substrate.entities.get(engineer_id) else {
             return Ok(false);
         };
-        if engineer.category != EntityCategory::Infantry
-            || !matches!(
-                engineer.mission.current().known(),
-                Some(MissionType::Capture | MissionType::AreaGuard | MissionType::Patrol)
-            )
-            || !self
-                .object_type(engineer.type_ref(), rules)
-                .is_some_and(|t| t.engineer)
+        if engineer.category != EntityCategory::Infantry {
+            return Ok(false);
+        }
+        let InfantryPerCellBuildingAdmission::GroundBuilding(building_id) =
+            self.infantry_per_cell_building_admission(engineer, rules)
+        else {
+            return Ok(false);
+        };
+        //519B3E's optional hut Tag event1 precedes this type gate. The live
+        //Tag receiver remains a separate required chain; ordinary Hills has
+        //no attached hut/Engineer Tag.519B58 tests Engineer before hut type.
+        if !self
+            .object_type(engineer.type_ref(), rules)
+            .is_some_and(|t| t.engineer)
         {
             return Ok(false);
         }
         let cell = (engineer.position.rx, engineer.position.ry);
         let owner = engineer.owner();
-        let Some(building_id) = self.substrate.occupancy.first_building_on_layer(
-            cell.0,
-            cell.1,
-            crate::sim::movement::locomotor::MovementLayer::Ground,
-        ) else {
-            return Ok(false);
-        };
-        let targets = matches!(engineer.navigation.nav_com,
-            Some(NavTargetRef::Entity{id}|NavTargetRef::Object{id}|NavTargetRef::Building{id}) if id==building_id)
-            || engineer.attack_target.as_ref().is_some_and(|attack| {
-                matches!(attack.target, crate::sim::combat::TargetKind::Entity(id) if id == building_id)
-            });
-        if !targets {
-            return Ok(false);
-        }
         let Some(building) = self.substrate.entities.get(building_id) else {
             return Ok(false);
         };
@@ -596,7 +569,8 @@ impl Simulation {
             }
             if let Some(e) = self.substrate.entities.get(sid) {
                 if let Some(plant) = e.c4_plant {
-                    if !e.dying {
+                    // A warped planter's mission does not run (`ai_frozen`).
+                    if !e.dying && !e.ai_frozen() {
                         walkup.push((sid, plant.target_building_id));
                     }
                 }
@@ -618,8 +592,8 @@ impl Simulation {
             }
 
             // gamemd claims only when the infantry's current cell resolves
-            // to the target building. Normal pathing stops at the blocked
-            // footprint boundary, then we issue the one-cell enter move below.
+            // to the target building. The walk reaches it because the building
+            // is the NavCom, which the Infantry +1AC admits (`0x0051C2D3..`).
             let attacker_cell = self
                 .substrate
                 .entities
@@ -643,34 +617,35 @@ impl Simulation {
             }
 
             if !target_footprint.contains(&attacker_cell) {
-                if self.adjacent_to_target_footprint(attacker_cell, &target_footprint)
-                    && !self.infantry_has_active_movement(attacker_id)
-                {
-                    self.issue_building_enter_target_cell(
-                        attacker_id,
-                        attacker_cell,
-                        &target_footprint,
-                        rules,
-                    );
-                }
-                continue; // walk-up or enter-cell movement still in progress
+                continue; // walk-up still in progress
             }
 
             // Claim the plant.
+            // RESIDUAL: native's planter then re-arms (`GameEntity::rearm_timer`)
+            // with `GetROF(1)` (`InfantryClass::PerCellProcess
+            // 0x0051A60B..0x0051A65F`), and so does a second planter entering an
+            // already charged building (`0x0051A546..0x0051A5A0`), which VERA's
+            // walk-up leaves hovering outside. Outside FireAt the burst index is
+            // below `Burst=`, so `combat::rof::get_rof` takes its mid-burst arm:
+            // one Scenario `RandomRanged(3, 5)` (an empty slot 1 returns 1
+            // without a draw, `0x006FCFD4`). Trigger: every C4 plant. Effect: the
+            // planter can fire up to 5 frames early, and one draw per plant is
+            // missing. Belongs to the C4 plant mechanism.
             if let Some(b) = self.substrate.entities.get_mut(target_id) {
                 b.pending_c4_detonation = Some(PendingC4Detonation {
-                    start_frame: self.session.binary_frame as i32,
-                    duration_frames: rules.c4_delay_ticks as i32,
+                    timer: crate::sim::timer::CdTimer::started(
+                        self.session.binary_frame as i32,
+                        rules.c4_delay_ticks as i32,
+                    ),
                     source_entity_id: Some(attacker_id),
                 });
             }
 
-            // Drive the plant animation (FireUp = Attack sequence).
+            // Native PerCell51A60D stops the Foot; it does not request Attack
+            // Doing4. The full C4 Stop/destination/ROF tail remains its own
+            // mechanism. Infantry presentation reads the retained Doing owner.
             if let Some(a) = self.substrate.entities.get_mut(attacker_id) {
                 a.movement_target = None;
-                if let Some(ref mut anim) = a.animation {
-                    anim.switch_to(crate::sim::animation::SequenceKind::Attack);
-                }
             }
 
             // SealPlaceBomb spatial sound. App-side dispatcher resolves to
@@ -715,7 +690,7 @@ impl Simulation {
                 .and_then(|e| e.pending_c4_detonation);
             let Some(pending) = pending else { continue };
 
-            if !pending.is_expired_at(self.session.binary_frame as i32) {
+            if !pending.timer.expired(self.session.binary_frame as i32) {
                 continue;
             }
 
@@ -803,7 +778,7 @@ impl Simulation {
         else {
             return;
         };
-        if !pending.is_expired_at(self.session.binary_frame as i32) || health <= 0 {
+        if !pending.timer.expired(self.session.binary_frame as i32) || health <= 0 {
             return;
         }
 
@@ -845,67 +820,6 @@ impl Simulation {
             target.position.ry,
             obj.foundation.as_str(),
         ))
-    }
-
-    fn adjacent_to_target_footprint(
-        &self,
-        attacker_cell: (u16, u16),
-        target_footprint: &[(u16, u16)],
-    ) -> bool {
-        target_footprint.iter().any(|&(trx, try_)| {
-            let dx = (attacker_cell.0 as i32 - trx as i32).abs();
-            let dy = (attacker_cell.1 as i32 - try_ as i32).abs();
-            dx <= 1 && dy <= 1
-        })
-    }
-
-    fn infantry_has_active_movement(&self, attacker_id: u64) -> bool {
-        self.substrate
-            .entities
-            .get(attacker_id)
-            .is_some_and(|attacker| attacker.movement_target.is_some())
-    }
-
-    fn issue_building_enter_target_cell(
-        &mut self,
-        attacker_id: u64,
-        attacker_cell: (u16, u16),
-        target_footprint: &[(u16, u16)],
-        rules: &RuleSet,
-    ) {
-        let Some(entry_cell) = target_footprint.iter().copied().min_by_key(|&(rx, ry)| {
-            let dx = (attacker_cell.0 as i32 - rx as i32).abs();
-            let dy = (attacker_cell.1 as i32 - ry as i32).abs();
-            (dx.max(dy), dx + dy, rx, ry)
-        }) else {
-            return;
-        };
-
-        let speed = self
-            .resolve_move_info(attacker_id, Some(rules))
-            .as_ref()
-            .map(|info| info.speed)
-            .unwrap_or(ra2_speed_to_leptons_per_second(4));
-        let timing = movement::DestinationTiming::new(
-            self.session.binary_frame,
-            self.blockage_path_delay_ticks,
-        );
-        if movement::issue_direct_move(
-            &mut self.substrate.entities,
-            attacker_id,
-            entry_cell,
-            speed,
-            timing,
-        ) {
-            if let Some(target) = self
-                .substrate
-                .entities
-                .get_mut(attacker_id)
-                .and_then(|attacker| attacker.movement_target.as_mut())
-            {
-                target.bypass_grid = true;
-            }
-        }
     }
 
     /// Post-detonation: any attacker that was on the destroyed building's
@@ -975,7 +889,6 @@ impl Simulation {
                         target_rx,
                         target_ry,
                         queue: false,
-                        group_id: None,
                     },
                 ));
             }
@@ -1028,7 +941,7 @@ impl Simulation {
                 }
                 None => false,
             };
-            let _ = attacker_id; // hut survives — no last_attacker_id update
+            let _ = attacker_id; // the hut survives: nothing is credited
             return C4DamageOutcome {
                 killed_building: false,
                 bridge_state_changed,
@@ -1077,7 +990,7 @@ impl Simulation {
     /// - Aircraft (own state machine in `attack_mission.rs`)
     /// - Deployed-fire infantry (locked while deployed)
     /// - Entities inside transports
-    /// - Dying entities
+    /// - Dying entities, and Health-0 wrecks, which run no mission
     /// - Objects holding a target their own scanner picked up (see below)
     /// - Objects on the **Sticky** mission, which drop the target instead
     ///
@@ -1090,20 +1003,20 @@ impl Simulation {
     /// map, unleashed, the first time an enemy scouted past: nothing carries
     /// these units home because they have no `OrderIntent` to resume.
     #[cfg(test)]
-    pub(crate) fn tick_attack_pursuit(&mut self, rules: &RuleSet, path_grid: Option<&PathGrid>) {
-        self.tick_attack_pursuit_with_overlay_registry(rules, path_grid, None, &BTreeSet::new());
+    pub(crate) fn tick_attack_pursuit(&mut self, rules: &RuleSet) {
+        self.tick_attack_pursuit_with_overlay_registry(rules, None, &BTreeSet::new());
     }
 
     pub(crate) fn tick_attack_pursuit_with_overlay_registry(
         &mut self,
         rules: &RuleSet,
-        path_grid: Option<&PathGrid>,
         overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
         turn_suppressed: &BTreeSet<u64>,
     ) {
-        let Some(grid) = path_grid else {
+        // Without a published grid pursuit decides nothing this tick.
+        if self.path_grid().is_none() {
             return;
-        };
+        }
 
         // Phase 1: collect pursuit decisions (read-only on entities).
         // Two action kinds: issue a new path, or clear an existing one.
@@ -1136,11 +1049,23 @@ impl Simulation {
                 continue;
             };
 
-            // Skip filters — see "Skips" doc above.
-            if entity.dying {
+            // Skip filters — see "Skips" doc above. The approach is Mission_
+            // Attack's, which a Health-0 wreck does not run
+            // (`MissionClass::AI @ 0x005B30A7`).
+            if entity.dying || !super::techno_ai::mission_handlers_run(self, id) {
                 continue;
             }
             if entity.passively_acquired_target {
+                continue;
+            }
+            // `FootClass::Mission_Guard @ 0x004D5070` has no approach call
+            // (vt+0x53C): an object committed to Guard fires at what it holds
+            // from where it stands, whoever assigned it. A player "guard this
+            // spot" order is VERA's Area Guard stand-in (`OrderIntent::Guard`)
+            // and still approaches.
+            if entity.mission.current().known() == Some(crate::sim::mission::MissionType::Guard)
+                && entity.order_intent.is_none()
+            {
                 continue;
             }
             if entity.category == EntityCategory::Structure {
@@ -1152,6 +1077,9 @@ impl Simulation {
             if entity.is_deployed() {
                 continue;
             }
+            // A passenger never walks: an open-topped transport's rider has
+            // its chase off (`+0x82`, `0x004D5782`) and a destination refused
+            // (`0x004D94D7`); its reach is `open_transport_reach_step`.
             if entity.passenger_role.is_inside_transport() {
                 continue;
             }
@@ -1173,18 +1101,16 @@ impl Simulation {
             // Resolve target coords using the same helper combat tick uses.
             // None means entity-target despawned; combat tick's target-dead
             // branch handles cleanup.
-            let target_pos = combat::resolve_target_coords(
-                &attack.target,
-                &self.substrate.entities,
-                Some(rules),
-                &self.interner,
-            );
+            let target_pos =
+                combat::resolve_target_coords(&attack.target, &self.substrate.entities);
             let Some((trx, try_, _tsx, _tsy)) = target_pos else {
                 continue;
             };
 
-            // Resolve the weapon using the shared helper. None means no weapon
-            // can engage; combat tick will drop on its own weapon-select fail.
+            // Resolve the weapon using the shared helper. None means the
+            // selected slot names no weapon. Legality is not asked here, as
+            // Approach_Target asks none: the fire routine's GetFireError and
+            // the 16-frame check decide what happens to the target.
             let Some(weapon) = combat::pursuit_selected_weapon(
                 entity,
                 &attack.target,
@@ -1233,6 +1159,24 @@ impl Simulation {
                 },
             );
 
+            // `FootClass::Per_Cell_Process @ 0x004D885C`: an `OpenTopped=`
+            // mover chasing a Foot target, on a mission the range stop admits,
+            // stops only on entering a cell, by distance
+            // (`foot_per_cell_range_stop`), never by InRange. A loaded Battle
+            // Fortress drives on to its GIs' M60 range. On any other mission
+            // (VERA's Guard and AttackMove orders among them) the stop never
+            // fires, and the halt below stands in as for every other mover.
+            let open_topped_chase = matches!(
+                attack.target,
+                combat::TargetKind::Entity(target_id)
+                    if self.substrate.entities.get(target_id).is_some_and(|target| {
+                        target.category != EntityCategory::Structure
+                    })
+            ) && movement::range_stop_admits(entity)
+                && self
+                    .object_type(entity.type_ref(), rules)
+                    .is_some_and(|obj| obj.open_topped);
+
             if verdict == combat::PursuitRangeVerdict::CloseIn {
                 // **Sticky never chases.** The one place the engine tells
                 // Sticky apart from Guard at all — they share a mission handler
@@ -1248,14 +1192,16 @@ impl Simulation {
                 if entity.mission.current().known() == Some(MissionType::Sticky) {
                     actions.push(PursuitAction::DropTargetAndMovement { entity_id: id });
                 } else if entity.movement_target.is_none() {
-                    // Out of range, no current pursuit — issue a path.
+                    // Out of range, no current pursuit — issue a path. A
+                    // mover on Teleport warps to this cell (the target's
+                    // own): see `teleport_move_to`'s residual.
                     actions.push(PursuitAction::IssueMove {
                         entity_id: id,
                         goal: (trx, try_),
                     });
                 }
                 // else: existing pursuit movement is still running; let it continue.
-            } else if entity.movement_target.is_some() {
+            } else if entity.movement_target.is_some() && !open_topped_chase {
                 // `CanFire` — halt for firing. `HoldInsideMinimumRange` halts
                 // here too: closing further cannot help, and this is the arm it
                 // took before the walk landed.
@@ -1270,70 +1216,48 @@ impl Simulation {
                     let Some(info) = self.resolve_move_info(entity_id, Some(rules)) else {
                         continue;
                     };
-                    let owner_str = self
-                        .substrate
-                        .entities
-                        .get(entity_id)
-                        .map(|e| self.interner.resolve(e.owner()).to_string())
-                        .unwrap_or_default();
-                    let (entity_blocks, entity_block_map) = bump_crush::build_entity_block_set(
-                        &self.substrate.entities,
-                        &owner_str,
-                        &self.house_alliances,
-                        &self.interner,
+                    let _issued = self.issue_ground_move(
+                        GroundMove {
+                            entity_id,
+                            target: goal,
+                            speed: info.speed,
+                            queue: false,
+                            speed_type: Some(info.speed_type),
+                            owner_blocks: true,
+                            object_destination: None,
+                        },
                         Some(rules),
-                    );
-                    let cost_grid = self.terrain_costs.get(&info.speed_type);
-                    let blocker_neighbor_counts =
-                        bump_crush::build_blocker_neighbor_counts_with_overlays(
-                            &self.substrate.entities,
-                            grid.width(),
-                            grid.height(),
-                            self.resolved_terrain.as_ref(),
-                            self.overlay_grid.as_ref(),
-                            overlay_registry,
-                            &self.interner,
-                            Some(rules),
-                        );
-                    let _issued = movement::issue_move_command_with_layered(
-                        &mut self.substrate.entities,
-                        grid,
-                        entity_id,
-                        goal,
-                        info.speed,
-                        false, // queue
-                        cost_grid,
-                        Some(&entity_blocks),
-                        self.resolved_terrain.as_ref(),
-                        self.zone_grid.as_ref(),
-                        Some(&entity_block_map),
-                        info.mover_is_crusher,
-                        Some(&blocker_neighbor_counts),
-                        self.playfield_bounds,
-                        Some(&mut self.substrate.cell_occupation),
-                        crate::sim::movement::DestinationTiming::new(
-                            self.session.binary_frame,
-                            rules.general.blockage_path_delay_ticks,
-                        ),
                     );
                     // No-op if A* fails — pursuit retries next tick.
                 }
                 PursuitAction::ClearMovement { entity_id } => {
-                    if let Some(e) = self.substrate.entities.get_mut(entity_id) {
-                        // A prior null destination (for example Stop) still
-                        // leaves a paid Walk head active until its completion.
-                        if !e.locomotor.as_ref().is_some_and(|loco| {
-                            loco.kind == crate::rules::locomotor_type::LocomotorKind::Walk
-                                && loco.step_head().is_some()
-                        }) {
-                            e.movement_target = None;
-                        }
+                    let Some(e) = self.substrate.entities.get_mut(entity_id) else {
+                        continue;
+                    };
+                    // A prior null destination (for example Stop) still
+                    // leaves a paid Walk head active until its completion.
+                    if !e.locomotor.as_ref().is_some_and(|loco| {
+                        loco.kind == crate::rules::locomotor_type::LocomotorKind::Walk
+                            && loco.step_head().is_some()
+                    }) {
+                        e.movement_target = None;
+                    }
+                    // The range stop in `FootClass::Per_Cell_Process`
+                    // (`0x004D8920..0x004D8968`): under Rescue, Area Guard,
+                    // Attack or Hunt with an empty NavQueue it calls the class
+                    // SetDestination(NULL, 1), so a vehicle that stops to fire
+                    // holds no NavCom. GetFireError's NavCom tests (U7..U10)
+                    // would otherwise keep refusing a spark, flame, drain or
+                    // temporal weapon. Infantry and open-topped units take
+                    // the per-cell owner's stop (`movement/per_cell.rs`).
+                    if e.category == EntityCategory::Unit && movement::range_stop_admits(e) {
+                        self.set_unit_null_destination(entity_id, Some(rules));
                     }
                 }
                 PursuitAction::DropTargetAndMovement { entity_id } => {
+                    // Foot4D5730 dispatches virtual+3C8 on Sticky refusal.
+                    let _ = self.assign_target_represented(entity_id, None, Some(rules));
                     if let Some(e) = self.substrate.entities.get_mut(entity_id) {
-                        e.attack_target = None;
-                        e.passively_acquired_target = false;
                         e.movement_target = None;
                         e.navigation.nav_com = None;
                     }
@@ -1388,30 +1312,28 @@ mod repair_notification_tests {
         let mut restored = restore();
         assert_eq!(restored.session.current_house, Some(owner));
         restored.announce_bridge_repair(owner, (7, 8), (8, 8));
-        assert_eq!(
-            restored.radar_events.len(),
-            1,
+        assert!(
+            matches!(
+                restored.sound_events.last(),
+                Some(SimSoundEvent::BridgeRepaired {
+                    radar: Some(crate::sim::radar::RadarEventRequest {
+                        event_type: crate::sim::radar::RadarEventType::BridgeRepaired,
+                        rx: 7,
+                        ry: 8,
+                    }),
+                    ..
+                })
+            ),
             "headless restore needs no app viewer bind"
         );
-        assert!(matches!(
-            restored.sound_events.last(),
-            Some(SimSoundEvent::BridgeRepaired {
-                eva_allowed: true,
-                ..
-            })
-        ));
 
         let mut other_current = restore();
         other_current.session.current_house = Some(other);
         other_current.announce_bridge_repair(owner, (7, 8), (8, 8));
-        assert_eq!(other_current.radar_events.len(), 0);
         assert!(
             matches!(
                 other_current.sound_events.last(),
-                Some(SimSoundEvent::BridgeRepaired {
-                    eva_allowed: false,
-                    ..
-                })
+                Some(SimSoundEvent::BridgeRepaired { radar: None, .. })
             ),
             "the spatial repair sound remains even when the native radar/EVA gate refuses"
         );
@@ -1432,15 +1354,17 @@ mod repair_notification_tests {
         }
         sim.houses.get_mut(&player).unwrap().player_control = true;
         sim.announce_bridge_repair(ai, (7, 8), (8, 8));
-        assert_eq!(sim.radar_events.len(), 0);
+        assert!(
+            matches!(
+                sim.sound_events.last(),
+                Some(SimSoundEvent::BridgeRepaired { radar: None, .. })
+            ),
+            "an AI repair never reaches CreateRadarEvent, so it cannot dedupe the human's"
+        );
         sim.announce_bridge_repair(player, (7, 8), (8, 8));
-        assert_eq!(sim.radar_events.len(), 1);
         assert!(matches!(
             sim.sound_events.last(),
-            Some(SimSoundEvent::BridgeRepaired {
-                eva_allowed: true,
-                ..
-            })
+            Some(SimSoundEvent::BridgeRepaired { radar: Some(_), .. })
         ));
     }
 }

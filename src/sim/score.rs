@@ -4,10 +4,14 @@
 //! sorting. The simulation owns the raw house statistics and the Scenario RNG
 //! draws used by the existing Rust victory-bonus projection.
 //!
-//! The exact native victory-bonus formula and score-dialog traversal remain
-//! UNCHECKED. This module preserves the prior Rust formula/admission rules, uses
-//! the sim's canonical house registration order, and prevents presentation from
-//! directly advancing the gameplay Scenario stream.
+//! The score follows `ScoreDialog__FillEntries` (`0x005C98A0`) as read from its
+//! instructions (not executed): only a positive `house+0x54E8` enters the entry
+//! (`0x005C99EB`), and a surviving house then gets `v + v/2 + Random(v/2, v)`,
+//! one Scenario RNG draw at `0x005C9A21` unless `v` is 0 (`0x0065C7E0` draws
+//! nothing when min equals max). The native traversal (`Houses[]` order,
+//! skipping `MultiplayPassive` types and the observer house) remains
+//! UNCHECKED against the sim's canonical house registration order used here.
+//! Presentation never advances the gameplay Scenario stream directly.
 
 use crate::sim::intern::InternedId;
 use crate::sim::world::Simulation;
@@ -86,14 +90,18 @@ impl Simulation {
                 continue;
             };
             let raw_score = stats.score(harvested_credits);
-            let score = if survived && raw_score > 0 {
-                let half = raw_score / 2;
+            // 0x005C99EB..0x005C99F5 adds only a positive score to the zeroed
+            // entry; a survivor then gets v + v/2 + Random(v/2, v), which
+            // draws nothing when v is 0 (0x0065C7E0 with min == max).
+            let base = raw_score.max(0);
+            let score = if survived && base > 0 {
+                let half = base / 2;
                 let bonus = self
                     .scenario_rng
-                    .next_range_u32_inclusive(half.max(0) as u32, raw_score.max(0) as u32);
-                raw_score.saturating_add(half).saturating_add(bonus as i32)
+                    .next_range_u32_inclusive(half as u32, base as u32);
+                base.saturating_add(half).saturating_add(bonus as i32)
             } else {
-                raw_score
+                base
             };
             rows.push(TerminalScoreRowSnapshot {
                 owner,
@@ -270,6 +278,41 @@ mod tests {
     }
 
     #[test]
+    fn a_negative_score_shows_zero_and_draws_nothing() {
+        // 0x005C99EB..0x005C99F5 adds only a positive score to the entry, so
+        // a survivor's bonus range is Random(0, 0), which draws nothing.
+        let mut sim = Simulation::with_seed(0x51C0_0FF5);
+        let mut owners = Vec::new();
+        for (name, defeated) in [("Survivor", false), ("Loser", true)] {
+            owners.push(insert_house(
+                &mut sim,
+                HouseFixture {
+                    name,
+                    defeated,
+                    passive: false,
+                    harvested: 0,
+                    kill_score: -40,
+                    units_killed: 0,
+                    buildings_killed: 0,
+                    units_lost: 0,
+                    buildings_lost: 0,
+                    built: 0,
+                },
+            ));
+        }
+        sim.session.house_order = owners;
+        let cursor = sim.clone_scenario_rng().state();
+
+        assert!(sim.finalize_terminal_score_snapshot());
+        let snapshot = sim.terminal_score_snapshot().expect("snapshot");
+        for row in &snapshot.rows {
+            assert_eq!(row.raw_score, -40);
+            assert_eq!(row.score, 0);
+        }
+        assert_eq!(sim.clone_scenario_rng().state(), cursor);
+    }
+
+    #[test]
     fn terminal_score_snapshot_is_latched_without_repeating_rng_draws() {
         let mut sim = Simulation::with_seed(0x51C0_5678);
         let owner = insert_house(
@@ -332,14 +375,7 @@ mod tests {
     fn natural_terminal_frame_finalizes_score_before_returned_hash_once() {
         let mut sim = natural_terminal_sim(0x51C0_9ABC);
 
-        let first = sim.advance_tick(
-            &[],
-            None,
-            &std::collections::BTreeMap::new(),
-            None,
-            None,
-            67,
-        );
+        let first = sim.advance_tick(&[], None, None, None, 67);
 
         assert!(!first.frame_committed);
         assert!(first.terminal_score_finalized);
@@ -350,14 +386,7 @@ mod tests {
             .clone();
         let cursor_after_first = sim.clone_scenario_rng().state();
 
-        let second = sim.advance_tick(
-            &[],
-            None,
-            &std::collections::BTreeMap::new(),
-            None,
-            None,
-            67,
-        );
+        let second = sim.advance_tick(&[], None, None, None, 67);
         assert!(!second.frame_committed);
         assert!(!second.terminal_score_finalized);
         assert_eq!(second.state_hash, first.state_hash);
@@ -371,12 +400,10 @@ mod tests {
 
     #[test]
     fn quit_and_connection_alone_do_not_score_but_ready_outcome_wins_exit_race() {
-        let height_map = std::collections::BTreeMap::new();
-
         let mut quit_only = Simulation::with_seed(0x51C0_B001);
         quit_only.quit_requested = true;
         let quit_cursor = quit_only.clone_scenario_rng().state();
-        let quit_tick = quit_only.advance_tick(&[], None, &height_map, None, None, 67);
+        let quit_tick = quit_only.advance_tick(&[], None, None, None, 67);
         assert!(!quit_tick.frame_committed);
         assert!(!quit_tick.terminal_score_finalized);
         assert!(quit_only.terminal_score_snapshot().is_none());
@@ -385,7 +412,7 @@ mod tests {
         let mut connection_only = Simulation::with_seed(0x51C0_B002);
         connection_only.connection_lost = true;
         let connection_cursor = connection_only.clone_scenario_rng().state();
-        let connection_tick = connection_only.advance_tick(&[], None, &height_map, None, None, 67);
+        let connection_tick = connection_only.advance_tick(&[], None, None, None, 67);
         assert!(!connection_tick.frame_committed);
         assert!(!connection_tick.terminal_score_finalized);
         assert!(connection_only.terminal_score_snapshot().is_none());
@@ -401,7 +428,7 @@ mod tests {
             1,
             crate::sim::command::Command::ExitMatch,
         );
-        let raced_tick = raced.advance_tick(&[exit], None, &height_map, None, None, 67);
+        let raced_tick = raced.advance_tick(&[exit], None, None, None, 67);
         assert!(!raced_tick.frame_committed);
         assert_eq!(raced_tick.executed_commands, 1);
         assert!(raced_tick.terminal_score_finalized);
@@ -411,14 +438,7 @@ mod tests {
     #[test]
     fn terminal_score_snapshot_roundtrips_in_current_version() {
         let mut sim = natural_terminal_sim(0x51C0_DEF0);
-        let tick = sim.advance_tick(
-            &[],
-            None,
-            &std::collections::BTreeMap::new(),
-            None,
-            None,
-            67,
-        );
+        let tick = sim.advance_tick(&[], None, None, None, 67);
         assert!(tick.terminal_score_finalized);
         let expected = sim
             .terminal_score_snapshot()
@@ -438,16 +458,10 @@ mod tests {
 
         let seed = 0x51C0_AA55;
         let mut recorded = natural_terminal_sim(seed);
-        let tick = recorded.advance_tick(
-            &[],
-            None,
-            &std::collections::BTreeMap::new(),
-            None,
-            None,
-            67,
-        );
+        let tick = recorded.advance_tick(&[], None, None, None, 67);
         assert!(tick.terminal_score_finalized);
         let mut replay = ReplayLog::new(ReplayHeader {
+            pixel_conversion_bounds: Default::default(),
             version: 1,
             tick_hz: 15,
             seed,
@@ -457,14 +471,7 @@ mod tests {
         replay.record_tick(tick.tick, Vec::new(), tick.state_hash);
 
         let mut playback = natural_terminal_sim(seed);
-        let hashes = ReplayRunner::run_fixture(
-            &mut playback,
-            &replay,
-            None,
-            &std::collections::BTreeMap::new(),
-            None,
-            67,
-        );
+        let hashes = ReplayRunner::run_fixture(&mut playback, &replay, None, None, 67);
 
         assert_eq!(hashes, vec![tick.state_hash]);
         assert_eq!(

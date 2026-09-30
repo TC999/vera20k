@@ -8,14 +8,11 @@
 //! - Position stores isometric cell coords only. Where an entity is *drawn* is
 //!   `render::locomotor_visual`'s business, derived on read — sim/ writes no
 //!   screen coordinates.
-//! - Some types here (Facing, VoxelModel, etc.) are legacy wrappers
-//!   kept for any remaining call sites. The canonical data lives in GameEntity fields.
 //!
 //! ## Dependency rules
-//! - Part of sim/ — depends on map/ (EntityCategory type).
+//! - Part of sim/.
 //! - sim/ NEVER depends on render/, ui/, sidebar/, audio/, net/.
 
-use crate::map::entities::EntityCategory;
 use crate::sim::intern::InternedId;
 use crate::sim::movement::locomotor::MovementLayer;
 use crate::util::fixed_math::{SIM_ZERO, SimFixed};
@@ -50,150 +47,112 @@ pub struct Position {
     pub sub_y: SimFixed,
 }
 
-/// Facing direction (0â€“255, RA2 convention).
+/// Signed actual ObjectClass health (+0x6C in gamemd.exe).
 ///
-/// 0 = north, 64 = east, 128 = south, 192 = west.
-/// Used for sprite/voxel rotation and movement direction.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-pub struct Facing(pub u8);
-
-/// Independent turret facing direction (0–255, RA2 convention).
-///
-/// Only present on entities with `Turret=yes` in rules.ini (e.g., tanks, War Miner).
-/// The turret rotates independently from the body: it tracks attack targets,
-/// and returns to body facing when idle.
-/// 0 = north, 64 = east, 128 = south, 192 = west.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-pub struct TurretFacing(pub u8);
-
-/// Hit points â€” current and maximum health.
-///
-/// When current reaches 0, the entity is destroyed.
-/// Max health comes from rules.ini Strength= value.
+/// Live ObjectType::strength owns the cap/ratio denominator. EstimatedHealth
+/// is independent state; writes to this field do not implicitly update it.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Health {
-    /// Current HP (0 = destroyed).
-    pub current: u16,
-    /// Maximum HP from rules.ini. Used for health bar display.
-    pub max: u16,
+    pub current: i32,
 }
 
-/// Vision radius in grid cells used for fog/shroud reveal.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-pub struct Vision {
-    /// Reveal/visibility radius in cells.
-    pub range_cells: u16,
+impl Health {
+    /// ObjectClass::GetHealthRatio (gamemd.exe 0x005F5C60..0x005F5C7F).
+    /// Signed loads and PC53/chop division; zero Strength keeps the native
+    /// masked infinity/NaN result for the caller's actual comparison/conversion.
+    pub fn ratio(self, strength: i32) -> crate::util::native_x87::MaskedX87Value {
+        use crate::util::native_x87::MaskedX87Chop53 as X87;
+        X87::div(X87::load_i32(self.current), X87::load_i32(strength))
+    }
+
+    /// Compare the native ratio without converting masked values to a host float.
+    pub fn compare_ratio(
+        self,
+        strength: i32,
+        threshold: f64,
+    ) -> crate::util::native_x87::MaskedX87Ordering {
+        use crate::util::native_x87::{MaskedX87Chop53 as X87, NativeF64Bits};
+        X87::compare(
+            self.ratio(strength),
+            X87::load_f64(NativeF64Bits::from_bits(threshold.to_bits())),
+        )
+    }
 }
 
-/// Marker component: this entity is rendered as a VXL voxel model.
-///
-/// Vehicles and aircraft use voxel models. The render loop loads the
-/// corresponding VXL+HVA files and renders them via the software rasterizer.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-pub struct VoxelModel;
+/// The type control used by construction and pack-up (BState 0).
+/// `BuildingClass::Begin_Mode(0)` (`0x00447780`) restarts the entity's sole
+/// native stage from this control; `sim::building_construction` owns the
+/// control's completion and wrap decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct BuildupStage {
+    /// The type's construction control (`Type+0xF04`): first frame, frame
+    /// count, rate (`RuleSet::buildup_control`).
+    pub control: [i32; 3],
+}
 
-/// Marker component: this entity is rendered as a SHP 2D sprite.
-///
-/// Infantry and buildings use SHP sprites. Not yet wired to rendering â€”
-/// will be implemented when SHP sprite batching is added.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-pub struct SpriteModel;
+/// Where a building's Construction mission (`0x12`) stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum ConstructionMission {
+    /// Queued behind no current mission (a human player's placement, a
+    /// deploy): the ready byte commences it (`0x0043FE27` once BState is not
+    /// 0, or `0x0043FF91`).
+    Queued,
+    /// Current with its mission timer due: the next dispatch is its first
+    /// visit (`Mission_Construction` status 0).
+    Due,
+    /// Visited (status 1): each visit completes on the ready byte.
+    Watching,
+}
 
-/// Which category this entity belongs to (unit, infantry, structure, aircraft).
-///
-/// Wraps the map::entities::EntityCategory enum so it can be used as an ECS component.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-pub struct Category(pub EntityCategory);
-
-/// Infantry sub-cell position (0–4).
-///
-/// RA2 uses sub-cell spots 2, 3, 4 — up to 3 infantry per cell, each at a
-/// different sub-position. Only meaningful for infantry entities.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-pub struct SubCell(pub u8);
-
-/// Veterancy level: 0 = rookie, 100 = veteran, 200 = elite.
-///
-/// Affects unit stats (damage, armor, speed bonuses) and visual indicators.
-///
-/// This is the RANK PROJECTION of `GameEntity::veterancy_raw`, which is the
-/// authoritative running accumulator. gamemd-derived:
-/// `TechnoClass::Record_The_Kill @ 0x00702D40` awards the victim's cost —
-/// zeroed between allies, doubled for a veteran victim, tripled for an elite
-/// one — and `VeterancyClass::Add @ 0x0074FF50` divides it by the killer's own
-/// cost times `[General] VeteranRatio=`, clamping at `VeteranCap=`. The rank
-/// tests are `>= 1.0` for veteran and `>= 2.0` for elite. A Grizzly promotes on
-/// its third rookie Rhino and goes elite on its fifth.
-///
-/// The rank effects live in `sim::combat::veterancy`: the full 18-token
-/// ability arrays, `HasWeaponAbility`, the ROF/FIREPOWER/FASTER/SIGHT
-/// multipliers, self-heal, the promotion announcement and the elite flash
-/// timer, and the `Record_The_Kill` recipient chain.
-///
-/// RESIDUAL (GSI-08.12) — the elite flash is not DRAWN. `elite_flash_frames`
-/// counts down as native's `+0xF0` does, but VERA draws no rank chevrons or
-/// flash at all (`DrawVeterancyPips @ 0x0070A990` has no presentation
-/// counterpart). Trigger: every promotion. Player effect: a promoted unit
-/// shows no chevron and a new elite does not blink. Frequency: continuous.
-/// Downstream risk: none — presentation only.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-pub struct Veterancy(pub u16);
-
-/// Marker component: this building is being repaired (spending credits to heal).
-///
-/// Added by the ToggleRepair command. Removed when health is full or credits run out.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-pub struct Repairing;
-
-/// Building construction animation state — plays the "make" SHP sequence.
-///
-/// When a building is first placed (from sidebar production or MCV deploy),
-/// it starts with this component. Each sim tick advances `elapsed_ticks`.
-/// When `elapsed_ticks >= total_ticks`, the component is removed and the
-/// building switches to its normal idle appearance.
-///
-/// The render side maps progress (elapsed/total) to make SHP frame indices.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+/// A building building up after its placement or deploy
+/// (`sim::building_construction`): its construction animation, its BState,
+/// its Construction mission, and `+0x6DD`, the byte set when the animation
+/// lands on its last frame. The render reads the actor's native stage from
+/// the Buildup SHP while BState is 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct BuildingUp {
-    /// Sim ticks elapsed since placement.
-    pub elapsed_ticks: u16,
-    /// Total sim ticks for the build-up animation.
-    pub total_ticks: u16,
+    /// The construction animation (BState 0); each `Begin_Mode(0)` restarts
+    /// it from the control.
+    pub anim: BuildupStage,
+    /// BState (`+0x534`) is 1, the idle control (`{0, 1, 0}`, the
+    /// BuildingType constructor's for every retail type), instead of 0.
+    pub idle: bool,
+    /// `Begin_Mode(1)` is queued (`+0x538`), applied at the end of the next
+    /// Update (`0x0043FFB4`): a human player's placement, whose factory
+    /// sends the building OVER_OUT (`0x004FB4A6` -> `0x0043CD01`).
+    pub idle_queued: bool,
+    pub mission: ConstructionMission,
+    /// `+0x6DD`, the animation-complete (ready-to-commence) byte.
+    pub done: bool,
+    /// The first frame with an Update: the frame after a human player's
+    /// placement, the placement frame of a computer house's, a deployed
+    /// building's creation frame.
+    pub first_frame: i32,
 }
 
-/// Reverse build-up animation: building is undeploying back into a mobile unit.
-///
-/// Plays the make SHP animation in reverse (last frame → first frame).
-/// When `elapsed_ticks >= total_ticks`, the building is despawned and the
-/// mobile unit is spawned (e.g., ConYard → MCV).
-///
-/// The render side maps progress (elapsed/total) to make SHP frame indices
-/// counting backwards from the last frame.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// A building on the Selling mission (`BuildingClass::Sell @ 0x00449C30`,
+/// `sim::building_construction`; its visits `production::production_sell`):
+/// stage 0 and 1 visits, then the construction animation played again (drawn
+/// in reverse) until `+0x6DD`, when the building converts into its
+/// `UndeploysInto=` unit (`Simulation::finish_undeploy`) or is sold for its
+/// refund.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct BuildingDown {
-    /// Sim ticks elapsed since undeploy was initiated.
-    pub elapsed_ticks: u16,
-    /// Total sim ticks for the undeploy animation.
-    pub total_ticks: u16,
-    /// Unit type to spawn when animation completes (e.g., "AMCV").
-    pub spawn_type: InternedId,
-    /// Owner of the unit to spawn.
-    pub spawn_owner: InternedId,
-    /// Map position where the mobile unit will appear.
-    pub spawn_rx: u16,
-    pub spawn_ry: u16,
-    /// Height level for the spawned unit.
-    pub spawn_z: u8,
-    /// Whether the entity was selected (transfer selection to spawned unit).
-    pub was_selected: bool,
+    /// The construction animation from stage 1's `Begin_Mode(0)`; before
+    /// that the building shows its idle frames. Sell's stage (`+0xBC`) is
+    /// the Selling mission's handler state (`MissionCom::handler_state`).
+    pub anim: BuildupStage,
+    /// The frame the Selling mission commenced; its visits start the frame
+    /// after.
+    pub commenced_frame: i32,
+    /// `+0x6DD`, the animation-complete byte.
+    pub done: bool,
+    /// Started by the player's undeploy order, VERA's stand-in for the retail
+    /// undeploy click (`BuildingClass::Active_Click_With 0x004436F0`), which
+    /// sets an ArchiveTarget before its SELL event: Sell and UpdateAnimation
+    /// read such a sale as archive-bearing (`+0x218`).
+    pub undeploy_order: bool,
 }
-
-/// Marker component: this entity is currently selected by the player.
-///
-/// Added/removed dynamically via `world.insert_one()` / `world.remove_one()`.
-/// The render loop queries for `Selected` to draw selection indicators.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-pub struct Selected;
 
 /// Movement path target â€” entity is moving along a computed A* path.
 ///
@@ -212,9 +171,11 @@ pub struct MovementTarget {
     /// Maximum movement speed in leptons per second (from rules.ini Speed= value).
     /// 256 leptons = 1 cell. Fixed-point for deterministic multiplayer.
     pub speed: SimFixed,
-    /// Actual speed this tick — ramps from 0 toward `speed` via acceleration,
-    /// and brakes down near the destination. If no ramping data is set (accel=0),
-    /// the movement system falls back to using `speed` directly.
+    /// The legacy pass lane's speed this frame (`movement_tick`): Hover's
+    /// throttled speed, else a ramp toward `speed` that brakes near the
+    /// destination, or `speed` itself without ramp data. It is not
+    /// GetCurrentSpeed, which the track and Walk steps and the readiness gate
+    /// query live (`movement::owner_current_speed`).
     pub current_speed: SimFixed,
     /// Fraction of max speed gained per tick during acceleration (AccelerationFactor=).
     pub accel_factor: SimFixed,
@@ -231,14 +192,24 @@ pub struct MovementTarget {
     /// Lepton distance from current cell center to next cell center.
     /// 256 for cardinal moves, ~362 for diagonal. Used to normalize advancement.
     pub move_dir_len: SimFixed,
+    /// Cell where this mover was last refused by a wall it could shoot.
+    ///
+    /// VERA-only scaffolding, and a recorded DRIFT. Native evaluates the cell
+    /// twice inside ONE `DriveLocomotionClass::Process_Movement` call: the 4/5
+    /// arm at `0x004B3ADB` drops `Path[0]`, stamps an already-expired timer and
+    /// tail-recurses at `0x004B4552` with `arg2 = 0`, which repaths and
+    /// re-evaluates immediately; the Override at `0x004B3BE9` fires only on that
+    /// second refusal. VERA issues its repath through `handle_blocked_tick` and
+    /// takes the second refusal on a later tick, so it needs to remember which
+    /// cell was refused. Cleared on any non-wall refusal, and naturally reset
+    /// when a new order replaces this target.
+    #[serde(default)]
+    pub wall_refusal_cell: Option<(u16, u16)>,
     /// Ultimate destination — preserved across 24-step segment replanning.
     /// When a path segment is exhausted before reaching this goal, the movement
     /// system auto-replans from the current position. `None` for short paths
     /// or test-only movement targets that don't need segmented replanning.
     pub final_goal: Option<(u16, u16)>,
-    /// Group ID for formation speed sync. When set, the movement system caps
-    /// this unit's speed to the slowest member of the group (deep_113 line 451).
-    pub group_id: Option<u32>,
     /// When true, the movement tick skips terrain cost passability checks
     /// for cell entry. Used by `issue_direct_move` to let harvesters walk
     /// onto ore cells that are terrain-blocked for their SpeedType.
@@ -250,6 +221,14 @@ pub struct MovementTarget {
     /// occupancy checks — other movers still collide.
     #[serde(default)]
     pub bypass_grid: bool,
+    /// A Rust route adapter owns this route (`issue_direct_move`, component
+    /// fixtures): its cells were never published to Foot+5E0 and it names no
+    /// locomotor destination, so a Drive/Ship Unit keeps the pass lane while it
+    /// is pending. Native routes (the setter's empty scheduling adapter and
+    /// Find_Path's install) leave it false, so emptying their Foot+5E0 head
+    /// never reroutes the Unit through the adapter lane.
+    #[serde(default)]
+    pub adapter_route: bool,
 }
 
 /// Native-like navigation target reference.
@@ -285,6 +264,9 @@ impl NavTargetRef {
 /// `MovementTarget`, which is only the active execution path.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct NavigationState {
+    /// Foot+55C is retained lifecycle history, not current occupancy.
+    #[serde(default)]
+    pub neighbor_state: crate::sim::cell_neighbors::FootNeighborState,
     /// Foot timers, retry count and blockage latch survive path retirement.
     #[serde(default)]
     pub path_runtime: FootPathRuntime,
@@ -322,6 +304,13 @@ pub struct FootPathRuntime {
     pub path_blocked: bool,
     /// Foot+64C, a dword decremented only while nonzero.
     pub retries_left: u32,
+    /// Foot+68A: the pending path-failure sound byte. Ordinary construction
+    /// clears it (0x004D33B4); raw Load (0x004103CD) and the no-init Foot
+    /// constructor (0x004D3540) preserve the exact byte, including 255.
+    /// No ordinary gameplay writer that arms it has been established.
+    /// Evidence: `tools/spatial_oracle/foot_scold_latch.{py,json,md}`.
+    #[serde(default)]
+    scold_latch: u8,
 }
 
 impl Default for FootPathRuntime {
@@ -337,42 +326,35 @@ impl FootPathRuntime {
             blocked_timer: crate::sim::timer::CdTimer::started(frame as i32, 0),
             path_blocked: false,
             retries_left: 10,
+            scold_latch: 0,
         }
     }
 
-    /// Preserve established non-Walk countdown semantics while its native
-    /// timer producers are separate work: one decrement per Process call.
-    /// Walk uses frame anchors and must never double-age when Scatter calls
-    /// Process again within the same frame.
-    pub(crate) fn advance_compatibility_process(&mut self) {
-        use crate::sim::timer::{CdTimer, PAUSED_START_FRAME};
-        self.movement_timer = CdTimer::from_raw(
-            PAUSED_START_FRAME,
-            self.movement_timer.duration().saturating_sub(1).max(0),
-        );
-        self.blocked_timer = CdTimer::from_raw(
-            PAUSED_START_FRAME,
-            self.blocked_timer.duration().saturating_sub(1).max(0),
-        );
+    /// Native Foot checksum 0x004DBCFE reads the byte without normalizing it.
+    pub(crate) const fn scold_latch_raw(&self) -> u8 {
+        self.scold_latch
     }
 
-    pub(crate) fn start_movement(&mut self, frame: u32, duration: u16, walk: bool) {
-        self.movement_timer = Self::timer(frame, duration, walk);
+    /// Walk 0x0075B085..0x0075B0B0 tests nonzero, then clears unconditionally.
+    /// Callers decide whether that branch requests a sound before clearing.
+    pub(crate) fn clear_scold_latch(&mut self) -> bool {
+        std::mem::replace(&mut self.scold_latch, 0) != 0
     }
 
-    pub(crate) fn start_blocked(&mut self, frame: u32, duration: u16, walk: bool) {
-        self.blocked_timer = Self::timer(frame, duration, walk);
+    /// Supply native retained inputs without inventing a gameplay arming edge.
+    #[cfg(test)]
+    pub(crate) fn set_scold_latch_for_test(&mut self, raw: u8) {
+        self.scold_latch = raw;
     }
 
-    fn timer(frame: u32, duration: u16, walk: bool) -> crate::sim::timer::CdTimer {
-        crate::sim::timer::CdTimer::from_raw(
-            if walk {
-                frame as i32
-            } else {
-                crate::sim::timer::PAUSED_START_FRAME
-            },
-            i32::from(duration),
-        )
+    /// Original Foot timers retain the binary frame; repeated Process calls
+    /// must not consume time (Drive4B3607, Ship6A2C56, Walk75B979).
+    pub(crate) fn start_movement(&mut self, frame: u32, duration: i32) {
+        self.movement_timer = crate::sim::timer::CdTimer::started(frame as i32, duration);
+    }
+
+    pub(crate) fn start_blocked(&mut self, frame: u32, duration: i32) {
+        self.blocked_timer = crate::sim::timer::CdTimer::started(frame as i32, duration);
     }
 }
 
@@ -440,17 +422,151 @@ impl FootPathQueue {
 /// Foot-owned applied speed, shared by every installed locomotor instance.
 ///
 /// SetSpeedFraction4D3710 writes Foot+578/+57C; GetCurrentSpeed4DB1A0 reads
-/// that fraction. Drive4AF540/Ship69EC50 constructors and DriveEND4AF930 do
+/// that fraction live (`movement::owner_current_speed`); nothing caches its
+/// result. Drive4AF540/Ship69EC50 constructors and DriveEND4AF930 do
 /// not own or reset it. Keep this outside both class payloads so a synchronous
 /// callback can replace a locomotor without replacing the owner's speed.
 /// Original executable witnesses: tools/spatial_oracle/foot_speed_owner.json.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FootSpeedState {
-    pub applied_fraction: SimFixed,
-    /// Existing Rust adapter cache of GetCurrentSpeed, not a native field.
-    /// Its producers use the movement request's adjusted type speed. The full
-    /// Process host must query live owner/type modifiers at native call sites.
-    pub cached_current_speed: i32,
+    /// Foot `+0x578`. The Foot constructor zeroes it (`0x004D327F`/`0x004D328B`,
+    /// ported by `Default`); after that only `FootClass::SetSpeedFraction @
+    /// 0x004D3710` writes it: [`Self::set_speed_fraction`] for a fixed-point
+    /// request and [`Self::set_speed_fraction_native_bits`] for a native double.
+    applied_fraction: SimFixed,
+    /// Foot+580, initialized to exactly 1.0 at4D3292/4D329B. Retain the
+    /// native bits: pickup refuses even the immediate neighbors of 1.0.
+    /// Every speed query reads it (GetCurrentSpeed multiplies it in).
+    /// RESIDUAL: its only native writer is the Speed crate
+    /// (`accept_speed_crate`), and crate pickup (Cell481A00 selection, removal,
+    /// effect dispatch) has no production caller yet, so it stays exactly 1.0.
+    /// Trigger: a Foot entering a crate cell. Effect: no crate is consumed and
+    /// no crate effect applies. Frequency: crate maps/options. Risk: saved and
+    /// hashed (v181) state that cannot differ from the constructor value until
+    /// the pickup receiver lands.
+    crate_multiplier: crate::util::native_x87::NativeF64Bits,
+}
+
+impl Default for FootSpeedState {
+    fn default() -> Self {
+        Self {
+            applied_fraction: crate::util::fixed_math::SIM_ZERO,
+            crate_multiplier: crate::util::native_x87::NativeF64Bits::ONE,
+        }
+    }
+}
+
+impl FootSpeedState {
+    pub(crate) fn crate_multiplier(&self) -> crate::util::native_x87::NativeF64Bits {
+        self.crate_multiplier
+    }
+
+    /// Foot `+0x578`, the applied speed fraction.
+    pub(crate) fn applied_fraction(&self) -> SimFixed {
+        self.applied_fraction
+    }
+
+    /// `FootClass::SetSpeedFraction @ 0x004D3710` for a fixed-point request:
+    /// at least 1 stores 1, at most 0 stores 0, and anything between is
+    /// stored as given ([`Self::stored_speed_fraction`]).
+    pub(crate) fn set_speed_fraction(&mut self, fraction: SimFixed) {
+        self.applied_fraction = fraction.clamp(
+            crate::util::fixed_math::SIM_ZERO,
+            crate::util::fixed_math::SIM_ONE,
+        );
+    }
+
+    /// The double `FootClass::SetSpeedFraction @ 0x004D3710` stores at Foot
+    /// `+0x578` for a requested one: at least 1.0, +infinity included, stores
+    /// 1.0 (`0x004D3714..0x004D3735`); at most 0, negative zero included, or
+    /// NaN stores +0 (`0x004D373C..0x004D375D`); anything between is stored
+    /// as given. Original executable witnesses, signed zeros, NaNs,
+    /// infinities and denormals included:
+    /// `tools/spatial_oracle/foot_speed_owner.json`.
+    pub(crate) fn stored_speed_fraction(
+        requested: crate::util::native_x87::NativeF64Bits,
+    ) -> crate::util::native_x87::NativeF64Bits {
+        use crate::util::native_x87::NativeF64Bits;
+        const INFINITY_BITS: u64 = 0x7ff0_0000_0000_0000;
+        let bits = requested.bits();
+        if bits >> 63 != 0 || bits == 0 || bits > INFINITY_BITS {
+            // A negative value, a zero of either sign, or NaN.
+            NativeF64Bits::POSITIVE_ZERO
+        } else if bits >= NativeF64Bits::ONE.bits() {
+            NativeF64Bits::ONE
+        } else {
+            requested
+        }
+    }
+
+    /// `FootClass::SetSpeedFraction @ 0x004D3710` for a locomotor that computes
+    /// its fraction as a native double (the Jumpjet's `Process`): the double
+    /// [`Self::stored_speed_fraction`] keeps.
+    ///
+    /// The stored double becomes `SimFixed` by truncation, from its bits, so
+    /// the fraction's readers compare against the truncated thresholds
+    /// ([`Self::above_tenth`], [`Self::above_eight_tenths`]). A double within
+    /// 2^-16 above a threshold would read as not above it. The Jumpjet's speed
+    /// is always a whole number k (it steps by the constructor's 2.0 up and
+    /// 3.0 down: stock spells `JumpJetAccel=`, which the case-sensitive reader
+    /// never sees, and clamps to its integer cap C and 0), so k/C above 0.1 is
+    /// at least 0.1 + 1/(10C), outside that window for any C up to 6553, and
+    /// above 0.8 for any C up to 13107; k/C exactly 0.1 or 0.8 divides with
+    /// truncation to just below it, as native reads it.
+    pub(crate) fn set_speed_fraction_native_bits(&mut self, bits: u64) {
+        use crate::util::native_x87::NativeF64Bits;
+        let stored = Self::stored_speed_fraction(NativeF64Bits::from_bits(bits)).bits();
+        self.applied_fraction = if stored == NativeF64Bits::ONE.bits() {
+            crate::util::fixed_math::SIM_ONE
+        } else {
+            // 0 <= value < 1: floor(value * 2^16) from the significand.
+            let exponent = ((stored >> 52) & 0x7ff) as i32;
+            let mantissa = stored & ((1 << 52) - 1);
+            let significand = if exponent == 0 {
+                mantissa
+            } else {
+                mantissa | (1 << 52)
+            };
+            let shift = 1075 - i64::from(exponent.max(1)) - 16;
+            SimFixed::from_bits(if shift >= 64 {
+                0
+            } else {
+                (significand >> shift) as i32
+            })
+        };
+    }
+
+    /// Foot `+0x578` above 0.1 (`0x007E3860`): the Infantry fire error's
+    /// moving gate (`0x0051C9B8`) and the sequencer's default arm
+    /// (`0x00520D45`). 0.1 lies between `SimFixed` raw 6553 and 6554; the
+    /// truncated threshold keeps a fraction that truncated to 6553 below it.
+    /// Original boundary witnesses: `tools/spatial_oracle/infantry_fire_speed.json`.
+    pub(crate) fn above_tenth(&self) -> bool {
+        self.applied_fraction > SimFixed::ONE / SimFixed::from_num(10)
+    }
+
+    /// Foot `+0x578` above 0.8 (`0x007EB5C8`): the Jumpjet infantryman's Fly
+    /// over Hover (`0x0052123C`). floor(0.8 * 2^16) = 52428.
+    pub(crate) fn above_eight_tenths(&self) -> bool {
+        self.applied_fraction > SimFixed::from_bits(52_428)
+    }
+
+    /// Cell48303A..483072: an already-modified Foot never stacks this effect.
+    /// Class/radius eligibility belongs to the pickup effect caller.
+    pub(crate) fn accept_speed_crate(
+        &mut self,
+        multiplier: crate::util::native_x87::NativeF64Bits,
+    ) -> bool {
+        use crate::util::native_x87::{MaskedX87Chop53 as X, NativeF64Bits};
+        if self.crate_multiplier != NativeF64Bits::ONE {
+            return false;
+        }
+        self.crate_multiplier = X::store_f64_masked_chop(X::mul(
+            X::load_f64(self.crate_multiplier),
+            X::load_f64(multiplier),
+        ));
+        true
+    }
 }
 
 /// ShipLocomotion-owned destination, committed head, and target speed state.
@@ -466,31 +582,19 @@ pub struct ShipLocomotionRuntime {
     pub head_to: Option<DriveCoord>,
     #[serde(default)]
     pub track: TrackProgress,
-    /// Accepted fresh head awaits its Process-owned Apply1 receiver. Persist
-    /// this obligation across save/rollback; cursor zero cannot infer it.
+    /// Ship+63, independent of head XYZ; admission6A05FC reads this byte.
     #[serde(default)]
-    pub pending_track_occupation: bool,
+    pub track_valid: bool,
+    /// Native class+62: last eligible Process observation of body rotation.
+    /// Do_Turn and track-point facing updates do not write this latch.
+    #[serde(default)]
+    pub turn_latched: bool,
     #[serde(default)]
     pub target_speed_fraction: SimFixed,
     #[serde(default)]
     pub occupation_head_to: Option<DriveOccupationFootprint>,
     #[serde(default)]
     pub occupation_handoff: Option<DriveOccupationFootprint>,
-}
-
-/// Drive-owned 16-bit facing target and first-movement gate.
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
-)]
-pub struct DriveTurnState {
-    #[serde(default)]
-    pub target_direction: Option<u8>,
-    #[serde(default)]
-    pub target_facing_16: Option<u16>,
-    #[serde(default)]
-    pub rate_timer: u16,
-    #[serde(default)]
-    pub first_movement_allowed: bool,
 }
 
 /// One active Drive/Ship locomotor's retained track selector, signed cursor,
@@ -533,7 +637,7 @@ pub struct DriveOccupationFootprint {
 
 /// DriveLocomotion-owned destination/head-to state.
 ///
-/// This is distinct from `DriveTrackState`: gamemd can clear destination,
+/// Native can clear destination,
 /// head-to, and active track state at different points in the lifecycle.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct DriveLocomotionRuntime {
@@ -542,13 +646,7 @@ pub struct DriveLocomotionRuntime {
     #[serde(default)]
     pub head_to: Option<DriveCoord>,
     #[serde(default)]
-    pub turn: DriveTurnState,
-    #[serde(default)]
     pub track: TrackProgress,
-    /// Accepted fresh head awaits its Process-owned Apply1 receiver. Persist
-    /// this obligation across save/rollback; cursor zero cannot infer it.
-    #[serde(default)]
-    pub pending_track_occupation: bool,
     /// Drive+65, seeded true at constructor4AF5BB. Native4B4BE0/4B4BF0
     /// disable/enable END while Foot Find_Path removes a Team membership.
     /// No production Rust writer models that synchronous pair yet.
@@ -556,6 +654,10 @@ pub struct DriveLocomotionRuntime {
     pub end_permitted: bool,
     #[serde(default)]
     pub track_valid: bool,
+    /// Native class+62: last eligible Process observation of body rotation.
+    /// Do_Turn and track-point facing updates do not write this latch.
+    #[serde(default)]
+    pub turn_latched: bool,
     #[serde(default)]
     pub target_speed_fraction: SimFixed,
     /// Head-to vehicle-occupation mark, independent from CellClass object-list
@@ -582,11 +684,10 @@ impl Default for DriveLocomotionRuntime {
         Self {
             destination: None,
             head_to: None,
-            turn: DriveTurnState::default(),
             track: TrackProgress::default(),
-            pending_track_occupation: false,
             end_permitted: true,
             track_valid: false,
+            turn_latched: false,
             target_speed_fraction: SIM_ZERO,
             occupation_head_to: None,
             occupation_handoff: None,
@@ -611,9 +712,10 @@ impl Default for MovementTarget {
             move_dir_y: SIM_ZERO,
             move_dir_len: SIM_ZERO,
             final_goal: None,
-            group_id: None,
             ignore_terrain_cost: false,
             bypass_grid: false,
+            wall_refusal_cell: None,
+            adapter_route: false,
         }
     }
 }
@@ -634,12 +736,6 @@ impl MovementTarget {
     }
 }
 
-/// Marker component: this entity currently occupies a bridge deck cell.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-pub struct BridgeOccupancy {
-    pub deck_level: u8,
-}
-
 /// Persistent high-level order state that survives transient combat/movement components.
 ///
 /// This keeps intent like attack-move or guard alive while systems temporarily
@@ -648,7 +744,7 @@ pub struct BridgeOccupancy {
 /// Slice 6: the "is this unit busy?" signalling role moved to the `mission`
 /// substrate (`mission::verb::get_current_mission`/`is_busy`). What remains here
 /// is the data `MissionType` cannot encode — the AttackMove goal / Guard anchor
-/// coords and the transport `Unloading` flag. Retiring this enum entirely waits
+/// coords. Retiring this enum entirely waits
 /// on a goal field landing on the mission/nav substrate (a later slice).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OrderIntent {
@@ -656,8 +752,6 @@ pub enum OrderIntent {
     AttackMove { goal_rx: u16, goal_ry: u16 },
     /// Hold position and auto-acquire nearby enemies.
     Guard { anchor_rx: u16, anchor_ry: u16 },
-    /// Transport is actively unloading passengers one per tick.
-    Unloading,
 }
 
 /// Which part of a multi-part voxel model an entity/atlas entry represents.
@@ -727,183 +821,13 @@ pub struct HarvestOverlay {
     pub frame: u16,
     /// Whether the overlay is currently visible and animating.
     pub visible: bool,
-    /// Reached native frames accumulated since last image advance.
-    pub elapsed_frames: u16,
-}
-
-/// Visual damage state derived from health ratio.
-///
-/// Pure helper — not an ECS component. Computed on the fly from `Health`
-/// by the render system to decide whether to show smoke/fire overlays.
-/// - Green: > 50% HP (healthy)
-/// - Yellow: 25–50% HP (damaged, shows smoke)
-/// - Red: < 25% HP (heavily damaged, shows fire)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum DamageState {
-    Green,
-    Yellow,
-    Red,
-}
-
-impl DamageState {
-    /// Compute the damage state from current and max health.
-    /// Uses pure integer math for deterministic results across platforms.
-    /// Green: ratio > 50%, Yellow: ratio > 25%, Red: ratio <= 25%.
-    pub fn from_health(current: u16, max: u16) -> Self {
-        if max == 0 {
-            return Self::Green;
-        }
-        // current/max > 0.5  ↔  current * 2 > max (no overflow: u16 * 2 fits u32)
-        let c = current as u32;
-        let m = max as u32;
-        if c * 2 > m {
-            Self::Green
-        } else if c * 4 > m {
-            Self::Yellow
-        } else {
-            Self::Red
-        }
-    }
-}
-
-/// Tracks the last entity that dealt damage to this entity.
-///
-/// Used for retaliation: when an idle unit takes damage, it automatically
-/// attacks the source. Still subject to Verses gates (0%/1% block retaliation).
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-pub struct LastAttacker {
-    /// Stable entity ID of the attacker that dealt the most recent damage.
-    pub attacker: u64,
-}
-
-/// Per-overlay one-shot animation state for a building (e.g., ConYard crane).
-///
-/// Each active one-shot anim overlay gets its own entry tracking frame progress.
-/// Driven by art.ini LoopStart/LoopEnd/LoopCount/Rate properties from the
-/// anim's own section (e.g., [GACNST_B]).
-///
-/// Timing is in logic frames, not wall-clock milliseconds: gamemd counts the
-/// animation's frame delay in logic frames, and a logic frame's duration is
-/// itself a function of the match game speed.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct AnimOverlayState {
-    /// Animation type interned ID (uppercase), e.g., "GACNST_B".
-    pub anim_type: InternedId,
-    /// Current frame index in the animation.
-    pub frame: u16,
-    /// First frame of the loop range (from art.ini LoopStart=).
-    pub loop_start: u16,
-    /// Last frame of the loop range, exclusive (from art.ini LoopEnd=).
-    pub loop_end: u16,
-    /// Logic frames per animation frame — gamemd's `900 / Rate=` frame delay,
-    /// rescaled through the match game speed when the section is
-    /// `Normalized=yes`. Zero blocks advance, as it does natively.
-    pub rate_logic_frames: u32,
-    /// Logic frames accumulated since the last frame advance.
-    pub elapsed_logic_frames: u32,
-    /// true = animation completed its one-shot playback.
-    pub finished: bool,
-}
-
-/// Active one-shot building animation overlays (field on GameEntity).
-///
-/// Populated when a one-shot anim is triggered (e.g., placing a building triggers
-/// the ConYard crane). Cleared when the entity is despawned via EntityStore.remove().
-/// Infinite-loop anims (LoopCount=-1) are NOT stored here — they use a global timer.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct BuildingAnimOverlays {
-    pub anims: Vec<AnimOverlayState>,
-}
-
-/// App-side runtime state for a normal AnimClass-like SHP animation.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct AnimRuntime {
-    /// Current art section / SHP type, uppercase (e.g. "UCFLASH").
-    pub type_name: String,
-    /// Native current frame field before the type Start offset is applied.
-    pub current_frame: i32,
-    /// Signed frame step. Reverse and PingPong mutate this.
-    pub frame_step: i32,
-    /// Constructor delay / loop random delay in native logic visits.
-    pub delay_logic_frames: u16,
-    /// Chosen frame-delay reload in native logic visits. Zero blocks advance.
-    pub reload_logic_frames: u16,
-    /// Accumulated non-guard visits since the previous frame advance.
-    pub rate_elapsed_logic_frames: u16,
-    /// Remaining loop byte. `0xFF` is the native infinite sentinel.
-    pub loop_remaining: u8,
-    /// Constructor-set first AI guard; first visit clears this and returns.
-    pub first_ai_guard: bool,
-    /// Native expired/destroyed marker for app retention.
-    pub expired: bool,
-    /// Instance reverse bit from the constructor argument.
-    pub constructor_reverse: bool,
-    /// Accumulated fixed-sim elapsed time for AI visits.
-    pub elapsed_logic_ms: u32,
-}
-
-/// A one-shot muzzle flash animation at a garrison building's fire port.
-///
-/// Spawned when a garrisoned building fires (one per shot). Positioned at the
-/// building's screen origin + MuzzleFlash pixel offset from art.ini. Auto-removed
-/// by the embedded AnimClass-like runtime.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct GarrisonMuzzleFlash {
-    /// Stable ID of the building entity (to look up screen position each frame).
-    pub building_id: u64,
-    /// App-side AnimClass-like lifecycle state.
-    pub runtime: AnimRuntime,
-    /// Pixel X offset from building screen origin (from art.ini MuzzleFlashN).
-    pub pixel_x: i32,
-    /// Pixel Y offset from building screen origin (from art.ini MuzzleFlashN).
-    pub pixel_y: i32,
-    /// Fixed screen-space fire origin from the firing tick.
-    pub screen_x: f32,
-    pub screen_y: f32,
-    /// Cell/elevation used for lighting and depth.
-    pub rx: u16,
-    pub ry: u16,
-    pub z: u8,
-    /// Native AnimClass `ZAdjust` sort adjustment. Occupied building shots
-    /// write -200 after constructing the `OccupantAnim` AnimClass.
-    pub z_adjust: i32,
-}
-
-/// A one-shot weapon muzzle flash animation at a fixed fire-tick origin.
-///
-/// Spawned by app-layer fire-effect processing for non-garrison weapon
-/// `Anim=` entries. This is presentation state, parallel to
-/// `GarrisonMuzzleFlash`, and is not authoritative gameplay state.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct WeaponMuzzleFlash {
-    /// Stable ID of the firing entity at spawn time.
-    pub attacker_id: u64,
-    /// SHP type id (e.g., "MGUN-N").
-    pub shp_name: String,
-    /// Fixed screen-space fire origin from the firing tick.
-    pub screen_x: f32,
-    pub screen_y: f32,
-    /// Cell/elevation used for lighting and depth.
-    pub rx: u16,
-    pub ry: u16,
-    pub z: u8,
-    /// Current animation frame.
-    pub frame: u16,
-    /// Total frames in the SHP (one-shot: removed when frame >= total_frames).
-    pub total_frames: u16,
-    /// Milliseconds per frame (~67ms = 15fps, standard for RA2 muzzle flashes).
-    pub rate_ms: u32,
-    /// Accumulated ms since last frame advance.
-    pub elapsed_ms: u32,
 }
 
 /// Constructor row for a generic AnimClass-like runtime spawn.
 ///
 /// This preserves the fields passed to `AnimClass::Constructor` separately from
 /// presentation conveniences such as cached frame count and wall-clock frame
-/// delay. Not every legacy `WorldEffect` producer has been migrated to native
-/// rows yet; migrated paths attach this descriptor so parity-sensitive code can
-/// inspect the original constructor surface.
+/// delay, so parity-sensitive code can inspect the original constructor surface.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct AnimClassSpawnDescriptor {
     /// AnimType/SHP type interned ID.
@@ -962,155 +886,6 @@ impl AnimClassSpawnDescriptor {
             draw_runtime: crate::sim::anim_class::AnimDrawRuntime::default(),
         }
     }
-}
-
-/// A temporary one-shot SHP animation playing at a fixed world position.
-///
-/// Used for visual effects not attached to any entity: chrono warp sparkles,
-/// explosions, weapon impacts, ion storm bolts, etc. The render loop draws
-/// these as flat ground-level sprites. They auto-remove when finished.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct WorldEffect {
-    /// Native constructor row, when this effect came from a verified
-    /// AnimClass-like spawn path.
-    pub anim_spawn: Option<AnimClassSpawnDescriptor>,
-    /// SHP type interned ID (uppercase), e.g., "WARPOUT", "WARPIN", "FBALL1".
-    pub shp_name: InternedId,
-    /// World cell containing the effect's game-space anchor.
-    pub rx: u16,
-    pub ry: u16,
-    /// Sub-cell X anchor in leptons. `128` is the cell center.
-    pub sub_x: SimFixed,
-    /// Sub-cell Y anchor in leptons. `128` is the cell center.
-    pub sub_y: SimFixed,
-    /// Height level for depth sorting.
-    pub z: u8,
-    /// Current frame index.
-    pub frame: u16,
-    /// Total frame count in the SHP.
-    pub total_frames: u16,
-    /// Native gameplay frames between image-frame advances.
-    pub frame_delay: u16,
-    /// Reached gameplay frames accumulated toward the next image frame.
-    pub elapsed_frames: u16,
-    /// Whether the effect renders with alpha/translucency (art.ini Translucent=yes).
-    pub translucent: bool,
-    /// Optional start delay in native gameplay frames.
-    /// Used for staggering multiple explosions on bridge destruction.
-    pub delay_frames: u16,
-    /// Optional sound ID to play when the effect starts after its delay.
-    pub start_sound_id: Option<InternedId>,
-    /// One-shot guard for `start_sound_id`.
-    pub start_sound_emitted: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WorldEffectTick {
-    pub finished: bool,
-    pub started_sound: Option<InternedId>,
-}
-
-impl WorldEffect {
-    pub fn from_anim_spawn(
-        anim_spawn: AnimClassSpawnDescriptor,
-        total_frames: u16,
-        frame_delay: u16,
-        translucent: bool,
-        start_sound_id: Option<InternedId>,
-    ) -> Self {
-        Self {
-            shp_name: anim_spawn.type_name,
-            rx: anim_spawn.rx,
-            ry: anim_spawn.ry,
-            sub_x: anim_spawn.sub_x,
-            sub_y: anim_spawn.sub_y,
-            z: anim_spawn.z,
-            frame: 0,
-            total_frames,
-            frame_delay,
-            elapsed_frames: 0,
-            translucent,
-            delay_frames: anim_spawn.delay,
-            start_sound_id,
-            start_sound_emitted: false,
-            anim_spawn: Some(anim_spawn),
-        }
-    }
-
-    /// Advance the animation by one native gameplay frame.
-    pub fn tick(&mut self) -> bool {
-        self.tick_with_start_sound().finished
-    }
-
-    /// Advance the animation and report a delayed-start sound edge.
-    pub fn tick_with_start_sound(&mut self) -> WorldEffectTick {
-        let mut started_sound = None;
-        if self.delay_frames > 0 {
-            self.delay_frames -= 1;
-            if self.delay_frames == 0 && !self.start_sound_emitted {
-                started_sound = self.start_sound_id;
-                self.start_sound_emitted = true;
-            }
-            return WorldEffectTick {
-                finished: false,
-                started_sound,
-            };
-        }
-        if !self.start_sound_emitted {
-            started_sound = self.start_sound_id;
-            self.start_sound_emitted = true;
-        }
-        if self.total_frames == 0 {
-            return WorldEffectTick {
-                finished: true,
-                started_sound,
-            };
-        }
-        if self.frame_delay == 0 {
-            return WorldEffectTick {
-                finished: false,
-                started_sound,
-            };
-        }
-        self.elapsed_frames = self.elapsed_frames.saturating_add(1);
-        while self.elapsed_frames >= self.frame_delay && self.frame < self.total_frames {
-            self.elapsed_frames -= self.frame_delay;
-            self.frame += 1;
-        }
-        WorldEffectTick {
-            finished: self.frame >= self.total_frames,
-            started_sound,
-        }
-    }
-}
-
-/// A parachute SHP rendering above a paradropped infantry during descent.
-///
-/// Spawned by `tick_parachute_anims` when an entity gains
-/// `parachute_state.is_some()`. Removed when the entity lands
-/// (`parachute_state.is_none()`) or dies. The chute follows the entity's
-/// world position via `target_id` lookup; no separate altitude state.
-///
-/// Frame advancement: frames `0..end_frame` play once on the first cycle
-/// (deploy phase implicit in `0..loop_start`); on `frame >= end_frame`,
-/// wrap to `loop_start` (loop phase). For PARACH: deploy = frames 0-19,
-/// loop = frames 20-39.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ParachuteAnim {
-    /// Stable ID of the descending entity. Render looks up screen position
-    /// each frame via `sim.entities.get(target_id)`.
-    pub target_id: u64,
-    /// Current animation frame (0..end_frame).
-    pub frame: u16,
-    /// Frame to wrap to on `frame >= end_frame`. Copied from
-    /// ParachuteRenderConfig at spawn time.
-    pub loop_start: u16,
-    /// Wraparound bound (exclusive). Copied from ParachuteRenderConfig.
-    pub end_frame: u16,
-    /// Gameplay frames per image frame. Copied from ParachuteRenderConfig.
-    pub frame_delay: u16,
-    /// Gameplay frames accumulated since last image-frame advance.
-    pub elapsed_frames: u16,
 }
 
 /// Emitted by the refinery dock state machine for EVERY due dump gate of
@@ -1172,8 +947,8 @@ pub struct C4PlantState {
 /// intentionally independent from this optional component.
 ///
 /// Optional component on `GameEntity` — present on vehicles, ships, and
-/// voxel-bodied buildings; `None` for infantry, aircraft, SHP-bodied
-/// buildings.
+/// voxel-bodied buildings; `None` for infantry and SHP-bodied buildings, and
+/// for aircraft until `FootClass::Crash` sets their spin rates.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct RockingState {
     /// Roll angle, rad. Positive sign matches AngleRotatedSideways convention.
@@ -1194,6 +969,7 @@ impl RockingState {
     pub const DEADBAND: SimFixed = SimFixed::lit("0.00002");
 
     /// Returns true when the body-rocking transform is neutral.
+    #[cfg(test)]
     pub fn is_neutral(&self) -> bool {
         !self.is_ship_rocking
             && self.angle_sideways.abs() <= Self::DEADBAND
@@ -1213,42 +989,18 @@ impl RockingState {
 /// BridgeRepairHut owns the separate consume-and-clear branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct PendingC4Detonation {
-    /// Native signed Building timer start frame (`+0x528`). `-1` means the
-    /// duration is already a remaining-duration value.
-    pub start_frame: i32,
-    /// Native signed duration (`+0x530`), preserved without clamping.
-    pub duration_frames: i32,
+    /// Native Building timer (`+0x528` start, `+0x530` duration), signed and
+    /// unclamped; its remaining time drives the shorten test, the Building
+    /// Update expiry and the checksum.
+    pub timer: crate::sim::timer::CdTimer,
     /// Retained source-object identity (`+0x540`). Fresh PostMortem arms leave
     /// this null; shortening an infantry C4 timer preserves its source.
     pub source_entity_id: Option<u64>,
 }
 
-impl PendingC4Detonation {
-    /// Native signed remaining-time calculation shared by the shorten test,
-    /// Building Update expiry, and deterministic checksum.
-    #[inline]
-    pub fn remaining_at(self, current_frame: i32) -> i32 {
-        if self.start_frame == -1 {
-            return self.duration_frames;
-        }
-        let elapsed = current_frame.wrapping_sub(self.start_frame);
-        if elapsed < self.duration_frames {
-            self.duration_frames.wrapping_sub(elapsed)
-        } else {
-            0
-        }
-    }
-
-    #[inline]
-    pub fn is_expired_at(self, current_frame: i32) -> bool {
-        self.remaining_at(current_frame) == 0
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::map::entities::EntityCategory;
 
     #[test]
     fn test_position_creation() {
@@ -1269,25 +1021,12 @@ mod tests {
         // GameEntity fields must be Send + Sync for future multithreaded sim ticks.
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Position>();
-        assert_send_sync::<Facing>();
-        assert_send_sync::<TurretFacing>();
         assert_send_sync::<Health>();
-        assert_send_sync::<Vision>();
-        assert_send_sync::<VoxelModel>();
-        assert_send_sync::<SpriteModel>();
-        assert_send_sync::<Category>();
-        assert_send_sync::<SubCell>();
-        assert_send_sync::<Veterancy>();
         assert_send_sync::<MovementTarget>();
-        assert_send_sync::<BridgeOccupancy>();
         assert_send_sync::<OrderIntent>();
         assert_send_sync::<BuildingUp>();
-        assert_send_sync::<Selected>();
-        assert_send_sync::<LastAttacker>();
         assert_send_sync::<VoxelAnimation>();
         assert_send_sync::<HarvestOverlay>();
-        assert_send_sync::<AnimOverlayState>();
-        assert_send_sync::<BuildingAnimOverlays>();
         assert_send_sync::<crate::sim::movement::locomotor::LocomotorState>();
         assert_send_sync::<NavigationState>();
         assert_send_sync::<DriveLocomotionRuntime>();
@@ -1319,7 +1058,6 @@ mod tests {
         let navigation = NavigationState::default();
         assert!(navigation.path_replay.directions.is_empty());
         assert_eq!(navigation.path_replay.cursor, 0);
-        assert_eq!(drive.turn.target_direction, None);
         assert_eq!(drive.track.turn_index, -1);
         assert_eq!(drive.track.cursor, -1);
         assert!(!drive.track_valid);
@@ -1327,8 +1065,44 @@ mod tests {
         assert_eq!(drive.target_speed_fraction, SIM_ZERO);
         let owner_speed = FootSpeedState::default();
         assert_eq!(owner_speed.applied_fraction, SIM_ZERO);
-        assert_eq!(owner_speed.cached_current_speed, 0);
         assert_eq!(drive.track.residual, 0);
+    }
+
+    /// `FootClass::SetSpeedFraction @ 0x004D3710` executed on the original
+    /// bytes: the double it stores for each requested one, signed zeros,
+    /// NaNs, infinities and denormals included, and that double's truncation
+    /// to `SimFixed`.
+    #[test]
+    fn speed_fraction_setter_matches_the_original() {
+        use crate::util::native_x87::NativeF64Bits;
+        let cases: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../tools/spatial_oracle/foot_speed_owner.json"
+        ))
+        .unwrap();
+        let bits = |row: &serde_json::Value, hex: &str, float: &str| {
+            row[hex].as_str().map_or_else(
+                || row[float].as_f64().unwrap().to_bits(),
+                |hex| u64::from_str_radix(hex, 16).unwrap(),
+            )
+        };
+        let mut setter_rows = 0;
+        for case in &cases {
+            let requested = bits(&case["input"], "requested_bits", "requested");
+            let stored = bits(&case["output"], "applied_bits", "applied");
+            let requested_double = NativeF64Bits::from_bits(requested);
+            assert_eq!(
+                FootSpeedState::stored_speed_fraction(requested_double).bits(),
+                stored,
+                "{case}"
+            );
+            let mut speed = FootSpeedState::default();
+            speed.set_speed_fraction_native_bits(requested);
+            // The stored double lies in [0, 1], so scaling by 2^16 is exact.
+            let truncated = SimFixed::from_bits((f64::from_bits(stored) * 65536.0) as i32);
+            assert_eq!(speed.applied_fraction(), truncated, "{case}");
+            setter_rows += usize::from(case["input"]["family"] == "setter");
+        }
+        assert_eq!((cases.len(), setter_rows), (25, 13));
     }
 
     #[test]
@@ -1350,7 +1124,6 @@ mod tests {
         let drive_a = DriveLocomotionRuntime::default();
         let mut drive_b = DriveLocomotionRuntime::default();
         drive_b.destination = Some(DriveCoord::cell(45, 40, 0));
-        drive_b.turn.target_facing_16 = Some(0x4000);
         drive_b.track.residual = 6;
 
         assert_ne!(hash_drive(&drive_a), hash_drive(&drive_b));
@@ -1365,24 +1138,6 @@ mod tests {
         fn _assert_copy<T: Copy>() {}
         _assert_copy::<C4PlantState>();
         _assert_copy::<PendingC4Detonation>();
-    }
-
-    #[test]
-    fn test_damage_state_thresholds() {
-        assert_eq!(DamageState::from_health(100, 100), DamageState::Green);
-        assert_eq!(DamageState::from_health(51, 100), DamageState::Green);
-        assert_eq!(DamageState::from_health(50, 100), DamageState::Yellow);
-        assert_eq!(DamageState::from_health(26, 100), DamageState::Yellow);
-        assert_eq!(DamageState::from_health(25, 100), DamageState::Red);
-        assert_eq!(DamageState::from_health(1, 100), DamageState::Red);
-        assert_eq!(DamageState::from_health(0, 100), DamageState::Red);
-        assert_eq!(DamageState::from_health(0, 0), DamageState::Green);
-    }
-
-    #[test]
-    fn test_category_wraps_entity_category() {
-        let cat: Category = Category(EntityCategory::Unit);
-        assert_eq!(cat.0, EntityCategory::Unit);
     }
 
     #[test]
@@ -1413,89 +1168,5 @@ mod tests {
         let mut r = RockingState::default();
         r.is_ship_rocking = true;
         assert!(!r.is_neutral());
-    }
-
-    #[test]
-    fn test_world_effect_tick_advances_and_finishes() {
-        use crate::sim::intern::test_intern;
-        let mut fx = WorldEffect {
-            anim_spawn: None,
-            shp_name: test_intern("WARPOUT"),
-            rx: 10,
-            ry: 10,
-            sub_x: crate::util::lepton::CELL_CENTER_LEPTON,
-            sub_y: crate::util::lepton::CELL_CENTER_LEPTON,
-            z: 0,
-            frame: 0,
-            total_frames: 3,
-            frame_delay: 2,
-            elapsed_frames: 0,
-            translucent: true,
-            delay_frames: 0,
-            start_sound_id: None,
-            start_sound_emitted: false,
-        };
-        assert!(!fx.tick());
-        assert_eq!(fx.frame, 0);
-        assert!(!fx.tick());
-        assert_eq!(fx.frame, 1);
-        for _ in 0..3 {
-            assert!(!fx.tick());
-        }
-        assert!(fx.tick());
-        assert_eq!(fx.frame, 3);
-    }
-
-    #[test]
-    fn bridge_twlt_sound_fires_once_when_delay_elapses() {
-        use crate::sim::intern::test_intern;
-        let sound_id = test_intern("Explosion06");
-        let mut fx = WorldEffect {
-            anim_spawn: None,
-            shp_name: test_intern("TWLT036"),
-            rx: 10,
-            ry: 10,
-            sub_x: crate::util::lepton::CELL_CENTER_LEPTON,
-            sub_y: crate::util::lepton::CELL_CENTER_LEPTON,
-            z: 0,
-            frame: 0,
-            total_frames: 3,
-            frame_delay: 2,
-            elapsed_frames: 0,
-            translucent: true,
-            delay_frames: 1,
-            start_sound_id: Some(sound_id),
-            start_sound_emitted: false,
-        };
-
-        let first = fx.tick_with_start_sound();
-        assert_eq!(first.started_sound, Some(sound_id));
-        let second = fx.tick_with_start_sound();
-        assert_eq!(second.started_sound, None);
-    }
-
-    #[test]
-    fn world_effect_preserves_anim_class_constructor_row() {
-        use crate::sim::intern::test_intern;
-        let anim_id = test_intern("WARPOUT");
-        let mut row = AnimClassSpawnDescriptor::new(
-            anim_id,
-            12,
-            34,
-            crate::util::lepton::CELL_CENTER_LEPTON,
-            crate::util::lepton::CELL_CENTER_LEPTON,
-            2,
-        );
-        row.delay = 1;
-        row.loop_count = 1;
-        row.draw_flags = 0x600;
-        row.z_adjust = -30;
-        row.reverse = true;
-
-        let fx = WorldEffect::from_anim_spawn(row.clone(), 20, 1, true, None);
-
-        assert_eq!(fx.shp_name, anim_id);
-        assert_eq!(fx.delay_frames, 1);
-        assert_eq!(fx.anim_spawn, Some(row));
     }
 }

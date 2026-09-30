@@ -25,18 +25,12 @@
 //!    eight Force_Track specials).
 //! 2. The TurnTrack references a RawTrack (normal or short curve variant).
 //! 3. The RawTrack's point array defines the smooth path through the cell.
-//! 4. Each tick, `point_index` advances based on speed; position and facing
-//!    are read from the current TrackPoint.
+//! 4. The retained class cursor and TrackProcess world host own stepping;
+//!    this module contains immutable geometry and selection only.
 //!
 //! ## Dependency rules
 //! - Part of sim/ — depends on util/fixed_math.
 //! - sim/ NEVER depends on render/, ui/, sidebar/, audio/, net/.
-
-use crate::util::fixed_math::SimFixed;
-
-/// Fixed cost per track point step, matching the original engine's movement
-/// budget system (subtracts 7 from the budget per step).
-const TRACK_STEP_COST: i32 = 7;
 
 /// Apply Transform_Track_Coords direction flags to a track point.
 ///
@@ -48,7 +42,7 @@ const TRACK_STEP_COST: i32 = 7;
 /// These are the lower 3 bits of the TurnTrack flags field. Applied in order:
 /// first swap, then negate-x, then negate-y. Facing is adjusted to match.
 /// Matches the original Transform_Track_Coords algorithm.
-pub(super) fn transform_track_point(x: i16, y: i16, facing: u8, flags: u8) -> (i16, i16, u8) {
+pub(crate) fn transform_track_point(x: i16, y: i16, facing: u8, flags: u8) -> (i16, i16, u8) {
     let mut tx = x;
     let mut ty = y;
     let mut tf = facing;
@@ -66,16 +60,6 @@ pub(super) fn transform_track_point(x: i16, y: i16, facing: u8, flags: u8) -> (i
         tf = (tf as i16).wrapping_neg().wrapping_sub(0x80i16) as u8;
     }
     (tx, ty, tf)
-}
-
-/// Integer floor division (rounds toward negative infinity).
-/// Rust's `/` operator truncates toward zero, which gives wrong results
-/// for negative dividends when we need floor division for cell coordinate
-/// computation (e.g., -1 / 256 should be -1, not 0).
-fn floor_div(a: i32, b: i32) -> i32 {
-    let d = a / b;
-    let r = a % b;
-    if (r != 0) && ((r ^ b) < 0) { d - 1 } else { d }
 }
 
 // ---------------------------------------------------------------------------
@@ -135,71 +119,6 @@ pub struct TurnTrack {
     pub target_facing: u8,
     /// Control flags — encodes movement direction context.
     pub flags: u8,
-}
-
-/// Runtime state for a vehicle currently following a track curve.
-///
-/// Created when a Drive vehicle begins a cell transition that involves a
-/// facing change. Consumed by tick_movement to advance position/facing along
-/// the track. Cleared when the track completes or the vehicle is rerouted.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct DriveTrackState {
-    /// Index into RAW_TRACKS for the active curve.
-    pub raw_track_index: u8,
-    /// Current position within the track's point array.
-    pub point_index: u16,
-    /// Movement budget remaining from the previous tick. The original engine
-    /// carries leftover budget across ticks so
-    /// faster vehicles process more track points and fractional progress isn't
-    /// lost. Each tick adds `speed * dt` to this residual.
-    pub residual: i32,
-    /// Transform flags from the TurnTrack entry (lower 3 bits).
-    /// Applied to raw track point coordinates via `transform_track_point`.
-    pub transform_flags: u8,
-    /// Lepton X offset from current cell origin to the head_to reference point.
-    /// Set at track start: `dx * 256 + 128` where dx = head_to.x - current.x.
-    /// Track points are offsets from head_to (destination cell center), so this
-    /// maps them to sub-cell coordinates relative to the current cell.
-    pub head_offset_x: i32,
-    /// Lepton Y offset from current cell origin to the head_to reference point.
-    pub head_offset_y: i32,
-    /// Lepton X offset applied after a mid-track cell transition.
-    /// When the vehicle crosses a cell boundary during a track curve,
-    /// rx/ry are updated but head_offset remains fixed. This offset shifts
-    /// subsequent track positions to the new cell's frame.
-    pub cell_offset_x: i32,
-    /// Lepton Y offset applied after a mid-track cell transition.
-    pub cell_offset_y: i32,
-    /// Post-turn facing (TURN_TRACKS[turn_track_index].target_facing).
-    /// Read by the chain caller as the "from-dir" for chain-target track
-    /// selection — using the live entity facing would pick the wrong curve
-    /// mid-turn since entity.facing is interpolated along the track.
-    pub target_facing: u8,
-}
-
-/// One-shot DriveLocomotion `Force_Track` state.
-///
-/// Unlike normal drive tracks, this is not tied to a `MovementTarget` path
-/// step. Building undock/refinery-exit code can force a special TurnTrack
-/// index directly, then ordinary movement resumes after the curve clears.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ForcedDriveTrackState {
-    /// Index into TURN_TRACKS. `0x47` is the **Tank Bunker eject**, not a refinery
-    /// exit: `BuildingClass::UndockUnit` @ `0x004593A0` and
-    /// `BuildingClass::ReleaseDockedHarvester` @ `0x004595C0` both push it, and
-    /// both early-return unless the building's `+0x2E4` dock link is set, which
-    /// only the bunker installer @ `0x00458E50` sets. VERA nevertheless uses it on
-    /// the refinery interrupt path — VERA-internal, gamemd equivalent UNCHECKED.
-    /// Trigger: a refinery sold or destroyed with a miner on the pad. Player
-    /// effect: VERA runs a forced curve gamemd may not run there at all.
-    /// Frequency: a handful of visible moments per ordinary match. Downstream
-    /// risk: `sell_refinery_interrupts_docked_miner_with_force_track_0x47` pins
-    /// the VERA behaviour, so settling this means re-reading that gate first.
-    pub turn_track_index: u8,
-    /// Runtime RawTrack progress.
-    pub track: DriveTrackState,
-    /// Full movement speed used for the forced curve.
-    pub speed: SimFixed,
 }
 
 // ---------------------------------------------------------------------------
@@ -3544,6 +3463,7 @@ pub(crate) fn occupant_slot_a4_answers_true(
 /// Select the appropriate RawTrack index from a TurnTrack.
 ///
 /// Uses the short track variant for fast vehicles.
+#[cfg(test)]
 pub fn select_raw_track_index(turn: &TurnTrack, use_short: bool) -> u8 {
     if use_short {
         turn.short_track
@@ -3555,46 +3475,6 @@ pub fn select_raw_track_index(turn: &TurnTrack, use_short: bool) -> u8 {
 /// Get the RawTrack metadata by index.
 pub fn raw_track_meta(index: u8) -> Option<&'static RawTrack> {
     RAW_TRACKS.get(index as usize)
-}
-
-/// Cells tested by retail DriveLocomotion slot 40 (`Is_At_Coord`).
-///
-/// The ordinary head cell is always the fallback candidate.  Before the
-/// track's occupation handoff point is consumed, retail first transforms that
-/// raw point around the stored head and tests its cell instead.  Rust rebases
-/// `current_cell` at curve crossings, so `cell_offset_*` is required to recover
-/// the same absolute head that native stores directly.
-pub(super) fn is_at_coord_track_cells(
-    state: &DriveTrackState,
-    current_cell: (u16, u16),
-    include_handoff: bool,
-) -> (Option<(i16, i16)>, (i16, i16)) {
-    let head_abs_x = i32::from(current_cell.0) * 256 + state.head_offset_x + state.cell_offset_x;
-    let head_abs_y = i32::from(current_cell.1) * 256 + state.head_offset_y + state.cell_offset_y;
-    let head_cell = (
-        crate::util::direction_tables::lepton_to_cell(head_abs_x) as i16,
-        crate::util::direction_tables::lepton_to_cell(head_abs_y) as i16,
-    );
-
-    let Some(meta) = RAW_TRACKS.get(state.raw_track_index as usize) else {
-        return (None, head_cell);
-    };
-    let handoff_index = meta.occupation_handoff_point_index;
-    if !include_handoff
-        || handoff_index < 0
-        || usize::from(state.point_index) >= handoff_index as usize
-    {
-        return (None, head_cell);
-    }
-    let Some(point) = raw_track_points(state.raw_track_index).get(handoff_index as usize) else {
-        return (None, head_cell);
-    };
-    let (tx, ty, _) = transform_track_point(point.x, point.y, point.facing, state.transform_flags);
-    let handoff_cell = (
-        ((head_abs_x + i32::from(tx)) / 256) as i16,
-        ((head_abs_y + i32::from(ty)) / 256) as i16,
-    );
-    (Some(handoff_cell), head_cell)
 }
 
 // ---------------------------------------------------------------------------
@@ -3660,20 +3540,6 @@ pub fn select_drive_track(
     })
 }
 
-/// Select an ordinary shared Drive/Ship curve. ShipLocomotion consumes only
-/// TurnTrack 0..63 backed by the byte-identical ordinary RawTrack 0..13 set.
-pub fn select_shared_ordinary_track(
-    current_facing: u8,
-    next_facing: u8,
-    is_ship: bool,
-) -> Option<DriveTrackSelection> {
-    let selection = select_drive_track(current_facing, next_facing, false)?;
-    if selection.turn_track_index >= 64 || (is_ship && selection.raw_track_index > 13) {
-        return None;
-    }
-    Some(selection)
-}
-
 /// Synthesize the substitute selection used when pathfinding produces a turn
 /// too sharp for any precomputed curve (`select_drive_track` returned `None`).
 /// Returns the `cur_dir * 9` TurnTrack entry — RawTrack 1 (cardinals) or 2
@@ -3683,6 +3549,7 @@ pub fn select_shared_ordinary_track(
 ///
 /// Returns `None` defensively if RawTrack 1 or 2 point data isn't loaded
 /// (never expected in normal operation — these are foundational tracks).
+#[cfg(test)]
 pub fn build_sharp_turn_fallback(current_facing: u8) -> Option<DriveTrackSelection> {
     let cur_dir = facing_to_dir(current_facing);
     let turn_index = cur_dir * FACING_DIRECTIONS + cur_dir; // cur_dir * 9
@@ -3707,19 +3574,6 @@ pub fn build_sharp_turn_fallback(current_facing: u8) -> Option<DriveTrackSelecti
     })
 }
 
-/// Ship-safe ordinary sharp-turn substitute. The synthesized selector remains
-/// in 0..63 and its raw curve must remain in Ship's shared 0..13 range.
-pub fn build_shared_sharp_turn_fallback(
-    current_facing: u8,
-    is_ship: bool,
-) -> Option<DriveTrackSelection> {
-    let selection = build_sharp_turn_fallback(current_facing)?;
-    if selection.turn_track_index >= 64 || (is_ship && selection.raw_track_index > 13) {
-        return None;
-    }
-    Some(selection)
-}
-
 // ---------------------------------------------------------------------------
 // Path-window track selection — the retail basis
 // ---------------------------------------------------------------------------
@@ -3733,28 +3587,28 @@ pub const TURN_TRACK_TURNS_FLAG: u8 = 0x08;
 /// Facing units per direction octant (256 / 8).
 const OCTANT_FACING_STEP: u8 = 0x20;
 
-/// Highest RawTrack index in the set ShipLocomotion shares with Drive.
-const SHIP_MAX_SHARED_RAW_TRACK: u8 = 13;
+/// The fresh selector `to + from*8` (Drive 0x4B4016..0x4B4034, Ship
+/// 0x6A3642..0x6A3660): a null entry takes the straight `from*9` diagonal,
+/// which is never itself null. Ship reads its own TurnTrack table
+/// (0x007F2A40), whose 64 entries are byte-identical to Drive's first 64
+/// (0x007E7B28, retail bytes), and every fresh index is below 64, so one
+/// selector serves both.
+pub(crate) fn fresh_turn_index(from: u8, to: u8) -> usize {
+    let (from, to) = (usize::from(from & 7), usize::from(to & 7));
+    let turn_index = from * FACING_DIRECTIONS + to;
+    if TURN_TRACKS[turn_index].normal_track == 0 {
+        from * FACING_DIRECTIONS + from
+    } else {
+        turn_index
+    }
+}
 
-/// Cell delta of each direction octant in the sim cell grid
-/// (+X = east, +Y = south), indexed N=0, NE=1, E=2, SE=3, S=4, SW=5, W=6, NW=7.
-/// Mirrors `crate::util::fixed_math::dir_to_cell_delta` without the facing-byte
-/// round trip, so a path step maps to an octant exactly.
-const OCTANT_CELL_DELTA: [(i32, i32); FACING_DIRECTIONS] = [
-    (0, -1),
-    (1, -1),
-    (1, 0),
-    (1, 1),
-    (0, 1),
-    (-1, 1),
-    (-1, 0),
-    (-1, -1),
-];
+/// Cell delta of each direction octant, `util::direction::DIRECTION_DELTAS`.
+const OCTANT_CELL_DELTA: [(i32, i32); FACING_DIRECTIONS] = crate::util::direction::DIRECTION_DELTAS;
 
 /// Direction octant of a one-cell path step. `None` for a null step.
 fn octant_from_cell_delta(dx: i32, dy: i32) -> Option<usize> {
-    let step = (dx.signum(), dy.signum());
-    OCTANT_CELL_DELTA.iter().position(|&delta| delta == step)
+    crate::util::direction::direction_from_delta(dx.signum(), dy.signum()).map(usize::from)
 }
 
 /// A curve chosen from the path window, with the head cell it reserves.
@@ -3773,6 +3627,7 @@ pub struct DriveTrackPlan {
 
 impl DriveTrackPlan {
     /// True when the curve spans two path nodes.
+    #[cfg(test)]
     pub fn spans_two_nodes(&self) -> bool {
         self.nodes == 2
     }
@@ -3807,38 +3662,26 @@ pub enum DriveTrackDecision {
 /// `to_delta` is `None` at the last step of a path, which gamemd normalises to
 /// `to := from` (its queue terminator).
 pub fn plan_drive_track_from_path(
-    body_facing: u8,
+    body_facing: u16,
     from_delta: (i32, i32),
     to_delta: Option<(i32, i32)>,
-    is_ship: bool,
 ) -> DriveTrackDecision {
     let Some(from_dir) = octant_from_cell_delta(from_delta.0, from_delta.1) else {
         return DriveTrackDecision::Unavailable;
     };
 
     // Exact-facing precondition. Zero tolerance: gamemd compares the 16-bit
-    // facing against `path[0]_dir << 13`, which in the 8-bit frame is
-    // `path[0]_dir * 0x20`, and any non-zero delta commands the turn instead.
+    // facing against `path[0]_dir << 13`; do not truncate the live sample.
+    // Original gate and one-bit cases: drive_fresh_turn.json (4B3408).
     let desired_facing = (from_dir as u8).wrapping_mul(OCTANT_FACING_STEP);
-    if body_facing != desired_facing {
+    if body_facing != u16::from(desired_facing) << 8 {
         return DriveTrackDecision::TurnFirst { desired_facing };
     }
 
     let to_dir = to_delta
         .and_then(|(dx, dy)| octant_from_cell_delta(dx, dy))
         .unwrap_or(from_dir);
-
-    // `from * 9` is the straight-ahead entry on the table diagonal; it is the
-    // null-curve substitute and is never itself null.
-    let straight_index = from_dir * FACING_DIRECTIONS + from_dir;
-    let mut turn_index = from_dir * FACING_DIRECTIONS + to_dir;
-    if TURN_TRACKS[turn_index].normal_track == 0 {
-        turn_index = straight_index;
-    }
-    // ShipLocomotion consumes only the RawTrack set it shares with Drive.
-    if is_ship && TURN_TRACKS[turn_index].normal_track > SHIP_MAX_SHARED_RAW_TRACK {
-        turn_index = straight_index;
-    }
+    let turn_index = fresh_turn_index(from_dir as u8, to_dir as u8);
 
     let turn = &TURN_TRACKS[turn_index];
     let raw_index = turn.normal_track;
@@ -3878,25 +3721,6 @@ pub fn plan_drive_track_from_path(
     })
 }
 
-/// Install a curve chosen by `plan_drive_track_from_path`.
-///
-/// The cursor starts at point 0, not at `entry_index`: gamemd's selection
-/// finalize writes 0 to the track cursor, and the lead-in points are exactly
-/// what carry the mover from its current cell centre into the arc. The
-/// non-zero `entry_index` is the *chain* entry point, used when a curve is
-/// adopted mid-motion.
-pub fn begin_selected_drive_track(plan: &DriveTrackPlan) -> Option<DriveTrackState> {
-    let mut state = begin_drive_track(
-        plan.selection.raw_track_index,
-        plan.selection.flags,
-        plan.head_dx,
-        plan.head_dy,
-        plan.selection.target_facing,
-    )?;
-    state.point_index = 0;
-    Some(state)
-}
-
 /// Quantize a 0-255 facing to a direction index 0-7 (N, NE, E, SE, S, SW, W, NW).
 fn facing_to_dir(facing: u8) -> usize {
     // Add half a direction (16) for rounding, then divide by 32.
@@ -3924,413 +3748,6 @@ pub struct DriveTrackSelection {
     pub target_facing: u8,
     /// Direction flags from the TurnTrack entry.
     pub flags: u8,
-}
-
-// ---------------------------------------------------------------------------
-// Track advancement — stepping through points each tick
-// ---------------------------------------------------------------------------
-
-/// Result of advancing one tick through a drive track.
-#[derive(Debug, Clone, Copy)]
-pub struct DriveTrackAdvance {
-    /// Sub-cell X position (transformed track point + head_offset + cell_offset).
-    pub sub_x: SimFixed,
-    /// Sub-cell Y position (transformed track point + head_offset + cell_offset).
-    pub sub_y: SimFixed,
-    /// Body facing at the current track point (transformed).
-    pub facing: u8,
-    /// True if the vehicle's position crossed into a different cell this tick.
-    /// Detected by coordinate-based boundary checking — every step checks
-    /// if the world position lands in a new cell.
-    pub cell_jump: bool,
-    /// Cell delta the coordinate crossing actually applied, in cells
-    /// (+X = east, +Y = south). `(0, 0)` whenever `cell_jump` is false.
-    ///
-    /// The caller must move the mover's cell by exactly this delta: it is the
-    /// same value that shifted `cell_offset_*`, so `cell * 256 + sub` stays
-    /// continuous across the crossing. A curve's crossings do not always match
-    /// its path steps one for one — the straight diagonals whose transform puts
-    /// a point exactly on a cell corner cross one axis, then the other, on
-    /// consecutive points for a single path node.
-    pub cell_jump_dx: i32,
-    /// See `cell_jump_dx`.
-    pub cell_jump_dy: i32,
-    /// True if the track reached the chain_index point. The caller should
-    /// attempt to chain into the next track curve (check Can_Enter_Cell on
-    /// the next-next cell, select new track if passable).
-    pub chain_ready: bool,
-    /// True if the track has been fully traversed.
-    pub finished: bool,
-    /// Lepton-space delta from the just-consumed point to the next-to-consume
-    /// point, transformed by the active flags. Zero when no next step exists
-    /// (track end / sentinel hit). Used by sub-step interp to scale fractional
-    /// progress from the residual budget.
-    pub next_step_delta_x: i32,
-    /// See `next_step_delta_x`.
-    pub next_step_delta_y: i32,
-    /// True iff a valid next step exists (not at last_index, not a sentinel).
-    /// Sub-step interp is only applied when this is true.
-    pub had_next_step: bool,
-}
-
-/// Begin following a drive track. Creates a new DriveTrackState starting at
-/// the track's entry_index.
-///
-/// `transform_flags`: lower 3 bits of TurnTrack.flags — controls mirror/flip
-/// of the base track curve for different turn orientations.
-///
-/// `head_dx`, `head_dy`: cell delta from the vehicle's current cell to the
-/// destination cell (head_to). Track point coordinates are offsets from the
-/// destination cell center, so these deltas map them to sub-cell space
-/// relative to the current cell.
-///
-/// `target_facing`: post-turn facing of the TurnTrack entry that produced
-/// this track. Stored on the state so the chain caller can read the
-/// post-turn "from-dir" for chain-target track selection.
-pub fn begin_drive_track(
-    raw_track_index: u8,
-    transform_flags: u8,
-    head_dx: i32,
-    head_dy: i32,
-    target_facing: u8,
-) -> Option<DriveTrackState> {
-    begin_drive_track_with_head_offset(
-        raw_track_index,
-        transform_flags,
-        head_dx * 256 + 128,
-        head_dy * 256 + 128,
-        target_facing,
-    )
-}
-
-/// Begin following a drive track with an explicit head-to lepton reference.
-///
-/// This is the lower-level form used by DriveLocomotion `Force_Track`, whose
-/// target coordinate can be sub-cell aligned rather than a neighboring cell
-/// center.
-pub fn begin_drive_track_with_head_offset(
-    raw_track_index: u8,
-    transform_flags: u8,
-    head_offset_x: i32,
-    head_offset_y: i32,
-    target_facing: u8,
-) -> Option<DriveTrackState> {
-    let meta = RAW_TRACKS.get(raw_track_index as usize)?;
-    let points = raw_track_points(raw_track_index);
-    if points.is_empty() {
-        return None;
-    }
-    Some(DriveTrackState {
-        raw_track_index,
-        point_index: meta.entry_index,
-        residual: 0,
-        transform_flags: transform_flags & 0x07, // only lower 3 bits
-        head_offset_x,
-        head_offset_y,
-        cell_offset_x: 0,
-        cell_offset_y: 0,
-        target_facing,
-    })
-}
-
-/// Begin a one-shot forced TurnTrack by direct index.
-///
-/// Special TurnTracks such as the Tank Bunker eject `0x47` are not selected from a
-/// facing-pair formula; gamemd writes the table index directly through
-/// DriveLocomotion::Force_Track.
-pub fn begin_forced_turn_track(
-    turn_track_index: u8,
-    head_offset_x: i32,
-    head_offset_y: i32,
-    speed: SimFixed,
-    use_short: bool,
-) -> Option<ForcedDriveTrackState> {
-    let turn = turn_track_at(turn_track_index as usize)?;
-    let raw_track_index = select_raw_track_index(turn, use_short);
-    let track = begin_drive_track_with_head_offset(
-        raw_track_index,
-        turn.flags,
-        head_offset_x,
-        head_offset_y,
-        turn.target_facing,
-    )?;
-    Some(ForcedDriveTrackState {
-        turn_track_index,
-        track,
-        speed,
-    })
-}
-
-/// Advance a drive track state by one tick.
-///
-/// Uses the original engine's movement budget system:
-/// each tick gets a budget of `speed * dt` leptons plus any residual
-/// from the previous tick. Each track point costs TRACK_STEP_COST (7).
-/// Leftover budget is saved in `state.residual` for the next tick
-/// so fractional progress is not lost between ticks.
-///
-/// **Coordinate-based cell detection**: after each step,
-/// the transformed track point is mapped to sub-cell coordinates. If the
-/// coordinates land in a different cell (sub_x outside [0,256) or sub_y
-/// outside [0,256)), a cell_jump is signaled with the applied `(dx, dy)` and
-/// the loop breaks so the caller can handle the transition. The original engine
-/// keeps one absolute coordinate per object and derives the cell from it by a
-/// sign-corrected shift, so the cell and the coordinate always move together;
-/// the caller must use the reported delta rather than its own path cursor, or
-/// the two disagree and the rendered position snaps.
-///
-/// **Track chaining** at chain_index (binary +0x04): when the stepping loop
-/// reaches the chain_index point, chain_ready is set and the loop breaks
-/// so the caller can attempt to select a follow-on track curve.
-///
-/// Returns the current position/facing after advancement, plus flags for
-/// cell transitions, chain readiness, and track completion.
-pub fn advance_drive_track(
-    state: &mut DriveTrackState,
-    speed: SimFixed,
-    dt: SimFixed,
-) -> DriveTrackAdvance {
-    let mut residual = state.residual;
-    let fresh_budget: i32 = (speed * dt).to_num::<i32>();
-    advance_drive_track_with_budget(state, fresh_budget, &mut residual)
-}
-
-/// Advance a drive track using a caller-owned residual budget.
-///
-/// Normal `DriveLocomotion` stores residual at the locomotor object, not inside
-/// the track table cursor. `DriveTrackState::residual` remains a synchronized
-/// mirror so interpolation and forced-track callers can share the same code.
-pub fn advance_drive_track_with_budget(
-    state: &mut DriveTrackState,
-    fresh_budget: i32,
-    residual_budget: &mut i32,
-) -> DriveTrackAdvance {
-    advance_drive_track_with_budget_mode(state, fresh_budget, residual_budget, true)
-}
-
-/// Advance a forced track without interpreting its head-relative coordinates
-/// as ordinary per-cell crossing coordinates. `Force_Track` transforms every
-/// raw point from the stored absolute head and only relinks the object on the
-/// paid terminal sentinel.
-pub(crate) fn advance_forced_drive_track(
-    state: &mut ForcedDriveTrackState,
-    dt: SimFixed,
-    residual_budget: &mut i32,
-) -> DriveTrackAdvance {
-    let fresh_budget: i32 = (state.speed * dt).to_num::<i32>();
-    advance_drive_track_with_budget_mode(&mut state.track, fresh_budget, residual_budget, false)
-}
-
-fn advance_drive_track_with_budget_mode(
-    state: &mut DriveTrackState,
-    fresh_budget: i32,
-    residual_budget: &mut i32,
-    detect_cell_jump: bool,
-) -> DriveTrackAdvance {
-    let meta = &RAW_TRACKS[state.raw_track_index as usize];
-    let points = raw_track_points(state.raw_track_index);
-    let last_index = meta.points_count.saturating_sub(1);
-    let mut cell_jump = false;
-    let mut cell_jump_dx = 0;
-    let mut cell_jump_dy = 0;
-    let mut chain_ready = false;
-
-    // Budget = this tick's speed + leftover from last tick.
-    state.residual = *residual_budget;
-    let mut budget: i32 = fresh_budget + *residual_budget;
-
-    // Consume track points at TRACK_STEP_COST each.
-    while budget > TRACK_STEP_COST && state.point_index < last_index {
-        state.point_index += 1;
-        budget -= TRACK_STEP_COST;
-
-        // Coordinate-based cell detection: transform the track point and
-        // check if the resulting sub-cell position is outside [0, 256).
-        // Every step checks whether the world position lands in a different cell.
-        if detect_cell_jump && let Some(pt) = points.get(state.point_index as usize) {
-            let (tx, ty, _) = transform_track_point(pt.x, pt.y, pt.facing, state.transform_flags);
-            let sx = state.head_offset_x + tx as i32 + state.cell_offset_x;
-            let sy = state.head_offset_y + ty as i32 + state.cell_offset_y;
-            let cell_x = floor_div(sx, 256);
-            let cell_y = floor_div(sy, 256);
-            if cell_x != 0 || cell_y != 0 {
-                // Position is in a different cell — apply offset so
-                // subsequent points are in the new cell's coordinate frame.
-                state.cell_offset_x -= cell_x * 256;
-                state.cell_offset_y -= cell_y * 256;
-                cell_jump = true;
-                cell_jump_dx = cell_x;
-                cell_jump_dy = cell_y;
-                break;
-            }
-        }
-
-        // Track chaining: at chain_index, signal the caller to attempt
-        // chaining into a follow-on track curve.
-        if meta.chain_index >= 0 && state.point_index == meta.chain_index as u16 {
-            chain_ready = true;
-            break;
-        }
-    }
-
-    // Save leftover budget for next tick.
-    state.residual = budget;
-    *residual_budget = budget;
-
-    let finished = state.point_index >= last_index;
-    // Track completion retains the canonical owner residual and its synchronized
-    // detached-state mirror for the caller's next movement decision.
-
-    // Read position and facing from current track point, applying
-    // transform flags and head/cell offsets.
-    let idx = state.point_index as usize;
-    if idx < points.len() {
-        let pt = &points[idx];
-        let (tx, ty, tf) = transform_track_point(pt.x, pt.y, pt.facing, state.transform_flags);
-
-        // Peek the next-to-consume point for sub-step interp.
-        // Skip if at last_index (no next step) or if the next point is the
-        // (0, 0) sentinel at a non-zero index (matches L6 in design ledger).
-        let next_idx = idx + 1;
-        let (next_dx, next_dy, has_next) =
-            if next_idx < points.len() && (next_idx as u16) <= last_index {
-                let npt = &points[next_idx];
-                let (ntx, nty, _) =
-                    transform_track_point(npt.x, npt.y, npt.facing, state.transform_flags);
-                let is_sentinel = npt.x == 0 && npt.y == 0 && next_idx != 0;
-                if is_sentinel {
-                    (0, 0, false)
-                } else {
-                    ((ntx as i32) - (tx as i32), (nty as i32) - (ty as i32), true)
-                }
-            } else {
-                (0, 0, false)
-            };
-
-        DriveTrackAdvance {
-            sub_x: SimFixed::from_num(state.head_offset_x + tx as i32 + state.cell_offset_x),
-            sub_y: SimFixed::from_num(state.head_offset_y + ty as i32 + state.cell_offset_y),
-            facing: tf,
-            cell_jump,
-            cell_jump_dx,
-            cell_jump_dy,
-            chain_ready,
-            finished,
-            next_step_delta_x: next_dx,
-            next_step_delta_y: next_dy,
-            had_next_step: has_next,
-        }
-    } else {
-        DriveTrackAdvance {
-            sub_x: SimFixed::from_num(128),
-            sub_y: SimFixed::from_num(128),
-            facing: 0,
-            cell_jump: false,
-            cell_jump_dx: 0,
-            cell_jump_dy: 0,
-            chain_ready: false,
-            finished: true,
-            next_step_delta_x: 0,
-            next_step_delta_y: 0,
-            had_next_step: false,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Sub-step interpolation
-// ---------------------------------------------------------------------------
-
-/// Step cost denominator. The original engine consumes 7 budget units per
-/// track point; residual budget after the step loop is in `0..=7` and feeds
-/// fractional progress into the next-to-consume step.
-const TRACK_STEP_DENOM: i32 = 7;
-
-/// Above-this residual triggers the L4 trust window — past the step midpoint,
-/// the interp result is used even when its cell classification looks
-/// unexpected (handles rounding edge cases at large fractions).
-const INTERP_TRUST_BUDGET: i32 = 3;
-
-/// Output of `interp_sub_step`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct InterpSubStepResult {
-    /// X relative to the saved cell. It may lie in the full-step cell;
-    /// ordinary movement then normalizes it in a residual crossing transaction.
-    pub sub_x: SimFixed,
-    /// Sub-cell Y to write to `Position.sub_y`.
-    pub sub_y: SimFixed,
-}
-
-/// Compute a sub-step interpolated position from the residual budget and the
-/// next-step peek. Returns `None` when no interp should be applied this tick
-/// (residual < 1, no next step, or any L5/L6 early-exit condition).
-///
-/// `saved_sub_x/saved_sub_y` are the lepton sub-cell coords AFTER the discrete
-/// step loop ran (the result of `advance_drive_track`). The cell anchor
-/// (`Position.rx/ry`) is implicit — the L4 safety gate uses cell-relative
-/// offsets, so the absolute cell coords are not needed here. A result outside
-/// the saved cell requires caller-owned cell/list/OnBridge updates while
-/// retaining raw Z; this helper only computes the coordinate.
-/// `next_delta_x/next_delta_y` are from `DriveTrackAdvance.next_step_delta_*`.
-/// `residual` is `state.residual` (range `0..=7` after a normal step-loop exit).
-pub(crate) fn interp_sub_step(
-    saved_sub_x: SimFixed,
-    saved_sub_y: SimFixed,
-    next_delta_x: i32,
-    next_delta_y: i32,
-    residual: i32,
-    had_next_step: bool,
-) -> Option<InterpSubStepResult> {
-    // L5: no interp when residual is zero (vehicle made no fractional progress
-    // this tick — either it consumed exactly 7-multiples of budget, or it had
-    // none to begin with).
-    if residual < 1 {
-        return None;
-    }
-    // L5/L6: no interp without a valid next step (track end or sentinel).
-    if !had_next_step {
-        return None;
-    }
-
-    // L2: interp offset = next_delta * residual / 7 (truncate toward zero).
-    let interp_dx: i32 = next_delta_x * residual / TRACK_STEP_DENOM;
-    let interp_dy: i32 = next_delta_y * residual / TRACK_STEP_DENOM;
-
-    // Full-step offset (what the next step would produce at residual = 7).
-    let full_dx: i32 = next_delta_x;
-    let full_dy: i32 = next_delta_y;
-
-    // Convert saved sub-coords to absolute lepton-space (saved_cell-origin).
-    let saved_lx: i32 = saved_sub_x.to_num::<i32>();
-    let saved_ly: i32 = saved_sub_y.to_num::<i32>();
-
-    // L4 cell membership: classify which cell the interp/full positions land in,
-    // expressed as cell-relative offsets from the saved cell.
-    let interp_cell_dx: i32 = floor_div(saved_lx + interp_dx, 256);
-    let interp_cell_dy: i32 = floor_div(saved_ly + interp_dy, 256);
-    let full_cell_dx: i32 = floor_div(saved_lx + full_dx, 256);
-    let full_cell_dy: i32 = floor_div(saved_ly + full_dy, 256);
-
-    let in_saved = interp_cell_dx == 0 && interp_cell_dy == 0;
-    let in_full = interp_cell_dx == full_cell_dx && interp_cell_dy == full_cell_dy;
-
-    // L4 gate: use interp if it lands in saved or full cell, OR residual > 3
-    // (the trust window — past the step midpoint, trust the interp even if
-    // cell classification looks off).
-    let use_interp = in_saved || in_full || residual > INTERP_TRUST_BUDGET;
-
-    if use_interp {
-        Some(InterpSubStepResult {
-            sub_x: SimFixed::from_num(saved_lx + interp_dx),
-            sub_y: SimFixed::from_num(saved_ly + interp_dy),
-        })
-    } else {
-        // L4 fallback: use full-step coords.
-        Some(InterpSubStepResult {
-            sub_x: SimFixed::from_num(saved_lx + full_dx),
-            sub_y: SimFixed::from_num(saved_ly + full_dy),
-        })
-    }
 }
 
 // ---------------------------------------------------------------------------

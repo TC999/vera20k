@@ -1,77 +1,27 @@
 //! Native FireAt launch math, with the stores and lookup boundaries retained.
 //!
-//! Owners: 6FE8EE..6FF014, 48A8D0/48A9D0, 4CAE30/4CB3D0,
-//! 4CADB0 and 4CACB0/4CAD00. This module does not resolve world receivers.
+//! Owners: 6FE663..6FE8E7 (launch scatter), 6FE8EE..6FF014, 48A8D0/48A9D0,
+//! 4CAE30/4CB3D0, 4CADB0 and 4CACB0/4CAD00, and SpawnShrapnel's child
+//! velocity (46A5D2..46A86D). This module does not resolve world receivers.
 
 use crate::map::retail_trig::{AcosTable, TrigTable};
 use crate::util::native_x87::{
     NativeF32Bits, NativeF64Bits, X87Chop53 as X, X87Ordering, X87Value,
 };
 
+use super::native_math::{
+    PI_HALF, angle_word, atan, cos, d, f, int, less, radians, round, sin, sqrt, store,
+};
 use super::{ProjectileCoord, ProjectileVelocity};
+use crate::sim::rng::SimRng;
 
-const PI_HALF: NativeF64Bits = NativeF64Bits::from_bits(0x3ff9_21fb_5444_2d18);
-const WORD_SCALE: NativeF64Bits = NativeF64Bits::from_bits(0xc0c4_5f07_af68_ecef);
-const RADIAN_SCALE: NativeF64Bits = NativeF64Bits::from_bits(0xbf19_222d_989f_5e57);
 const POSITIVE_HEIGHT_ANGLE: NativeF64Bits = NativeF64Bits::from_bits(0x3fe9_21d9_f4d3_7c12);
-const TRIG_SCALE: NativeF32Bits = NativeF32Bits::from_bits(0x4522_f983);
-
-fn d(bits: NativeF64Bits) -> X87Value {
-    X::load_f64(bits).expect("finite native launch input")
-}
-
-fn f(bits: NativeF32Bits) -> X87Value {
-    X::load_f32(bits).expect("finite native launch table value")
-}
-
-fn store(value: X87Value) -> NativeF64Bits {
-    X::store_f64(value).expect("finite stored native launch value")
-}
-
-fn round(value: X87Value) -> X87Value {
-    d(store(value))
-}
-
-fn int(value: X87Value) -> i32 {
-    X::ftol_i64(value).expect("native launch conversion fits signed i64") as i32
-}
-
-fn sqrt(value: X87Value) -> X87Value {
-    f(crate::util::native_x87::sqrt_approx_f32(round(value))
-        .expect("native launch squared value fits the finite lookup domain"))
-}
-
-fn less(a: X87Value, b: X87Value) -> bool {
-    X::compare(a, b) == X87Ordering::Less
-}
-
-fn radians(word: u16) -> NativeF64Bits {
-    store(X::mul(
-        X::load_i32(i32::from(word as i16) - 0x3fff),
-        d(RADIAN_SCALE),
-    ))
-}
-
-fn angle_word(angle: X87Value) -> u16 {
-    int(X::mul(X::sub(angle, d(PI_HALF)), d(WORD_SCALE))) as u16
-}
-
-fn sin(table: &TrigTable, angle: NativeF64Bits) -> X87Value {
-    let units = int(X::mul(d(angle), f(TRIG_SCALE)));
-    f(NativeF32Bits::from_bits(table.sin(units).to_bits()))
-}
-
-fn cos(table: &TrigTable, angle: NativeF64Bits) -> X87Value {
-    let units = int(X::mul(d(angle), f(TRIG_SCALE)));
-    f(NativeF32Bits::from_bits(table.cos(units).to_bits()))
-}
-
-fn atan(y: X87Value, x: X87Value) -> X87Value {
-    crate::util::direction_tables::native_atan2_f32(
-        X::store_f32(y).expect("finite launch atan numerator"),
-        X::store_f32(x).expect("finite launch atan denominator"),
-    )
-}
+/// `[0x007E3570]` = 1/0x7FFFFFFE, the scatter angle draw's bound.
+const INVERSE_DRAW_SPAN: NativeF64Bits = NativeF64Bits::from_bits(0x3e00_0000_0040_0000);
+/// `[0x007E3CC0]` = 2π.
+const TWO_PI: NativeF64Bits = NativeF64Bits::from_bits(0x4019_21fb_5444_2d18);
+/// SpawnShrapnel's fixed launch pitch, pushed as an immediate (`0x0046A787`).
+const SHRAPNEL_PITCH: NativeF64Bits = NativeF64Bits::from_bits(0x3fe9_2164_8732_995c);
 
 fn acos(table: &AcosTable, argument: X87Value) -> X87Value {
     // 4CADB0 uses a NEGATIVE scale and subtracts the signed offset from
@@ -183,6 +133,7 @@ pub(crate) struct FireAtLaunch {
     pub delta: ProjectileCoord,
     pub speed: i32,
     pub vertical: bool,
+    pub homing: bool,
     pub heading: Option<u16>,
     pub arcing: bool,
     pub gravity: NativeF64Bits,
@@ -195,6 +146,123 @@ pub(crate) struct FireAtLaunch {
 pub(crate) struct FireAtLaunchResult {
     pub velocity: ProjectileVelocity,
     pub speed: i32,
+}
+
+/// `[0x007F4E80]`, the lead's 0.9.
+const LEAD_SPEED_FACTOR: NativeF64Bits = NativeF64Bits::from_bits(0x3fec_cccc_cccc_cccd);
+
+/// The projectile fields `WeaponTypeClass::GetSpeed` reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LaunchSpeedProjectile {
+    /// `BulletTypeClass+0x2DC` `ROT=`.
+    pub rot: i32,
+    /// `BulletTypeClass+0x295` `Floater=`.
+    pub floater: bool,
+}
+
+/// `WeaponTypeClass::GetSpeed @ 0x00773070`: the speed a shot is launched
+/// with, for a `distance` in leptons. A projectile with `ROT=0` ignores the
+/// weapon's `Speed=` and launches at `ftol(Sqrt_Approx(distance * gravity *
+/// 1.2))` (`0x0048AB90`), where gravity is `Gravity=` (`Rules+0x16B8`) or, for
+/// a `Floater=` projectile, half of it (`0x0048ACF0`); anything else (a homing
+/// projectile, or no projectile) launches at the retained, already converted
+/// speed (`+0xA8`). Retail Cannon takes the first arm, deriving speed from the
+/// current firing distance instead of the Range used by its Rules postpass.
+///
+/// Native execution: `tools/projectile_oracle/fireat_speed.py` (`speed` rows).
+pub(crate) fn weapon_launch_speed(
+    weapon_speed: i32,
+    projectile: Option<LaunchSpeedProjectile>,
+    gravity: i32,
+    distance: i32,
+) -> i32 {
+    let Some(projectile) = projectile.filter(|projectile| projectile.rot == 0) else {
+        return weapon_speed;
+    };
+    crate::util::native_ballistics::ballistic_launch_speed(distance, gravity, projectile.floater)
+}
+
+/// `TechnoClass::FireAt @ 0x006FE4F6..0x006FE537`: the distance FireAt hands
+/// [`weapon_launch_speed`]. The squared X and Y deltas between the target
+/// coordinate and the launch source add as signed 32-bit integers (IMUL, ADD),
+/// then FILD, `Sqrt_Approx` and ftol; Z takes no part.
+///
+/// Native execution: `tools/projectile_oracle/fireat_speed.py` (`distance`).
+pub(crate) fn fireat_launch_distance(source: ProjectileCoord, target: ProjectileCoord) -> i32 {
+    let dx = target.x.wrapping_sub(source.x);
+    let dy = target.y.wrapping_sub(source.y);
+    let squared = dx.wrapping_mul(dx).wrapping_add(dy.wrapping_mul(dy));
+    int(sqrt(X::load_i32(squared)))
+}
+
+/// The lead of FireAt's aim point `0x0070BCB0` (`0x0070BD84..0x0070BE20`) for
+/// a moving UnitClass target: `ftol(distance / (shot_speed * 0.9) *
+/// target_speed)` leptons along the target's body facing, added to `aim` as
+/// `(ftol(cos * lead + x), ftol(y - sin * lead))`, Z unchanged. `distance` is
+/// `ObjectClass::Distance_AdjForFoundation` from the firer, `shot_speed` the
+/// current weapon's [`weapon_launch_speed`] at that distance and
+/// `target_speed` `FootClass::GetCurrentSpeed`. A zero shot speed divides to
+/// infinity, whose ftol is the integer-indefinite value with a zero low word,
+/// so no lead.
+///
+/// Native execution: `tools/projectile_oracle/fireat_speed.py` (`aim`).
+pub(crate) fn lead_aim(
+    aim: ProjectileCoord,
+    target_facing: u16,
+    distance: i32,
+    shot_speed: i32,
+    target_speed: i32,
+) -> ProjectileCoord {
+    let (trig, _) = crate::map::retail_trig::required_math_tables();
+    lead_aim_with_table(aim, target_facing, distance, shot_speed, target_speed, trig)
+}
+
+fn lead_aim_with_table(
+    aim: ProjectileCoord,
+    target_facing: u16,
+    distance: i32,
+    shot_speed: i32,
+    target_speed: i32,
+    trig: &TrigTable,
+) -> ProjectileCoord {
+    // 0x0070BD9A..0x0070BDAC: FILD speed; FMUL 0.9; FDIVR distance; FIMUL
+    // target speed; ftol (the masked conversion: infinity gives 0).
+    let lead = crate::util::native_x87::MaskedX87Chop53::ftol_i32_low_masked(
+        crate::util::native_x87::MaskedX87Chop53::mul(
+            crate::util::native_x87::MaskedX87Chop53::div(
+                crate::util::native_x87::MaskedX87Chop53::load_i32(distance),
+                crate::util::native_x87::MaskedX87Chop53::mul(
+                    crate::util::native_x87::MaskedX87Chop53::load_i32(shot_speed),
+                    crate::util::native_x87::MaskedX87Chop53::load_f64(LEAD_SPEED_FACTOR),
+                ),
+            ),
+            crate::util::native_x87::MaskedX87Chop53::load_i32(target_speed),
+        ),
+    );
+    // 0x0070BDC5..0x0070BE20: the facing word to radians, then the same
+    // offset shape as the launch scatter.
+    offset_along(aim, radians(target_facing), lead, trig)
+}
+
+/// `(ftol(cos(angle) * magnitude + x), ftol(y - sin(angle) * magnitude))`,
+/// Z unchanged: the shape both the launch scatter (`0x006FE79A..0x006FE7E9`)
+/// and the aim's lead (`0x0070BDFA..0x0070BE20`) use.
+fn offset_along(
+    point: ProjectileCoord,
+    angle: NativeF64Bits,
+    magnitude: i32,
+    trig: &TrigTable,
+) -> ProjectileCoord {
+    let magnitude = X::load_i32(magnitude);
+    let y = int(X::sub(
+        X::load_i32(point.y),
+        X::mul(sin(trig, angle), magnitude),
+    ));
+    let x = int(X::add(
+        X::mul(cos(trig, angle), magnitude),
+        X::load_i32(point.x),
+    ));
+    ProjectileCoord::new(x, y, point.z)
 }
 
 /// Native 70D590, after the firing owner resolves source raw Location and the
@@ -220,6 +288,182 @@ pub(crate) fn high_arc_root(
     int(sqrt(X::add(X::mul(x, x), X::mul(y, y)))) < height
 }
 
+/// `TechnoClass::FireAt`'s launch scatter (`0x006FE663..0x006FE8E7`), taken
+/// for an `Inaccurate=` `Arcing=` projectile: it moves the target delta by a
+/// drawn magnitude in a drawn direction, leaving Z. Two Scenario draws,
+/// magnitude then angle. The flak arm (`FlakScatter=` and not `Inviso=`;
+/// stock `FlakTProj`) scales `RandomRanged(0, BallisticScatter)` by the
+/// delta's length over the weapon's range (vt+0x168, `0x007012C0`); the plain
+/// arm draws the magnitude from `RandomRanged(BallisticScatter / 2,
+/// BallisticScatter)`. A zero range faults natively; here it scatters by zero.
+pub(crate) fn fireat_launch_scatter(
+    delta: ProjectileCoord,
+    ballistic_scatter: i32,
+    weapon_range: i32,
+    flak: bool,
+    rng: &mut SimRng,
+) -> ProjectileCoord {
+    let (trig, _) = crate::map::retail_trig::required_math_tables();
+    launch_scatter_with(
+        delta,
+        ballistic_scatter,
+        weapon_range,
+        flak,
+        |low, high| rng.next_range_i32_inclusive(low, high),
+        trig,
+    )
+}
+
+/// The scatter with its two `Random__RandomRanged` draws supplied.
+fn launch_scatter_with(
+    delta: ProjectileCoord,
+    ballistic_scatter: i32,
+    weapon_range: i32,
+    flak: bool,
+    mut random_ranged: impl FnMut(i32, i32) -> i32,
+    trig: &TrigTable,
+) -> ProjectileCoord {
+    let magnitude = if flak {
+        let distance = flak_scatter_distance(delta);
+        // 0x006FE727..0x006FE73D: IMUL, then IDIV by the range.
+        random_ranged(0, ballistic_scatter)
+            .wrapping_mul(distance)
+            .checked_div(weapon_range)
+            .unwrap_or(0)
+    } else {
+        // 0x006FE815..0x006FE81C: the halving is CDQ/SUB/SAR, toward zero.
+        random_ranged(ballistic_scatter / 2, ballistic_scatter)
+    };
+    let raw = random_ranged(0, 0x7fff_fffe);
+    scatter_delta(delta, magnitude, raw, trig)
+}
+
+/// `0x006FE6AD..0x006FE722`: the flak arm's length of the delta: X and Y
+/// stored as floats, Z loaded as an integer, `(x·x + y·y) + z·z` through
+/// `Sqrt_Approx`, stored as a float and truncated.
+fn flak_scatter_distance(delta: ProjectileCoord) -> i32 {
+    let float =
+        |value: i32| f(X::store_f32(X::load_i32(value)).expect("finite scatter delta component"));
+    let (x, y, z) = (float(delta.x), float(delta.y), X::load_i32(delta.z));
+    int(sqrt(X::add(
+        X::add(X::mul(x, x), X::mul(y, y)),
+        X::mul(z, z),
+    )))
+}
+
+/// The scatter's angle (`0x006FE75F..0x006FE796`, again at `0x006FE841..
+/// 0x006FE878`): the draw times 1/0x7FFFFFFE and 2π to a DirStruct word,
+/// then back to radians. Then `0x006FE79A..0x006FE7E9`: the new delta is
+/// `(cos·magnitude + x, y − sin·magnitude)`, each truncated.
+fn scatter_delta(
+    delta: ProjectileCoord,
+    magnitude: i32,
+    raw: i32,
+    trig: &TrigTable,
+) -> ProjectileCoord {
+    let angle = radians(angle_word(X::mul(
+        X::mul(X::load_i32(raw), d(INVERSE_DRAW_SPAN)),
+        d(TWO_PI),
+    )));
+    offset_along(delta, angle, magnitude, trig)
+}
+
+/// `BulletClass::SpawnShrapnel`'s child launch velocity. Both branches turn
+/// the zeroed velocity's seed (100, 0, 0) toward the target, divide out its
+/// existing pitch and apply the fixed pitch `0x3FE921648732995C`. A child
+/// aimed at a hostile object (`0x0046A5D2..0x0046A86D`) is scaled to the child
+/// weapon's `Speed=` last; a child aimed at a random cell (`0x0046AA9D..
+/// 0x0046AD1D`) is scaled first, so the pitch acts on a Speed-long vector.
+pub(crate) fn shrapnel_launch_velocity(
+    origin: ProjectileCoord,
+    target: ProjectileCoord,
+    speed: i32,
+    random_cell: bool,
+) -> ProjectileVelocity {
+    let (trig, _) = crate::map::retail_trig::required_math_tables();
+    shrapnel_launch_with_table(origin, target, speed, random_cell, trig)
+}
+
+fn square(value: X87Value) -> X87Value {
+    X::mul(value, value)
+}
+
+fn shrapnel_launch_with_table(
+    origin: ProjectileCoord,
+    target: ProjectileCoord,
+    speed: i32,
+    random_cell: bool,
+    trig: &TrigTable,
+) -> ProjectileVelocity {
+    let zero = X::load_i32(0);
+    // 0x0046A623..0x0046A653: the heading toward the target.
+    let heading = radians(angle_word(atan(
+        round(X::sub(X::load_i32(origin.y), X::load_i32(target.y))),
+        round(X::sub(X::load_i32(target.x), X::load_i32(origin.x))),
+    )));
+    // 0x0046A658..0x0046A6EC: the seed turns to the heading at its 2-D
+    // length (0x0041C430).
+    let seed = X::load_i32(100);
+    let length = round(sqrt(X::add(square(seed), square(zero))));
+    let mut v = [
+        round(X::mul(cos(trig, heading), length)),
+        round(X::neg(X::mul(sin(trig, heading), length))),
+        zero,
+    ];
+    if random_cell {
+        // 0x0046AB75..0x0046AC04, with the inline length (z·z + x·x) + y·y.
+        v = scale_to_speed(v, speed, |[x, y, z]| {
+            X::add(X::add(square(z), square(x)), square(y))
+        });
+    }
+    // 0x0046A6F0..0x0046A738: the existing pitch over the 2-D length
+    // (0x0041C350), then the 3-D length: 0x0041C3C0's (x·x + y·y) + z·z, or
+    // inline (y·y + z·z) + x·x for a random cell (0x0046AC4F..0x0046AC73).
+    let [x, y, z] = v;
+    let pitch = radians(angle_word(atan(z, sqrt(X::add(square(x), square(y))))));
+    let magnitude = round(sqrt(if random_cell {
+        X::add(X::add(square(y), square(z)), square(x))
+    } else {
+        X::add(X::add(square(x), square(y)), square(z))
+    }));
+    if X::compare(d(pitch), zero) != X87Ordering::Equal {
+        let cosine = cos(trig, pitch);
+        v[0] = round(X::div(v[0], cosine).expect("nonzero existing pitch cosine"));
+        v[1] = round(X::div(v[1], cosine).expect("nonzero existing pitch cosine"));
+    }
+    // 0x0046A787..0x0046A7CE: the fixed pitch.
+    v = [
+        round(X::mul(cos(trig, SHRAPNEL_PITCH), v[0])),
+        round(X::mul(cos(trig, SHRAPNEL_PITCH), v[1])),
+        round(X::mul(sin(trig, SHRAPNEL_PITCH), magnitude)),
+    ];
+    if !random_cell {
+        // 0x0046A7DC..0x0046A86D, with 0x0041C3C0's length.
+        v = scale_to_speed(v, speed, |[x, y, z]| {
+            X::add(X::add(square(x), square(y)), square(z))
+        });
+    }
+    ProjectileVelocity::from_native(v.map(store))
+}
+
+/// A zero vector seeds (100, 0, 0); then `Speed / Sqrt_Approx(length²)`
+/// scales each axis.
+fn scale_to_speed(
+    mut v: [X87Value; 3],
+    speed: i32,
+    length2: impl Fn([X87Value; 3]) -> X87Value,
+) -> [X87Value; 3] {
+    let zero = X::load_i32(0);
+    if v.iter()
+        .all(|&axis| X::compare(axis, zero) == X87Ordering::Equal)
+    {
+        v[0] = X::load_i32(100);
+    }
+    let factor =
+        X::div(X::load_i32(speed), sqrt(length2(v))).expect("positive shrapnel velocity length");
+    v.map(|axis| round(X::mul(factor, axis)))
+}
+
 /// FireAt 6FE8EE..6FF014 for ordinary ROT<=0 and stock RadialFireSegments=0.
 /// The returned doubles are the six DWORDs copied by Bullet::Fire 468691..A0.
 pub(crate) fn fireat_launch(input: FireAtLaunch) -> Option<FireAtLaunchResult> {
@@ -238,7 +482,7 @@ fn fireat_launch_with_tables(
     let x2 = round(X::mul(x, x));
     let distance = int(sqrt(X::add(X::add(X::mul(z, z), X::mul(y, y)), x2)));
     let mut speed = input.speed.min(distance / 2);
-    if input.vertical {
+    if input.vertical || input.homing {
         speed = 1;
     }
     let heading = input
@@ -305,12 +549,20 @@ fn fireat_launch_with_tables(
         vy = round(X::div(vy, cos(trig, existing_pitch)).expect("nonzero initial pitch cosine"));
     }
     let pitch_radians = radians(pitch);
+    let mut velocity = [
+        round(X::mul(cos(trig, pitch_radians), vx)),
+        round(X::mul(cos(trig, pitch_radians), vy)),
+        round(X::mul(sin(trig, pitch_radians), magnitude)),
+    ];
+    // Bullet::Fire 468AAC..468B57 renormalizes ROT>0 after the six DWORDs
+    // have been copied, with (z*z + y*y) + x*x and another Sqrt_Approx.
+    if input.homing {
+        velocity = scale_to_speed(velocity, 1, |[x, y, z]| {
+            X::add(X::add(square(z), square(y)), square(x))
+        });
+    }
     Some(FireAtLaunchResult {
-        velocity: ProjectileVelocity::from_native([
-            store(X::mul(cos(trig, pitch_radians), vx)),
-            store(X::mul(cos(trig, pitch_radians), vy)),
-            store(X::mul(sin(trig, pitch_radians), magnitude)),
-        ]),
+        velocity: ProjectileVelocity::from_native(velocity.map(store)),
         speed,
     })
 }
@@ -367,6 +619,7 @@ mod tests {
                 let input = FireAtLaunch {
                     delta,
                     speed: row["speed"].as_i64().unwrap() as i32,
+                    homing: false,
                     vertical: row["vertical"].as_bool().unwrap_or(false),
                     heading: row["hull"].as_u64().map(|hull| {
                         if row["turret"].as_bool().unwrap() {
@@ -419,6 +672,219 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    fn coord(value: &Value) -> ProjectileCoord {
+        let axis = |index: usize| value[index].as_i64().unwrap() as i32;
+        ProjectileCoord::new(axis(0), axis(1), axis(2))
+    }
+
+    fn fireat_speed_corpus() -> Value {
+        serde_json::from_str(include_str!(
+            "../../../tools/projectile_oracle/fireat_speed.json"
+        ))
+        .unwrap()
+    }
+
+    /// `tools/projectile_oracle/fireat_speed.json`: `WeaponTypeClass::GetSpeed`
+    /// on the original instructions over ROT, Floater, gravity (negative and
+    /// zero included) and distance (negative, zero and the signed32 maximum),
+    /// plus the homing and projectile-less arms.
+    #[test]
+    fn original_weapon_launch_speed_rows() {
+        let corpus = fireat_speed_corpus();
+        let rows = corpus["speed"].as_array().unwrap();
+        assert_eq!(rows.len(), 359);
+        for (index, row) in rows.iter().enumerate() {
+            let input = &row["input"];
+            let int = |key: &str| input[key].as_i64().unwrap() as i32;
+            let projectile =
+                input["projectile"]
+                    .as_bool()
+                    .unwrap()
+                    .then(|| LaunchSpeedProjectile {
+                        rot: int("rot"),
+                        floater: int("floater") != 0,
+                    });
+            assert_eq!(
+                weapon_launch_speed(int("speed"), projectile, int("gravity"), int("distance")),
+                row["speed"].as_i64().unwrap() as i32,
+                "row {index}: {input}"
+            );
+        }
+    }
+
+    /// The same corpus's FireAt distance block (`0x006FE4F6..0x006FE537`),
+    /// signed32 overflow of the squared deltas included.
+    #[test]
+    fn original_fireat_launch_distance_rows() {
+        let corpus = fireat_speed_corpus();
+        let rows = corpus["distance"].as_array().unwrap();
+        assert_eq!(rows.len(), 23);
+        for (index, row) in rows.iter().enumerate() {
+            let input = &row["input"];
+            let point = |key: &str| {
+                let xy = &input[key];
+                ProjectileCoord::new(
+                    xy[0].as_i64().unwrap() as i32,
+                    xy[1].as_i64().unwrap() as i32,
+                    // Z takes no part; a nonzero source Z must not change it.
+                    if key == "source" { 999 } else { 0 },
+                )
+            };
+            assert_eq!(
+                fireat_launch_distance(point("source"), point("target")),
+                row["distance"].as_i64().unwrap() as i32,
+                "row {index}: {input}"
+            );
+        }
+    }
+
+    /// The same corpus's aim rows (`0x0070BCB0`): every moving-Unit row's lead,
+    /// from the distance `Distance_AdjForFoundation` measures (Location to
+    /// Location, 3-D), the current weapon's launch speed at it and the target's
+    /// speed and facing. The rows whose native aim is the unled target
+    /// coordinate (another class, not moving, no weapon) are the caller's gate
+    /// and must be exactly that coordinate.
+    #[test]
+    #[ignore = "requires RA2_DIR with verified gamemd.exe math tables"]
+    fn original_aim_lead_rows() {
+        let (trig, _) = tables();
+        let corpus = fireat_speed_corpus();
+        let rows = corpus["aim"].as_array().unwrap();
+        assert_eq!(rows.len(), 596);
+        let mut led = 0;
+        for (index, row) in rows.iter().enumerate() {
+            let input = &row["input"];
+            if !input["target"].as_bool().unwrap() {
+                continue;
+            }
+            let int = |key: &str| input[key].as_i64().unwrap() as i32;
+            let firer = coord(&input["firer_xyz"]);
+            let target = coord(&input["target_xyz"]);
+            let expected = coord(&row["aim"]);
+            let leads = int("whatami") == 1 && int("moving") != 0 && input["weapon"] == true;
+            if !leads {
+                assert_eq!(expected, target, "row {index}: no lead");
+                continue;
+            }
+            let distance = crate::util::native_x87::distance_3d_leptons(
+                [firer.x, firer.y, firer.z],
+                [target.x, target.y, target.z],
+            );
+            let shot_speed = weapon_launch_speed(
+                int("speed"),
+                Some(LaunchSpeedProjectile {
+                    rot: int("rot"),
+                    floater: false,
+                }),
+                int("gravity"),
+                distance,
+            );
+            let actual = lead_aim_with_table(
+                target,
+                int("facing") as u16,
+                distance,
+                shot_speed,
+                int("target_speed"),
+                trig,
+            );
+            assert_eq!(actual, expected, "row {index}: {input}");
+            led += 1;
+        }
+        assert_eq!(led, 587);
+    }
+
+    fn launch_scatter_corpus() -> Value {
+        serde_json::from_str(include_str!(
+            "../../../tools/projectile_oracle/launch_scatter.json"
+        ))
+        .unwrap()
+    }
+
+    /// `tools/projectile_oracle/launch_scatter.json`: FireAt's launch scatter
+    /// on the original instructions, both arms. The Rust scatter runs with
+    /// the recorded draws, and its `RandomRanged` bounds must match the
+    /// recorded arguments in order.
+    #[test]
+    #[ignore = "requires RA2_DIR with verified gamemd.exe math tables"]
+    fn original_launch_scatter_both_arms() {
+        let (trig, _) = tables();
+        let corpus = launch_scatter_corpus();
+        let rows = corpus["scatter"].as_array().unwrap();
+        assert_eq!(rows.len(), 87);
+        for (index, row) in rows.iter().enumerate() {
+            let input = &row["input"];
+            let int = |key: &str| input[key].as_i64().unwrap() as i32;
+            let flak = int("flak_scatter") != 0 && int("inviso") == 0;
+            let mut draws = input["draws"].as_array().unwrap().iter();
+            let mut bounds = Vec::new();
+            let result = launch_scatter_with(
+                coord(&input["delta"]),
+                int("scatter"),
+                int("range"),
+                flak,
+                |low, high| {
+                    bounds.push((low, high));
+                    draws.next().unwrap().as_i64().unwrap() as i32
+                },
+                trig,
+            );
+            let calls = row["calls"].as_array().unwrap();
+            let native: Vec<(i32, i32)> = calls
+                .iter()
+                .filter(|call| call[0] == "random_ranged")
+                .map(|call| {
+                    (
+                        call[1].as_i64().unwrap() as i32,
+                        call[2].as_i64().unwrap() as i32,
+                    )
+                })
+                .collect();
+            assert_eq!(bounds, native, "row {index}: the draws");
+            assert_eq!(result, coord(&row["result"]), "row {index}: {input}");
+            // Only the flak arm asks for the fired weapon's range.
+            let asks_range = calls
+                .iter()
+                .any(|call| call[0] == "weapon_range" && call[1] == input["weapon"]);
+            assert_eq!(asks_range, flak, "row {index}");
+        }
+    }
+
+    /// The same corpus's SpawnShrapnel rows: both branches' child velocity,
+    /// bit for bit, over headings, the zero delta and zero speed (the kernel
+    /// reads only the target's X and Y).
+    #[test]
+    #[ignore = "requires RA2_DIR with verified gamemd.exe math tables"]
+    fn original_shrapnel_launch_velocity_both_branches() {
+        let (trig, _) = tables();
+        let corpus = launch_scatter_corpus();
+        let rows = corpus["shrapnel"].as_array().unwrap();
+        assert_eq!(rows.len(), 54);
+        for (index, row) in rows.iter().enumerate() {
+            let input = &row["input"];
+            let velocity = shrapnel_launch_with_table(
+                coord(&input["origin"]),
+                coord(&input["target"]),
+                input["speed"].as_i64().unwrap() as i32,
+                input["random_cell"].as_bool().unwrap(),
+                trig,
+            );
+            let actual = velocity
+                .native()
+                .map(|axis| format!("{:016x}", axis.bits()));
+            let expected: Vec<_> = row["bits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|bits| bits.as_str().unwrap())
+                .collect();
+            assert_eq!(
+                actual.as_slice(),
+                expected.as_slice(),
+                "row {index}: {input}"
+            );
         }
     }
 

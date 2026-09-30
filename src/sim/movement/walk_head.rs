@@ -49,7 +49,11 @@ pub(crate) fn selected_head(
     DriveCoord {
         x: (input.x & !255).wrapping_add(x),
         y: (input.y & !255).wrapping_add(y),
-        z: input_ground_z.wrapping_add(if bridge { 416 } else { 0 }),
+        z: input_ground_z.wrapping_add(if bridge {
+            crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS
+        } else {
+            0
+        }),
     }
 }
 
@@ -80,7 +84,8 @@ pub(crate) fn raw_at(
         },
         |(t, c)| t.native_cell_flags(c) & 0x100 != 0,
     );
-    let deck = coord.z >= ground.wrapping_add(416) && (!put || structural);
+    let deck = coord.z >= ground.wrapping_add(crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS)
+        && (!put || structural);
     let mask = infantry_raw_occupation_mask(
         SimFixed::from_num(coord.x % 256),
         SimFixed::from_num(coord.y % 256),
@@ -90,7 +95,7 @@ pub(crate) fn raw_at(
     } else {
         super::locomotor::MovementLayer::Ground
     };
-    raw.write_infantry(key, layer, mask, owner, put);
+    raw.write_occupant(key, layer, mask, Some(owner), put);
 }
 
 /// Successful fresh-head tail75BC2A..75BCBD. Facing+4C is75AE00 ->
@@ -116,13 +121,13 @@ pub(super) fn finish_fresh_head(
             head.x.wrapping_sub(current.x),
             head.y.wrapping_sub(current.y),
         );
+        entity.body_facing.snap(facing, native_frame);
         entity
-            .body_facing
-            .get_or_insert_with(|| super::FacingClass::new(0, 0))
-            .snap(facing, native_frame);
-        entity.facing = (facing >> 8) as u8;
-        entity.facing_target = None;
-        entity.foot_speed.applied_fraction = crate::util::fixed_math::SIM_ONE;
+            .foot_speed
+            .set_speed_fraction(crate::util::fixed_math::SIM_ONE);
+        //75BC36's dead-owner exit bypasses75BCB2 and retains the exact byte.
+        // Native controls: foot_scold_latch.json dead_fresh_head rows.
+        entity.navigation.path_runtime.clear_scold_latch();
     }
     true
 }
@@ -165,6 +170,57 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dead_fresh_head_preserves_native_scold_byte() {
+        let corpus: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tools/spatial_oracle/foot_scold_latch.json"
+        ))
+        .unwrap();
+        let mut checked = 0;
+        for row in corpus["paid_tails"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|row| row["case"] == "dead_fresh_head")
+        {
+            let mut actor =
+                crate::sim::game_entity::GameEntity::test_default(1, "E1", "Owner", 9, 10);
+            actor.lifecycle.object_alive = false;
+            actor.locomotor = Some(super::super::locomotor::LocomotorState::for_test_kind(
+                crate::rules::locomotor_type::LocomotorKind::Walk,
+            ));
+            actor
+                .locomotor
+                .as_mut()
+                .unwrap()
+                .set_step_head(Some(DriveCoord::cell(10, 10, 0)));
+            actor
+                .foot_speed
+                .set_speed_fraction(SimFixed::from_num(0.75));
+            actor
+                .navigation
+                .path_runtime
+                .set_scold_latch_for_test(row["supplied_byte"].as_u64().unwrap() as u8);
+            let body_before = actor.body_facing;
+            assert!(finish_fresh_head(&mut actor, 100));
+            assert_eq!(
+                u64::from(actor.navigation.path_runtime.scold_latch_raw()),
+                row["final_byte"].as_u64().unwrap()
+            );
+            assert_eq!(
+                actor.locomotor.as_ref().unwrap().walk_animation_moving(),
+                Some(row["motion"] == 1)
+            );
+            assert_eq!(
+                actor.foot_speed.applied_fraction(),
+                SimFixed::from_num(row["speed_fraction"].as_f64().unwrap())
+            );
+            assert_eq!(actor.body_facing, body_before, "a dead owner turns nothing");
+            checked += 1;
+        }
+        assert_eq!(checked, 3);
+    }
+
+    #[test]
     fn slave_priority_reserves_head_through_live_master_occupation_without_rng() {
         use super::super::locomotor::{LocomotorState, MovementLayer};
         use crate::map::entities::EntityCategory;
@@ -175,7 +231,7 @@ mod tests {
             game_entity::GameEntity,
             intern::StringInterner,
             occupancy::{CellListInsertion, OccupancyGrid},
-            slave_miner::SlaveHarvester,
+            slave_manager::SlaveManager,
         };
         let rules = RuleSet::from_ini(&IniFile::from_str(
             "[BuildingTypes]\n0=MASTER\n[MASTER]\nFoundation=1x1\n[InfantryTypes]\n0=SLAV\n",
@@ -188,6 +244,9 @@ mod tests {
         master.owner = owner;
         master.type_ref = interner.intern("MASTER");
         master.category = EntityCategory::Structure;
+        let slav = interner.intern("SLAV");
+        // An existing manager that does not hold the slave refuses it.
+        master.slave_manager = Some(SlaveManager::new(slav, [None; 0], 0, 0, 0));
         entities.insert(master);
         let mut slave = GameEntity::test_default(2, "SLAV", "Owner", 3, 4);
         slave.owner = owner;
@@ -201,7 +260,7 @@ mod tests {
             next_index: 1,
             ..Default::default()
         });
-        slave.slave_harvester = Some(SlaveHarvester::new(1, 4));
+        slave.slave = crate::sim::slave_manager::SlaveLink::for_test(Some(1), Vec::new());
         let current = super::super::ground_pose::position_world_coord(&slave.position);
         entities.insert(slave);
         let terrain = ResolvedTerrainGrid::from_cells(
@@ -229,7 +288,6 @@ mod tests {
         raw_at(&mut raw, owner, current, true, Some(&terrain), None);
         let mut rng = crate::sim::rng::SimRng::new(31);
         let rng_before = rng.logical_state();
-        let mut bindings = std::collections::BTreeMap::from([(1, vec![])]);
         assert!(!prepare_step_head(
             &mut entities,
             2,
@@ -239,7 +297,6 @@ mod tests {
             None,
             Some(&rules),
             &interner,
-            Some(&bindings),
             &mut rng
         ));
         assert_eq!(
@@ -247,7 +304,8 @@ mod tests {
             4,
             "failed selection restores the cleared current slot"
         );
-        bindings.insert(1, vec![2]);
+        entities.get_mut(1).unwrap().slave_manager =
+            Some(SlaveManager::new(slav, [Some(2)], 0, 0, 0));
         assert!(prepare_step_head(
             &mut entities,
             2,
@@ -257,7 +315,6 @@ mod tests {
             None,
             Some(&rules),
             &interner,
-            Some(&bindings),
             &mut rng
         ));
         assert_eq!(
@@ -463,6 +520,16 @@ mod tests {
             let input = &row["input"];
             let mut entity = GameEntity::test_default(1, "E1", "Owner", 9, 10);
             entity.category = crate::map::entities::EntityCategory::Infantry;
+            if input["infantry_constructor_facing"]
+                .as_bool()
+                .unwrap_or(false)
+            {
+                // The Infantry constructor's rate 127 (`0x00517BC5`).
+                entity.set_body_facing_rot(0);
+            } else {
+                // Retain the older corpus's explicitly supplied rate0 owner.
+                entity.body_facing = super::super::FacingClass::new(0, 0);
+            }
             entity.owner = InternedId::from_index(41);
             entity.position.sub_x = SimFixed::from_num(input["sub"][0].as_i64().unwrap());
             entity.position.sub_y = SimFixed::from_num(input["sub"][1].as_i64().unwrap());
@@ -529,7 +596,6 @@ mod tests {
                 None,
                 None,
                 &StringInterner::new(),
-                None,
                 &mut rng
             ));
             let entity = entities.get_mut(1).unwrap();
@@ -547,11 +613,11 @@ mod tests {
                 Some(row["motion"] == 1)
             );
             assert_eq!(
-                serde_json::to_value(entity.body_facing.unwrap()).unwrap(),
+                serde_json::to_value(entity.body_facing).unwrap(),
                 row["facing"]
             );
             assert_eq!(
-                entity.foot_speed.applied_fraction,
+                entity.foot_speed.applied_fraction(),
                 SimFixed::from_num(row["speed_fraction"].as_f64().unwrap())
             );
             assert_eq!(entity.navigation.path_replay.directions, vec![2, 3, 4, 5]);
@@ -643,11 +709,8 @@ pub(super) fn prepare_step_head(
     grid: Option<&PathGrid>,
     rules: Option<&crate::rules::ruleset::RuleSet>,
     interner: &crate::sim::intern::StringInterner,
-    bindings: Option<&std::collections::BTreeMap<u64, Vec<u64>>>,
     rng: &mut crate::sim::rng::SimRng,
 ) -> bool {
-    use super::locomotor::MovementLayer;
-    use crate::map::entities::EntityCategory;
     use crate::rules::locomotor_type::LocomotorKind;
     let Some(entity) = entities.get(id) else {
         return false;
@@ -669,13 +732,51 @@ pub(super) fn prepare_step_head(
         return true;
     };
     let is_walk = loco.kind == LocomotorKind::Walk;
-    let owner = entity.owner();
     let current = super::ground_pose::position_world_coord(&entity.position);
     let input = DriveCoord {
         x: i32::from(next.0) * 256 + if is_walk { current.x % 256 } else { 128 },
         y: i32::from(next.1) * 256 + if is_walk { current.y % 256 } else { 128 },
         z: current.z,
     };
+    prepare_step_head_at(
+        entities, id, occupancy, raw, terrain, grid, rules, interner, rng, input,
+    )
+}
+
+/// Walk75BC1A consumes the prospective coordinate already selected from the
+/// retained Foot path word. Its caller owns admission; this is the same
+/// priority/subcell/raw-occupation owner used by the adapter above.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepare_step_head_at(
+    entities: &mut crate::sim::entity_store::EntityStore,
+    id: u64,
+    occupancy: &crate::sim::occupancy::OccupancyGrid,
+    raw: &mut RawCellOccupationGrid,
+    terrain: Option<&ResolvedTerrainGrid>,
+    grid: Option<&PathGrid>,
+    rules: Option<&crate::rules::ruleset::RuleSet>,
+    interner: &crate::sim::intern::StringInterner,
+    rng: &mut crate::sim::rng::SimRng,
+    input: DriveCoord,
+) -> bool {
+    use super::locomotor::MovementLayer;
+    use crate::map::entities::EntityCategory;
+    use crate::rules::locomotor_type::LocomotorKind;
+    let Some(entity) = entities.get(id) else {
+        return false;
+    };
+    let Some(loco) = entity.locomotor.as_ref() else {
+        return true;
+    };
+    if !matches!(loco.kind, LocomotorKind::Walk | LocomotorKind::Hover)
+        || loco.step_head().is_some()
+    {
+        return true;
+    }
+    let is_walk = loco.kind == LocomotorKind::Walk;
+    let owner = entity.owner();
+    let current = super::ground_pose::position_world_coord(&entity.position);
+    let next = ((input.x / 256) as u16, (input.y / 256) as u16);
     let (head, sub) = if is_walk {
         //75C2A0 first; even a failed chooser must restore current raw at75C62A.
         raw_at(raw, owner, current, false, terrain, grid);
@@ -714,10 +815,9 @@ pub(super) fn prepare_step_head(
         }
         //75C434 still executes when the ordinary target already granted
         //priority. Its map lookups cannot be elided by boolean short-circuit.
-        if let (Some(terrain), Some(rules), Some(bindings)) = (terrain, rules, bindings) {
+        if let (Some(terrain), Some(rules)) = (terrain, rules) {
             let query = crate::sim::slave_deposit::SlaveDepositQuery {
                 entities,
-                bindings,
                 occupancy,
                 terrain,
                 rules,
@@ -795,7 +895,11 @@ pub(super) fn prepare_step_head(
             DriveCoord {
                 x: input.x,
                 y: input.y,
-                z: ground.wrapping_add(if bridge { 416 } else { 0 }),
+                z: ground.wrapping_add(if bridge {
+                    crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS
+                } else {
+                    0
+                }),
             },
             None,
         )

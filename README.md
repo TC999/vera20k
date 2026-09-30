@@ -1,92 +1,71 @@
 <img src="docs/images/new-conscirpt-hero-image.png" alt="VERA20k hero image" width="100%">
 
+# VERA20k
+
+VERA20k is a rewrite of the Red Alert 2: Yuri's Revenge engine (`gamemd.exe`) in Rust. It ports
+the original game's behavior one mechanic at a time, and aims to scale up to 30 players and
+20,000 units. Unlike [OpenRA](https://www.openra.net), which remakes the classic games on its
+own engine, it tries to reproduce Yuri's Revenge itself.
+
+You'll need your own copy of the game. EA sells it in *Command & Conquer The Ultimate
+Collection*, on [Steam](https://store.steampowered.com/bundle/39394/) and on
+[EA's site](https://www.ea.com/games/command-and-conquer/command-and-conquer-the-ultimate-collection/buy/pc).
+
 <img src="docs/images/vera20k-screenshots.png" alt="VERA20k skirmish setup screen and in-game view" width="100%">
 
-[![VERA20K Discord](https://img.shields.io/badge/VERA20K%20Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.gg/kmjRUn5m5F)
+## Status
 
-Red Alert 2: Yuri's Revenge — rebuilt from scratch in Rust for large multiplayer battles.
+Pre-alpha (September 2026). You can play a local skirmish on the retail maps on Windows, against
+a placeholder AI. A lot of the game works already: retail and random maps, the original menus
+and sidebar, base building and power, the tech tree, the miners, infantry, vehicle, naval and
+base-defense combat, garrisons, transports, engineers, cloaking, some support powers, and save
+and load.
 
-This project stands on the shoulders of giants. Thanks to OpenRA, XCC mixer, ModEnc website, PPM website, EA for open source RA1, World Altering Editor, Final Alert,YRpp, Ares, Phobos and much more.
+Aircraft attack runs, mind control, crates, death effects and some bridge types are partly
+done. Not there yet: multiplayer, the original AI, the campaign and most map triggers, the
+movies, and several special weapons and superweapons, such as the Chrono Legionnaire, Prism
+chaining, the Nuke and the Chronosphere. The 30-player, 20,000-unit scale hasn't been
+demonstrated yet.
 
-VERA20K operates after contributor-owned cooperative principles. Contributors earn equity shares through contributions or donations. Those shares give automatically income rights and governance weight.
+## Running it
 
----
+You need Rust 1.88 or newer, a GPU with Vulkan, DirectX 12 or Metal, and the game installed.
+It's been played on Windows, Linux and macOS, and CI builds and tests all three.
 
-## Project Goals
+```sh
+git clone https://github.com/YuriPlanet/vera20k.git
+cd vera20k
+cp config.toml.example config.toml   # then set ra2_dir to your game folder
+cargo run --release --bin vera20k    # always --release: debug builds are too slow to play
+```
 
-<small>
+The tests don't need the game: `cargo test -p vera20k --lib`. See
+[CONTRIBUTING.md](CONTRIBUTING.md#set-up) for more setup details, including where VERA20k looks
+for `config.toml`.
 
-**1.**
-Engine true to the original Westwood game: visuals, atmosphere, gameplay.
+## How it's built
 
-**2.**
-Built for big multiplayer: targeting support for 30 players, 20,000 units, larger maps.
-
-**3.**
-Room for RTS features the original never had.
-
-## Development process
-
-The reference is the decompiled `gamemd.exe`. New behavior is read from the original function in Ghidra first, and the Rust that matches it cites that function and address; 1,100+ reverse-engineering notes in `docs/research/` back this. Playtesting in retail and in VERA decides what gets worked on next.
-
-For executable comparisons, see the [native oracle workflow](tools/native_oracle.md):
-run original game code under Unicorn and compare its outputs with production Rust.
-
-## Current Status
-
-**Early development** — Work is focused on the core engine. Approximately 40% complete.
-
-**Runs today** (still being matched to the original engine):
-
-- Retail Yuri's Revenge maps with the original menus, loading screen and sidebar
-- Base building, power, tech tree, placement, selling and repair
-- Harvesting with War, Chrono and Slave miners
-- Ground, naval, air and spawned-unit combat; garrisons, transports, engineer capture, mind control, cloak
-- Lightning Storm, Iron Curtain, Force Shield, Genetic Mutator, Psychic Reveal, Paradrop
-- Save/load mid-match, match recording and replay
-
-**Not yet**
-
-- Network play (lockstep and checksums exist, no transport)
-- A real AI opponent (the current one builds a base and sends waves)
-- Nuke, Chronosphere, Psychic Dominator, Spy Plane
-- Campaign missions and most map triggers
-
-
-## Requirements
-
-- [Rust](https://rustup.rs/) 1.85+ (edition 2024)
-- A copy of **Red Alert 2: Yuri's Revenge** (the engine reads .mix files from your install)
-
-
-## Setup
-
-1. Clone the repo:
-   ```
-   git clone https://github.com/YuriPlanet/vera20k.git
-   cd vera20k
-   ```
-
-2. Copy the example config and set your RA2 install path:
-   ```
-   cp config.toml.example config.toml
-   ```
-   Edit `config.toml` and set `ra2_dir` to where your RA2/YR is installed.
-
-3. Build and run:
-   ```
-   cargo run --bin vera20k
-   ```
+The original `gamemd.exe` is the reference. Newer gameplay code names the original function it
+was ported from, and [native harnesses](tools/native_oracle.md) run the original code to check
+the Rust results. Most of the code is written by AI coding agents that I direct, following the
+rules in [AGENTS.md](AGENTS.md).
 
 ## Contributing
 
-Read the [architecture overview](https://yuriplanet.github.io/vera20k/) before diving in.
+Help is welcome, and you don't need reverse-engineering experience. Playing VERA20k next to the
+original and reporting differences helps a lot, and so does trying it on Linux or macOS. Start
+with [CONTRIBUTING.md](CONTRIBUTING.md) or the
+[good first issues](https://github.com/YuriPlanet/vera20k/labels/good%20first%20issue), or say
+hi on [Discord](https://discord.gg/kmjRUn5m5F). For more depth there's the
+[architecture overview](https://yuriplanet.github.io/vera20k/), the
+[native oracle](tools/native_oracle.md) and the [research notes](docs/research/README.md).
 
-1. Fork the repo
-2. Create a feature branch (`git checkout -b feature/my-feature`)
-3. Make your changes and commit
-4. Push to your fork and open a Pull Request
+## Credits and legal
 
-## License
+Thanks to OpenRA, XCC Mixer, the ModEnc wiki, Project Perfect Mod, EA's GPL source release of
+Command & Conquer and Red Alert, World-Altering Editor, Final Alert, YRpp, Ares, Phobos and
+many others.
 
-- [GNU General Public License v3.0](LICENSE-GPL)
+Licensed under the [GPLv3](LICENSE-GPL). This repository contains no game files. Command &
+Conquer and Red Alert are trademarks of Electronic Arts Inc., and the screenshots show game art
+owned by Electronic Arts. VERA20k is not affiliated with or endorsed by Electronic Arts.

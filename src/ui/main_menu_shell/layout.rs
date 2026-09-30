@@ -2,14 +2,15 @@
 
 use super::state::MainMenuControlId;
 use crate::ui::shell::descriptor::{
-    AnchorRule, BgKind, ControlDescriptor, ControlKind, DialogDescriptor, DialogId,
-    RepositionPolicy,
+    AnchorRule, BgKind, ControlDescriptor, ControlKind, DialogDescriptor, DialogId, HEADING_ANCHOR,
+    MONITOR_ANCHOR, RepositionPolicy,
 };
 use crate::ui::shell::geom::SDBTNANM_CELL_W_NARROW;
 pub use crate::ui::shell::geom::{RIGHT_PANEL_TILE_H, RIGHT_PANEL_WIDTH};
 pub use crate::ui::shell::geom::{RectPx, RightPanelRects};
 use crate::ui::shell::geom::{dlu_rect, lower_strip_rect, right_panel_rects};
 use crate::ui::shell::layout::{LaidOutControl, layout_pass};
+use crate::ui::shell::warning_monitor::WARNING_MONITOR_CONTROL;
 
 pub const SHELL_BASE_W: i32 = 800;
 pub const SHELL_BASE_H: i32 = 600;
@@ -51,7 +52,8 @@ pub struct MainMenuShellLayout {
     /// Bottom-left hover tooltip/status static. Receives the CSF tooltip for the
     /// control under the cursor and is otherwise blank.
     pub tooltip_line: RectPx,
-    pub website_static: RectPx,
+    /// Static `0x71C` window rect (the animated SDWRNANM monitor).
+    pub warning_monitor: RectPx,
     pub buttons: [MainMenuButtonRect; 6],
     pub right_panel: RightPanelRects,
     pub lower_strip: RectPx,
@@ -79,40 +81,22 @@ pub fn movie_base_for_screen_width(screen_w: u32) -> MainMenuMovieBase {
     }
 }
 
-/// Bottom-left tooltip/status rect anchored to the screen bottom-left.
-///
-/// X is offset `+10` px from the centering margin; Y places the control's
-/// bottom edge one pixel above the screen bottom (or above the centered
-/// shell's bottom on oversized screens).
+/// Status line `0x695` window (template `(2, 355, 303, 12)` DLU).
 fn tooltip_line_rect(screen_w: i32, screen_h: i32) -> RectPx {
-    let base = dlu_rect(2, 355, 303, 12);
-    let ctrl_w = base.w;
-    let ctrl_h = base.h;
-    let delta_x = if screen_w > SHELL_BASE_W {
-        (screen_w - SHELL_BASE_W) / 2
-    } else {
-        0
-    };
-    let delta_y = if screen_h > SHELL_BASE_H {
-        (screen_h - SHELL_BASE_H) / 2
-    } else {
-        0
-    };
-    let x = delta_x + 10;
-    let y = screen_h - ctrl_h - delta_y - 1;
-    RectPx::new(x, y, ctrl_w, ctrl_h)
+    crate::ui::shell::layout::status_line_rect(RectPx::new(2, 355, 303, 12), screen_w, screen_h)
 }
 
 /// Bottom-right version-line rect anchored to the SDBTM lower-cap bottom edge.
 ///
 /// The retail layout pass uses a sidebar inset of `(168 - ctrl_w) / 2` on the
-/// X axis (3 px at the standard 162 px control width), shifted left by
-/// `max(0, (screen_w - 800) / 2)` on widescreens. Y anchors the control's
-/// bottom edge to the bottom edge of the right-panel lower cap.
+/// X axis, shifted left by `max(0, (screen_w - 800) / 2)` on widescreens. Y
+/// anchors the control's bottom edge to the bottom edge of the right-panel
+/// lower cap. The runtime window is one pixel wider and taller than the DLU
+/// conversion, as for the heading, the monitor and the status line.
 fn version_line_rect(screen_w: i32, right_panel: RightPanelRects) -> RectPx {
     let base = dlu_rect(425, 357, 108, 10);
-    let ctrl_w = base.w;
-    let ctrl_h = base.h;
+    let ctrl_w = base.w + 1;
+    let ctrl_h = base.h + 1;
     let inset = (RIGHT_PANEL_WIDTH - ctrl_w) / 2;
     let delta_x = if screen_w > SHELL_BASE_W {
         (screen_w - SHELL_BASE_W) / 2
@@ -153,7 +137,7 @@ fn button_ctrl(
 }
 
 /// Dialog 0xE2 descriptor: the six owner-draw buttons (five stacked + Exit) plus
-/// the 0x694 heading and the 0x71b Yuri-website static. The bottom-anchored
+/// the 0x694 heading and the 0x71C warning monitor. The bottom-anchored
 /// version/tooltip statics keep their bespoke shell helpers for now (no verified
 /// resource id; one-of-a-kind anchors), so they are computed outside this table.
 fn dialog_descriptor() -> DialogDescriptor {
@@ -197,26 +181,21 @@ fn dialog_descriptor() -> DialogDescriptor {
                 id: 0x0694,
                 kind: ControlKind::Static,
                 dlu_rect: RectPx::new(425, 1, 108, 10),
-                anchor: AnchorRule::RightAnchorRuntimeAdjust {
-                    resource_dw: 1,
-                    resource_dh: 1,
-                    dy: 7,
-                    dh: 1,
-                },
+                anchor: HEADING_ANCHOR,
                 csf_key: None,
                 tooltip_key: None,
                 group: 0,
                 enabled: true,
                 visible: true,
             },
-            // 0x71b Yuri-website static: plain right-anchor.
+            // 0x71C SDWRNANM warning monitor (kind 4).
             ControlDescriptor {
-                id: 0x071B,
+                id: WARNING_MONITOR_CONTROL,
                 kind: ControlKind::Static,
                 dlu_rect: RectPx::new(447, 29, 61, 33),
-                anchor: AnchorRule::RightAnchor,
-                csf_key: Some("TXT_YURI_WEBSITE"),
-                tooltip_key: Some("STT:MainButtonYuriWebSite"),
+                anchor: MONITOR_ANCHOR,
+                csf_key: None,
+                tooltip_key: None,
                 group: 0,
                 enabled: true,
                 visible: true,
@@ -248,7 +227,7 @@ pub fn compute_layout(screen_w: u32, screen_h: u32) -> MainMenuShellLayout {
     let version_line = version_line_rect(screen_w, right_panel);
     let tooltip_line = tooltip_line_rect(screen_w, screen_h);
 
-    // Owner-draw buttons + the 0x694 heading + 0x71b website static are laid out
+    // Owner-draw buttons + the 0x694 heading + 0x71C monitor static are laid out
     // by the shared shell pass (contract C7: DLU->pixel once, then include-set
     // re-anchor). The bottom-anchored version/tooltip statics keep their bespoke
     // helpers above.
@@ -261,7 +240,7 @@ pub fn compute_layout(screen_w: u32, screen_h: u32) -> MainMenuShellLayout {
         title: rect_for(&laid, 0x0694),
         version_line,
         tooltip_line,
-        website_static: rect_for(&laid, 0x071B),
+        warning_monitor: rect_for(&laid, WARNING_MONITOR_CONTROL),
         buttons: [
             MainMenuButtonRect {
                 id: MainMenuControlId::SinglePlayer0x683,
@@ -330,7 +309,7 @@ pub fn compute_responsive_layout(screen_w: u32, screen_h: u32) -> MainMenuShellL
         title: scale_rect(base.title, scale_x, scale_y),
         version_line: scale_rect(base.version_line, scale_x, scale_y),
         tooltip_line: scale_rect(base.tooltip_line, scale_x, scale_y),
-        website_static: scale_rect(base.website_static, scale_x, scale_y),
+        warning_monitor: scale_rect(base.warning_monitor, scale_x, scale_y),
         buttons,
         right_panel,
         lower_strip,
@@ -379,20 +358,21 @@ mod tests {
 
     #[test]
     fn tooltip_line_anchors_bottom_left_with_10_px_inset() {
-        // DLU (2, 355, 303, 12) at 800x600 → pixel (3, 577, 455, 20).
-        // Bottom-left layout pass: X = 0 + 10 = 10, Y = 600 - 20 - 0 - 1 = 579.
+        // DLU (2, 355, 303, 12) at 800x600 → pixel (3, 577, 455, 20), one
+        // pixel larger at runtime (456x21). 0x0060B550: X = 0 + 10 = 10,
+        // Y = 600 - 21 - 0 - 1 = 578.
         let layout = compute_layout(800, 600);
-        assert_eq!(layout.tooltip_line, RectPx::new(10, 579, 455, 20));
+        assert_eq!(layout.tooltip_line, RectPx::new(10, 578, 456, 21));
     }
 
     #[test]
     fn version_line_uses_sidebar_inset_and_bottom_cap_anchor() {
-        // DLU (425, 357, 108, 10) at 800x600 → pixel (638, 580, 162, 16) raw.
-        // Sidebar inset = (168 - 162) / 2 = 3 → final X = 800 - 3 - 162 = 635.
-        // Bottom-cap anchor: right_panel.bottom = (632, 577, 168, 23);
-        // bottom_edge = 600. Y = 600 - 16 = 584.
+        // DLU (425, 357, 108, 10) at 800x600 → pixel (638, 580, 162, 16) raw,
+        // one pixel larger at runtime (163x17). Sidebar inset = (168 - 163) / 2
+        // = 2 → X = 800 - 2 - 163 = 635. Bottom-cap anchor: right_panel.bottom
+        // = (632, 577, 168, 23); bottom_edge = 600. Y = 600 - 17 = 583.
         let layout = compute_layout(800, 600);
-        assert_eq!(layout.version_line, RectPx::new(635, 584, 162, 16));
+        assert_eq!(layout.version_line, RectPx::new(635, 583, 163, 17));
     }
 
     #[test]

@@ -4,13 +4,18 @@
 //! profile, filesystem, audio device, window, or child-dialog callback.
 
 use crate::ui::client_theme;
+use crate::ui::shell::trackbar::{
+    TrackbarHold, TrackbarPress, thumb_left, trackbar_position_from_x, trackbar_press,
+};
 
 pub(crate) mod shell;
 
 /// gamemd-derived: launcher owner `OptionsClass__ShowLauncherDialog @
 /// 0x0055FC80` and its primary-proc slice `0x0055FDB0..0x0056047A` bind the
-/// RT_DIALOG `0xD5` controls to these launcher-local CSF keys/fallbacks.
-pub(crate) const LAUNCHER_LABEL_SPECS: [(&str, &str); 34] = [
+/// RT_DIALOG `0xD5` controls to these launcher-local CSF keys/fallbacks. The
+/// template's slider captions (`GUI:HigherDetail`, `GUI:Harder`,
+/// `GUI:Faster`) never show: the init renames them by position.
+pub(crate) const LAUNCHER_LABEL_SPECS: [(&str, &str); 31] = [
     ("GUI:OptionsMenu", "Options"),
     ("GUI:MainMenu", "Main Menu"),
     ("GUI:Keyboard", "Keyboard"),
@@ -30,9 +35,6 @@ pub(crate) const LAUNCHER_LABEL_SPECS: [(&str, &str); 34] = [
     ("GUI:SoundVolume", "Sound Volume"),
     ("GUI:VoiceVolume", "Voice Volume"),
     ("GUI:Blank", ""),
-    ("GUI:HigherDetail", "Higher"),
-    ("GUI:Harder", "Harder"),
-    ("GUI:Faster", "Faster"),
     ("TXT_LOW", "Low"),
     ("TXT_HIGH", "High"),
     ("TXT_EASY", "Easy"),
@@ -68,9 +70,6 @@ pub(crate) struct LauncherOptionsLabels {
     pub(crate) sound_volume: String,
     pub(crate) voice_volume: String,
     pub(crate) blank: String,
-    higher_detail: String,
-    harder: String,
-    faster: String,
     low: String,
     high: String,
     easy: String,
@@ -105,22 +104,19 @@ impl LauncherOptionsLabels {
             sound_volume: label(16),
             voice_volume: label(17),
             blank: label(18),
-            higher_detail: label(19),
-            harder: label(20),
-            faster: label(21),
-            low: label(22),
-            high: label(23),
-            easy: label(24),
-            normal: label(25),
-            hard: label(26),
+            low: label(19),
+            high: label(20),
+            easy: label(21),
+            normal: label(22),
+            hard: label(23),
             scroll_tokens: [
+                label(24),
+                label(25),
+                label(26),
                 label(27),
                 label(28),
                 label(29),
                 label(30),
-                label(31),
-                label(32),
-                label(33),
             ],
         }
     }
@@ -316,7 +312,9 @@ impl LauncherTrackbarId {
         }
     }
 
-    const fn plaque_reserve(self) -> i32 {
+    /// The value plaque's reserve; Detail, Difficulty and Scroll turn the
+    /// plaque off (`0x4AC` with 0).
+    pub(crate) const fn plaque_reserve(self) -> i32 {
         match self {
             Self::Detail | Self::Difficulty | Self::Scroll => 0,
             Self::Score | Self::Sound | Self::Voice => 50,
@@ -562,7 +560,7 @@ fn trackbar_paint_geometry(
     id: LauncherTrackbarId,
     position: u8,
 ) -> TrackbarPaintGeometry {
-    // gamemd-derived: `TrackBar_ProcessMouse @ 0x0061D950` and its owner-draw
+    // gamemd-derived: `ShellTrackbar__WndProc @ 0x0061D950` and its owner-draw
     // path share the literal 12x22 grip, 6px rail inset, and plaque reserve;
     // paint therefore consumes the same integer `thumb_left` as admission.
     let width = control.width();
@@ -578,7 +576,12 @@ fn trackbar_paint_geometry(
             bottom: rail_top + 4,
         },
         thumb: PhysicalLocalRect::from_min_size(
-            thumb_left(position, width, id.plaque_reserve(), id.maximum()),
+            thumb_left(
+                i32::from(position),
+                width,
+                id.plaque_reserve(),
+                i32::from(id.maximum()),
+            ),
             thumb_top,
             12,
             22,
@@ -605,6 +608,7 @@ pub(crate) struct PhysicalControlFrame {
 }
 
 impl PhysicalControlFrame {
+    #[cfg(test)]
     pub(crate) fn from_logical(
         left: f64,
         top: f64,
@@ -640,27 +644,23 @@ pub(crate) fn admitted_volume_position(volume: f32) -> u8 {
     admitted_initial_position(request.trunc() as i64, 10)
 }
 
-/// gamemd-derived: `TrackBar_ProcessMouse @ 0x0061D950` uses the literal
-/// reserve/13/12/6 geometry and `(range + 1)` integer partition below.
-pub(crate) fn trackbar_position_from_x(
-    raw_mouse_x: i32,
-    client_width: i32,
-    plaque_reserve: i32,
-    maximum: u8,
-) -> u8 {
-    let usable_span = (client_width - plaque_reserve - 13).max(1);
-    let maximum_track_x = (client_width - plaque_reserve - 12).max(1);
-    let track_x = (raw_mouse_x - 6).clamp(1, maximum_track_x);
-    let relative = ((track_x - 1) * (i32::from(maximum) + 1)) / usable_span;
-    relative.min(i32::from(maximum)) as u8
+/// Detail caption by position: `TXT_LOW`, else `TXT_HIGH` (table
+/// `0x0082A248` entries 0 and 2).
+fn detail_caption(labels: &LauncherOptionsLabels, position: u8) -> String {
+    if position == 0 {
+        labels.low.clone()
+    } else {
+        labels.high.clone()
+    }
 }
 
-pub(crate) fn thumb_left(position: u8, client_width: i32, reserve: i32, maximum: u8) -> i32 {
-    let usable_span = (client_width - reserve - 13).max(1);
-    // Original 0x0061E486..0x0061E4A8 (TBM_SETPOS) and
-    // 0x0061DC44..0x0061DC58 (drag) divide the painted offset by range.
-    // Mouse quantization above deliberately uses range + 1 instead.
-    1 + i32::from(position) * usable_span / i32::from(maximum).max(1)
+/// Difficulty caption by position (table `0x0082A254`).
+fn difficulty_caption(labels: &LauncherOptionsLabels, position: u8) -> String {
+    match position {
+        0 => labels.easy.clone(),
+        1 => labels.normal.clone(),
+        _ => labels.hard.clone(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -674,7 +674,8 @@ pub(crate) struct OptionsDialogState {
     detail_caption: String,
     difficulty_caption: String,
     scroll_caption: String,
-    capture: Option<LauncherTrackbarId>,
+    /// The slider holding the mouse since a press on it.
+    capture: Option<TrackbarHold<LauncherTrackbarId>>,
     pending_events: Vec<LauncherOptionsEvent>,
     pending_result: Option<LauncherParentResult>,
     shell_interaction: shell::ShellInteraction,
@@ -714,10 +715,17 @@ impl OptionsDialogState {
         values.voice_position = admitted_initial_position(i64::from(values.voice_position), 10);
         let selected_resolution =
             selected_resolution.filter(|index| *index < resolution_rows.len());
+        // The 0x497 init sets each trackbar's range and position; every change
+        // sends WM_HSCROLL (0x0061E609..0x0061E6AF), whose handler
+        // (0x0055FF68) names the position (tables 0x0082A248 / 0x0082A254 /
+        // 0x0082A260), so the resource captions never show.
+        let detail_caption = detail_caption(&labels, values.detail_position);
+        let difficulty_caption = difficulty_caption(&labels, values.difficulty_position);
+        let scroll_caption = labels.scroll_tokens[usize::from(values.scroll_position)].clone();
         Self {
-            detail_caption: labels.higher_detail.clone(),
-            difficulty_caption: labels.harder.clone(),
-            scroll_caption: labels.faster.clone(),
+            detail_caption,
+            difficulty_caption,
+            scroll_caption,
             labels,
             values,
             resolution_rows,
@@ -788,20 +796,12 @@ impl OptionsDialogState {
         *slot = position;
         match id {
             LauncherTrackbarId::Detail => {
-                self.detail_caption = if position == 0 {
-                    self.labels.low.clone()
-                } else {
-                    self.labels.high.clone()
-                };
+                self.detail_caption = detail_caption(&self.labels, position);
                 self.pending_events
                     .push(LauncherOptionsEvent::Cue(LauncherCue::GenericClick));
             }
             LauncherTrackbarId::Difficulty => {
-                self.difficulty_caption = match position {
-                    0 => self.labels.easy.clone(),
-                    1 => self.labels.normal.clone(),
-                    _ => self.labels.hard.clone(),
-                };
+                self.difficulty_caption = difficulty_caption(&self.labels, position);
                 self.pending_events
                     .push(LauncherOptionsEvent::Cue(LauncherCue::GenericClick));
             }
@@ -822,39 +822,29 @@ impl OptionsDialogState {
         }
     }
 
-    /// gamemd-derived: the initial down row of `TrackBar_ProcessMouse @
-    /// 0x0061D950` requires `y > bottom - 18`; thumb-down captures without a
-    /// jump, while a rail down jumps once and does not capture.
+    /// A press on one trackbar ([`trackbar_press`]).
     pub(crate) fn trackbar_mouse_down(
         &mut self,
         id: LauncherTrackbarId,
         frame: PhysicalControlFrame,
     ) {
-        if (id.is_audio() && !self.launcher_audio_available)
-            || frame.local_x < 0
-            || frame.local_x >= frame.width
-            || frame.local_y <= frame.height - 18
-            || frame.local_y >= frame.height
-        {
+        if id.is_audio() && !self.launcher_audio_available {
             return;
         }
-        let left = thumb_left(
-            self.trackbar_position(id),
-            frame.width,
-            id.plaque_reserve(),
-            id.maximum(),
-        );
-        if (left..left + 12).contains(&frame.local_x) {
-            self.capture = Some(id);
-            return;
-        }
-        let position = trackbar_position_from_x(
+        let press = trackbar_press(
+            i32::from(self.trackbar_position(id)),
             frame.local_x,
+            frame.local_y,
             frame.width,
+            frame.height,
             id.plaque_reserve(),
-            id.maximum(),
+            i32::from(id.maximum()),
         );
-        self.set_trackbar_position(id, position);
+        self.capture = press.hold(id);
+        if let TrackbarPress::Jump(position) = press {
+            // The position never exceeds the byte-sized maximum.
+            self.set_trackbar_position(id, position as u8);
+        }
     }
 
     pub(crate) fn trackbar_mouse_move(
@@ -862,20 +852,20 @@ impl OptionsDialogState {
         id: LauncherTrackbarId,
         frame: PhysicalControlFrame,
     ) {
-        if self.capture != Some(id) {
+        if self.capture != Some(TrackbarHold { id, dragging: true }) {
             return;
         }
         let position = trackbar_position_from_x(
             frame.local_x,
             frame.width,
             id.plaque_reserve(),
-            id.maximum(),
+            i32::from(id.maximum()),
         );
-        self.set_trackbar_position(id, position);
+        self.set_trackbar_position(id, position as u8);
     }
 
     pub(crate) fn trackbar_mouse_up(&mut self, id: LauncherTrackbarId) {
-        if self.capture == Some(id) {
+        if self.capture.is_some_and(|hold| hold.id == id) {
             self.capture = None;
         }
     }
@@ -1504,7 +1494,7 @@ mod tests {
 
     #[test]
     fn exact_launcher_label_fallbacks_are_local_and_complete() {
-        const EXPECTED: [(&str, &str); 34] = [
+        const EXPECTED: [(&str, &str); 31] = [
             ("GUI:OptionsMenu", "Options"),
             ("GUI:MainMenu", "Main Menu"),
             ("GUI:Keyboard", "Keyboard"),
@@ -1524,9 +1514,6 @@ mod tests {
             ("GUI:SoundVolume", "Sound Volume"),
             ("GUI:VoiceVolume", "Voice Volume"),
             ("GUI:Blank", ""),
-            ("GUI:HigherDetail", "Higher"),
-            ("GUI:Harder", "Harder"),
-            ("GUI:Faster", "Faster"),
             ("TXT_LOW", "Low"),
             ("TXT_HIGH", "High"),
             ("TXT_EASY", "Easy"),
@@ -1567,9 +1554,6 @@ mod tests {
             labels.sound_volume.as_str(),
             labels.voice_volume.as_str(),
             labels.blank.as_str(),
-            labels.higher_detail.as_str(),
-            labels.harder.as_str(),
-            labels.faster.as_str(),
             labels.low.as_str(),
             labels.high.as_str(),
             labels.easy.as_str(),
@@ -1741,7 +1725,7 @@ mod tests {
     }
 
     #[test]
-    fn initial_captions_ignore_positions_and_only_changed_values_swap_tokens() {
+    fn captions_name_the_position_from_the_start_and_only_changes_click() {
         let mut state = OptionsDialogState::new(
             labels(),
             LauncherOptionsValues {
@@ -1754,18 +1738,16 @@ mod tests {
             None,
             true,
         );
-        assert_eq!(state.detail_caption, "Higher");
-        assert_eq!(state.difficulty_caption, "Harder");
-        assert_eq!(state.scroll_caption, "Faster");
+        // Retail opens with the positions named (TXT_LOW/HARD/SLOWEST here).
+        assert_eq!(state.detail_caption, "Low");
+        assert_eq!(state.difficulty_caption, "Hard");
+        assert_eq!(state.scroll_caption, "Slowest");
 
         state.set_trackbar_position(LauncherTrackbarId::Detail, 1);
         state.set_trackbar_position(LauncherTrackbarId::Difficulty, 2);
         state.set_trackbar_position(LauncherTrackbarId::Scroll, 6);
         assert_eq!(state.detail_caption, "High");
-        assert_eq!(
-            state.difficulty_caption, "Harder",
-            "unchanged move retains resource caption"
-        );
+        assert_eq!(state.difficulty_caption, "Hard", "an unchanged move");
         assert_eq!(state.scroll_caption, "Fastest");
         assert_eq!(
             state.drain_output().events,
@@ -1852,7 +1834,11 @@ mod tests {
                         position,
                         "scale={scale} id={id:?}"
                     );
-                    assert_eq!(state.capture, Some(id), "scale={scale} id={id:?}");
+                    assert_eq!(
+                        state.capture,
+                        Some(TrackbarHold { id, dragging: true }),
+                        "scale={scale} id={id:?}"
+                    );
 
                     let drag = production_frame(
                         scale,
@@ -1917,114 +1903,22 @@ mod tests {
     }
 
     #[test]
-    fn trackbar_formula_matches_all_canonical_d5_thresholds() {
-        let cases = [
-            (180, 0, 1, vec![(90, 0), (91, 1)]),
-            (180, 0, 2, vec![(62, 0), (63, 1), (118, 1), (119, 2)]),
-            (
-                180,
-                0,
-                6,
-                vec![
-                    (30, 0),
-                    (31, 1),
-                    (55, 2),
-                    (79, 3),
-                    (103, 4),
-                    (127, 5),
-                    (151, 6),
-                ],
-            ),
-            (
-                128,
-                50,
-                10,
-                vec![
-                    (12, 0),
-                    (13, 1),
-                    (19, 2),
-                    (25, 3),
-                    (31, 4),
-                    (37, 5),
-                    (43, 6),
-                    (49, 7),
-                    (55, 8),
-                    (61, 9),
-                    (67, 10),
-                ],
-            ),
-        ];
-        for (width, reserve, maximum, samples) in cases {
-            for (x, expected) in samples {
-                assert_eq!(
-                    trackbar_position_from_x(x, width, reserve, maximum),
-                    expected,
-                    "width={width} reserve={reserve} x={x}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn launcher_trackbar_position_and_painted_thumb_match_original_instruction_goldens() {
-        // Reproduced by tools/storage_oracle/launcher_trackbar.py from the
-        // hash-checked retail executable. This compares the separate native
-        // range+1 pointer partition and range-only retained paint calculation.
-        let golden: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../tools/storage_oracle/launcher_trackbar.json"
-        ))
-        .unwrap();
-        // BBB/B8 add geometries to the shared oracle; retain original D5 coverage.
-        let geometries: Vec<_> = golden["geometries"].as_array().unwrap().iter()
-            .filter(|geometry| matches!(geometry["width"].as_i64(), Some(128 | 180))).collect();
-        assert_eq!(geometries.len(), 16);
-        let integer = |value: &serde_json::Value, key: &str| value[key].as_i64().unwrap() as i32;
-        let mut position_count = 0;
-        let mut pointer_count = 0;
-        for geometry in geometries {
-            let width = integer(geometry, "width");
-            let reserve = integer(geometry, "reserve");
-            let maximum = integer(geometry, "maximum") as u8;
-            for sample in geometry["positions"].as_array().unwrap() {
-                let position = integer(sample, "position") as u8;
-                let left = thumb_left(position, width, reserve, maximum);
-                assert_eq!(
-                    left,
-                    integer(sample, "thumb_left"),
-                    "{geometry:?} {sample:?}"
-                );
-                assert_eq!(left + 12, integer(sample, "thumb_right"));
-                position_count += 1;
-            }
-            for sample in geometry["pointers"].as_array().unwrap() {
-                let x = integer(sample, "x");
-                let position = trackbar_position_from_x(x, width, reserve, maximum);
-                assert_eq!(
-                    i32::from(position),
-                    integer(sample, "position"),
-                    "width={width} reserve={reserve} maximum={maximum} x={x}"
-                );
-                let left = thumb_left(position, width, reserve, maximum);
-                assert_eq!(left, integer(sample, "thumb_left"));
-                assert_eq!(left + 12, integer(sample, "thumb_right"));
-                pointer_count += 1;
-            }
-        }
-        assert_eq!(position_count, 92);
-        assert_eq!(pointer_count, 2736);
-    }
-
-    #[test]
     fn thumb_down_captures_without_jump_and_captured_motion_is_x_only() {
         let mut state = state(true);
         let before = state.trackbar_position(LauncherTrackbarId::Difficulty);
-        let left = thumb_left(before, 180, 0, 2);
+        let left = thumb_left(i32::from(before), 180, 0, 2);
         state.trackbar_mouse_down(LauncherTrackbarId::Difficulty, frame(left + 5, 23, 180, 24));
         assert_eq!(
             state.trackbar_position(LauncherTrackbarId::Difficulty),
             before
         );
-        assert_eq!(state.capture, Some(LauncherTrackbarId::Difficulty));
+        assert_eq!(
+            state.capture,
+            Some(TrackbarHold {
+                id: LauncherTrackbarId::Difficulty,
+                dragging: true,
+            })
+        );
         state.trackbar_mouse_move(LauncherTrackbarId::Difficulty, frame(179, -400, 180, 24));
         assert_eq!(state.trackbar_position(LauncherTrackbarId::Difficulty), 2);
         state.trackbar_mouse_up(LauncherTrackbarId::Difficulty);
@@ -2032,17 +1926,25 @@ mod tests {
     }
 
     #[test]
-    fn rail_jump_has_lower_strip_gate_and_never_captures() {
+    fn rail_jump_has_lower_strip_gate_and_holds_without_drag() {
         let mut state = state(true);
+        let held = Some(TrackbarHold {
+            id: LauncherTrackbarId::Scroll,
+            dragging: false,
+        });
         state.trackbar_mouse_down(LauncherTrackbarId::Scroll, frame(151, 6, 180, 24));
         assert_eq!(
             state.trackbar_position(LauncherTrackbarId::Scroll),
             3,
             "strict lower edge rejects"
         );
+        assert_eq!(state.capture, held);
+        state.trackbar_mouse_up(LauncherTrackbarId::Scroll);
         state.trackbar_mouse_down(LauncherTrackbarId::Scroll, frame(151, 7, 180, 24));
         assert_eq!(state.trackbar_position(LauncherTrackbarId::Scroll), 6);
-        assert_eq!(state.capture, None);
+        assert_eq!(state.capture, held);
+        state.trackbar_mouse_move(LauncherTrackbarId::Scroll, frame(0, 7, 180, 24));
+        assert_eq!(state.trackbar_position(LauncherTrackbarId::Scroll), 6);
     }
 
     #[test]

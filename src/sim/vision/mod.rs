@@ -102,6 +102,7 @@ impl CellVisibilityRuntime {
     const FLAG_TRANSIENT: u32 = 0x40;
     const FLAG_FOGGED_OBJECT_SNAPSHOT: u32 = 0x400000;
 
+    #[cfg(test)]
     fn set_fogged_object_snapshot(&mut self, present: bool) {
         if present {
             self.flags |= Self::FLAG_FOGGED_OBJECT_SNAPSHOT;
@@ -143,6 +144,7 @@ impl CellVisibilityRuntime {
     }
 
     /// Native `CellClass::Unshroud` flag projection; it is not a traversal.
+    #[cfg(test)]
     pub fn unshroud(&mut self) {
         self.alt_flags |= Self::ALT_GROUND_VISIBLE | Self::ALT_GROUND_OPEN;
         if self.shroud_counter > 0 {
@@ -222,20 +224,31 @@ fn iso_height_shift_cells(height_leptons: i32) -> i32 {
 
 /// Height above the map plane, in leptons, for one entity.
 ///
+/// Residual: this is not `ground_pose::object_world_z_leptons`. It ignores an
+/// exact coordinate and reads the stored level. Native See reads the object's
+/// coordinate Z, but VERA's sight records compare their origin every tick, so
+/// the exact Z (a Hover bob, a ramp step) would release and re-reveal the
+/// whole sight area each time and drift the hashed shroud counters. Native
+/// reveal cadence is unverified.
+///
 /// The engine keeps a single 3-D world coordinate per object and feeds its Z to
 /// both the reveal-centre shift and the line-of-sight viewer level, so terrain
-/// elevation and flight altitude are one quantity here too. The precedence
-/// between the three things that can hold an object up mirrors
-/// `render::locomotor_visual` exactly, so the shroud and the sprite cannot
-/// disagree about where the object is.
+/// elevation and flight altitude are one quantity here too. A falling object
+/// reads its Location Z, which the fall moves every frame anyway. Otherwise
+/// the precedence between the two things that can hold an object up mirrors
+/// `render::locomotor_visual`, so the shroud and the sprite cannot disagree
+/// about where the object is.
 fn entity_height_leptons(entity: &crate::sim::game_entity::GameEntity) -> i32 {
     use crate::rules::locomotor_type::LocomotorKind;
     use crate::sim::movement::locomotor::MovementLayer;
 
+    if entity.is_falling_down()
+        && let Some(z) = entity.position.exact_z_leptons
+    {
+        return z;
+    }
     let terrain: i32 = i32::from(entity.position.z) * LEPTONS_PER_HEIGHT_LEVEL;
-    let above_ground: i32 = if let Some(state) = entity.parachute_state.as_ref() {
-        state.altitude.to_num::<i32>()
-    } else if let Some(state) = entity.rocket_state.as_ref() {
+    let above_ground: i32 = if let Some(state) = entity.rocket_state.as_ref() {
         state.altitude.to_num::<i32>()
     } else {
         match entity.locomotor.as_ref() {
@@ -334,6 +347,7 @@ impl OwnerVisibility {
     }
 
     /// Mark a cell as both visible and revealed.
+    #[cfg(test)]
     pub fn mark_visible(&mut self, rx: u16, ry: u16) {
         self.mark_visible_with_fog_of_war(rx, ry, true);
         if let Some(index) = self.index(rx, ry) {
@@ -455,6 +469,7 @@ impl OwnerVisibility {
         &self.visibility_marks
     }
 
+    #[cfg(test)]
     fn set_fogged_object_snapshot(&mut self, rx: u16, ry: u16, present: bool) {
         let Some(index) = self.index(rx, ry) else {
             return;
@@ -510,6 +525,7 @@ impl OwnerVisibility {
 
     /// Merge revealed bits from a previous tick's grid into this one.
     /// Cells that were revealed before stay revealed even if no unit sees them now.
+    #[cfg(test)]
     pub fn merge_revealed_from(&mut self, other: &OwnerVisibility) {
         // If dimensions differ, fall back to per-cell copy for the overlapping region.
         if self.width == other.width && self.height == other.height {
@@ -715,6 +731,7 @@ impl FogState {
     /// Insert one shared frozen-building footprint record. Named location:
     /// `BuildingClass::FreezeInFog` installs the same FoggedObjectClass pointer
     /// into every occupy-list cell, not one allocation per cell.
+    #[cfg(test)]
     pub fn insert_fogged_object_footprint(
         &mut self,
         viewer: InternedId,
@@ -759,6 +776,7 @@ impl FogState {
     /// `ClearFoggedObjects` is not a symbol in this program. The address stays
     /// unbound rather than swapped for a positive match against an unrelated
     /// function.
+    #[cfg(test)]
     pub fn clear_fogged_objects_at(
         &mut self,
         viewer: InternedId,
@@ -809,6 +827,7 @@ impl FogState {
     }
 
     /// Native `FUN_00487110 (unlabelled; name not a symbol)`.
+    #[cfg(test)]
     pub fn set_cloaked_by_house(&mut self, house_index: u8, rx: u16, ry: u16) -> bool {
         let Some(word) = self.cloak_word_mut(rx, ry) else {
             return false;
@@ -820,6 +839,7 @@ impl FogState {
     }
 
     /// Native `FUN_00487130 (unlabelled; name not a symbol)`.
+    #[cfg(test)]
     pub fn clear_cloaked_by_house(&mut self, house_index: u8, rx: u16, ry: u16) -> bool {
         let Some(word) = self.cloak_word_mut(rx, ry) else {
             return false;
@@ -868,6 +888,7 @@ impl FogState {
         self.cloaked_by_houses.get(index).copied()
     }
 
+    #[cfg(test)]
     fn cloak_word_mut(&mut self, rx: u16, ry: u16) -> Option<&mut u32> {
         if rx >= self.width || ry >= self.height {
             return None;
@@ -904,6 +925,7 @@ impl FogState {
     /// - Frequency: continuous around stock submarines and detector units.
     /// - Downstream risk: sensor-driven resident-object `+0x420` reevaluation
     ///   and cloak-generator ownership remain separate mechanisms.
+    #[cfg(test)]
     pub fn sensors_add_at(
         &mut self,
         house: InternedId,
@@ -918,6 +940,7 @@ impl FogState {
     }
 
     /// Paired `TechnoClass::RemoveSensorsAt` @ `0x004DE940` decrement walk.
+    #[cfg(test)]
     pub fn sensors_remove_at(
         &mut self,
         house: InternedId,
@@ -1085,6 +1108,7 @@ impl FogState {
     }
 
     /// Native `CellClass::DrawObjectsCloaked`: no observer-mode bypass.
+    #[cfg(test)]
     pub fn draw_objects_cloaked(
         &self,
         current_player: Option<InternedId>,
@@ -1154,6 +1178,27 @@ impl FogState {
         None
     }
 
+    /// Native586360 tests Cell+12C bit8, which persists independently of the
+    /// current sight flag. Gameplay reads the viewer authority directly;
+    /// building a presentation cache cannot change destination admission.
+    pub(crate) fn is_ground_unshrouded(&self, owner: InternedId, rx: u16, ry: u16) -> bool {
+        self.by_owner.get(&owner).is_some_and(|view| {
+            view.index(rx, ry)
+                .and_then(|i| view.cell_runtime.get(i))
+                .is_some_and(|cell| cell.alt_flags & CellVisibilityRuntime::ALT_GROUND_VISIBLE != 0)
+        })
+    }
+
+    /// Aircraft FindFireLocation419986 reads Cell+12C bit16 directly. This is
+    /// independent of bit8 and of the presentation's merged sight cache.
+    pub(crate) fn is_ground_open(&self, owner: InternedId, rx: u16, ry: u16) -> bool {
+        self.by_owner.get(&owner).is_some_and(|view| {
+            view.index(rx, ry)
+                .and_then(|i| view.cell_runtime.get(i))
+                .is_some_and(|cell| cell.alt_flags & CellVisibilityRuntime::ALT_GROUND_OPEN != 0)
+        })
+    }
+
     /// Returns true if the owner (or a friendly ally) currently sees the cell.
     pub fn is_cell_visible(&self, owner: InternedId, rx: u16, ry: u16) -> bool {
         // Fast path: use pre-merged grid.
@@ -1208,6 +1253,7 @@ impl FogState {
 
     /// Clear all explored/revealed state for the given owner.
     /// Used by spy infiltration to reset an enemy's map knowledge.
+    #[cfg(test)]
     pub fn reset_explored_for_owner(&mut self, owner: InternedId) {
         let cells = self.rectangular_cells();
         self.transition_whole_map_for_owner(owner, cells, true, false);
@@ -1270,6 +1316,7 @@ impl FogState {
     /// Bit 3 = NW (rx-1, ry).
     ///
     /// Out-of-bounds neighbors are treated as shrouded (bit set).
+    #[cfg(test)]
     pub fn shroud_edge_mask(&self, owner: InternedId, rx: u16, ry: u16) -> u8 {
         let mut mask: u8 = 0;
         if ry == 0 || !self.is_cell_revealed(owner, rx, ry - 1) {
@@ -1404,6 +1451,7 @@ impl Default for VisionConfig {
 ///
 /// Creates a fresh `FogState` and populates it. Used by tests; production code
 /// calls `recompute_owner_visibility_in_place` to avoid per-tick allocation.
+#[cfg(test)]
 pub fn recompute_owner_visibility(
     entities: &EntityStore,
     path_grid: Option<&PathGrid>,
@@ -1559,7 +1607,6 @@ pub(crate) fn reveal_entity_vision(
 
 /// Explicit admitted release/readmit event (e.g. FootAI4DA6F7/4DA706),
 /// distinct from unchanged view reconciliation. The caller owns its timer/gates.
-#[cfg(test)]
 pub(crate) fn force_refresh_entity_vision(
     fog: &mut FogState,
     entity: &crate::sim::game_entity::GameEntity,
@@ -1957,7 +2004,34 @@ const REVEAL_MIRROR: [(i8, i8); 309] = [
     (0, -1), (0, -1), (0, -1), (0, -1), (0, -1), (0, -1), (0, -1),
 ];
 
-/// Public version of reveal_radius for use by external systems (e.g., RevealOnFire).
+/// `MapClass::IsShrouded @ 0x00586360`: the Cell under `point`, projected up
+/// by its height level, is not yet mapped (`open` answers the Cell's
+/// ground-open bit, `+0x12C & 0x08`); an odd level also tests the next cell
+/// (`0x00481810(3)`).
+pub(crate) fn coordinate_is_shrouded(
+    cells: &crate::map::resolved_terrain::NativeCellQuery<'_>,
+    point: crate::sim::components::DriveCoord,
+    open: &impl Fn(crate::map::cell_index::NativeCellIdentity) -> Result<bool, String>,
+) -> Result<bool, String> {
+    let level = point.z / crate::util::lepton::GROUND_LEVEL_HEIGHT_LEPTONS;
+    let shift = level / 2 + i32::from(level & 1 != 0);
+    let first = cells.lookup((
+        ((point.x / 256) as i16).wrapping_sub(shift as i16),
+        ((point.y / 256) as i16).wrapping_sub(shift as i16),
+    ));
+    if open(first)? {
+        return Ok(false);
+    }
+    if level & 1 != 0 {
+        let (x, y) = cells.coord(first);
+        let next = cells.lookup((x.wrapping_add(1), y.wrapping_add(1)));
+        return open(next).map(|open| !open);
+    }
+    Ok(true)
+}
+
+/// A flat fire-leaf reveal of `range` cells around a cell, with no height
+/// shift or height line of sight (fixtures and flat callers).
 pub fn reveal_radius(
     fog: &mut FogState,
     owner: InternedId,
@@ -1965,6 +2039,46 @@ pub fn reveal_radius(
     center_ry: u16,
     range: u16,
 ) {
+    let cells = collect_reveal_cells(
+        center_rx, center_ry, range, 0, false, None, fog.width, fog.height,
+    );
+    fire_reveal_cells(fog, owner, cells);
+}
+
+/// `MapClass::RevealShroud @ 0x005673A0` as FireAt's RevealOnFire calls it
+/// (`0x006FF6F2`): radius 3 around the firer's coordinate, centred on its
+/// height-shifted cell, with `RevealByHeight=`'s line of sight (arg 7 = 1),
+/// for `house`'s map. Each cell takes the fire leaf `0x004876F0`.
+pub(crate) fn reveal_shroud_on_fire(
+    fog: &mut FogState,
+    house: InternedId,
+    coord: crate::sim::components::DriveCoord,
+    reveal_by_height: bool,
+    height_grid: Option<&[u8]>,
+) {
+    if coord.x < 0 || coord.y < 0 {
+        return;
+    }
+    let cells = collect_reveal_cells(
+        (coord.x / 256) as u16,
+        (coord.y / 256) as u16,
+        REVEAL_ON_FIRE_RADIUS,
+        coord.z,
+        reveal_by_height,
+        height_grid,
+        fog.width,
+        fog.height,
+    );
+    fire_reveal_cells(fog, house, cells);
+}
+
+/// FireAt's reveal radius (`PUSH 0x3` at `0x006FF6E0`).
+const REVEAL_ON_FIRE_RADIUS: u16 = 3;
+
+/// The fire leaf `0x004876F0` over collected cells: unlike Psychic's
+/// reduce/increase pair, it never changes the shroud counter and tests
+/// counter > 0 for pending.
+fn fire_reveal_cells(fog: &mut FogState, owner: InternedId, cells: Vec<(u16, u16)>) {
     let width = fog.width;
     let height = fog.height;
     if width == 0 || height == 0 {
@@ -1974,10 +2088,7 @@ pub fn reveal_radius(
         .by_owner
         .entry(owner)
         .or_insert_with(|| OwnerVisibility::new(width, height));
-    // Selected admitted fire leaf4876F0: unlike Psychic's reduce/increase pair,
-    // this never changes the shroud counter and tests counter>0 for pending.
-    for (rx, ry) in collect_reveal_cells(center_rx, center_ry, range, 0, false, None, width, height)
-    {
+    for (rx, ry) in cells {
         vis.mark_visible_with_fog_of_war(rx, ry, true);
         let index = vis.index(rx, ry).expect("collected cell is in bounds");
         vis.shroud_knowledge[index].fire_unshroud();
@@ -2070,6 +2181,7 @@ pub(crate) fn reveal_radius_for_direct_allies(
 /// active owners and never infers a transition from an absent list entry.
 ///
 /// Takes the owner names whose persisted SpySat latch is active.
+#[cfg(test)]
 pub fn apply_spy_sat(
     fog: &mut FogState,
     spy_sat_owners: &[InternedId],

@@ -1,10 +1,9 @@
-//! Unit movement system — moves entities along A* paths each tick.
+//! Locomotor movement and its shared Foot/coordinate owners.
 //!
-//! The movement system reads MovementTarget fields and advances entities
-//! toward their destination using lepton-based sub-cell movement.
-//! Each tick, `sub_x`/`sub_y` advance along the direction vector at
-//! `speed` leptons per second. Cell transitions occur when sub_x/sub_y
-//! cross the cell boundary (0 or 256 leptons).
+//! Native-frame visits execute the retained locomotor state: Drive/Ship use
+//! their track hosts and Walk pays a polar step toward its accepted head.
+//! Other locomotors retain their class-specific movement adapters. Coordinate
+//! and occupation transactions publish the resulting whole-cell crossings.
 //!
 //! ## Coordinate update
 //! Movement advances `rx`/`ry`/`sub_x`/`sub_y` only. Screen position is not
@@ -15,11 +14,20 @@
 //! ## Facing
 //! RA2 uses a 0-255 screen-relative DirStruct byte: 0=north on screen (iso -x,-y),
 //! 64=east on screen (iso +x,-y), 128=south on screen (iso +x,+y),
-//! 192=west on screen (iso -x,+y). Facing is updated whenever the entity starts
-//! moving toward a new cell.
+//! 192=west on screen (iso -x,+y). The full 16-bit heading is the body
+//! FacingClass (`GameEntity::body_facing`, `+0x388`), each Techno's only copy;
+//! byte readers take its high byte.
 //!
 //! ## Sub-modules
-//! - `movement_commands` — A* pathfinding and MovementTarget attachment
+//! - `movement_commands` — destination setters and the MovementTarget
+//!   scheduling adapter; Walk, Drive and Ship accept without a search, the
+//!   remaining locomotors keep their command-time A* adapter
+//! - `foot_path` — the shared `FootClass::Find_Path` (0x4D3920) owner that a
+//!   Walk or Drive/Ship no-queue Process request runs at Simulation level
+//! - `walk_path` / `track_path` — the Walk and Drive/Ship continuations after
+//!   Find_Path and the class receivers they reach
+//! - `track_continuation` — the Drive/Ship Process continuing into
+//!   Process_Movement and Process_Track(1) after a track ends in the same call
 //! - `movement_tick` — per-tick ground movement state machine (the main loop)
 //!
 //! ## Dependency rules
@@ -40,6 +48,7 @@ use crate::sim::intern::InternedId;
 #[cfg(test)]
 use crate::sim::lifecycle_request::LifecycleRequest;
 use crate::sim::pathfinding::PathGrid;
+use crate::sim::pathfinding::cell_entry::WallArmTables;
 #[cfg(test)]
 use crate::sim::pathfinding::terrain_cost::TerrainCostGrid;
 #[cfg(test)]
@@ -49,43 +58,79 @@ use crate::sim::pathfinding::zone_map::ZoneGrid;
 use crate::sim::rng::SimRng;
 #[cfg(test)]
 use crate::util::fixed_math::SIM_ZERO;
-use crate::util::fixed_math::{SIM_ONE, SimFixed, facing_from_delta_int};
+use crate::util::fixed_math::{SimFixed, facing_from_delta_int};
 
 // --- Internal submodules ---
 pub(crate) mod at_coord;
+mod building_coordinate;
 mod cell_arrival;
+mod cell_contact;
 mod drive_locomotion;
+mod foot_coordinate;
+mod foot_mark;
+mod foot_path;
+#[cfg(test)]
+pub(crate) use foot_path::FindPathResult;
+pub(crate) use foot_path::FootPathOutcome;
+pub(crate) use track_fresh::{BlockingObject, ProcessMovementArgs};
+mod foot_range_stop;
+pub(crate) use foot_range_stop::range_stop_admits;
+mod foot_speed;
 pub(crate) mod ground_pose;
+pub(crate) mod infantry_action;
 pub(crate) mod infantry_entry;
+mod infantry_scatter;
 pub(crate) mod locomotor_owner;
 pub(crate) mod locomotor_ready;
+pub(crate) mod motion_query;
 mod movement_blocked;
 pub(crate) mod movement_bridge;
 mod movement_commands;
+#[cfg(test)]
+pub(crate) use movement_commands::clear_destination_path_head;
 mod movement_occupancy;
 mod movement_path;
 mod movement_step;
 pub(crate) mod movement_tick;
 mod navcom;
-pub(crate) use navcom::set_walk_destination_coord;
+pub(crate) use navcom::{building_dock_cell, nav_target_coordinate, set_walk_destination_coord};
+#[cfg(test)]
+pub(crate) mod fresh_oracle_seam;
 mod path_markers;
+mod per_cell;
+pub(crate) use per_cell::PerCellReason;
 pub(crate) mod ready_producer;
+mod scatter;
+#[cfg(test)]
+pub(crate) use infantry_scatter::answered_process;
+pub(crate) use scatter::ScatterFlags;
+mod scatter_cell;
 pub(crate) mod slope_transition;
-mod track_head;
+mod track_continuation;
+mod track_fresh;
+mod track_fresh_dispatch;
+pub(crate) mod track_head;
 mod track_host;
+mod track_path;
 pub(crate) mod track_process;
+mod track_speed;
+#[cfg(test)]
+pub(crate) mod track_speed_native;
+pub(crate) mod track_turn;
+mod walk_admission;
 pub(crate) mod walk_head;
 mod walk_host;
 mod walk_path;
+mod walk_step;
 
 // --- Movement-related modules (public API) ---
 pub mod air_movement;
+pub(crate) mod block_index;
 pub mod bump_crush;
 pub mod drive_track;
-pub mod drop_pod_movement;
 pub mod facing_class;
+pub mod fly_height;
 pub mod group_destination;
-pub mod homing_movement;
 pub mod hover;
 pub mod jumpjet_flight;
 pub mod jumpjet_movement;
@@ -93,139 +138,42 @@ pub mod locomotion;
 pub mod locomotor;
 pub mod parachute_descent;
 pub mod rocket_movement;
-pub mod scatter;
 pub mod teleport_movement;
 pub mod tube_movement;
-pub mod tunnel_movement;
 pub mod turret;
 
 pub use facing_class::FacingClass;
 
-// The drive-locomotor "Process" presence marker, consumed read-only by the
-// per-object AI shell (sim/world/techno_ai.rs, Slice S1) to observe that the
-// locomotor would process AFTER mission dispatch. Behavior-neutral re-export.
 #[cfg(test)]
-pub(crate) use drive_locomotion::owner_current_speed_from_fraction;
+pub(crate) use foot_speed::owner_current_speed_from_fraction;
+pub(crate) use foot_speed::{SpeedRules, order_speed, owner_current_speed};
 // NOT test-gated: `techno_common_pre`'s DisguiseWhenStill check
 // (sim/world/techno_ai.rs) consumes this in every build; a 2026-08-14
 // warning-cleanup gate on it broke release-only compilation.
-pub(crate) use drive_locomotion::drive_locomotor_is_moving;
-#[cfg(test)]
-pub(crate) use drive_locomotion::{DriveProcessOutcome, process_drive_locomotion_shell};
+pub(crate) use drive_locomotion::{drive_do_turn, drive_locomotor_is_moving};
 
 // Re-export command functions so callers can use `movement::issue_move_command` etc.
+#[cfg(test)]
+pub(crate) use movement_commands::issue_move_command_with_layered;
 pub use movement_commands::{
     DestinationTiming, clear_navigation_for_entity, issue_direct_move, issue_move_command,
-    set_destination_for_teleporter_entity, stop_navigation_at_committed_head,
+    stop_navigation_at_committed_head,
 };
 pub(crate) use movement_commands::{
-    issue_move_command_with_destination, issue_move_command_with_layered,
-    prepare_walk_cell_destination, retain_committed_movement,
+    can_accept_destination, issue_move_command_with_destination, prepare_walk_destination,
+    retain_committed_movement,
 };
 #[cfg(test)]
 pub(crate) use movement_path::{
     path_search_used_zone_grid_marker, reset_path_search_used_zone_grid_marker,
 };
-pub(crate) use movement_tick::sync_formation_speeds_after_live_pass;
+pub(crate) use navcom::{
+    foot_stop_moving, nav_targets_same_receiver, set_destination_internal_cell, target_cell_coord,
+    track_stop_moving,
+};
 // Legacy batch tick used by focused movement fixtures.
 #[cfg(test)]
 pub(crate) use movement_tick::tick_movement_with_grids;
-
-/// Install the active-YR `DriveLocomotion::Force_Track` state for a flat-ground
-/// unit. The caller supplies head offsets from the unit's current cell origin;
-/// and the caller's raw Z (native Force_Track4B0C40 copies the full XYZ).
-/// The stored head is an exact absolute lepton coordinate.
-pub(crate) fn install_forced_drive_track(
-    entity: &mut crate::sim::game_entity::GameEntity,
-    cell_occupation: &mut crate::sim::occupancy::CellOccupationGrid,
-    mut forced: drive_track::ForcedDriveTrackState,
-    head_z_leptons: i32,
-) -> bool {
-    if entity.occupancy_list_layer() != Some(locomotor::MovementLayer::Ground) {
-        return false;
-    }
-
-    let absolute_x = i32::from(entity.position.rx) * 256 + forced.track.head_offset_x;
-    let absolute_y = i32::from(entity.position.ry) * 256 + forced.track.head_offset_y;
-    let target_rx = absolute_x.div_euclid(256);
-    let target_ry = absolute_y.div_euclid(256);
-    let (Ok(target_rx), Ok(target_ry)) = (u16::try_from(target_rx), u16::try_from(target_ry))
-    else {
-        return false;
-    };
-
-    let head = crate::sim::components::DriveCoord {
-        x: absolute_x,
-        y: absolute_y,
-        z: head_z_leptons,
-    };
-    let footprint = crate::sim::components::DriveOccupationFootprint {
-        rx: target_rx,
-        ry: target_ry,
-        layer: locomotor::MovementLayer::Ground,
-    };
-
-    // Captured before the Drive borrow. The early return above already
-    // established the mover is on the ground plane.
-    let current_cell = (entity.position.rx, entity.position.ry);
-    let current_layer = locomotor::MovementLayer::Ground;
-    let entity_stable_id = entity.stable_id();
-
-    let drive = entity
-        .drive_locomotion
-        .get_or_insert_with(crate::sim::components::DriveLocomotionRuntime::default);
-    // Force_Track preserves DriveLocomotion's integer movement residual. The
-    // detached forced cursor mirrors that canonical owner field for snapshots.
-    forced.track.residual = drive.track.residual;
-    drive.pending_track_occupation = false;
-    drive.destination = Some(head);
-    drive.head_to = Some(head);
-    drive
-        .track
-        .select_forced(i32::from(forced.turn_track_index));
-    drive.track_valid = true;
-    drive.target_speed_fraction = SIM_ONE;
-    // OPEN Process-host timing: native Force_Track4B0D52 changes the class
-    // target only; the subsequent ProcessTrack owns the applied-speed write.
-    entity.foot_speed.applied_fraction = SIM_ONE;
-    entity.foot_speed.cached_current_speed =
-        drive_locomotion::owner_current_speed_from_fraction(forced.speed, SIM_ONE);
-    // Force_Track directly installs the new head mark. Its active retail callers
-    // enter with no old head — but nothing in this function's signature enforces
-    // that, and a caller that reached a mid-curve mover would otherwise strand
-    // both of that curve's claims: a head cell and a forward handoff cell that
-    // nothing occupies and every later mover is refused entry to.
-    // `Apply_Track_Occupation_Mode` releases the pair together on mode 0, so
-    // release them here before installing the replacement.
-    crate::sim::occupancy::drop_drive_handoff_occupation(
-        &mut entity.foot_occupation_enabled,
-        drive,
-        cell_occupation,
-        entity_stable_id,
-        current_cell,
-        current_layer,
-    );
-    crate::sim::occupancy::clear_drive_head_to_occupation_for_replacement(
-        &mut entity.foot_occupation_enabled,
-        drive,
-        cell_occupation,
-        entity_stable_id,
-        current_cell,
-        current_layer,
-    );
-    cell_occupation.mark_vehicle_on_layer(
-        footprint.rx,
-        footprint.ry,
-        entity_stable_id,
-        footprint.layer,
-    );
-    drive.occupation_head_to = Some(footprint);
-
-    entity.drive_track = None;
-    entity.forced_drive_track = Some(forced);
-    entity.facing_target = None;
-    true
-}
 
 // ---------------------------------------------------------------------------
 // Constants — shared across movement submodules via `super::`
@@ -258,10 +206,6 @@ const PATH_STUCK_INIT: u32 = 10;
 /// **VERA-internal, gamemd equivalent UNCHECKED** — "abs(current_z / HeightStep
 /// - cell.height) >= 3 levels" carries no address and no verified owner.
 const CLIFF_HEIGHT_THRESHOLD: u16 = 3;
-/// Infantry wobble phase increment per second (radians/sec).
-/// One full cycle (2π) per ~2.5 seconds ≈ 2.5 rad/s. Matches slow
-/// infantry walk cadence in the original game.
-const INFANTRY_WOBBLE_RATE: f32 = 2.5;
 /// Minimum speed as a fraction of max speed during normal braking.
 /// Original engine: 0.3 (30% of max speed).
 const MIN_BRAKE_FRACTION: SimFixed = SimFixed::lit("0.3");
@@ -278,24 +222,169 @@ pub(super) struct PathfindingContext<'a> {
     pub resolved_terrain: Option<&'a ResolvedTerrainGrid>,
     pub playfield_bounds: Option<PlayfieldBounds>,
     pub blocker_neighbor_counts: Option<&'a crate::sim::pathfinding::BlockerNeighborCounts>,
-    /// Per-mover wall-arm cost producer for the A* `search_cost_classifier`
-    /// seam (ledger I9b).
+    /// Map-global tables the wall arm reads, carried once per pass (ledger I9b).
     ///
     /// The search calls the Foot `+0x1AC` slot per neighbour and prices the
     /// returned class through `AStar_compute_edge_cost @ 0x00429830`; a wall
     /// answers 4 or 5, which expand at 60x and 20x rather than blocking. `None`
     /// keeps the pre-I9b search, where a wall is simply impassable.
-    pub wall_cost: Option<&'a dyn crate::sim::pathfinding::SearchCellCostClassifier>,
+    ///
+    /// This carries the *tables*, not a built classifier: the classifier is
+    /// per mover and is constructed at the search boundary from these plus the
+    /// mover's own facts. Holding a per-mover `&dyn` on a per-pass `Copy` struct
+    /// was a granularity mismatch.
+    pub wall_tables: Option<WallArmTables<'a>>,
 }
 
-/// Movement timing/threshold config derived from rules.ini [General] section.
+/// The mover's own facts a path search needs, carried as one value.
+///
+/// Three of these — `urgency`, `mover_is_crusher`, `is_infantry` — used to
+/// travel as loose positional arguments through `find_move_path`,
+/// `find_move_path_with_marker` and `..._detailed`, eighteen parameters at the
+/// widest. Wiring the wall arm's search half (ledger I9b) needs four more: the
+/// mover's house for the ally test, `Is_Armed` (`0x0073F48F`), and the primary
+/// warhead's `Wall=` and `Wood=` (`0x0073F4A9`, `0x0073F4B3`). Adding those
+/// positionally is the exact shape ledger row I9c records as a landed
+/// regression — a mover fact derived independently per call site, where the
+/// callers without context quietly passed `false` and crushers detoured around
+/// sandbags they would have driven through.
+///
+/// So they travel together and are derived in two places only, both from the
+/// mover itself: `from_snapshot` on the tick path and
+/// `from_entity_without_wall_arm` where no snapshot exists. No caller supplies
+/// a fact.
+///
+/// RESIDUAL: `mover_is_crusher` here is `Crusher=` or `OmniCrusher=`, and the
+/// search uses it both for the entity soft-block exemption and for the
+/// crushable-wall admission. The runtime crossing keys the wall admission on
+/// `Crusher=` alone (`CrushCapability::wall_arm_crusher`, native
+/// `0x0073F438`). Trigger: a modded `OmniCrusher=yes`, `Crusher=no` unit
+/// routed across a sandbag line; stock `[BFRT]` sets both. Effect: the search
+/// admits a cell the crossing then refuses, and the unit repaths at the wall.
+/// Frequency: never in stock rules. Downstream risk: splitting the fact moves
+/// search results for such mods only.
+#[derive(Clone, Copy)]
+pub(super) struct MoverPathFacts {
+    pub urgency: u8,
+    pub mover_is_crusher: bool,
+    pub is_infantry: bool,
+    pub speed_type: Option<SpeedType>,
+    pub owner: Option<InternedId>,
+    pub is_armed: bool,
+    pub warhead_wall: bool,
+    pub warhead_wood: bool,
+    /// A slave's deposit Cells (`SlaveManagerClass 0x006B0880`), which its
+    /// `Can_Enter_Cell` admits past the master's footprint.
+    pub slave_deposit_cells: [Option<(u16, u16)>; 2],
+}
+
+impl MoverPathFacts {
+    /// Derive every fact from the mover. `urgency` is the request's, not the
+    /// mover's — it is the code-2 escalation level of this particular search.
+    pub fn from_snapshot(snap: &MoverSnapshot, urgency: u8) -> Self {
+        Self {
+            urgency,
+            mover_is_crusher: snap.crush_capability().can_crush_units(),
+            is_infantry: snap.category == EntityCategory::Infantry,
+            speed_type: snap.speed_type,
+            owner: Some(snap.owner),
+            is_armed: snap.is_armed,
+            warhead_wall: snap.warhead_wall,
+            warhead_wood: snap.warhead_wood,
+            slave_deposit_cells: snap.slave_deposit_cells,
+        }
+    }
+
+    /// Facts for a search issued outside the movement tick, where no
+    /// `MoverSnapshot` exists: a move order, or the process-entry repath.
+    ///
+    /// The crusher and infantry facts come from the mover itself, the same
+    /// fields `from_snapshot` reads, so no caller supplies them. Ledger row I9c
+    /// is what happened when callers did: the ones without context passed
+    /// `false`, and the same tank planned as a crusher or not depending on
+    /// which function issued its move.
+    ///
+    /// RESIDUAL (ledger I9b): the wall arm is off on these searches, so a wall
+    /// the mover could shoot answers 7, a hard block, where retail prices it at
+    /// 20x or 60x. The armed flag and primary warhead need the rules, which
+    /// this signature does not take, and they would have no consumer yet: the
+    /// order path's context carries no wall tables, and the process-entry and
+    /// Drive tick contexts carry them with `interner: None`, which keeps the
+    /// arm off there too. Wiring this constructor alone would not give retail
+    /// behavior. Walk orders already get the arm (`walk_path.rs`).
+    /// - Trigger: an armed unit that searches at command time (every locomotor
+    ///   but Walk: Drive, Ship, Hover) ordered to a goal it can reach
+    ///   only through a wall its warhead can hit.
+    /// - Effect: a detour, or no path at all when the goal is walled in, where
+    ///   retail drives at the wall and shoots it.
+    /// - Frequency: uncommon; walled-in goals in base assaults.
+    /// - Downstream risk: enabling it changes search results in the lockstep
+    ///   stream, so it is a movement-parity change with its own evidence.
+    pub fn from_entity_without_wall_arm(
+        entity: &crate::sim::game_entity::GameEntity,
+        urgency: u8,
+    ) -> Self {
+        Self {
+            urgency,
+            mover_is_crusher: bump_crush::CrushCapability::of(entity).can_crush_units(),
+            is_infantry: entity.category == EntityCategory::Infantry,
+            speed_type: None,
+            owner: None,
+            is_armed: false,
+            warhead_wall: false,
+            warhead_wood: false,
+            slave_deposit_cells: [None, None],
+        }
+    }
+
+    /// Hand-built facts for a search fixture with no entity behind it.
+    #[cfg(test)]
+    pub fn without_wall_arm(urgency: u8, mover_is_crusher: bool, is_infantry: bool) -> Self {
+        Self {
+            urgency,
+            mover_is_crusher,
+            is_infantry,
+            speed_type: None,
+            owner: None,
+            is_armed: false,
+            warhead_wall: false,
+            warhead_wood: false,
+            slave_deposit_cells: [None, None],
+        }
+    }
+}
+
+/// Invocation-local movement delays from [AI] and threshold from [General].
 /// Separate from `PathfindingContext` because `find_move_path` doesn't need these.
 #[derive(Clone, Copy)]
-pub(super) struct MovementConfig {
+pub(crate) struct MovementConfig {
     pub binary_frame: u32,
     pub close_enough: SimFixed,
-    pub path_delay_ticks: u16,
-    pub blockage_path_delay_ticks: u16,
+    pub path_delay_ticks: i32,
+    pub blockage_path_delay_ticks: i32,
+}
+
+impl MovementConfig {
+    /// Invocation-local projection. Rules remain the configuration authority;
+    /// timers retain their own signed duration after a reached native store.
+    pub(crate) fn from_rules(
+        binary_frame: u32,
+        rules: Option<&crate::rules::ruleset::RuleSet>,
+    ) -> Self {
+        let defaults;
+        let general = if let Some(rules) = rules {
+            &rules.general
+        } else {
+            defaults = crate::rules::ruleset::GeneralRules::default();
+            &defaults
+        };
+        Self {
+            binary_frame,
+            close_enough: SimFixed::from_num(general.close_enough),
+            path_delay_ticks: general.path_delay_ticks(),
+            blockage_path_delay_ticks: general.blockage_path_delay_ticks,
+        }
+    }
 }
 
 /// Snapshot of mover properties taken before the inner movement loop.
@@ -308,13 +397,22 @@ pub(super) struct MoverSnapshot {
     pub movement_zone: MovementZone,
     pub omni_crusher: bool,
     pub regular_crusher: bool,
-    pub drive_accelerates: bool,
     pub owner: InternedId,
-    pub too_big_to_fit_under_bridge: bool,
+    /// `TechnoClass::Is_Armed @ 0x00701120` (vtable `+0x2AC`). An unarmed mover
+    /// leaves the wall arm through the shared epilogue at `0x0073FCD0`.
+    ///
+    /// Resolved here, per mover, rather than at each path-request site: ledger
+    /// row I9c is what happens when a mover fact is derived independently per
+    /// caller and the callers without context quietly pass `false`.
+    pub is_armed: bool,
+    /// Slot-0 warhead `Wall=` (`WarheadTypeClass+0x144`).
+    pub warhead_wall: bool,
+    /// Slot-0 warhead `Wood=` (`+0x147`), which the arm admits only against an
+    /// overlay whose own `Armor` is wood, and only for Units.
+    pub warhead_wood: bool,
     pub on_bridge: bool,
     pub runtime_bridge_transition: movement_bridge::RuntimeBridgeTransitionState,
     pub locomotor: Option<locomotor::LocomotorState>,
-    pub rot: i32,
     /// Mover's `MovementTarget.bypass_grid` flag — when true, structure
     /// occupants are skipped during the foundation-cross occupancy check
     /// (harvester dock drive: buildings are not scatter targets).
@@ -339,6 +437,10 @@ pub(super) struct MoverSnapshot {
     /// byte. False under live MapClass authority bypasses hierarchy and uses
     /// flat A*; headless fixtures without authority retain hierarchy.
     pub allow_zone_hierarchy: bool,
+    /// A slave's deposit Cells (`sim::slave_deposit::slave_deposit_cells`):
+    /// `InfantryClass::Can_Enter_Cell` (`0x0051C29E..0x0051C2CA`) admits it
+    /// into them past the master's footprint.
+    pub slave_deposit_cells: [Option<(u16, u16)>; 2],
 }
 
 impl MoverSnapshot {
@@ -364,11 +466,10 @@ pub struct MovementTickStats {
     pub blocked_attempts: u32,
     pub repath_attempts: u32,
     pub repath_successes: u32,
-    pub scatter_successes: u32,
+    /// Scatter calls the pass lane queued for a blocked cell entry.
+    pub scatter_requests: u32,
     pub crush_kills: u32,
     pub stuck_aborts: u32,
-    /// Scatter attempts triggered when infantry are blocked.
-    pub scatter_attempts: u32,
     /// Track selections triggered for vehicle turns.
     pub track_selections: u32,
     /// Stuck entities that recovered via repath or scatter.
@@ -388,12 +489,9 @@ impl MovementTickStats {
         self.blocked_attempts = self.blocked_attempts.saturating_add(other.blocked_attempts);
         self.repath_attempts = self.repath_attempts.saturating_add(other.repath_attempts);
         self.repath_successes = self.repath_successes.saturating_add(other.repath_successes);
-        self.scatter_successes = self
-            .scatter_successes
-            .saturating_add(other.scatter_successes);
+        self.scatter_requests = self.scatter_requests.saturating_add(other.scatter_requests);
         self.crush_kills = self.crush_kills.saturating_add(other.crush_kills);
         self.stuck_aborts = self.stuck_aborts.saturating_add(other.stuck_aborts);
-        self.scatter_attempts = self.scatter_attempts.saturating_add(other.scatter_attempts);
         self.track_selections = self.track_selections.saturating_add(other.track_selections);
         self.stuck_recoveries = self.stuck_recoveries.saturating_add(other.stuck_recoveries);
         self.selection_admission_refusals = self
@@ -401,15 +499,6 @@ impl MovementTickStats {
             .saturating_add(other.selection_admission_refusals);
         self.elapsed_us = self.elapsed_us.saturating_add(other.elapsed_us);
     }
-}
-
-/// Command to move an entity to a target cell (queued for next tick).
-#[derive(Debug, Clone)]
-pub struct MoveCommand {
-    pub entity_id: u64,
-    pub target_rx: u16,
-    pub target_ry: u16,
-    pub queue: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -429,6 +518,7 @@ pub fn facing_from_delta(dx: i32, dy: i32) -> u8 {
 ///
 /// This bridge mirrors FootClass::AI's per-tick "ok to end piggyback" check
 /// without changing existing movement ownership for non-migrated special flows.
+#[cfg(test)]
 pub fn tick_locomotor_piggyback_restore(entities: &mut EntityStore) -> usize {
     let mut restored = 0usize;
     let keys = entities.keys_sorted();
@@ -438,34 +528,6 @@ pub fn tick_locomotor_piggyback_restore(entities: &mut EntityStore) -> usize {
         )));
     }
     restored
-}
-
-/// Build the `Is_Ok_To_End` inputs for one entity.
-///
-/// gamemd's END gate reads the ACTIVE locomotor's own `Is_Moving` (ILocomotion
-/// slot 4) — `Drive::Is_Ok_To_End` calls it on the object's own ILocomotion,
-/// which inspects the Drive locomotor's destination and head-to coordinates
-/// against the owner's exact position, never the owner's path queue. Drive now
-/// has that predicate; the remaining classes keep the VERA-internal
-/// owner-path approximation, gamemd equivalent UNCHECKED.
-pub(crate) fn locomotor_end_gate_context(
-    entity: &crate::sim::game_entity::GameEntity,
-) -> locomotion::piggyback::EndGateContext {
-    let active_is_drive = entity.locomotor.as_ref().is_some_and(|loco| {
-        loco.active_kind() == crate::rules::locomotor_type::LocomotorKind::Drive
-    });
-    let owner_moving = if active_is_drive {
-        drive_locomotion::drive_locomotor_is_moving(entity) || entity.forced_drive_track.is_some()
-    } else {
-        entity.movement_target.is_some() || entity.forced_drive_track.is_some()
-    };
-    locomotion::piggyback::EndGateContext {
-        owner_moving,
-        owner_teleporting: entity.teleport_state.is_some(),
-        owner_deploying: entity.building_up.is_some()
-            || entity.building_down.is_some()
-            || entity.deploy_state.is_some(),
-    }
 }
 
 pub(crate) fn tick_locomotor_piggyback_restore_one(entities: &mut EntityStore, id: u64) -> bool {
@@ -524,7 +586,6 @@ pub(crate) fn tick_movement_with_grid(
     lifecycle_requests: &mut Vec<LifecycleRequest>,
 ) -> MovementTickStats {
     let mut sound_events: Vec<crate::sim::world::SimSoundEvent> = Vec::new();
-    let mut next_occupancy_enter_order = crate::sim::world::EnterOrderCounter::new();
     let mut cell_occupation = crate::sim::occupancy::CellOccupationGrid::rebuild(entities);
     let mut raw_cell_occupation = crate::sim::occupancy::RawCellOccupationGrid::new();
     tick_movement_with_grids(
@@ -536,7 +597,6 @@ pub(crate) fn tick_movement_with_grid(
         occupancy,
         &mut cell_occupation,
         &mut raw_cell_occupation,
-        &mut next_occupancy_enter_order,
         rng,
         sim_tick,
         sim_tick as u32, // native-frame proxy (test-only wrapper: 1 frame/tick)
@@ -588,6 +648,8 @@ fn walking_to_subcell_dest(
 }
 
 #[cfg(test)]
+pub(crate) mod bridge_layer_oracle_tests;
+#[cfg(test)]
 mod ground_pose_tests;
 #[cfg(test)]
 mod movement_bridge_retail_tests;
@@ -595,3 +657,6 @@ mod movement_bridge_retail_tests;
 mod movement_tests;
 #[cfg(test)]
 mod prone_speed_tests;
+
+#[cfg(test)]
+mod foot_timer_migration_tests;

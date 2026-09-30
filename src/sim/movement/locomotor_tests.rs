@@ -5,7 +5,7 @@ use super::*;
 use crate::rules::jumpjet_params::JumpjetParams;
 use crate::rules::locomotor_type::{LocomotorKind, MovementZone, SpeedType};
 use crate::rules::object_type::{ObjectCategory, ObjectType, PipScale};
-use crate::util::fixed_math::{SIM_ONE, SimFixed, sim_from_f32};
+use crate::util::fixed_math::{SIM_ZERO, SimFixed, sim_from_f32};
 
 #[test]
 fn walk_destination_and_cell_producer_match_original_startup_conversion() {
@@ -41,7 +41,6 @@ fn walk_destination_and_cell_producer_match_original_startup_conversion() {
         let mut entity = GameEntity::test_default(1, "E1", "Owner", 9, 10);
         entity.locomotor = Some(LocomotorState::from_object_type(
             &make_obj(LocomotorKind::Walk, ObjectCategory::Infantry),
-            0,
             0,
         ));
         let coord = if input["cell_target"].as_bool().unwrap() {
@@ -95,7 +94,6 @@ fn walk_moving_byte_matches_original_setter_and_head_lifetime_traces() {
         let mut loco = LocomotorState::from_object_type(
             &make_obj(LocomotorKind::Walk, ObjectCategory::Infantry),
             0,
-            0,
         );
         let actions = case["actions"].as_array().unwrap();
         let trace = case["output"]["trace"].as_array().unwrap();
@@ -138,15 +136,20 @@ fn make_obj(locomotor: LocomotorKind, category: ObjectCategory) -> ObjectType {
         name: None,
         ui_name: None,
         cost: 0,
+        soylent: 0,
         factory_plant: false,
         cost_bonuses: [crate::util::native_x87::NativeF32Bits::ONE; 5],
         trainable: true,
+        burst_delays: [-1; 4],
+        dead_bodies: Vec::new(),
+        not_human: false,
         explosion_anims: Vec::new(),
         destroy_anims: Vec::new(),
         strength: 100,
         dont_score: false,
         special_threat_value: 0.0,
         threat_posed: 0,
+        leadership_rating: 5,
         my_effectiveness_coefficient: None,
         target_effectiveness_coefficient: None,
         target_special_threat_coefficient: None,
@@ -161,12 +164,18 @@ fn make_obj(locomotor: LocomotorKind, category: ObjectCategory) -> ObjectType {
         decel_factor: SimFixed::lit("0.02"),
         accelerates: true,
         passive: false,
+        is_train: false,
         slowdown_distance: 512,
+        flight_level: -1,
+        is_dropship: false,
+        pitch_angle: SimFixed::lit("0.34906585"),
+        aux_sound1: None,
+        aux_sound2: None,
         sight: 5,
         tech_level: -1,
-        build_time_multiplier: 1.0,
-        build_time_multiplier_x1000: 1000,
+        build_time_multiplier: crate::util::native_x87::NativeF32Bits::ONE,
         owner: vec![],
+        double_owned: false,
         required_houses: vec![],
         forbidden_houses: vec![],
         ai_base_planning_side: -1,
@@ -209,11 +218,20 @@ fn make_obj(locomotor: LocomotorKind, category: ObjectCategory) -> ObjectType {
         die_sounds: Vec::new(),
         damage_sound: None,
         move_sound: None,
+        crashing_sound: None,
+        voice_crashing: None,
+        sinking_sound: None,
+        enter_water_sound: None,
+        leave_water_sound: None,
+        voice_sinking: None,
+        impact_water_sound: None,
+        impact_land_sound: None,
         voice_feedback: None,
         voice_special_attack: None,
         crush_sound: None,
         deploy_sound: None,
         undeploy_sound: None,
+        packup_sound: None,
         leave_transport_sound: None,
         chrono_in_sound: None,
         chrono_out_sound: None,
@@ -229,15 +247,15 @@ fn make_obj(locomotor: LocomotorKind, category: ObjectCategory) -> ObjectType {
         opportunity_fire: false,
         can_retaliate: true,
         can_passive_acquire: true,
+        spray_attack: false,
         distributed_fire: false,
+        vhp_scan: crate::rules::object_type::VhpScan::None,
         explodes: false,
         veteran_abilities: Default::default(),
         elite_abilities: Default::default(),
         self_healing: false,
         veteran_explodes: false,
         elite_explodes: false,
-        veteran_stronger: false,
-        elite_stronger: false,
         veteran_scatter: false,
         elite_scatter: false,
         veteran_cloak: false,
@@ -272,6 +290,7 @@ fn make_obj(locomotor: LocomotorKind, category: ObjectCategory) -> ObjectType {
         spawned: false,
         refinery: false,
         weeder: false,
+        dock_unload: false,
         bib: false,
         gate: false,
         deploy_time_ticks: 0,
@@ -279,12 +298,13 @@ fn make_obj(locomotor: LocomotorKind, category: ObjectCategory) -> ObjectType {
         storage: 0,
         free_unit: None,
         dock: vec![],
-        queueing_cell: None,
+        queueing_cell: [0, 0],
         pads: Vec::new(),
         hidden_occupancy: crate::rules::object_type::BuildingHiddenOccupancyProfile::default(),
         base_reservation_spacing: None,
         unloading_class: None,
         ammo: -1,
+        initial_ammo: -1,
         spawns: None,
         spawns_number: 0,
         spawn_regen_rate: 0,
@@ -316,6 +336,7 @@ fn make_obj(locomotor: LocomotorKind, category: ObjectCategory) -> ObjectType {
         zfudge_bridge: 7,
         too_big_to_fit_under_bridge: false,
         crashable: false,
+        tilt_crash_jumpjet: false,
         move_to_shroud: true,
         teleporter: false,
         hover_attack: false,
@@ -327,6 +348,7 @@ fn make_obj(locomotor: LocomotorKind, category: ObjectCategory) -> ObjectType {
         fly_by: false,
         fly_back: false,
         landable: false,
+        carryall: false,
         jumpjet: false,
         jumpjet_params: JumpjetParams::default(),
         deploys_into: None,
@@ -336,6 +358,9 @@ fn make_obj(locomotor: LocomotorKind, category: ObjectCategory) -> ObjectType {
         build_const_eligible: false,
         base_plan_type_index: -1,
         is_base_defense: false,
+        anti_air_value: 0,
+        anti_armor_value: 0,
+        anti_infantry_value: 0,
         factory: None,
         weapons_factory: false,
         cloning: false,
@@ -351,9 +376,16 @@ fn make_obj(locomotor: LocomotorKind, category: ObjectCategory) -> ObjectType {
         immune: false,
         type_immune: false,
         immune_to_psionics: false,
+        warpable: true,
+        bombable: true,
+        bomb_sight: 0,
+        mind_control_ring_offset: 0x8C,
+        mind_cleared_sound: None,
         immune_to_psionic_weapons: false,
         immune_to_poison: false,
         engineer: false,
+        ivan: false,
+        infiltrate: false,
         deployer: false,
         capturable: false,
         needs_engineer: false,
@@ -366,6 +398,8 @@ fn make_obj(locomotor: LocomotorKind, category: ObjectCategory) -> ObjectType {
         to_tile: None,
         bridge_repair_hut: false,
         laser_fence: false,
+        laser_fence_post: false,
+        firestorm_wall: false,
         passengers: 0,
         size_limit: 0,
         size: 3,
@@ -374,7 +408,7 @@ fn make_obj(locomotor: LocomotorKind, category: ObjectCategory) -> ObjectType {
         ifv_mode: 0,
         open_transport_weapon: -1,
         deploy_fire: false,
-        deploy_fire_weapon: None,
+        deploy_fire_weapon: 1,
         max_number_occupants: 0,
         occupier: false,
         assaulter: false,
@@ -393,8 +427,24 @@ fn make_obj(locomotor: LocomotorKind, category: ObjectCategory) -> ObjectType {
         land_targeting: 0,
         underwater: false,
         organic: false,
+        parasiteable: true,
+        suppression_threshold: 0,
+        reselect_if_limboed: false,
+        rejoin_team_if_limboed: false,
         unnatural: false,
+        natural: false,
+        pushy: false,
+        berserk_friendly: false,
+        mobile_fire: true,
+        hunter_seeker: false,
+        non_vehicle: false,
+        jumpjet_turn: false,
+        emp_pulse_cannon: false,
+        has_stupid_guard_mode: false,
+        tick_tank: false,
         is_gattling: false,
+        artillary: false,
+        gattling_stages: Default::default(),
         turret_count: 0,
         drainable: false,
         produce_cash_startup: 0,
@@ -415,6 +465,7 @@ fn make_obj(locomotor: LocomotorKind, category: ObjectCategory) -> ObjectType {
         number_of_docks: 1,
         toggle_power: false,
         powered: false,
+        powered_special: false,
         can_disguise: false,
         disguise_when_still: false,
         wall: false,
@@ -453,18 +504,17 @@ fn make_obj(locomotor: LocomotorKind, category: ObjectCategory) -> ObjectType {
         stupid_hunt: false,
         vehicle_thief: false,
         undeploy_delay: -1,
+        fire_angle: 8,
     }
 }
 
 #[test]
 fn test_drive_locomotor() {
     let obj = make_obj(LocomotorKind::Drive, ObjectCategory::Vehicle);
-    let state = LocomotorState::from_object_type(&obj, 1500, 0);
+    let state = LocomotorState::from_object_type(&obj, 0);
     assert_eq!(state.kind, LocomotorKind::Drive);
     assert_eq!(state.layer, MovementLayer::Ground);
-    assert_eq!(state.phase, GroundMovePhase::Idle);
-    assert_eq!(state.air_phase, AirMovePhase::Landed);
-    assert_eq!(state.speed_multiplier, SIM_ONE);
+    assert_eq!(state.air_phase(), AirMovePhase::Landed);
     assert!(state.is_ground_mover());
     assert!(!state.is_air_mover());
 }
@@ -474,16 +524,15 @@ fn test_hover_cruises_at_full_base_speed() {
     // Hover now cruises at its full base Speed (throttle 1.0), not the old
     // made-up 0.65x. The accel/brake throttle ramp lives in sim/movement/hover.rs.
     let obj = make_obj(LocomotorKind::Hover, ObjectCategory::Vehicle);
-    let state = LocomotorState::from_object_type(&obj, 1500, 0);
+    let state = LocomotorState::from_object_type(&obj, 0);
     assert_eq!(state.kind, LocomotorKind::Hover);
-    assert_eq!(state.speed_multiplier, SIM_ONE);
     assert!(state.is_ground_mover());
 }
 
 #[test]
 fn test_walk_locomotor() {
     let obj = make_obj(LocomotorKind::Walk, ObjectCategory::Infantry);
-    let state = LocomotorState::from_object_type(&obj, 1500, 0);
+    let state = LocomotorState::from_object_type(&obj, 0);
     assert_eq!(state.kind, LocomotorKind::Walk);
     assert_eq!(state.layer, MovementLayer::Ground);
     assert!(state.is_ground_mover());
@@ -492,25 +541,53 @@ fn test_walk_locomotor() {
 #[test]
 fn test_fly_locomotor_air_layer() {
     let obj = make_obj(LocomotorKind::Fly, ObjectCategory::Aircraft);
-    let state = LocomotorState::from_object_type(&obj, 1500, 0);
+    let state = LocomotorState::from_object_type(&obj, 0);
     assert_eq!(state.kind, LocomotorKind::Fly);
     assert_eq!(state.layer, MovementLayer::Air);
-    assert_eq!(state.air_phase, AirMovePhase::Landed);
+    assert_eq!(state.air_phase(), AirMovePhase::Landed);
     assert!(!state.is_ground_mover());
     assert!(state.is_air_mover());
-    assert_eq!(state.target_altitude, SimFixed::from_num(1500));
-    assert_eq!(state.climb_rate, FLY_CLIMB_RATE);
+    assert_eq!(state.fly_target_height(), 0);
+    assert_eq!(
+        state.fly_runtime().unwrap().target_speed,
+        SIM_ZERO,
+        "constructor4CC9E5 target speed"
+    );
+}
+
+#[test]
+fn fly_target_uses_type_flight_level_without_changing_other_locomotors() {
+    let mut obj = make_obj(LocomotorKind::Fly, ObjectCategory::Aircraft);
+    for (configured, expected) in [(-1, 1500), (0, 0), (-2, -2), (2200, 2200)] {
+        obj.flight_level = configured;
+        let mut state = LocomotorState::from_object_type(&obj, 0);
+        assert_eq!(state.fly_target_height(), 0, "constructor4CC9EE");
+        state.begin_fly_takeoff(obj.flight_level(1500));
+        assert_eq!(
+            state.fly_target_height(),
+            expected,
+            "admitted BeginTakeoff4CF9F8"
+        );
+    }
+    obj.flight_level = 2200;
+    obj.locomotor = LocomotorKind::Jumpjet;
+    let state = LocomotorState::from_object_type(&obj, 0);
+    assert_eq!(
+        state.jumpjet_runtime().unwrap().params.height,
+        obj.jumpjet_params.height
+    );
+    assert!(state.fly_runtime().is_none());
 }
 
 #[test]
 fn test_jumpjet_air_layer() {
     let obj = make_obj(LocomotorKind::Jumpjet, ObjectCategory::Infantry);
-    let state = LocomotorState::from_object_type(&obj, 1500, 0);
+    let state = LocomotorState::from_object_type(&obj, 0);
     assert_eq!(state.kind, LocomotorKind::Jumpjet);
     assert_eq!(state.layer, MovementLayer::Air);
     assert!(!state.is_ground_mover());
     assert!(state.is_air_mover());
-    assert_eq!(state.target_altitude, SimFixed::from_num(500));
+    assert_eq!(state.jumpjet_runtime().unwrap().params.height, 500);
 }
 
 #[test]
@@ -528,16 +605,17 @@ fn test_jumpjet_with_custom_params() {
         deviation: 40,
         no_wobbles: false,
     };
-    let state = LocomotorState::from_object_type(&obj, 1500, 0);
-    assert_eq!(state.target_altitude, SimFixed::from_num(750));
-    assert_eq!(state.jumpjet_speed, sim_from_f32(20.0));
-    assert_eq!(state.climb_rate, sim_from_f32(8.0) * SimFixed::from_num(15));
+    let state = LocomotorState::from_object_type(&obj, 0);
+    let params = state.jumpjet_runtime().unwrap().params;
+    assert_eq!(params.height, 750);
+    assert_eq!(params.speed, 20);
+    assert_eq!(params.climb_bits, 8.0f32.to_bits());
 }
 
 #[test]
 fn test_ship_is_ground_mover() {
     let obj = make_obj(LocomotorKind::Ship, ObjectCategory::Vehicle);
-    let state = LocomotorState::from_object_type(&obj, 1500, 0);
+    let state = LocomotorState::from_object_type(&obj, 0);
     assert_eq!(state.kind, LocomotorKind::Ship);
     assert!(state.is_ground_mover());
     assert!(!state.is_air_mover());
@@ -548,23 +626,12 @@ fn cmin_locomotor_initializes_primary_and_active_teleport() {
     let mut obj = make_obj(LocomotorKind::Teleport, ObjectCategory::Vehicle);
     obj.harvester = true;
     obj.teleporter = true;
-    obj.turret_rot = 5;
 
-    let state = LocomotorState::from_object_type(&obj, 1500, 0);
+    let state = LocomotorState::from_object_type(&obj, 0);
 
     assert_eq!(state.active_kind(), LocomotorKind::Teleport);
     assert_eq!(state.effective_kind(), LocomotorKind::Teleport);
     assert!(state.is_primary_active());
-    assert_eq!(state.rot, 5);
-}
-
-#[test]
-fn test_is_airborne() {
-    let obj = make_obj(LocomotorKind::Fly, ObjectCategory::Aircraft);
-    let mut state = LocomotorState::from_object_type(&obj, 1500, 0);
-    assert!(!state.is_airborne());
-    state.altitude = SimFixed::from_num(100);
-    assert!(state.is_airborne());
 }
 
 // --- Override/Piggyback mechanism tests ---
@@ -572,13 +639,13 @@ fn test_is_airborne() {
 #[test]
 fn test_override_teleport_round_trip() {
     let obj = make_obj(LocomotorKind::Drive, ObjectCategory::Vehicle);
-    let mut state = LocomotorState::from_object_type(&obj, 1500, 0);
+    let mut state = LocomotorState::from_object_type(&obj, 0);
     assert!(!state.is_overridden());
     assert_eq!(state.kind, LocomotorKind::Drive);
     assert_eq!(state.layer, MovementLayer::Ground);
 
     // Begin teleport override.
-    state.begin_piggyback(LocomotorKind::Teleport, MovementLayer::Ground, 0);
+    state.begin_piggyback(LocomotorKind::Teleport, 0);
     assert!(state.is_overridden());
     assert_eq!(state.kind, LocomotorKind::Teleport);
     assert_eq!(state.layer, MovementLayer::Ground);
@@ -588,13 +655,12 @@ fn test_override_teleport_round_trip() {
     assert!(!state.is_overridden());
     assert_eq!(state.kind, LocomotorKind::Drive);
     assert_eq!(state.layer, MovementLayer::Ground);
-    assert_eq!(state.speed_multiplier, SIM_ONE);
 }
 
 #[test]
 fn end_piggyback_without_a_stash_reports_nothing_to_pop() {
     let obj = make_obj(LocomotorKind::Drive, ObjectCategory::Vehicle);
-    let mut state = LocomotorState::from_object_type(&obj, 1500, 0);
+    let mut state = LocomotorState::from_object_type(&obj, 0);
     let result = state.end_piggyback();
     assert!(
         !result,
@@ -607,10 +673,10 @@ fn end_piggyback_without_a_stash_reports_nothing_to_pop() {
 fn test_override_preserves_speed_type() {
     let mut obj = make_obj(LocomotorKind::Drive, ObjectCategory::Vehicle);
     obj.speed_type = SpeedType::Wheel;
-    let mut state = LocomotorState::from_object_type(&obj, 1500, 0);
+    let mut state = LocomotorState::from_object_type(&obj, 0);
     assert_eq!(state.speed_type, SpeedType::Wheel);
 
-    state.begin_piggyback(LocomotorKind::Teleport, MovementLayer::Ground, 0);
+    state.begin_piggyback(LocomotorKind::Teleport, 0);
     // SpeedType should still reflect the original during override.
     state.end_piggyback();
     assert_eq!(state.speed_type, SpeedType::Wheel);
@@ -619,17 +685,12 @@ fn test_override_preserves_speed_type() {
 #[test]
 fn drive_piggyback_restores_primary_teleport_only_after_not_moving() {
     let obj = make_obj(LocomotorKind::Teleport, ObjectCategory::Vehicle);
-    let mut state = LocomotorState::from_object_type(&obj, 1500, 0);
+    let mut state = LocomotorState::from_object_type(&obj, 0);
 
     assert!(state.begin_drive_piggyback_for_teleporter(0));
     assert_eq!(state.active_kind(), LocomotorKind::Drive);
     assert_eq!(state.effective_kind(), LocomotorKind::Teleport);
-    assert!(!state.can_restore_primary_from_piggyback(true, false, false));
-    assert!(!state.can_restore_primary_from_piggyback(false, true, false));
-    assert!(!state.can_restore_primary_from_piggyback(false, false, true));
-    assert!(state.can_restore_primary_from_piggyback(false, false, false));
-
-    assert!(state.restore_primary_from_piggyback());
+    assert!(state.end_piggyback());
     assert_eq!(state.active_kind(), LocomotorKind::Teleport);
     assert_eq!(state.effective_kind(), LocomotorKind::Teleport);
     assert!(state.is_primary_active());
@@ -638,7 +699,7 @@ fn drive_piggyback_restores_primary_teleport_only_after_not_moving() {
 #[test]
 fn drive_piggyback_refuses_an_unstashed_active_drive() {
     let obj = make_obj(LocomotorKind::Teleport, ObjectCategory::Vehicle);
-    let mut state = LocomotorState::from_object_type(&obj, 1500, 0);
+    let mut state = LocomotorState::from_object_type(&obj, 0);
     state.kind = LocomotorKind::Drive;
 
     assert!(!state.begin_drive_piggyback_for_teleporter(0));
@@ -657,49 +718,33 @@ fn drive_piggyback_refuses_an_unstashed_active_drive() {
 /// constructor's 500.
 #[test]
 fn retail_kirov_and_disc_reach_their_authored_hover_altitude() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("ini")
-        .join("rulesmd.ini");
-    let bytes = std::fs::read(&path).unwrap_or_else(|e| {
-        panic!(
-            "cannot read {}: {e}. The gitignored ini/ directory is required; \
-             a fresh worktree needs it copied in from the main checkout.",
-            path.display()
-        )
-    });
-    let ini =
-        crate::rules::ini_parser::IniFile::from_bytes(&bytes).expect("retail rulesmd.ini parses");
+    let Some(ini) = crate::rules::retail_ini_fixture::retail_ini("rulesmd.ini") else {
+        return;
+    };
 
     // (section, JumpjetSpeed, JumpjetClimb, JumpjetCrash) as authored.
-    for (id, speed, climb, crash) in [("ZEP", 5.0, 6.0, 12.0), ("DISK", 16.0, 8.0, 15.0)] {
+    for (id, speed, climb, crash) in [("ZEP", 5, 6.0_f32, 12.0_f32), ("DISK", 16, 8.0, 15.0)] {
         let obj = ObjectType::from_ini_section(
             id,
             ini.section(id).unwrap_or_else(|| panic!("[{id}] section")),
             ObjectCategory::Vehicle,
         );
-        let state = LocomotorState::from_object_type(&obj, 1500, 0);
+        let state = LocomotorState::from_object_type(&obj, 0);
 
         assert_eq!(state.kind, LocomotorKind::Jumpjet, "[{id}]");
+        let params = state.jumpjet_runtime().unwrap().params;
         assert_eq!(
-            state.target_altitude,
-            SimFixed::from_num(750),
+            params.height, 750,
             "[{id}] hovers at its authored JumpjetHeight"
         );
-        assert_eq!(state.jumpjet_speed, sim_from_f32(speed), "[{id}]");
-        assert_eq!(
-            state.climb_rate,
-            sim_from_f32(climb) * SimFixed::from_num(15),
-            "[{id}]"
-        );
-        assert_eq!(
-            state.jumpjet_crash_speed,
-            (sim_from_f32(climb) + sim_from_f32(crash)) * SimFixed::from_num(15),
-            "[{id}] crash descent is (climb + crash)"
-        );
-        // The constructor's acceleration, because stock spells the key
-        // `JumpJetAccel=` and gamemd looks up `JumpjetAccel`.
-        assert_eq!(state.jumpjet_accel, sim_from_f32(2.0), "[{id}]");
-        assert_eq!(state.jumpjet_turn_rate, 4, "[{id}]");
+        assert_eq!(params.speed, speed, "[{id}]");
+        assert_eq!(params.climb_bits, climb.to_bits(), "[{id}]");
+        assert_eq!(params.crash_bits, crash.to_bits(), "[{id}]");
+        // The constructor's acceleration and turn rate, because stock spells
+        // the keys `JumpJetAccel=`/`JumpJetTurnRate=` and gamemd looks up
+        // `JumpjetAccel`/`JumpjetTurnRate`.
+        assert_eq!(params.accel_bits, 2.0f32.to_bits(), "[{id}]");
+        assert_eq!(params.turn_rate, 4, "[{id}]");
     }
 }
 
@@ -729,26 +774,11 @@ fn non_jumpjet_locomotors_ignore_the_types_jumpjet_block() {
             deviation: 15,
             no_wobbles: true,
         };
-        let state = LocomotorState::from_object_type(&obj, 1500, 0);
+        let state = LocomotorState::from_object_type(&obj, 0);
 
-        assert_eq!(
-            state.jumpjet_accel,
-            crate::util::fixed_math::SIM_ZERO,
-            "{kind:?}"
-        );
-        assert_eq!(state.jumpjet_deviation, 0, "{kind:?}");
-        assert_eq!(
-            state.jumpjet_crash_speed,
-            crate::util::fixed_math::SIM_ZERO,
-            "{kind:?}"
-        );
-        assert_eq!(state.jumpjet_turn_rate, 4, "{kind:?}");
+        assert!(state.jumpjet_runtime().is_none(), "{kind:?}");
         if kind != LocomotorKind::Fly {
-            assert_eq!(
-                state.target_altitude,
-                crate::util::fixed_math::SIM_ZERO,
-                "{kind:?}"
-            );
+            assert_eq!(state.fly_target_height(), 0, "{kind:?}");
         }
     }
 }

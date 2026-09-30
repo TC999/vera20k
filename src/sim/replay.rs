@@ -9,8 +9,6 @@
 //! [`ReplayLog`] remains the richer Rust-only command/hash diagnostic used by
 //! parity tests. It is deliberately separate from [`NativeReplay`].
 
-#[cfg(test)]
-use std::collections::BTreeMap;
 use std::num::NonZeroI32;
 use std::path::Path;
 
@@ -170,14 +168,7 @@ impl NativeReplayHeader {
         self.scenario_name[..len].copy_from_slice(&name.as_bytes()[..len]);
     }
 
-    pub fn scenario_name_bytes(&self) -> &[u8; NATIVE_REPLAY_SCENARIO_NAME_LEN] {
-        &self.scenario_name
-    }
-
-    pub fn options_bytes(&self) -> &[u8; NATIVE_REPLAY_OPTIONS_LEN] {
-        &self.options
-    }
-
+    #[cfg(test)]
     pub fn set_options_bytes(&mut self, options: [u8; NATIVE_REPLAY_OPTIONS_LEN]) {
         self.options = options;
     }
@@ -217,14 +208,6 @@ impl NativeReplayPresentation {
         let cursor = *live_cursor;
         *live_cursor = [0; 2];
         Self::new(scenario_hash, selected_objects, cursor)
-    }
-
-    /// Whether the live selection matches the recorded additive identity sum.
-    ///
-    /// Retail clears selection on a mismatch, then consumes the recorded
-    /// identities to restore the frame's selection.
-    pub fn selection_matches(&self, live_selected_objects: &[u32]) -> bool {
-        selection_checksum(live_selected_objects) == self.selection_checksum
     }
 }
 
@@ -296,6 +279,7 @@ impl NativeReplay {
     /// The native stream has no tag for an omitted command batch. Its presence
     /// is known from session mode, frame, and network cadence, so the scheduler
     /// supplies that decision after each presentation record is decoded.
+    #[cfg(test)]
     pub fn decode_with_command_schedule(
         bytes: &[u8],
         mut has_command_batch: impl FnMut(usize, &NativeReplayPresentation) -> bool,
@@ -330,22 +314,13 @@ impl NativeReplay {
             .with_context(|| format!("Failed to write native replay: {}", path.display()))
     }
 
-    pub fn load_with_command_schedule(
-        path: &Path,
-        has_command_batch: impl FnMut(usize, &NativeReplayPresentation) -> bool,
-    ) -> Result<Self> {
-        let bytes = std::fs::read(path)
-            .with_context(|| format!("Failed to read native replay: {}", path.display()))?;
-        Self::decode_with_command_schedule(&bytes, has_command_batch)
-            .context("Failed to decode native replay")
-    }
-
     /// Initialize playback through the normal scenario-loading owner.
     ///
     /// No snapshot or serialized active-object vector is accepted here. The
     /// caller must rebuild the scenario from the header, after which frames are
     /// exposed in stream order for the scheduler's presentation and command
     /// rungs.
+    #[cfg(test)]
     pub fn initialize_playback<S, E>(
         &self,
         initialize_scenario: impl FnOnce(&NativeReplayHeader) -> std::result::Result<S, E>,
@@ -554,6 +529,7 @@ impl<'a, S> NativeReplayStream<'a, S> {
     }
 
     /// Finish through the verified native caller/session cadence.
+    #[cfg(test)]
     pub fn finish_scheduled_frame(
         &mut self,
         frame: i32,
@@ -589,6 +565,7 @@ pub fn selection_checksum(selected_objects: &[u32]) -> u32 {
 /// A zero kind is the native null sentinel. Other kinds occupy the high byte
 /// and the object's heap-pool identity (or the kind-specific raw value) is
 /// truncated to 24 bits.
+#[cfg(test)]
 pub fn pack_selection_identity(kind: u8, raw_value: u32) -> u32 {
     if kind == 0 {
         u32::MAX
@@ -632,6 +609,7 @@ fn encode_frame(
     Ok(())
 }
 
+#[cfg(test)]
 fn decode_presentation(
     bytes: &[u8],
     cursor: &mut usize,
@@ -663,6 +641,7 @@ fn decode_presentation(
     })
 }
 
+#[cfg(test)]
 fn decode_command_batch(
     bytes: &[u8],
     cursor: &mut usize,
@@ -678,6 +657,7 @@ fn decode_command_batch(
     Ok(commands)
 }
 
+#[cfg(test)]
 fn take<const N: usize>(
     bytes: &[u8],
     cursor: &mut usize,
@@ -715,6 +695,9 @@ fn read_stream_into(bytes: &[u8], cursor: &mut usize, destination: &mut [u8]) ->
 /// Header for the Rust-only deterministic diagnostic log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplayHeader {
+    /// Match input; an old JSON log uses the documented default profile.
+    #[serde(default)]
+    pub pixel_conversion_bounds: crate::util::pixel_conversion::PixelConversionBounds,
     pub version: u32,
     pub tick_hz: u32,
     pub seed: u64,
@@ -777,11 +760,17 @@ impl ReplayRunner {
     /// resources and navigation re-snapshots per frame just as a recorded
     /// app session did - nothing is caller-substitutable and a mid-match
     /// path-grid change replays faithfully.
+    #[cfg(test)]
     pub fn run_runtime(
         runtime: &mut crate::sim::runtime::SimRuntime,
         replay: &ReplayLog,
         tick_ms: u32,
     ) -> Result<Vec<u64>> {
+        anyhow::ensure!(
+            runtime.simulation.session.pixel_conversion_bounds
+                == replay.header.pixel_conversion_bounds,
+            "replay pixel conversion bounds differ from the initialized match"
+        );
         debug_assert_eq!(
             runtime.simulation.session.seed, replay.header.seed,
             "replay playback sim must be constructed from header.seed"
@@ -817,13 +806,10 @@ impl ReplayRunner {
         sim: &mut Simulation,
         replay: &ReplayLog,
         rules: Option<&RuleSet>,
-        height_map: &BTreeMap<(u16, u16), u8>,
         path_grid: Option<&PathGrid>,
         tick_ms: u32,
     ) -> Vec<u64> {
-        Self::run_fixture_with_overlay_registry(
-            sim, replay, rules, height_map, path_grid, None, tick_ms,
-        )
+        Self::run_fixture_with_overlay_registry(sim, replay, rules, path_grid, None, tick_ms)
     }
 
     /// Fixture-only variant with the static overlay type registry used by the
@@ -835,7 +821,6 @@ impl ReplayRunner {
         sim: &mut Simulation,
         replay: &ReplayLog,
         rules: Option<&RuleSet>,
-        height_map: &BTreeMap<(u16, u16), u8>,
         path_grid: Option<&PathGrid>,
         overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
         tick_ms: u32,
@@ -844,7 +829,6 @@ impl ReplayRunner {
             sim,
             replay,
             rules,
-            height_map,
             path_grid,
             overlay_registry,
             tick_ms,
@@ -862,13 +846,16 @@ impl ReplayRunner {
         sim: &mut Simulation,
         replay: &ReplayLog,
         rules: Option<&RuleSet>,
-        height_map: &BTreeMap<(u16, u16), u8>,
         path_grid: Option<&PathGrid>,
         overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
         tick_ms: u32,
         trigger_inputs: Option<TriggerInputs<'_>>,
     ) -> Vec<u64> {
         // The diagnostic playback must be constructed from the recorded seed.
+        assert_eq!(
+            sim.session.pixel_conversion_bounds, replay.header.pixel_conversion_bounds,
+            "replay pixel conversion bounds differ from the initialized match"
+        );
         // A sim seeded
         // differently than the header it replays is a guaranteed silent
         // divergence.
@@ -891,6 +878,7 @@ impl ReplayRunner {
                 );
             }
         }
+        sim.install_fixture_path_grid(path_grid);
         let mut hashes: Vec<u64> = Vec::with_capacity(replay.ticks.len());
         for entry in &replay.ticks {
             let due_commands = sim.take_due_replay_commands(entry.commands.iter().cloned());
@@ -898,8 +886,6 @@ impl ReplayRunner {
                 .advance_master_frame(
                     &due_commands,
                     rules,
-                    height_map,
-                    path_grid,
                     overlay_registry,
                     tick_ms,
                     TickLane::Ordinary,
@@ -1353,6 +1339,7 @@ mod tests {
     #[test]
     fn diagnostic_log_json_roundtrip() {
         let mut log = ReplayLog::new(ReplayHeader {
+            pixel_conversion_bounds: Default::default(),
             version: 1,
             tick_hz: 30,
             seed: 42,
@@ -1365,7 +1352,6 @@ mod tests {
                 crate::sim::intern::test_intern("Americans"),
                 1,
                 Command::SetRally {
-                    owner: crate::sim::intern::test_intern("Americans"),
                     rx: 10,
                     ry: 11,
                     producer_ids: vec![1, 2],
@@ -1385,6 +1371,7 @@ mod tests {
     fn gsi_04_07_wall_sell_diagnostic_replay_roundtrips_without_native_version_bump() {
         let owner = crate::sim::intern::test_intern("Receiver");
         let mut log = ReplayLog::new(ReplayHeader {
+            pixel_conversion_bounds: Default::default(),
             version: 1,
             tick_hz: 15,
             seed: 7,
@@ -1421,6 +1408,7 @@ mod tests {
         sim.session.house_order.push(owner);
         sim.session.tick = 3;
         let mut log = ReplayLog::new(ReplayHeader {
+            pixel_conversion_bounds: Default::default(),
             version: 1,
             tick_hz: 15,
             seed: 7,
@@ -1440,8 +1428,7 @@ mod tests {
         assert_eq!(decoded.ticks[0].commands[0].payload, Command::ExitMatch);
         assert_eq!(NATIVE_REPLAY_VERSION, 10);
 
-        let hashes =
-            ReplayRunner::run_fixture(&mut sim, &decoded, None, &BTreeMap::new(), None, 33);
+        let hashes = ReplayRunner::run_fixture(&mut sim, &decoded, None, None, 33);
         assert_eq!(hashes.len(), 1);
         assert!(sim.quit_requested);
         assert_eq!(sim.take_executed_exit_owner(), Some(owner));
@@ -1462,17 +1449,11 @@ mod tests {
         };
         let (mut recorded, owner) = make_sim();
         let command = CommandEnvelope::new(owner, 1, Command::SetGameSpeed { speed: 4 });
-        let tick = recorded.advance_tick(
-            std::slice::from_ref(&command),
-            None,
-            &BTreeMap::new(),
-            None,
-            None,
-            67,
-        );
+        let tick = recorded.advance_tick(std::slice::from_ref(&command), None, None, None, 67);
         assert_eq!(recorded.session.game_options.game_speed, 4);
 
         let mut log = ReplayLog::new(ReplayHeader {
+            pixel_conversion_bounds: Default::default(),
             version: 1,
             tick_hz: 15,
             seed: 7,
@@ -1484,8 +1465,7 @@ mod tests {
         let decoded: ReplayLog = serde_json::from_str(&json).expect("decode GameSpeed replay");
 
         let (mut replayed, _) = make_sim();
-        let hashes =
-            ReplayRunner::run_fixture(&mut replayed, &decoded, None, &BTreeMap::new(), None, 67);
+        let hashes = ReplayRunner::run_fixture(&mut replayed, &decoded, None, None, 67);
         assert_eq!(hashes, vec![tick.state_hash]);
         assert_eq!(replayed.session.game_options.game_speed, 4);
         assert_eq!(replayed.state_hash(), recorded.state_hash());
@@ -1497,6 +1477,7 @@ mod tests {
         let mut sim = Simulation::with_seed(7);
         let owner = sim.interner.intern("Local");
         let mut log = ReplayLog::new(ReplayHeader {
+            pixel_conversion_bounds: Default::default(),
             version: 1,
             tick_hz: 15,
             seed: 7,
@@ -1514,7 +1495,7 @@ mod tests {
         );
         log.record_tick(2, Vec::new(), 0);
 
-        let hashes = ReplayRunner::run_fixture(&mut sim, &log, None, &BTreeMap::new(), None, 33);
+        let hashes = ReplayRunner::run_fixture(&mut sim, &log, None, None, 33);
 
         assert_eq!(hashes.len(), 2);
         assert!(
@@ -1540,6 +1521,7 @@ mod tests {
         let regenerated = CommandEnvelope::new(owner, 1, Command::SetGameSpeed { speed: 4 });
         sim.queue_command(regenerated.clone());
         let mut log = ReplayLog::new(ReplayHeader {
+            pixel_conversion_bounds: Default::default(),
             version: 1,
             tick_hz: 15,
             seed: 7,
@@ -1548,7 +1530,7 @@ mod tests {
         });
         log.record_tick(1, vec![regenerated.clone()], 0);
 
-        let hashes = ReplayRunner::run_fixture(&mut sim, &log, None, &BTreeMap::new(), None, 33);
+        let hashes = ReplayRunner::run_fixture(&mut sim, &log, None, None, 33);
 
         assert_eq!(hashes.len(), 1);
         assert_eq!(sim.session.game_options.game_speed, 4);

@@ -44,10 +44,8 @@ pub enum DebugEventKind {
     PathSegmentComplete { final_goal: Option<(u16, u16)> },
 
     // -- Miner --
-    /// Miner high-level state changed (e.g., SearchOre → MoveToOre).
+    /// Miner high-level state changed (e.g., SearchOre → Harvest).
     MinerStateChange { from: String, to: String },
-    /// Refinery dock sub-phase changed (e.g., Approach → WaitForDock).
-    DockPhaseChange { from: String, to: String },
 
     // -- Special movement --
     /// Special movement system activated (Teleport/Tunnel/Rocket/DropPod).

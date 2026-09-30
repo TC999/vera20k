@@ -10,7 +10,9 @@ use super::{
     LauncherResolutionRow, LauncherTrackbarId, OptionsDialogState, PhysicalControlFrame,
     thumb_left,
 };
-use crate::ui::shell::geom::{RectPx, center_offset, dlu_rect};
+use crate::ui::shell::descriptor::DialogId;
+use crate::ui::shell::geom::{RectPx, center_offset, child_window, dlu_rect};
+use crate::ui::shell::menu_page::{self, MenuPageButtonSpec, MenuPageSpec};
 use crate::ui::skirmish_shell::{
     COMBO_DROPDOWN_ROW_H, COMBO_DROPDOWN_SCROLLBAR_BUTTON_H, COMBO_DROPDOWN_SCROLLBAR_W,
     COMBO_FACE_H, ScrollModel,
@@ -23,12 +25,52 @@ pub(super) struct ShellInteraction {
     popup_hovered: Option<usize>,
     popup_top: usize,
     popup_scroll_grab: Option<i32>,
+    /// Status help last written by a dialog hit test (`0x00622CCB`).
+    status_help: Option<&'static str>,
 }
+
+pub(crate) const KEYBOARD_BUTTON: u16 = 0x05CE;
+pub(crate) const NETWORK_BUTTON: u16 = 0x05CD;
+pub(crate) const MAIN_MENU_BUTTON: u16 = 0x0686;
+
+/// `0xD5` as a family page (Session `+0x30D8` clear at the main menu): the
+/// right-panel column is Keyboard and Network (`0x006092CB`), then Main Menu
+/// (`0x0060982C`); the heading and status line sit at the family places.
+/// Button captions come from the dialog's own labels.
+pub(crate) const OPTIONS_PAGE: MenuPageSpec = MenuPageSpec {
+    dialog: DialogId(0x00D5),
+    title_key: "GUI:OptionsMenu",
+    stacked: &[
+        MenuPageButtonSpec {
+            id: KEYBOARD_BUTTON,
+            dlu_top: 122,
+            csf_key: "GUI:Keyboard",
+            tooltip_key: "STT:MainOptButtonKeyboard",
+            result: None,
+        },
+        MenuPageButtonSpec {
+            id: NETWORK_BUTTON,
+            dlu_top: 149,
+            csf_key: "GUI:Network",
+            tooltip_key: "STT:MainOptButtonNetwork",
+            result: None,
+        },
+    ],
+    back: MenuPageButtonSpec {
+        id: MAIN_MENU_BUTTON,
+        dlu_top: 346,
+        csf_key: "GUI:MainMenu",
+        tooltip_key: "STT:MainOptButtonBack",
+        result: Some(0x05CB),
+    },
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LauncherOptionsLayout {
     pub(crate) title: RectPx,
     pub(crate) warning: RectPx,
+    /// Status line `0x695`.
+    pub(crate) status_help: RectPx,
     pub(crate) resolution: RectPx,
     pub(crate) trackbars: [(LauncherTrackbarId, RectPx); 6],
     pub(crate) checkboxes: [(LauncherCheckboxId, RectPx); 3],
@@ -43,17 +85,24 @@ impl LauncherOptionsLayout {
         let offset_y = center_offset(height, 600);
         let px = |rect: RectPx| rect.translate(offset_x, offset_y);
         let dlu = |x, y, w, h| px(dlu_rect(x, y, w, h));
+        // The sliders run one pixel wider and taller than the template
+        // (retail stills: 181x22 and 129x22).
+        let slider = |x, y, w, h| px(child_window(x, y, w, h));
+        // The right-panel children follow the panel, not the dialog centring.
+        let page = menu_page::compute_layout(&OPTIONS_PAGE, width as u32, height as u32);
+        let button = |id| page.button_rect(id).expect("0xD5 page button");
         Self {
-            title: px(RectPx::new(635, 9, 162, 17)),
-            warning: px(RectPx::new(670, 47, 92, 54)),
+            title: page.title,
+            warning: page.warning_monitor,
+            status_help: page.status_help,
             resolution: px(RectPx::new(351, 86, 180, COMBO_FACE_H)),
             trackbars: [
-                (LauncherTrackbarId::Detail, dlu(89, 53, 120, 13)),
-                (LauncherTrackbarId::Difficulty, dlu(92, 128, 120, 13)),
-                (LauncherTrackbarId::Scroll, dlu(238, 203, 120, 13)),
-                (LauncherTrackbarId::Score, dlu(82, 289, 85, 13)),
-                (LauncherTrackbarId::Sound, dlu(179, 289, 85, 13)),
-                (LauncherTrackbarId::Voice, dlu(277, 289, 85, 13)),
+                (LauncherTrackbarId::Detail, slider(89, 53, 120, 13)),
+                (LauncherTrackbarId::Difficulty, slider(92, 128, 120, 13)),
+                (LauncherTrackbarId::Scroll, slider(238, 203, 120, 13)),
+                (LauncherTrackbarId::Score, slider(82, 289, 85, 13)),
+                (LauncherTrackbarId::Sound, slider(179, 289, 85, 13)),
+                (LauncherTrackbarId::Voice, slider(277, 289, 85, 13)),
             ],
             checkboxes: [
                 (LauncherCheckboxId::Tooltips, dlu(93, 188, 130, 10)),
@@ -61,18 +110,9 @@ impl LauncherOptionsLayout {
                 (LauncherCheckboxId::ShowHidden, dlu(93, 218, 130, 10)),
             ],
             buttons: [
-                (
-                    LauncherParentResult::Keyboard,
-                    px(RectPx::new(644, 199, 156, 42)),
-                ),
-                (
-                    LauncherParentResult::Network,
-                    px(RectPx::new(644, 241, 156, 42)),
-                ),
-                (
-                    LauncherParentResult::Back,
-                    px(RectPx::new(644, 535, 156, 42)),
-                ),
+                (LauncherParentResult::Keyboard, button(KEYBOARD_BUTTON)),
+                (LauncherParentResult::Network, button(NETWORK_BUTTON)),
+                (LauncherParentResult::Back, button(MAIN_MENU_BUTTON)),
             ],
             offset_x,
             offset_y,
@@ -208,10 +248,10 @@ impl OptionsDialogState {
 
     pub(crate) fn shell_trackbar_thumb_left(&self, id: LauncherTrackbarId, width: i32) -> i32 {
         thumb_left(
-            self.trackbar_position(id),
+            i32::from(self.trackbar_position(id)),
             width,
             id.plaque_reserve(),
-            id.maximum(),
+            i32::from(id.maximum()),
         )
     }
 
@@ -248,7 +288,7 @@ impl OptionsDialogState {
         // 74 DLU (120px) allocated, admitting five 23px rows. Actual HWND
         // border adjustments remain outside this resource-derived bound.
         let model = ScrollModel::combo(5);
-        let visible_rows = model.visible_rows(self.resolution_rows.len(), 0);
+        let visible_rows = model.visible_rows(self.resolution_rows.len());
         let rect = RectPx::new(
             layout.resolution.x,
             layout.resolution.y + COMBO_FACE_H + 1,
@@ -265,15 +305,14 @@ impl OptionsDialogState {
                 rect.h,
             )
         });
-        let thumb = scrollbar.and_then(|scrollbar| {
-            let height =
-                model.thumb_height(visible_rows, self.resolution_rows.len(), scrollbar.h)?;
-            Some(RectPx::new(
+        let thumb = scrollbar.map(|scrollbar| {
+            let height = model.thumb_height(visible_rows, self.resolution_rows.len(), scrollbar.h);
+            RectPx::new(
                 scrollbar.x,
                 model.thumb_y(scrollbar, height, first_row, max_top),
                 scrollbar.w,
                 height,
-            ))
+            )
         });
         Some(LauncherResolutionPopup {
             rect,
@@ -291,6 +330,72 @@ impl OptionsDialogState {
             selected: self.selected_resolution,
             hovered: self.shell_interaction.popup_hovered,
         })
+    }
+
+    /// The status help the line shows: the key the last dialog hit test
+    /// wrote. While a slider or button holds the mouse capture, or the
+    /// resolution list is open, the dialog gets no hit test and the text
+    /// stays.
+    pub(crate) fn shell_status_help(&self) -> Option<&'static str> {
+        self.shell_interaction.status_help
+    }
+
+    /// Status help (`0x00604729..0x00604838`) for the control under the
+    /// pointer. Hover is enable-unfiltered; the open resolution list is a
+    /// window of its own with no entry.
+    pub(crate) fn shell_status_help_key(
+        &self,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> Option<&'static str> {
+        let layout = LauncherOptionsLayout::new(width, height);
+        if self
+            .shell_popup(&layout)
+            .is_some_and(|popup| popup.rect.contains(x, y))
+        {
+            return None;
+        }
+        if let Some((id, _)) = layout.buttons.iter().find(|(_, rect)| rect.contains(x, y)) {
+            let control = match id {
+                LauncherParentResult::Keyboard => KEYBOARD_BUTTON,
+                LauncherParentResult::Network => NETWORK_BUTTON,
+                LauncherParentResult::Back | LauncherParentResult::Terminal => MAIN_MENU_BUTTON,
+            };
+            return OPTIONS_PAGE
+                .button(control)
+                .map(|button| button.tooltip_key);
+        }
+        if let Some((id, _)) = layout
+            .trackbars
+            .iter()
+            .find(|(_, rect)| rect.contains(x, y))
+        {
+            return Some(match id {
+                LauncherTrackbarId::Detail => "STT:MainOptSliderVisual",
+                LauncherTrackbarId::Difficulty => "STT:MainOptSliderDifficulty",
+                LauncherTrackbarId::Scroll => "STT:MainOptSliderScroll",
+                LauncherTrackbarId::Score => "STT:MainOptSliderMusic",
+                LauncherTrackbarId::Sound => "STT:MainOptSliderSound",
+                LauncherTrackbarId::Voice => "STT:MainOptSliderVoice",
+            });
+        }
+        if let Some((id, _)) = layout
+            .checkboxes
+            .iter()
+            .find(|(_, rect)| rect.contains(x, y))
+        {
+            return Some(match id {
+                LauncherCheckboxId::Tooltips => "STT:MainOptCBoxTooltips",
+                LauncherCheckboxId::TargetLines => "STT:MainOptCBoxTargetLines",
+                LauncherCheckboxId::ShowHidden => "STT:MainOptCBoxHidden",
+            });
+        }
+        layout
+            .resolution
+            .contains(x, y)
+            .then_some("STT:MainOptComboModes")
     }
 
     /// The caller routes all pointer messages here while this parent is topmost.
@@ -371,8 +476,15 @@ impl OptionsDialogState {
 
     pub(crate) fn shell_mouse_move(&mut self, x: i32, y: i32, width: i32, height: i32) {
         let layout = LauncherOptionsLayout::new(width, height);
-        if let Some(id) = self.capture {
-            self.trackbar_mouse_move(id, frame(layout.trackbar_rect(id), x, y));
+        if self.capture.is_none()
+            && self.shell_interaction.pressed_button.is_none()
+            && !self.resolution_popup_open
+        {
+            self.shell_interaction.status_help = self.shell_status_help_key(x, y, width, height);
+        }
+        if let Some(hold) = self.capture {
+            let rect = layout.trackbar_rect(hold.id);
+            self.trackbar_mouse_move(hold.id, frame(rect, x, y));
             self.shell_interaction.hovered_button = None;
             return;
         }
@@ -406,8 +518,8 @@ impl OptionsDialogState {
 
     pub(crate) fn shell_mouse_up(&mut self, x: i32, y: i32, width: i32, height: i32) {
         self.shell_interaction.popup_scroll_grab = None;
-        if let Some(id) = self.capture {
-            self.trackbar_mouse_up(id);
+        if let Some(hold) = self.capture {
+            self.trackbar_mouse_up(hold.id);
         }
         self.shell_mouse_move(x, y, width, height);
         if let Some(id) = self.shell_interaction.pressed_button.take() {
@@ -424,6 +536,7 @@ mod tests {
     use crate::ui::main_menu_dialogs::options::{
         LauncherCue, LauncherOptionsEvent, LauncherOptionsLabels, LauncherOptionsValues,
     };
+    use crate::ui::shell::trackbar::TrackbarHold;
 
     fn state() -> OptionsDialogState {
         OptionsDialogState::new(
@@ -439,13 +552,65 @@ mod tests {
     }
 
     #[test]
+    fn right_panel_children_follow_the_family_places() {
+        let layout = LauncherOptionsLayout::new(800, 600);
+        assert_eq!(layout.title, RectPx::new(635, 9, 163, 18));
+        assert_eq!(layout.status_help, RectPx::new(10, 578, 456, 21));
+        let buttons = layout.buttons.map(|(_, rect)| rect);
+        assert_eq!(
+            buttons,
+            [
+                RectPx::new(644, 199, 156, 42),
+                RectPx::new(644, 241, 156, 42),
+                RectPx::new(644, 535, 156, 42),
+            ]
+        );
+    }
+
+    #[test]
+    fn status_help_names_the_control_under_the_pointer() {
+        let state = state();
+        let layout = LauncherOptionsLayout::new(800, 600);
+        let at = |rect: RectPx| state.shell_status_help_key(rect.x + 2, rect.y + 2, 800, 600);
+        assert_eq!(at(layout.buttons[0].1), Some("STT:MainOptButtonKeyboard"));
+        assert_eq!(at(layout.buttons[2].1), Some("STT:MainOptButtonBack"));
+        assert_eq!(
+            at(layout.trackbar_rect(LauncherTrackbarId::Score)),
+            Some("STT:MainOptSliderMusic")
+        );
+        assert_eq!(at(layout.resolution), Some("STT:MainOptComboModes"));
+        assert_eq!(state.shell_status_help_key(5, 5, 800, 600), None);
+    }
+
+    #[test]
+    fn a_captured_slider_keeps_the_status_help_until_release() {
+        let mut state = state();
+        let layout = LauncherOptionsLayout::new(800, 600);
+        let rect = layout.trackbar_rect(LauncherTrackbarId::Score);
+        let thumb = state.shell_trackbar_thumb_left(LauncherTrackbarId::Score, rect.w);
+        state.shell_mouse_down(rect.x + thumb + 5, rect.y + 10, 800, 600);
+        assert_eq!(state.shell_status_help(), Some("STT:MainOptSliderMusic"));
+        let back = layout.buttons[2].1;
+        state.shell_mouse_move(back.x + 5, back.y + 5, 800, 600);
+        assert_eq!(state.shell_status_help(), Some("STT:MainOptSliderMusic"));
+        state.shell_mouse_up(back.x + 5, back.y + 5, 800, 600);
+        assert_eq!(state.shell_status_help(), Some("STT:MainOptButtonBack"));
+    }
+
+    #[test]
     fn physical_slider_capture_crosses_other_controls_without_activating_them() {
         let mut state = state();
         let layout = LauncherOptionsLayout::new(800, 600);
         let rect = layout.trackbar_rect(LauncherTrackbarId::Score);
         let thumb = state.shell_trackbar_thumb_left(LauncherTrackbarId::Score, rect.w);
         state.shell_mouse_down(rect.x + thumb + 5, rect.y + 10, 800, 600);
-        assert_eq!(state.capture, Some(LauncherTrackbarId::Score));
+        assert_eq!(
+            state.capture,
+            Some(TrackbarHold {
+                id: LauncherTrackbarId::Score,
+                dragging: true,
+            })
+        );
         state.shell_mouse_move(799, 550, 800, 600);
         state.shell_mouse_up(799, 550, 800, 600);
         assert_eq!(state.trackbar_position(LauncherTrackbarId::Score), 10);
@@ -461,7 +626,13 @@ mod tests {
         // Fixture starts at4: original128px/50px plaque projection puts the
         // thumb at client27 (screen150), so155 is inside its12px capture box.
         state.shell_mouse_down(155, 475, 800, 600);
-        assert_eq!(state.capture, Some(LauncherTrackbarId::Score));
+        assert_eq!(
+            state.capture,
+            Some(TrackbarHold {
+                id: LauncherTrackbarId::Score,
+                dragging: true,
+            })
+        );
         state.shell_cancel_pointer_gesture();
         let before = state.pack();
         state.shell_mouse_move(799, 550, 800, 600);
@@ -471,29 +642,50 @@ mod tests {
     }
 
     #[test]
-    fn rail_jump_and_checkbox_text_do_not_acquire_capture() {
+    fn every_slider_press_holds_the_mouse_until_release() {
         let mut state = state();
+        let layout = LauncherOptionsLayout::new(800, 600);
+        let held = Some(TrackbarHold {
+            id: LauncherTrackbarId::Difficulty,
+            dragging: false,
+        });
+        // Above the admitted strip the press only takes the capture.
         state.shell_mouse_down(140, 210, 800, 600);
         assert_eq!(
             state.trackbar_position(LauncherTrackbarId::Difficulty),
             1,
             "native lower strip rejects y=2"
         );
+        assert_eq!(state.capture, held);
+        state.shell_mouse_up(140, 210, 800, 600);
+        // Beside the thumb it jumps once and holds without dragging.
         state.shell_mouse_down(140, 218, 800, 600);
         assert_eq!(state.trackbar_position(LauncherTrackbarId::Difficulty), 0);
-        assert_eq!(state.capture, None);
+        assert_eq!(state.capture, held);
+        assert_eq!(
+            state.drain_output().events,
+            [LauncherOptionsEvent::Cue(LauncherCue::GenericClick)]
+        );
         state.shell_mouse_move(317, 218, 800, 600);
         assert_eq!(state.trackbar_position(LauncherTrackbarId::Difficulty), 0);
+        let back = layout.buttons[2].1;
+        state.shell_mouse_move(back.x + 5, back.y + 5, 800, 600);
+        assert_eq!(
+            state.shell_status_help(),
+            Some("STT:MainOptSliderDifficulty")
+        );
+        state.shell_mouse_up(back.x + 5, back.y + 5, 800, 600);
+        assert_eq!(state.capture, None);
+        assert_eq!(state.shell_status_help(), Some("STT:MainOptButtonBack"));
+        assert_eq!(state.drain_output().result, None);
+        // The checkbox text takes no press.
         state.shell_mouse_down(170, 310, 800, 600);
         assert!(state.shell_checkbox_checked(LauncherCheckboxId::Tooltips));
         state.shell_mouse_down(150, 310, 800, 600);
         assert!(!state.shell_checkbox_checked(LauncherCheckboxId::Tooltips));
         assert_eq!(
             state.drain_output().events,
-            [
-                LauncherOptionsEvent::Cue(LauncherCue::GenericClick),
-                LauncherOptionsEvent::Cue(LauncherCue::Checkbox)
-            ]
+            [LauncherOptionsEvent::Cue(LauncherCue::Checkbox)]
         );
     }
 

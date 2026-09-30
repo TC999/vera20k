@@ -71,22 +71,22 @@ const ZERO_COMBINED_SUBSTITUTE: SimFixed = SIM_HALF;
 /// `Process_Movement` and nowhere else.
 const DAMAGED_MOVER_SPEED_FACTOR: SimFixed = SimFixed::lit("0.75");
 
-/// `ConditionYellow` is stored as a fraction; the sim compares it as an integer
-/// scaled by this factor so no float enters the health test.
-const CONDITION_YELLOW_SCALE: i64 = 1000;
-
-/// Whether the mover's health ratio is at or below `[AudioVisual] ConditionYellow`.
-///
-/// The original engine's test is `ratio <= ConditionYellow` — a unit sitting
-/// exactly on the threshold IS penalised. `condition_yellow_x1000` is the
-/// pre-scaled integer form parsed from `[AudioVisual]`; the cross-multiply keeps
-/// the comparison in integers, matching the building damage-state gate.
+/// Drive4B3DD4..3DEE / Ship6A3423..343D test AH,0x41: Less, Equal or
+/// Unordered all apply the penalty. The shared x87 owner preserves signed
+/// Strength and masked zero-denominator results.
 pub fn is_at_or_below_condition_yellow(
-    current_hp: i64,
-    max_hp: i64,
-    condition_yellow_x1000: i64,
+    current_hp: i32,
+    strength: i32,
+    condition_yellow: f64,
 ) -> bool {
-    max_hp > 0 && current_hp * CONDITION_YELLOW_SCALE <= max_hp * condition_yellow_x1000
+    use crate::util::native_x87::MaskedX87Ordering::{Equal, Less, Unordered};
+    matches!(
+        crate::sim::components::Health {
+            current: current_hp
+        }
+        .compare_ratio(strength, condition_yellow),
+        Less | Equal | Unordered
+    )
 }
 
 /// Whether this locomotor is one of the two that route through the land-type ×
@@ -108,24 +108,24 @@ fn uses_land_type_speed_chain(kind: LocomotorKind) -> bool {
 /// travel direction. Vanilla values are 1.0 uphill / 1.2 downhill for both.
 #[derive(Debug, Clone)]
 pub struct TerrainSpeedConfig {
-    /// Tracked vehicle moving uphill (`TrackedUphill=`; vanilla 1.0).
+    /// Tracked vehicle moving uphill (`TrackedUphill=`, Rules +0x768).
     pub tracked_uphill: SimFixed,
-    /// Tracked vehicle moving downhill (`TrackedDownhill=`; vanilla 1.2).
+    /// Tracked vehicle moving downhill (`TrackedDownhill=`, Rules +0x770).
     pub tracked_downhill: SimFixed,
-    /// Non-tracked (wheeled and other) vehicle moving uphill (`WheeledUphill=`; vanilla 1.0).
+    /// Non-tracked (wheeled and other) vehicle moving uphill (`WheeledUphill=`, Rules +0x778).
     pub wheeled_uphill: SimFixed,
-    /// Non-tracked vehicle moving downhill (`WheeledDownhill=`; vanilla 1.2).
+    /// Non-tracked vehicle moving downhill (`WheeledDownhill=`, Rules +0x780).
     pub wheeled_downhill: SimFixed,
 }
 
 impl Default for TerrainSpeedConfig {
+    /// The RulesClass constructor's 1.0 for all four (0x6660BE..0x6660ED).
     fn default() -> Self {
-        // Vanilla rulesmd.ini [General]: 1.0 uphill / 1.2 downhill for both pairs.
         Self {
             tracked_uphill: SIM_ONE,
-            tracked_downhill: SimFixed::lit("1.2"),
+            tracked_downhill: SIM_ONE,
             wheeled_uphill: SIM_ONE,
-            wheeled_downhill: SimFixed::lit("1.2"),
+            wheeled_downhill: SIM_ONE,
         }
     }
 }
@@ -156,7 +156,7 @@ impl TerrainSpeedConfig {
 pub fn compute_cell_speed_modifier(
     speed_type: SpeedType,
     locomotor_kind: LocomotorKind,
-    current_cell: (u16, u16),
+    mover_world: (i32, i32),
     next_cell: (u16, u16),
     terrain: &ResolvedTerrainGrid,
     config: &TerrainSpeedConfig,
@@ -166,13 +166,42 @@ pub fn compute_cell_speed_modifier(
         return SIM_ONE;
     }
     let terrain_factor = terrain_speed_factor(speed_type, next_cell, terrain);
+    // Two sampled ground heights, as native does: the mover's exact position
+    // against the destination cell's own coordinate.
     let slope_factor = slope_factor_for(
         speed_type,
-        cell_level(current_cell, terrain),
-        cell_level(next_cell, terrain),
+        ground_height_at_world(mover_world, terrain),
+        ground_height_at_world(cell_centre_world(next_cell), terrain),
         config,
     );
 
+    combine_speed_stages(terrain_factor, slope_factor, below_condition_yellow)
+}
+
+/// Drive/Ship Process_Movement's target for an admitted first candidate
+/// (`0x004B357F..0x004B35D6`, `0x004B3C84..0x004B3DF6`): the candidate Cell's
+/// land speed row, or `road_row` (land type 1) when the caller found its
+/// retained height two or more levels from the Cell, then the same slope,
+/// zero and damage stages as [`compute_cell_speed_modifier`].
+pub(crate) fn fresh_track_speed_fraction(
+    speed_type: SpeedType,
+    mover_world: (i32, i32),
+    next_cell: (u16, u16),
+    road_row: Option<SimFixed>,
+    terrain: &ResolvedTerrainGrid,
+    config: &TerrainSpeedConfig,
+    below_condition_yellow: bool,
+) -> SimFixed {
+    let terrain_factor = road_row.map_or_else(
+        || terrain_speed_factor(speed_type, next_cell, terrain),
+        |row| row.min(TERRAIN_SPEED_MAX),
+    );
+    let slope_factor = slope_factor_for(
+        speed_type,
+        ground_height_at_world(mover_world, terrain),
+        ground_height_at_world(cell_centre_world(next_cell), terrain),
+        config,
+    );
     combine_speed_stages(terrain_factor, slope_factor, below_condition_yellow)
 }
 
@@ -202,9 +231,38 @@ fn combine_speed_stages(
     }
 }
 
-/// Terrain height of a cell, defaulting to 0 outside the grid.
-fn cell_level(cell: (u16, u16), terrain: &ResolvedTerrainGrid) -> u8 {
-    terrain.cell(cell.0, cell.1).map(|c| c.level).unwrap_or(0)
+/// Ground height in leptons under an exact world position.
+///
+/// `CellClass::ComputeGroundHeightAtCoord 0x0047B3A0`, through the evaluator
+/// that `tools/ramp_height_vectors.json` already pins against 158 native
+/// fixtures. The low bytes of the world coordinates carry the sub-cell offset,
+/// which is the whole point: on a ramp, two positions in one cell have
+/// different ground heights.
+///
+/// Falls back to the cell's flat base when the position is off-grid or the
+/// slope is one the evaluator does not model, which is the behaviour this
+/// function replaced (a pure level-byte reading) and so cannot regress.
+fn ground_height_at_world(world: (i32, i32), terrain: &ResolvedTerrainGrid) -> i32 {
+    let cell = (
+        crate::util::lepton::lepton_to_cell(world.0),
+        crate::util::lepton::lepton_to_cell(world.1),
+    );
+    let (level, slope) = match (u16::try_from(cell.0), u16::try_from(cell.1)) {
+        (Ok(x), Ok(y)) => terrain
+            .cell(x, y)
+            .map_or((0, 0), |c| (c.level, c.slope_type)),
+        _ => (0, 0),
+    };
+    crate::sim::cell_kernel::cell_floor_height(level, slope, world.0, world.1).unwrap_or_else(
+        |_| i32::from(level as i8) * crate::util::lepton::GROUND_LEVEL_HEIGHT_LEPTONS,
+    )
+}
+
+/// The centre of a cell, in world leptons - what native samples for the
+/// destination (`0x004B3CEC` passes the destination coordinate, not the
+/// mover's).
+fn cell_centre_world(cell: (u16, u16)) -> (i32, i32) {
+    (i32::from(cell.0) * 256 + 128, i32::from(cell.1) * 256 + 128)
 }
 
 /// Factor 1: terrain type speed from INI land-type percentages.
@@ -229,27 +287,35 @@ fn terrain_speed_factor(
     }
 }
 
-/// Pick the slope coefficient for a mover stepping from `cur_level` to `next_level`.
+/// Pick the slope coefficient from two sampled ground heights, in leptons.
 ///
-/// Destination higher than current = uphill; lower = downhill; equal = no change.
-/// Track SpeedType uses the tracked pair, every other SpeedType the wheeled pair —
-/// matching the original engine's `SpeedType == Track` test (infantry are handled
-/// by a separate precomputed-foot mechanism and don't reach this vehicle path).
+/// Destination higher than the mover = uphill; lower = downhill; equal = no
+/// change. Track SpeedType uses the tracked pair, every other SpeedType the
+/// wheeled pair — matching the original engine's `SpeedType == Track` test
+/// (infantry are handled by a separate precomputed-foot mechanism and don't
+/// reach this vehicle path).
+///
+/// These are **heights**, not cell level bytes. Native compares two
+/// `GetGroundHeight` results (`0x004B3CEC` destination, `0x004B3D1A` the mover's
+/// own coordinate, compared at `0x004B3D21`), and the two differ exactly where a
+/// mover is partway down a ramp whose cell level already equals the flat cell it
+/// is leaving for — which is about half of all ramp-to-flat adjacencies on the
+/// stock maps, so it is the ordinary case rather than a corner.
 fn slope_factor_for(
     speed_type: SpeedType,
-    cur_level: u8,
-    next_level: u8,
+    cur_height: i32,
+    next_height: i32,
     config: &TerrainSpeedConfig,
 ) -> SimFixed {
     let tracked = speed_type == SpeedType::Track;
-    if next_level > cur_level {
+    if next_height > cur_height {
         // Uphill.
         if tracked {
             config.tracked_uphill
         } else {
             config.wheeled_uphill
         }
-    } else if next_level < cur_level {
+    } else if next_height < cur_height {
         // Downhill.
         if tracked {
             config.tracked_downhill
@@ -263,8 +329,153 @@ fn slope_factor_for(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn original_health_ratio_corpus_drives_flat_drive_and_ship_speed() {
+        use crate::map::resolved_terrain::{ResolvedTerrainGrid, test_flat_cell};
+        let terrain = ResolvedTerrainGrid::from_cells(
+            2,
+            1,
+            (0..2)
+                .map(|rx| {
+                    let mut cell = test_flat_cell(rx, 0);
+                    cell.speed_costs = SpeedCostProfile {
+                        track: Some(100),
+                        float: Some(100),
+                        ..Default::default()
+                    };
+                    cell
+                })
+                .collect(),
+        );
+        for row in crate::sim::health_ratio_fixture::rows() {
+            let damaged = is_at_or_below_condition_yellow(
+                row.input.current,
+                row.input.strength,
+                row.input.yellow(),
+            );
+            for (speed, kind, bits) in [
+                (
+                    SpeedType::Track,
+                    LocomotorKind::Drive,
+                    &row.output.drive_speed_bits,
+                ),
+                (
+                    SpeedType::Float,
+                    LocomotorKind::Ship,
+                    &row.output.ship_speed_bits,
+                ),
+            ] {
+                let actual = compute_cell_speed_modifier(
+                    speed,
+                    kind,
+                    (128, 128),
+                    (1, 0),
+                    &terrain,
+                    &TerrainSpeedConfig::default(),
+                    damaged,
+                );
+                assert_eq!(
+                    actual,
+                    SimFixed::from_num(crate::sim::health_ratio_fixture::decode(bits)),
+                    "{row:?}, {kind:?}"
+                );
+            }
+        }
+    }
     use super::*;
     use crate::rules::terrain_rules::SpeedCostProfile;
+
+    /// A8 D1, over a real grid and through the production entry point.
+    ///
+    /// Native picks the slope coefficient from two sampled ground heights - the
+    /// destination's coordinate at `0x004B3CEC` and the mover's own `+0x9C` at
+    /// `0x004B3D1A`, compared at `0x004B3D21`. This port compared the two cells'
+    /// integer `level` bytes, which are equal exactly where a mover leaves a ramp
+    /// for a flat cell standing at the ramp's own level.
+    ///
+    /// So the fixture is that shape: a ramp at level 3 beside a flat cell also at
+    /// level 3. If the comparison ever returns to level bytes, both read 3, the
+    /// factor is 1.0 and this fails.
+    ///
+    /// The destination land row is deliberately below 100%: `SetSpeedFraction
+    /// 0x004D3710` clamps the combined value at 1.0, so on a full-speed row the
+    /// downhill bonus is invisible and the assertion could not discriminate.
+    #[test]
+    fn leaving_a_ramp_for_a_flat_cell_at_the_same_level_is_downhill() {
+        use crate::map::resolved_terrain::{ResolvedTerrainGrid, test_flat_cell};
+
+        const LEVEL: u8 = 3;
+        const RAMP: (u16, u16) = (4, 4);
+        const FLAT: (u16, u16) = (5, 4);
+        const SIZE: u16 = 8;
+
+        let mut cells = Vec::new();
+        for ry in 0..SIZE {
+            for rx in 0..SIZE {
+                let mut cell = test_flat_cell(rx, ry);
+                cell.level = LEVEL;
+                // A land row the clamp will not swallow.
+                cell.speed_costs = SpeedCostProfile {
+                    track: Some(50),
+                    ..Default::default()
+                };
+                if (rx, ry) == RAMP {
+                    cell.slope_type = 1;
+                    cell.has_ramp = true;
+                }
+                cells.push(cell);
+            }
+        }
+        let terrain = ResolvedTerrainGrid::from_cells(SIZE, SIZE, cells);
+        // Stock rulesmd.ini [General]: TrackedDownhill=1.2.
+        let config = TerrainSpeedConfig {
+            tracked_downhill: SimFixed::lit("1.2"),
+            wheeled_downhill: SimFixed::lit("1.2"),
+            ..TerrainSpeedConfig::default()
+        };
+
+        // Both cells carry level 3, so a level-byte comparison calls this flat.
+        assert_eq!(
+            terrain.cell(RAMP.0, RAMP.1).map(|c| c.level),
+            terrain.cell(FLAT.0, FLAT.1).map(|c| c.level),
+            "the fixture is only meaningful while the two level bytes agree"
+        );
+
+        // A mover partway across the ramp, heading for the flat cell.
+        let on_ramp = (i32::from(RAMP.0) * 256 + 200, i32::from(RAMP.1) * 256 + 200);
+        let leaving = compute_cell_speed_modifier(
+            SpeedType::Track,
+            LocomotorKind::Drive,
+            on_ramp,
+            FLAT,
+            &terrain,
+            &config,
+            false,
+        );
+
+        // Standing on the flat cell already, heading further along it.
+        let on_flat = (i32::from(FLAT.0) * 256 + 128, i32::from(FLAT.1) * 256 + 128);
+        let flat_to_flat = compute_cell_speed_modifier(
+            SpeedType::Track,
+            LocomotorKind::Drive,
+            on_flat,
+            (FLAT.0 + 1, FLAT.1),
+            &terrain,
+            &config,
+            false,
+        );
+
+        assert!(
+            leaving > flat_to_flat,
+            "leaving the ramp must earn the downhill coefficient the flat step \
+             does not: ramp {leaving:?} vs flat {flat_to_flat:?}"
+        );
+        assert_eq!(
+            flat_to_flat,
+            SimFixed::from_num(0.5),
+            "flat to flat is the land row alone"
+        );
+    }
 
     #[test]
     fn speed_multiplier_for_normal_terrain() {
@@ -333,7 +544,7 @@ mod tests {
     /// `[AudioVisual] ConditionYellow=50%`.
     #[test]
     fn gsi_06_04_condition_yellow_test_is_inclusive() {
-        const STOCK: i64 = 500; // 50% x1000
+        const STOCK: f64 = 0.5;
         // Exactly on the threshold — penalised.
         assert!(is_at_or_below_condition_yellow(50, 100, STOCK));
         // Below — penalised.
@@ -342,7 +553,7 @@ mod tests {
         assert!(!is_at_or_below_condition_yellow(51, 100, STOCK));
         assert!(!is_at_or_below_condition_yellow(100, 100, STOCK));
         // A zero-max entity has no ratio to compare.
-        assert!(!is_at_or_below_condition_yellow(0, 0, STOCK));
+        assert!(is_at_or_below_condition_yellow(0, 0, STOCK));
     }
 
     /// GSI-06.13 gap 7 — the `0.0 → 0.5` rescue is a substitution on the
@@ -390,29 +601,47 @@ mod tests {
     }
 
     #[test]
-    fn default_config_values() {
+    fn default_config_values_are_the_rules_constructor() {
         let config = TerrainSpeedConfig::default();
         assert_eq!(config.tracked_uphill, SIM_ONE);
-        assert_eq!(config.tracked_downhill, SimFixed::lit("1.2"));
+        assert_eq!(config.tracked_downhill, SIM_ONE);
         assert_eq!(config.wheeled_uphill, SIM_ONE);
-        assert_eq!(config.wheeled_downhill, SimFixed::lit("1.2"));
+        assert_eq!(config.wheeled_downhill, SIM_ONE);
     }
 
+    /// `[General]` ReadDouble over the constructor's 1.0: a present value, a
+    /// `%` value scaled by 0.01, and an absent key that keeps 1.0.
     #[test]
-    fn slope_uphill_no_change_downhill_boost() {
-        let config = TerrainSpeedConfig::default();
-        // Uphill (next higher) → 1.0; downhill → 1.2; flat → 1.0. Track and Wheel
-        // share vanilla values but exercise both selection arms.
+    fn general_slope_keys_use_the_native_reader_and_defaults() {
+        let ini = crate::rules::ini_parser::IniFile::from_str(
+            "[General]\nTrackedDownhill=1.2\nWheeledUphill=80%\nWheeledDownhill=1.3\n",
+        );
+        let rules = crate::rules::ruleset::RuleSet::from_ini(&ini).unwrap();
+        let general = &rules.general;
+        let config = TerrainSpeedConfig::from_general(
+            general.tracked_uphill,
+            general.tracked_downhill,
+            general.wheeled_uphill,
+            general.wheeled_downhill,
+        );
+        assert_eq!(config.tracked_uphill, SIM_ONE);
+        assert_eq!(config.tracked_downhill, SimFixed::from_num(1.2f32 as f64));
+        assert_eq!(
+            config.wheeled_uphill,
+            SimFixed::from_num(80.0f32 as f64 * 0.01)
+        );
+        assert_eq!(config.wheeled_downhill, SimFixed::from_num(1.3f32 as f64));
         for st in [SpeedType::Track, SpeedType::Wheel] {
-            assert_eq!(
-                slope_factor_for(st, 0, 1, &config),
-                SIM_ONE,
-                "uphill {st:?}"
-            );
-            let down = slope_factor_for(st, 1, 0, &config);
-            assert_eq!(down, SimFixed::lit("1.2"), "downhill {st:?}");
             assert_eq!(slope_factor_for(st, 2, 2, &config), SIM_ONE, "flat {st:?}");
         }
+        assert_eq!(
+            slope_factor_for(SpeedType::Track, 1, 0, &config),
+            config.tracked_downhill
+        );
+        assert_eq!(
+            slope_factor_for(SpeedType::Wheel, 0, 1, &config),
+            config.wheeled_uphill
+        );
     }
 
     #[test]

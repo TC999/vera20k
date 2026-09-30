@@ -43,8 +43,28 @@ pub enum DockTeardown {
 }
 
 impl Simulation {
-    /// Run the dock-reservation subset selected by `teardown`. Each branch calls
-    /// the exact reservation helpers the corresponding command sites call today.
+    /// `TechnoClass::ResetOrdersToGuard` (`vt+0x3D0` = `0x0070F850`, no
+    /// class override): the class setter `vt+0x480(0, 1)` (`0x0070F859`),
+    /// class `vt+0x3C8(0)` (`0x0070F865`), ArchiveTarget (`+0x218`)
+    /// cleared (`0x0070F871`), then `Assign_Mission(Guard)` (`0x0070F87B`).
+    /// Callers: the capture reset (`0x00471EA5`)
+    /// and the slave manager (the deploy hand-off `0x006B0D10` and the
+    /// release `0x006B0BC5`).
+    pub(crate) fn reset_orders_to_guard(
+        &mut self,
+        id: u64,
+        rules: &crate::rules::ruleset::RuleSet,
+    ) {
+        let now = self.session.binary_frame;
+        self.assign_null_destination(id, Some(rules));
+        let _ = self.assign_target_represented(id, None, Some(rules));
+        if let Some(entity) = self.substrate.entities.get_mut(id) {
+            entity.movement_target = None;
+            entity.set_archive_target(None);
+        }
+        let _ = self.mission_assign_exact(id, MissionId::from_known(MissionType::Guard), now);
+    }
+
     pub(crate) fn run_dock_teardown(&mut self, id: u64, teardown: DockTeardown) {
         match teardown {
             DockTeardown::All => {
@@ -116,9 +136,12 @@ impl Simulation {
     /// store to `+0x2B8` or `+0x5A8`. Clearing there would leave a unit parked
     /// after a Stop where retail resumes its archived move on the next Restore.
     ///
-    /// Six commands `command_uses_megamission` also counts — Guard, MinerReturn,
-    /// EjectBunker, UnloadPassengers, HarvestCell, ToggleInfantryDeploy — write
-    /// their missions outside this funnel entirely and so still get no clear.
+    /// Five commands `command_uses_megamission` also counts — Guard, MinerReturn,
+    /// EjectBunker, HarvestCell, ToggleInfantryDeploy — write
+    /// their missions outside this funnel entirely and so still get no clear,
+    /// and do not take a team member off its team (`0x004C7380`); only
+    /// computer units are team members, and only `sim::ai`'s AttackMove,
+    /// which passes here, orders them.
     /// Pre-existing, not narrowed by the split. Trigger: one of those issued to
     /// a unit already carrying an Override archive. Player effect: a later
     /// Restore hands back a destination or target the order should have
@@ -135,13 +158,29 @@ impl Simulation {
         id: u64,
         mission: MissionType,
         teardown: DockTeardown,
+        rules: Option<&crate::rules::ruleset::RuleSet>,
     ) {
+        // The radio break precedes the Queue (`0x004C72E8..0x004C7342` run
+        // before `0x004C73B9`).
+        crate::sim::miner::miner_dock::break_for_retask(self, id, rules);
+        // `0x004C735D..0x004C7380`: an order other than Unload takes a Foot
+        // off its team, without an idle order.
+        if mission != MissionType::Unload {
+            self.leave_team(id, true, rules);
+        }
         self.queue_mission_with_teardown(id, mission, teardown);
         if let Some(entity) = self.substrate.entities.get_mut(id) {
             entity.suspended_attack_target = None;
             if entity.category != crate::map::entities::EntityCategory::Structure {
                 entity.navigation.suspended_nav_com = None;
             }
+        }
+        // `0x004C73E1..0x004C73EA`: any order but Attack takes a Slave Miner
+        // off its hunt (`sim::slave_manager`).
+        if mission != MissionType::Attack
+            && let Some(rules) = rules
+        {
+            self.reset_slave_manager(id, rules);
         }
     }
 
@@ -188,10 +227,17 @@ impl Simulation {
     ///
     /// Everything else Stop touches is left alone; this is the only mission
     /// write retail's Stop performs on any object.
+    ///
+    /// The flag is the type's `Harvester=` (`+0xE0E`, `0x004C766B`): every
+    /// VERA miner but the Slave Miner, whose Miner component is only an
+    /// order marker (`sim::slave_manager`).
     pub fn commit_stop_miner_guard(&mut self, id: u64) {
         let is_stoppable_miner = self.substrate.entities.get(id).is_some_and(|entity| {
             entity.category == crate::map::entities::EntityCategory::Unit
-                && entity.miner.is_some()
+                && entity
+                    .miner
+                    .as_ref()
+                    .is_some_and(|miner| miner.kind != crate::sim::miner::MinerKind::Slave)
                 && matches!(
                     entity.mission.current().known(),
                     Some(MissionType::Harvest) | Some(MissionType::Return)

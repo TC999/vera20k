@@ -5,10 +5,10 @@
 //! their supported combination before any Scenario cursor or load effect is
 //! installed; persistence/restore deliberately has no conversion into it.
 
-use crate::app::frontend::list_maps::LoadedMapSource;
 use crate::app::shell_random_map::AcceptedRmgStartStaging;
 use crate::map::map_file::MapFile;
 use crate::map::resolved_terrain::OverlayLoadSource;
+use crate::map::source::LoadedMapSource;
 use crate::match_bootstrap::LoadingStartup;
 use crate::sim::scenario_bootstrap::{
     MatchLaunchDescriptor, PreFillScenarioPrefixPlan, StockOfflinePrefixProjection,
@@ -30,6 +30,7 @@ impl FreshMapMaterialization {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FreshScenarioFamily {
     StockOffline,
@@ -199,30 +200,37 @@ impl FreshScenarioLoadContextDescriptor {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn physical_source(&self) -> &LoadedMapSource {
         &self.physical_source
     }
 
+    #[cfg(test)]
     pub(crate) fn materialization(&self) -> FreshMapMaterialization {
         self.materialization
     }
 
+    #[cfg(test)]
     pub(crate) fn signed_new_ini_format(&self) -> i32 {
         self.signed_new_ini_format
     }
 
+    #[cfg(test)]
     pub(crate) fn match_seed(&self) -> u32 {
         self.match_seed
     }
 
+    #[cfg(test)]
     pub(crate) fn authored_pack_bodies_enabled(&self) -> bool {
         self.materialization == FreshMapMaterialization::Authored && self.signed_new_ini_format > 1
     }
 
+    #[cfg(test)]
     pub(crate) fn startup_provenance(&self) -> FreshStartupProvenance {
         self.startup_provenance
     }
 
+    #[cfg(test)]
     pub(crate) fn family(&self) -> FreshScenarioFamily {
         match &self.prefix {
             FreshScenarioPrefixReceipt::StockOffline { .. } => FreshScenarioFamily::StockOffline,

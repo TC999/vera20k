@@ -1,7 +1,7 @@
 //! Neutral top-level launch dispatch for interactive and capture modes.
 //!
-//! The retail switch table is consumed first, then every remaining non-tactical
-//! argument is delegated byte-for-byte to the sealed shell parser. This module
+//! Capture vectors reach their sealed parsers unchanged. Interactive arguments
+//! pass through the retail switch table before shell dispatch. This module
 //! owns only mode routing and the strict tactical profile/contract/output
 //! boundary.
 
@@ -20,6 +20,8 @@ use crate::app::diagnostics::tactical_capture::profile::{
 use crate::app::frontend::startup_options::{RetailStartupOptions, consume_retail_switches};
 use crate::skirmish_launch::SkirmishLaunchSession;
 
+use crate::app::diagnostics::tactical_capture::session::MapCaptureProfile;
+
 const TACTICAL_CAPTURE_FLAG: &str = "--tactical-capture";
 
 #[derive(Debug)]
@@ -36,12 +38,14 @@ pub enum AppLaunchMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TacticalCaptureCheckpoint {
     RadarOnlineV2,
+    MapObserveV1,
 }
 
 impl TacticalCaptureCheckpoint {
     fn parse(value: &str) -> Result<Self> {
         match value {
             CHECKPOINT_RADAR_ONLINE_V2 => Ok(Self::RadarOnlineV2),
+            "map-observe-v1" => Ok(Self::MapObserveV1),
             _ => bail!("unsupported tactical-capture checkpoint {value:?}"),
         }
     }
@@ -49,14 +53,21 @@ impl TacticalCaptureCheckpoint {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::RadarOnlineV2 => CHECKPOINT_RADAR_ONLINE_V2,
+            Self::MapObserveV1 => "map-observe-v1",
         }
     }
 }
 
 #[derive(Debug, Clone)]
+enum CaptureProfile {
+    Radar(Box<SealedJsonFile<TacticalCaptureProfile>>),
+    Map(Box<SealedJsonFile<MapCaptureProfile>>),
+}
+
+#[derive(Debug, Clone)]
 pub struct TacticalCaptureRequest {
     checkpoint: TacticalCaptureCheckpoint,
-    profile: SealedJsonFile<TacticalCaptureProfile>,
+    profile: CaptureProfile,
     contract: SealedJsonFile<TacticalCaptureContract>,
     output_dir: PathBuf,
 }
@@ -66,12 +77,43 @@ impl TacticalCaptureRequest {
         self.checkpoint
     }
 
-    pub(crate) fn profile(&self) -> &TacticalCaptureProfile {
-        &self.profile.value
+    pub(crate) fn profile(&self) -> Result<&TacticalCaptureProfile> {
+        Ok(&self.sealed_profile()?.value)
     }
 
-    pub(crate) fn sealed_profile(&self) -> &SealedJsonFile<TacticalCaptureProfile> {
-        &self.profile
+    pub(crate) fn sealed_profile(&self) -> Result<&SealedJsonFile<TacticalCaptureProfile>> {
+        match &self.profile {
+            CaptureProfile::Radar(profile) => Ok(profile),
+            CaptureProfile::Map(_) => bail!("radar profile requested for map observation"),
+        }
+    }
+
+    pub(crate) fn map_profile(&self) -> Option<&SealedJsonFile<MapCaptureProfile>> {
+        match &self.profile {
+            CaptureProfile::Map(profile) => Some(profile),
+            CaptureProfile::Radar(_) => None,
+        }
+    }
+
+    pub(crate) fn seed(&self) -> u32 {
+        match &self.profile {
+            CaptureProfile::Radar(p) => p.value.launch.seed,
+            CaptureProfile::Map(p) => p.value.seed,
+        }
+    }
+
+    pub(crate) fn child_timeout_seconds(&self) -> u32 {
+        match &self.profile {
+            CaptureProfile::Radar(p) => p.value.budgets.child_timeout_seconds,
+            CaptureProfile::Map(p) => p.value.timeout_seconds,
+        }
+    }
+
+    pub(crate) fn post_l0_timeout_seconds(&self) -> u32 {
+        match &self.profile {
+            CaptureProfile::Radar(p) => p.value.budgets.post_l0_timeout_seconds,
+            CaptureProfile::Map(p) => p.value.timeout_seconds,
+        }
     }
 
     pub(crate) fn sealed_contract(&self) -> &SealedJsonFile<TacticalCaptureContract> {
@@ -83,15 +125,24 @@ impl TacticalCaptureRequest {
     }
 
     pub fn width(&self) -> u32 {
-        self.profile.value.capture.output_width
+        match &self.profile {
+            CaptureProfile::Radar(p) => p.value.capture.output_width,
+            CaptureProfile::Map(p) => p.value.width,
+        }
     }
 
     pub fn height(&self) -> u32 {
-        self.profile.value.capture.output_height
+        match &self.profile {
+            CaptureProfile::Radar(p) => p.value.capture.output_height,
+            CaptureProfile::Map(p) => p.value.height,
+        }
     }
 
     pub(crate) fn launch_session(&self) -> SkirmishLaunchSession {
-        self.profile.value.launch_session()
+        match &self.profile {
+            CaptureProfile::Radar(p) => p.value.launch_session(),
+            CaptureProfile::Map(p) => p.value.launch.clone(),
+        }
     }
 
     pub fn validate_runtime_environment(&self) -> Result<()> {
@@ -101,16 +152,10 @@ impl TacticalCaptureRequest {
 
 /// Parse the neutral application launch boundary.
 ///
-/// Native's global switch table runs over every argument before launch
-/// dispatch, so it is consumed here first: without that, a player typing the
-/// one switch the community actually uses (`-WIN`) gets no window at all. Only
-/// the arguments native does not recognise reach the mode parsers, so the
-/// sealed capture contract — a misspelled automation flag must never open an
-/// interactive window — is untouched.
-///
-/// Tactical mode is then recognized only when its flag is the first remaining
-/// argument. Every other vector, including an empty vector and malformed or
-/// non-UTF-8 shell vectors, is passed unchanged to the existing shell parser.
+/// Capture option values bypass the retail switch table. Ordinary arguments
+/// pass through that table, then the shell parser rejects anything left over.
+/// Tactical capture requires its flag first; malformed vectors never silently
+/// open an interactive window.
 pub fn parse_launch_args<I>(args: I) -> Result<AppLaunchMode>
 where
     I: IntoIterator<Item = OsString>,
@@ -134,9 +179,7 @@ where
             ShellAppLaunchMode::ShellCapture(request) => Ok(AppLaunchMode::ShellCapture(request)),
         };
     }
-    // `AssetManager` reads the original process argv for `-CD` itself, using
-    // native's substring match; consuming the switch with the same predicate
-    // here keeps the two matchers from disagreeing about what `-CD` means.
+    // This is the only process-argument owner for retail startup decisions.
     let (retail_options, args) = consume_retail_switches(args);
     if retail_options.usage_requested {
         return Ok(AppLaunchMode::Usage);
@@ -160,7 +203,7 @@ fn parse_tactical_args(args: Vec<OsString>) -> Result<AppLaunchMode> {
     let mut args = args.into_iter();
     let first = args.next().context("missing tactical-capture flag")?;
     ensure!(
-        first == OsString::from(TACTICAL_CAPTURE_FLAG),
+        first == TACTICAL_CAPTURE_FLAG,
         "internal tactical dispatch mismatch"
     );
     let checkpoint_text = next_utf8(&mut args, "checkpoint after --tactical-capture")?;
@@ -205,19 +248,27 @@ fn parse_tactical_args(args: Vec<OsString>) -> Result<AppLaunchMode> {
     let profile_path = profile_path.context("missing required --profile")?;
     let contract_path = contract_path.context("missing required --contract")?;
     let output_dir = output_dir.context("missing required --output")?;
-    let profile = TacticalCaptureProfile::load_strict(&profile_path)?;
-    ensure!(
-        profile.value.checkpoint == checkpoint.as_str(),
-        "profile checkpoint {:?} differs from requested checkpoint {:?}",
-        profile.value.checkpoint,
-        checkpoint.as_str()
-    );
+    let profile = match checkpoint {
+        TacticalCaptureCheckpoint::RadarOnlineV2 => {
+            let profile = TacticalCaptureProfile::load_strict(&profile_path)?;
+            ensure!(
+                profile.value.checkpoint == checkpoint.as_str(),
+                "profile checkpoint differs"
+            );
+            CaptureProfile::Radar(Box::new(profile))
+        }
+        TacticalCaptureCheckpoint::MapObserveV1 => {
+            CaptureProfile::Map(Box::new(MapCaptureProfile::load(&profile_path)?))
+        }
+    };
     let contract = TacticalCaptureContract::load_external(&contract_path)?;
-    ensure!(
-        profile.value.budgets.absolute_timeout_max_seconds
-            == contract.value.absolute_max_child_timeout_seconds,
-        "profile and contract absolute timeout maxima differ"
-    );
+    if let CaptureProfile::Radar(profile) = &profile {
+        ensure!(
+            profile.value.budgets.absolute_timeout_max_seconds
+                == contract.value.absolute_max_child_timeout_seconds,
+            "profile and contract absolute timeout maxima differ"
+        );
+    }
     validate_new_output_directory(&output_dir)?;
 
     Ok(AppLaunchMode::TacticalCapture(TacticalCaptureRequest {
@@ -258,6 +309,10 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir(&directory).expect("create test directory");
+        // macOS keeps the temp dir under `/var`, a symlink to `/private/var`,
+        // which the tactical output guard rightly refuses; test the resolved path.
+        #[cfg(unix)]
+        let directory = std::fs::canonicalize(&directory).expect("canonical test directory");
         directory
     }
 
@@ -278,6 +333,32 @@ mod tests {
     }
 
     #[test]
+    fn map_observation_routes_through_tactical_capture_and_refuses_radar_profile() {
+        let parent = test_directory("map-observe");
+        let output = parent.join("capture");
+        let mut args = tactical_args(&output);
+        args[1] = "map-observe-v1".into();
+        assert!(parse_launch_args(args.clone()).is_err());
+        args[3] = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tools/map_observation.example.json")
+            .into_os_string();
+        let AppLaunchMode::TacticalCapture(request) = parse_launch_args(args.clone()).unwrap()
+        else {
+            panic!("wrong capture lifecycle");
+        };
+        assert_eq!(
+            request.checkpoint(),
+            TacticalCaptureCheckpoint::MapObserveV1
+        );
+        assert_eq!(request.map_profile().unwrap().value.ticks, 30);
+        assert!(request.profile().is_err());
+        std::fs::create_dir(&output).unwrap();
+        assert!(parse_launch_args(args).is_err());
+        std::fs::remove_dir(&output).unwrap();
+        std::fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
     fn no_args_still_delegate_to_interactive_shell_launch() {
         assert!(matches!(
             parse_launch_args(Vec::<OsString>::new()).expect("parse"),
@@ -295,15 +376,16 @@ mod tests {
 
     #[test]
     fn a_cd_superstring_launches_instead_of_aborting() {
-        // The asset layer already selects the wildcard media branch for any
-        // argument *containing* `-CD`, so the launch parser must accept the
-        // same set or an argument like `-CDROM` refuses to start the game.
+        // Native substring matching also accepts -CDROM.
         let AppLaunchMode::Interactive(options) =
             parse_launch_args([OsString::from("-CDROM")]).expect("parse")
         else {
             panic!("a -CD superstring must stay an interactive launch");
         };
-        assert!(options.cd_media);
+        assert_eq!(
+            options.media_archive_mode,
+            crate::assets::asset_manager::MediaArchiveMode::CdWildcard
+        );
     }
 
     #[test]
@@ -341,6 +423,11 @@ mod tests {
             panic!("a -CD-containing output path must stay a tactical capture");
         };
         assert_eq!(request.output_dir(), output);
+        let app = crate::app::App::new_tactical_capture(request);
+        assert_eq!(
+            app.startup_options.media_archive_mode,
+            crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+        );
         std::fs::remove_dir(parent).expect("remove test directory");
     }
 
@@ -408,7 +495,10 @@ mod tests {
             request.checkpoint(),
             TacticalCaptureCheckpoint::RadarOnlineV2
         );
-        assert_eq!(request.profile().profile_id, "soviet-radar-online-v2");
+        assert_eq!(
+            request.profile().unwrap().profile_id,
+            "soviet-radar-online-v2"
+        );
         assert_eq!(request.width(), 800);
         assert_eq!(request.height(), 600);
         assert_eq!(request.output_dir(), output);

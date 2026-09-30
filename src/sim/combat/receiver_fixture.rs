@@ -4,17 +4,86 @@
 use super::*;
 use crate::sim::world::Simulation;
 
+thread_local! {
+    static FIRE_VISIT_TRACE: std::cell::RefCell<Option<Vec<serde_json::Value>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Observe the real FireAt transaction at its caller's boundaries. The trace
+/// supplies no return values, callbacks or world state, and is never saved.
+pub(crate) fn trace_fire_visits<T>(run: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
+    FIRE_VISIT_TRACE.with_borrow_mut(|trace| {
+        assert!(trace.is_none(), "nested FireAt traces");
+        *trace = Some(Vec::new());
+    });
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FIRE_VISIT_TRACE.with_borrow_mut(|trace| *trace = None);
+        }
+    }
+    let reset = Reset;
+    let result = run();
+    let trace = FIRE_VISIT_TRACE.with_borrow_mut(|trace| trace.take().unwrap());
+    drop(reset);
+    (result, trace)
+}
+
+/// Snapshot only when a comparison installed the observer. Ordinary tests and
+/// the production build pay no actor-serialization or RNG-copy cost.
+pub(crate) fn observe_fire_visit(world: &Simulation, id: u64, phase: &str) {
+    FIRE_VISIT_TRACE.with_borrow_mut(|trace| {
+        if let Some(observations) = trace {
+            observations.push(serde_json::json!({
+                "phase": phase,
+                "id": id,
+                "actor": world.substrate.entities.get(id),
+                "rng_streams": {
+                    "main": world.main_rng.native_state_hex(),
+                    "scenario": world.scenario_rng.native_state_hex(),
+                    "mapgen": world.mapgen_rng.native_state_hex(),
+                },
+                "rng_states": {
+                    "main": world.main_rng,
+                    "scenario": world.scenario_rng,
+                    "mapgen": world.mapgen_rng,
+                },
+            }));
+        }
+    });
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct BaseDefenseResponseTraceEntry {
     pub(crate) site: BaseDefenseResponseCallSite,
     pub(crate) victim_id: u64,
-    pub(crate) health: u16,
+    pub(crate) health: i32,
     pub(crate) last_attacker_house_index: i32,
 }
 
 #[derive(Default)]
 pub(crate) struct FixtureTrace {
     pub(crate) entries: Vec<BaseDefenseResponseTraceEntry>,
+    pub(crate) constructed_anims: Vec<ConstructedAnimObservation>,
+}
+
+/// Read-only observations of objects the real inline constructor admitted.
+/// These are never deferred spawn requests and cannot construct a second anim.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ConstructedAnimObservation {
+    pub(crate) type_id: InternedId,
+    pub(crate) world_coord: crate::sim::anim_class::AnimWorldCoord,
+}
+
+fn constructed_anims(world: &Simulation) -> Vec<ConstructedAnimObservation> {
+    world
+        .substrate
+        .anims
+        .iter()
+        .map(|(_, anim)| ConstructedAnimObservation {
+            type_id: anim.type_id,
+            world_coord: anim.world_coord,
+        })
+        .collect()
 }
 
 /// Fixture omissions, never serialized or installed on a returned world.
@@ -27,6 +96,12 @@ pub(crate) struct FixturePolicy {
     pub(crate) terrain_collection: bool,
     pub(crate) trace: FixtureTrace,
     pub(crate) deferred_tiberium: Vec<TiberiumReductionRequest>,
+    /// Bullet detonations the same frame's tail committed, held for the
+    /// fixture's result instead of the world's consequence commit.
+    pub(crate) tail_effects: Vec<(crate::sim::combat::DeathEffects, Vec<UnderAttackEvent>)>,
+    /// The launch record of every bullet the fixture's shots admit, with its
+    /// id and whether it is Inviso.
+    pub(crate) admitted_spawns: Vec<(u64, bool, crate::sim::projectile::ProjectileSpawn)>,
 }
 
 /// Adapters preserve the old phase's supplied state, without bootstrapping a
@@ -39,7 +114,6 @@ fn with_world<R>(
     mut houses: Option<&mut BTreeMap<InternedId, HouseState>>,
     main_rng: Option<&mut SimRng>,
     scenario_rng: &mut SimRng,
-    resource_nodes: &mut BTreeMap<(u16, u16), ResourceNode>,
     overlay_grid: Option<&mut OverlayGrid>,
     terrain: Option<&mut ResolvedTerrainGrid>,
     mut terrain_area: Option<&mut TerrainAreaState>,
@@ -50,7 +124,32 @@ fn with_world<R>(
 ) -> R {
     let mut world = Simulation::new();
     world.substrate.entities = std::mem::take(entities);
+    // A hand-placed fixture object out of limbo stands on the map: native
+    // Unlimbo marks it (`ObjectClass::Mark 0x005F58F7`, `+0x74`), which
+    // `Apply_area_damage`'s dispatch reads. Mark such objects for the phase
+    // and hand the caller back its own flag.
+    let unmarked: Vec<u64> = world
+        .substrate
+        .entities
+        .values()
+        .filter(|entity| !entity.lifecycle.in_limbo && !entity.lifecycle.cell_marked)
+        .map(|entity| entity.stable_id())
+        .collect();
+    for &id in &unmarked {
+        if let Some(entity) = world.substrate.entities.get_mut(id) {
+            entity.lifecycle.cell_marked = true;
+        }
+    }
     world.substrate.occupancy = std::mem::take(occupancy);
+    // Bullets and anims a fixture shot creates take ids past its hand-placed
+    // objects, as `ScenarioClass::NextUniqueID` would give them.
+    world.substrate.next_stable_object_id = world
+        .substrate
+        .entities
+        .keys_sorted()
+        .last()
+        .map_or(1, |&id| id + 1)
+        .max(world.substrate.next_stable_object_id);
     world.interner = std::mem::take(interner);
     if let Some(houses) = houses.as_deref_mut() {
         world.houses = std::mem::take(houses);
@@ -59,7 +158,6 @@ fn with_world<R>(
         world.main_rng = rng.clone();
     }
     world.scenario_rng = scenario_rng.clone();
-    world.production.resource_nodes = std::mem::take(resource_nodes);
     world.overlay_grid = overlay_grid.as_deref().cloned();
     world.resolved_terrain = terrain.as_deref().cloned();
     if let Some(events) = sound_sink.as_deref_mut() {
@@ -85,6 +183,8 @@ fn with_world<R>(
         terrain_collection: terrain_area.is_some(),
         trace: FixtureTrace::default(),
         deferred_tiberium: Vec::new(),
+        tail_effects: Vec::new(),
+        admitted_spawns: Vec::new(),
     });
 
     let result = configure_and_run(&mut world, &mut run);
@@ -99,6 +199,7 @@ fn with_world<R>(
     );
     if let Some(trace) = trace {
         trace.entries.extend(policy.trace.entries);
+        trace.constructed_anims.extend(constructed_anims(&world));
     }
     if let Some(area) = terrain_area {
         area.swap_authority(
@@ -110,6 +211,11 @@ fn with_world<R>(
     if let Some(handled) = handled_deaths {
         *handled = run.handled_deaths;
     }
+    for id in unmarked {
+        if let Some(entity) = world.substrate.entities.get_mut(id) {
+            entity.lifecycle.cell_marked = false;
+        }
+    }
     *entities = world.substrate.entities;
     *occupancy = world.substrate.occupancy;
     *interner = world.interner;
@@ -120,7 +226,6 @@ fn with_world<R>(
         *rng = world.main_rng;
     }
     *scenario_rng = world.scenario_rng;
-    *resource_nodes = world.production.resource_nodes;
     if let Some(grid) = overlay_grid {
         *grid = world.overlay_grid.expect("supplied overlay retained");
     }
@@ -164,7 +269,6 @@ pub(crate) fn tick_combat(
     occupancy: &mut OccupancyGrid,
     rules: &RuleSet,
     interner: &mut StringInterner,
-    resource_nodes: &mut BTreeMap<(u16, u16), ResourceNode>,
     current_tick: u64,
     tick_ms: u32,
     binary_frame: u32,
@@ -178,7 +282,6 @@ pub(crate) fn tick_combat(
         None,
         &BTreeMap::new(),
         None,
-        resource_nodes,
         None,
         None,
         None,
@@ -202,7 +305,6 @@ pub(crate) fn tick_combat_with_fog(
     fog: Option<&FogState>,
     power_states: &BTreeMap<InternedId, PowerState>,
     sound_sink: Option<&mut Vec<SimSoundEvent>>,
-    resource_nodes: &mut BTreeMap<(u16, u16), ResourceNode>,
     overlay_grid: Option<&mut OverlayGrid>,
     overlay_registry: Option<&OverlayTypeRegistry>,
     terrain: Option<&mut crate::map::resolved_terrain::ResolvedTerrainGrid>,
@@ -231,7 +333,6 @@ pub(crate) fn tick_combat_with_fog(
         &[],
         &HouseAllianceMap::new(),
         sound_sink,
-        resource_nodes,
         overlay_grid,
         overlay_registry,
         terrain,
@@ -262,7 +363,6 @@ pub(crate) fn tick_combat_with_fog_and_main_rng(
     house_order: &[InternedId],
     alliances: &HouseAllianceMap,
     sound_sink: Option<&mut Vec<SimSoundEvent>>,
-    resource_nodes: &mut BTreeMap<(u16, u16), ResourceNode>,
     overlay_grid: Option<&mut OverlayGrid>,
     overlay_registry: Option<&OverlayTypeRegistry>,
     terrain: Option<&mut crate::map::resolved_terrain::ResolvedTerrainGrid>,
@@ -290,7 +390,6 @@ pub(crate) fn tick_combat_with_fog_and_main_rng(
         house_order,
         alliances,
         sound_sink,
-        resource_nodes,
         overlay_grid,
         overlay_registry,
         terrain,
@@ -327,7 +426,6 @@ pub(crate) fn commit_damage_events(
     main_rng: &mut SimRng,
     scenario_rng: &mut SimRng,
     handled_deaths: &mut Vec<u64>,
-    resource_nodes: &mut BTreeMap<(u16, u16), ResourceNode>,
     overlay_grid: Option<&mut OverlayGrid>,
     overlay_registry: Option<&OverlayTypeRegistry>,
     terrain: Option<&mut crate::map::resolved_terrain::ResolvedTerrainGrid>,
@@ -345,7 +443,6 @@ pub(crate) fn commit_damage_events(
         Some(houses),
         Some(main_rng),
         scenario_rng,
-        resource_nodes,
         overlay_grid,
         terrain,
         None,
@@ -383,7 +480,6 @@ pub(crate) fn commit_area_damage_receivers(
     main_rng: &mut SimRng,
     scenario_rng: &mut SimRng,
     handled_deaths: &mut Vec<u64>,
-    resource_nodes: &mut BTreeMap<(u16, u16), ResourceNode>,
     overlay_grid: Option<&mut OverlayGrid>,
     overlay_registry: Option<&OverlayTypeRegistry>,
     terrain: Option<&mut crate::map::resolved_terrain::ResolvedTerrainGrid>,
@@ -402,7 +498,6 @@ pub(crate) fn commit_area_damage_receivers(
         Some(houses),
         Some(main_rng),
         scenario_rng,
-        resource_nodes,
         overlay_grid,
         terrain,
         terrain_area_state,
@@ -435,7 +530,6 @@ pub(crate) fn handle_entity_deaths(
     handled_deaths: &mut Vec<u64>,
     dead_entities: &[u64],
     damage_events: &[EntityDamageEvent],
-    resource_nodes: &mut BTreeMap<(u16, u16), ResourceNode>,
     overlay_grid: Option<&mut OverlayGrid>,
     overlay_registry: Option<&OverlayTypeRegistry>,
     terrain: Option<&mut crate::map::resolved_terrain::ResolvedTerrainGrid>,
@@ -452,7 +546,6 @@ pub(crate) fn handle_entity_deaths(
         Some(houses),
         Some(main_rng),
         scenario_rng,
-        resource_nodes,
         overlay_grid,
         terrain,
         terrain_area_state.as_deref_mut(),
@@ -486,7 +579,6 @@ pub(crate) fn emit_projectile_detonations(
     rules: &RuleSet,
     interner: &mut StringInterner,
     handles: Option<crate::sim::type_handle_table::ResolvedRuleHandles>,
-    resource_nodes: &mut BTreeMap<(u16, u16), ResourceNode>,
     overlay_grid: Option<&mut OverlayGrid>,
     overlay_registry: Option<&OverlayTypeRegistry>,
     terrain: Option<&mut crate::map::resolved_terrain::ResolvedTerrainGrid>,
@@ -508,14 +600,13 @@ pub(crate) fn emit_projectile_detonations(
         None,
         None,
         scenario_rng,
-        resource_nodes,
         overlay_grid,
         terrain,
         fixture_terrain.as_mut(),
         None,
         None,
         inline_hooks.as_deref_mut(),
-        |world, _run| {
+        |world, run| {
             world.rule_handles = handles;
             world.session.no_damage = scenario_no_damage;
             world.receiver_fixture.as_mut().unwrap().terrain_collection = terrain_objects.is_some();
@@ -525,12 +616,14 @@ pub(crate) fn emit_projectile_detonations(
             }
             world.house_alliances = house_alliances.clone();
             world.bridge_state = bridge_state.cloned();
-            world_receiver::emit_projectile_detonations(
+            world_receiver::commit_projectile_detonations_inline(
                 world,
+                run,
                 rules,
                 overlay_registry,
                 detonations,
                 out,
+                &mut Vec::new(),
             )
         },
     )
@@ -543,7 +636,6 @@ pub(crate) fn resolve_attacker_fire(
     rules: &RuleSet,
     interner: &mut StringInterner,
     handles: Option<crate::sim::type_handle_table::ResolvedRuleHandles>,
-    resource_nodes: &mut BTreeMap<(u16, u16), ResourceNode>,
     fog: Option<&FogState>,
     occupancy: &OccupancyGrid,
     overlay_grid: Option<&mut OverlayGrid>,
@@ -552,7 +644,6 @@ pub(crate) fn resolve_attacker_fire(
     terrain_objects: Option<combat_aoe::TerrainCollectionView<'_>>,
     terrain_area_state: Option<&TerrainAreaState>,
     scenario_no_damage: bool,
-    require_playfield_membership: bool,
     binary_frame: u32,
     _tick_ms: u32,
     has_active_wave: bool,
@@ -570,7 +661,6 @@ pub(crate) fn resolve_attacker_fire(
         None,
         None,
         scenario_rng,
-        resource_nodes,
         overlay_grid,
         terrain,
         fixture_terrain.as_mut(),
@@ -587,18 +677,20 @@ pub(crate) fn resolve_attacker_fire(
             }
             world.session.binary_frame = binary_frame;
             world.receiver_fixture.as_mut().unwrap().current_tick = u64::from(binary_frame);
+            if let Some(fog) = fog {
+                world.fog = fog.clone();
+            }
             world_receiver::resolve_attacker_fire(
                 world,
                 rules,
                 overlay_registry,
                 snap,
-                fog,
-                require_playfield_membership,
+                fog.is_some(),
                 binary_frame,
                 _tick_ms,
                 has_active_wave,
                 out,
-            )
+            );
         },
     )
 }
@@ -616,7 +708,6 @@ pub(crate) fn tick_combat_with_fog_and_main_rng_with_terrain_area(
     house_order: &[InternedId],
     alliances: &HouseAllianceMap,
     sound_sink: Option<&mut Vec<SimSoundEvent>>,
-    resource_nodes: &mut BTreeMap<(u16, u16), ResourceNode>,
     overlay_grid: Option<&mut OverlayGrid>,
     overlay_registry: Option<&OverlayTypeRegistry>,
     terrain: Option<&mut crate::map::resolved_terrain::ResolvedTerrainGrid>,
@@ -645,7 +736,6 @@ pub(crate) fn tick_combat_with_fog_and_main_rng_with_terrain_area(
         Some(houses),
         Some(main_rng),
         scenario_rng,
-        resource_nodes,
         overlay_grid,
         terrain,
         terrain_area_state,
@@ -676,7 +766,72 @@ pub(crate) fn tick_combat_with_fog_and_main_rng_with_terrain_area(
             if let Some(radiation) = radiation.as_deref() {
                 world.radiation = radiation.clone();
             }
-            let result = world_receiver::tick_combat(
+            // No object pass runs here: a building takes its Update's
+            // Mission_Attack and ProcessDelayedFire before the receiver.
+            let buildings: Vec<u64> = world
+                .substrate
+                .entities
+                .keys_sorted()
+                .into_iter()
+                .filter(|&id| {
+                    world.substrate.entities.get(id).is_some_and(|entity| {
+                        entity.category == EntityCategory::Structure
+                            && entity.health.current > 0
+                            && !entity.lifecycle.in_limbo
+                    })
+                })
+                .collect();
+            for id in buildings {
+                // A hand-built object switched to Structure keeps its first
+                // category's leaf; construction gives a building its own.
+                if let Some(entity) = world.substrate.entities.get_mut(id)
+                    && entity.mission_leaf.as_building().is_none()
+                {
+                    entity.mission_leaf =
+                        crate::sim::mission::MissionLeafState::for_entity_category(
+                            EntityCategory::Structure,
+                        );
+                }
+                world.fixture_building_visit(id, rules, overlay_registry);
+            }
+            let fire_requests = std::mem::take(&mut world.fire_requests);
+            let first_tail_id = world.substrate.next_stable_object_id;
+            // Pure fire fixtures supply the actor clock themselves. Invoke
+            // the ordinary Infantry Fire_At_Target host, rather than restore
+            // the removed global queued-shot implementation for tests.
+            let order = if live_order.is_empty() {
+                world.substrate.entities.keys_sorted()
+            } else {
+                live_order.to_vec()
+            };
+            let mut infantry_results = Vec::new();
+            for id in order {
+                if fire_suppressed.contains(&id)
+                    || !world.substrate.entities.get(id).is_some_and(|entity| {
+                        entity.category == EntityCategory::Infantry
+                            && entity.is_ai_alive()
+                            && !entity.lifecycle.in_limbo
+                    })
+                {
+                    continue;
+                }
+                if let Some(entity) = world.substrate.entities.get_mut(id)
+                    && entity.mission_leaf.as_infantry().is_none()
+                {
+                    entity.mission_leaf =
+                        crate::sim::mission::MissionLeafState::for_entity_category(
+                            EntityCategory::Infantry,
+                        );
+                }
+                infantry_results.push(world_receiver::visit_fire(
+                    world,
+                    run,
+                    world_receiver::FireVisit::InfantryTarget(id),
+                    rules,
+                    overlay_registry,
+                ));
+            }
+            let mut result = world_receiver::tick_combat(
                 world,
                 run,
                 rules,
@@ -684,12 +839,69 @@ pub(crate) fn tick_combat_with_fog_and_main_rng_with_terrain_area(
                 tick_ms,
                 live_order,
                 fire_suppressed,
+                &fire_requests,
                 projectile_detonations,
                 wave_damage_events,
+            );
+            for earlier in infantry_results.into_iter().rev() {
+                result
+                    .consequences
+                    .prepend_actor_fire_for_test(earlier.consequences);
+                let mut projectiles = earlier.projectile_spawns;
+                projectiles.append(&mut result.projectile_spawns);
+                result.projectile_spawns = projectiles;
+            }
+            // The same frame's tail: the shots' bullets take their first AI
+            // (an Inviso one detonates). Bullets still in flight are handed
+            // back as their admission records.
+            world.visit_combat_tail(first_tail_id, rules, overlay_registry);
+            for (mut effects, under_attack_events) in
+                std::mem::take(&mut world.receiver_fixture.as_mut().unwrap().tail_effects)
+            {
+                if world.receiver_fixture.as_ref().unwrap().sound_enabled {
+                    for (die_sound_id, rx, ry) in effects.death_sounds.drain(..) {
+                        world.sound_events.push(SimSoundEvent::EntityDied {
+                            die_sound_id,
+                            rx,
+                            ry,
+                        });
+                    }
+                }
+                // The world's consequence commit arms the tail's radiation
+                // sites; the fixture keeps its field here.
+                if world.receiver_fixture.as_ref().unwrap().radiation_enabled {
+                    for detonation in effects.rad_detonations.drain(..) {
+                        world.radiation.apply_detonation(
+                            detonation,
+                            binary_frame,
+                            &rules.radiation,
+                            world.resolved_terrain.as_ref(),
+                        );
+                    }
+                }
+                result
+                    .consequences
+                    .append_tail_for_test(effects, under_attack_events);
+            }
+            // Every launch, less the Inviso bullets the tail already detonated.
+            let admitted =
+                std::mem::take(&mut world.receiver_fixture.as_mut().unwrap().admitted_spawns);
+            result.projectile_spawns.extend(
+                admitted
+                    .into_iter()
+                    .filter(|&(id, inviso, _)| {
+                        !inviso
+                            || world
+                                .projectiles
+                                .get(id)
+                                .is_some_and(|projectile| projectile.in_logic_vector)
+                    })
+                    .map(|(_, _, spawn)| spawn),
             );
             if let Some(radiation) = radiation {
                 *radiation = std::mem::take(&mut world.radiation);
             }
+            result.fixture_anims = constructed_anims(world);
             result
         },
     )

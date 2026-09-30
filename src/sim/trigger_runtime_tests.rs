@@ -1,10 +1,10 @@
 use super::*;
 use std::collections::HashMap;
 
-use crate::map::actions::MapAction;
+use crate::map::actions::{ActionMap, MapAction};
 use crate::map::entities::EntityCategory;
 use crate::map::events::MapEvent;
-use crate::map::trigger_graph::build_trigger_graph;
+use crate::map::trigger_graph::{TriggerGraph, build_trigger_graph};
 use crate::map::triggers::{MapTrigger, TriggerDifficulty};
 use crate::map::variable_names::{LocalVariable, LocalVariableMap};
 use crate::sim::game_entity::GameEntity;
@@ -15,82 +15,39 @@ use crate::sim::projectile::{
 use crate::sim::replay::{ReplayHeader, ReplayLog, ReplayRunner};
 use crate::sim::snapshot::GameSnapshot;
 use crate::sim::world::{MasterFrameTestRung, Simulation, TickLane, TriggerInputs};
-use std::collections::BTreeMap;
+
+/// Drive the production dispatch owner at a chosen native frame without
+/// advancing unrelated simulation phases in focused action tests.
+fn advance_trigger_frame(
+    sim: &mut Simulation,
+    current_frame: u32,
+    graph: &TriggerGraph,
+    triggers: &TriggerMap,
+    events: &EventMap,
+    actions: &ActionMap,
+    rules: Option<&crate::rules::ruleset::RuleSet>,
+    waypoints: &HashMap<u32, crate::map::waypoints::Waypoint>,
+) -> Vec<TriggerEffect> {
+    sim.session.binary_frame = current_frame;
+    sim.advance_triggers(TriggerInputs {
+        graph,
+        triggers,
+        events,
+        actions,
+        rules,
+        waypoints,
+    })
+}
 
 fn flat_trigger_playfield_terrain(
     width: u16,
     height: u16,
 ) -> crate::map::resolved_terrain::ResolvedTerrainGrid {
-    use crate::map::resolved_terrain::{ResolvedTerrainCell, zone_class};
-    use crate::rules::terrain_rules::{SpeedCostProfile, TerrainClass};
-
-    let prototype = ResolvedTerrainCell {
-        rx: 0,
-        ry: 0,
-        source_tile_index: 0,
-        source_sub_tile: 0,
-        final_tile_index: 0,
-        final_sub_tile: 0,
-        is_wood_bridge_repair_tile: false,
-        level: 0,
-        filled_clear: false,
-        tileset_index: Some(0),
-        land_type: 0,
-        yr_cell_land_type: 0,
-        slope_type: 0,
-        template_height: 0,
-        height_in_pixels: 0,
-        render_offset_x: 0,
-        render_offset_y: 0,
-        terrain_class: TerrainClass::Clear,
-        speed_costs: SpeedCostProfile::default(),
-        is_water: false,
-        is_cliff_like: false,
-        is_rough: false,
-        is_road: false,
-        accepts_smudge: false,
-        allows_tiberium: false,
-        variant: 0,
-        has_ramp: false,
-        canonical_ramp: None,
-        ground_walk_blocked: false,
-        terrain_object_blocks: false,
-        terrain_object_occupation: None,
-        overlay_blocks: false,
-        overlay_zone_type: None,
-        outside_playfield: false,
-        zone_type: zone_class::GROUND,
-        base_ground_walk_blocked: false,
-        base_build_blocked: false,
-        base_land_type: 0,
-        base_yr_cell_land_type: 0,
-        base_terrain_class: TerrainClass::Clear,
-        base_speed_costs: SpeedCostProfile::default(),
-        build_blocked: false,
-        has_bridge_deck: false,
-        bridge_walkable: false,
-        bridge_transition: false,
-        bridge_deck_level: 0,
-        bridge_layer: None,
-        bridge_facts: crate::map::bridge_facts::BridgeCellFacts::default(),
-        tube_index: None,
-        radar_left: [0; 3],
-        radar_right: [0; 3],
-        has_damaged_data: false,
-        bridgehead_anchor_class_at_load: None,
-    };
-    let cells = (0..height)
-        .flat_map(|ry| {
-            let prototype = prototype.clone();
-            (0..width).map(move |rx| {
-                let mut cell = prototype.clone();
-                cell.rx = rx;
-                cell.ry = ry;
-                cell
-            })
-        })
-        .collect();
-    crate::map::resolved_terrain::ResolvedTerrainGrid::from_cells(width, height, cells)
+    crate::map::resolved_terrain::test_grid(
+        width,
+        height,
+        crate::map::resolved_terrain::test_clear_cell,
+    )
 }
 
 fn make_trigger(
@@ -106,7 +63,7 @@ fn make_trigger(
             "Neutral".to_string(),
             linked_trigger_id.unwrap_or("<none>").to_string(),
             name.to_string(),
-            if enabled { "1" } else { "0" }.to_string(),
+            if enabled { "0" } else { "1" }.to_string(),
             "1".to_string(),
             "1".to_string(),
             "1".to_string(),
@@ -136,10 +93,7 @@ fn spawn_type(sim: &mut Simulation, type_id: &str) -> u64 {
         0,
         0,
         owner_id,
-        crate::sim::components::Health {
-            current: 100,
-            max: 100,
-        },
+        crate::sim::components::Health { current: 100 },
         type_id_interned,
         EntityCategory::Unit,
         0,
@@ -148,6 +102,256 @@ fn spawn_type(sim: &mut Simulation, type_id: &str) -> u64 {
     );
     sim.substrate.entities.insert(ge);
     sid
+}
+
+#[test]
+fn parsed_event_records_match_native_list_and_production_predicates() {
+    #[derive(serde::Deserialize)]
+    struct NativeCondition {
+        kind: i32,
+        value: i32,
+        name: String,
+        results: Vec<u8>,
+    }
+    #[derive(serde::Deserialize)]
+    struct NativeRow {
+        raw: String,
+        conditions: Vec<NativeCondition>,
+        frames: Vec<u32>,
+    }
+    let rows: Vec<NativeRow> = serde_json::from_str(include_str!(
+        "../../tools/spatial_oracle/trigger_event_records.json"
+    ))
+    .unwrap();
+    for row in rows {
+        let ini = crate::rules::ini_parser::IniFile::from_str(&format!(
+            "[Triggers]\nEVENT=Neutral,<none>,Event,0,1,1,1,0\n\
+             [Events]\nEVENT={}\n[Actions]\nEVENT=1,112,0,0,0,0,0,0,A\n",
+            row.raw
+        ));
+        let triggers = crate::map::triggers::parse_triggers(&ini);
+        let events = crate::map::events::parse_events(&ini);
+        let actions = crate::map::actions::parse_actions(&ini);
+        let conditions = &events["EVENT"].conditions;
+        assert_eq!(conditions.len(), row.conditions.len(), "{}", row.raw);
+        for (rust, native) in conditions.iter().zip(&row.conditions) {
+            assert_eq!(
+                (
+                    rust.kind,
+                    rust.value,
+                    rust.type_name.as_deref().unwrap_or("")
+                ),
+                (native.kind, native.value, native.name.as_str()),
+                "{}",
+                row.raw
+            );
+        }
+        // Timer events need the live Trigger instance port. Type-count reader
+        // coverage here does not certify the existing registry/count query.
+        if conditions.is_empty()
+            || !row.conditions.iter().all(|c| {
+                matches!(c.kind, 27 | 28 | 36 | 37 | 47) && c.results.len() == row.frames.len()
+            })
+        {
+            continue;
+        }
+        let graph = build_trigger_graph(
+            &HashMap::new(),
+            &HashMap::new(),
+            &triggers,
+            &events,
+            &actions,
+        );
+        for (n, frame) in row.frames.iter().enumerate() {
+            let mut sim = Simulation::new();
+            sim.session.binary_frame = *frame;
+            sim.initialize_map_triggers(&triggers, &HashMap::new());
+            sim.trigger_runtime.globals_set.insert(7);
+            sim.trigger_runtime.locals_set.insert(9);
+            let result = sim
+                .advance_master_frame(
+                    &[],
+                    None,
+                    None,
+                    67,
+                    TickLane::Ordinary,
+                    Some(TriggerInputs {
+                        graph: &graph,
+                        triggers: &triggers,
+                        events: &events,
+                        actions: &actions,
+                        waypoints: &HashMap::new(),
+                        rules: None,
+                    }),
+                )
+                .unwrap();
+            assert!(result.frame_committed);
+            assert_eq!(
+                !sim.drain_trigger_effects().is_empty(),
+                row.conditions.iter().all(|c| c.results[n] != 0),
+                "{} at frame {frame}",
+                row.raw
+            );
+        }
+    }
+}
+
+#[test]
+fn parsed_variable_actions_match_native_reader_dispatch_and_restore() {
+    #[derive(serde::Deserialize)]
+    struct NativeRow {
+        raw: String,
+        kind: i32,
+        value: i32,
+        waypoint: i32,
+        initial_globals: BTreeSet<u32>,
+        initial_locals: BTreeSet<u32>,
+        globals: BTreeSet<u32>,
+        locals: BTreeSet<u32>,
+    }
+    let rows: Vec<NativeRow> = serde_json::from_str(include_str!(
+        "../../tools/spatial_oracle/trigger_action_values.json"
+    ))
+    .unwrap();
+    for row in rows {
+        let ini = crate::rules::ini_parser::IniFile::from_str(&format!(
+            "[Triggers]\nVARIABLE=Neutral,<none>,Variable,0,1,1,1,0\n\
+             [Events]\nVARIABLE=1,47,0,0\n[Actions]\nVARIABLE=1,{}\n",
+            row.raw
+        ));
+        let triggers = crate::map::triggers::parse_triggers(&ini);
+        let events = crate::map::events::parse_events(&ini);
+        let actions = crate::map::actions::parse_actions(&ini);
+        let entry = &actions["VARIABLE"].entries[0];
+        assert_eq!(entry.kind, row.kind, "{}", row.raw);
+        assert_eq!(entry.literal_value(), Some(row.value), "{}", row.raw);
+        assert_eq!(
+            entry.waypoint_index.map_or(-1, |value| value as i32),
+            row.waypoint,
+            "{}",
+            row.raw
+        );
+        let graph = build_trigger_graph(
+            &HashMap::new(),
+            &HashMap::new(),
+            &triggers,
+            &events,
+            &actions,
+        );
+        let mut original = Simulation::new();
+        original.initialize_map_triggers(&triggers, &HashMap::new());
+        original.trigger_runtime.globals_set = row.initial_globals;
+        original.trigger_runtime.locals_set = row.initial_locals;
+        let bytes = GameSnapshot::save(&original, 0, 0, "trigger_values", 0);
+        let mut restored = GameSnapshot::load(&bytes).unwrap().sim;
+        restored.restore_after_snapshot_load().unwrap();
+        for sim in [&mut original, &mut restored] {
+            let before_rng = sim.rng_state();
+            let frame = sim
+                .advance_master_frame(
+                    &[],
+                    None,
+                    None,
+                    67,
+                    TickLane::Ordinary,
+                    Some(TriggerInputs {
+                        graph: &graph,
+                        triggers: &triggers,
+                        events: &events,
+                        actions: &actions,
+                        waypoints: &HashMap::new(),
+                        rules: None,
+                    }),
+                )
+                .unwrap();
+            assert!(frame.frame_committed);
+            assert_eq!(sim.trigger_runtime.globals_set, row.globals, "{}", row.raw);
+            assert_eq!(sim.trigger_runtime.locals_set, row.locals, "{}", row.raw);
+            assert_eq!(
+                sim.rng_state(),
+                before_rng,
+                "empty native Tag registry draws no RNG"
+            );
+        }
+        assert_eq!(
+            original.trigger_runtime, restored.trigger_runtime,
+            "{}",
+            row.raw
+        );
+    }
+}
+
+#[test]
+fn parsed_map_trigger_flags_gate_production_frames_and_survive_restore() {
+    // Use actual map text, not hand-built MapTrigger booleans. The enabled
+    // and difficulty expectations are established by trigger_type_flags.json.
+    let map = crate::map::map_file::MapFile::from_bytes(
+        b"[Map]\nTheater=TEMPERATE\nSize=0,0,2,1\nLocalSize=0,0,2,1\n\
+          [IsoMapPack5]\n1=DwALABwBAAIA/////wAAABEAAA==\n\
+          [Triggers]\n\
+          ACTIVE=Neutral,<none>,Active,0,1,1,1,0\n\
+          DISABLED=Neutral,<none>,Disabled,1,1,1,1,0\n\
+          NO_MEDIUM=Neutral,<none>,Other difficulty,0,1,0,1,0\n\
+          MISSING=Neutral,<none>,Missing flags\n\
+          SHIFTED=Neutral,<none>,Empty token,,0,0,-2,0,0\n\
+          [Events]\n\
+          ACTIVE=1,47,0,0\nDISABLED=1,47,0,0\nNO_MEDIUM=1,47,0,0\n\
+          MISSING=1,47,0,0\nSHIFTED=1,47,0,0\n\
+          [Actions]\n\
+          ACTIVE=1,112,0,0,0,0,0,0,A\n\
+          DISABLED=1,112,0,0,0,0,0,0,B\n\
+          NO_MEDIUM=1,112,0,0,0,0,0,0,C\n\
+          MISSING=1,112,0,0,0,0,0,0,D\n\
+          SHIFTED=1,112,0,0,0,0,0,0,E\n",
+    )
+    .expect("map loader accepts trigger fixture");
+    let mut original = Simulation::new();
+    // Same initialization as app/loading/init.rs.
+    original.initialize_map_triggers(&map.triggers, &map.local_variables);
+    assert_eq!(
+        original.trigger_runtime.disabled_triggers,
+        ["DISABLED", "MISSING", "NO_MEDIUM"]
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    );
+    let bytes = GameSnapshot::save(&original, 0, 0, "trigger_flags", 0);
+    let mut restored = GameSnapshot::load(&bytes).unwrap().sim;
+    restored.restore_after_snapshot_load().unwrap();
+    for sim in [&mut original, &mut restored] {
+        let frame = sim
+            .advance_master_frame(
+                &[],
+                None,
+                None,
+                67,
+                TickLane::Ordinary,
+                Some(TriggerInputs {
+                    graph: &map.trigger_graph,
+                    triggers: &map.triggers,
+                    events: &map.events,
+                    actions: &map.actions,
+                    waypoints: &map.waypoints,
+                    rules: None,
+                }),
+            )
+            .expect("production frame completes");
+        assert!(frame.frame_committed);
+        assert_eq!(
+            sim.drain_trigger_effects(),
+            vec![
+                TriggerEffect::CenterCameraAtWaypoint {
+                    waypoint: 0,
+                    immediate: true,
+                },
+                TriggerEffect::CenterCameraAtWaypoint {
+                    waypoint: 4,
+                    immediate: true,
+                },
+            ]
+        );
+    }
+    assert_eq!(original.trigger_runtime, restored.trigger_runtime);
 }
 
 #[test]
@@ -188,7 +392,8 @@ fn trigger_action_40_normalizes_and_refreshes_authority_same_frame() {
             fields: vec![],
             conditions: vec![EventCondition {
                 kind: 47,
-                params: vec!["0".to_string(), "0".to_string()],
+                value: 0,
+                ..Default::default()
             }],
         },
     )]
@@ -240,7 +445,7 @@ fn trigger_action_40_normalizes_and_refreshes_authority_same_frame() {
     let path_grid = PathGrid::from_resolved_terrain(&terrain);
     sim.resolved_terrain = Some(terrain);
     sim.rebuild_zone_grid(&path_grid);
-    sim.trigger_runtime = TriggerRuntime::from_map(&triggers, &HashMap::new());
+    sim.initialize_map_triggers(&triggers, &HashMap::new());
 
     let before_zone = sim
         .zone_grid
@@ -261,8 +466,6 @@ fn trigger_action_40_normalizes_and_refreshes_authority_same_frame() {
     let tick = sim
         .advance_master_frame(
             &[],
-            None,
-            &BTreeMap::new(),
             None,
             None,
             67,
@@ -400,10 +603,7 @@ fn techno_playfield_action_40_exact_recompute_and_mobile_reveal_callback() {
         0,
         0,
         owner,
-        Health {
-            current: 100,
-            max: 100,
-        },
+        Health { current: 100 },
         mobile_type,
         EntityCategory::Unit,
         100,
@@ -419,10 +619,7 @@ fn techno_playfield_action_40_exact_recompute_and_mobile_reveal_callback() {
         0,
         0,
         owner,
-        Health {
-            current: 100,
-            max: 100,
-        },
+        Health { current: 100 },
         building_type,
         EntityCategory::Structure,
         0,
@@ -481,7 +678,8 @@ fn time_trigger_can_center_camera_at_waypoint() {
             ],
             conditions: vec![EventCondition {
                 kind: 47,
-                params: vec!["3".to_string(), "0".to_string()],
+                value: 3,
+                ..Default::default()
             }],
         },
     )]
@@ -528,32 +726,32 @@ fn time_trigger_can_center_camera_at_waypoint() {
         &events,
         &actions,
     );
-    let mut runtime = TriggerRuntime::from_map(&triggers, &HashMap::new());
+    let mut sim = Simulation::new();
+    sim.initialize_map_triggers(&triggers, &HashMap::new());
 
     assert!(
-        runtime
-            .advance_at_frame(
-                44,
-                &graph,
-                &triggers,
-                &events,
-                &actions,
-                None,
-                None,
-                &HashMap::new(),
-            )
-            .is_empty()
+        advance_trigger_frame(
+            &mut sim,
+            44,
+            &graph,
+            &triggers,
+            &events,
+            &actions,
+            None,
+            &HashMap::new()
+        )
+        .is_empty()
     );
     assert_eq!(
-        runtime.advance_at_frame(
+        advance_trigger_frame(
+            &mut sim,
             45,
             &graph,
             &triggers,
             &events,
             &actions,
             None,
-            None,
-            &HashMap::new(),
+            &HashMap::new()
         ),
         vec![TriggerEffect::CenterCameraAtWaypoint {
             waypoint: 9,
@@ -561,18 +759,17 @@ fn time_trigger_can_center_camera_at_waypoint() {
         }]
     );
     assert!(
-        runtime
-            .advance_at_frame(
-                46,
-                &graph,
-                &triggers,
-                &events,
-                &actions,
-                None,
-                None,
-                &HashMap::new(),
-            )
-            .is_empty()
+        advance_trigger_frame(
+            &mut sim,
+            46,
+            &graph,
+            &triggers,
+            &events,
+            &actions,
+            None,
+            &HashMap::new()
+        )
+        .is_empty()
     );
 }
 
@@ -591,7 +788,8 @@ fn master_frame_polls_triggers_before_logic_houses_commit_and_delete() {
             fields: vec![],
             conditions: vec![EventCondition {
                 kind: 47,
-                params: vec!["0".to_string(), "0".to_string()],
+                value: 0,
+                ..Default::default()
             }],
         },
     )]
@@ -627,13 +825,11 @@ fn master_frame_polls_triggers_before_logic_houses_commit_and_delete() {
         &actions,
     );
     let mut sim = Simulation::new();
-    sim.trigger_runtime = TriggerRuntime::from_map(&triggers, &HashMap::new());
+    sim.initialize_map_triggers(&triggers, &HashMap::new());
 
     let tick = sim
         .advance_master_frame(
             &[],
-            None,
-            &BTreeMap::new(),
             None,
             None,
             67,
@@ -686,7 +882,8 @@ fn master_frame_save_load_continues_trigger_projectile_and_delete_state() {
             fields: vec![],
             conditions: vec![EventCondition {
                 kind: 47,
-                params: vec!["0".to_string(), "0".to_string()],
+                value: 0,
+                ..Default::default()
             }],
         },
     )]
@@ -699,7 +896,7 @@ fn master_frame_save_load_continues_trigger_projectile_and_delete_state() {
             fields: vec![],
             entries: vec![ActionEntry {
                 kind: 28,
-                params: vec!["13".to_string()],
+                params: vec!["0".to_string(), "13".to_string()],
                 waypoint_index: Some(0),
             }],
         },
@@ -713,7 +910,6 @@ fn master_frame_save_load_continues_trigger_projectile_and_delete_state() {
         &events,
         &actions,
     );
-    let height_map = BTreeMap::new();
     let waypoints = HashMap::new();
     let trigger_inputs = TriggerInputs {
         graph: &graph,
@@ -725,12 +921,10 @@ fn master_frame_save_load_continues_trigger_projectile_and_delete_state() {
     };
 
     let mut original = Simulation::new();
-    original.trigger_runtime = TriggerRuntime::from_map(&triggers, &HashMap::new());
+    original.initialize_map_triggers(&triggers, &HashMap::new());
     original
         .advance_master_frame(
             &[],
-            None,
-            &height_map,
             None,
             None,
             67,
@@ -744,16 +938,18 @@ fn master_frame_save_load_continues_trigger_projectile_and_delete_state() {
     original.admit_projectile(
         projectile_id,
         ProjectileSpawn {
+            native_unique_id: 0,
+            line_trail: None,
+            flat: false,
             source_id: crate::sim::combat::RAD_NO_ATTACKER,
             origin: ProjectileCoord::new(0, 0, 0),
             target: ProjectileTarget::Cell { rx: 4, ry: 0 },
             initial_target_position: ProjectileCoord::new(1024, 0, 0),
-            payload: ProjectilePayload {
-                base_damage: 40,
-                warhead: crate::sim::intern::InternedId::from_index(0),
-                weapon: crate::sim::intern::InternedId::from_index(0),
-                owner: crate::sim::intern::InternedId::from_index(0),
-            },
+            payload: ProjectilePayload::new(
+                40,
+                crate::sim::intern::InternedId::from_index(0),
+                crate::sim::intern::InternedId::from_index(0),
+            ),
             speed_leptons_per_frame: 64,
             velocity: crate::sim::projectile::ProjectileVelocity::new(64, 0, 0),
             trajectory: crate::sim::projectile::ProjectileTrajectory::Straight,
@@ -790,8 +986,6 @@ fn master_frame_save_load_continues_trigger_projectile_and_delete_state() {
         .advance_master_frame(
             &[],
             None,
-            &height_map,
-            None,
             None,
             67,
             TickLane::Ordinary,
@@ -799,6 +993,7 @@ fn master_frame_save_load_continues_trigger_projectile_and_delete_state() {
         )
         .expect("fixture frame must complete");
     let mut replay_log = ReplayLog::new(ReplayHeader {
+        pixel_conversion_bounds: Default::default(),
         version: 1,
         tick_hz: 15,
         seed: original.session.seed,
@@ -809,8 +1004,6 @@ fn master_frame_save_load_continues_trigger_projectile_and_delete_state() {
     let restored_tick = restored
         .advance_master_frame(
             &[],
-            None,
-            &height_map,
             None,
             None,
             67,
@@ -834,7 +1027,6 @@ fn master_frame_save_load_continues_trigger_projectile_and_delete_state() {
             &mut replayed,
             &replay_log,
             None,
-            &height_map,
             None,
             None,
             67,
@@ -856,21 +1048,24 @@ fn trigger_runtime_latches_participate_in_state_hash() {
 
 #[test]
 fn elapsed_time_uses_signed_current_frame_divided_by_fifteen() {
-    let runtime = TriggerRuntime::default();
+    let sim = Simulation::new();
     let one_second = EventCondition {
         kind: 47,
-        params: vec!["1".to_string(), "0".to_string()],
+        value: 1,
+        ..Default::default()
     };
     let zero_seconds = EventCondition {
         kind: 47,
-        params: vec!["0".to_string(), "0".to_string()],
+        value: 0,
+        ..Default::default()
     };
 
-    assert!(runtime.evaluate_event(&zero_seconds, 0, None));
-    assert!(!runtime.evaluate_event(&one_second, 14, None));
-    assert!(runtime.evaluate_event(&one_second, 15, None));
+    assert!(sim.trigger_runtime.evaluate_event(&zero_seconds, 0, &sim));
+    assert!(!sim.trigger_runtime.evaluate_event(&one_second, 14, &sim));
+    assert!(sim.trigger_runtime.evaluate_event(&one_second, 15, &sim));
     assert!(
-        !runtime.evaluate_event(&one_second, 0x8000_0000, None),
+        !sim.trigger_runtime
+            .evaluate_event(&one_second, 0x8000_0000, &sim),
         "the native frame counter is divided as a signed 32-bit value"
     );
 }
@@ -902,7 +1097,8 @@ fn global_actions_can_enable_and_force_followup_trigger() {
                 ],
                 conditions: vec![EventCondition {
                     kind: 47,
-                    params: vec!["1".to_string(), "0".to_string()],
+                    value: 1,
+                    ..Default::default()
                 }],
             },
         ),
@@ -918,7 +1114,8 @@ fn global_actions_can_enable_and_force_followup_trigger() {
                 ],
                 conditions: vec![EventCondition {
                     kind: 27,
-                    params: vec!["7".to_string(), "0".to_string()],
+                    value: 7,
+                    ..Default::default()
                 }],
             },
         ),
@@ -933,8 +1130,8 @@ fn global_actions_can_enable_and_force_followup_trigger() {
                 fields: vec![
                     "D".to_string(),
                     "28".to_string(),
-                    "7".to_string(),
                     "0".to_string(),
+                    "7".to_string(),
                     "0".to_string(),
                     "0".to_string(),
                     "0".to_string(),
@@ -961,8 +1158,8 @@ fn global_actions_can_enable_and_force_followup_trigger() {
                     ActionEntry {
                         kind: 28,
                         params: vec![
-                            "7".to_string(),
                             "0".to_string(),
+                            "7".to_string(),
                             "0".to_string(),
                             "0".to_string(),
                             "0".to_string(),
@@ -1040,18 +1237,19 @@ fn global_actions_can_enable_and_force_followup_trigger() {
         &events,
         &actions,
     );
-    let mut runtime = TriggerRuntime::from_map(&triggers, &HashMap::new());
+    let mut sim = Simulation::new();
+    sim.initialize_map_triggers(&triggers, &HashMap::new());
 
     assert_eq!(
-        runtime.advance_at_frame(
+        advance_trigger_frame(
+            &mut sim,
             15,
             &graph,
             &triggers,
             &events,
             &actions,
             None,
-            None,
-            &HashMap::new(),
+            &HashMap::new()
         ),
         vec![TriggerEffect::CenterCameraAtWaypoint {
             waypoint: 3,
@@ -1087,7 +1285,8 @@ fn linked_trigger_field_queues_followup_trigger() {
                 ],
                 conditions: vec![EventCondition {
                     kind: 47,
-                    params: vec!["1".to_string(), "0".to_string()],
+                    value: 1,
+                    ..Default::default()
                 }],
             },
         ),
@@ -1103,7 +1302,8 @@ fn linked_trigger_field_queues_followup_trigger() {
                 ],
                 conditions: vec![EventCondition {
                     kind: 28,
-                    params: vec!["9".to_string(), "0".to_string()],
+                    value: 9,
+                    ..Default::default()
                 }],
             },
         ),
@@ -1118,8 +1318,8 @@ fn linked_trigger_field_queues_followup_trigger() {
                 fields: vec![
                     "1".to_string(),
                     "28".to_string(),
-                    "5".to_string(),
                     "0".to_string(),
+                    "5".to_string(),
                     "0".to_string(),
                     "0".to_string(),
                     "0".to_string(),
@@ -1129,8 +1329,8 @@ fn linked_trigger_field_queues_followup_trigger() {
                 entries: vec![ActionEntry {
                     kind: 28,
                     params: vec![
-                        "5".to_string(),
                         "0".to_string(),
+                        "5".to_string(),
                         "0".to_string(),
                         "0".to_string(),
                         "0".to_string(),
@@ -1181,18 +1381,19 @@ fn linked_trigger_field_queues_followup_trigger() {
         &events,
         &actions,
     );
-    let mut runtime = TriggerRuntime::from_map(&triggers, &HashMap::new());
+    let mut sim = Simulation::new();
+    sim.initialize_map_triggers(&triggers, &HashMap::new());
 
     assert_eq!(
-        runtime.advance_at_frame(
+        advance_trigger_frame(
+            &mut sim,
             15,
             &graph,
             &triggers,
             &events,
             &actions,
             None,
-            None,
-            &HashMap::new(),
+            &HashMap::new()
         ),
         vec![TriggerEffect::CenterCameraAtWaypoint {
             waypoint: 4,
@@ -1228,7 +1429,8 @@ fn forced_trigger_with_unmet_conditions_does_not_fire() {
                 ],
                 conditions: vec![EventCondition {
                     kind: 47,
-                    params: vec!["1".to_string(), "0".to_string()],
+                    value: 1,
+                    ..Default::default()
                 }],
             },
         ),
@@ -1244,7 +1446,8 @@ fn forced_trigger_with_unmet_conditions_does_not_fire() {
                 ],
                 conditions: vec![EventCondition {
                     kind: 27,
-                    params: vec!["99".to_string(), "0".to_string()],
+                    value: 99,
+                    ..Default::default()
                 }],
             },
         ),
@@ -1322,18 +1525,19 @@ fn forced_trigger_with_unmet_conditions_does_not_fire() {
         &events,
         &actions,
     );
-    let mut runtime = TriggerRuntime::from_map(&triggers, &HashMap::new());
+    let mut sim = Simulation::new();
+    sim.initialize_map_triggers(&triggers, &HashMap::new());
 
     assert_eq!(
-        runtime.advance_at_frame(
+        advance_trigger_frame(
+            &mut sim,
             15,
             &graph,
             &triggers,
             &events,
             &actions,
             None,
-            None,
-            &HashMap::new(),
+            &HashMap::new()
         ),
         Vec::<TriggerEffect>::new()
     );
@@ -1359,7 +1563,8 @@ fn mission_announce_then_force_end_emits_result_effects() {
             ],
             conditions: vec![EventCondition {
                 kind: 47,
-                params: vec!["1".to_string(), "0".to_string()],
+                value: 1,
+                ..Default::default()
             }],
         },
     )]
@@ -1427,18 +1632,19 @@ fn mission_announce_then_force_end_emits_result_effects() {
         &events,
         &actions,
     );
-    let mut runtime = TriggerRuntime::from_map(&triggers, &HashMap::new());
+    let mut sim = Simulation::new();
+    sim.initialize_map_triggers(&triggers, &HashMap::new());
 
     assert_eq!(
-        runtime.advance_at_frame(
+        advance_trigger_frame(
+            &mut sim,
             15,
             &graph,
             &triggers,
             &events,
             &actions,
             None,
-            None,
-            &HashMap::new(),
+            &HashMap::new()
         ),
         vec![
             TriggerEffect::MissionAnnouncement {
@@ -1479,7 +1685,8 @@ fn local_variables_seed_and_gate_followup_triggers() {
                 ],
                 conditions: vec![EventCondition {
                     kind: 37,
-                    params: vec!["2".to_string(), "0".to_string()],
+                    value: 2,
+                    ..Default::default()
                 }],
             },
         ),
@@ -1495,7 +1702,8 @@ fn local_variables_seed_and_gate_followup_triggers() {
                 ],
                 conditions: vec![EventCondition {
                     kind: 36,
-                    params: vec!["2".to_string(), "0".to_string()],
+                    value: 2,
+                    ..Default::default()
                 }],
             },
         ),
@@ -1510,8 +1718,8 @@ fn local_variables_seed_and_gate_followup_triggers() {
                 fields: vec![
                     "1".to_string(),
                     "56".to_string(),
-                    "2".to_string(),
                     "0".to_string(),
+                    "2".to_string(),
                     "0".to_string(),
                     "0".to_string(),
                     "0".to_string(),
@@ -1521,8 +1729,8 @@ fn local_variables_seed_and_gate_followup_triggers() {
                 entries: vec![ActionEntry {
                     kind: 56,
                     params: vec![
-                        "2".to_string(),
                         "0".to_string(),
+                        "2".to_string(),
                         "0".to_string(),
                         "0".to_string(),
                         "0".to_string(),
@@ -1583,32 +1791,33 @@ fn local_variables_seed_and_gate_followup_triggers() {
         &events,
         &actions,
     );
-    let mut runtime = TriggerRuntime::from_map(&triggers, &local_variables);
+    let mut sim = Simulation::new();
+    sim.initialize_map_triggers(&triggers, &local_variables);
 
     assert_eq!(
-        runtime.advance_at_frame(
+        advance_trigger_frame(
+            &mut sim,
             0,
             &graph,
             &triggers,
             &events,
             &actions,
             None,
-            None,
-            &HashMap::new(),
+            &HashMap::new()
         ),
         Vec::<TriggerEffect>::new()
     );
-    assert!(runtime.locals_set.contains(&2));
+    assert!(sim.trigger_runtime.locals_set.contains(&2));
     assert_eq!(
-        runtime.advance_at_frame(
+        advance_trigger_frame(
+            &mut sim,
             0,
             &graph,
             &triggers,
             &events,
             &actions,
             None,
-            None,
-            &HashMap::new(),
+            &HashMap::new()
         ),
         vec![TriggerEffect::CenterCameraAtWaypoint {
             waypoint: 6,
@@ -1644,7 +1853,9 @@ fn techtype_exists_and_not_exists_query_simulation_world() {
                 ],
                 conditions: vec![EventCondition {
                     kind: 60,
-                    params: vec!["2".to_string(), "GAPOWR".to_string()],
+                    value: 2,
+                    type_name: Some("GAPOWR".to_string()),
+                    ..Default::default()
                 }],
             },
         ),
@@ -1660,7 +1871,9 @@ fn techtype_exists_and_not_exists_query_simulation_world() {
                 ],
                 conditions: vec![EventCondition {
                     kind: 61,
-                    params: vec!["0".to_string(), "GAAIRC".to_string()],
+                    value: 0,
+                    type_name: Some("GAAIRC".to_string()),
+                    ..Default::default()
                 }],
             },
         ),
@@ -1738,21 +1951,21 @@ fn techtype_exists_and_not_exists_query_simulation_world() {
         &events,
         &actions,
     );
-    let mut runtime = TriggerRuntime::from_map(&triggers, &HashMap::new());
     let mut sim = Simulation::new();
+    sim.initialize_map_triggers(&triggers, &HashMap::new());
     spawn_type(&mut sim, "GAPOWR");
     spawn_type(&mut sim, "GAPOWR");
 
     assert_eq!(
-        runtime.advance_at_frame(
+        advance_trigger_frame(
+            &mut sim,
             0,
             &graph,
             &triggers,
             &events,
             &actions,
-            Some(&mut sim),
             None,
-            &HashMap::new(),
+            &HashMap::new()
         ),
         vec![
             TriggerEffect::CenterCameraAtWaypoint {
@@ -1786,7 +1999,8 @@ fn run_waypoint_action(
             fields: Vec::new(),
             conditions: vec![EventCondition {
                 kind: 47,
-                params: vec!["0".to_string()],
+                value: 0,
+                ..Default::default()
             }],
         },
     )]
@@ -1817,16 +2031,9 @@ fn run_waypoint_action(
         &events,
         &actions,
     );
-    let mut runtime = TriggerRuntime::from_map(&triggers, &HashMap::new());
-    runtime.advance_at_frame(
-        0,
-        &graph,
-        &triggers,
-        &events,
-        &actions,
-        Some(sim),
-        rules,
-        waypoints,
+    sim.initialize_map_triggers(&triggers, &HashMap::new());
+    advance_trigger_frame(
+        sim, 0, &graph, &triggers, &events, &actions, rules, waypoints,
     )
 }
 

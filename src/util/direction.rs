@@ -77,6 +77,7 @@ impl Ra2Direction {
         self.index() * FACING_UNITS_PER_DIRECTION
     }
 
+    #[cfg(test)]
     pub fn short_name(self) -> &'static str {
         match self {
             Self::North => "N",
@@ -93,6 +94,15 @@ impl Ra2Direction {
 
 pub fn direction_delta(direction: u8) -> Option<(i32, i32)> {
     Ra2Direction::from_index(direction).map(Ra2Direction::delta)
+}
+
+/// Direction whose one-cell step is exactly `(dx, dy)`; `None` for a null or
+/// longer step.
+pub fn direction_from_delta(dx: i32, dy: i32) -> Option<u8> {
+    DIRECTION_DELTAS
+        .iter()
+        .position(|&delta| delta == (dx, dy))
+        .map(|index| index as u8)
 }
 
 pub fn direction_from_facing(facing: u8) -> u8 {

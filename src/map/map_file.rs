@@ -18,7 +18,6 @@ use crate::assets::error::AssetError;
 use crate::assets::mix_archive::MixArchive;
 use crate::map::actions::{self, ActionMap};
 use crate::map::basic::{self, BasicSection, SpecialFlagsSection};
-use crate::map::briefing::{self, BriefingSection};
 use crate::map::cell_tags::{self, CellTagMap};
 use crate::map::entities::{self, MapEntity};
 use crate::map::events::{self, EventMap};
@@ -35,6 +34,7 @@ use crate::map::variable_names::{self, LocalVariableMap};
 use crate::map::waypoints::{self, Waypoint};
 use crate::rules::error::RulesError;
 use crate::rules::ini_parser::IniFile;
+use crate::rules::ini_value::{crt_atoi, strtok};
 use crate::util::base64;
 use crate::util::lzo::{self, LzoError};
 
@@ -46,7 +46,6 @@ const CELL_HEADER_SIZE: usize = 4;
 const ISO_MAP_ROW_WIDTH: i32 = 512;
 const ISO_MAP_CELL_COUNT: i32 = ISO_MAP_ROW_WIDTH * ISO_MAP_ROW_WIDTH;
 const DEFAULT_SIZE_RECT: [i32; 4] = [1, 1, 50, 50];
-const MISSING_RECT_TEXT: &str = "0,0,0,0";
 
 /// Errors during map file parsing.
 #[derive(Debug)]
@@ -265,8 +264,6 @@ pub struct MapFile {
     pub header: MapHeader,
     /// Parsed `[Basic]` metadata such as title and briefing hooks.
     pub basic: BasicSection,
-    /// Parsed ordered mission briefing lines from `[Briefing]`.
-    pub briefing: BriefingSection,
     /// Parsed preview metadata from `[Preview]` / `[PreviewPack]`.
     pub preview: PreviewSection,
     pub cells: Vec<MapCell>,
@@ -312,11 +309,13 @@ pub struct MapFile {
 impl MapFile {
     /// Parse a map from raw INI bytes.
     pub fn from_bytes(data: &[u8]) -> Result<Self, MapError> {
-        let ini: IniFile = IniFile::from_bytes(data)?;
+        Self::from_ini(IniFile::from_bytes(data)?)
+    }
+
+    fn from_ini(ini: IniFile) -> Result<Self, MapError> {
         let header: MapHeader = parse_header(&ini)?;
         let basic: BasicSection = basic::parse_basic_section(&ini);
         let special_flags: SpecialFlagsSection = basic::parse_special_flags_section(&ini);
-        let briefing: BriefingSection = briefing::parse_briefing_section(&ini);
         let mut preview: PreviewSection = preview::parse_preview_section(&ini);
         match preview::decode_preview_image_from_ini(&ini) {
             Ok(Some(decoded)) => preview.decoded = Some(decoded),
@@ -351,7 +350,6 @@ impl MapFile {
         Ok(MapFile {
             header,
             basic,
-            briefing,
             preview,
             cells: iso_map_pack.cells,
             iso_map_pack_lookups: iso_map_pack.lookups,
@@ -412,20 +410,26 @@ pub(crate) struct OverlayPacksAlreadyConsumed;
 /// text. We dispatch on the first two header bytes — `00 00` is the
 /// new-format MIX marker; anything else is treated as INI text.
 pub fn load_from_path(path: &Path) -> Result<MapFile, MapError> {
-    let bytes: Vec<u8> = std::fs::read(path)?;
-    if is_mix_header(&bytes) {
-        let archive: MixArchive = MixArchive::load(path)?;
-        let id: i32 = pick_map_entry_id(&archive)?;
-        let data: &[u8] = archive.get_by_id(id).ok_or(MapError::MissingIsoMapPack)?;
-        MapFile::from_bytes(data)
-    } else {
-        MapFile::from_bytes(&bytes)
-    }
+    load_from_bytes(std::fs::read(path)?)
 }
 
-/// Backwards-compatible alias for callers still naming the MIX path explicitly.
-pub fn load_mmx(path: &Path) -> Result<MapFile, MapError> {
-    load_from_path(path)
+/// Parse one consumed file buffer, auto-detecting MIX-wrapped vs raw INI.
+///
+/// Callers recording source identity can hash this same buffer before passing
+/// ownership here. Wrapped maps retain the existing inner-entry selection.
+pub fn load_from_bytes(bytes: Vec<u8>) -> Result<MapFile, MapError> {
+    MapFile::from_ini(ini_from_file_bytes(bytes)?)
+}
+
+/// Select and parse the map INI without decoding terrain or preview packs.
+/// Menu metadata and full loading share this raw/wrapped-file decision.
+pub(crate) fn ini_from_file_bytes(bytes: Vec<u8>) -> Result<IniFile, MapError> {
+    if is_mix_header(&bytes) {
+        let archive: MixArchive = MixArchive::from_bytes(bytes)?;
+        pick_map_ini(&archive)
+    } else {
+        Ok(IniFile::from_bytes(&bytes)?)
+    }
 }
 
 /// New-format MIX marker: first two bytes are `0x00 0x00`.
@@ -439,7 +443,7 @@ fn is_mix_header(bytes: &[u8]) -> bool {
 /// ~120-byte `[MultiMaps]` description stub. We try entries in descending
 /// size order and return the first one whose bytes parse as INI containing
 /// a `[Map]` section.
-fn pick_map_entry_id(archive: &MixArchive) -> Result<i32, MapError> {
+fn pick_map_ini(archive: &MixArchive) -> Result<IniFile, MapError> {
     let mut entries: Vec<_> = archive.entries().to_vec();
     if entries.is_empty() {
         return Err(MapError::MissingIsoMapPack);
@@ -451,7 +455,7 @@ fn pick_map_entry_id(archive: &MixArchive) -> Result<i32, MapError> {
         };
         if let Ok(ini) = IniFile::from_bytes(data) {
             if ini.section("Map").is_some() {
-                return Ok(entry.id);
+                return Ok(ini);
             }
         }
     }
@@ -464,17 +468,20 @@ fn parse_header(ini: &IniFile) -> Result<MapHeader, MapError> {
         .section("Map")
         .ok_or(MapError::MissingSection { name: "Map".into() })?;
 
+    // `Read_Map_Section_And_IsoMapPacks @ 0x004ACE70`: the theater name read
+    // (`0x00475870`, 0x80 bytes), `Fill` as a 0x20-byte ReadString, ReadInt
+    // `Level`, and ReadRect for both rectangles.
     let theater: String = map_section
-        .get("Theater")
+        .read_name("Theater", 0x80)
         .unwrap_or("TEMPERATE")
         .to_uppercase();
-    let fill = map_section.get("Fill").unwrap_or("Clear").to_string();
-    let level = map_section.get_i32("Level").unwrap_or(0);
+    let fill = map_section.read_string("Fill", "Clear", 0x20);
+    let level = map_section.read_int("Level", 0);
 
     // Full-map resizing stores Size width/height but normalizes its origin before LocalSize is read.
-    let size_parts = read_rect_i32(map_section.get("Size"), DEFAULT_SIZE_RECT);
+    let size_parts = map_section.read_rect("Size", DEFAULT_SIZE_RECT);
     let normalized_size = [0, 0, size_parts[2], size_parts[3]];
-    let local_parts = read_rect_i32(map_section.get("LocalSize"), normalized_size);
+    let local_parts = map_section.read_rect("LocalSize", normalized_size);
 
     Ok(MapHeader {
         theater,
@@ -489,60 +496,6 @@ fn parse_header(ini: &IniFile) -> Result<MapHeader, MapError> {
     })
 }
 
-/// Read a signed rectangle by overlaying each successfully scanned CSV prefix field.
-fn read_rect_i32(value: Option<&str>, default: [i32; 4]) -> [i32; 4] {
-    let value = value.unwrap_or(MISSING_RECT_TEXT);
-    let bytes = value.as_bytes();
-    let mut parsed = default;
-    let mut cursor = 0;
-
-    for (index, field) in parsed.iter_mut().enumerate() {
-        let Some((value, end)) = scan_decimal_i32(bytes, cursor) else {
-            break;
-        };
-        *field = value;
-        cursor = end;
-
-        if index == 3 {
-            break;
-        }
-        if bytes.get(cursor) != Some(&b',') {
-            break;
-        }
-        cursor += 1;
-    }
-
-    parsed
-}
-
-fn scan_decimal_i32(bytes: &[u8], mut cursor: usize) -> Option<(i32, usize)> {
-    while bytes
-        .get(cursor)
-        .is_some_and(|byte| byte.is_ascii_whitespace())
-    {
-        cursor += 1;
-    }
-
-    let start = cursor;
-    if bytes
-        .get(cursor)
-        .is_some_and(|byte| matches!(*byte, b'+' | b'-'))
-    {
-        cursor += 1;
-    }
-
-    let digits_start = cursor;
-    while bytes.get(cursor).is_some_and(|byte| byte.is_ascii_digit()) {
-        cursor += 1;
-    }
-    if cursor == digits_start {
-        return None;
-    }
-
-    let number = std::str::from_utf8(&bytes[start..cursor]).ok()?;
-    Some((number.parse().ok()?, cursor))
-}
-
 /// Extract and decode the [IsoMapPack5] terrain data.
 ///
 /// 1. Concatenate all numbered key values from the section.
@@ -554,13 +507,7 @@ fn parse_iso_map_pack(ini: &IniFile) -> Result<ParsedIsoMapPack, MapError> {
         .section("IsoMapPack5")
         .ok_or(MapError::MissingIsoMapPack)?;
 
-    // Concatenate all values in key order (keys are "1", "2", "3", ...).
-    let mut b64_data: String = String::new();
-    for key in section.keys() {
-        if let Some(val) = section.get(key) {
-            b64_data.push_str(val);
-        }
-    }
+    let b64_data = section.read_packed_text();
 
     if b64_data.is_empty() {
         return Err(MapError::MissingIsoMapPack);
@@ -643,12 +590,10 @@ fn parse_iso_map_pack_records(decompressed: &[u8]) -> Result<ParsedIsoMapPack, M
         // Y is unsigned, and every non-sentinel header performs this fixed
         // 512-wide lookup before either applying or discarding its payload.
         let linear: i32 = i32::from(y) * ISO_MAP_ROW_WIDTH + i32::from(x);
-        let canonical = (0..ISO_MAP_CELL_COUNT)
-            .contains(&linear)
-            .then_some((
-                (linear % ISO_MAP_ROW_WIDTH) as u16,
-                (linear / ISO_MAP_ROW_WIDTH) as u16,
-            ));
+        let canonical = (0..ISO_MAP_CELL_COUNT).contains(&linear).then_some((
+            (linear % ISO_MAP_ROW_WIDTH) as u16,
+            (linear / ISO_MAP_ROW_WIDTH) as u16,
+        ));
         lookups.push(IsoMapPackLookup {
             raw_x: x,
             raw_y: y,
@@ -679,20 +624,24 @@ fn parse_map_smudges(ini: &IniFile) -> Vec<MapSmudgeEntry> {
     let Some(section) = ini.section("Smudge") else {
         return Vec::new();
     };
+    // The `[Smudge]` reader (`0x006B4C80`): a 0x80-byte ReadString split by
+    // `strtok(",")`, coordinates as `(short)atoi`. Native reads a missing Y
+    // as `atoi(NULL)`; Rust drops the row.
     let mut out: Vec<MapSmudgeEntry> = Vec::new();
-    for value in section.get_values() {
-        let parts: Vec<&str> = value.split(',').map(|s| s.trim()).collect();
+    for key in section.keys() {
+        let Some(value) = section.read_name(key, 0x80) else {
+            continue;
+        };
+        let parts: Vec<&str> = strtok(value, &[',']).collect();
         if parts.len() < 3 {
             continue;
         }
-        let is_baked = parts
-            .get(3)
-            .map_or(0, |value| crate::rules::ini_value::atoi_lenient(value));
+        let is_baked = parts.get(3).map_or(0, |value| crt_atoi(value));
         if is_baked != 0 {
             continue;
         }
-        let rx = crate::rules::ini_value::atoi_lenient(parts[1]) as i16 as u16;
-        let ry = crate::rules::ini_value::atoi_lenient(parts[2]) as i16 as u16;
+        let rx = crt_atoi(parts[1]) as i16 as u16;
+        let ry = crt_atoi(parts[2]) as i16 as u16;
         out.push(MapSmudgeEntry {
             type_name: parts[0].to_uppercase(),
             rx,
@@ -742,11 +691,12 @@ mod smudge_parse_tests {
         .unwrap();
         let smudges = parse_map_smudges(&ini);
         // Three-token entries default IsBaked to zero; malformed numerics use atoi's zero.
-        // Entry 1: empty type_name accepted by parser but won't resolve to a registered SmudgeType later.
+        // Entry 1: strtok skips the empty first field, so "5" is the type name.
         assert_eq!(smudges.len(), 4);
         assert_eq!(smudges[0].type_name, "CR1");
         assert_eq!((smudges[0].rx, smudges[0].ry), (5, 6));
-        assert_eq!(smudges[1].type_name, "");
+        assert_eq!(smudges[1].type_name, "5");
+        assert_eq!((smudges[1].rx, smudges[1].ry), (6, 0));
         assert_eq!((smudges[2].rx, smudges[2].ry), (0, 6));
         assert_eq!(smudges[3].type_name, "CR1");
     }
@@ -824,8 +774,7 @@ LocalSize=2,4,96,92
 
     #[test]
     fn authored_overlay_pack_receipt_can_be_taken_only_once() {
-        let mut map = MapFile::from_bytes(&full_map_with_preview(""))
-            .expect("minimal parsed map");
+        let mut map = MapFile::from_bytes(&full_map_with_preview("")).expect("minimal parsed map");
         let first = map
             .take_authored_overlay_packs()
             .expect("first authored receipt");
@@ -870,9 +819,6 @@ LocalSize=2,4,96,92
 
     #[test]
     fn gsi_04_01_missing_rects_ignore_nonzero_caller_defaults() {
-        assert_eq!(read_rect_i32(None, DEFAULT_SIZE_RECT), [0, 0, 0, 0]);
-        assert_eq!(read_rect_i32(None, [0, 0, 40, 41]), [0, 0, 0, 0]);
-
         let ini = IniFile::from_str("[Map]\nSize=2,3,40,41\n");
 
         let header = parse_header(&ini).expect("missing rectangles should remain loadable");
@@ -887,21 +833,12 @@ LocalSize=2,4,96,92
     }
 
     #[test]
-    fn gsi_04_01_direct_helper_present_empty_text_preserves_caller_default() {
-        assert_eq!(
-            read_rect_i32(Some(""), DEFAULT_SIZE_RECT),
-            DEFAULT_SIZE_RECT
-        );
-        assert_eq!(read_rect_i32(Some(" \t"), [0, 0, 40, 41]), [0, 0, 40, 41]);
-    }
-
-    #[test]
     fn gsi_04_01_loaded_empty_rect_values_are_omitted_and_become_missing_zeros() {
         let ini = IniFile::from_str("[Map]\nTheater=TEMPERATE\nSize=\nLocalSize= \t \n");
         let map_section = ini.section("Map").expect("Map section");
 
-        assert!(map_section.get("Size").is_none());
-        assert!(map_section.get("LocalSize").is_none());
+        assert!(map_section.get_for_test("Size").is_none());
+        assert!(map_section.get_for_test("LocalSize").is_none());
 
         let header = parse_header(&ini).expect("omitted empty rectangles should remain loadable");
         assert_eq!(header.width, 0);
@@ -928,12 +865,11 @@ LocalSize=2,4,96,92
 
     #[test]
     fn gsi_04_01_invalid_field_stops_after_prior_assignments() {
+        let spaced = IniFile::from_str("[Map]\nSize=2 ,3,40,41\n");
         assert_eq!(
-            read_rect_i32(Some("2,invalid,40,41"), DEFAULT_SIZE_RECT),
-            [2, 1, 50, 50]
-        );
-        assert_eq!(
-            read_rect_i32(Some("2 ,3,40,41"), DEFAULT_SIZE_RECT),
+            spaced
+                .section_or_empty("Map")
+                .read_rect("Size", DEFAULT_SIZE_RECT),
             [2, 1, 50, 50]
         );
 

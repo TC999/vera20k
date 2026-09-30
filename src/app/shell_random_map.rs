@@ -7,12 +7,8 @@ const RANDMAP_SED_FILE: &str = "RandMap.Sed";
 /// becomes the sentinel row's displayed name.
 pub(super) const RANDOM_MAP_DESCRIPTION_KEY: &str = "TXT_RANDOM_MAP_DESCRIPTION";
 pub(super) const RANDOM_MAP_DESCRIPTION_FALLBACK: &str = "Random Map";
-/// The players slider is the last of the setup dialog's six option rows, and the
-/// dialog gives it a range of 2..8 with a step of one.
+/// The players slider is the last of the setup dialog's six option rows.
 const SETUP_PLAYERS_ROW: usize = 5;
-const SETUP_PLAYERS_MIN: i32 = 2;
-const SETUP_PLAYERS_MAX: i32 = 8;
-const SETUP_PLAYERS_STEP: i32 = 1;
 /// Matches the rules default the map-load path falls back to; the preview only
 /// needs it because terrain resolution takes it, not because cliffs affect the
 /// image.
@@ -305,6 +301,7 @@ pub(super) struct PreparedRandomMapGeneration {
 pub(super) fn prepare_random_map_generation(
     asset_manager: &mut crate::assets::asset_manager::AssetManager,
     options: &crate::map::rmg::RmgOptions,
+    native_rules: Option<&crate::rules::process_owner::NativeRulesProcessOwner>,
 ) -> Option<PreparedRandomMapGeneration> {
     let settings = crate::map::rmg::RmgSettings::load(asset_manager);
     let theater_name = crate::map::rmg::emit::theater_name(options.theater);
@@ -312,10 +309,10 @@ pub(super) fn prepare_random_map_generation(
         log::warn!("random map: theater {theater_name} unavailable");
         return None;
     };
-    let terrain_rules = asset_manager
-        .get_ref("rulesmd.ini")
-        .and_then(|bytes| crate::rules::ini_parser::IniFile::from_bytes(bytes).ok())
-        .map(|ini| crate::rules::terrain_rules::TerrainRules::from_ini(&ini))
+    let terrain_rules = native_rules
+        .map(|owner| {
+            crate::rules::terrain_rules::TerrainRules::from_ini(owner.selected_rules_root())
+        })
         .unwrap_or_default();
     let resolved_inputs = crate::map::rmg::build::ResolvedTheaterInputs::from_theater(
         &theater,
@@ -326,7 +323,7 @@ pub(super) fn prepare_random_map_generation(
         crate::map::rmg::theater_blocks::TheaterTileBlocks::build(&theater.lookup, |name| {
             asset_manager.get(name)
         });
-    let tech_types = crate::app::loading::init_helpers::load_neutral_tech_types(asset_manager);
+    let tech_types = crate::app::loading::init_helpers::load_neutral_tech_types(native_rules);
     Some(PreparedRandomMapGeneration {
         theater,
         terrain_rules,
@@ -563,7 +560,8 @@ impl App {
             &mut state.frontend.random_map_retention,
             options,
         );
-        let (manager, tile_cache) = state.process_assets.manager_mut_with_tile_cache();
+        let (manager, native_rules, tile_cache) =
+            state.process_assets.manager_and_rules_with_tile_cache();
         let Some(asset_manager) = manager else {
             return false;
         };
@@ -574,7 +572,7 @@ impl App {
             resolved_inputs,
             blocks,
             tech_types,
-        }) = prepare_random_map_generation(asset_manager, options)
+        }) = prepare_random_map_generation(asset_manager, options, native_rules)
         else {
             return false;
         };
@@ -693,7 +691,12 @@ impl App {
                 }
             };
             if accept {
-                Self::accept_random_map_setup(state);
+                // The generate block ran inside Use Map; the dialog then
+                // ends through its teardown slide.
+                Self::leave_shell_dialog(
+                    state,
+                    crate::app::frontend::shell_transition::ShellExitThen::RandomMapUse,
+                );
             }
             return true;
         }
@@ -748,7 +751,7 @@ impl App {
     /// That matters beyond tidiness: a late finish would otherwise overwrite
     /// `RandMap.img`, changing the chooser's thumbnail to a map the player
     /// walked away from.
-    fn cancel_random_map_setup(state: &mut AppState) {
+    pub(super) fn cancel_random_map_setup(state: &mut AppState) {
         let ra2_dir = state
             .platform
             .game_config
@@ -762,11 +765,27 @@ impl App {
             &mut frontend.random_map_retention,
             ra2_dir.as_deref(),
         );
+        Self::show_choose_map_after_random_map(state);
+    }
+
+    /// The random-map run has returned to the hidden chooser: unless its
+    /// Use Map closed it or asks to eject AI players, it shows again and its
+    /// first paint slides it in (`0x005E6B47`, `0x005E6B51`).
+    fn show_choose_map_after_random_map(state: &mut AppState) {
+        let shell = &mut state.frontend.skirmish_shell_state;
+        if shell.random_map_setup_modal.is_some() {
+            return;
+        }
+        if let Some(chooser) = shell.choose_map_modal.as_mut()
+            && chooser.eject_prompt.is_none()
+        {
+            chooser.show();
+        }
     }
 
     /// Commit the dialog's options and close it. Shared by the immediate accept
     /// and the one deferred behind a generation.
-    fn accept_random_map_setup(state: &mut AppState) {
+    pub(super) fn accept_random_map_setup(state: &mut AppState) {
         let ra2_dir = state
             .platform
             .game_config
@@ -799,6 +818,7 @@ impl App {
                 log::error!("random map: could not write {RANDMAP_SED_FILE}: {err}");
             }
         }
+        Self::show_choose_map_after_random_map(state);
     }
 
     /// Rasterise the finished map into the dialog-owned preview surface.
@@ -827,7 +847,8 @@ impl App {
         // never sees.
         let resolved_terrain = {
             let frontend_main_rng = &mut state.frontend.frontend_main_rng;
-            let (manager, selector_cache) = state.process_assets.manager_mut_with_tile_cache();
+            let (manager, _, selector_cache) =
+                state.process_assets.manager_and_rules_with_tile_cache();
             let asset_manager = manager.map(|m| &*m);
             build_random_map_preview_grid(
                 map_file,
@@ -902,6 +923,10 @@ impl App {
         };
         // Reuse the modal helper: it upserts the single sentinel, honours the
         // mode's random-map admission, and refreshes the filtered record list.
+        let chooser_layout = crate::ui::skirmish_shell::compute_choose_map_modal_layout(
+            state.render_width(),
+            state.render_height(),
+        );
         let Some(modal) = state
             .frontend
             .skirmish_shell_state
@@ -920,6 +945,7 @@ impl App {
                 &state.frontend.skirmish_modes,
                 display,
                 options.num_players,
+                &chooser_layout,
             )
         };
         let mode_id = modal.selected_mode_id;
@@ -929,8 +955,12 @@ impl App {
                 mode_id,
                 record_index: Some(index),
             };
-            let _ = Self::commit_choose_map_selection(state, selection);
-            Self::close_choose_map_modal(state);
+            // Success runs the hidden chooser's Use Map (`0x005E6B2F`): its
+            // eject box can keep the chooser (`0x005E6B47`).
+            if Self::prompt_choose_map_eject(state, selection) {
+                return Ok(());
+            }
+            Self::commit_choose_map_use(state, selection);
         }
         Ok(())
     }
@@ -984,8 +1014,11 @@ impl App {
             // The players slider is not a button: it acts on press, not on
             // release, so it never arms a pressed control.
             if control == crate::ui::skirmish_shell::RandomMapSetupControl::Players0x3eb {
-                if modal.is_enabled(control) {
-                    Self::press_setup_players_trackbar(modal, &layout, x, y);
+                let rect = layout.control_rects[SETUP_PLAYERS_ROW];
+                if modal.is_enabled(control)
+                    && modal.press_players(x - rect.x, y - rect.y, rect.w, rect.h)
+                {
+                    Self::play_skirmish_shell_generic_click_sound(state);
                 }
                 return true;
             }
@@ -1000,42 +1033,42 @@ impl App {
         layout.dialog.contains(x, y)
     }
 
-    /// Press behaviour for the players slider, mirroring the shell's other
-    /// trackbars: grabbing the thumb starts a tracking drag, while a press on
-    /// the rail jumps the value once and tracks nothing.
-    fn press_setup_players_trackbar(
-        modal: &mut crate::ui::skirmish_shell::RandomMapSetupModalState,
-        layout: &crate::ui::skirmish_shell::RandomMapSetupLayout,
-        x: i32,
-        y: i32,
-    ) {
-        let rect = layout.control_rects[SETUP_PLAYERS_ROW];
-        if !crate::ui::skirmish_shell::trackbar_mouse_allowed_y(rect, y) {
-            return;
-        }
-        let pixel_offset = crate::ui::skirmish_shell::trackbar_pixel_offset(
-            modal.options.num_players,
-            SETUP_PLAYERS_MIN,
-            SETUP_PLAYERS_MAX,
-            SETUP_PLAYERS_STEP,
-            rect,
-        );
-        if crate::ui::skirmish_shell::trackbar_thumb_hit(rect, pixel_offset, x, y) {
-            modal.dragging_players_thumb = true;
-        } else if rect.contains(x, y) {
-            modal.set_num_players(crate::ui::skirmish_shell::trackbar_mouse_value(
-                rect,
-                x,
-                SETUP_PLAYERS_MIN,
-                SETUP_PLAYERS_MAX,
-                SETUP_PLAYERS_STEP,
-            ));
-        }
-    }
-
     pub(super) fn handle_random_map_setup_mouse_move(state: &mut AppState) {
         let layout = Self::skirmish_random_map_setup_layout(state);
         let x = state.match_state.input.cursor_x.round() as i32;
+        let y = state.match_state.input.cursor_y.round() as i32;
+        // `0x105`'s proc runs the common handler first (`0x0059631A`): every
+        // move writes the help of the control under the pointer, or an empty
+        // one, and repaints the status line. An open list holds the mouse
+        // capture instead (`ComboDropWin` `0x0060E0F1`); its own move handler
+        // (`0x0060E262`) asks the dialog for the row's help (`0x4E9`), which
+        // `0x105` never answers, so the status line keeps its text. So does a
+        // Players slider holding the mouse since a press on it.
+        let mouse_held = state
+            .frontend
+            .skirmish_shell_state
+            .random_map_setup_modal
+            .as_ref()
+            .is_some_and(|modal| modal.open_combo.is_some() || modal.players_hold.is_some());
+        if !mouse_held {
+            let help = crate::ui::skirmish_shell::random_map_setup_control_at(&layout, x, y)
+                .map(|control| {
+                    Self::localized_status_help_text(
+                        state,
+                        crate::ui::skirmish_shell::status_help_key_for_random_map_setup(control),
+                    )
+                })
+                .unwrap_or_default();
+            if let Some(setup) = state
+                .frontend
+                .skirmish_shell_state
+                .random_map_setup_modal
+                .as_mut()
+                && setup.statics.hover(&help, std::time::Instant::now())
+            {
+                state.platform.window.request_redraw();
+            }
+        }
         let Some(modal) = state
             .frontend
             .skirmish_shell_state
@@ -1044,23 +1077,33 @@ impl App {
         else {
             return;
         };
-        if !modal.dragging_players_thumb {
+        if modal.players_hold.is_none() {
             return;
         }
         let rect = layout.control_rects[SETUP_PLAYERS_ROW];
-        modal.set_num_players(crate::ui::skirmish_shell::trackbar_mouse_value(
-            rect,
-            x,
-            SETUP_PLAYERS_MIN,
-            SETUP_PLAYERS_MAX,
-            SETUP_PLAYERS_STEP,
-        ));
+        if modal.drag_players(x - rect.x, rect.w) {
+            Self::play_skirmish_shell_generic_click_sound(state);
+        }
         state.platform.window.request_redraw();
     }
 
     pub(super) fn handle_random_map_setup_mouse_up(state: &mut AppState) -> bool {
         use crate::ui::skirmish_shell::RandomMapSetupControl as Control;
 
+        let Some(modal) = state
+            .frontend
+            .skirmish_shell_state
+            .random_map_setup_modal
+            .as_mut()
+        else {
+            return false;
+        };
+        // The release goes to a slider holding the mouse; freeing it lets the
+        // dialog's hit test run again.
+        if modal.players_hold.take().is_some() {
+            Self::handle_random_map_setup_mouse_move(state);
+            return true;
+        }
         let layout = Self::skirmish_random_map_setup_layout(state);
         let x = state.match_state.input.cursor_x.round() as i32;
         let y = state.match_state.input.cursor_y.round() as i32;
@@ -1085,10 +1128,6 @@ impl App {
         else {
             return false;
         };
-        if modal.dragging_players_thumb {
-            modal.dragging_players_thumb = false;
-            return true;
-        }
         // Releasing over an open list commits that entry. The press was never
         // armed for list clicks, so this has to run before the pressed check.
         if let Some(combo) = modal.open_combo {
@@ -1199,11 +1238,18 @@ impl App {
             // Accept, if it was asked for, is now the job's responsibility.
             return true;
         }
+        // Both results end the dialog through its teardown slide.
         if accept_requested {
-            Self::accept_random_map_setup(state);
+            Self::leave_shell_dialog(
+                state,
+                crate::app::frontend::shell_transition::ShellExitThen::RandomMapUse,
+            );
         }
         if close_setup {
-            Self::cancel_random_map_setup(state);
+            Self::leave_shell_dialog(
+                state,
+                crate::app::frontend::shell_transition::ShellExitThen::RandomMapCancel,
+            );
         }
         true
     }

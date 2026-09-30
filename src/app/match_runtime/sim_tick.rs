@@ -102,7 +102,7 @@ pub(crate) fn drive_local_player_outcome_voice_wait(state: &mut AppState, wall_m
         return;
     }
     if state.match_state.scenario_outcome.is_none() {
-        let Some(owner) = state.match_state.local_player_owner.as_deref() else {
+        let Some(owner) = state.match_state.local_player_owner() else {
             return;
         };
         let outcome = state
@@ -130,12 +130,14 @@ pub(crate) fn drive_local_player_outcome_voice_wait(state: &mut AppState, wall_m
         );
     }
 
-    let voices_active = match (&mut state.audio.sfx_player, state.process_assets.manager()) {
-        (Some(sfx), Some(assets)) => sfx.pump_and_check_voices(
-            &state.audio.sound_registry,
-            assets,
-            &state.audio.audio_indices,
-        ),
+    let voices_active = match (
+        &mut state.audio.sfx_player,
+        state.process_assets.manager(),
+        state.process_assets.audio_catalog(),
+    ) {
+        (Some(sfx), Some(assets), Some(catalog)) => {
+            sfx.pump_and_check_voices(catalog.sounds(), assets, catalog.index())
+        }
         _ => false,
     };
     let finished = state
@@ -173,47 +175,94 @@ pub(crate) fn drive_local_player_outcome_voice_wait(state: &mut AppState, wall_m
     );
 }
 
-/// The name one score row shows.
-///
-/// Native copies a stored per-house display name into every row, so no row ever
-/// shows the raw house key. The local player's is the handle they launched
-/// under; every other house shows its country's display name, which is what
-/// native derives that slot from.
+/// A score row's name: the house's UI name (`house+0x1602A`, copied at
+/// `0x005C98FE`). Skirmish setup gives a human house its player's handle
+/// (`0x00688094`) and every computer house `TXT_COMPUTER`
+/// (`0x00688252..0x00688270`). A human without a recorded handle (a launch
+/// with no skirmish session) shows `fallback`.
 fn score_row_display_name(
-    owner_name: &str,
-    local_owner: &Option<String>,
-    local_handle: &Option<String>,
-    country_name: Option<&str>,
+    is_human: bool,
+    handle: Option<&str>,
+    computer: &str,
+    fallback: &str,
 ) -> String {
-    let is_local = local_owner
-        .as_deref()
-        .is_some_and(|local| local.eq_ignore_ascii_case(owner_name));
-    if is_local && let Some(handle) = local_handle {
-        return handle.clone();
+    if !is_human {
+        return computer.to_string();
     }
-    // The raw house key is the last resort: it only surfaces for a house with no
-    // resolvable country at all.
-    country_name.unwrap_or(owner_name).to_string()
+    handle.unwrap_or(fallback).to_string()
+}
+
+/// A score row's colour: `HSV_To_RGB` of the house colour scheme's base HSV
+/// (`0x005C9E0C`, scheme `+0x308`, the `[Colors]` entry).
+pub(crate) fn score_row_rgb(
+    schemes: &[crate::rules::color_scheme::ColorSchemeEntry],
+    color: crate::rules::house_colors::HouseColorIndex,
+) -> [u8; 3] {
+    crate::rules::color_scheme::scheme_hsv_by_entry(schemes, usize::from(color.0))
+        .map_or([0xFF; 3], crate::rules::color_scheme::hsv_to_rgb)
+}
+
+/// What names and colours the score rows.
+struct ScoreRowSources<'a> {
+    handle: Option<&'a str>,
+    computer: &'a str,
+    schemes: &'a [crate::rules::color_scheme::ColorSchemeEntry],
+    colors: &'a crate::map::houses::HouseColorMap,
+}
+
+/// The dialog's rows from the sim's snapshot, in its order (`0x005C9D7A`).
+fn resolve_score_rows(
+    sim: &crate::sim::world::Simulation,
+    snapshot: &crate::sim::score::TerminalScoreSnapshot,
+    sources: &ScoreRowSources<'_>,
+    country_name: impl Fn(crate::sim::intern::InternedId) -> Option<String>,
+) -> Vec<crate::ui::score_shell::ScoreRow> {
+    let mut rows: Vec<_> = snapshot
+        .rows
+        .iter()
+        .map(|raw| {
+            let owner_name = sim.interner.resolve(raw.owner).to_string();
+            let is_human = sim
+                .houses
+                .get(&raw.owner)
+                .is_some_and(|house| house.is_human);
+            let fallback = raw.country.and_then(&country_name);
+            let color = sources
+                .colors
+                .get(&owner_name)
+                .copied()
+                .unwrap_or(crate::rules::house_colors::NO_REMAP);
+            crate::ui::score_shell::ScoreRow {
+                name: score_row_display_name(
+                    is_human,
+                    sources.handle,
+                    sources.computer,
+                    fallback.as_deref().unwrap_or(&owner_name),
+                ),
+                rgb: score_row_rgb(sources.schemes, color),
+                kills: raw.kills,
+                losses: raw.losses,
+                built: raw.built,
+                score: raw.score,
+            }
+        })
+        .collect();
+    crate::ui::score_shell::sort_rows(&mut rows);
+    rows
 }
 
 /// Resolve the end-of-match score presentation from a sim-owned raw snapshot.
 ///
 /// Simulation owns contender admission, raw statistics, displayed-score bonus
-/// calculation, and its Scenario RNG draws. This app helper only resolves names,
-/// colours, elapsed wall time, and display order. The existing Rust bonus formula
-/// and contender admission rules are preserved, while sim now uses its canonical
-/// house registration order. Exact native score-dialog traversal remains UNCHECKED.
+/// calculation, and its Scenario RNG draws. This app helper resolves names,
+/// colours, the local side, elapsed wall time, and display order. Exact native
+/// score-dialog traversal remains UNCHECKED.
 fn build_score_screen_model(
     state: &AppState,
     elapsed_seconds: i32,
 ) -> crate::ui::score_shell::ScoreScreenModel {
-    use crate::ui::score_shell::{ScoreRow, ScoreScreenModel};
+    use crate::ui::score_shell::ScoreScreenModel;
 
-    let local_owner = crate::app::input::commands::preferred_local_owner_name(state);
-    // Use the launch handle while it is still available. Current map handoff
-    // clears LoadingSession instead of pinning the handle for the match, so the
-    // ordinary fallback remains a recorded presentation residual.
-    let local_handle = crate::app::loading::pump::launch_player_name(state);
     let Some(sim) = state
         .match_state
         .sim_runtime
@@ -222,14 +271,24 @@ fn build_score_screen_model(
     else {
         return ScoreScreenModel::default();
     };
-    let Some(raw_snapshot) = sim.terminal_score_snapshot().cloned() else {
+    let Some(raw_snapshot) = sim.terminal_score_snapshot() else {
         log::error!("Natural match exit reached the score screen without a sim snapshot");
         return ScoreScreenModel::default();
     };
-    let mut rows: Vec<ScoreRow> = Vec::with_capacity(raw_snapshot.rows.len());
-    for raw in raw_snapshot.rows {
-        let owner_name = sim.interner.resolve(raw.owner).to_string();
-        let country_name = raw.country.and_then(|country| {
+    let computer = crate::app::frontend::shell_pass::resolve_csf(state, "TXT_COMPUTER");
+    let presentation = &state.match_state.match_presentation;
+    let rows = resolve_score_rows(
+        sim,
+        raw_snapshot,
+        &ScoreRowSources {
+            handle: presentation.local_player_handle.as_deref(),
+            computer: &computer,
+            schemes: state
+                .rules()
+                .map_or(&[][..], |rules| rules.color_schemes.as_slice()),
+            colors: &presentation.house_color_map,
+        },
+        |country| {
             let country = sim.interner.resolve(country);
             let (ui_key, plain) = state
                 .rules()
@@ -240,41 +299,15 @@ fn build_score_screen_model(
                 .map(|(key, csf)| csf.text(key).into_owned())
                 .filter(|text| Some(text.as_str()) != ui_key);
             localized.or_else(|| plain.map(str::to_string))
-        });
-        let display_name = score_row_display_name(
-            &owner_name,
-            &local_owner,
-            &local_handle,
-            country_name.as_deref(),
-        );
-        let color_index = state
-            .match_state
-            .match_presentation
-            .house_color_map
-            .get(&owner_name)
-            .copied()
-            .unwrap_or(crate::rules::house_colors::NO_REMAP);
-        // Shade 0 is the brightest band of the scheme ramp — the same colour
-        // the radar draws this house's dots with.
-        let rgb = state
-            .rules()
-            .map(|rules| {
-                let color = rules.house_color_ramps.ramp(color_index)[0];
-                [color.r, color.g, color.b]
-            })
-            .unwrap_or([0xFF, 0xFF, 0xFF]);
-        rows.push(ScoreRow {
-            name: display_name,
-            rgb,
-            kills: raw.kills,
-            losses: raw.losses,
-            built: raw.built,
-            score: raw.score,
-        });
-    }
-    // Highest score first. A stable sort keeps ties in house order, so the table
-    // is reproducible across peers rather than depending on a sort's tie-break.
-    rows.sort_by(|a, b| b.score.cmp(&a.score));
+        },
+    );
+    // Scenario +0x34B8: the side of session player 0's country, the local
+    // player in a skirmish (0x0068779A..0x0068782D).
+    let side = crate::app::input::commands::preferred_local_owner_name(state)
+        .as_deref()
+        .and_then(|owner| sim.interner.get(owner))
+        .and_then(|owner| sim.houses.get(&owner))
+        .map_or(0, |house| house.side_index);
 
     ScoreScreenModel {
         // A stock offline skirmish takes the skirmish heading; the networked
@@ -285,6 +318,7 @@ fn build_score_screen_model(
         // model is unsigned and applies the native 99:59:59 ceiling, so keep
         // the pathological rollover representation local to this boundary.
         elapsed_seconds: elapsed_seconds as u32,
+        side,
         rows,
     }
 }
@@ -338,9 +372,10 @@ pub(crate) fn monotonic_frame_pacer_ms(state: &AppState, now: Instant) -> u64 {
 /// Pause is the explicit `GamePause::Enter @ 0x00406F00` path: suspend every
 /// event, stop the playing channels, and pause the EVA/speech stream.
 ///
-/// `match_state.paused` **is** VERA's in-game-menu state — `in_game.rs` sets
-/// it from `InGameMenuState::is_open()`, and apart from the `J` debug toggle
-/// VERA has no other pause. That is not a divergence from gamemd; it is
+/// `MatchState::paused` **is** VERA's in-game-menu state: it reads
+/// `InGameMenuState::is_open()`, and apart from the `J` debug pause and the
+/// fullscreen movie below no other pause reaches the SFX player. That is not
+/// a divergence from gamemd; it is
 /// exactly gamemd's pause. `State_Machine @ 0x0048C8B0` brackets its entire
 /// dialog switch — case 5 `OptionsClass::ShowInGameDialog`, case 8
 /// `Show_Diplomacy_Menu`, case 9 `ScenarioClass::ShowMissionRestateBriefing`
@@ -356,6 +391,13 @@ pub(crate) fn monotonic_frame_pacer_ms(state: &AppState, now: Instant) -> u64 {
 /// straight into `set_paused` is the correct behaviour — do **not** add a
 /// "menu open is not really a pause" carve-out here; that would be a
 /// regression against the binary.
+///
+/// A fullscreen movie also pauses: `Play_Movie @ 0x005BED40` pauses the EVA
+/// stream (`Audio__PauseForMovie @ 0x005BF580`, behind guard `0x00ABF35C`)
+/// and suspends the sound events (`0x00406EA0`) for the whole movie, and
+/// resumes the events after it (`0x00406EC0`). This pump is the only writer of
+/// the SFX pause, so the sources are combined here, one frame after the movie
+/// starts and ends.
 pub(crate) fn pump_audio_service(state: &mut AppState, now_ms: u64) {
     // `AudioSystem__Pump @ 0x00406F70` reaches `ThemeClass__AI @ 0x007209D0`
     // on every screen (menu, loading, in-game, pause, score, inactive window);
@@ -368,13 +410,16 @@ pub(crate) fn pump_audio_service(state: &mut AppState, now_ms: u64) {
     ) {
         state.audio.update_theme(assets, now_ms);
     }
-    let paused = state.match_state.paused;
-    let registry = &state.audio.sound_registry;
-    let audio_indices = &state.audio.audio_indices;
-    let (Some(sfx), Some(assets)) = (&mut state.audio.sfx_player, state.process_assets.manager())
-    else {
+    let paused = state.match_state.paused() || state.frontend.fullscreen_movie.is_some();
+    let (Some(sfx), Some(assets), Some(catalog)) = (
+        &mut state.audio.sfx_player,
+        state.process_assets.manager(),
+        state.process_assets.audio_catalog(),
+    ) else {
         return;
     };
+    let registry = catalog.sounds();
+    let audio_indices = catalog.index();
     sfx.set_paused(paused, now_ms);
     sfx.pump(now_ms, registry, assets, audio_indices);
 }
@@ -386,6 +431,13 @@ pub(crate) fn pump_audio_service(state: &mut AppState, now_ms: u64) {
 /// uninitialized mode the pump treats conservatively as non-advancing. This type
 /// is read ONLY by the app loop, never by `sim/` (the layering rule).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "VERA launches only offline skirmish (`current_session_mode`); the other game modes gamemd writes are kept for the modal pump and command bar"
+    )
+)]
 pub enum SessionMode {
     /// Campaign / single-player. The modal pump freezes the world.
     Campaign,
@@ -403,6 +455,7 @@ pub enum SessionMode {
 impl SessionMode {
     /// Map gamemd's raw `g_GameMode` int to a session mode. Writer-proofed:
     /// 0=Campaign, 3=Lan, 4=Wol, 5=Skirmish; every other value is `Other`.
+    #[cfg(test)]
     pub fn from_game_mode(raw: i32) -> Self {
         match raw {
             0 => SessionMode::Campaign,
@@ -666,7 +719,7 @@ fn advance_in_game_runtime_mode(
         window_active: state.platform.window_active,
         startup_admitted,
         frame_stepping,
-        paused: state.match_state.paused,
+        paused: state.match_state.paused(),
         menu_open: state.match_state.match_presentation.in_game_menu.is_open(),
         session_mode: current_session_mode(state),
         pacer_timing_admits,
@@ -680,13 +733,6 @@ fn advance_in_game_runtime_mode(
 
     if decision.run_sim {
         let tick_lane = decision.tick_lane;
-        let garrison_flash_start_tick = state
-            .match_state
-            .sim_runtime
-            .as_ref()
-            .map(|rt| &rt.simulation)
-            .map(|sim| sim.session.tick)
-            .unwrap_or(0);
         let frame_committed = advance_one_simulation_frame(state, tick_lane);
         crate::app::presentation::sidebar_render::advance_sidebar_credits_after_frame(
             state,
@@ -699,28 +745,10 @@ fn advance_in_game_runtime_mode(
             };
             state.platform.frame_pacer.record_admitted_frame(now_ms);
         }
-        let garrison_flash_elapsed_ticks = state
-            .match_state
-            .sim_runtime
-            .as_ref()
-            .map(|rt| &rt.simulation)
-            .map(|sim| sim.session.tick.saturating_sub(garrison_flash_start_tick))
-            .unwrap_or(0);
         // Building one-shots, refinery particles, and their logic-frame clocks
         // were finalized inside the authoritative sim transaction. Only the
         // independent wall-clock terrain-overlay timer remains app-owned.
         crate::app::presentation::building_anim::tick_terrain_overlay_animations(state, 16);
-        // Looping slot animations are phased off the logic frame their building
-        // was placed, so the base has to be recorded on a sim frame boundary
-        // rather than on a render frame.
-        crate::app::presentation::building_anim::refresh_building_anim_phase_bases(state);
-        crate::app::presentation::building_anim::tick_garrison_muzzle_flashes(
-            state,
-            garrison_flash_elapsed_ticks.saturating_mul(u64::from(SIM_TICK_MS)) as u32,
-        );
-        finish_fire_effect_batch(&mut state.match_state.match_presentation.pending_fire_effects);
-        crate::app::presentation::fire_effects::tick_weapon_muzzle_flashes(state, 16);
-        crate::app::presentation::chute_anim::tick_parachute_anims(state);
     }
 
     // Ordered native source/global operations were applied with the frame
@@ -789,6 +817,7 @@ fn advance_one_simulation_frame(state: &mut AppState, tick_lane: TickLane) -> bo
         if state.match_state.match_diagnostics.replay_log.is_none() {
             let sim = &rt.simulation;
             state.match_state.match_diagnostics.replay_log = Some(ReplayLog::new(ReplayHeader {
+                pixel_conversion_bounds: sim.session.pixel_conversion_bounds,
                 version: 1,
                 tick_hz: SIM_TICK_HZ,
                 seed: sim.session.seed,
@@ -799,8 +828,6 @@ fn advance_one_simulation_frame(state: &mut AppState, tick_lane: TickLane) -> bo
             }));
         }
     }
-
-    begin_fire_effect_batch(&mut state.match_state.match_presentation.pending_fire_effects);
 
     for _ in 0..1 {
         // Compute local owner before mutable borrow of simulation.
@@ -835,7 +862,7 @@ fn advance_one_simulation_frame(state: &mut AppState, tick_lane: TickLane) -> bo
                 overlay_removals,
                 sound_events: frame_sound_events,
                 fire_events: frame_fire_events,
-                invulnerability_impacts,
+                combat_lights,
                 lighting_events,
             } = rt
                 .advance_frame(&due_commands, SIM_TICK_MS, tick_lane)
@@ -855,8 +882,8 @@ fn advance_one_simulation_frame(state: &mut AppState, tick_lane: TickLane) -> bo
             frame_committed = tick_result.frame_committed;
             if tick_result.frame_committed {
                 drained_combat_lights =
-                    crate::app::presentation::combat_lights::materialize_simulation_impacts(
-                        invulnerability_impacts,
+                    crate::app::presentation::combat_lights::materialize_combat_lights(
+                        combat_lights,
                         Some(&resources.rules),
                         &sim.interner,
                     );
@@ -884,12 +911,18 @@ fn advance_one_simulation_frame(state: &mut AppState, tick_lane: TickLane) -> bo
                 }
                 sim.prepare_fog_view_for(owner);
             }
-            // Drain fire events for render-side muzzle flash / projectile origin.
+            // Fire events position the weapon report sounds.
             drained_fire_events = frame_fire_events;
-            append_fire_effect_batch(
-                &mut state.match_state.match_presentation.pending_fire_effects,
-                &drained_fire_events,
-            );
+            // The radar event array is the local client's (RadarClass). A
+            // match without a minimap renderer has no such client, so nothing
+            // is admitted and the radar-gated EVA lines stay silent.
+            let radar_frame = sim.session.tick;
+            let minimap = &mut state.match_state.match_presentation.minimap;
+            let mut admit_radar = |request: crate::sim::radar::RadarEventRequest| {
+                minimap.as_mut().is_some_and(|minimap| {
+                    minimap.admit_radar_event(request, radar_frame, Some(&resources.rules))
+                })
+            };
             super::sound_dispatch::dispatch_sim_sound_events(
                 frame_sound_events,
                 sim,
@@ -900,6 +933,7 @@ fn advance_one_simulation_frame(state: &mut AppState, tick_lane: TickLane) -> bo
                     .sfx_player
                     .as_mut()
                     .map(|player| player as &mut dyn super::sound_dispatch::SoundEventRandom),
+                &mut admit_radar,
                 &mut state.match_state.match_audio.sound_events,
             );
             if tick_result.destroyed_structure {
@@ -940,18 +974,25 @@ fn advance_one_simulation_frame(state: &mut AppState, tick_lane: TickLane) -> bo
         // direct attachment or retained audio handle.
         for output in drained_lifecycle_outputs {
             match output {
-                LifecycleOutput::DetachAttachedAnims { stable_id } => {
-                    state
-                        .match_state
-                        .match_presentation
-                        .garrison_muzzle_flashes
-                        .retain(|flash| flash.building_id != stable_id);
-                    state
-                        .match_state
-                        .match_presentation
-                        .parachute_anims
-                        .retain(|anim| anim.target_id != stable_id);
+                LifecycleOutput::LineTrailConstructed { stable_id, style } => {
+                    let presentation = &mut state.match_state.match_presentation;
+                    presentation.line_trails.attach(
+                        stable_id,
+                        style.color,
+                        style.decrement,
+                        presentation.in_game_options.detail_level as i32,
+                    );
                 }
+                LifecycleOutput::LineTrailDetached { stable_id } => {
+                    state
+                        .match_state
+                        .match_presentation
+                        .line_trails
+                        .detach(stable_id);
+                }
+                // Attached anims are simulation objects; the store detaches
+                // them itself.
+                LifecycleOutput::DetachAttachedAnims { .. } => {}
                 LifecycleOutput::StopVoc { stable_id } => {
                     if let Some(sfx) = state.audio.sfx_player.as_mut() {
                         sfx.stop_animation_sound(stable_id);
@@ -966,7 +1007,7 @@ fn advance_one_simulation_frame(state: &mut AppState, tick_lane: TickLane) -> bo
                 | LifecycleOutput::ClearRedraw { .. } => {}
             }
         }
-        crate::app::presentation::fire_effects::spawn_non_garrison_fire_effects(
+        crate::app::presentation::fire_effects::queue_weapon_report_sounds(
             state,
             &drained_fire_events,
         );
@@ -1026,18 +1067,6 @@ fn refresh_cell_lighting(state: &mut AppState) {
         &runtime.resources.rules,
         presentation.in_game_options.detail_level,
     );
-}
-
-fn begin_fire_effect_batch(pending: &mut Vec<SimFireEvent>) {
-    pending.clear();
-}
-
-fn append_fire_effect_batch(pending: &mut Vec<SimFireEvent>, events: &[SimFireEvent]) {
-    pending.extend(events.iter().cloned());
-}
-
-fn finish_fire_effect_batch(pending: &mut Vec<SimFireEvent>) {
-    pending.clear();
 }
 
 fn apply_trigger_effects(state: &mut AppState, effects: &[TriggerEffect]) {
@@ -1139,17 +1168,17 @@ pub(crate) fn update_building_placement_preview(state: &mut AppState) {
             type_id,
             rx,
             ry,
-            sim.path_grid(),
-            &state.height_map(),
             state.overlay_registry(),
         );
 }
 
-/// Refresh entity atlases after new entities are spawned.
+/// Refresh entity atlases after entities spawn, die, change owner or leave the
+/// display.
 ///
-/// Uses an incremental approach: first checks if the existing atlases already
-/// contain all needed sprite keys. If so, skips the expensive rebuild entirely.
-/// Only performs a full rebuild when genuinely new sprite types appear.
+/// This runs on every such event, so the check is per object model, never per
+/// sprite key: a refresh happens only when a voxel model or an object (type,
+/// house colour) appears that the atlas has not collected. The refresh then
+/// renders only those sprites and appends them to a growth page.
 /// Reuses the process asset manager instead of creating a new one (avoids re-opening
 /// all MIX archives from disk).
 pub(crate) fn refresh_entity_atlases(state: &mut AppState) {
@@ -1163,50 +1192,29 @@ pub(crate) fn refresh_entity_atlases(state: &mut AppState) {
         return;
     };
 
-    // Check if unit atlas needs rebuilding (new voxel entity types appeared).
-    let unit_needed = unit_atlas::collect_needed_unit_keys(
+    // Check if the unit atlas lacks a voxel model the world now draws.
+    let unit_rebuild = !unit_atlas::atlas_covers_world(
+        state.match_state.match_presentation.unit_atlas.as_ref(),
         sim.entities(),
-        asset_manager,
         bound_rules,
-        bound_rules.map(|rules| &rules.art_registry),
         Some(&sim.interner),
     );
-    let unit_rebuild: bool = match &state.match_state.match_presentation.unit_atlas {
-        Some(atlas) => !atlas.has_all_keys(&unit_needed),
-        None => !unit_needed.is_empty(),
-    };
 
-    // Check if sprite atlas needs rebuilding (new SHP entity types appeared).
-    let extra_buildings: Vec<&str> = crate::app::frontend::skirmish::deployable_building_types(
-        sim.entities(),
-        bound_rules,
-        Some(&sim.interner),
-    );
-    let sprite_base_keys = sprite_atlas::collect_needed_base_keys(
+    // Check if the sprite atlas lacks an object (type, house colour), an
+    // AnimClass colour remap or the harvest overlay the world now draws.
+    let extra_buildings: Vec<&str> =
+        crate::app::frontend::skirmish::deployable_building_types(bound_rules);
+    let anim_remap_keys = sprite_atlas::collect_anim_remap_base_keys(sim);
+    let sprite_rebuild = !sprite_atlas::atlas_covers_world(
+        state.match_state.match_presentation.sprite_atlas.as_ref(),
         sim.entities(),
         &state.match_state.match_presentation.house_color_map,
         &extra_buildings,
+        &anim_remap_keys,
         Some(&sim.interner),
     );
-    let anim_remap_keys = sprite_atlas::collect_anim_remap_base_keys(sim);
-    let sprite_rebuild: bool = match &state.match_state.match_presentation.sprite_atlas {
-        Some(atlas) => {
-            !sprite_atlas::atlas_covers_base_keys(
-                atlas,
-                &sprite_base_keys,
-                sprite_atlas::ShpPaletteContext::Legacy,
-            ) || !sprite_atlas::atlas_covers_base_keys(
-                atlas,
-                &anim_remap_keys,
-                sprite_atlas::ShpPaletteContext::SelectedScheme,
-            )
-        }
-        None => !sprite_base_keys.is_empty() || !anim_remap_keys.is_empty(),
-    };
 
-    // Early out: no new sprite types → skip the expensive atlas rebuild.
     if !unit_rebuild && !sprite_rebuild {
-        log::debug!("Atlas refresh: no new sprite types — skipping rebuild");
         return;
     }
 
@@ -1220,17 +1228,16 @@ pub(crate) fn refresh_entity_atlases(state: &mut AppState) {
     };
 
     if unit_rebuild {
-        log::info!("Rebuilding unit atlas: new voxel entity types detected");
+        log::info!("Refreshing the unit atlas: new voxel models");
         let existing = state.match_state.match_presentation.unit_atlas.take();
         if let Some(new_unit_atlas) = unit_atlas::build_unit_atlas(
-            &state.renderer.gpu,
+            &state.renderer.gpu.device,
+            &state.renderer.gpu.queue,
             &state.renderer.batch_renderer,
             sim.entities(),
             asset_manager,
             bound_rules,
-            bound_rules.map(|rules| &rules.art_registry),
             existing,
-            state.renderer.vxl_compute.as_mut(),
             Some(&sim.interner),
         ) {
             state.match_state.match_presentation.unit_atlas = Some(new_unit_atlas);
@@ -1238,7 +1245,7 @@ pub(crate) fn refresh_entity_atlases(state: &mut AppState) {
     }
 
     if sprite_rebuild {
-        log::warn!(">>> SPRITE ATLAS REBUILD TRIGGERED — new SHP entity types detected <<<");
+        log::info!("Refreshing the sprite atlas: new SHP object types or colour remaps");
         let existing = state.match_state.match_presentation.sprite_atlas.take();
         let cell_drawer_type_ids: HashSet<String> = sim
             .resolved_terrain
@@ -1252,7 +1259,8 @@ pub(crate) fn refresh_entity_atlases(state: &mut AppState) {
             &state.match_state.match_presentation.theater_ext,
         );
         if let Some(new_sprite_atlas) = sprite_atlas::build_sprite_atlas(
-            &state.renderer.gpu,
+            &state.renderer.gpu.device,
+            &state.renderer.gpu.queue,
             &state.renderer.batch_renderer,
             sim.entities(),
             asset_manager,
@@ -1260,7 +1268,7 @@ pub(crate) fn refresh_entity_atlases(state: &mut AppState) {
             &state.match_state.match_presentation.theater_ext,
             &state.match_state.match_presentation.theater_name,
             bound_rules,
-            bound_rules.map(|rules| &rules.art_registry),
+            bound_rules.map(|rules| rules.art()),
             &state.match_state.match_presentation.house_color_map,
             &extra_buildings,
             &anim_remap_keys,
@@ -1382,6 +1390,18 @@ pub(crate) fn screen_point_to_world_with_camera(
     (screen.0 / zoom + camera.0, screen.1 / zoom + camera.1)
 }
 
+/// Borrow current real-cell flags for the inverse. There is no retained app
+/// bridge projection to invalidate after collapse, repair or world replacement.
+/// Native 6D674C resolves the current cell before reading 0x100/0x800; see
+/// tools/bridge_click_state_oracle/README.md.
+pub(crate) fn tactical_bridge_cells(
+    sim: &crate::sim::world::Simulation,
+) -> Option<&dyn terrain::TacticalBridgeLookup> {
+    sim.resolved_terrain
+        .as_ref()
+        .map(|terrain| terrain as &dyn terrain::TacticalBridgeLookup)
+}
+
 /// Shared owner for world-space point -> map-cell resolution in the app layer.
 ///
 /// Any app code that already has world coordinates should use this instead of
@@ -1390,9 +1410,7 @@ pub(crate) fn world_point_to_cell(
     world_x: f32,
     world_y: f32,
     height_map: &std::collections::BTreeMap<(u16, u16), u8>,
-    bridge_cells: Option<
-        &std::collections::BTreeMap<(u16, u16), crate::map::terrain::TacticalBridgeCell>,
-    >,
+    bridge_cells: Option<&dyn terrain::TacticalBridgeLookup>,
 ) -> (u16, u16) {
     let inverse = terrain::screen_to_cell_tactical_inverse(
         world_x,
@@ -1430,12 +1448,9 @@ pub(crate) fn screen_point_to_world_cell(
         world_x,
         world_y,
         &state.height_map(),
-        Some(
-            &state
-                .match_state
-                .match_presentation
-                .tactical_bridge_inverse_map,
-        ),
+        state.sim_view().and_then(|view| {
+            crate::app::match_runtime::sim_tick::tactical_bridge_cells(view.simulation())
+        }),
     )
 }
 
@@ -1476,24 +1491,17 @@ pub(crate) fn rules_hash(rules: &crate::rules::ruleset::RuleSet) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExactStepError, ExactStepReceipt, append_fire_effect_batch, begin_fire_effect_batch,
-        finish_fire_effect_batch, upsert_overlay_entries, validate_exact_step_receipt,
+        ExactStepError, ExactStepReceipt, upsert_overlay_entries, validate_exact_step_receipt,
         world_point_to_cell,
     };
-    use crate::map::entities::EntityCategory;
     use crate::map::overlay::OverlayEntry;
     use crate::map::resolved_terrain::{ResolvedTerrainCell, ResolvedTerrainGrid, zone_class};
     use crate::rules::locomotor_type::SpeedType;
     use crate::rules::terrain_rules::{LandType, SpeedCostProfile, TerrainClass};
-    use crate::sim::combat::TargetKind;
-    use crate::sim::combat::combat_weapon::WeaponSlot;
-    use crate::sim::intern::{InternedId, StringInterner, test_intern};
+    use crate::sim::intern::StringInterner;
     use crate::sim::terrain_object::{
-        TerrainObjectLifecycle, TerrainObjectState, mark_terrain_occupation,
-        unmark_terrain_occupation,
+        TerrainObjectState, mark_terrain_occupation, unmark_terrain_occupation,
     };
-    use crate::sim::world::{FireOriginSnapshot, SimFireEvent};
-    use crate::util::fixed_math::SimFixed;
     use std::collections::BTreeMap;
 
     fn entry(rx: u16, ry: u16, overlay_id: u8, frame: u8) -> OverlayEntry {
@@ -1525,75 +1533,27 @@ mod tests {
             1,
             1,
             vec![ResolvedTerrainCell {
-                rx: 0,
-                ry: 0,
-                source_tile_index: 0,
-                source_sub_tile: 0,
-                final_tile_index: 0,
-                final_sub_tile: 0,
-                is_wood_bridge_repair_tile: false,
-                level: 0,
-                filled_clear: false,
                 tileset_index: None,
                 land_type: LandType::Clear.as_index(),
                 yr_cell_land_type: LandType::Clear.as_index(),
-                slope_type: 0,
-                template_height: 0,
-                render_offset_x: 0,
-                render_offset_y: 0,
-                terrain_class: TerrainClass::Clear,
                 speed_costs,
-                is_water: false,
-                is_cliff_like: false,
-                is_rough: false,
-                is_road: false,
-                accepts_smudge: false,
-                allows_tiberium: false,
-                height_in_pixels: 0,
-                variant: 0,
-                has_ramp: false,
-                canonical_ramp: None,
-                ground_walk_blocked: false,
-                terrain_object_blocks: false,
-                terrain_object_occupation: None,
-                overlay_blocks: false,
-                overlay_zone_type: None,
-                outside_playfield: false,
                 zone_type: zone_class::GROUND,
-                base_ground_walk_blocked: false,
-                base_build_blocked: false,
                 base_land_type: LandType::Clear.as_index(),
                 base_yr_cell_land_type: LandType::Clear.as_index(),
                 base_terrain_class: TerrainClass::Clear,
                 base_speed_costs: speed_costs,
-                build_blocked: false,
-                has_bridge_deck: false,
-                bridge_walkable: false,
-                bridge_transition: false,
-                bridge_deck_level: 0,
-                bridge_layer: None,
-                bridge_facts: crate::map::bridge_facts::BridgeCellFacts::default(),
-                tube_index: None,
-                radar_left: [0; 3],
-                radar_right: [0; 3],
-                has_damaged_data: false,
-                bridgehead_anchor_class_at_load: None,
+                ..crate::map::resolved_terrain::test_flat_cell(0, 0)
             }],
         );
         let mut sim = crate::sim::world::Simulation::new();
         sim.resolved_terrain = Some(terrain);
         let mut interner = StringInterner::default();
-        let tree = TerrainObjectState {
-            stable_id: 1,
-            native_unique_id: None,
-            in_logic_vector: false,
-            type_ref: interner.intern("TREE01"),
-            rx: 0,
-            ry: 0,
-            health: 10,
-            max_health: 10,
-            occupation_bits: 7,
-            lifecycle: TerrainObjectLifecycle::Live,
+        let tree = {
+            let mut terrain = TerrainObjectState::for_test(1, interner.intern("TREE01"), 0, 0);
+            terrain.health = 10;
+            terrain.max_health = 10;
+            terrain.occupation_bits = 7;
+            terrain
         };
         {
             let (production, resolved) = (&mut sim.production, &mut sim.resolved_terrain);
@@ -1620,56 +1580,6 @@ mod tests {
             100,
             "terrain cost authority must be rebuilt from the cleared resolved cell"
         );
-    }
-
-    fn fire_event(attacker_id: u64, occupant_anim: Option<InternedId>) -> SimFireEvent {
-        SimFireEvent {
-            attacker_id,
-            attacker_type_ref: test_intern("CABHUT"),
-            weapon_slot: WeaponSlot::Primary,
-            weapon_id: test_intern("UCWEAPON"),
-            facing: 0,
-            veterancy: 0,
-            origin_snapshot: FireOriginSnapshot {
-                rx: 10,
-                ry: 20,
-                sub_x: SimFixed::ZERO,
-                sub_y: SimFixed::ZERO,
-                z: 0,
-                facing: 0,
-                category: EntityCategory::Structure,
-                burst_index: 0,
-            },
-            target: TargetKind::Cell(12, 20),
-            report_sound_id: None,
-            garrison_muzzle_index: occupant_anim.map(|_| 0),
-            occupant_anim,
-        }
-    }
-
-    #[test]
-    fn fire_effect_batch_accumulates_fixed_tick_events_until_finish() {
-        let mut pending = vec![fire_event(99, Some(test_intern("STALE")))];
-        begin_fire_effect_batch(&mut pending);
-        assert!(pending.is_empty());
-
-        append_fire_effect_batch(&mut pending, &[fire_event(1, Some(test_intern("UCFLASH")))]);
-        append_fire_effect_batch(
-            &mut pending,
-            &[
-                fire_event(2, Some(test_intern("UCCONS"))),
-                fire_event(3, None),
-            ],
-        );
-
-        let attacker_ids: Vec<u64> = pending.iter().map(|ev| ev.attacker_id).collect();
-        assert_eq!(attacker_ids, vec![1, 2, 3]);
-        assert_eq!(pending[0].occupant_anim, Some(test_intern("UCFLASH")));
-        assert_eq!(pending[1].occupant_anim, Some(test_intern("UCCONS")));
-        assert_eq!(pending[2].occupant_anim, None);
-
-        finish_fire_effect_batch(&mut pending);
-        assert!(pending.is_empty());
     }
 
     #[test]
@@ -1779,7 +1689,7 @@ mod tests {
     }
 
     #[test]
-    fn world_point_to_cell_forwards_tactical_bridge_inverse_map() {
+    fn world_point_to_cell_forwards_bridge_lookup() {
         let (world_x, world_y) = (150.0, 180.0);
         let height_map = BTreeMap::new();
         let bridge_cells = BTreeMap::from([(
@@ -1826,8 +1736,8 @@ mod tests {
 #[cfg(test)]
 mod modal_pump_tests {
     use super::{
-        SessionMode, modal_pump_should_advance_sim, score_row_display_name,
-        should_record_replay_tick, wall_clock_service_admission,
+        ScoreRowSources, SessionMode, modal_pump_should_advance_sim, resolve_score_rows,
+        score_row_rgb, should_record_replay_tick, wall_clock_service_admission,
     };
 
     #[test]
@@ -2027,7 +1937,6 @@ mod modal_pump_tests {
     #[test]
     fn pumped_world_tick_freezes_offline_and_advances_on_network() {
         use crate::sim::world::Simulation;
-        use std::collections::BTreeMap;
 
         // C2 acceptance with a real headless World: drive `advance_tick` exactly
         // when the pump decision is true, and assert `session.tick` motion.
@@ -2036,12 +1945,11 @@ mod modal_pump_tests {
         let pumped_world_delta = |mode: SessionMode| -> u64 {
             let mut sim = Simulation::new();
             let start = sim.session.tick;
-            let height_map: BTreeMap<(u16, u16), u8> = BTreeMap::new();
             for _ in 0..FRAMES {
                 if modal_pump_should_advance_sim(mode, false, false) {
                     // `tick_ms` does not affect the asserted tick delta; a literal
                     // matches the sim-test style and avoids the const dependency.
-                    sim.advance_tick(&[], None, &height_map, None, None, 33);
+                    sim.advance_tick(&[], None, None, None, 33);
                 }
             }
             sim.session.tick - start
@@ -2057,62 +1965,98 @@ mod modal_pump_tests {
     }
 
     #[test]
-    fn score_rows_never_show_the_raw_house_key() {
-        let local = Some("Americans".to_string());
-        let handle = Some("Commander".to_string());
-        // Local player: the handle they launched under.
-        assert_eq!(
-            score_row_display_name("Americans", &local, &handle, Some("Americans!")),
-            "Commander"
-        );
-        // Owner-key match is case-insensitive, as elsewhere in the owner paths.
-        assert_eq!(
-            score_row_display_name("AMERICANS", &local, &handle, Some("Americans!")),
-            "Commander"
-        );
-        // Every other house shows its country's display name. Two computer
-        // opponents of different countries read differently, as they do natively.
-        assert_eq!(
-            score_row_display_name("Russians", &local, &handle, Some("Russia")),
-            "Russia"
-        );
-        assert_eq!(
-            score_row_display_name("Africans", &local, &handle, Some("Libya")),
-            "Libya"
-        );
-    }
-
-    #[test]
-    fn current_house_collision_score_label_uses_the_separate_handle() {
-        let local_owner = Some("Player".to_string());
-        for handle in ["Neutral", "SPECIAL", "computer1"] {
-            let local_handle = Some(handle.to_string());
-            assert_eq!(
-                score_row_display_name("Player", &local_owner, &local_handle, Some("America")),
-                handle,
+    fn retail_score_row_colours_match_the_retail_still() {
+        // Retail still at 800x600: the Easy AI (DarkRed) and the local player
+        // (DarkBlue, Color=2) rows, in RGB565 units.
+        let Some(rules) = crate::rules::retail_ini_fixture::retail_ini("rulesmd.ini") else {
+            return;
+        };
+        let schemes = crate::rules::color_scheme::parse_color_schemes(&rules);
+        for (name, units) in [("DarkRed", [31, 6, 3]), ("DarkBlue", [4, 26, 26])] {
+            let entry = crate::rules::color_scheme::scheme_entry_by_name(&schemes, name)
+                .unwrap_or_else(|| panic!("[Colors] {name}"));
+            let rgb = score_row_rgb(
+                &schemes,
+                crate::rules::house_colors::HouseColorIndex(entry as u8),
             );
-            assert_eq!(
-                score_row_display_name("Computer1", &local_owner, &local_handle, Some("Russia")),
-                "Russia",
-            );
+            assert_eq!([rgb[0] >> 3, rgb[1] >> 2, rgb[2] >> 3], units, "{name}");
         }
     }
 
     #[test]
-    fn score_row_name_falls_back_when_no_launch_handle_was_recorded() {
-        // Outside a skirmish launch there is no handle, so even the local row
-        // takes the country name.
-        assert_eq!(
-            score_row_display_name("Americans", &None, &None, Some("America")),
-            "America"
+    fn score_rows_follow_the_houses_names_colours_and_the_native_order() {
+        use crate::sim::house_state::HouseState;
+        // Retail still: the local player (DarkBlue) and one Easy AI (DarkRed),
+        // both at score 0; the dialog lists "Computer" first.
+        let schemes = crate::rules::color_scheme::parse_color_schemes(
+            &crate::rules::ini_parser::IniFile::from_str(
+                "[Colors]\nDarkRed=0,230,255\nDarkBlue=153,214,212\n",
+            ),
         );
-    }
-
-    #[test]
-    fn score_row_name_uses_the_house_key_only_with_no_resolvable_country() {
-        assert_eq!(
-            score_row_display_name("Americans", &None, &None, None),
-            "Americans"
+        let mut sim = crate::sim::world::Simulation::with_seed(1);
+        let player = sim.interner.intern("Player");
+        let computer = sim.interner.intern("Computer1");
+        sim.houses
+            .insert(player, HouseState::new(player, 0, None, true, 0, 10));
+        sim.houses
+            .insert(computer, HouseState::new(computer, 1, None, false, 0, 10));
+        let row = |owner, losses| crate::sim::score::TerminalScoreRowSnapshot {
+            owner,
+            country: None,
+            survived: owner == computer,
+            kills: 0,
+            losses,
+            built: 0,
+            raw_score: 0,
+            score: 0,
+        };
+        let snapshot = crate::sim::score::TerminalScoreSnapshot {
+            rows: vec![row(player, 15), row(computer, 0)],
+        };
+        let colors = crate::map::houses::HouseColorMap::from([
+            (
+                "Player".to_string(),
+                crate::rules::house_colors::HouseColorIndex(1),
+            ),
+            (
+                "Computer1".to_string(),
+                crate::rules::house_colors::HouseColorIndex(0),
+            ),
+        ]);
+        let rows = resolve_score_rows(
+            &sim,
+            &snapshot,
+            &ScoreRowSources {
+                handle: Some("[New Player]"),
+                computer: "Computer",
+                schemes: &schemes,
+                colors: &colors,
+            },
+            |_| None,
         );
+        let shown: Vec<(&str, [u8; 3], u32)> = rows
+            .iter()
+            .map(|row| (row.name.as_str(), row.rgb, row.losses))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("Computer", [255, 25, 25], 0),
+                ("[New Player]", [34, 105, 212], 15)
+            ]
+        );
+        // Without a skirmish session a human row falls back.
+        let rows = resolve_score_rows(
+            &sim,
+            &snapshot,
+            &ScoreRowSources {
+                handle: None,
+                computer: "Computer",
+                schemes: &schemes,
+                colors: &colors,
+            },
+            |_| None,
+        );
+        assert_eq!(rows[1].name, "Player");
     }
 }

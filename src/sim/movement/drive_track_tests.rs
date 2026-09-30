@@ -1,4 +1,12 @@
-//! Tests for drive track data validation and lookup functions.
+//! Tests for drive track data validation, selection and retained projections.
+//!
+//! The retired detached executor tests are covered by the native cursor corpus
+//! in track_process_tests::retained_cursor_and_paid_samples_match_original_drive_and_ship
+//! (3,540 samples, fresh/chain selectors, all arrays, terminal budgets), its
+//! residual_scalar_and_cell_identity_gate_match_original_instructions comparison,
+//! and movement_step_tests' production-host budget and terminal regressions.
+//! Coordinate relinking, chain callbacks and occupation are exercised by
+//! track_host_tests; ground_pose_tests retain the exact-Z and snapshot routes.
 
 use super::*;
 
@@ -275,57 +283,6 @@ fn raw_track_3_is_north_to_ne_curve() {
 }
 
 #[test]
-fn track_3_begin_starts_at_entry_12() {
-    let state = begin_drive_track(3, 0, 1, -1, 0x20).unwrap();
-    assert_eq!(state.point_index, 12, "Track 3 entry_index is 12");
-}
-
-#[test]
-fn drive_track_budget_equal_seven_does_not_consume_point() {
-    let mut state = begin_drive_track_with_head_offset(1, 0, 0, 0, 0).unwrap();
-    let start_index = state.point_index;
-    let mut residual = 7;
-
-    let advance = advance_drive_track_with_budget(&mut state, 0, &mut residual);
-
-    assert_eq!(state.point_index, start_index);
-    assert_eq!(state.residual, 7);
-    assert_eq!(residual, 7);
-    assert!(!advance.finished);
-    assert!(!advance.cell_jump);
-}
-
-#[test]
-fn drive_runtime_residual_carries_across_track_ticks() {
-    let mut state = begin_drive_track_with_head_offset(1, 0, 0, 0, 0).unwrap();
-    let start_index = state.point_index;
-    let mut residual = 6;
-
-    let advance = advance_drive_track_with_budget(&mut state, 2, &mut residual);
-
-    assert_eq!(state.point_index, start_index + 1);
-    assert_eq!(state.residual, 1);
-    assert_eq!(residual, 1);
-    assert!(!advance.finished);
-    assert!(!advance.cell_jump);
-}
-
-#[test]
-fn drive_track_finish_preserves_residual_for_same_tick_retry() {
-    let mut state = begin_drive_track(15, 0, 0, 0, 0xC0).unwrap();
-    let last_index = raw_track_meta(15).unwrap().points_count - 1;
-    state.point_index = last_index - 1;
-    let mut residual = 0;
-
-    let advance = advance_drive_track_with_budget(&mut state, 20, &mut residual);
-
-    assert!(advance.finished);
-    assert_eq!(state.point_index, last_index);
-    assert_eq!(state.residual, 13);
-    assert_eq!(residual, 13);
-}
-
-#[test]
 fn select_drive_track_ne_diagonal_gives_track_2() {
     // Facing NE (32), moving NE (32) → entry 9: normal_track=2 (straight diagonal).
     let sel = select_drive_track(32, 32, false);
@@ -571,74 +528,27 @@ fn build_sharp_turn_fallback_rounds_to_nearest_dir() {
 
 #[test]
 fn sharp_turn_fallback_produces_valid_track_for_all_8_dirs() {
-    // Wiring test: build_sharp_turn_fallback + dir_to_cell_delta +
-    // begin_drive_track must combine into a valid DriveTrackState for
-    // every quantized current_facing. This is what the
-    // configure_motion_after_transition fallback branch does.
     use crate::util::fixed_math::dir_to_cell_delta;
     for facing in [0u8, 32, 64, 96, 128, 160, 192, 224] {
-        let fb = build_sharp_turn_fallback(facing)
-            .unwrap_or_else(|| panic!("fallback should exist for facing {}", facing));
-        let (cdx, cdy) = dir_to_cell_delta(facing);
-        let state = begin_drive_track(fb.raw_track_index, fb.flags, cdx, cdy, fb.target_facing);
-        assert!(
-            state.is_some(),
-            "fallback track should initialize for facing {}",
-            facing
-        );
-        let state = state.unwrap();
-        assert_eq!(
-            state.target_facing, fb.target_facing,
-            "DriveTrackState.target_facing should match selection's target_facing for facing {}",
-            facing
-        );
-        // head_offset = head_d * 256 + 128 — verify deltas were applied.
-        assert_eq!(
-            state.head_offset_x,
-            cdx * 256 + 128,
-            "head_offset_x for facing {}",
-            facing
-        );
-        assert_eq!(
-            state.head_offset_y,
-            cdy * 256 + 128,
-            "head_offset_y for facing {}",
-            facing
-        );
+        let fallback = build_sharp_turn_fallback(facing).unwrap();
+        let delta = dir_to_cell_delta(facing);
+        let plan = expect_plan(facing, delta, None);
+        assert_eq!(plan.selection.raw_track_index, fallback.raw_track_index);
+        assert_eq!(plan.selection.flags, fallback.flags);
+        assert_eq!(plan.selection.target_facing, fallback.target_facing);
+        let position = crate::sim::components::Position {
+            rx: 10,
+            ry: 10,
+            z: 0,
+            exact_z_leptons: Some(731),
+            sub_x: crate::util::fixed_math::SimFixed::from_num(85),
+            sub_y: crate::util::fixed_math::SimFixed::from_num(153),
+        };
+        let head = super::super::track_head::begin_fresh(&plan, &position).unwrap();
+        assert_eq!(head.x, 10 * 256 + 85 + delta.0 * 256);
+        assert_eq!(head.y, 10 * 256 + 153 + delta.1 * 256);
+        assert_eq!(head.z, 731);
     }
-}
-
-// ---------------------------------------------------------------------------
-// begin_drive_track tests
-// ---------------------------------------------------------------------------
-
-#[test]
-fn begin_drive_track_1_starts_at_entry() {
-    let state = begin_drive_track(1, 0, 0, 0, 0);
-    assert!(state.is_some(), "Track 1 should be startable");
-    let state = state.unwrap();
-    assert_eq!(state.raw_track_index, 1);
-    assert_eq!(state.point_index, 0, "Track 1 entry_index is 0");
-}
-
-#[test]
-fn begin_drive_track_0_returns_none() {
-    // Track 0 is the null track (no points).
-    let state = begin_drive_track(0, 0, 0, 0, 0);
-    assert!(state.is_none(), "Track 0 (null) should not be startable");
-}
-
-#[test]
-fn begin_drive_track_missing_data_returns_none() {
-    // Out-of-range track index (only 0-15 exist) should return None.
-    let state = begin_drive_track(16, 0, 0, 0, 0);
-    assert!(state.is_none(), "Track with no metadata should return None");
-    // Track 5 now has point data and should be startable.
-    let state5 = begin_drive_track(5, 0, 1, -1, 0);
-    assert!(
-        state5.is_some(),
-        "Track 5 should be startable (has 61 points)"
-    );
 }
 
 #[test]
@@ -670,464 +580,6 @@ fn raw_track_4_is_north_to_east_90_degree() {
 }
 
 // ---------------------------------------------------------------------------
-// advance_drive_track tests
-// ---------------------------------------------------------------------------
-
-#[test]
-fn advance_drive_track_1_progresses() {
-    // Track 1 (straight north) with head_to = one cell north (dx=0, dy=-1).
-    // head_offset = (128, -128). Point 0: sub = (128, -128+245=117).
-    let mut state = begin_drive_track(1, 0, 0, -1, 0).unwrap();
-    let dt = SimFixed::lit("0.066"); // ~66ms tick (15fps)
-    let speed = SimFixed::from_num(256); // 256 leptons/sec = 1 cell/sec
-
-    // Advance one tick.
-    let result = advance_drive_track(&mut state, speed, dt);
-    // Budget = 256 * 0.066 ≈ 16, cost per step = 7, so 2 steps this tick.
-    assert!(!result.finished, "track should not be done after 1 tick");
-    assert_eq!(
-        result.facing, 0,
-        "facing should stay 0 (north) on straight track"
-    );
-    // sub_x should be 128 (center, since track x=0, head_offset_x=128).
-    assert_eq!(
-        result.sub_x.to_num::<i32>(),
-        128,
-        "sub_x should be centered"
-    );
-    // sub_y should be positive and decreasing (northward).
-    let sy = result.sub_y.to_num::<i32>();
-    assert!(sy > 0 && sy < 120, "sub_y should decrease: got {}", sy);
-}
-
-#[test]
-fn advance_drive_track_1_completes() {
-    // Track 1 (straight north) with head_to one cell north.
-    let mut state = begin_drive_track(1, 0, 0, -1, 0).unwrap();
-    let dt = SimFixed::lit("0.066");
-    let speed = SimFixed::from_num(256);
-
-    // Advance many ticks until track finishes.
-    let mut finished = false;
-    for _ in 0..100 {
-        let result = advance_drive_track(&mut state, speed, dt);
-        if result.finished {
-            finished = true;
-            // Final y point is 3 → sub_y = -128 + 3 = -125.
-            // After cell_jump offset (+256): sub_y ≈ 131.
-            let sy = result.sub_y.to_num::<i32>();
-            assert!(
-                sy > 100 && sy < 160,
-                "final sub_y should be ~131 after cell offset: got {}",
-                sy
-            );
-            break;
-        }
-    }
-    assert!(finished, "track should complete within 100 ticks");
-}
-
-#[test]
-fn advance_drive_track_1_cell_jump_fires_once() {
-    // Track 1 (straight north) with head_to one cell north.
-    // Coordinate-based detection should fire cell_jump exactly once
-    // when sub_y crosses below 0 (around step 11 where y drops below 128).
-    let mut state = begin_drive_track(1, 0, 0, -1, 0).unwrap();
-    let dt = SimFixed::lit("0.066");
-    let speed = SimFixed::from_num(256);
-
-    let mut jump_count = 0;
-    for _ in 0..100 {
-        let result = advance_drive_track(&mut state, speed, dt);
-        if result.cell_jump {
-            jump_count += 1;
-        }
-        if result.finished {
-            break;
-        }
-    }
-    assert_eq!(
-        jump_count, 1,
-        "straight north track should cross exactly one cell boundary"
-    );
-}
-
-#[test]
-fn advance_drive_track_strictly_requires_budget_above_step_cost() {
-    let mut state = begin_drive_track(15, 0, 0, 0, 0xC0).unwrap();
-    let dt = SimFixed::from_num(1);
-
-    let exact = advance_drive_track(&mut state, SimFixed::from_num(7), dt);
-    assert_eq!(state.point_index, 0);
-    assert_eq!(state.residual, 7);
-    assert_eq!(exact.facing, 0x80);
-    assert!(!exact.cell_jump);
-
-    let one_over = advance_drive_track(&mut state, SimFixed::from_num(1), dt);
-    assert_eq!(state.point_index, 1);
-    assert_eq!(state.residual, 1);
-    assert_eq!(one_over.facing, 0x84);
-}
-
-#[test]
-fn advance_drive_track_budget_14_consumes_one_point_not_two() {
-    let mut state = begin_drive_track(15, 0, 0, 0, 0xC0).unwrap();
-    let result = advance_drive_track(&mut state, SimFixed::from_num(14), SimFixed::from_num(1));
-
-    assert_eq!(state.point_index, 1);
-    assert_eq!(state.residual, 7);
-    assert_eq!(result.facing, 0x84);
-}
-
-#[test]
-fn raw_track_15_advances_without_cell_jump_or_chain() {
-    let mut state = begin_drive_track(15, 0, 0, 0, 0xC0).unwrap();
-    let mut finished = false;
-    for _ in 0..32 {
-        let result = advance_drive_track(&mut state, SimFixed::from_num(8), SimFixed::from_num(1));
-        assert!(!result.cell_jump, "Track 15 must not cross cells");
-        assert!(!result.chain_ready, "Track 15 must not chain");
-        if result.finished {
-            finished = true;
-            break;
-        }
-    }
-    assert!(finished, "Track 15 should finish within guard");
-}
-
-#[test]
-fn raw_track_15_facing_changes_only_when_point_is_consumed() {
-    let mut state = begin_drive_track(15, 0, 0, 0, 0xC0).unwrap();
-
-    let residual_only =
-        advance_drive_track(&mut state, SimFixed::from_num(6), SimFixed::from_num(1));
-    assert_eq!(state.point_index, 0);
-    assert_eq!(state.residual, 6);
-    assert_eq!(residual_only.facing, 0x80);
-    assert_ne!(residual_only.facing, 0x47);
-
-    let consumed = advance_drive_track(&mut state, SimFixed::from_num(2), SimFixed::from_num(1));
-    assert_eq!(state.point_index, 1);
-    assert_eq!(state.residual, 1);
-    assert_eq!(consumed.facing, 0x84);
-}
-
-// ---------------------------------------------------------------------------
-// interp_sub_step tests
-// ---------------------------------------------------------------------------
-
-#[test]
-fn interp_sub_step_residual_zero_returns_none() {
-    let result = interp_sub_step(
-        SimFixed::from_num(128),
-        SimFixed::from_num(128),
-        14,
-        0,
-        0,
-        true,
-    );
-    assert_eq!(result, None, "residual=0 must yield no interp");
-}
-
-#[test]
-fn interp_sub_step_no_next_step_returns_none() {
-    let result = interp_sub_step(
-        SimFixed::from_num(128),
-        SimFixed::from_num(128),
-        14,
-        0,
-        3,
-        false,
-    );
-    assert_eq!(result, None, "had_next_step=false must yield no interp");
-}
-
-#[test]
-fn interp_sub_step_fraction_at_residual_1() {
-    // delta=14, residual=1 → 14 * 1 / 7 = 2.
-    let result = interp_sub_step(
-        SimFixed::from_num(100),
-        SimFixed::from_num(100),
-        14,
-        0,
-        1,
-        true,
-    )
-    .expect("interp should apply");
-    assert_eq!(
-        result.sub_x,
-        SimFixed::from_num(102),
-        "saved 100 + 14*1/7=2 → 102"
-    );
-    assert_eq!(result.sub_y, SimFixed::from_num(100));
-}
-
-#[test]
-fn interp_sub_step_fraction_at_residual_6() {
-    // delta=14, residual=6 → 14 * 6 / 7 = 12.
-    let result = interp_sub_step(
-        SimFixed::from_num(100),
-        SimFixed::from_num(100),
-        14,
-        0,
-        6,
-        true,
-    )
-    .expect("interp should apply");
-    assert_eq!(
-        result.sub_x,
-        SimFixed::from_num(112),
-        "saved 100 + 14*6/7=12 → 112"
-    );
-}
-
-#[test]
-fn interp_sub_step_negative_delta_truncates_toward_zero() {
-    // delta=-15, residual=3 → -15 * 3 / 7 = -45 / 7 = -6 (truncated from -6.43).
-    let result = interp_sub_step(
-        SimFixed::from_num(200),
-        SimFixed::from_num(100),
-        -15,
-        0,
-        3,
-        true,
-    )
-    .expect("interp should apply");
-    assert_eq!(
-        result.sub_x,
-        SimFixed::from_num(194),
-        "saved 200 + (-15)*3/7=-6 → 194 (truncate toward zero on negative)"
-    );
-}
-
-#[test]
-fn interp_sub_step_diagonal_delta() {
-    // dx=14, dy=-7, residual=4 → dx*4/7=8, dy*4/7=-4.
-    let result = interp_sub_step(
-        SimFixed::from_num(100),
-        SimFixed::from_num(100),
-        14,
-        -7,
-        4,
-        true,
-    )
-    .expect("interp should apply");
-    assert_eq!(result.sub_x, SimFixed::from_num(108));
-    assert_eq!(result.sub_y, SimFixed::from_num(96));
-}
-
-#[test]
-fn interp_sub_step_all_residual_values_monotonic() {
-    // For positive delta, sub_x must increase monotonically with residual.
-    let mut last = SimFixed::from_num(100);
-    for r in 1..=7 {
-        let result = interp_sub_step(
-            SimFixed::from_num(100),
-            SimFixed::from_num(100),
-            14,
-            0,
-            r,
-            true,
-        )
-        .expect("interp should apply");
-        assert!(
-            result.sub_x > last,
-            "residual {} produced sub_x {:?} not greater than previous {:?}",
-            r,
-            result.sub_x,
-            last
-        );
-        last = result.sub_x;
-    }
-}
-
-#[test]
-fn interp_sub_step_lands_in_saved_cell() {
-    // saved=(100, 100), delta=(14, 0), residual=2 → interp_dx=4 → 104.
-    // floor_div(100+4, 256) = 0, floor_div(100, 256) = 0. interp_cell == saved.
-    let result = interp_sub_step(
-        SimFixed::from_num(100),
-        SimFixed::from_num(100),
-        14,
-        0,
-        2,
-        true,
-    )
-    .expect("interp should apply");
-    assert_eq!(result.sub_x, SimFixed::from_num(104));
-}
-
-#[test]
-fn interp_sub_step_lands_in_full_step_cell() {
-    // saved=(250, 100), full delta=(14, 0). residual=6 → interp_dx = 12.
-    // saved_lx + interp_dx = 262 → cell offset (1, 0).
-    // saved_lx + full_dx = 264 → cell offset (1, 0).
-    // interp_cell == full_cell, so use interp.
-    let result = interp_sub_step(
-        SimFixed::from_num(250),
-        SimFixed::from_num(100),
-        14,
-        0,
-        6,
-        true,
-    )
-    .expect("interp should apply");
-    // 250 + 14*6/7 = 250 + 12 = 262.
-    assert_eq!(result.sub_x, SimFixed::from_num(262));
-}
-
-#[test]
-fn interp_sub_step_third_cell_with_high_residual_uses_interp() {
-    // Third-cell construction: saved=(0, 0), delta=(770, 0), residual=4.
-    // interp_dx = 770*4/7 = 440. saved+interp = 440 → cell offset 1.
-    // full_dx = 770. saved+full = 770 → cell offset 3 (770 = 3*256+2).
-    // saved cell offset 0, interp 1, full 3. Third-cell case.
-    // residual=4 > 3 → use interp despite third-cell classification.
-    let result = interp_sub_step(
-        SimFixed::from_num(0),
-        SimFixed::from_num(0),
-        770,
-        0,
-        4,
-        true,
-    )
-    .expect("interp should apply");
-    // residual > 3 → use interp: 0 + 440 = 440.
-    assert_eq!(result.sub_x, SimFixed::from_num(440));
-}
-
-#[test]
-fn interp_sub_step_third_cell_with_low_residual_falls_back() {
-    // saved=(0, 0), delta=(2000, 0), residual=2.
-    // interp_dx = 2000*2/7 = 571. saved+interp = 571 → cell offset 2.
-    // full_dx = 2000. saved+full = 2000 → cell offset 7.
-    // saved 0, interp 2, full 7. Third-cell case.
-    // residual=2 ≤ 3 → fall back to full-step coords.
-    let result = interp_sub_step(
-        SimFixed::from_num(0),
-        SimFixed::from_num(0),
-        2000,
-        0,
-        2,
-        true,
-    )
-    .expect("interp should apply (fallback path)");
-    // L4 fallback: use full-step coords.
-    assert_eq!(
-        result.sub_x,
-        SimFixed::from_num(2000),
-        "low residual + third-cell interp must fall back to full-step coords"
-    );
-}
-
-#[test]
-fn interp_sub_step_residual_threshold_is_strict_greater() {
-    // residual = 3 must NOT trigger the trust window (gate is > 3, not >= 3).
-    // saved=(0, 0), delta=(2000, 0), residual=3.
-    // interp_dx = 2000*3/7 = 857. saved+interp = 857 → cell offset 3.
-    // full = 2000 → cell offset 7. Third-cell case.
-    // residual=3 NOT > 3 → fall back to full.
-    let result = interp_sub_step(
-        SimFixed::from_num(0),
-        SimFixed::from_num(0),
-        2000,
-        0,
-        3,
-        true,
-    )
-    .expect("interp should apply (fallback path)");
-    assert_eq!(
-        result.sub_x,
-        SimFixed::from_num(2000),
-        "residual=3 with third-cell interp must fall back (gate is > 3, not >= 3)"
-    );
-}
-
-#[test]
-fn interp_sub_step_residual_4_triggers_trust_window() {
-    // Same construction with residual=4 — should now USE interp.
-    // interp_dx = 2000*4/7 = 1142. saved+interp = 1142 → cell offset 4.
-    // full = 2000 → cell offset 7. Third-cell, residual=4 > 3 → trust window.
-    let result = interp_sub_step(
-        SimFixed::from_num(0),
-        SimFixed::from_num(0),
-        2000,
-        0,
-        4,
-        true,
-    )
-    .expect("interp should apply");
-    assert_eq!(
-        result.sub_x,
-        SimFixed::from_num(1142),
-        "residual=4 trust window: use interp despite third-cell"
-    );
-}
-
-#[test]
-fn end_to_end_sub_step_smoothness_no_stalls() {
-    // Pick a speed that produces less than one step's worth of budget per tick
-    // (budget ≈ 4, step cost = 7). Without interp the vehicle would visibly
-    // stall on every "no-step" tick (point_index unchanged, residual carries
-    // forward) and snap forward on "step" ticks. With interp, every tick's
-    // visual position advances because the residual contributes a fractional
-    // offset toward the next track point.
-    let mut state = begin_drive_track(1, 0, 0, -1, 0).expect("track 1 exists");
-    let dt = SimFixed::lit("0.066");
-    let speed = SimFixed::from_num(60); // 60 * 0.066 ≈ 4 leptons/tick budget
-
-    let mut prev_y: Option<SimFixed> = None;
-    let mut zero_delta_ticks: i32 = 0;
-    let mut tick_count: i32 = 0;
-
-    // 10 ticks ~ 40 budget ~ 5 steps — well below this track's first cell jump.
-    for _ in 0..10 {
-        let advance = advance_drive_track(&mut state, speed, dt);
-        if advance.finished || advance.cell_jump {
-            break;
-        }
-
-        let mut sub_y = advance.sub_y;
-        if let Some(interp) = interp_sub_step(
-            advance.sub_x,
-            advance.sub_y,
-            advance.next_step_delta_x,
-            advance.next_step_delta_y,
-            state.residual,
-            advance.had_next_step,
-        ) {
-            sub_y = interp.sub_y;
-        }
-
-        if let Some(py) = prev_y
-            && sub_y == py
-        {
-            zero_delta_ticks += 1;
-        }
-        prev_y = Some(sub_y);
-        tick_count += 1;
-    }
-
-    assert!(
-        tick_count >= 8,
-        "test setup error: only {} ticks ran before cell_jump/finished",
-        tick_count
-    );
-    // With sub-step interp wired in, every tick should advance because residual
-    // varies from one tick to the next (4 leptons added per tick into a step
-    // cost of 7 produces a non-trivial residual cycle: 3, 6, 2, 5, 1, 4, 0, ...).
-    // Zero-delta ticks happen only when residual lands at 0 after a step (no
-    // interp on that frame); allowing up to 2 covers the residual-cycle floor.
-    assert!(
-        zero_delta_ticks <= 2,
-        "{} zero-delta ticks (out of {}) indicates interp didn't fire — \
-         vehicle is stalling between steps instead of drifting smoothly",
-        zero_delta_ticks,
-        tick_count
-    );
-}
-
-// ---------------------------------------------------------------------------
 // GSI-06.13 — the path-window selection basis
 // ---------------------------------------------------------------------------
 
@@ -1136,8 +588,48 @@ const FACE_E: u8 = 0x40;
 const FACE_S: u8 = 0x80;
 const FACE_W: u8 = 0xC0;
 
+#[test]
+fn fresh_heading_gate_and_facing_setter_match_original_native_rows() {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+        "../../../tools/spatial_oracle/drive_fresh_turn.json"
+    ))
+    .unwrap();
+    assert_eq!(rows.len(), 120);
+    let mut sub_byte_refusals = 0;
+    for row in rows {
+        let input = &row["input"];
+        let initial = input["initial"].as_u64().unwrap() as u16;
+        let direction = input["direction"].as_u64().unwrap() as usize;
+        let call = &row["calls"][0];
+        let decision = plan_drive_track_from_path(initial, OCTANT_CELL_DELTA[direction], None);
+        let refused = matches!(decision, DriveTrackDecision::TurnFirst { .. });
+        assert_eq!(refused, call["boundary"] == "turn_then_return", "{input}");
+        if refused && initial >> 8 == (direction as u16) << 5 {
+            sub_byte_refusals += 1;
+        }
+        let rate = input["rate"].as_i64().unwrap();
+        if rate < 0 {
+            // A supplied raw negative Facing rate is not produced by SetROT.
+            continue;
+        }
+        let mut facing =
+            crate::sim::movement::facing_class::FacingClass::new(initial, (rate >> 8) as u8);
+        if refused {
+            facing.set((direction as u16) << 13, 2);
+        }
+        for call in row["calls"].as_array().unwrap() {
+            assert_eq!(
+                u64::from(facing.current(call["frame"].as_u64().unwrap() as u32)),
+                call["sampled_after"].as_u64().unwrap(),
+                "{input}"
+            );
+        }
+    }
+    assert_eq!(sub_byte_refusals, 10);
+}
+
 fn expect_plan(body_facing: u8, from: (i32, i32), to: Option<(i32, i32)>) -> DriveTrackPlan {
-    match plan_drive_track_from_path(body_facing, from, to, false) {
+    match plan_drive_track_from_path(u16::from(body_facing) << 8, from, to) {
         DriveTrackDecision::Select(plan) => plan,
         other => panic!("expected a curve, got {other:?}"),
     }
@@ -1211,7 +703,7 @@ fn gsi_06_13_last_step_normalises_to_the_straight_entry() {
 /// turn and returns without selecting a curve or consuming a node.
 #[test]
 fn gsi_06_13_body_off_the_head_octant_turns_before_any_selection() {
-    match plan_drive_track_from_path(FACE_W, (1, 0), Some((0, 1)), false) {
+    match plan_drive_track_from_path(u16::from(FACE_W) << 8, (1, 0), Some((0, 1))) {
         DriveTrackDecision::TurnFirst { desired_facing } => {
             assert_eq!(desired_facing, FACE_E, "turn onto the head node's octant");
         }
@@ -1219,7 +711,7 @@ fn gsi_06_13_body_off_the_head_octant_turns_before_any_selection() {
     }
     // One facing unit off is still off — the comparison has no tolerance.
     assert!(matches!(
-        plan_drive_track_from_path(FACE_E + 1, (1, 0), Some((0, 1)), false),
+        plan_drive_track_from_path((u16::from(FACE_E) << 8) + 1, (1, 0), Some((0, 1))),
         DriveTrackDecision::TurnFirst { .. }
     ));
 }
@@ -1269,17 +761,24 @@ fn gsi_06_13_turns_flag_and_head_span_agree_across_all_direction_pairs() {
 #[test]
 fn gsi_06_13_selected_curve_starts_at_the_movers_own_cell_centre() {
     let plan = expect_plan(FACE_E, (1, 0), Some((0, 1)));
-    let state = begin_selected_drive_track(&plan).expect("curve installed");
-    assert_eq!(state.point_index, 0, "fresh selection starts at cursor 0");
-    let points = raw_track_points(state.raw_track_index);
+    let position = crate::sim::components::Position {
+        rx: 0,
+        ry: 0,
+        z: 0,
+        exact_z_leptons: None,
+        sub_x: crate::util::lepton::CELL_CENTER_LEPTON,
+        sub_y: crate::util::lepton::CELL_CENTER_LEPTON,
+    };
+    let head = super::super::track_head::begin_fresh(&plan, &position).unwrap();
+    let points = raw_track_points(plan.selection.raw_track_index);
     let (tx, ty, tf) = transform_track_point(
         points[0].x,
         points[0].y,
         points[0].facing,
-        state.transform_flags,
+        plan.selection.flags,
     );
-    let sub_x = state.head_offset_x + i32::from(tx);
-    let sub_y = state.head_offset_y + i32::from(ty);
+    let sub_x = head.x + i32::from(tx);
+    let sub_y = head.y + i32::from(ty);
     assert!(
         (0..256).contains(&sub_x) && (0..256).contains(&sub_y),
         "curve point 0 must sit in the mover's own cell, got ({sub_x},{sub_y})"
@@ -1291,12 +790,12 @@ fn gsi_06_13_selected_curve_starts_at_the_movers_own_cell_centre() {
         points[last].x,
         points[last].y,
         points[last].facing,
-        state.transform_flags,
+        plan.selection.flags,
     );
     assert_eq!(
         (
-            (state.head_offset_x + i32::from(lx)).div_euclid(256),
-            (state.head_offset_y + i32::from(ly)).div_euclid(256),
+            (head.x + i32::from(lx)).div_euclid(256),
+            (head.y + i32::from(ly)).div_euclid(256),
         ),
         (1, 1),
         "the curve ends on the two-cell endpoint"
@@ -1304,98 +803,190 @@ fn gsi_06_13_selected_curve_starts_at_the_movers_own_cell_centre() {
     assert_eq!(lf, FACE_S, "and on the table's target facing");
 }
 
-/// Retail Raw2 point15 is (-129,129), so its NE projection about head
-/// (384,-128) is (255,1). Point16 is (264,-8): both cell axes change together.
-/// The former Rust (-128,128) transcription invented an exact-corner sample
-/// and split that crossing. Exercise all four orientations of the corrected
-/// catalog through the existing geometric adapter; this is not a full native
-/// Process_Track comparison.
+/// Every `TURN_TRACKS` and `RAW_TRACKS` entry, as gamemd.exe stores them.
+///
+/// Read from the retail binary (SHA-256 `1cdd1180...4298c`) at `0x007E7B28`
+/// (72 entries of 12 bytes) and `0x007E7A28` (16 entries of 16 bytes). Native
+/// layout: TurnTrack byte +0x00 normal track, +0x01 short track, dword +0x04
+/// target facing, dword +0x08 flags; RawTrack dword +0x00 points pointer,
+/// +0x04 chain index, +0x08 entry index, +0x0C occupation handoff index, the
+/// last three signed with -1 meaning none.
+///
+/// The A3 examination sampled 8 of the 72 TurnTrack entries and 6 of the 16
+/// RawTrack entries and carried the remainder as a coverage limit. This pins
+/// all of both, so an edit to either table has to answer to the binary.
+///
+/// The pointer column is deliberately absent: VERA stores the points inline
+/// through `points_start`/`points_count`, so there is no address to compare.
 #[test]
-fn advance_drive_track_2_diagonals_cross_both_axes_together() {
-    fn count_boundaries(transform_flags: u8, head_dx: i32, head_dy: i32, facing: u8) -> u32 {
-        let mut state = begin_drive_track(2, transform_flags, head_dx, head_dy, facing).unwrap();
-        let dt = SimFixed::lit("0.066");
-        let speed = SimFixed::from_num(256);
-        let mut jumps = 0;
-        for _ in 0..200 {
-            let result = advance_drive_track(&mut state, speed, dt);
-            if result.cell_jump {
-                jumps += 1;
-            }
-            if result.finished {
-                break;
-            }
-        }
-        jumps
-    }
+fn track_tables_match_the_retail_bytes_entry_for_entry() {
+    // (normal_track, short_track, target_facing, flags)
+    const NATIVE_TURN_TRACKS: [(u8, u8, u8, u8); 72] = [
+        (1, 0, 0x00, 0x00),
+        (3, 7, 0x20, 0x08),
+        (4, 9, 0x40, 0x08),
+        (0, 0, 0x60, 0x00),
+        (0, 0, 0x80, 0x00),
+        (0, 0, 0xA0, 0x00),
+        (4, 9, 0xC0, 0x0A),
+        (3, 7, 0xE0, 0x0A),
+        (6, 8, 0x00, 0x0F),
+        (2, 0, 0x20, 0x00),
+        (6, 8, 0x40, 0x08),
+        (5, 10, 0x60, 0x08),
+        (0, 0, 0x80, 0x00),
+        (0, 0, 0xA0, 0x00),
+        (0, 0, 0xC0, 0x00),
+        (5, 10, 0xE0, 0x0F),
+        (4, 9, 0x00, 0x0F),
+        (3, 7, 0x20, 0x0F),
+        (1, 0, 0x40, 0x03),
+        (3, 7, 0x60, 0x0B),
+        (4, 9, 0x80, 0x0B),
+        (0, 0, 0xA0, 0x00),
+        (0, 0, 0xC0, 0x00),
+        (0, 0, 0xE0, 0x00),
+        (0, 0, 0x00, 0x00),
+        (5, 10, 0x20, 0x0C),
+        (6, 8, 0x40, 0x0C),
+        (2, 0, 0x60, 0x04),
+        (6, 8, 0x80, 0x0B),
+        (5, 10, 0xA0, 0x0B),
+        (0, 0, 0xC0, 0x00),
+        (0, 0, 0xE0, 0x00),
+        (0, 0, 0x00, 0x00),
+        (0, 0, 0x20, 0x00),
+        (4, 9, 0x40, 0x0C),
+        (3, 7, 0x60, 0x0C),
+        (1, 0, 0x80, 0x04),
+        (3, 7, 0xA0, 0x0E),
+        (4, 9, 0xC0, 0x0E),
+        (0, 0, 0xE0, 0x00),
+        (0, 0, 0x00, 0x00),
+        (0, 0, 0x20, 0x00),
+        (0, 0, 0x40, 0x00),
+        (5, 10, 0x60, 0x09),
+        (6, 8, 0x80, 0x09),
+        (2, 0, 0xA0, 0x01),
+        (6, 8, 0xC0, 0x0E),
+        (5, 10, 0xE0, 0x0E),
+        (4, 9, 0x00, 0x0D),
+        (0, 0, 0x20, 0x00),
+        (0, 0, 0x40, 0x00),
+        (0, 0, 0x60, 0x00),
+        (4, 9, 0x80, 0x09),
+        (3, 7, 0xA0, 0x09),
+        (1, 0, 0xC0, 0x01),
+        (3, 7, 0xE0, 0x0D),
+        (6, 8, 0x00, 0x0D),
+        (5, 10, 0x20, 0x0D),
+        (0, 0, 0x40, 0x00),
+        (0, 0, 0x60, 0x00),
+        (0, 0, 0x80, 0x00),
+        (5, 10, 0xA0, 0x0A),
+        (6, 8, 0xC0, 0x0A),
+        (2, 0, 0xE0, 0x02),
+        (11, 11, 0xA0, 0x00),
+        (12, 12, 0xA0, 0x00),
+        (13, 13, 0xA0, 0x00),
+        (14, 14, 0x20, 0x00),
+        (14, 14, 0x60, 0x04),
+        (14, 14, 0xA0, 0x01),
+        (14, 14, 0xE0, 0x02),
+        (15, 15, 0xC0, 0x00),
+    ];
+    // (chain_index, entry_index, occupation_handoff_point_index)
+    const NATIVE_RAW_TRACKS: [(i16, u16, i16); 16] = [
+        (0, 192, 0),
+        (-1, 0, -1),
+        (-1, 0, -1),
+        (37, 12, 22),
+        (26, 11, 19),
+        (45, 15, 31),
+        (44, 16, 27),
+        (-1, 0, -1),
+        (-1, 0, -1),
+        (-1, 0, -1),
+        (-1, 0, -1),
+        (-1, 0, -1),
+        (-1, 0, -1),
+        (-1, 0, -1),
+        (-1, 0, -1),
+        (-1, 0, -1),
+    ];
 
-    assert_eq!(
-        count_boundaries(0, 1, -1, 0x20),
-        1,
-        "NE retail points skip the exact cell corner"
-    );
-    assert_eq!(
-        count_boundaries(1, -1, 1, 0xA0),
-        1,
-        "SW mirrors the same combined crossing"
-    );
-    assert_eq!(
-        count_boundaries(4, 1, 1, 0x60),
-        1,
-        "SE straight crosses both axes on one point"
-    );
-    assert_eq!(
-        count_boundaries(2, -1, -1, 0xE0),
-        1,
-        "NW straight crosses both axes on one point"
-    );
+    for (index, native) in NATIVE_TURN_TRACKS.iter().enumerate() {
+        let ours = &TURN_TRACKS[index];
+        assert_eq!(
+            (
+                ours.normal_track,
+                ours.short_track,
+                ours.target_facing,
+                ours.flags
+            ),
+            *native,
+            "TURN_TRACKS[{index}] disagrees with gamemd 0x007E7B28 + {index} * 12",
+        );
+    }
+    for (index, native) in NATIVE_RAW_TRACKS.iter().enumerate() {
+        let ours = &RAW_TRACKS[index];
+        assert_eq!(
+            (
+                ours.chain_index,
+                ours.entry_index,
+                ours.occupation_handoff_point_index
+            ),
+            *native,
+            "RAW_TRACKS[{index}] disagrees with gamemd 0x007E7A28 + {index} * 16",
+        );
+    }
 }
 
-/// The reported cell delta is the one the coordinate applied, and the crossings
-/// of a curve always sum to its head delta.
-///
-/// This is the contract the caller relies on: moving the mover's cell by the
-/// reported delta keeps `cell * 256 + sub` continuous, because the same delta
-/// is what shifted `cell_offset_*` inside the stepping loop.
+/// The immutable catalog omits the separately paid terminal sentinel; no
+/// noninitial real point may masquerade as that zero-XY terminator.
 #[test]
-fn advance_drive_track_reported_cell_deltas_sum_to_the_head_delta() {
-    fn deltas(
-        raw: u8,
-        transform_flags: u8,
-        head_dx: i32,
-        head_dy: i32,
-        facing: u8,
-    ) -> Vec<(i32, i32)> {
-        let mut state = begin_drive_track(raw, transform_flags, head_dx, head_dy, facing).unwrap();
-        let dt = SimFixed::lit("0.066");
-        let speed = SimFixed::from_num(256);
-        let mut out = Vec::new();
-        for _ in 0..400 {
-            let result = advance_drive_track(&mut state, speed, dt);
-            if result.cell_jump {
-                out.push((result.cell_jump_dx, result.cell_jump_dy));
-            } else {
-                assert_eq!(
-                    (result.cell_jump_dx, result.cell_jump_dy),
-                    (0, 0),
-                    "no crossing must report a zero delta"
-                );
-            }
-            if result.finished {
-                break;
-            }
+fn no_shipped_track_holds_an_interior_sentinel_point() {
+    for index in 1..=15u8 {
+        for (slot, point) in raw_track_points(index).iter().enumerate().skip(1) {
+            assert!(
+                point.x != 0 || point.y != 0,
+                "track {index} slot {slot} is an interior zero-XY terminator"
+            );
         }
-        out
     }
+}
 
-    // All orientations of retail Raw2 cross both axes on a single point.
-    assert_eq!(deltas(2, 0, 1, -1, 0x20), vec![(1, -1)]);
-    assert_eq!(deltas(2, 1, -1, 1, 0xA0), vec![(-1, 1)]);
-    assert_eq!(deltas(2, 4, 1, 1, 0x60), vec![(1, 1)]);
-    assert_eq!(deltas(2, 2, -1, -1, 0xE0), vec![(-1, -1)]);
-    // The cardinals are single-axis by construction.
-    assert_eq!(deltas(1, 0, 0, -1, 0x00), vec![(0, -1)]);
-    assert_eq!(deltas(1, 3, 1, 0, 0x40), vec![(1, 0)]);
-    assert_eq!(deltas(1, 4, 0, 1, 0x80), vec![(0, 1)]);
-    assert_eq!(deltas(1, 1, -1, 0, 0xC0), vec![(-1, 0)]);
+/// Drive4B49B6 compares RawTrack+0x0C against the retained cursor with JGE.
+#[test]
+fn occupation_handoff_releases_on_the_retained_native_cursor() {
+    use crate::rules::locomotor_type::LocomotorKind;
+    use crate::sim::components::DriveCoord;
+    use crate::sim::movement::at_coord::{AtCoordQuery, AtCoordTrack};
+    assert_eq!(
+        raw_track_meta(3).unwrap().occupation_handoff_point_index,
+        22
+    );
+    for kind in [LocomotorKind::Drive, LocomotorKind::Ship] {
+        let claim_at = |cursor| {
+            AtCoordQuery::from_state(
+                kind,
+                DriveCoord::cell(10, 10, 0),
+                Some(DriveCoord::cell(11, 8, 0)),
+                AtCoordTrack {
+                    turn_index: 1,
+                    cursor,
+                    reversed: false,
+                },
+            )
+            .unwrap()
+            .cells()
+            .0
+        };
+        assert!(claim_at(0).is_some(), "fresh acceptance claims the handoff");
+        assert!(claim_at(21).is_some(), "last cursor before handoff");
+        assert!(
+            claim_at(22).is_none(),
+            "the native JGE releases on cursor 22"
+        );
+    }
 }

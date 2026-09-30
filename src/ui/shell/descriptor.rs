@@ -44,23 +44,68 @@ pub enum AnchorRule {
     /// right-panel bottom cap, flush-right at `cell_w`. The resource top is not
     /// consumed. (0xE2 Exit.)
     OwnerDrawButtonBottomRow { cell_w: i32 },
-    /// Right-panel child: sidebar-inset, oversized-screen compensated, anchored
-    /// to `panel.top.y + dlu_top`. (0xE2 Yuri-website static.) This is the main
-    /// menu's convention specifically; single-player and skirmish anchor Y to
-    /// `center_offset(screen_h, 600)` instead, so they will need their own
-    /// variant when they migrate. Do NOT collapse this to one convention — that
-    /// would silently shift the shipped 0xE2 title/website pixels.
+    /// Right-panel static (`0x0060B1D0`): sidebar inset and the half of the
+    /// screen beyond 800x600 on each axis (heading and `0x71C` monitor of 0xE2
+    /// and the menu pages 0x100/0x101/0x129).
     RightAnchor,
     /// Apply a runtime size correction to the converted resource rect before
     /// right-anchoring it, then apply the final `(dy, dh)` adjustment.
-    /// (0xE2 0x694 heading: +1w/+1h before anchor, then +7y/+1h.)
+    /// (0xE2 0x694 heading: +1w/+1h before anchor, then +7y/+1h.) `inset`
+    /// is the control's inset override (record `+0xDC`, set by
+    /// `0x0060AB71..0x0060AD16`), which replaces `(168 - w) / 2`.
     RightAnchorRuntimeAdjust {
         resource_dw: i32,
         resource_dh: i32,
+        inset: Option<i32>,
         dy: i32,
         dh: i32,
     },
 }
+
+/// Right-panel heading static `0x694`: the runtime window is one pixel wider
+/// and taller than the resource conversion (the compatibility correction the
+/// 0xE2 heading already carried), then the fix-up pass adds `+7` y / `+1` h
+/// for the right-panel shells (`0x0060BD17`).
+pub const HEADING_ANCHOR: AnchorRule = AnchorRule::RightAnchorRuntimeAdjust {
+    resource_dw: 1,
+    resource_dh: 1,
+    inset: None,
+    dy: 7,
+    dh: 1,
+};
+
+/// Heading `0x694` of `0xBC 0xBD 0x102 0xC2 0xC9 0xBC6 0x105 0x6B 0x113`:
+/// the same window, which the fix-up pass moves only `+1` y (`0x0060BCE4`).
+pub const LOW_HEADING_ANCHOR: AnchorRule = AnchorRule::RightAnchorRuntimeAdjust {
+    resource_dw: 1,
+    resource_dh: 1,
+    inset: None,
+    dy: 1,
+    dh: 0,
+};
+
+/// Game type `0x6EC` and map name `0x5A8` of `0xBC 0xBD 0xC2 0xC9 0x102
+/// 0xBC6`: the one-pixel window correction and the inset override 14
+/// (`0x0060ACC2..0x0060AD04`).
+pub const MAP_TEXT_ANCHOR: AnchorRule = AnchorRule::RightAnchorRuntimeAdjust {
+    resource_dw: 1,
+    resource_dh: 1,
+    inset: Some(14),
+    dy: 0,
+    dh: 0,
+};
+
+/// Monitor static `0x71C`: the same one-pixel window correction as the
+/// heading and its inset override 37, set in the family dialogs that carry it
+/// (`0x0060AB71..0x0060ACA5`): x 670 at 800x600 with the 93x55 window, and the
+/// 92x53 SDWRNANM frame centers at `(670, 48)`.
+pub const MONITOR_ANCHOR: AnchorRule = AnchorRule::RightAnchorRuntimeAdjust {
+    resource_dw: 1,
+    resource_dh: 1,
+    inset: Some(37),
+    dy: 0,
+    dh: 0,
+};
 
 /// Background composition mode (study §C8): mode-1 right-panel shells vs mode-2
 /// SHP modal. Only `RightPanelShell` is exercised this slice.

@@ -17,13 +17,12 @@ use crate::sim::components::{
 };
 use crate::sim::debug_event_log::DebugEventKind;
 use crate::sim::movement::bump_crush;
-use crate::sim::movement::drive_locomotion as drive_locomotion_helpers;
-use crate::sim::movement::drive_track::{self, DriveTrackState};
-use crate::sim::movement::locomotor::{GroundMovePhase, LocomotorState, MovementLayer};
+use crate::sim::movement::drive_track;
+use crate::sim::movement::locomotor::{LocomotorState, MovementLayer};
 use crate::sim::movement::movement_blocked::handle_blocked_tick;
 use crate::sim::movement::movement_bridge::resolve_cell_transition_bridge_state;
 use crate::sim::movement::movement_occupancy::{
-    DeferredCellCheck, LiveBuildingEntrySkipMap, detect_deferred_cell_check,
+    BuildingEntrySkipLookup, DeferredCellCheck, detect_deferred_cell_check,
     evaluate_runtime_can_enter_cell_with_transition, naval_terrain_diag,
     runtime_can_enter_cell_args,
 };
@@ -32,11 +31,7 @@ use crate::sim::pathfinding::LayeredEntityBlockMap;
 use crate::sim::pathfinding::PathGrid;
 use crate::sim::pathfinding::terrain_cost::TerrainCostGrid;
 use crate::sim::rng::SimRng;
-use crate::sim::world::EnterOrderCounter;
-use crate::util::fixed_math::{
-    SIM_HALF, SIM_ONE, SIM_ZERO, SimFixed, facing_from_delta_int as facing_from_delta,
-    fixed_distance,
-};
+use crate::util::fixed_math::{SIM_HALF, SIM_ONE, SIM_ZERO, SimFixed, fixed_distance};
 use crate::util::lepton::CELL_CENTER_LEPTON;
 
 use super::{
@@ -94,63 +89,6 @@ fn accept_shared_track(
     }
 }
 
-pub(super) fn movement_frame_budget_from_current_speed(current_speed_per_second: SimFixed) -> i32 {
-    (current_speed_per_second / SimFixed::from_num(15u8)).to_num::<i32>()
-}
-
-fn scaled_frame_delta(
-    direction_component: SimFixed,
-    direction_length: SimFixed,
-    frame_budget: i32,
-) -> SimFixed {
-    if direction_component == SIM_ZERO || direction_length <= SIM_ZERO || frame_budget == 0 {
-        return SIM_ZERO;
-    }
-
-    const FRACTION_SCALE: i64 = 1 << 16;
-    let numerator =
-        i64::from(direction_component.to_bits()) * i64::from(frame_budget) * FRACTION_SCALE;
-    let delta_bits = numerator / i64::from(direction_length.to_bits());
-    SimFixed::from_bits(
-        i32::try_from(delta_bits).expect("movement component exceeds SimFixed range"),
-    )
-}
-
-fn whole_lepton_subcell_after_delta(cell: u16, subcell: SimFixed, delta: SimFixed) -> SimFixed {
-    const FRACTION_SCALE: i64 = 1 << 16;
-    const LEPTONS_PER_CELL: i64 = crate::util::lepton::LEPTONS_PER_CELL_I32 as i64;
-    let cell_origin = i64::from(cell) * LEPTONS_PER_CELL;
-    let absolute_bits =
-        cell_origin * FRACTION_SCALE + i64::from(subcell.to_bits()) + i64::from(delta.to_bits());
-    let absolute_leptons = absolute_bits / FRACTION_SCALE;
-    let subcell_leptons = absolute_leptons - cell_origin;
-    SimFixed::from_num(
-        i32::try_from(subcell_leptons).expect("sub-cell movement exceeds SimFixed range"),
-    )
-}
-
-fn advance_by_frame_budget(target: &MovementTarget, position: &mut Position, frame_budget: i32) {
-    let delta_x = scaled_frame_delta(target.move_dir_x, target.move_dir_len, frame_budget);
-    let delta_y = scaled_frame_delta(target.move_dir_y, target.move_dir_len, frame_budget);
-    position.sub_x = whole_lepton_subcell_after_delta(position.rx, position.sub_x, delta_x);
-    position.sub_y = whole_lepton_subcell_after_delta(position.ry, position.sub_y, delta_y);
-}
-
-fn advance_straight_position(
-    target: &MovementTarget,
-    position: &mut Position,
-    frame_budget: i32,
-    fraction: SimFixed,
-    whole_lepton_result: bool,
-) {
-    if whole_lepton_result {
-        advance_by_frame_budget(target, position, frame_budget);
-    } else {
-        position.sub_x += target.move_dir_x * fraction;
-        position.sub_y += target.move_dir_y * fraction;
-    }
-}
-
 pub(super) fn apply_cell_transition_remainder(
     path_runtime: &mut crate::sim::components::FootPathRuntime,
     position: &mut Position,
@@ -165,7 +103,10 @@ pub(super) fn apply_cell_transition_remainder(
     // Infantry: clear blocking state on each cell arrival (fresh grace period).
     // Vehicles: keep both flags — once blocked, urgency escalates permanently.
     if is_infantry {
-        path_runtime.start_blocked(native_frame, 0, walk);
+        // Walk75BE11/75BFD1 clears the latch but retains the grace timer.
+        if !walk {
+            path_runtime.start_blocked(native_frame, 0);
+        }
         path_runtime.path_blocked = false;
     }
     if dx_cell > 0 {
@@ -183,16 +124,9 @@ pub(super) fn apply_cell_transition_remainder(
 }
 
 pub(super) fn configure_motion_after_transition(
-    path_replay: &mut crate::sim::components::FootPathQueue,
     target: &mut MovementTarget,
     locomotor: &Option<LocomotorState>,
-    drive_track: &mut Option<DriveTrackState>,
-    drive_locomotion: &mut Option<DriveLocomotionRuntime>,
-    ship_locomotion: &mut Option<ShipLocomotionRuntime>,
-    facing: &mut u8,
-    facing_target: &mut Option<u8>,
     category: EntityCategory,
-    mover_rot: i32,
     position: &Position,
 ) {
     let current_cell = (position.rx, position.ry);
@@ -202,69 +136,6 @@ pub(super) fn configure_motion_after_transition(
         let next = target.path[target.next_index];
         let ndx = next.0 as i32 - current_cell.0 as i32;
         let ndy = next.1 as i32 - current_cell.1 as i32;
-
-        let new_face = facing_from_delta(ndx, ndy);
-        let shared_kind = shared_track_kind(locomotor);
-        let uses_drive_tracks = shared_kind.is_some();
-        let is_ship = shared_kind == Some(LocomotorKind::Ship);
-        let mut turn_first: Option<u8> = None;
-        let mut accepted_plan = None;
-        if uses_drive_tracks {
-            match drive_track::plan_drive_track_from_path(
-                *facing,
-                (ndx, ndy),
-                path_window_to_delta(target),
-                is_ship,
-            ) {
-                drive_track::DriveTrackDecision::TurnFirst { desired_facing } => {
-                    *drive_track = None;
-                    turn_first = Some(desired_facing);
-                }
-                drive_track::DriveTrackDecision::Select(plan) => {
-                    if let Some((head, curve)) = super::track_head::begin_fresh(&plan, position) {
-                        *drive_track = Some(curve);
-                        accepted_plan = Some((plan, head));
-                    }
-                }
-                drive_track::DriveTrackDecision::Unavailable => {}
-            }
-        } else {
-            *drive_track = None;
-        }
-
-        if let Some((plan, head)) = accepted_plan {
-            *facing_target = None;
-            if let Some(kind) = shared_kind {
-                let endpoint = (
-                    (i32::from(current_cell.0) + plan.head_dx) as i16,
-                    (i32::from(current_cell.1) + plan.head_dy) as i16,
-                );
-                accept_shared_track(
-                    path_replay,
-                    kind,
-                    drive_locomotion,
-                    ship_locomotion,
-                    endpoint,
-                    head,
-                    plan.nodes,
-                    plan.selection.turn_track_index,
-                );
-            }
-        } else {
-            if is_ship && let Some(ship) = ship_locomotion.as_mut() {
-                ship.head_to = None;
-                ship.pending_track_occupation = false;
-            }
-            // The exact-facing precondition takes precedence over the ordinary
-            // step facing: the body must reach the head node's octant before any
-            // curve may be selected, and it takes no step meanwhile.
-            let wanted = turn_first.unwrap_or(new_face);
-            if category == EntityCategory::Infantry || mover_rot <= 0 {
-                *facing = wanted;
-            } else {
-                *facing_target = Some(wanted);
-            }
-        }
 
         if category == EntityCategory::Infantry {
             // Infantry: direction from current sub-cell toward next cell's subcell position.
@@ -311,20 +182,15 @@ pub(super) fn configure_motion_after_transition(
 /// path-directed crossing loop cannot absorb a sideways cell exit; the drift
 /// this suppresses is bounded by the brake-decay tail (see the P2b plan doc).
 ///
-/// Hover never uses the stop-rotate-go path (`handle_vehicle_rotation`); any
-/// `facing_target` left by shared path plumbing is cleared here.
+/// Hover never uses the stop-rotate-go path (`handle_vehicle_rotation`).
 pub(super) fn hover_steer(
-    facing: &mut u8,
-    facing_target: &mut Option<u8>,
-    body_facing: &mut Option<super::facing_class::FacingClass>,
+    body_facing: &mut super::facing_class::FacingClass,
     position: &Position,
     target: &mut MovementTarget,
-    rot: i32,
     native_frame: u32,
 ) -> bool {
     use crate::util::lepton::CELL_CENTER_LEPTON;
 
-    *facing_target = None;
     let (wx, wy): (u16, u16) = if target.next_index < target.path.len() {
         target.path[target.next_index]
     } else {
@@ -335,19 +201,14 @@ pub(super) fn hover_steer(
     let dyl: SimFixed = SimFixed::from_num((wy as i32 - position.ry as i32) * 256)
         + (CELL_CENTER_LEPTON - position.sub_y);
     if dxl == SIM_ZERO && dyl == SIM_ZERO {
-        // Already exactly on the waypoint — nothing to steer toward.
-        *body_facing = None;
+        // Already exactly on the waypoint — nothing to steer toward. A turn
+        // already started keeps running on the frame clock.
         return false;
     }
 
     let desired16: u16 = super::hover::hover_desired_facing16(dxl, dyl);
-    let rot_byte: u8 = rot.clamp(0, 0x7F) as u8;
-    let bf = body_facing.get_or_insert_with(|| {
-        super::facing_class::FacingClass::new((*facing as u16) << 8, rot_byte)
-    });
-    bf.set(desired16, native_frame);
-    let current16: u16 = bf.current(native_frame);
-    *facing = (current16 >> 8) as u8;
+    body_facing.set(desired16, native_frame);
+    let current16: u16 = body_facing.current(native_frame);
 
     let (mx, my) = super::hover::hover_move_dir(current16);
     target.move_dir_x = mx;
@@ -360,115 +221,41 @@ pub(super) fn hover_steer(
 /// Result of vehicle rotation — tells the caller whether to skip this tick.
 pub(super) enum RotationResult {
     /// Still rotating in place — caller should `continue` (skip lepton advancement).
-    StillRotating {
-        debug_events: Vec<(u32, DebugEventKind)>,
-    },
+    StillRotating,
     /// Rotation complete or not needed — proceed with movement.
     ReadyToMove,
 }
 
 /// Handle vehicle in-place rotation before movement begins.
 ///
-/// Vehicles rotate toward `facing_target` before advancing. When `ROT > 0` the
-/// hull turns through a native-frame `FacingClass` at the unit's rules ROT —
-/// gamemd's `DriveLocomotionClass::Do_Turn` on the body PrimaryFacing, whose
-/// turn duration is `abs(delta_8bit) / ROT` native frames (frame-count based,
-/// NOT millisecond based). `ROT = 0` means instant snap. Infantry are excluded
-/// by the caller (they always turn instantly without this function).
-///
-/// `facing` stays the authoritative rendered/logic heading; each tick it is
-/// refreshed from the interpolator's current value (top byte of the 16-bit
-/// facing). `body_facing` holds the interpolator and lives only while a turn is
-/// in progress — it is cleared as soon as there is no active rotation.
+/// A vehicle holds position while its hull turns: gamemd's Drive/Ship Process
+/// returns through its tail while `FacingClass::Is_Rotating` answers true on
+/// the body (`0x004B0788`), whoever started the turn. `desired` is a turn this
+/// visit issues first — the fresh arm's `Do_Turn` (`0x004B343B`), one
+/// `FacingClass::Set` at the body's constructor rate (duration
+/// `abs(delta) / rate` native frames; a non-positive rate is instant). Infantry
+/// are excluded by the caller.
 ///
 /// Takes individual fields to avoid borrow conflicts with `entity.movement_target`.
 pub(super) fn handle_vehicle_rotation(
-    facing: &mut u8,
-    facing_target: &mut Option<u8>,
-    body_facing: &mut Option<super::facing_class::FacingClass>,
-    _position: &mut Position,
-    locomotor: &mut Option<LocomotorState>,
-    rot: i32,
+    body_facing: &mut super::facing_class::FacingClass,
+    desired: Option<u16>,
     native_frame: u32,
-    sim_tick: u64,
 ) -> RotationResult {
-    let Some(target_facing) = *facing_target else {
-        // No in-place rotation in progress — drop any stale interpolator so the
-        // next turn starts fresh from the then-current heading.
-        *body_facing = None;
-        return RotationResult::ReadyToMove;
-    };
-    if rot <= 0 {
-        // ROT=0 — instant turn, no gradual rotation.
-        *facing = target_facing;
-        *facing_target = None;
-        *body_facing = None;
+    if let Some(desired) = desired {
+        body_facing.set(desired, native_frame);
+    }
+    if !body_facing.is_rotating(native_frame) {
         return RotationResult::ReadyToMove;
     }
-
-    // Rules ROT drives the hull FacingClass. `set` is a no-op once already aimed
-    // at the target, so calling it each tick is safe and yields smooth retargets
-    // (it snapshots the live animated value into the rotation origin).
-    let rot_byte = rot.min(0x7F) as u8;
-    let bf = body_facing.get_or_insert_with(|| {
-        super::facing_class::FacingClass::new((*facing as u16) << 8, rot_byte)
-    });
-    bf.set((target_facing as u16) << 8, native_frame);
-    *facing = (bf.current(native_frame) >> 8) as u8;
-
-    if bf.is_rotating(native_frame) {
-        // Still rotating in place — advance facing but don't move.
-        let mut debug_events = Vec::new();
-        if let Some(loco) = locomotor {
-            let old_phase = loco.phase;
-            loco.phase = GroundMovePhase::Accelerating;
-            if old_phase != GroundMovePhase::Accelerating {
-                debug_events.push((
-                    sim_tick as u32,
-                    DebugEventKind::PhaseChange {
-                        from: format!("{:?}", old_phase),
-                        to: "Accelerating".into(),
-                        reason: "movement started".into(),
-                    },
-                ));
-            }
-        }
-        RotationResult::StillRotating { debug_events }
-    } else {
-        // Rotation complete — snap to the exact target and start moving.
-        *facing = target_facing;
-        *facing_target = None;
-        *body_facing = None;
-        RotationResult::ReadyToMove
-    }
+    // Still rotating in place — the hull turns but the mover does not advance.
+    RotationResult::StillRotating
 }
 
 /// Result of lepton position advancement.
 pub(super) enum AdvanceResult {
-    /// Walk75BE3C: the retained subcell head completed, before PerCell2.
-    WalkStepCompleted,
     /// Drive track is active — caller should `continue` (skip cell crossings).
     DriveTrackActive,
-    /// Drive track crossed a cell boundary — caller must handle the cell
-    /// transition (move rx/ry by `cell_dx`/`cell_dy`, reserve destination),
-    /// then continue the track on the next tick.
-    ///
-    /// The delta is the one the coordinate actually applied, not the next path
-    /// step: the original engine derives the cell from its single absolute
-    /// coordinate, so the path cursor advances only once the mover's cell has
-    /// actually reached the queued node.
-    DriveTrackCellJump { cell_dx: i32, cell_dy: i32 },
-    /// Residual XY crossed a cell: only the object-list/OnBridge transaction
-    /// runs. Raw Z and the paid path cursor remain unchanged (0x4B253F).
-    DriveTrackResidualCellJump { cell_dx: i32, cell_dy: i32 },
-    /// Drive track reached the chain_index — caller should attempt to chain
-    /// into a follow-on track curve (check passability of the next-next cell,
-    /// select new track if OK). If chaining fails, the current track continues
-    /// on the next tick.
-    DriveTrackChainReady,
-    /// The completed approach retired its selector; the next path step is
-    /// an explicit tube. The host must enter it before ordinary selection.
-    DriveTrackTubeReady(crate::map::tube_facts::TubeId),
     /// A fresh curve was refused by the cell occupation mask. No curve was
     /// installed, no head reservation was stamped, and the mover has not moved.
     /// The refusal carries its own answer — see [`DriveSelectionRefusal`] — so
@@ -479,648 +266,8 @@ pub(super) enum AdvanceResult {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::rules::locomotor_type::LocomotorKind;
-    use crate::sim::movement::locomotor::LocomotorState;
-
-    #[test]
-    fn exhausted_foot_queue_cannot_bypass_drive_or_ship_track_admission() {
-        for kind in [LocomotorKind::Drive, LocomotorKind::Ship] {
-            for directions in [vec![], vec![2, 2]] {
-                let mut queue = crate::sim::components::FootPathQueue {
-                    cursor: directions.len() as u16,
-                    directions,
-                    reference_cell: Some((0, 0)),
-                };
-                let mut target = MovementTarget {
-                    path: vec![(0, 0), (1, 0)],
-                    next_index: 1,
-                    move_dir_x: SimFixed::from_num(256),
-                    move_dir_y: SIM_ZERO,
-                    move_dir_len: SimFixed::from_num(256),
-                    current_speed: SimFixed::from_num(255),
-                    ..Default::default()
-                };
-                let mut position = Position {
-                    rx: 0,
-                    ry: 0,
-                    z: 0,
-                    exact_z_leptons: None,
-                    sub_x: CELL_CENTER_LEPTON,
-                    sub_y: CELL_CENTER_LEPTON,
-                };
-                let before = position.clone();
-                let mut drive =
-                    (kind == LocomotorKind::Drive).then(DriveLocomotionRuntime::default);
-                let mut ship = (kind == LocomotorKind::Ship).then(ShipLocomotionRuntime::default);
-                let mut curve = None;
-                let result = advance_lepton_position(
-                    &mut true,
-                    &mut queue,
-                    &mut target,
-                    &mut Default::default(),
-                    &mut position,
-                    &mut 64,
-                    &mut None,
-                    &mut curve,
-                    &mut drive,
-                    &mut ship,
-                    &mut Some(LocomotorState::for_test_kind(kind)),
-                    EntityCategory::Unit,
-                    SimFixed::from_num(255),
-                    255,
-                    SimFixed::from_num(1) / SimFixed::from_num(15),
-                    1,
-                    None,
-                    DriveCellAdmission::default(),
-                    MovementLayer::Ground,
-                    None,
-                    None,
-                );
-                assert!(
-                    matches!(result, AdvanceResult::DriveTrackActive),
-                    "{kind:?}"
-                );
-                assert_eq!(
-                    (
-                        position.rx,
-                        position.ry,
-                        position.sub_x,
-                        position.sub_y,
-                        position.z,
-                        position.exact_z_leptons
-                    ),
-                    (
-                        before.rx,
-                        before.ry,
-                        before.sub_x,
-                        before.sub_y,
-                        before.z,
-                        before.exact_z_leptons
-                    ),
-                    "{kind:?}: no admitted track, no coordinate step"
-                );
-                assert!(curve.is_none());
-                assert_eq!(target.next_index, 1);
-                assert!(queue.remaining_directions().is_empty());
-            }
-        }
-    }
-
-    #[test]
-    fn fresh_retry_terminal_retains_raw_head_for_both_track_families() {
-        for kind in [LocomotorKind::Drive, LocomotorKind::Ship] {
-            let head = DriveCoord {
-                x: 3 * 256 + 85,
-                y: 2 * 256 + 153,
-                z: 731,
-            };
-            let mut position = Position {
-                rx: 3,
-                ry: 2,
-                z: 1,
-                exact_z_leptons: Some(104),
-                sub_x: SimFixed::from_num(85),
-                sub_y: SimFixed::from_num(154),
-            };
-            let mut curve =
-                drive_track::begin_drive_track_with_head_offset(1, 0, 85, 153, 0).unwrap();
-            curve.point_index = drive_track::raw_track_meta(1).unwrap().points_count - 2;
-            curve.residual = 8;
-            let mut curve = Some(curve);
-            let mut drive = (kind == LocomotorKind::Drive).then(|| DriveLocomotionRuntime {
-                head_to: Some(head),
-                track: crate::sim::components::TrackProgress {
-                    residual: 8,
-                    ..Default::default()
-                },
-                ..Default::default()
-            });
-            let mut ship = (kind == LocomotorKind::Ship).then(|| ShipLocomotionRuntime {
-                head_to: Some(head),
-                track: crate::sim::components::TrackProgress {
-                    residual: 8,
-                    ..Default::default()
-                },
-                ..Default::default()
-            });
-            let mut target = MovementTarget {
-                path: vec![(3, 2)],
-                path_layers: vec![MovementLayer::Ground],
-                ..Default::default()
-            };
-            let result = advance_shared_track(
-                &mut true,
-                &mut target,
-                &mut Default::default(),
-                &mut position,
-                &mut 0,
-                &mut None,
-                &mut curve,
-                &mut drive,
-                &mut ship,
-                kind,
-                &mut None,
-                1,
-                MovementLayer::Ground,
-                None,
-                None,
-                0,
-            );
-            assert!(
-                matches!(result, AdvanceResult::ReadyForCrossings),
-                "{kind:?}"
-            );
-            assert!(curve.is_none());
-            assert_eq!(
-                super::super::ground_pose::position_world_coord(&position),
-                head
-            );
-            assert_eq!(drive.and_then(|d| d.head_to), None);
-            assert_eq!(ship.and_then(|s| s.head_to), None);
-        }
-    }
-
-    /// Body/hull in-place turn duration = abs(delta_8bit) / ROT native frames
-    /// (gamemd DriveLocomotionClass::Do_Turn on the hull FacingClass at the
-    /// unit's rules ROT). Verified in
-    /// docs/research/BODY_FACING_DRIVE_LOCOMOTOR_ROT_GHIDRA_REPORT.md: for ROT=5
-    /// a 90° (0x40) turn is 12 frames and a 180° (0x80) turn is 25 frames — the
-    /// values gamemd produces, and the whole point of the frame-based model
-    /// (the old ms-integrated path was tick-rate-dependent and ~2× too fast).
-    #[test]
-    fn test_body_rotation_matches_native_frame_duration() {
-        // Drive the in-place rotation frame by frame, returning the native-frame
-        // count at which it completes (ReadyToMove with the exact target reached).
-        fn frames_to_turn(from: u8, to: u8, rot: i32) -> u32 {
-            let mut facing = from;
-            let mut facing_target = Some(to);
-            let mut body_facing = None;
-            let mut position = Position {
-                rx: 5,
-                ry: 5,
-                z: 0,
-                exact_z_leptons: None,
-                sub_x: crate::util::lepton::CELL_CENTER_LEPTON,
-                sub_y: crate::util::lepton::CELL_CENTER_LEPTON,
-            };
-            let mut locomotor = None;
-            for frame in 0..1000u32 {
-                match handle_vehicle_rotation(
-                    &mut facing,
-                    &mut facing_target,
-                    &mut body_facing,
-                    &mut position,
-                    &mut locomotor,
-                    rot,
-                    frame,
-                    0,
-                ) {
-                    RotationResult::ReadyToMove => {
-                        assert_eq!(facing, to, "rotation must land exactly on the target");
-                        assert!(body_facing.is_none(), "interpolator cleared on completion");
-                        return frame;
-                    }
-                    RotationResult::StillRotating { .. } => {}
-                }
-            }
-            panic!("rotation did not complete within 1000 frames");
-        }
-
-        // ROT=5 (MTNK/AMCV/HTNK/…): 0x40 = 16384/1280 = 12 frames; 0x80 = 25.
-        assert_eq!(
-            frames_to_turn(0x00, 0x40, 5),
-            12,
-            "90° at ROT=5 = 12 frames"
-        );
-        assert_eq!(
-            frames_to_turn(0x00, 0x80, 5),
-            25,
-            "180° at ROT=5 = 25 frames"
-        );
-        // Counter-clockwise 90° (shortest arc) is the same duration.
-        assert_eq!(
-            frames_to_turn(0x40, 0x00, 5),
-            12,
-            "CCW 90° at ROT=5 = 12 frames"
-        );
-        // ROT=0 snaps instantly (no gradual rotation).
-        assert_eq!(frames_to_turn(0x00, 0x40, 0), 0, "ROT=0 turns instantly");
-    }
-
-    #[test]
-    fn drive_track_completion_retries_new_track_with_residual_only() {
-        let mut target = MovementTarget {
-            path: vec![(0, 0), (1, 0)],
-            path_layers: vec![MovementLayer::Ground; 2],
-            next_index: 1,
-            speed: SimFixed::from_num(300),
-            current_speed: SimFixed::from_num(300),
-            move_dir_x: SimFixed::from_num(256),
-            move_dir_y: SIM_ZERO,
-            move_dir_len: SimFixed::from_num(256),
-            final_goal: Some((1, 0)),
-            ..Default::default()
-        };
-        let mut position = Position {
-            rx: 0,
-            ry: 0,
-            z: 0,
-            exact_z_leptons: None,
-            sub_x: crate::util::lepton::CELL_CENTER_LEPTON,
-            sub_y: crate::util::lepton::CELL_CENTER_LEPTON,
-        };
-        let mut facing = 0;
-        let mut facing_target = None;
-        let mut drive_track_state =
-            Some(drive_track::begin_drive_track(15, 0, 0, 0, 0xC0).unwrap());
-        let last_index = drive_track::raw_track_meta(15).unwrap().points_count - 1;
-        drive_track_state.as_mut().unwrap().point_index = last_index - 1;
-        let mut drive_locomotion = Some(DriveLocomotionRuntime::default());
-        let mut ship_locomotion = None;
-        let mut locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Drive));
-
-        let result = advance_lepton_position(
-            &mut true,
-            &mut Default::default(),
-            &mut target,
-            &mut Default::default(),
-            &mut position,
-            &mut facing,
-            &mut facing_target,
-            &mut drive_track_state,
-            &mut drive_locomotion,
-            &mut ship_locomotion,
-            &mut locomotor,
-            EntityCategory::Unit,
-            SimFixed::from_num(300),
-            movement_frame_budget_from_current_speed(SimFixed::from_num(300)),
-            SimFixed::from_num(1) / SimFixed::from_num(15),
-            1,
-            None,
-            DriveCellAdmission::default(),
-            MovementLayer::Ground,
-            None,
-            None,
-        );
-
-        // The finishing curve leaves the hull on its last point's facing (0xBC
-        // for this raw track), which is not the east octant the head path node
-        // needs, so the exact-facing precondition fires first: no new curve, and
-        // the whole leftover budget is still on the owner.
-        assert!(matches!(result, AdvanceResult::DriveTrackActive));
-        assert!(
-            drive_track_state.is_none(),
-            "no curve while the hull is off-octant"
-        );
-        assert_eq!(
-            facing_target,
-            Some(0x40),
-            "turn commanded onto the head node"
-        );
-        assert_eq!(
-            drive_locomotion
-                .as_ref()
-                .expect("drive runtime")
-                .track
-                .residual,
-            13
-        );
-
-        // Once the hull is on the octant, the fresh selection runs and enters the
-        // new curve on the carried residual alone — a selection costs no budget.
-        facing = 0x40;
-        facing_target = None;
-        let result = advance_lepton_position(
-            &mut true,
-            &mut Default::default(),
-            &mut target,
-            &mut Default::default(),
-            &mut position,
-            &mut facing,
-            &mut facing_target,
-            &mut drive_track_state,
-            &mut drive_locomotion,
-            &mut ship_locomotion,
-            &mut locomotor,
-            EntityCategory::Unit,
-            SimFixed::from_num(300),
-            movement_frame_budget_from_current_speed(SimFixed::from_num(300)),
-            SimFixed::from_num(1) / SimFixed::from_num(15),
-            1,
-            None,
-            DriveCellAdmission::default(),
-            MovementLayer::Ground,
-            None,
-            None,
-        );
-
-        assert!(matches!(result, AdvanceResult::DriveTrackActive));
-        let drive = drive_locomotion.as_ref().expect("drive runtime");
-        assert_eq!(drive.track.residual, 6);
-        let track = drive_track_state.as_ref().expect("new track installed");
-        assert_eq!(track.residual, 6);
-        assert_eq!(drive.track.cursor, i32::from(track.point_index));
-    }
-
-    #[test]
-    fn drive_track_first_native_frame_uses_native_frame_budget() {
-        let mut target = MovementTarget {
-            path: vec![(0, 0), (1, 0)],
-            path_layers: vec![MovementLayer::Ground; 2],
-            next_index: 1,
-            speed: SimFixed::from_num(255),
-            current_speed: SimFixed::from_num(255) * SimFixed::lit("0.7"),
-            move_dir_x: SimFixed::from_num(256),
-            move_dir_y: SIM_ZERO,
-            move_dir_len: SimFixed::from_num(256),
-            final_goal: Some((1, 0)),
-            ..Default::default()
-        };
-        let mut position = Position {
-            rx: 0,
-            ry: 0,
-            z: 0,
-            exact_z_leptons: None,
-            sub_x: crate::util::lepton::CELL_CENTER_LEPTON,
-            sub_y: crate::util::lepton::CELL_CENTER_LEPTON,
-        };
-        let mut facing = 0;
-        let mut facing_target = None;
-        let mut drive_track_state =
-            Some(drive_track::begin_drive_track_with_head_offset(1, 0, 0, 0, 0).unwrap());
-        let start_index = drive_track_state.as_ref().unwrap().point_index;
-        let mut drive_locomotion = Some(DriveLocomotionRuntime::default());
-        let mut ship_locomotion = None;
-        let mut locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Drive));
-        let current_speed = target.current_speed;
-
-        let result = advance_lepton_position(
-            &mut true,
-            &mut Default::default(),
-            &mut target,
-            &mut Default::default(),
-            &mut position,
-            &mut facing,
-            &mut facing_target,
-            &mut drive_track_state,
-            &mut drive_locomotion,
-            &mut ship_locomotion,
-            &mut locomotor,
-            EntityCategory::Unit,
-            current_speed,
-            movement_frame_budget_from_current_speed(current_speed),
-            SimFixed::from_num(1) / SimFixed::from_num(15),
-            1,
-            None,
-            DriveCellAdmission::default(),
-            MovementLayer::Ground,
-            None,
-            None,
-        );
-
-        assert!(matches!(result, AdvanceResult::DriveTrackActive));
-        let drive = drive_locomotion.as_ref().unwrap();
-        let track = drive_track_state.as_ref().unwrap();
-        assert_eq!(track.point_index, start_index + 1);
-        assert_eq!(drive.track.residual, 4);
-        assert_eq!(track.residual, 4);
-    }
-
-    #[test]
-    fn gsi_04_05_paid_track_point_clears_current_before_same_cell_coordinate_commit() {
-        let mut foot_occupation_enabled = true;
-        let mut target = MovementTarget {
-            path: vec![(0, 0), (1, 0)],
-            path_layers: vec![MovementLayer::Ground; 2],
-            next_index: 1,
-            speed: SimFixed::from_num(255),
-            current_speed: SimFixed::from_num(255),
-            move_dir_x: SimFixed::from_num(256),
-            move_dir_y: SIM_ZERO,
-            move_dir_len: SimFixed::from_num(256),
-            ..Default::default()
-        };
-        let mut position = Position {
-            rx: 0,
-            ry: 0,
-            z: 0,
-            exact_z_leptons: None,
-            sub_x: crate::util::lepton::CELL_CENTER_LEPTON,
-            sub_y: crate::util::lepton::CELL_CENTER_LEPTON,
-        };
-        let mut facing = 0;
-        let mut facing_target = None;
-        let mut drive_track_state =
-            Some(drive_track::begin_drive_track_with_head_offset(1, 0, 0, 0, 0).unwrap());
-        let mut drive_locomotion = Some(DriveLocomotionRuntime {
-            occupation_head_to: Some(DriveOccupationFootprint {
-                rx: 1,
-                ry: 0,
-                layer: MovementLayer::Ground,
-            }),
-            ..Default::default()
-        });
-        let mut ship_locomotion = None;
-        let mut locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Drive));
-        let mut bits = CellOccupationGrid::new();
-        bits.mark_vehicle_on_layer(0, 0, 1, MovementLayer::Ground);
-        bits.mark_vehicle_on_layer(1, 0, 1, MovementLayer::Ground);
-
-        let result = advance_lepton_position(
-            &mut foot_occupation_enabled,
-            &mut Default::default(),
-            &mut target,
-            &mut Default::default(),
-            &mut position,
-            &mut facing,
-            &mut facing_target,
-            &mut drive_track_state,
-            &mut drive_locomotion,
-            &mut ship_locomotion,
-            &mut locomotor,
-            EntityCategory::Unit,
-            SimFixed::from_num(255),
-            movement_frame_budget_from_current_speed(SimFixed::from_num(255)),
-            SimFixed::from_num(1) / SimFixed::from_num(15),
-            1,
-            Some(&mut bits),
-            DriveCellAdmission::default(),
-            MovementLayer::Ground,
-            None,
-            None,
-        );
-
-        assert!(matches!(result, AdvanceResult::DriveTrackActive));
-        assert_eq!((position.rx, position.ry), (0, 0));
-        assert_eq!(bits.vehicle_bits(0, 0, MovementLayer::Ground), 0);
-        assert_eq!(bits.vehicle_bits(1, 0, MovementLayer::Ground), 0x20);
-        assert!(!foot_occupation_enabled);
-    }
-
-    #[test]
-    fn drive_track_each_call_consumes_fresh_native_frame_budget() {
-        let mut target = MovementTarget {
-            path: vec![(0, 0), (1, 0)],
-            path_layers: vec![MovementLayer::Ground; 2],
-            next_index: 1,
-            speed: SimFixed::from_num(255),
-            current_speed: SimFixed::from_num(255) * SimFixed::lit("0.7"),
-            move_dir_x: SimFixed::from_num(256),
-            move_dir_y: SIM_ZERO,
-            move_dir_len: SimFixed::from_num(256),
-            final_goal: Some((1, 0)),
-            ..Default::default()
-        };
-        let mut position = Position {
-            rx: 0,
-            ry: 0,
-            z: 0,
-            exact_z_leptons: None,
-            sub_x: crate::util::lepton::CELL_CENTER_LEPTON,
-            sub_y: crate::util::lepton::CELL_CENTER_LEPTON,
-        };
-        let mut facing = 0;
-        let mut facing_target = None;
-        let mut drive_track_state =
-            Some(drive_track::begin_drive_track_with_head_offset(1, 0, 0, 0, 0).unwrap());
-        let mut drive_locomotion = Some(DriveLocomotionRuntime::default());
-        let mut ship_locomotion = None;
-        let mut locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Drive));
-        let dt = SimFixed::from_num(1) / SimFixed::from_num(15);
-        let current_speed = target.current_speed;
-
-        let _ = advance_lepton_position(
-            &mut true,
-            &mut Default::default(),
-            &mut target,
-            &mut Default::default(),
-            &mut position,
-            &mut facing,
-            &mut facing_target,
-            &mut drive_track_state,
-            &mut drive_locomotion,
-            &mut ship_locomotion,
-            &mut locomotor,
-            EntityCategory::Unit,
-            current_speed,
-            movement_frame_budget_from_current_speed(current_speed),
-            dt,
-            1,
-            None,
-            DriveCellAdmission::default(),
-            MovementLayer::Ground,
-            None,
-            None,
-        );
-        let index_after_native_frame = drive_track_state.as_ref().unwrap().point_index;
-
-        let _ = advance_lepton_position(
-            &mut true,
-            &mut Default::default(),
-            &mut target,
-            &mut Default::default(),
-            &mut position,
-            &mut facing,
-            &mut facing_target,
-            &mut drive_track_state,
-            &mut drive_locomotion,
-            &mut ship_locomotion,
-            &mut locomotor,
-            EntityCategory::Unit,
-            current_speed,
-            movement_frame_budget_from_current_speed(current_speed),
-            dt,
-            1,
-            None,
-            DriveCellAdmission::default(),
-            MovementLayer::Ground,
-            None,
-            None,
-        );
-        assert_eq!(
-            drive_track_state.as_ref().unwrap().point_index,
-            index_after_native_frame + 2,
-            "every explicit call must consume a fresh reached-frame budget"
-        );
-    }
-
-    fn advance_straight_walk(effective_speed: SimFixed, frame_budget: i32) -> Position {
-        let mut target = MovementTarget {
-            path: vec![(0, 0), (1, 0)],
-            path_layers: vec![MovementLayer::Ground; 2],
-            next_index: 1,
-            speed: effective_speed,
-            current_speed: effective_speed,
-            move_dir_x: SimFixed::from_num(256),
-            move_dir_y: SIM_ZERO,
-            move_dir_len: SimFixed::from_num(256),
-            final_goal: Some((1, 0)),
-            ..Default::default()
-        };
-        let mut position = Position {
-            rx: 0,
-            ry: 0,
-            z: 0,
-            exact_z_leptons: None,
-            sub_x: SimFixed::from_num(128),
-            sub_y: SimFixed::from_num(128),
-        };
-        let mut facing = 0;
-        let mut facing_target = None;
-        let mut drive_track_state = None;
-        let mut drive_locomotion = None;
-        let mut ship_locomotion = None;
-        let mut locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Walk));
-
-        let result = advance_lepton_position(
-            &mut true,
-            &mut Default::default(),
-            &mut target,
-            &mut Default::default(),
-            &mut position,
-            &mut facing,
-            &mut facing_target,
-            &mut drive_track_state,
-            &mut drive_locomotion,
-            &mut ship_locomotion,
-            &mut locomotor,
-            EntityCategory::Infantry,
-            effective_speed,
-            frame_budget,
-            SimFixed::from_num(1) / SimFixed::from_num(15),
-            1,
-            None,
-            DriveCellAdmission::default(),
-            MovementLayer::Ground,
-            None,
-            None,
-        );
-        assert!(matches!(result, AdvanceResult::ReadyForCrossings));
-        position
-    }
-
-    #[test]
-    fn straight_walk_commits_the_whole_frame_budget() {
-        let effective_speed = SimFixed::from_num(150);
-        let position = advance_straight_walk(
-            effective_speed,
-            movement_frame_budget_from_current_speed(effective_speed),
-        );
-
-        assert_eq!(position.sub_x, SimFixed::from_num(138));
-        assert_eq!(position.sub_y, SimFixed::from_num(128));
-    }
-
-    #[test]
-    fn straight_walk_zero_budget_leaves_position_unchanged() {
-        let position = advance_straight_walk(SIM_ZERO, 0);
-
-        assert_eq!(position.sub_x, SimFixed::from_num(128));
-        assert_eq!(position.sub_y, SimFixed::from_num(128));
-    }
-}
+#[path = "movement_step_tests.rs"]
+mod tests;
 
 /// Install the pair of marks a Drive curve claims: the forward RawTrack handoff
 /// cell it passes through and the head cell it comes to rest on.
@@ -1185,14 +332,26 @@ fn install_drive_head_to_occupation(
 /// A curve whose head resolves to the deck claims neither cell; the deck
 /// equivalent of both marks is UNCHECKED.
 fn drive_track_handoff_footprint(
-    track: &DriveTrackState,
-    current_cell: (u16, u16),
+    kind: LocomotorKind,
+    current: DriveCoord,
+    head: DriveCoord,
+    track: crate::sim::components::TrackProgress,
     layer: MovementLayer,
 ) -> Option<DriveOccupationFootprint> {
     if layer != MovementLayer::Ground {
         return None;
     }
-    let (handoff, _) = drive_track::is_at_coord_track_cells(track, current_cell, true);
+    let (handoff, _) = super::at_coord::AtCoordQuery::from_state(
+        kind,
+        current,
+        Some(head),
+        super::at_coord::AtCoordTrack {
+            turn_index: track.turn_index,
+            cursor: track.cursor,
+            reversed: track.reversed,
+        },
+    )?
+    .cells();
     let (hx, hy) = handoff?;
     Some(DriveOccupationFootprint {
         rx: u16::try_from(hx).ok()?,
@@ -1212,7 +371,7 @@ enum FreshTrackOutcome {
     /// The cell the curve would step into is already claimed by another
     /// vehicle. Nothing was installed and nothing was reserved.
     BlockedByOccupation(DriveSelectionRefusal),
-    /// No curve available; the caller keeps its non-track behaviour.
+    /// No usable descriptor; the native movement invocation remains idle.
     None,
 }
 
@@ -1305,8 +464,8 @@ pub(super) enum DriveRefusalArm {
 /// standing property of a vehicle:
 /// `DriveLocomotionClass__Process_Drive_Track @ 0x004B0F20` writes 0 at
 /// 0x004B161A and 1 at 0x004B1FEF, so an occupant in transit carries 0 and can
-/// be skipped by the locomotor answer like any other. See the DRIFT recorded on
-/// `drive_track_chain_entry_allows_track_install`.
+/// be skipped by the locomotor answer like any other. The shared runtime
+/// classifier in `cell_entry` owns that live occupant predicate.
 ///
 /// Building footprints are NOT consulted here either. Terrain and building
 /// admission are answered by the crossing lane, which knows about
@@ -1326,14 +485,21 @@ pub(super) struct DriveCellAdmission<'a> {
 /// (`0x0073F8D4..FA26`), captured before the mover takes its mutable borrow.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct MoverHeadOnContext {
-    pub facing: u8,
+    /// The visit's frame, at which both bodies' headings are sampled.
+    pub frame: u32,
+    /// The body heading (`+0x388`) at `frame`.
+    pub facing: u16,
     pub world: [i32; 3],
 }
 
 impl MoverHeadOnContext {
-    pub(super) fn from_entity(entity: &crate::sim::game_entity::GameEntity) -> Option<Self> {
+    pub(super) fn from_entity(
+        entity: &crate::sim::game_entity::GameEntity,
+        frame: u32,
+    ) -> Option<Self> {
         (entity.category == crate::map::entities::EntityCategory::Unit).then(|| Self {
-            facing: entity.facing,
+            frame,
+            facing: entity.body_facing_current(frame),
             world: crate::sim::pathfinding::cell_entry::entity_world_leptons(entity),
         })
     }
@@ -1365,7 +531,7 @@ impl DriveCellAdmission<'_> {
             && crate::sim::pathfinding::cell_entry::head_on_exit(
                 mover.facing,
                 mover.world,
-                ally.facing,
+                ally.facing.current(mover.frame),
                 ally.world,
             )
         {
@@ -1388,9 +554,7 @@ fn select_fresh_drive_track_at_current_cell(
     path_replay: &mut crate::sim::components::FootPathQueue,
     target: &mut MovementTarget,
     position: &Position,
-    facing: u8,
-    facing_target: &mut Option<u8>,
-    drive_track_state: &mut Option<DriveTrackState>,
+    facing: u16,
     drive_locomotion: &mut Option<DriveLocomotionRuntime>,
     ship_locomotion: &mut Option<ShipLocomotionRuntime>,
     cell_occupation: &mut Option<&mut CellOccupationGrid>,
@@ -1404,12 +568,10 @@ fn select_fresh_drive_track_at_current_cell(
     };
     let ndx = i32::from(next.0) - i32::from(position.rx);
     let ndy = i32::from(next.1) - i32::from(position.ry);
-    let is_ship = shared_kind == LocomotorKind::Ship;
     let plan = match drive_track::plan_drive_track_from_path(
         facing,
         (ndx, ndy),
         path_window_to_delta(target),
-        is_ship,
     ) {
         drive_track::DriveTrackDecision::TurnFirst { desired_facing } => {
             return FreshTrackOutcome::TurnFirst(desired_facing);
@@ -1493,7 +655,6 @@ fn select_fresh_drive_track_at_current_cell(
             // one — to the caller's dispatch.
             if let Some(drive) = drive_locomotion.as_mut() {
                 drive.head_to = None;
-                drive.pending_track_occupation = false;
             }
             install_drive_head_to_occupation(
                 foot_occupation_enabled,
@@ -1526,7 +687,7 @@ fn select_fresh_drive_track_at_current_cell(
         }
     }
 
-    let Some((head, new_track)) = super::track_head::begin_fresh(&plan, position) else {
+    let Some(head) = super::track_head::begin_fresh(&plan, position) else {
         return FreshTrackOutcome::None;
     };
 
@@ -1534,8 +695,6 @@ fn select_fresh_drive_track_at_current_cell(
     target.move_dir_x = d_x;
     target.move_dir_y = d_y;
     target.move_dir_len = d_len;
-    *drive_track_state = Some(new_track);
-    *facing_target = None;
 
     // The reserved head is the curve's endpoint: the head node for a straight
     // run, the node after it for a turning curve.
@@ -1564,8 +723,19 @@ fn select_fresh_drive_track_at_current_cell(
             })
         })
         .flatten();
-    let handoff_occupation = drive_track_state.as_ref().and_then(|track| {
-        drive_track_handoff_footprint(track, (position.rx, position.ry), endpoint_layer)
+    let progress = match shared_kind {
+        LocomotorKind::Drive => drive_locomotion.as_ref().map(|state| state.track),
+        LocomotorKind::Ship => ship_locomotion.as_ref().map(|state| state.track),
+        _ => None,
+    };
+    let handoff_occupation = progress.and_then(|track| {
+        drive_track_handoff_footprint(
+            shared_kind,
+            super::ground_pose::position_world_coord(position),
+            head,
+            track,
+            endpoint_layer,
+        )
     });
     install_drive_head_to_occupation(
         foot_occupation_enabled,
@@ -1582,21 +752,22 @@ fn select_fresh_drive_track_at_current_cell(
 
 pub(super) enum NativeTrackPreparation {
     Invoke(super::track_process::TrackInvocation),
-    Idle,
-    Blocked(DriveSelectionRefusal),
+    /// The body is off the path's leading octant: turn it to this 8-bit
+    /// direction first.
+    TurnFirst(super::track_process::TrackInvocation, u8),
+    Idle(super::track_process::TrackInvocation),
+    Blocked(super::track_process::TrackInvocation, DriveSelectionRefusal),
 }
 
-/// Ordinary world execution hands off below the speed prefix. Geometry remains
-/// an admission/occupation adapter; only the locomotor TrackProgress is advanced.
+/// Ordinary world execution hands off below the speed prefix. Admission and
+/// execution use the locomotor TrackProgress and retained raw head.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn prepare_native_track(
     foot_occupation_enabled: &mut bool,
     replay: &mut crate::sim::components::FootPathQueue,
     target: &mut MovementTarget,
     position: &Position,
-    facing: u8,
-    facing_target: &mut Option<u8>,
-    geometry: &mut Option<DriveTrackState>,
+    facing: u16,
     drive: &mut Option<DriveLocomotionRuntime>,
     ship: &mut Option<ShipLocomotionRuntime>,
     locomotor: &Option<LocomotorState>,
@@ -1605,20 +776,30 @@ pub(super) fn prepare_native_track(
     occupation: &mut CellOccupationGrid,
     admission: DriveCellAdmission<'_>,
     layer: MovementLayer,
-    fresh_budget: i32,
 ) -> Option<NativeTrackPreparation> {
     use super::track_process::{TrackFamily, TrackInvocation};
     let kind = shared_track_kind(locomotor)?;
     if category == EntityCategory::Infantry {
         return None;
     }
+    // Ordinary Process4B0A75..4B0AAA /6A013E..6A0173 calls TrackProcess
+    // after fresh selection even when AL is false. Its entry, not fresh
+    // selection, clears residual when no valid descriptor/queue8 remains.
+    let mut invocation = TrackInvocation::after_process_movement(
+        entity_id,
+        if kind == LocomotorKind::Ship {
+            TrackFamily::Ship
+        } else {
+            TrackFamily::Drive
+        },
+    );
     let active = match kind {
         LocomotorKind::Drive => drive
             .as_ref()
-            .is_some_and(|state| state.track.turn_index >= 0 && state.head_to.is_some()),
+            .is_some_and(|state| state.track_valid && state.track.turn_index != -1),
         LocomotorKind::Ship => ship
             .as_ref()
-            .is_some_and(|state| state.track.turn_index >= 0 && state.head_to.is_some()),
+            .is_some_and(|state| state.track_valid && state.track.turn_index != -1),
         _ => false,
     };
     if !active {
@@ -1628,8 +809,6 @@ pub(super) fn prepare_native_track(
             target,
             position,
             facing,
-            facing_target,
-            geometry,
             drive,
             ship,
             &mut Some(occupation),
@@ -1640,288 +819,19 @@ pub(super) fn prepare_native_track(
         ) {
             FreshTrackOutcome::Installed => {}
             FreshTrackOutcome::TurnFirst(desired) => {
-                *facing_target = Some(desired);
-                return Some(NativeTrackPreparation::Idle);
+                return Some(NativeTrackPreparation::TurnFirst(invocation, desired));
             }
             FreshTrackOutcome::BlockedByOccupation(refusal) => {
-                return Some(NativeTrackPreparation::Blocked(refusal));
+                return Some(NativeTrackPreparation::Blocked(invocation, refusal));
             }
-            FreshTrackOutcome::None => return Some(NativeTrackPreparation::Idle),
+            FreshTrackOutcome::None => return Some(NativeTrackPreparation::Idle(invocation)),
         }
     }
-    Some(NativeTrackPreparation::Invoke(TrackInvocation {
-        entity_id,
-        family: if kind == LocomotorKind::Ship {
-            TrackFamily::Ship
-        } else {
-            TrackFamily::Drive
-        },
-        fresh_budget,
-    }))
+    invocation.apply_fresh_occupation = !active;
+    Some(NativeTrackPreparation::Invoke(invocation))
 }
 
-fn commit_paid_track_height(
-    position: &mut Position,
-    advance: &drive_track::DriveTrackAdvance,
-    on_bridge: bool,
-    terrain: Option<&ResolvedTerrainGrid>,
-    path_grid: Option<&PathGrid>,
-) {
-    let xy = [
-        i32::from(position.rx) * 256 + advance.sub_x.to_num::<i32>(),
-        i32::from(position.ry) * 256 + advance.sub_y.to_num::<i32>(),
-    ];
-    if let Some(z) = super::ground_pose::ground_surface_z_at(xy, on_bridge, terrain, path_grid) {
-        position.exact_z_leptons = Some(z);
-    }
-}
-
-/// A prior residual crossing may already have moved the object into the path
-/// node. Consume VERA's coordinate-based cursor only when a paid point follows;
-/// the residual transaction itself never performs this paid bookkeeping.
-fn consume_previously_reached_track_node(target: &mut MovementTarget, position: &Position) {
-    if target.path.get(target.next_index).copied() != Some((position.rx, position.ry)) {
-        return;
-    }
-    target.next_index += 1;
-    if let Some(&(nx, ny)) = target.path.get(target.next_index) {
-        let (dx, dy, len) = crate::util::lepton::cell_delta_to_lepton_dir(
-            i32::from(nx) - i32::from(position.rx),
-            i32::from(ny) - i32::from(position.ry),
-        );
-        target.move_dir_x = dx;
-        target.move_dir_y = dy;
-        target.move_dir_len = len;
-    }
-}
-
-fn apply_track_residual(
-    position: &mut Position,
-    track: &mut DriveTrackState,
-    advance: &drive_track::DriveTrackAdvance,
-) -> AdvanceResult {
-    position.sub_x = advance.sub_x;
-    position.sub_y = advance.sub_y;
-    if let Some(interp) = drive_track::interp_sub_step(
-        advance.sub_x,
-        advance.sub_y,
-        advance.next_step_delta_x,
-        advance.next_step_delta_y,
-        track.residual,
-        advance.had_next_step,
-    ) {
-        let cell_dx = interp.sub_x.to_num::<i32>().div_euclid(256);
-        let cell_dy = interp.sub_y.to_num::<i32>().div_euclid(256);
-        position.sub_x = interp.sub_x - SimFixed::from_num(cell_dx * 256);
-        position.sub_y = interp.sub_y - SimFixed::from_num(cell_dy * 256);
-        if cell_dx != 0 || cell_dy != 0 {
-            // Keep the track's reference frame aligned with the object cell
-            // that the caller commits. Future paid points must not cross twice.
-            track.cell_offset_x -= cell_dx * 256;
-            track.cell_offset_y -= cell_dy * 256;
-            return AdvanceResult::DriveTrackResidualCellJump { cell_dx, cell_dy };
-        }
-    }
-    AdvanceResult::DriveTrackActive
-}
-
-/// Shared ordinary terminal, including a freshly selected curve completed by
-/// retained budget in the same movement pass. Native copies Head_To, then
-/// SetHeight(0); no caller may substitute a cell center afterward.
-#[allow(clippy::too_many_arguments)]
-fn finish_shared_track(
-    position: &mut Position,
-    curve: &mut DriveTrackState,
-    kind: LocomotorKind,
-    drive_locomotion: &mut Option<DriveLocomotionRuntime>,
-    ship_locomotion: &mut Option<ShipLocomotionRuntime>,
-    on_bridge: bool,
-    terrain: Option<&ResolvedTerrainGrid>,
-    path_grid: Option<&PathGrid>,
-) -> Option<(i32, i32)> {
-    let head = match kind {
-        LocomotorKind::Drive => drive_locomotion.as_ref().and_then(|d| d.head_to),
-        LocomotorKind::Ship => ship_locomotion.as_ref().and_then(|s| s.head_to),
-        _ => None,
-    };
-    let (head_x, head_y) = if let Some(head) = head {
-        position.exact_z_leptons = Some(head.z);
-        (
-            head.x.wrapping_sub(i32::from(position.rx) * 256),
-            head.y.wrapping_sub(i32::from(position.ry) * 256),
-        )
-    } else {
-        // Legacy/test curves can lack retained instance state. Their exact
-        // curve anchor is still authoritative; raw1's last real point is
-        // three leptons short of the head, not the zero sentinel.
-        (
-            curve.head_offset_x + curve.cell_offset_x,
-            curve.head_offset_y + curve.cell_offset_y,
-        )
-    };
-    let cell_delta = (head_x.div_euclid(256), head_y.div_euclid(256));
-    position.sub_x = SimFixed::from_num(head_x - cell_delta.0 * 256);
-    position.sub_y = SimFixed::from_num(head_y - cell_delta.1 * 256);
-    if cell_delta != (0, 0) {
-        // A boundary-aligned head can cross after the last real point. Let the
-        // existing outer CellArrival transaction commit its list/path cell
-        // before any fresh selection reads Position as an origin. Ordinary
-        // movement's deferred cell cadence remains a separate parity gap.
-        curve.cell_offset_x -= cell_delta.0 * 256;
-        curve.cell_offset_y -= cell_delta.1 * 256;
-        return Some(cell_delta);
-    }
-    match kind {
-        LocomotorKind::Drive => {
-            if let Some(drive) = drive_locomotion {
-                drive.head_to = None;
-                drive.pending_track_occupation = false;
-                // Original terminal retirement4B210E precedes the next path
-                // selector/tube admission and preserves residual/short state.
-                drive.track.clear_selector();
-            }
-        }
-        LocomotorKind::Ship => {
-            if let Some(ship) = ship_locomotion {
-                ship.head_to = None;
-                ship.pending_track_occupation = false;
-                ship.track.clear_selector(); // Ship6A1751 counterpart.
-            }
-        }
-        _ => {}
-    }
-    super::ground_pose::commit_ground_height(position, on_bridge, terrain, path_grid);
-    None
-}
-
-fn advance_shared_track(
-    foot_occupation_enabled: &mut bool,
-    target: &mut MovementTarget,
-    path_runtime: &mut crate::sim::components::FootPathRuntime,
-    position: &mut Position,
-    facing: &mut u8,
-    facing_target: &mut Option<u8>,
-    drive_track_state: &mut Option<DriveTrackState>,
-    drive_locomotion: &mut Option<DriveLocomotionRuntime>,
-    ship_locomotion: &mut Option<ShipLocomotionRuntime>,
-    kind: LocomotorKind,
-    cell_occupation: &mut Option<&mut CellOccupationGrid>,
-    entity_id: u64,
-    current_occupation_layer: MovementLayer,
-    terrain: Option<&ResolvedTerrainGrid>,
-    path_grid: Option<&PathGrid>,
-    fresh_budget: i32,
-) -> AdvanceResult {
-    let Some(track_state) = drive_track_state else {
-        return AdvanceResult::ReadyForCrossings;
-    };
-    let prior_point_index = track_state.point_index;
-    let advance = match kind {
-        LocomotorKind::Drive => {
-            let drive = drive_locomotion.get_or_insert_with(Default::default);
-            let advance = drive_track::advance_drive_track_with_budget(
-                track_state,
-                fresh_budget,
-                &mut drive.track.residual,
-            );
-            drive.track.cursor = i32::from(track_state.point_index);
-            drive.track_valid = !advance.finished;
-            advance
-        }
-        LocomotorKind::Ship => {
-            let ship = ship_locomotion.get_or_insert_with(Default::default);
-            let advance = drive_track::advance_drive_track_with_budget(
-                track_state,
-                fresh_budget,
-                &mut ship.track.residual,
-            );
-            ship.track.cursor = i32::from(track_state.point_index);
-            advance
-        }
-        _ => return AdvanceResult::ReadyForCrossings,
-    };
-    if track_state.point_index != prior_point_index {
-        // Real forward progress clears the owner's impatience flag. gamemd does
-        // this on the first paid track point of a segment, in the same block
-        // that clears the raw occupation bit and the cell-occupation-enabled
-        // byte — repath success alone never clears it. Clearing here is what
-        // buys the mover a fresh BlockagePathDelay grace on its next block.
-        path_runtime.path_blocked = false;
-        if let (Some(drive), Some(occupation)) =
-            (drive_locomotion.as_mut(), cell_occupation.as_deref_mut())
-        {
-            crate::sim::occupancy::clear_current_drive_occupation_for_paid_point(
-                foot_occupation_enabled,
-                drive,
-                occupation,
-                entity_id,
-                (position.rx, position.ry),
-                current_occupation_layer,
-            );
-        }
-    }
-    *facing = advance.facing;
-    *facing_target = None;
-
-    if track_state.point_index != prior_point_index || advance.finished {
-        // Consume the old current cell before a paid point can leave it.
-        consume_previously_reached_track_node(target, position);
-    }
-
-    if advance.cell_jump {
-        position.sub_x = advance.sub_x;
-        position.sub_y = advance.sub_y;
-        return AdvanceResult::DriveTrackCellJump {
-            cell_dx: advance.cell_jump_dx,
-            cell_dy: advance.cell_jump_dy,
-        };
-    }
-
-    if track_state.point_index != prior_point_index || advance.finished {
-        commit_paid_track_height(
-            position,
-            &advance,
-            current_occupation_layer == MovementLayer::Bridge,
-            terrain,
-            path_grid,
-        );
-    }
-
-    if advance.chain_ready && target.next_index < target.path.len() {
-        position.sub_x = advance.sub_x;
-        position.sub_y = advance.sub_y;
-        return AdvanceResult::DriveTrackChainReady;
-    }
-
-    if advance.finished {
-        if let Some((cell_dx, cell_dy)) = finish_shared_track(
-            position,
-            track_state,
-            kind,
-            drive_locomotion,
-            ship_locomotion,
-            current_occupation_layer == MovementLayer::Bridge,
-            terrain,
-            path_grid,
-        ) {
-            return AdvanceResult::DriveTrackCellJump { cell_dx, cell_dy };
-        }
-        *drive_track_state = None;
-        return AdvanceResult::ReadyForCrossings;
-    }
-
-    apply_track_residual(
-        position,
-        drive_track_state.as_mut().expect("active track"),
-        &advance,
-    )
-}
-
-/// Advance sub_x/sub_y toward the next cell — either via drive track (smooth
-/// curve) or straight-line lepton vector. Includes infantry wobble seeding.
-///
-/// Takes individual entity fields to avoid borrow conflicts with
-/// `entity.movement_target` (which the caller holds as `ref mut target`).
+/// Walk75BD70 completes a retained subcell head within 17 world leptons.
 pub(super) fn completed_walk_head(
     position: &Position,
     locomotor: &Option<LocomotorState>,
@@ -1939,377 +849,37 @@ pub(super) fn completed_walk_head(
 }
 
 pub(super) fn advance_lepton_position(
-    foot_occupation_enabled: &mut bool,
-    path_replay: &mut crate::sim::components::FootPathQueue,
     target: &mut MovementTarget,
-    path_runtime: &mut crate::sim::components::FootPathRuntime,
     position: &mut Position,
-    facing: &mut u8,
-    facing_target: &mut Option<u8>,
-    drive_track_state: &mut Option<DriveTrackState>,
-    drive_locomotion: &mut Option<DriveLocomotionRuntime>,
-    ship_locomotion: &mut Option<ShipLocomotionRuntime>,
     locomotor: &mut Option<LocomotorState>,
-    category: EntityCategory,
     effective_speed: SimFixed,
-    frame_budget: i32,
     dt: SimFixed,
-    entity_id: u64,
-    mut cell_occupation: Option<&mut CellOccupationGrid>,
-    admission: DriveCellAdmission<'_>,
-    current_occupation_layer: MovementLayer,
-    path_grid: Option<&PathGrid>,
-    terrain: Option<&ResolvedTerrainGrid>,
 ) -> AdvanceResult {
-    let walk_xy_before = locomotor
-        .as_ref()
-        .filter(|loco| loco.kind == LocomotorKind::Walk)
-        .map(|_| super::ground_pose::position_world_xy(position));
-    if walk_xy_before.is_some()
-        && let Some(head) = locomotor.as_ref().and_then(LocomotorState::step_head)
-    {
-        let [x, y] = super::ground_pose::position_world_xy(position);
-        let dx = SimFixed::from_num(head.x.wrapping_sub(x));
-        let dy = SimFixed::from_num(head.y.wrapping_sub(y));
-        let distance = fixed_distance(dx, dy);
-        // Walk75BD70 tests the retained head BEFORE the next polar step.
-        // Crossing its cell boundary does not consume the queued step.
-        if distance < SimFixed::from_num(17) {
-            position.rx = (head.x / 256) as u16;
-            position.ry = (head.y / 256) as u16;
-            position.sub_x = SimFixed::from_num(head.x % 256);
-            position.sub_y = SimFixed::from_num(head.y % 256);
-            position.exact_z_leptons = Some(head.z);
-            super::path_markers::accept_path_replay(
-                path_replay,
-                (position.rx as i16, position.ry as i16),
-                1,
-            );
-            super::ground_pose::commit_ground_height(
-                position,
-                current_occupation_layer == MovementLayer::Bridge,
-                terrain,
-                path_grid,
-            );
-            configure_motion_after_transition(
-                path_replay,
-                target,
-                locomotor,
-                drive_track_state,
-                drive_locomotion,
-                ship_locomotion,
-                facing,
-                facing_target,
-                category,
-                0,
-                position,
-            );
-            if let Some(loco) = locomotor {
-                // FindSubCellDest(NULL)75BE18 retires the completed head
-                // before the world-capable PerCell2 call75BE3C.
-                loco.set_step_head(None);
-                loco.subcell_dest = Some((position.sub_x, position.sub_y));
-            }
-            return AdvanceResult::WalkStepCompleted;
-        }
-        target.move_dir_x = dx;
-        target.move_dir_y = dy;
-        target.move_dir_len = distance;
+    // Track and Walk coordinate execution have their own production owners.
+    if shared_track_kind(locomotor).is_some() {
+        return AdvanceResult::DriveTrackActive;
     }
-    if drive_track_state.is_some() {
-        let kind = shared_track_kind(locomotor).unwrap_or(LocomotorKind::Drive);
-        let fresh_budget = if kind == LocomotorKind::Drive {
-            movement_frame_budget_from_current_speed(effective_speed)
-        } else {
-            (effective_speed * dt).to_num::<i32>()
-        };
-        let advance = advance_shared_track(
-            foot_occupation_enabled,
-            target,
-            path_runtime,
-            position,
-            facing,
-            facing_target,
-            drive_track_state,
-            drive_locomotion,
-            ship_locomotion,
-            kind,
-            &mut cell_occupation,
-            entity_id,
-            current_occupation_layer,
-            terrain,
-            path_grid,
-            fresh_budget,
-        );
-        if !matches!(advance, AdvanceResult::ReadyForCrossings) {
-            return advance;
-        }
-        // Drive Process4B0647/4B0665/4B0AAA retries after terminal retirement
-        // in this same call. Process_Movement4B3298/4B3A4D leaves direction8
-        // for Process_Track's tube gate4B1297/4B12AE, before the paid loop;
-        // it must not become an ordinary octant.
-        // The host owns list/raw-mark removal, so expose that boundary before
-        // selecting another curve without re-running the movement prefix.
-        if let Some(tube_id) = super::tube_movement::pending_path_tube_id(
-            target,
-            position,
-            current_occupation_layer,
-            terrain,
-        ) {
-            return AdvanceResult::DriveTrackTubeReady(tube_id);
-        }
-        {
-            let shared_kind = shared_track_kind(locomotor);
-            let uses_drive_tracks = shared_kind.is_some();
-            let is_ship = shared_kind == Some(LocomotorKind::Ship);
-            if uses_drive_tracks
-                && category != EntityCategory::Infantry
-                && let Some(kind) = shared_kind
-            {
-                match select_fresh_drive_track_at_current_cell(
-                    foot_occupation_enabled,
-                    path_replay,
-                    target,
-                    position,
-                    *facing,
-                    facing_target,
-                    drive_track_state,
-                    drive_locomotion,
-                    ship_locomotion,
-                    &mut cell_occupation,
-                    admission,
-                    entity_id,
-                    current_occupation_layer,
-                    kind,
-                ) {
-                    FreshTrackOutcome::Installed => {
-                        return advance_shared_track(
-                            foot_occupation_enabled,
-                            target,
-                            path_runtime,
-                            position,
-                            facing,
-                            facing_target,
-                            drive_track_state,
-                            drive_locomotion,
-                            ship_locomotion,
-                            kind,
-                            &mut cell_occupation,
-                            entity_id,
-                            current_occupation_layer,
-                            terrain,
-                            path_grid,
-                            0,
-                        );
-                    }
-                    FreshTrackOutcome::TurnFirst(desired_facing) => {
-                        // No curve, no node, no step until the body is on the
-                        // head node's octant.
-                        *facing_target = Some(desired_facing);
-                        return AdvanceResult::DriveTrackActive;
-                    }
-                    FreshTrackOutcome::BlockedByOccupation(refusal) => {
-                        return AdvanceResult::DriveTrackFreshBlocked(refusal);
-                    }
-                    FreshTrackOutcome::None => {
-                        if is_ship && let Some(ship) = ship_locomotion.as_mut() {
-                            ship.head_to = None;
-                            ship.pending_track_occupation = false;
-                        }
-                    }
-                }
-            }
-            // Fall through to ReadyForCrossings — normal movement takes over.
-        }
-    } else {
-        let needs_drive_native_step = drive_locomotion.as_ref().is_some_and(|drive| {
-            drive_locomotion_helpers::drive_requires_native_step(drive, path_replay)
-        });
-        let shared_kind = shared_track_kind(locomotor);
-        let is_ship = shared_kind == Some(LocomotorKind::Ship);
-        let needs_ship_native_step = is_ship
-            && ship_locomotion
-                .as_ref()
-                .is_some_and(|_| !path_replay.remaining_directions().is_empty());
-        if needs_drive_native_step || needs_ship_native_step {
-            if target.next_index >= target.path.len() {
-                if let Some(drive) = drive_locomotion.as_mut() {
-                    drive.track.residual = 0;
-                    path_replay.cursor = path_replay.directions.len().min(u16::MAX as usize) as u16;
-                    path_replay.directions.clear();
-                }
-                return AdvanceResult::ReadyForCrossings;
-            }
-            let uses_drive_tracks = shared_kind.is_some();
-            if uses_drive_tracks
-                && category != EntityCategory::Infantry
-                && let Some(kind) = shared_kind
-            {
-                match select_fresh_drive_track_at_current_cell(
-                    foot_occupation_enabled,
-                    path_replay,
-                    target,
-                    position,
-                    *facing,
-                    facing_target,
-                    drive_track_state,
-                    drive_locomotion,
-                    ship_locomotion,
-                    &mut cell_occupation,
-                    admission,
-                    entity_id,
-                    current_occupation_layer,
-                    kind,
-                ) {
-                    FreshTrackOutcome::Installed => {
-                        return advance_shared_track(
-                            foot_occupation_enabled,
-                            target,
-                            path_runtime,
-                            position,
-                            facing,
-                            facing_target,
-                            drive_track_state,
-                            drive_locomotion,
-                            ship_locomotion,
-                            kind,
-                            &mut cell_occupation,
-                            entity_id,
-                            current_occupation_layer,
-                            terrain,
-                            path_grid,
-                            0,
-                        );
-                    }
-                    FreshTrackOutcome::TurnFirst(desired_facing) => {
-                        *facing_target = Some(desired_facing);
-                    }
-                    FreshTrackOutcome::BlockedByOccupation(refusal) => {
-                        return AdvanceResult::DriveTrackFreshBlocked(refusal);
-                    }
-                    FreshTrackOutcome::None => {
-                        if is_ship && let Some(ship) = ship_locomotion.as_mut() {
-                            ship.head_to = None;
-                            ship.pending_track_occupation = false;
-                        }
-                    }
-                }
-            }
-            return AdvanceResult::DriveTrackActive;
-        }
-        if shared_kind.is_some() && path_replay.reference_cell.is_some() {
-            // Once the Foot replay has been installed, its exhausted suffix
-            // cannot turn the physical A* adapter into an alternate locomotor.
-            // Drive/Ship admission must produce another native track first.
-            return AdvanceResult::DriveTrackActive;
-        }
-        // **VERA-internal, gamemd has no equivalent for the Walk arm.**
-        //
-        // `WalkLocomotionClass::ProcessMovement` @ `0x0075AEC0` has no
-        // whole-lepton quantizer: a walker takes a polar step. The facing is
-        // `ftol((atan2(cur.y - head.y, head.x - cur.x) - pi/2) *
-        // -10430.060040584269)` - note the **inverted Y** and the negative
-        // scale, both of which this project's N/S flip class turns on
-        // (`FILD`/`FISUB` pairs 0x0075BFED-0x0075C005, `FSUB [0x007E2820]`
-        // = pi/2, `FMUL [0x007E2818]`, ftol 0x0075C01C). The step is then
-        // `Sin`/`Cos` of `(facing16 - 0x3FFF) * -9.587672516830327e-05`
-        // (0x007E2810) scaled by `GetCurrentSpeed`, **subtracted** from the
-        // current coordinate (`FSUBR [ESP+0x1C]` at 0x0075C0A5) - and the
-        // step completes when the 2-D distance to
-        // the head falls under 17 leptons (`< 0x11`), snapping the coordinate
-        // through vtable `+0x1B4`. VERA has no Walk locomotor arm at all:
-        // infantry run through the generic `MovementTarget` interpolator, and
-        // this substitutes the frame budget on their behalf.
-        //
-        // Trigger: every infantry step. Player effect: the sub-lepton path
-        // shape and the exact tick a step completes follow a different rule
-        // than gamemd's, and a walker does not stay exactly on its facing
-        // ray. Frequency: continuous, for every infantryman in every match.
-        // Downstream risk: this is the substrate the rest of GSI-06.14 rests
-        // on, so closing it means a Walk locomotor arm, not a patch here.
-        let whole_lepton_result = locomotor
+    assert!(
+        !locomotor
             .as_ref()
-            .is_some_and(|locomotor| locomotor.kind == LocomotorKind::Walk);
-        let lepton_step = if whole_lepton_result {
-            SimFixed::from_num(frame_budget)
+            .is_some_and(|l| l.kind == LocomotorKind::Walk),
+        "Walk must execute its admitted paid step"
+    );
+    if target.move_dir_len > SIM_ZERO {
+        let frac = effective_speed * dt / target.move_dir_len;
+        let final_subcell = locomotor
+            .as_ref()
+            .and_then(|l| l.subcell_dest)
+            .filter(|_| target.next_index >= target.path.len());
+        if frac >= SIM_ONE
+            && let Some((x, y)) = final_subcell
+        {
+            position.sub_x = x;
+            position.sub_y = y;
         } else {
-            effective_speed * dt
-        };
-        if target.move_dir_len > SIM_ZERO {
-            let frac: SimFixed = lepton_step / target.move_dir_len;
-            // When walking to subcell_dest (path exhausted), clamp so we
-            // don't overshoot. Without this, frac > 1.0 makes the infantry
-            // walk past the destination and off the cell.
-            if frac >= SIM_ONE {
-                if let Some(loco) = locomotor {
-                    if let Some((dest_x, dest_y)) = loco.subcell_dest {
-                        if target.next_index >= target.path.len() {
-                            // Snap to destination — we'd overshoot this tick.
-                            position.sub_x = dest_x;
-                            position.sub_y = dest_y;
-                            // Fall through below.
-                            // The post-loop check will detect arrival and finish.
-                        }
-                    }
-                }
-                // For cell-to-cell movement, frac > 1.0 is normal — it means
-                // the entity crossed a cell boundary, handled by the crossing loop.
-                if target.next_index < target.path.len()
-                    || locomotor.as_ref().and_then(|l| l.subcell_dest).is_none()
-                {
-                    advance_straight_position(
-                        target,
-                        position,
-                        frame_budget,
-                        frac,
-                        whole_lepton_result,
-                    );
-                }
-            } else {
-                advance_straight_position(
-                    target,
-                    position,
-                    frame_budget,
-                    frac,
-                    whole_lepton_result,
-                );
-            }
+            position.sub_x += target.move_dir_x * frac;
+            position.sub_y += target.move_dir_y * frac;
         }
-
-        // Advance infantry wobble phase while walking.
-        // Original engine: WalkLocomotionClass accumulates wobble each tick
-        // via `wobble += 3.0 / (wobbleRate / turnRate)`.
-        if category == EntityCategory::Infantry {
-            if let Some(loco) = locomotor {
-                // Seed phase from entity ID on first tick so group members
-                // don't bob in sync — each starts at a different phase.
-                if loco.infantry_wobble_phase == 0.0 {
-                    loco.infantry_wobble_phase =
-                        (entity_id.wrapping_mul(2654435761) & 0xFFFF) as f32 / 0xFFFF as f32
-                            * std::f32::consts::TAU;
-                }
-                let dt_f32: f32 = dt.to_num::<f32>();
-                loco.infantry_wobble_phase += super::INFANTRY_WOBBLE_RATE * dt_f32;
-            }
-        }
-    }
-
-    // Walk same-cell SetCoords -> SetHeight(0) @ 0x75C20F/0x75C21C.
-    // Out-of-cell coordinates are provisional until admission succeeds;
-    // process_cell_crossings owns their height write before Mark(PUT).
-    if let Some(before) = walk_xy_before
-        && super::ground_pose::position_world_xy(position) != before
-        && position.sub_x >= SIM_ZERO
-        && position.sub_x < SimFixed::from_num(256)
-        && position.sub_y >= SIM_ZERO
-        && position.sub_y < SimFixed::from_num(256)
-    {
-        super::ground_pose::commit_ground_height(
-            position,
-            current_occupation_layer == MovementLayer::Bridge,
-            terrain,
-            path_grid,
-        );
     }
     AdvanceResult::ReadyForCrossings
 }
@@ -2322,6 +892,13 @@ pub(super) struct CrossingOutput {
     pub walk_head_admitted: bool,
     /// If set, the caller must handle deferred occupancy outside the entity borrow.
     pub deferred_cell_check: Option<DeferredCellCheck>,
+    /// If set, the mover was refused a second time at this cell by a wall it can
+    /// shoot, and the caller must run the wall-attack Override there.
+    ///
+    /// Deferred rather than fired inline: this function holds decomposed `&mut`
+    /// fields and has neither `&mut EntityStore` nor `&mut GameEntity`, and the
+    /// Override needs to write `mission`, `attack_target` and `navigation`.
+    pub deferred_wall_override: Option<(u16, u16)>,
     /// Bridge render state to apply after the loop. Predicate-driven; see movement_bridge.rs.
     pub pending_bridge_update: super::movement_bridge::BridgeStateUpdate,
     /// The resolved movement layer after all crossings.
@@ -2347,11 +924,8 @@ pub(super) fn process_cell_crossings(
     target: &mut MovementTarget,
     path_runtime: &mut crate::sim::components::FootPathRuntime,
     position: &mut Position,
-    facing: &mut u8,
-    facing_target: &mut Option<u8>,
-    body_facing: Option<super::FacingClass>,
+    body_facing: &super::FacingClass,
     locomotor: &mut Option<LocomotorState>,
-    drive_track_state: &mut Option<DriveTrackState>,
     drive_locomotion: &mut Option<DriveLocomotionRuntime>,
     ship_locomotion: &mut Option<ShipLocomotionRuntime>,
     sub_cell: &mut Option<u8>,
@@ -2364,14 +938,17 @@ pub(super) fn process_cell_crossings(
     entity_cost_grid: Option<&TerrainCostGrid>,
     mover_entity_blocks: Option<&BTreeSet<(u16, u16)>>,
     mover_entity_block_map: Option<&crate::sim::pathfinding::LayeredEntityBlockMap>,
-    live_building_entry_skips: &LiveBuildingEntrySkipMap,
+    live_building_entry_skips: &impl BuildingEntrySkipLookup,
     occupancy: &mut OccupancyGrid,
     cell_occupation: &mut CellOccupationGrid,
-    occupancy_enter_order: &mut u64,
-    next_occupancy_enter_order: &mut EnterOrderCounter,
     stats: &mut MovementTickStats,
     finished_entities: &mut Vec<u64>,
     rng: &mut SimRng,
+    // Borrowed for this call only. The wall arm needs it to resolve house names
+    // for the ally test, and a per-call borrow is what keeps it off
+    // `PathfindingContext`, which outlives the pass and would collide with the
+    // `&mut StringInterner` the pass still needs.
+    interner: &crate::sim::intern::StringInterner,
     ctx: PathfindingContext<'_>,
     mcfg: MovementConfig,
     sim_tick: u64,
@@ -2386,6 +963,7 @@ pub(super) fn process_cell_crossings(
     let mut walk_boundary = None;
     let mut debug_events: Vec<(u32, DebugEventKind)> = Vec::new();
     let mut deferred_cell_check: Option<DeferredCellCheck> = None;
+    let mut deferred_wall_override: Option<(u16, u16)> = None;
     let mut runtime_bridge_transition = snap.runtime_bridge_transition;
     let mut pending_bridge_update: super::movement_bridge::BridgeStateUpdate =
         super::movement_bridge::BridgeStateUpdate::Unchanged;
@@ -2443,6 +1021,18 @@ pub(super) fn process_cell_crossings(
             break;
         }
 
+        // The wall memo names the cell where a wall refused this mover on its
+        // previous attempt. The moment it attempts a different cell - because a
+        // repath found a detour - that refusal is stale, and a memo that outlived
+        // its cell would let the Override fire on a FIRST refusal later, skipping
+        // the repath native requires before its second evaluation.
+        if target
+            .wall_refusal_cell
+            .is_some_and(|cell| cell != (nx, ny))
+        {
+            target.wall_refusal_cell = None;
+        }
+
         let next_layer = target.layer_at(target.next_index);
         //75AECD..75AEF8 jumps past pathfind/admission when a head exists.
         //Only the no-head branch reaches CanEnter75B690 before75BC1A.
@@ -2475,22 +1065,20 @@ pub(super) fn process_cell_crossings(
                         LocomotorKind::Drive | LocomotorKind::Ship | LocomotorKind::Walk
                     )
                 }) {
-                    super::ground_pose::commit_ground_height(
+                    super::ground_pose::set_height(
                         position,
                         projected_on_bridge_state,
+                        0,
                         resolved_terrain,
                         path_grid,
                     );
                 }
-                *drive_track_state = None;
-                path_runtime.start_movement(mcfg.binary_frame, 0, walk);
-                let mover_is_crusher = snap.crush_capability().can_crush_units();
+                path_runtime.start_movement(mcfg.binary_frame, 0);
                 let evts = handle_blocked_tick(
                     path_replay,
                     target,
                     path_runtime,
-                    facing,
-                    body_facing,
+                    body_facing.current(mcfg.binary_frame),
                     &snap.locomotor,
                     drive_locomotion,
                     ship_locomotion,
@@ -2505,13 +1093,10 @@ pub(super) fn process_cell_crossings(
                     entity_cost_grid,
                     mover_entity_blocks,
                     mover_entity_block_map,
-                    snap.too_big_to_fit_under_bridge,
                     mcfg,
-                    rng,
                     sim_tick,
                     PATH_STUCK_INIT,
-                    mover_is_crusher,
-                    category == EntityCategory::Infantry,
+                    super::MoverPathFacts::from_snapshot(snap, 0),
                     snap.allow_zone_hierarchy,
                     true,
                     true,
@@ -2523,6 +1108,10 @@ pub(super) fn process_cell_crossings(
             }
 
             // --- Terrain walkability check (static map data) ---
+            // Set when the Ground arm refuses because of a wall this mover could
+            // shoot (`Can_Enter_Cell` 4 or 5 rather than 7). Recorded here and
+            // consumed by the refusal block; ledger row I9b.
+            let mut ground_wall_class: Option<u8> = None;
             let layer_walkable = match layer_context.terrain_layer {
                 MovementLayer::Ground => {
                     // Water movers (ships) bypass PathGrid — water cells are
@@ -2538,23 +1127,49 @@ pub(super) fn process_cell_crossings(
                     // sub-cell view of terrain objects has to hold here too —
                     // otherwise A* plans through a tree cell the step-in refuses
                     // and the mover block/repath-loops onto the identical route.
-                    let grid_ok: bool = match path_grid {
-                    Some(grid) => crate::sim::pathfinding::is_cell_passable_for_category_on_layer(
-                        grid,
-                        nx,
-                        ny,
-                        MovementLayer::Ground,
-                        Some(snap.movement_zone),
-                        snap.speed_type,
-                        resolved_terrain,
-                        cost_grid,
-                        target.bypass_grid,
-                        crate::sim::pathfinding::cell_entry::TerrainEntryMode::RuntimeTransition,
-                        category == EntityCategory::Infantry,
-                        snap.regular_crusher,
-                    ),
-                    None => true,
-                };
+                    // Result-preserving: the bool form flattens the wall
+                    // arm's 4 and 5 into the same refusal as a hard 7, and the
+                    // Override needs that distinction. With no wall tables the
+                    // context is `None` and this is the previous predicate
+                    // exactly - see `evaluate_cell_entry_for_category_on_layer`.
+                    let entry = match path_grid {
+                        Some(grid) => {
+                            crate::sim::pathfinding::evaluate_cell_entry_for_category_on_layer(
+                                grid,
+                                nx,
+                                ny,
+                                MovementLayer::Ground,
+                                Some(snap.movement_zone),
+                                snap.speed_type,
+                                resolved_terrain,
+                                cost_grid,
+                                target.bypass_grid
+                                    || snap.slave_deposit_cells.contains(&Some((nx, ny))),
+                                category == EntityCategory::Infantry,
+                                snap.crush_capability().wall_arm_crusher(),
+                                ctx.wall_tables.map(|tables| {
+                                    crate::sim::pathfinding::cell_entry::WallArmContext {
+                                        overlay_grid: tables.overlay_grid,
+                                        overlay_registry: tables.overlay_registry,
+                                        alliances: tables.alliances,
+                                        interner: Some(interner),
+                                        mover_owner: Some(snap.owner),
+                                        is_armed: snap.is_armed,
+                                        warhead_wall: snap.warhead_wall,
+                                        warhead_wood: snap.warhead_wood,
+                                    }
+                                }),
+                            )
+                        }
+                        None => crate::sim::pathfinding::cell_entry::CanEnterCellResult::Clear,
+                    };
+                    if let crate::sim::pathfinding::cell_entry::CanEnterCellResult::WallBlocked {
+                        cost_class,
+                    } = entry
+                    {
+                        ground_wall_class = Some(cost_class);
+                    }
+                    let grid_ok: bool = entry.is_clear();
                     let terrain_ok: bool = true;
                     layer_grid_ok = Some(grid_ok);
                     layer_terrain_ok = Some(terrain_ok);
@@ -2571,7 +1186,6 @@ pub(super) fn process_cell_crossings(
                         resolved_terrain,
                         entity_cost_grid,
                         target.bypass_grid,
-                        crate::sim::pathfinding::cell_entry::TerrainEntryMode::RuntimeTransition,
                     )
                 }),
                 MovementLayer::Air | MovementLayer::Underground => false,
@@ -2606,24 +1220,51 @@ pub(super) fn process_cell_crossings(
                         LocomotorKind::Drive | LocomotorKind::Ship | LocomotorKind::Walk
                     )
                 }) {
-                    super::ground_pose::commit_ground_height(
+                    super::ground_pose::set_height(
                         position,
                         projected_on_bridge_state,
+                        0,
                         resolved_terrain,
                         path_grid,
                     );
                 }
-                *drive_track_state = None;
+
+                // Wall arm (ledger I9b). `Can_Enter_Cell` answered 4 or 5: a wall
+                // this mover is armed against and whose warhead admits it. Native
+                // does not Override on the first refusal - it drops the path and
+                // retries within the same call (`0x004B3ADB` -> `0x004B4552`,
+                // `arg2 = 0`), and the Override at `0x004B3BE9` fires only when
+                // the repathed first step is refused 4/5 again. So the first
+                // refusal repaths exactly as any other block does, and only a
+                // repeat at the same cell attacks.
+                match ground_wall_class {
+                    Some(_) if target.wall_refusal_cell == Some((nx, ny)) => {
+                        // Second refusal at the same cell: attack it. No
+                        // `handle_blocked_tick` - that would scatter, re-arm the
+                        // blockage timer and start another repath, which is the
+                        // loop this arm exists to break.
+                        deferred_wall_override = Some((nx, ny));
+                        target.wall_refusal_cell = None;
+                        break;
+                    }
+                    Some(_) => {
+                        target.wall_refusal_cell = Some((nx, ny));
+                    }
+                    None => {
+                        // An ordinary block clears the memo, so two unrelated
+                        // refusals can never be read as a repeat.
+                        target.wall_refusal_cell = None;
+                    }
+                }
+
                 // Terrain-blocked (building/cliff) — the path is stale.
                 // Force immediate repath by clearing movement_delay.
-                path_runtime.start_movement(mcfg.binary_frame, 0, walk);
-                let mover_is_crusher = snap.crush_capability().can_crush_units();
+                path_runtime.start_movement(mcfg.binary_frame, 0);
                 let evts = handle_blocked_tick(
                     path_replay,
                     target,
                     path_runtime,
-                    facing,
-                    body_facing,
+                    body_facing.current(mcfg.binary_frame),
                     &snap.locomotor,
                     drive_locomotion,
                     ship_locomotion,
@@ -2638,13 +1279,10 @@ pub(super) fn process_cell_crossings(
                     entity_cost_grid,
                     mover_entity_blocks,
                     mover_entity_block_map,
-                    snap.too_big_to_fit_under_bridge,
                     mcfg,
-                    rng,
                     sim_tick,
                     PATH_STUCK_INIT,
-                    mover_is_crusher,
-                    category == EntityCategory::Infantry,
+                    super::MoverPathFacts::from_snapshot(snap, 0),
                     snap.allow_zone_hierarchy,
                     true, // terrain block: skip code-2 grace period
                     true,
@@ -2667,7 +1305,7 @@ pub(super) fn process_cell_crossings(
                     // structural deck cell whose permission is clear — a damaged span, or
                     // one carrying a terrain object — reads as ordinary terrain here. A
                     // mover on the deck now carries `ground + 4` (the native height model,
-                    // `FootClass::Set_Height_On_Bridge` 0x005F5FA0), so against that cell's
+                    // `ObjectClass::SetHeight` 0x005F5FA0), so against that cell's
                     // terrain level the difference is exactly the deck delta and the mover
                     // is stopped mid-span as if it had walked off a cliff. Reading the
                     // structural flag as well keeps the deck a deck regardless of the
@@ -2690,22 +1328,20 @@ pub(super) fn process_cell_crossings(
                                 LocomotorKind::Drive | LocomotorKind::Ship | LocomotorKind::Walk
                             )
                         }) {
-                            super::ground_pose::commit_ground_height(
+                            super::ground_pose::set_height(
                                 position,
                                 projected_on_bridge_state,
+                                0,
                                 resolved_terrain,
                                 path_grid,
                             );
                         }
-                        *drive_track_state = None;
-                        path_runtime.start_movement(mcfg.binary_frame, 0, walk);
-                        let mover_is_crusher = snap.crush_capability().can_crush_units();
+                        path_runtime.start_movement(mcfg.binary_frame, 0);
                         let evts = handle_blocked_tick(
                             path_replay,
                             target,
                             path_runtime,
-                            facing,
-                            body_facing,
+                            body_facing.current(mcfg.binary_frame),
                             &snap.locomotor,
                             drive_locomotion,
                             ship_locomotion,
@@ -2720,13 +1356,10 @@ pub(super) fn process_cell_crossings(
                             entity_cost_grid,
                             mover_entity_blocks,
                             mover_entity_block_map,
-                            snap.too_big_to_fit_under_bridge,
                             mcfg,
-                            rng,
                             sim_tick,
                             PATH_STUCK_INIT,
-                            mover_is_crusher,
-                            category == EntityCategory::Infantry,
+                            super::MoverPathFacts::from_snapshot(snap, 0),
                             snap.allow_zone_hierarchy,
                             true, // cliff block: skip code-2 grace period
                             true,
@@ -2819,9 +1452,10 @@ pub(super) fn process_cell_crossings(
             .as_ref()
             .is_some_and(|loco| loco.kind == LocomotorKind::Walk)
         {
-            super::ground_pose::commit_ground_height(
+            super::ground_pose::set_height(
                 position,
                 projected_on_bridge_state,
+                0,
                 resolved_terrain,
                 path_grid,
             );
@@ -2846,7 +1480,6 @@ pub(super) fn process_cell_crossings(
                     y: position.sub_y.to_num::<i32>(),
                 },
             ));
-            *occupancy_enter_order = next_occupancy_enter_order.next();
             occupancy.move_entity_layered(
                 old_rx,
                 old_ry,
@@ -2872,8 +1505,6 @@ pub(super) fn process_cell_crossings(
                 drive_locomotion,
                 foot_occupation_enabled,
                 sub_cell,
-                occupancy_enter_order,
-                next_occupancy_enter_order,
                 occupancy,
                 cell_occupation,
                 stats,
@@ -2895,19 +1526,7 @@ pub(super) fn process_cell_crossings(
             loco.set_step_head(None);
         }
 
-        configure_motion_after_transition(
-            path_replay,
-            target,
-            locomotor,
-            drive_track_state,
-            drive_locomotion,
-            ship_locomotion,
-            facing,
-            facing_target,
-            category,
-            snap.rot,
-            position,
-        );
+        configure_motion_after_transition(target, locomotor, category, position);
 
         // Pre-allocate subcell in the NEXT path cell for infantry direction targeting.
         // FindSubCellDest reserves a subcell in the destination cell before walking,
@@ -2956,6 +1575,7 @@ pub(super) fn process_cell_crossings(
     }
 
     CrossingOutput {
+        deferred_wall_override,
         walk_boundary,
         walk_head_admitted,
         deferred_cell_check,

@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use vera20k::assets::asset_manager::AssetManager;
+use vera20k::assets::asset_manager::{AssetManager, MediaArchiveMode};
 use vera20k::assets::pal_file::Palette;
 use vera20k::assets::shp_file::ShpFile;
 use vera20k::map::map_file;
@@ -31,9 +31,10 @@ fn print_overlay_id_mapping_for_dustbowl() {
         return;
     }
 
-    let asset_manager: AssetManager = AssetManager::new(ra2_dir).expect("asset manager");
+    let asset_manager: AssetManager =
+        AssetManager::new(ra2_dir, MediaArchiveMode::STOCK_DIGITAL).expect("asset manager");
     let map_path = ra2_dir.join("Dustbowl.mmx");
-    let map = map_file::load_mmx(&map_path).expect("load Dustbowl.mmx");
+    let map = map_file::load_from_path(&map_path).expect("load Dustbowl.mmx");
 
     let (rules_bytes, source) = asset_manager
         .get_with_source("rulesmd.ini")
@@ -82,15 +83,15 @@ fn print_overlay_id_mapping_for_dustbowl() {
                 found_any = true;
                 println!("  id={:3} count={:4} name={}", id, count, name);
                 if let Some(sec) = rules_ini.section(name) {
-                    let tib_type = sec.get("TiberiumType").unwrap_or("(none)");
-                    let image = sec.get("Image").unwrap_or("(none)");
-                    let tib_flag = sec.get("Tiberium").unwrap_or("(none)");
+                    let tib_type = sec.read_name("TiberiumType", 0x80).unwrap_or("(none)");
+                    let image = sec.read_name("Image", 0x80).unwrap_or("(none)");
+                    let tib_flag = sec.read_name("Tiberium", 0x80).unwrap_or("(none)");
                     println!(
                         "    [{}] Tiberium={} TiberiumType={} Image={}",
                         name, tib_flag, tib_type, image
                     );
                     if let Some(tib_sec) = rules_ini.section(tib_type) {
-                        let color = tib_sec.get("Color").unwrap_or("(none)");
+                        let color = tib_sec.read_name("Color", 0x80).unwrap_or("(none)");
                         println!("    [{}] Color={}", tib_type, color);
                     }
                 }
@@ -109,8 +110,8 @@ fn print_overlay_id_mapping_for_dustbowl() {
 
     for name in ["LOBRDG27", "FENCE21", "LOBRDG26", "FENCE20"] {
         if let Some(sec) = rules_ini.section(name) {
-            let image = sec.get("Image").unwrap_or("(none)");
-            let theater = sec.get("Theater").unwrap_or("(none)");
+            let image = sec.read_name("Image", 0x80).unwrap_or("(none)");
+            let theater = sec.read_name("Theater", 0x80).unwrap_or("(none)");
             println!("Rule [{}]: Image={} Theater={}", name, image, theater);
         } else {
             println!("Rule [{}]: (missing section)", name);
@@ -182,7 +183,8 @@ fn inspect_tib20_frames() {
         return;
     }
 
-    let asset_manager: AssetManager = AssetManager::new(ra2_dir).expect("asset manager");
+    let asset_manager: AssetManager =
+        AssetManager::new(ra2_dir, MediaArchiveMode::STOCK_DIGITAL).expect("asset manager");
     let mut found_any = false;
 
     let pal_data = asset_manager
@@ -260,7 +262,8 @@ fn inspect_problem_overlay_assets() {
         return;
     }
 
-    let asset_manager: AssetManager = AssetManager::new(ra2_dir).expect("asset manager");
+    let asset_manager: AssetManager =
+        AssetManager::new(ra2_dir, MediaArchiveMode::STOCK_DIGITAL).expect("asset manager");
     for name in [
         "lobrdg27.tem",
         "LOBRDG27.tem",
@@ -296,7 +299,8 @@ fn inspect_problem_overlay_frames() {
         return;
     }
 
-    let asset_manager: AssetManager = AssetManager::new(ra2_dir).expect("asset manager");
+    let asset_manager: AssetManager =
+        AssetManager::new(ra2_dir, MediaArchiveMode::STOCK_DIGITAL).expect("asset manager");
     for name in ["LOBRDG27.tem", "FENCE21.tem"] {
         let data = asset_manager.get(name).expect("overlay asset");
         let shp = ShpFile::from_bytes(&data).expect("parse shp");
@@ -327,7 +331,8 @@ fn dump_raw_overlaytypes_ranges() {
         return;
     }
 
-    let asset_manager: AssetManager = AssetManager::new(ra2_dir).expect("asset manager");
+    let asset_manager: AssetManager =
+        AssetManager::new(ra2_dir, MediaArchiveMode::STOCK_DIGITAL).expect("asset manager");
     let (rules_bytes, source) = asset_manager
         .get_with_source("rulesmd.ini")
         .or_else(|| asset_manager.get_with_source("rules.ini"))
@@ -339,14 +344,14 @@ fn dump_raw_overlaytypes_ranges() {
     println!("Raw OverlayTypes key->name around 95..110:");
     for i in 95..=110 {
         let k = i.to_string();
-        let v = section.get(&k).unwrap_or("(none)");
+        let v = section.read_name(&k, 0x80).unwrap_or("(none)");
         println!("  key {:3} => {}", i, v);
     }
 
     println!("Raw OverlayTypes key->name around 164..172:");
     for i in 164..=172 {
         let k = i.to_string();
-        let v = section.get(&k).unwrap_or("(none)");
+        let v = section.read_name(&k, 0x80).unwrap_or("(none)");
         println!("  key {:3} => {}", i, v);
     }
 
@@ -363,13 +368,16 @@ fn dump_raw_overlaytypes_ranges() {
         }
     }
     for i in 0..=max_key {
-        if section.get(&i.to_string()).is_none() {
+        if !section.is_present(&i.to_string()) {
             missing_keys.push(i);
         }
     }
     println!("Total keys: {}, max_key: {}", total_keys, max_key);
     println!("Missing keys in 0..{}: {:?}", max_key, missing_keys);
-    println!("Raw key 0 => {}", section.get("0").unwrap_or("(missing)"));
+    println!(
+        "Raw key 0 => {}",
+        section.read_name("0", 0x80).unwrap_or("(missing)")
+    );
 
     let reg = OverlayTypeRegistry::from_ini(&rules_ini, None);
     println!("Registry len: {}", reg.len());
@@ -393,9 +401,10 @@ fn compare_overlay_index_modes() {
         return;
     }
 
-    let asset_manager: AssetManager = AssetManager::new(ra2_dir).expect("asset manager");
+    let asset_manager: AssetManager =
+        AssetManager::new(ra2_dir, MediaArchiveMode::STOCK_DIGITAL).expect("asset manager");
     let map_path = ra2_dir.join("Dustbowl.mmx");
-    let map = map_file::load_mmx(&map_path).expect("load Dustbowl.mmx");
+    let map = map_file::load_from_path(&map_path).expect("load Dustbowl.mmx");
     let (rules_bytes, _) = asset_manager
         .get_with_source("rulesmd.ini")
         .or_else(|| asset_manager.get_with_source("rules.ini"))
@@ -417,7 +426,7 @@ fn compare_overlay_index_modes() {
         let mut tiberium: u32 = 0;
         for (id, count) in &ids {
             let key = (*id as u16 + offset).to_string();
-            match section.get(&key) {
+            match section.read_name(&key, 0x80) {
                 Some(name) => {
                     mapped += *count;
                     let up = name.to_ascii_uppercase();
@@ -456,7 +465,8 @@ fn yr_overlay_registry_matches_ra2_resource_families() {
         return;
     }
 
-    let asset_manager: AssetManager = AssetManager::new(ra2_dir).expect("asset manager");
+    let asset_manager: AssetManager =
+        AssetManager::new(ra2_dir, MediaArchiveMode::STOCK_DIGITAL).expect("asset manager");
     let (rules_bytes, _) = asset_manager
         .get_with_source("rulesmd.ini")
         .or_else(|| asset_manager.get_with_source("rules.ini"))
@@ -484,7 +494,8 @@ fn inspect_tib01_palette_indices() {
         return;
     }
 
-    let asset_manager: AssetManager = AssetManager::new(ra2_dir).expect("asset manager");
+    let asset_manager: AssetManager =
+        AssetManager::new(ra2_dir, MediaArchiveMode::STOCK_DIGITAL).expect("asset manager");
 
     // --- Load TIB01.tem SHP ---
     let shp_data = asset_manager
@@ -624,7 +635,7 @@ fn inspect_tib01_palette_indices() {
     println!("\n[Tiberiums] section:");
     if let Some(tib_sec) = rules_ini.section("Tiberiums") {
         for key in tib_sec.keys() {
-            let val = tib_sec.get(key).unwrap_or("(empty)");
+            let val = tib_sec.read_name(key, 0x80).unwrap_or("(empty)");
             println!("  {}={}", key, val);
         }
     } else {
@@ -635,7 +646,7 @@ fn inspect_tib01_palette_indices() {
     println!("\n[Riparius] section:");
     if let Some(rip_sec) = rules_ini.section("Riparius") {
         for key in rip_sec.keys() {
-            let val = rip_sec.get(key).unwrap_or("(empty)");
+            let val = rip_sec.read_name(key, 0x80).unwrap_or("(empty)");
             println!("  {}={}", key, val);
         }
     } else {
@@ -684,9 +695,10 @@ fn dustbowl_overlay_168_stays_non_resource() {
         return;
     }
 
-    let asset_manager: AssetManager = AssetManager::new(ra2_dir).expect("asset manager");
+    let asset_manager: AssetManager =
+        AssetManager::new(ra2_dir, MediaArchiveMode::STOCK_DIGITAL).expect("asset manager");
     let map_path = ra2_dir.join("Dustbowl.mmx");
-    let map = map_file::load_mmx(&map_path).expect("load Dustbowl.mmx");
+    let map = map_file::load_from_path(&map_path).expect("load Dustbowl.mmx");
     let (rules_bytes, _) = asset_manager
         .get_with_source("rulesmd.ini")
         .or_else(|| asset_manager.get_with_source("rules.ini"))
@@ -708,9 +720,10 @@ fn print_overlay_id_mapping_for_goldst() {
         return;
     }
 
-    let asset_manager: AssetManager = AssetManager::new(ra2_dir).expect("asset manager");
+    let asset_manager: AssetManager =
+        AssetManager::new(ra2_dir, MediaArchiveMode::STOCK_DIGITAL).expect("asset manager");
     let map_path = ra2_dir.join("GoldSt.mmx");
-    let map = match map_file::load_mmx(&map_path) {
+    let map = match map_file::load_from_path(&map_path) {
         Ok(map) => map,
         Err(err) => {
             println!("SKIP: could not load GoldSt.mmx: {err}");
@@ -767,7 +780,8 @@ fn inspect_pips_shp() {
         return;
     }
 
-    let asset_manager: AssetManager = AssetManager::new(ra2_dir).expect("asset manager");
+    let asset_manager: AssetManager =
+        AssetManager::new(ra2_dir, MediaArchiveMode::STOCK_DIGITAL).expect("asset manager");
 
     // Load the unit palette to show actual RGB colors for pip indices.
     let pal = asset_manager

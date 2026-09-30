@@ -4,10 +4,14 @@
 //! each tick. Drive/Ship slope interpolation is owned separately by locomotor
 //! runtime payload state.
 //!
-//! # DEAD SUBSYSTEM (GSI-08.14) — no producer and no consumer
+//! # The crash spin is live; the rocker is still dead (GSI-08.14)
 //!
-//! [`tick`] runs every frame from `World::advance_tick` Phase 2.5, but nothing
-//! in the build writes an impulse into it and nothing reads the angles back out:
+//! `FootClass::Crash @ 0x004DEBB0` writes a crashing object's spin rates
+//! (`sim::world::crash`), [`tick`]'s crashing branch
+//! ([`rocking_system::advance_crash_spin`], `RockingUpdate 0x0070B63D`)
+//! integrates them, and the unit renderer draws the angles through Fly
+//! Draw_Matrix's crashing arm (`render::vxl_raster`). Everything below is about
+//! the ordinary damped rocker, which still has no producer and no consumer:
 //!
 //! - **No producer.** [`apply_rocker_impulse`] has no caller outside this
 //!   module's tests. gamemd reaches `TechnoClass::ApplyRocker` (vtable `+0x3D8`
@@ -15,10 +19,11 @@
 //!   `CALL [reg+0x3D8]` census over all 1.16M instructions in the image:
 //!   `BulletClass::DetonateAtCoord @ 0x004699A1` (`DirectRocker=`, zero stock
 //!   authors), `Apply_area_damage @ 0x00489DFF`/`0x00489E3E` (`Rocker=`, 18
-//!   stock warheads), and `WarpAttachClass::UpdateAttack @ 0x0062A21C` (the
-//!   Chrono Legionnaire erase impulse, force `1.5`, one RNG draw for the
-//!   lateral sign). `FootClass::ReceiveEMP @ 0x004DECF0` writes the velocities
-//!   directly instead. **Firing never rocks the body** — there is no
+//!   stock warheads), and `ParasiteClass::AI @ 0x0062A21C` (a parasite bite
+//!   on a non-Infantry victim, force `1.5`; its lateral-sign RNG draw at
+//!   `0x0062A17F` is taken in `combat/parasite.rs`).
+//!   `FootClass::ReceiveEMP @ 0x004DECF0` writes the velocities directly
+//!   instead. **Firing never rocks the body** — there is no
 //!   `ApplyRocker` site in `Fire_At`, and none in any crush or deploy path.
 //! - **No consumer.** `grep` over `render/` and `app/` finds no read of
 //!   `GameEntity::rocking`, so even a correct impulse would tilt nothing, and

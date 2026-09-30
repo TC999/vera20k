@@ -1,13 +1,9 @@
 use super::*;
 
-use std::collections::BTreeMap;
-
-use crate::map::bridge_facts::{
-    Axis, BRIDGE_FLAG_ANCHOR_SELF, BridgeCellFacts, BridgeheadAnchorClass,
-};
+use crate::map::bridge_facts::BRIDGE_FLAG_ANCHOR_SELF;
 use crate::map::entities::EntityCategory;
 use crate::map::playfield::PlayfieldBounds;
-use crate::map::resolved_terrain::{RadarColorMetadata, ResolvedTerrainCell, ResolvedTerrainGrid};
+use crate::map::resolved_terrain::{RadarColorMetadata, ResolvedTerrainCell};
 use crate::map::terrain::build_terrain_grid_from_resolved;
 use crate::render::minimap_projection::MinimapPlayfieldProjection;
 use crate::render::radar_terrain_updates::{
@@ -15,12 +11,8 @@ use crate::render::radar_terrain_updates::{
 };
 use crate::rules::ini_parser::IniFile;
 use crate::rules::ruleset::RuleSet;
-use crate::rules::terrain_rules::{SpeedCostProfile, TerrainClass};
-use crate::sim::bridge_state::{
-    AnchorSpan, BridgeCellRole, BridgeDamageEvent, BridgeRuntimeCell, BridgeRuntimeState,
-    DamageState, Direction,
-};
-use crate::sim::combat::AttackTarget;
+use crate::rules::terrain_rules::TerrainClass;
+use crate::sim::bridge_state::{BridgeDamageEvent, BridgeRuntimeState};
 use crate::sim::command::Command;
 use crate::sim::components::Health;
 use crate::sim::game_entity::GameEntity;
@@ -48,82 +40,20 @@ fn bounds() -> PlayfieldBounds {
 fn cell(rx: u16, ry: u16) -> ResolvedTerrainCell {
     let in_flood = FLOOD.contains(&(rx, ry));
     ResolvedTerrainCell {
-        rx,
-        ry,
         source_tile_index: if in_flood { 42 } else { 0 },
-        source_sub_tile: 0,
         final_tile_index: if in_flood { 42 } else { 0 },
-        final_sub_tile: 0,
-        is_wood_bridge_repair_tile: false,
         level: 4,
-        filled_clear: false,
-        tileset_index: Some(0),
-        land_type: 0,
-        yr_cell_land_type: 0,
-        slope_type: 0,
-        template_height: 0,
-        height_in_pixels: 0,
-        render_offset_x: 0,
-        render_offset_y: 0,
-        terrain_class: TerrainClass::Clear,
-        speed_costs: SpeedCostProfile::default(),
-        is_water: false,
-        is_cliff_like: false,
-        is_rough: false,
-        is_road: false,
         accepts_smudge: true,
-        allows_tiberium: false,
-        variant: 0,
-        has_ramp: false,
-        canonical_ramp: None,
-        ground_walk_blocked: false,
-        terrain_object_blocks: false,
-        terrain_object_occupation: None,
-        overlay_blocks: false,
-        overlay_zone_type: None,
-        outside_playfield: false,
-        zone_type: 0,
-        base_ground_walk_blocked: false,
-        base_build_blocked: false,
-        base_land_type: 0,
-        base_yr_cell_land_type: 0,
         base_terrain_class: TerrainClass::Clear,
-        base_speed_costs: SpeedCostProfile::default(),
-        build_blocked: false,
-        has_bridge_deck: false,
-        bridge_walkable: false,
-        bridge_transition: false,
-        bridge_deck_level: 0,
-        bridge_layer: None,
-        bridge_facts: BridgeCellFacts::default(),
-        tube_index: None,
         radar_left: [20, 40, 60],
         radar_right: [7, 8, 9],
         has_damaged_data: in_flood,
-        bridgehead_anchor_class_at_load: None,
-    }
-}
-
-fn bridge_cell(role: BridgeCellRole, span: Option<u16>, overlay_byte: u8) -> BridgeRuntimeCell {
-    BridgeRuntimeCell {
-        deck_present: true,
-        destroyable: true,
-        deck_level: 4,
-        bridge_group_id: Some(1),
-        damage_state: DamageState::Healthy { variant: 0 },
-        axis: Some(Axis::NS),
-        role,
-        anchor_span_id: span,
-        overlay_byte,
-        bridgehead_anchor_class: BridgeheadAnchorClass::Variant0,
+        ..crate::map::resolved_terrain::test_flat_cell(rx, ry)
     }
 }
 
 fn simulation_fixture() -> (Simulation, crate::map::terrain::TerrainGrid) {
-    let cells = (0..SIDE)
-        .flat_map(|ry| (0..SIDE).map(move |rx| cell(rx, ry)))
-        .collect();
-    let mut terrain = ResolvedTerrainGrid::from_cells(SIDE, SIDE, cells);
+    let mut terrain = crate::map::resolved_terrain::test_grid(SIDE, SIDE, |rx, ry| cell(rx, ry));
     // Native572230 selects pavement from the raw tile independently of its
     // overlay-state write. Give synthetic tile42 the retail relative identity
     // BridgeBottomRight1=3 with BridgeSet base40; an overlay alone is not enough.
@@ -164,38 +94,18 @@ fn simulation_fixture() -> (Simulation, crate::map::terrain::TerrainGrid) {
             },
         );
     }
-    let grid = build_terrain_grid_from_resolved(&terrain, None, None);
-    let mut bridge_state = BridgeRuntimeState::from_resolved_terrain(&terrain, true, 1500);
-    bridge_state.test_seed_cell(
-        CENTER.0,
-        CENTER.1,
-        bridge_cell(BridgeCellRole::Anchor, Some(1), 24),
-    );
-    for &(rx, ry) in &FLOOD {
-        let overlay = if (rx, ry) == FLOOD[0] { 0xD1 } else { 0 };
-        bridge_state.test_seed_cell(rx, ry, bridge_cell(BridgeCellRole::Anchor, None, overlay));
+    // Ordinary high 0xD1 identities on the perpendicular anchor and the
+    // repair start (CellClass+44).
+    for (rx, ry) in [FLOOD[0], REPAIR_START] {
+        terrain.cell_mut(rx, ry).unwrap().bridge_facts.overlay_id = Some(0xD1);
     }
-    bridge_state.test_seed_cell(
-        REPAIR_START.0,
-        REPAIR_START.1,
-        bridge_cell(BridgeCellRole::Anchor, None, 0xD1),
+    let grid = build_terrain_grid_from_resolved(&terrain, None, None);
+    let bridge_state = BridgeRuntimeState::from_resolved_terrain_with_map_size(
+        &terrain,
+        true,
+        1500,
+        (bounds().base, 40),
     );
-    bridge_state.test_seed_anchor_span(AnchorSpan {
-        id: 1,
-        anchor: CENTER,
-        cells: [
-            Some(CENTER),
-            Some((25, 24)),
-            Some((25, 23)),
-            Some((25, 22)),
-            Some((25, 26)),
-            None,
-        ],
-        axis: Axis::NS,
-        direction: Direction::N,
-        damage_state: DamageState::Healthy { variant: 0 },
-        bridge_group_id: 1,
-    });
 
     let mut sim = Simulation::new();
     sim.resolved_terrain = Some(terrain);
@@ -216,7 +126,6 @@ fn projection(
         Some(bounds()),
         Some(CurrentRadarCellAuthority::new(
             sim.resolved_terrain.as_ref(),
-            sim.bridge_state.as_ref(),
             sim.overlay_grid.as_ref(),
             None,
             None,
@@ -265,7 +174,6 @@ fn present_runtime_projection(
                 },
                 CurrentRadarCellAuthority::new(
                     view.resolved_terrain(),
-                    view.bridge_state(),
                     view.overlay_grid(),
                     Some(&runtime.resources.overlay_registry),
                     Some(&runtime.resources.rules),
@@ -287,8 +195,8 @@ fn present_runtime_projection(
     )
 }
 
-fn production_rules() -> RuleSet {
-    RuleSet::from_ini(&IniFile::from_str(
+fn production_ini() -> IniFile {
+    let mut ini = IniFile::from_str(
         "[InfantryTypes]\n0=ENGI\n\n\
          [VehicleTypes]\n0=MTNK\n\n\
          [AircraftTypes]\n\n\
@@ -300,8 +208,19 @@ fn production_rules() -> RuleSet {
          [105mm]\nDamage=1501\nROF=50\nRange=6\nWarhead=AP\n\n\
          [AP]\nWall=yes\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n\n\
          [AudioVisual]\nRepairBridgeSound=BridgeRepaired\n",
-    ))
-    .expect("production bridge damage/repair rules")
+    );
+    let mut terrain_and_overlays = String::from(
+        "[Clear]\nFoot=100%\nTrack=100%\nWheel=100%\n\
+         [Road]\nFoot=100%\nTrack=100%\nWheel=100%\n[OverlayTypes]\n",
+    );
+    for id in 0..=238 {
+        terrain_and_overlays.push_str(&format!("{id}=O{id}\n"));
+    }
+    for id in 0..=238 {
+        terrain_and_overlays.push_str(&format!("[O{id}]\nNoUseTileLandType=no\n"));
+    }
+    ini.merge(&IniFile::from_str(&terrain_and_overlays));
+    ini
 }
 
 fn spawn(
@@ -311,7 +230,7 @@ fn spawn(
     category: EntityCategory,
     cell: (u16, u16),
     z: u8,
-    health: u16,
+    health: i32,
     facing: u8,
 ) -> u64 {
     let owner = sim.interner.intern(owner_name);
@@ -324,10 +243,7 @@ fn spawn(
         z,
         facing,
         owner,
-        Health {
-            current: health,
-            max: health,
-        },
+        Health { current: health },
         type_ref,
         category,
         0,
@@ -346,29 +262,22 @@ fn spawn(
 #[test]
 fn gsi_04_01_production_tick_keeps_pavement_damage_through_ordinary_overlay_repair() {
     let (mut sim, grid) = simulation_fixture();
-    let rules = production_rules();
+    let ini = production_ini();
+    let rules = RuleSet::from_ini(&ini).expect("production bridge damage/repair rules");
+    sim.intern_rule_type_ids(&rules);
     sim.resolve_type_handles(&rules);
     let attacker = spawn(
         &mut sim,
         "Americans",
         "MTNK",
         EntityCategory::Unit,
-        CENTER,
+        (CENTER.0 - 2, CENTER.1),
         4,
         10_000,
         64,
     );
-    let target = spawn(
-        &mut sim,
-        "Soviets",
-        "TARGB",
-        EntityCategory::Structure,
-        CENTER,
-        4,
-        10_000,
-        192,
-    );
-    sim.add_entity_occupancy(target);
+    // This regression attacks the bridge deck. A ground-level building below
+    // it lies outside native Apply_area_damage's structural height window.
     let owner = sim.interner.get("Americans").expect("owner interned");
     sim.fog = crate::sim::vision::FogState {
         width: SIDE,
@@ -376,16 +285,22 @@ fn gsi_04_01_production_tick_keeps_pavement_damage_through_ordinary_overlay_repa
         ..Default::default()
     };
     crate::sim::vision::reveal_radius(&mut sim.fog, owner, CENTER.0, CENTER.1, 6);
-    sim.substrate
-        .entities
-        .get_mut(attacker)
-        .expect("attacker")
-        .attack_target = Some(AttackTarget::new(target));
+    assert!(sim.apply_command(
+        "Americans",
+        &Command::ForceAttackCell {
+            attacker_id: attacker,
+            target_rx: CENTER.0,
+            target_ry: CENTER.1,
+        },
+        Some(&rules),
+    ));
     let mut radar = projection(&sim, &grid);
     let mut last_generation = 0;
     assert_eq!(raw_pair(&radar, FLOOD[0]), [PRISTINE; 2]);
 
     let mut runtime = SimRuntime::from_simulation(sim);
+    runtime.resources.overlay_registry =
+        crate::map::overlay_types::OverlayTypeRegistry::from_ini(&ini, None);
     runtime.resources.rules = rules;
     let mut fire_count = 0;
     for _ in 0..32 {
@@ -412,7 +327,7 @@ fn gsi_04_01_production_tick_keeps_pavement_damage_through_ordinary_overlay_repa
             .simulation
             .fog
             .is_cell_visible(owner, CENTER.0, CENTER.1),
-        runtime.simulation.tactical_registration_order(),
+        runtime.simulation.logic_order(),
     );
     assert_eq!(runtime.simulation.radar_terrain_dirty_generation, 3);
     let mut uploaded_rgba = Vec::new();
@@ -444,6 +359,34 @@ fn gsi_04_01_production_tick_keeps_pavement_damage_through_ordinary_overlay_repa
     }
     assert!(runtime.simulation.radar_terrain_dirty_cells.is_empty());
 
+    // Supply the ordinary strip's actual Cell overlay identities and native
+    // map inputs before the independent repair command. The old fixture had
+    // only legacy runtime overlay bytes and no playfield/Foot terrain rows;
+    // that cannot enter a hut through Foot+2CC / +1AC or select57F200 repair.
+    runtime.simulation.playfield_bounds = Some(bounds());
+    runtime.simulation.playfield_size_height = Some(40);
+    let terrain_rules = crate::rules::terrain_rules::TerrainRules::from_ini(&ini);
+    let clear_costs = terrain_rules
+        .semantics_for_land_type(0)
+        .unwrap()
+        .speed_costs;
+    let terrain = runtime.simulation.resolved_terrain.as_mut().unwrap();
+    for cell in &mut terrain.cells {
+        cell.speed_costs = clear_costs;
+        cell.base_speed_costs = clear_costs;
+    }
+    terrain.test_set_high_bridge_set_starts(Some(40), Some(200));
+    crate::map::resolved_terrain::install_ordinary_repair_test_catalog(terrain);
+    let mut overlays = crate::sim::overlay_grid::OverlayGrid::new(SIDE, SIDE);
+    for point in [FLOOD[0], REPAIR_START] {
+        terrain
+            .cell_mut(point.0, point.1)
+            .unwrap()
+            .bridge_facts
+            .overlay_id = Some(0xD1);
+        overlays.write_bridge_overlay_identity(point.0, point.1, 0xD1);
+    }
+    runtime.simulation.overlay_grid = Some(overlays);
     let cabhut = spawn(
         &mut runtime.simulation,
         "Soviets",
@@ -487,7 +430,6 @@ fn gsi_04_01_production_tick_keeps_pavement_damage_through_ordinary_overlay_repa
             .simulation
             .rebuild_dynamic_navigation(&runtime.resources.rules)
     );
-    let grid = runtime.simulation.path_grid_snapshot();
     assert!(runtime.simulation.apply_command(
         "Americans",
         &Command::CaptureBuilding {
@@ -495,10 +437,7 @@ fn gsi_04_01_production_tick_keeps_pavement_damage_through_ordinary_overlay_repa
             target_building_id: cabhut,
         },
         Some(&runtime.resources.rules),
-        grid.as_deref(),
-        &BTreeMap::new(),
     ));
-    drop(grid);
     for _ in 0..100 {
         let _ = runtime
             .advance_frame(&[], 67, TickLane::Ordinary)
@@ -522,6 +461,19 @@ fn gsi_04_01_production_tick_keeps_pavement_damage_through_ordinary_overlay_repa
             .get(engineer)
             .is_none(),
         "the engineer enters the hut and is consumed by the repair"
+    );
+    let repaired = runtime
+        .simulation
+        .resolved_terrain
+        .as_ref()
+        .unwrap()
+        .cell(REPAIR_START.0, REPAIR_START.1)
+        .unwrap()
+        .bridge_facts
+        .overlay_id;
+    assert!(
+        matches!(repaired, Some(205..=208)),
+        "ordinary strip changed: {repaired:?}"
     );
     // Original ordinary strip repair has no56E990 clear/radar callback.
     // Its overlay change must not publish pristine pavement or a fake batch.
@@ -565,7 +517,7 @@ fn gsi_04_01_bridge_collapse_publishes_variant_preorder_before_setter_radar() {
             damage: 1,
             warhead_ref: Default::default(),
             is_ion_cannon: true,
-            impact_z: 4,
+            impact_z_leptons: 8 * 104, // Ground level4 plus the structural deck.
         }],
     );
 

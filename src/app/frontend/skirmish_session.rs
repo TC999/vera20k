@@ -27,11 +27,13 @@ use crate::skirmish_persistence::{
 use crate::ui::main_menu::SkirmishCountry;
 use crate::ui::skirmish_shell::{
     PlayerNameEditState, SkirmishAiRowType, SkirmishShellState, SkirmishTrackbarId,
+    game_speed_from_visual_position, game_speed_visual_position,
 };
 
 const RA2MD_INI: &str = "RA2MD.INI";
 const CONCRETE_ITEM_DATA: i32 = -1;
 const RANDOM_ITEM_DATA: i32 = -2;
+const MULTIPLAYER_HANDLE_UNITS: usize = 0x14;
 const MULTIPLAYER_HANDLE_LIMIT_BYTES: usize = 19;
 const DEFAULT_MULTIPLAYER_HANDLE: &[u8] = b"[New Player]";
 const DEFAULT_MULTIPLAYER_GAME_MODE: i32 = 1;
@@ -193,18 +195,17 @@ impl OfflineSkirmishRuntime {
             .filter(|index| *index < maps.len())
             .unwrap_or(0);
 
-        let (speed_min, speed_max, _) = state
-            .trackbar_bounds
-            .range(SkirmishTrackbarId::GameSpeed0x529);
-        let (credits_min, credits_max, _) = state
-            .trackbar_bounds
-            .range(SkirmishTrackbarId::Credits0x511);
-        let (units_min, units_max, _) = state
-            .trackbar_bounds
-            .range(SkirmishTrackbarId::UnitCount0x50c);
-        state.game_speed = clamp_between(self.snapshot.game_speed, speed_min, speed_max);
-        state.starting_credits = clamp_between(self.snapshot.credits, credits_min, credits_max);
-        state.unit_count = clamp_between(self.snapshot.unit_count, units_min, units_max);
+        // `SkirmishDialog__OnSetup497` hands each saved value to its fresh
+        // slider through `TBM_SETRANGE` and `TBM_SETPOS`.
+        let bounds = state.trackbar_bounds;
+        let speed = bounds.range(SkirmishTrackbarId::GameSpeed0x529);
+        let credits = bounds.range(SkirmishTrackbarId::Credits0x511);
+        let units = bounds.range(SkirmishTrackbarId::UnitCount0x50c);
+        state.game_speed = game_speed_from_visual_position(
+            speed.set_up(game_speed_visual_position(self.snapshot.game_speed)),
+        );
+        state.starting_credits = credits.set_up(self.snapshot.credits);
+        state.unit_count = units.set_up(self.snapshot.unit_count);
         state.short_game = self.snapshot.short_game;
         state.super_weapons = self.snapshot.super_weapons_allowed;
         state.build_off_ally = self.snapshot.build_off_ally;
@@ -610,7 +611,7 @@ fn pack_snapshot_slots(snapshot: &mut SkirmishPersistedSnapshot, state: &Skirmis
 
 fn pack_snapshot_options(snapshot: &mut SkirmishPersistedSnapshot, state: &SkirmishShellState) {
     snapshot.game_speed = state.game_speed;
-    snapshot.credits = state.starting_credits;
+    snapshot.credits = state.credits();
     snapshot.unit_count = state.unit_count;
     snapshot.short_game = state.short_game;
     snapshot.super_weapons_allowed = state.super_weapons;
@@ -640,7 +641,7 @@ pub(crate) fn skirmish_global_defaults(state: &SkirmishShellState) -> SkirmishGl
         game_mode: state.selected_mode_id,
         scenario_index: i32::try_from(state.selected_map_idx).unwrap_or(0),
         game_speed: state.game_speed,
-        credits: state.starting_credits,
+        credits: state.credits(),
         unit_count: state.unit_count,
         short_game: state.short_game,
         super_weapons_allowed: state.super_weapons,
@@ -694,36 +695,45 @@ fn read_local_multiplayer_preferences(bytes: &[u8]) -> LocalMultiplayerPreferenc
         return preferences;
     };
 
-    if let Some(mut handle_bytes) = section
-        .get("Handle")
-        .and_then(decode_multiplayer_handle_bytes)
-    {
-        handle_bytes.truncate(MULTIPLAYER_HANDLE_LIMIT_BYTES);
+    // `SessionClass` reader at 0x006980C0: `ReadCommaHexUTF16(0x14)` over the
+    // `TXT_NONAME` default. The visible units become handle bytes by their low
+    // byte, and a handle that ends up empty keeps the current one.
+    let default_handle: Vec<u16> = preferences
+        .handle_bytes
+        .iter()
+        .map(|byte| u16::from(*byte))
+        .collect();
+    let handle_bytes: Vec<u8> = section
+        .read_comma_hex_utf16("Handle", &default_handle, MULTIPLAYER_HANDLE_UNITS)
+        .into_iter()
+        .map(|unit| unit as u8)
+        .take_while(|byte| *byte != 0)
+        .take(MULTIPLAYER_HANDLE_LIMIT_BYTES)
+        .collect();
+    if !handle_bytes.is_empty() {
         preferences.handle_bytes = handle_bytes;
     }
-    if let Some(country) = section.get("Side").and_then(|side| {
+    // `Side` is the 0x80-byte ReadString + HouseType index helper at
+    // 0x00475540 (`_stricmp` on the type IDs, `<random>` is -2, other names
+    // allocate a type). Only the ten country IDs have a Rust value here; any
+    // other name keeps the current country.
+    if let Some(country) = section.read_name("Side", 0x80).and_then(|side| {
         SkirmishCountry::ALL
             .into_iter()
-            .find(|country| country.country_name().eq_ignore_ascii_case(side.trim()))
+            .find(|country| country.country_name().eq_ignore_ascii_case(side))
     }) {
         preferences.country = country;
     }
-    if let Some(color_index) = section
-        .get_i32("Color")
-        .and_then(|value| usize::try_from(value).ok())
+    let color = section.read_int("Color", -1);
+    if let Some(color_index) = usize::try_from(color)
+        .ok()
         .filter(|value| *value < crate::skirmish_launch::HOUSE_COLOR_COUNT)
     {
         preferences.color_index = color_index;
     }
-    if let Some(side_ex) = section.get_i32("SideEx") {
-        preferences.side_ex = side_ex;
-    }
-    if let Some(color_ex) = section.get_i32("ColorEx") {
-        preferences.color_ex = color_ex;
-    }
-    if let Some(game_mode) = section.get_i32("GameMode") {
-        preferences.game_mode = game_mode;
-    }
+    preferences.side_ex = section.read_int("SideEx", preferences.side_ex);
+    preferences.color_ex = section.read_int("ColorEx", preferences.color_ex);
+    preferences.game_mode = section.read_int("GameMode", DEFAULT_MULTIPLAYER_GAME_MODE);
 
     preferences
 }
@@ -751,42 +761,11 @@ fn menu_country_from_launch(country: LaunchCountry) -> SkirmishCountry {
     }
 }
 
-fn decode_multiplayer_handle_bytes(value: &str) -> Option<Vec<u8>> {
-    let mut bytes = Vec::new();
-    for part in value.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let unit = u32::from_str_radix(part, 16).ok()? as u16;
-        let byte = unit as u8;
-        if byte == 0 {
-            break;
-        }
-        bytes.push(byte);
-    }
-
-    if bytes.is_empty() {
-        return None;
-    }
-    Some(bytes)
-}
-
-#[cfg(test)]
-fn decode_multiplayer_handle(value: &str) -> Option<String> {
-    decode_multiplayer_handle_bytes(value)
-        .map(|bytes| crate::util::native_string::acp_decode(&bytes))
-}
-
 fn is_cooperative_mode(session: &SkirmishLaunchSession) -> bool {
     session
         .mode
         .override_file
         .eq_ignore_ascii_case("MPCoopMD.ini")
-}
-
-fn clamp_between(value: i32, left: i32, right: i32) -> i32 {
-    value.clamp(left.min(right), left.max(right))
 }
 
 fn ai_row_type_from_persisted(value: i32) -> SkirmishAiRowType {
@@ -828,9 +807,8 @@ fn cooperative_country_roster_from_rules(
         .into_iter()
         .map(|country| {
             let id = country.country_name();
-            let name = rules
-                .section(id)
-                .and_then(|section| section.get("Name"));
+            // AbstractTypeClass::ReadINI reads `Name` into 0x31 bytes (0x00410AA0).
+            let name = rules.section_or_empty(id).read_name("Name", 0x31);
             CooperativeCountryRosterEntry::new(id, name)
         })
         .collect()
@@ -850,7 +828,6 @@ const _: [(); SKIRMISH_PERSISTED_SLOT_COUNT] = [(); crate::skirmish_launch::SKIR
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::map::briefing::BriefingSection;
     use crate::map::preview::PreviewSection;
     use crate::skirmish_launch::{
         AiDifficulty, LaunchStartPosition, LaunchTeam, SkirmishAiSlot, SkirmishLaunchMode,
@@ -863,7 +840,6 @@ mod tests {
             file_name: file_name.to_string(),
             display_name: "Test".to_string(),
             author: None,
-            briefing: BriefingSection::default(),
             preview: PreviewSection::default(),
             multiplayer_start_waypoints: Vec::new(),
             player_capacity: 8,
@@ -884,6 +860,7 @@ mod tests {
 
     fn mode() -> SkirmishGameMode {
         SkirmishGameMode {
+            class: crate::skirmish_modes::MpModeClass::Battle,
             id: 1,
             ui_name_key: "GUI:Battle".to_string(),
             tooltip_key: "STT:ModeBattle".to_string(),
@@ -897,6 +874,7 @@ mod tests {
 
     fn cooperative_mode() -> SkirmishGameMode {
         SkirmishGameMode {
+            class: crate::skirmish_modes::MpModeClass::Cooperative,
             override_file: "MPCoopMD.ini".to_string(),
             ..mode()
         }
@@ -1067,14 +1045,17 @@ Credits=12345\r\n";
             let bytes = std::fs::read(&path).expect("persisted profile");
             let ini = IniFile::from_bytes(&bytes).expect("profile INI");
             assert_eq!(
-                ini.section("Skirmish").unwrap().get("Credits"),
+                ini.section("Skirmish").unwrap().get_for_test("Credits"),
                 Some(credits.to_string().as_str())
             );
             assert_eq!(
-                ini.section("Options").unwrap().get("ScrollRate"),
+                ini.section("Options").unwrap().get_for_test("ScrollRate"),
                 Some(scroll_rate.to_string().as_str())
             );
-            assert_eq!(ini.section("Unrelated").unwrap().get("Key"), Some("kept"));
+            assert_eq!(
+                ini.section("Unrelated").unwrap().get_for_test("Key"),
+                Some("kept")
+            );
             assert!(bytes.starts_with(b"; keep this comment"));
         }
 
@@ -1123,6 +1104,48 @@ Credits=12345\r\n";
             pre_fill_house_roster:
                 crate::skirmish_launch::PreFillHouseRoster::from_compact_skirmish(1),
             options: SkirmishLaunchOptions::default(),
+        }
+    }
+
+    #[test]
+    fn saved_slider_values_reach_the_sliders_through_the_native_setup() {
+        // `SkirmishDialog__OnSetup497` sets each fresh slider's range, then
+        // its saved value; `TBM_SETPOS` ignores a value outside the range
+        // (executed in `tools/storage_oracle/launcher_trackbar.py`).
+        let Some(rules) = crate::rules::retail_ini_fixture::retail_ini("rulesmd.ini") else {
+            return;
+        };
+        let bounds =
+            crate::ui::skirmish_shell::SkirmishTrackbarBounds::from_multiplayer_dialog_settings(
+                &rules,
+            );
+        for ((credits, units, speed), expected) in [
+            ((7549, 4, 2), (7549, 7500, 4, 2)),
+            ((20000, 15, 9), (10000, 10000, 0, 6)),
+            ((4999, -1, -1), (10000, 10000, 0, 6)),
+        ] {
+            let mut snapshot = SkirmishPersistedSnapshot::from_global_defaults(defaults());
+            snapshot.credits = credits;
+            snapshot.unit_count = units;
+            snapshot.game_speed = speed;
+            let mut runtime = runtime(snapshot, 7);
+            let mut shell = SkirmishShellState::default();
+            shell.trackbar_bounds = bounds;
+            runtime.hydrate_shell(&mut shell, &[map()], &[mode()]);
+            assert_eq!(
+                (
+                    shell.starting_credits,
+                    shell.credits(),
+                    shell.unit_count,
+                    shell.game_speed
+                ),
+                expected,
+                "saved {credits} {units} {speed}"
+            );
+            // The game starts with, and the settings keep, what the slider
+            // reads back (`0x006AD742..0x006AD79E`).
+            runtime.pack_shell_snapshot(&shell, &[map()], &[mode()]);
+            assert_eq!(runtime.snapshot().credits, expected.1);
         }
     }
 
@@ -1463,25 +1486,23 @@ Credits=12345\r\n";
     #[test]
     fn malformed_multiplayer_preferences_fall_back_independently() {
         let preferences = read_local_multiplayer_preferences(
-            b"[MultiPlayer]\nHandle=not-hex,\nColor=99\nSide=UnknownCountry\n",
+            b"[MultiPlayer]\nHandle=100,41,\nColor=99\nSide=UnknownCountry\n",
         );
         assert_eq!(preferences, LocalMultiplayerPreferences::default());
-        assert_eq!(decode_multiplayer_handle(""), None);
+        let handle = |value: &str| {
+            read_local_multiplayer_preferences(
+                format!("[MultiPlayer]\nHandle={value}\n").as_bytes(),
+            )
+            .handle_bytes
+        };
+        assert_eq!(handle(""), DEFAULT_MULTIPLAYER_HANDLE);
+        assert_eq!(handle("41,00,42,"), b"A");
+        assert_eq!(handle("e9,"), [0xe9]);
+        assert_eq!(handle("20ac,"), [0xac]);
         assert_eq!(
-            decode_multiplayer_handle("41,00,42,"),
-            Some("A".to_string())
+            handle(&"41,".repeat(25)),
+            [b'A'; MULTIPLAYER_HANDLE_LIMIT_BYTES]
         );
-        assert_eq!(decode_multiplayer_handle("e9,"), Some("\u{e9}".to_string()));
-        #[cfg(windows)]
-        assert_eq!(
-            decode_multiplayer_handle("80,"),
-            Some("\u{20ac}".to_string())
-        );
-        assert_eq!(
-            decode_multiplayer_handle("20ac,"),
-            Some("\u{ac}".to_string())
-        );
-        assert_eq!(decode_multiplayer_handle("100,41,"), None);
     }
 
     #[test]
@@ -1663,7 +1684,10 @@ Credits=12345\r\n";
 
         let mut first = runtime.random_map_options_for_setup();
         assert_eq!(first.seed, expected_seed);
-        assert_eq!(runtime.scenario_rng.logical_state(), reference.logical_state());
+        assert_eq!(
+            runtime.scenario_rng.logical_state(),
+            reference.logical_state()
+        );
 
         first.resources = 3;
         first.num_players = 7;
@@ -1705,7 +1729,10 @@ Credits=12345\r\n";
         }
         runtime.replay_random_map_preview_construction(&trace);
 
-        assert_eq!(runtime.scenario_rng.logical_state(), reference.logical_state());
+        assert_eq!(
+            runtime.scenario_rng.logical_state(),
+            reference.logical_state()
+        );
     }
 
     #[test]

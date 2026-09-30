@@ -2,15 +2,12 @@
 //!
 //! Extracted from production_placement.rs for file-size limits.
 
-use std::collections::BTreeMap;
-
 use crate::map::entities::EntityCategory;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::find_nearby_cell::{
     NearbyAnchorGate, NearbyFootprint, NearbyQuery, NearbySearchOptions, PassabilityArgs,
     RADIUS_HARD_CAP, find_nearby_passable_cell_with_options,
 };
-use crate::sim::pathfinding::PathGrid;
 use crate::sim::world::{PlacementEvidence, Simulation};
 
 use super::production_tech::foundation_dimensions;
@@ -42,8 +39,6 @@ pub(crate) fn spawn_completed_refinery_free_units(
     sim: &mut Simulation,
     completed_building_ids: &[u64],
     rules: &RuleSet,
-    path_grid: Option<&PathGrid>,
-    height_map: &BTreeMap<(u16, u16), u8>,
     overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
 ) -> bool {
     let mut any_spawned = false;
@@ -83,8 +78,6 @@ pub(crate) fn spawn_completed_refinery_free_units(
             ry,
             width,
             height,
-            path_grid,
-            height_map,
             overlay_registry,
         );
     }
@@ -102,8 +95,6 @@ fn try_spawn_refinery_free_unit(
     building_ry: u16,
     width: u16,
     height: u16,
-    path_grid: Option<&PathGrid>,
-    height_map: &BTreeMap<(u16, u16), u8>,
     overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
 ) -> bool {
     if !rules.is_refinery_type(building_type_id) {
@@ -114,9 +105,6 @@ fn try_spawn_refinery_free_unit(
         return false;
     };
     let free_unit_type = free_unit_type.to_owned();
-    let refund = rules
-        .object(&free_unit_type)
-        .map_or(0, |object| object.cost.max(0));
 
     let primary = primary_free_unit_cell(building_rx, building_ry, width, height);
     // Both nearby searches are seeded from the building's NORTH-WEST footprint cell —
@@ -129,10 +117,7 @@ fn try_spawn_refinery_free_unit(
     // the primary target; it is overwritten by whichever attempt commits, and the
     // object is not on the map until one does.
     let (initial_rx, initial_ry) = primary.unwrap_or(search_seed);
-    let initial_z = height_map
-        .get(&(initial_rx, initial_ry))
-        .copied()
-        .unwrap_or(0);
+    let initial_z = sim.terrain_cell_level(initial_rx, initial_ry).unwrap_or(0);
     let Some(free_unit_id) = sim.spawn_object_limbo_at_height(
         &free_unit_type,
         owner,
@@ -142,7 +127,7 @@ fn try_spawn_refinery_free_unit(
         initial_z,
         rules,
     ) else {
-        refund_failed_free_unit(sim, owner, refund);
+        let refund = refund_free_unit(sim, rules, owner, &free_unit_type);
         log::warn!(
             "Completed refinery {} could not construct free unit {}; refunded {} to {}",
             building_type_id,
@@ -162,7 +147,6 @@ fn try_spawn_refinery_free_unit(
             FREE_UNIT_FACING_PRIMARY,
             rules,
             building_id,
-            height_map,
             overlay_registry,
         )
     {
@@ -182,14 +166,9 @@ fn try_spawn_refinery_free_unit(
     // refused, and each search runs here — after the primary has failed — rather
     // than being precomputed, so it sees the occupancy the placement will meet.
     for options in FREE_UNIT_FALLBACK_ATTEMPTS {
-        let Some((fallback_rx, fallback_ry)) = find_free_unit_nearby_cell(
-            sim,
-            rules,
-            &free_unit_type,
-            search_seed,
-            path_grid,
-            options,
-        ) else {
+        let Some((fallback_rx, fallback_ry)) =
+            find_free_unit_nearby_cell(sim, rules, &free_unit_type, search_seed, options)
+        else {
             continue;
         };
         if try_place_free_unit(
@@ -200,7 +179,6 @@ fn try_spawn_refinery_free_unit(
             FREE_UNIT_FACING_FALLBACK,
             rules,
             building_id,
-            height_map,
             overlay_registry,
         ) {
             log::info!(
@@ -216,7 +194,7 @@ fn try_spawn_refinery_free_unit(
     }
 
     // gamemd refunds before uninitializing the constructed UnitClass.
-    refund_failed_free_unit(sim, owner, refund);
+    let refund = refund_free_unit(sim, rules, owner, &free_unit_type);
     sim.uninit_with_rules(free_unit_id, rules);
     log::warn!(
         "Completed refinery {} could not place free unit {}; refunded {} to {}",
@@ -236,7 +214,6 @@ fn try_place_free_unit(
     facing: u8,
     rules: &RuleSet,
     producer_id: u64,
-    height_map: &BTreeMap<(u16, u16), u8>,
     overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
 ) -> bool {
     // BuildingClass::OnConstructionComplete @ 0x00445F80 invokes the newly
@@ -253,7 +230,7 @@ fn try_place_free_unit(
         rx,
         ry,
         facing,
-        height_map.get(&(rx, ry)).copied().unwrap_or(0),
+        sim.terrain_cell_level(rx, ry).unwrap_or(0),
         PlacementEvidence::EvaluateMark,
         rules,
         overlay_registry,
@@ -262,9 +239,31 @@ fn try_place_free_unit(
     .is_some()
 }
 
-fn refund_failed_free_unit(sim: &mut Simulation, owner: &str, refund: i32) {
-    let credits = super::credits_entry_for_owner(sim, owner);
-    *credits = credits.saturating_add(refund.max(0));
+/// A free unit that cannot be made or placed pays its house its GetRefund with
+/// `full` set ([`super::type_refund`]; `0x00446E71..0x00446E8F`,
+/// `0x00446EB9..0x00446EDD`) through `HouseClass::Add_Credits @ 0x004F9950`.
+/// Returns the amount credited.
+fn refund_free_unit(sim: &mut Simulation, rules: &RuleSet, owner: &str, unit_type: &str) -> i32 {
+    let Some(owner_id) = sim.interner.get(owner) else {
+        return 0;
+    };
+    let refund = match (
+        rules.object(unit_type),
+        sim.houses.get(&owner_id),
+        sim.house_cost_factors(owner_id),
+    ) {
+        (Some(object), Some(house), Some(factors)) => super::type_refund(
+            rules,
+            object,
+            house,
+            &factors,
+            sim.session.game_mode_nonzero,
+            true,
+        ),
+        _ => return 0,
+    };
+    crate::sim::credit_income::add_credits(sim, owner_id, refund);
+    refund
 }
 
 fn primary_free_unit_cell(
@@ -295,7 +294,6 @@ fn find_free_unit_nearby_cell(
     rules: &RuleSet,
     free_unit_type: &str,
     seed: (u16, u16),
-    path_grid: Option<&PathGrid>,
     options: NearbySearchOptions,
 ) -> Option<(u16, u16)> {
     let free_unit = rules.object(free_unit_type)?;
@@ -344,7 +342,7 @@ fn find_free_unit_nearby_cell(
         // is the hard cap itself on any playable map.
         radius_cap: RADIUS_HARD_CAP,
         target_cell: None,
-        path_grid,
+        path_grid: sim.path_grid(),
         resolved_terrain: sim.resolved_terrain.as_ref(),
         overlay_grid: sim.overlay_grid.as_ref(),
         occupancy: Some(&sim.substrate.occupancy),

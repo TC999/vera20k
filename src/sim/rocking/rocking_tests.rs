@@ -386,86 +386,20 @@ fn out_of_range_velocity_runs_away_not_inward() {
 use crate::map::resolved_terrain::{ResolvedTerrainCell, ResolvedTerrainGrid};
 use crate::rules::ini_parser::IniFile;
 use crate::rules::ruleset::RuleSet;
-use crate::rules::terrain_rules::{SpeedCostProfile, TerrainClass};
 use crate::sim::pathfinding::PathGrid;
 use crate::sim::world::Simulation;
-use std::collections::BTreeMap;
 
 const GRID_W: u16 = 10;
 const GRID_H: u16 = 10;
 const TICK_MS: u32 = 33;
 
 fn flat_terrain(width: u16, height: u16) -> ResolvedTerrainGrid {
-    let mut cells = Vec::with_capacity((width as usize) * (height as usize));
-    let speed_costs = SpeedCostProfile {
-        foot: Some(100),
-        track: Some(100),
-        wheel: Some(100),
-        float: Some(100),
-        amphibious: Some(100),
-        float_beach: Some(100),
-        hover: Some(100),
-    };
-    for y in 0..height {
-        for x in 0..width {
-            cells.push(ResolvedTerrainCell {
-                rx: x,
-                ry: y,
-                source_tile_index: 0,
-                source_sub_tile: 0,
-                final_tile_index: 0,
-                final_sub_tile: 0,
-                is_wood_bridge_repair_tile: false,
-                level: 0,
-                filled_clear: true,
-                tileset_index: Some(0),
-                land_type: 0,
-                yr_cell_land_type: 0,
-                slope_type: 0,
-                template_height: 0,
-                render_offset_x: 0,
-                render_offset_y: 0,
-                terrain_class: TerrainClass::Clear,
-                speed_costs,
-                is_water: false,
-                is_cliff_like: false,
-                height_in_pixels: 0,
-                variant: 0,
-                is_rough: false,
-                is_road: false,
-                accepts_smudge: false,
-                allows_tiberium: false,
-                has_ramp: false,
-                canonical_ramp: None,
-                ground_walk_blocked: false,
-                terrain_object_blocks: false,
-                terrain_object_occupation: None,
-                overlay_blocks: false,
-                overlay_zone_type: None,
-                outside_playfield: false,
-                zone_type: 0,
-                base_ground_walk_blocked: false,
-                base_build_blocked: false,
-                base_land_type: 0,
-                base_yr_cell_land_type: 0,
-                base_terrain_class: Default::default(),
-                base_speed_costs: speed_costs,
-                build_blocked: false,
-                has_bridge_deck: false,
-                bridge_walkable: false,
-                bridge_transition: false,
-                bridge_deck_level: 0,
-                bridge_layer: None,
-                bridge_facts: crate::map::bridge_facts::BridgeCellFacts::default(),
-                tube_index: None,
-                radar_left: [0, 0, 0],
-                radar_right: [0, 0, 0],
-                has_damaged_data: false,
-                bridgehead_anchor_class_at_load: None,
-            });
-        }
-    }
-    ResolvedTerrainGrid::from_cells(width, height, cells)
+    crate::map::resolved_terrain::test_grid(width, height, |x, y| ResolvedTerrainCell {
+        filled_clear: true,
+        speed_costs: crate::map::resolved_terrain::TEST_OPEN_SPEED_COSTS,
+        base_speed_costs: crate::map::resolved_terrain::TEST_OPEN_SPEED_COSTS,
+        ..crate::map::resolved_terrain::test_flat_cell(x, y)
+    })
 }
 
 fn minimal_rules() -> RuleSet {
@@ -496,7 +430,7 @@ fn make_test_simulation_with_one_vehicle() -> (Simulation, RuleSet, PathGrid) {
     let path_grid = PathGrid::new(GRID_W, GRID_H);
 
     let id = sim
-        .spawn_object("MTNK", "Americans", 5, 5, 64, &rules, &BTreeMap::new())
+        .spawn_object("MTNK", "Americans", 5, 5, 64, &rules)
         .expect("spawn MTNK");
     // Production-side spawn doesn't initialize `rocking` yet (sim-side only
     // path lands with combat in Task 19); flip it on here so the rocking
@@ -510,14 +444,7 @@ fn make_test_simulation_with_one_vehicle() -> (Simulation, RuleSet, PathGrid) {
 }
 
 fn advance(sim: &mut Simulation, rules: &RuleSet, path_grid: &PathGrid) {
-    let _ = sim.advance_tick(
-        &[],
-        Some(rules),
-        &BTreeMap::new(),
-        Some(path_grid),
-        None,
-        TICK_MS,
-    );
+    let _ = sim.advance_tick(&[], Some(rules), Some(path_grid), None, TICK_MS);
 }
 
 #[test]
@@ -602,4 +529,105 @@ fn integration_determinism_same_impulse_same_hash() {
             tick + 1,
         );
     }
+}
+
+/// `RockingUpdate`'s crashing branch against the executable: 40-frame spins of
+/// both signs, a `BalloonHover=` clamp and a start from nonzero angles
+/// (`tools/spatial_oracle/aircraft_crash.json`, `rocking`). Native keeps f32;
+/// each SimFixed step may differ by one quantum, so the tolerance grows with
+/// the frame count.
+#[test]
+fn crash_spin_matches_native_rocking_update() {
+    use crate::sim::rocking::rocking_system::advance_crash_spin;
+    let oracle: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tools/spatial_oracle/aircraft_crash.json"
+    ))
+    .unwrap();
+    let rows = oracle["rocking"].as_array().unwrap();
+    assert_eq!(rows.len(), 4);
+    let native = |hex: &serde_json::Value| {
+        f64::from(f32::from_bits(
+            u32::from_str_radix(hex.as_str().unwrap(), 16).unwrap(),
+        ))
+    };
+    for row in rows {
+        let input = &row["input"];
+        let rates = input["rates"].as_array().unwrap();
+        let angles = input["angles"].as_array();
+        // The fixture writes the rates and angles as f32; start from those
+        // exact values.
+        let f32_of = |v: &serde_json::Value| f64::from(v.as_f64().unwrap() as f32);
+        let mut state = RockingState {
+            vel_sideways: SimFixed::from_num(f32_of(&rates[0])),
+            vel_forwards: SimFixed::from_num(f32_of(&rates[1])),
+            angle_sideways: angles.map_or(SimFixed::ZERO, |a| SimFixed::from_num(f32_of(&a[0]))),
+            angle_forwards: angles.map_or(SimFixed::ZERO, |a| SimFixed::from_num(f32_of(&a[1]))),
+            is_ship_rocking: false,
+        };
+        let balloon = input["balloon_hover"].as_i64() == Some(1);
+        for (frame, expected) in row["history"].as_array().unwrap().iter().enumerate() {
+            advance_crash_spin(&mut state, balloon);
+            let tolerance = (frame as f64 + 3.0) / 65536.0;
+            for (actual, index) in [(state.angle_sideways, 0), (state.angle_forwards, 1)] {
+                let expected = native(&expected[index]);
+                assert!(
+                    (actual.to_num::<f64>() - expected).abs() <= tolerance,
+                    "{} frame {frame} axis {index}: {actual} vs {expected}",
+                    input["name"]
+                );
+            }
+        }
+    }
+}
+
+/// `RockingUpdate`'s crashing branch on a Unit owner, through the real
+/// `UnitClass` type getters (`tools/spatial_oracle/unit_rocking_update.json`,
+/// `crash` mode): one step from the clamp boundaries (±π/4 and its
+/// neighbouring f32s, ±4) with rates of both signs, for `BalloonHover=` off,
+/// on, and a raw 255. The rates are kept; within one quantum of native f32.
+#[test]
+fn unit_crash_spin_matches_native_rocking_update() {
+    use crate::sim::rocking::rocking_system::advance_crash_spin;
+    let rows: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../tools/spatial_oracle/unit_rocking_update.json"
+    ))
+    .unwrap();
+    let native = |hex: &serde_json::Value| {
+        f64::from(f32::from_bits(
+            u32::from_str_radix(hex.as_str().unwrap(), 16).unwrap(),
+        ))
+    };
+    let mut crashing = 0;
+    for row in rows.as_array().unwrap() {
+        if row["output"]["mode"] != "crash" {
+            continue;
+        }
+        crashing += 1;
+        let input = &row["input"];
+        let fixed = |key: &str| SimFixed::from_num(native(&input[key]));
+        let mut state = RockingState {
+            vel_sideways: fixed("side_velocity_bits"),
+            vel_forwards: fixed("forward_velocity_bits"),
+            angle_sideways: fixed("side_angle_bits"),
+            angle_forwards: fixed("forward_angle_bits"),
+            is_ship_rocking: false,
+        };
+        let rates = (state.vel_sideways, state.vel_forwards);
+        advance_crash_spin(&mut state, input["balloon_hover"].as_i64() != Some(0));
+        let output = &row["output"];
+        for (actual, key) in [
+            (state.angle_sideways, "side_angle_bits"),
+            (state.angle_forwards, "forward_angle_bits"),
+        ] {
+            let expected = native(&output[key]);
+            assert!(
+                (actual.to_num::<f64>() - expected).abs() <= 2.0 / 65536.0,
+                "{} {key}: {actual} vs {expected}",
+                input["name"]
+            );
+        }
+        assert_eq!((state.vel_sideways, state.vel_forwards), rates);
+        assert!(!output["damage_called"].as_bool().unwrap());
+    }
+    assert_eq!(crashing, 135);
 }

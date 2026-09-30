@@ -15,7 +15,7 @@ use crate::sim::debug_event_log::DebugEventKind;
 pub(crate) fn debug_panel_frame() -> egui::Frame {
     egui::Frame {
         fill: egui::Color32::from_rgb(245, 245, 245),
-        stroke: egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 180, 180)),
+        stroke: egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(180, 180, 180)),
         inner_margin: egui::Margin::same(6),
         outer_margin: egui::Margin::same(2),
         corner_radius: egui::CornerRadius::same(3),
@@ -33,7 +33,7 @@ pub(crate) fn push_debug_light_visuals(ctx: &egui::Context) -> egui::Visuals {
     let mut visuals = egui::Visuals::light();
     visuals.window_fill = egui::Color32::from_rgb(245, 245, 245);
     visuals.panel_fill = egui::Color32::from_rgb(245, 245, 245);
-    visuals.window_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 180, 180));
+    visuals.window_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(180, 180, 180));
     ctx.set_visuals(visuals);
     prev
 }
@@ -181,20 +181,10 @@ pub(crate) fn draw_debug_panel(ctx: &egui::Context, state: &AppState) {
             // --- VXL render pipeline ---
             if let Some(atlas) = &state.match_state.match_presentation.unit_atlas {
                 ui.separator();
-                if atlas.gpu_rendered > 0 {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(20, 120, 20),
-                        format!(
-                            "VXL: {} GPU compute, {} CPU",
-                            atlas.gpu_rendered, atlas.cpu_rendered,
-                        ),
-                    );
-                } else {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(160, 120, 0),
-                        format!("VXL: {} CPU (GPU inactive)", atlas.cpu_rendered),
-                    );
-                }
+                ui.colored_label(
+                    egui::Color32::from_rgb(20, 120, 20),
+                    format!("VXL: {} sprites rendered by the last build", atlas.rendered),
+                );
             }
 
             ui.separator();
@@ -284,7 +274,12 @@ pub(crate) fn draw_debug_panel(ctx: &egui::Context, state: &AppState) {
                             cat_str,
                             sim.interner.resolve(entity.owner()),
                             entity.health.current,
-                            entity.health.max,
+                            state
+                                .rules()
+                                .and_then(
+                                    |rules| rules.object(sim.interner.resolve(entity.type_ref()))
+                                )
+                                .map_or_else(|| "?".to_owned(), |obj| obj.strength.to_string()),
                         ));
                     }
                 }
@@ -430,9 +425,6 @@ pub(crate) fn draw_debug_panel(ctx: &egui::Context, state: &AppState) {
                         crate::sim::miner::MinerState::Harvest => {
                             egui::Color32::from_rgb(20, 120, 20)
                         }
-                        crate::sim::miner::MinerState::MoveToOre => {
-                            egui::Color32::from_rgb(160, 120, 0)
-                        }
                         crate::sim::miner::MinerState::SearchOre => {
                             egui::Color32::from_rgb(0, 90, 160)
                         }
@@ -448,20 +440,17 @@ pub(crate) fn draw_debug_panel(ctx: &egui::Context, state: &AppState) {
                         _ => egui::Color32::from_rgb(80, 80, 80),
                     };
                     ui.colored_label(state_color, format!("State: {miner_state:?}"));
-                    if matches!(miner_state, crate::sim::miner::MinerState::Dock) {
-                        ui.label(format!("  Dock phase: {:?}", miner.dock_phase));
-                    }
                     ui.label(format!(
                         "Cargo: {}/{}",
                         miner.cargo.len(),
                         miner.capacity_bales
                     ));
-                    ui.label(format!("Harvest timer: {:?}", miner.harvest_timer));
-                    if let Some(ore) = miner.target_ore_cell {
-                        ui.label(format!("Target ore: ({},{})", ore.0, ore.1));
-                    } else {
-                        ui.label("Target ore: (none)");
-                    }
+                    ui.label(format!(
+                        "Stage: {} (rate {}) harvesting: {}",
+                        entity.native_stage().value(),
+                        entity.native_stage().rate(),
+                        miner.harvesting
+                    ));
                     if let Some(ref_id) = miner.reserved_refinery {
                         let ref_type = sim
                             .entities()
@@ -470,8 +459,10 @@ pub(crate) fn draw_debug_panel(ctx: &egui::Context, state: &AppState) {
                             .unwrap_or("?");
                         ui.label(format!("Refinery: {} (id={})", ref_type, ref_id));
                     }
-                    if let Some(last) = miner.last_harvest_cell {
-                        ui.label(format!("Last harvest: ({},{})", last.0, last.1));
+                    if let Some(crate::sim::combat::TargetKind::Cell(x, y)) =
+                        entity.archive_target()
+                    {
+                        ui.label(format!("Archived ore: ({x},{y})"));
                     }
                     let has_mt = entity.movement_target.is_some();
                     let has_tp = entity.teleport_state.is_some();
@@ -608,10 +599,6 @@ fn format_debug_event_light(
         DebugEventKind::MinerStateChange { from, to } => (
             egui::Color32::from_rgb(160, 110, 0),
             format!("[{tick}] Miner: {from} \u{2192} {to}"),
-        ),
-        DebugEventKind::DockPhaseChange { from, to } => (
-            egui::Color32::from_rgb(180, 100, 20),
-            format!("[{tick}] Dock: {from} \u{2192} {to}"),
         ),
         DebugEventKind::SpecialMovementStart { kind } => (
             egui::Color32::from_rgb(90, 50, 180),

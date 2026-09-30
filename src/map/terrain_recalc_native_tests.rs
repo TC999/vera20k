@@ -44,20 +44,31 @@ pub(crate) fn bridge_constructor_terrain() -> ResolvedTerrainGrid {
 /// Tile2 is invalid against the two-entry registry; tile0 has the supplied
 /// slope used by the second-pass admission discriminator. No Recalc substitute.
 pub(crate) fn install_bridge_batch_test_catalog(grid: &mut ResolvedTerrainGrid, slope: bool) {
-    install_repair_test_catalog(grid, slope, true);
+    install_repair_test_catalog(grid, slope, true, 11);
 }
 
 pub(crate) fn install_ordinary_repair_test_catalog(grid: &mut ResolvedTerrainGrid) {
-    install_repair_test_catalog(grid, false, false);
+    install_repair_test_catalog(grid, false, false, 11);
 }
 
-fn install_repair_test_catalog(grid: &mut ResolvedTerrainGrid, slope: bool, wheel_only: bool) {
+/// The ordinary catalog with a Tunnel tile1 (TMP terrain type 5): a Cell on it
+/// keeps Cell+EC = Tunnel through the Recalc(-1) its Mark runs.
+pub(crate) fn install_tunnel_repair_test_catalog(grid: &mut ResolvedTerrainGrid) {
+    install_repair_test_catalog(grid, false, false, 5);
+}
+
+fn install_repair_test_catalog(
+    grid: &mut ResolvedTerrainGrid,
+    slope: bool,
+    wheel_only: bool,
+    second_terrain: u8,
+) {
     let theater = synthetic_theater_from_ini(
         b"[TileSet0000]\nTilesInSet=2\nFileName=source\nSetName=Plain\n",
     );
     let mut first = gsi_04_02_last_tiles_tmp_bytes(11, [0; 3], [0; 3]);
     first[62] = u8::from(slope);
-    let second = gsi_04_02_last_tiles_tmp_bytes(11, [0; 3], [0; 3]);
+    let second = gsi_04_02_last_tiles_tmp_bytes(second_terrain, [0; 3], [0; 3]);
     let (_directory, assets) = gsi_04_02_asset_manager_with_loose_tmps(&[
         ("source01.tem", &first),
         ("source02.tem", &second),
@@ -129,10 +140,7 @@ fn recalc_pristine_metadata_and_level_override_match_original_instructions() {
         map.header.local_top = 0;
         map.header.local_width = 16;
         map.header.local_height = 16;
-        let cells = (0..33)
-            .flat_map(|y| (0..33).map(move |x| make_test_cell(x, y)))
-            .collect();
-        let mut grid = ResolvedTerrainGrid::from_cells(33, 33, cells);
+        let mut grid = crate::map::resolved_terrain::test_grid(33, 33, |x, y| make_test_cell(x, y));
         let index = 16 * 33 + 16;
         grid.cells[index].final_tile_index = if flag("invalid") {
             2
@@ -160,6 +168,7 @@ fn recalc_pristine_metadata_and_level_override_match_original_instructions() {
             flag("lat"),
             0,
             grid.cells.len(),
+            crate::util::pixel_conversion::PixelConversionBounds::default(),
         );
         let overlay = if flag("early") {
             FinalizedOverlayCell::from_parts(0, 0)
@@ -590,8 +599,11 @@ fn resident_bridge_recalc_and_presentation_match_original_execution() {
 #[ignore = "requires active retail assets; original NewUrban Wood suffix boundary"]
 fn retail_bridge_recalc_and_presentation_match_original_execution() {
     let retail = std::env::var("RA2_DIR").expect("retail directory");
-    let mut assets =
-        crate::assets::asset_manager::AssetManager::new(std::path::Path::new(&retail)).unwrap();
+    let mut assets = crate::assets::asset_manager::AssetManager::new(
+        std::path::Path::new(&retail),
+        crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+    )
+    .unwrap();
     let theater = crate::map::theater::load_theater(&mut assets, "NEWURBAN").unwrap();
     let corpus = bridge_catalog_corpus();
     let group = corpus["groups"]

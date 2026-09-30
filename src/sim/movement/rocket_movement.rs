@@ -8,9 +8,9 @@
 use crate::sim::components::Position;
 use crate::sim::debug_event_log::DebugEventKind;
 use crate::sim::entity_store::EntityStore;
+use crate::sim::game_entity::GameEntity;
 use crate::sim::intern::InternedId;
 use crate::sim::movement::facing_from_delta;
-use crate::sim::movement::locomotion::piggyback::LocomotorRuntimePayload;
 use crate::util::fixed_math::{
     SIM_ONE, SIM_ZERO, SimFixed, int_distance_to_sim, native_movement_frame_fraction, sim_to_f32,
 };
@@ -69,6 +69,14 @@ pub enum RocketPhase {
     Secondary,
 }
 
+impl RocketPhase {
+    /// Rocket ILocomotion+80 / 661F90 accepts native phases3..5 only.
+    /// Also used by the Aircraft41B920 V3/DMisl high-flight override.
+    pub(crate) fn is_moving_now(self) -> bool {
+        matches!(self, Self::Ascent | Self::Cruise | Self::Terminal)
+    }
+}
+
 /// Per-projectile flight values selected from the native rocket table.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RocketFlightParameters {
@@ -117,6 +125,7 @@ pub struct RocketState {
 }
 
 /// Attach a rocket using the compatibility parameters used by existing callers.
+#[cfg(test)]
 pub fn attach_rocket_state(
     entities: &mut EntityStore,
     entity_id: u64,
@@ -131,6 +140,7 @@ pub fn attach_rocket_state(
         target,
         RocketFlightParameters::legacy(speed),
         None,
+        0,
     )
 }
 
@@ -143,6 +153,7 @@ pub fn attach_rocket_state_with_payload(
     target: (u16, u16),
     speed: SimFixed,
     payload: Option<RocketPayload>,
+    frame: u32,
 ) -> bool {
     attach_rocket_state_full(
         entities,
@@ -151,18 +162,8 @@ pub fn attach_rocket_state_with_payload(
         target,
         RocketFlightParameters::legacy(speed),
         payload,
+        frame,
     )
-}
-
-/// Attach a rocket using the selected native flight-table values.
-pub fn attach_rocket_state_with_parameters(
-    entities: &mut EntityStore,
-    entity_id: u64,
-    origin: (u16, u16),
-    target: (u16, u16),
-    parameters: RocketFlightParameters,
-) -> bool {
-    attach_rocket_state_full(entities, entity_id, origin, target, parameters, None)
 }
 
 fn attach_rocket_state_full(
@@ -172,15 +173,17 @@ fn attach_rocket_state_full(
     target: (u16, u16),
     parameters: RocketFlightParameters,
     payload: Option<RocketPayload>,
+    frame: u32,
 ) -> bool {
     let Some(entity) = entities.get_mut(entity_id) else {
         return false;
     };
 
-    entity.facing = facing_from_delta(
+    let heading = facing_from_delta(
         i32::from(target.0) - i32::from(origin.0),
         i32::from(target.1) - i32::from(origin.1),
     );
+    entity.body_facing.snap(u16::from(heading) << 8, frame);
     let rocket_state = RocketState {
         phase: RocketPhase::Ignition,
         origin_rx: origin.0,
@@ -196,10 +199,7 @@ fn attach_rocket_state_full(
         pitch: std::f32::consts::FRAC_PI_2, // Nose up during launch.
         payload,
     };
-    entity.rocket_state = Some(rocket_state.clone());
-    if let Some(locomotor) = entity.locomotor.as_mut() {
-        locomotor.runtime_payload = LocomotorRuntimePayload::Rocket(Some(rocket_state));
-    }
+    entity.rocket_state = Some(rocket_state);
     entity.push_debug_event(
         0,
         DebugEventKind::SpecialMovementStart {
@@ -219,6 +219,7 @@ pub fn process_rocket_state(
 ) -> SpecialMovementOutcome {
     let dt = native_movement_frame_fraction();
     let before = rocket.phase;
+    let altitude_before = rocket.altitude;
 
     match rocket.phase {
         RocketPhase::Ignition => {
@@ -278,61 +279,37 @@ pub fn process_rocket_state(
         }
     }
 
+    super::foot_coordinate::publish_altitude_change(position, altitude_before, rocket.altitude);
     if rocket.phase != before {
         rocket.phase_frames = 0;
     }
     SpecialMovementOutcome::Continue
 }
 
-/// Advance all rockets in supplied live object order.
-///
-/// Compatibility return: each ID whose flight completed this frame is returned
-/// for the combat/lifecycle owner to resolve. Completion stays idempotent while
-/// the entity remains alive, matching the previous detonation queue seam.
-pub fn tick_rocket_movement(
-    entities: &mut EntityStore,
-    live_order: &[u64],
-    sim_tick: u64,
-) -> Vec<u64> {
-    let fallback_order;
-    let entity_order: &[u64] = if live_order.is_empty() {
-        fallback_order = entities.keys_sorted();
-        &fallback_order
-    } else {
-        live_order
+/// Rocket Process (`0x006622C0`) for one owner, which the object turn admits
+/// with Rocket as its active locomotor. Answers whether the flight completed
+/// this frame; the caller queues the detonation. Completion stays idempotent
+/// while the owner remains alive.
+pub fn process_rocket(entity: &mut GameEntity, sim_tick: u64) -> bool {
+    let (outcome, phase_change) = {
+        let Some(rocket) = entity.rocket_state.as_mut() else {
+            return false;
+        };
+        let before = rocket.phase;
+        let outcome = process_rocket_state(rocket, &mut entity.position);
+        let phase_change = (rocket.phase != before).then(|| format!("{:?}", rocket.phase));
+        (outcome, phase_change)
     };
-    let mut completed = Vec::new();
-
-    for &id in entity_order {
-        let Some(entity) = entities.get_mut(id) else {
-            continue;
-        };
-        let (outcome, phase_change) = {
-            let Some(rocket) = entity.rocket_state.as_mut() else {
-                continue;
-            };
-            let before = rocket.phase;
-            let outcome = process_rocket_state(rocket, &mut entity.position);
-            let phase_change = (rocket.phase != before).then(|| format!("{:?}", rocket.phase));
-            (outcome, phase_change)
-        };
-        if let (Some(rocket), Some(locomotor)) =
-            (entity.rocket_state.as_ref(), entity.locomotor.as_mut())
-        {
-            locomotor.runtime_payload = LocomotorRuntimePayload::Rocket(Some(rocket.clone()));
-        }
-        if let Some(phase) = phase_change {
-            entity.push_debug_event(
-                sim_tick as u32,
-                DebugEventKind::SpecialMovementPhase { phase },
-            );
-        }
-        if outcome == SpecialMovementOutcome::Complete {
-            completed.push(id);
-            entity.push_debug_event(sim_tick as u32, DebugEventKind::SpecialMovementEnd);
-        }
+    if let Some(phase) = phase_change {
+        entity.push_debug_event(
+            sim_tick as u32,
+            DebugEventKind::SpecialMovementPhase { phase },
+        );
     }
-
+    let completed = outcome == SpecialMovementOutcome::Complete;
+    if completed {
+        entity.push_debug_event(sim_tick as u32, DebugEventKind::SpecialMovementEnd);
+    }
     completed
 }
 
@@ -419,7 +396,7 @@ mod tests {
             if phases.last() != Some(&rocket.phase) {
                 phases.push(rocket.phase);
             }
-            if tick_rocket_movement(&mut entities, &[], 0).contains(&1) {
+            if process_rocket(entities.get_mut(1).unwrap(), 0) {
                 completed = true;
                 break;
             }
@@ -472,30 +449,5 @@ mod tests {
         );
         assert_eq!(rocket.phase, RocketPhase::Ignition);
         assert_eq!(rocket.parameters.relaunches, 0);
-    }
-
-    #[test]
-    fn completion_preserves_live_object_order() {
-        let mut entities = EntityStore::new();
-        for id in [1, 2] {
-            let mut entity = GameEntity::test_default(id, "V3RKT", "Soviet", 5, 5);
-            entity.rocket_state = Some(RocketState {
-                phase: RocketPhase::Secondary,
-                origin_rx: 5,
-                origin_ry: 5,
-                target_rx: 5,
-                target_ry: 5,
-                speed: SimFixed::from_num(1),
-                current_speed: SIM_ZERO,
-                altitude: SIM_ZERO,
-                progress: SIM_ONE,
-                phase_frames: 0,
-                parameters: RocketFlightParameters::legacy(SimFixed::from_num(1)),
-                pitch: 0.0,
-                payload: None,
-            });
-            entities.insert(entity);
-        }
-        assert_eq!(tick_rocket_movement(&mut entities, &[2, 1], 0), vec![2, 1]);
     }
 }

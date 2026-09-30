@@ -29,6 +29,12 @@ use crate::render::unit_atlas::UnitAtlas;
 use crate::sidebar::{SidebarChromeLayoutSpec, SidebarTab};
 
 pub(crate) struct MatchPresentationState {
+    /// Native Techno+3CA waterline cache, captured by drawing and retained in
+    /// the snapshot presentation supplement rather than simulation authority.
+    pub(crate) sinking_waterlines: std::cell::RefCell<crate::render::sinking::SinkingWaterlines>,
+    /// The pitch each unit type's cached barrel image was first drawn at.
+    pub(crate) barrel_image_pitches:
+        std::cell::RefCell<crate::render::unit_atlas::BarrelImagePitches>,
     pub(crate) tile_atlas: Option<TileAtlas>,
     /// BUILDNGZ.SHA z-shape bound at group 2 of the Z-writing building draw.
     pub(crate) building_zshape: Option<crate::render::building_zshape::BuildingZShape>,
@@ -43,6 +49,12 @@ pub(crate) struct MatchPresentationState {
     pub(crate) sidebar_chrome: Option<SidebarChromeSet>,
     pub(crate) software_cursor: Option<crate::app::presentation::render::SoftwareCursor>,
     pub(crate) terrain_grid: Option<TerrainGrid>,
+    /// Load-time cell levels for click and hover resolution. A presentation
+    /// copy: the simulation reads its live terrain, and this is not refreshed
+    /// when a bridge body or cliff rewrites a level.
+    pub(crate) height_map: BTreeMap<(u16, u16), u8>,
+    /// Load-time high-bridge deck levels for the same click resolution.
+    pub(crate) bridge_height_map: BTreeMap<(u16, u16), u8>,
     /// Last mutable MapClass playfield authority installed into presentation.
     /// `None` is an explicit stale gate (new map / quickload); the inner
     /// optional bounds preserves fail-closed absence without inventing a rect.
@@ -62,7 +74,12 @@ pub(crate) struct MatchPresentationState {
     /// Owner name → house color index mapping for atlas key lookups.
     pub(crate) house_color_map: HouseColorMap,
     pub(crate) house_roster: HouseRoster,
+    /// The handle the local player launched this match under: the session
+    /// name skirmish setup copies into the human house's UI name
+    /// (`0x00688094`). `None` for launches without a skirmish session.
+    pub(crate) local_player_handle: Option<String>,
     pub(crate) lighting: super::lighting::MatchLighting,
+    pub(crate) line_trails: super::line_trails::LineTrails,
     pub(crate) combat_lights: crate::app::presentation::combat_lights::CombatLightRuntime,
     pub(crate) minimap: Option<MinimapRenderer>,
     /// Animated radar chrome — plays 33-frame open/close animation when radar gained/lost.
@@ -86,52 +103,17 @@ pub(crate) struct MatchPresentationState {
     /// SHROUD.SHP brightness pixels blitted per-cell, then a full-screen multiply pass
     /// darkens the scene.
     pub(crate) shroud_buffer: Option<crate::render::shroud_buffer::ShroudBuffer>,
-    /// Cell (rx, ry) -> high-bridge facts used by the tactical cursor inverse.
-    pub(crate) tactical_bridge_inverse_map:
-        BTreeMap<(u16, u16), crate::map::terrain::TacticalBridgeCell>,
     /// Active map theater name (e.g., DESERT).
     pub(crate) theater_name: String,
     /// Active map theater extension (e.g., des).
     pub(crate) theater_ext: String,
     /// Target/action lines — colored lines from selected units to command destinations.
     pub(crate) target_lines: crate::app::presentation::target_lines::TargetLineState,
-    /// Fire events from the current sim tick — position data for future muzzle
-    /// flash rendering and projectile origin computation. Drained each frame.
-    pub(crate) pending_fire_effects: Vec<crate::sim::world::SimFireEvent>,
-    /// Active garrison muzzle flash animations. Short-lived one-shot entries
-    /// spawned when a garrisoned building fires. Ticked each frame, removed on completion.
-    pub(crate) garrison_muzzle_flashes: Vec<crate::sim::components::GarrisonMuzzleFlash>,
-    /// Active non-garrison weapon muzzle flash animations spawned from weapon `Anim=`.
-    /// App-owned presentation state; combat only emits the fire facts.
-    pub(crate) weapon_muzzle_flashes: Vec<crate::sim::components::WeaponMuzzleFlash>,
-    /// Active parachute animations, one per descending paradropped infantry.
-    /// Polling-based lifecycle: spawned when an entity gains parachute_state
-    /// in the sim, removed on landing or death. Render-only; not snapshotted.
-    pub(crate) parachute_anims: Vec<crate::sim::components::ParachuteAnim>,
     /// Global elapsed time for looping terrain overlay animations.
     pub(crate) idle_anim_elapsed_ms: u32,
-    /// Logic frame on which each building's slot animations were created, by
-    /// entity id.
-    ///
-    /// gamemd gives every building animation slot its own animation object whose
-    /// frame timer is based at the frame it was constructed, so two identical
-    /// buildings placed at different times run out of phase with each other.
-    /// Presentation-only, so it lives here rather than on the entity.
-    ///
-    /// DRIFT: gamemd serializes each animation object with its own timer, so a
-    /// saved game restores the phases it was saved with. This map is not in the
-    /// snapshot. Entries whose IDs survive replacement retain their old phase;
-    /// newly observed IDs start at the current frame. A reused ID can therefore
-    /// inherit an unrelated phase. Native animation restoration remains DRIFT;
-    /// a blanket reset would also change the current retained-match behavior.
-    pub(crate) building_anim_phase_base: std::collections::BTreeMap<u64, u64>,
     // -- Reusable per-frame scratch buffers (avoid allocation each frame) --
     /// Overlay instance scratch vec — cleared and refilled each frame.
     pub(crate) cached_overlay_instances: Vec<crate::render::batch::SpriteInstance>,
-    /// Unit (voxel) instance scratch vec — cleared and refilled each frame.
-    pub(crate) cached_unit_instances: Vec<crate::render::batch::SpriteInstance>,
-    /// UnitAtlas texture-page tags aligned with `cached_unit_instances`.
-    pub(crate) cached_unit_pages: Vec<usize>,
     /// Animated power bar — segment-by-segment transition matching original PowerClass.
     pub(crate) power_bar_anim: crate::sidebar::PowerBarAnimState,
     /// Persistent flash + mode state for in-game sidebar gadgets. Ticked from
@@ -182,8 +164,10 @@ pub(crate) struct MatchPresentationState {
     pub(crate) pause_menu_has_saves: bool,
     pub(crate) pause_menu_interaction: crate::ui::shell::pause_menu::PauseMenuInteraction,
     pub(crate) sound_dialog: Option<crate::ui::shell::sound::SoundState>,
-    pub(crate) abort_buttons: crate::ui::shell::button::ShellButtonInteraction<crate::ui::shell::abort::AbortButton>,
-    pub(crate) saved_game_browser: Option<crate::ui::skirmish_shell::SavedSeedBrowserState<std::path::PathBuf>>,
+    pub(crate) abort_buttons:
+        crate::ui::shell::button::ShellButtonInteraction<crate::ui::shell::abort::AbortButton>,
+    pub(crate) saved_game_browser:
+        Option<crate::ui::skirmish_shell::SavedSeedBrowserState<std::path::PathBuf>>,
     /// Client-side in-game Options (0xBBB) state: the six [Options] values plus
     /// transient interaction flags. `game_speed` mirrors the launched sim and
     /// queues an authoritative transition on close; `sim_speed_tps` is its local

@@ -179,6 +179,8 @@ pub struct ScenarioDescriptor {
     /// Map `[Basic] FreeRadar`, native Scenario+34A4. Fresh reset at 0068383C
     /// is false; House 00508DF0 bypasses ordinary power/providers when set.
     pub free_radar: bool,
+    /// Map `[Basic] IgnoreGlobalAITriggers`, native Scenario+34B4.
+    pub ignore_global_ai_triggers: bool,
     /// Native `ScenarioClass` flags bit `0x40` (`[SpecialFlags] TiberiumGrows`,
     /// bit layout from the writer `0x006B8B30`). Every skirmish/multiplayer
     /// start forces it on (`OR 0xC0` at `0x005E74CD` on the ordinary skirmish
@@ -194,6 +196,8 @@ pub struct ScenarioDescriptor {
     pub tiberium_spreads_flag: bool,
     /// Map-authored global-light profiles plus their tick-zero mutable state.
     pub lighting: ScenarioLightingState,
+    /// Shared gameplay conversion profile; independent of every client's window.
+    pub pixel_conversion_bounds: crate::util::pixel_conversion::PixelConversionBounds,
     /// Authoritative map bounds in the CANONICAL CELL-ARRAY frame (max cell
     /// rx/ry + 1 — the frame entities, waypoints, and vision index), NOT the
     /// raw `[Map] Size=` values: sim cell coordinates span the iso diamond,
@@ -217,6 +221,7 @@ impl ScenarioDescriptor {
     ///
     /// Map bounds, theater, objects, and active registration order are rebuilt
     /// by the ordinary map loader; a recording is never a snapshot restore.
+    #[cfg(test)]
     pub fn from_native_replay_header(header: &crate::sim::replay::NativeReplayHeader) -> Self {
         Self {
             seed: header.seed,
@@ -255,6 +260,9 @@ pub struct ScenarioSession {
     /// Persistent native Scenario+34A4, included by original CRC at 0068BC16.
     #[serde(default)]
     pub free_radar: bool,
+    /// Persistent native Scenario+34B4 (`[Basic] IgnoreGlobalAITriggers`).
+    #[serde(default)]
+    ignore_global_ai_triggers: bool,
     /// Persisted native `ScenarioClass` flags bit `0x40` (`TiberiumGrows`);
     /// see the descriptor field of the same name.
     #[serde(default)]
@@ -264,6 +272,8 @@ pub struct ScenarioSession {
     pub tiberium_spreads_flag: bool,
     /// Persistent fixed-integer global-light configuration and transition state.
     pub lighting: ScenarioLightingState,
+    /// Saved match authority for Building and Tile animation coordinates.
+    pub pixel_conversion_bounds: crate::util::pixel_conversion::PixelConversionBounds,
     /// Authoritative map bounds in the canonical cell-array frame (max cell
     /// rx/ry + 1); see the descriptor field of the same name. Seeds the fog
     /// grid dimensions at construction.
@@ -334,6 +344,9 @@ impl ScenarioSession {
         if s.free_radar {
             b"scenario-free-radar-v1".hash(hasher);
         }
+        if s.ignore_global_ai_triggers {
+            b"scenario-ignore-global-ai-triggers-v1".hash(hasher);
+        }
         // Same legacy-preserving shape for the `0x40`/`0x80` tiberium bits.
         if s.tiberium_grows_flag {
             b"scenario-tiberium-grows-v1".hash(hasher);
@@ -402,6 +415,12 @@ impl ScenarioSession {
         opts.ai_players.hash(hasher);
     }
 
+    /// Scenario+34B4 (`[Basic] IgnoreGlobalAITriggers=`): the computer's
+    /// team creation skips the global (`AIMD.INI`) AI triggers.
+    pub(crate) const fn ignore_global_ai_triggers(&self) -> bool {
+        self.ignore_global_ai_triggers
+    }
+
     pub fn from_descriptor(desc: &ScenarioDescriptor) -> Self {
         Self {
             seed: u64::from(desc.seed),
@@ -410,9 +429,11 @@ impl ScenarioSession {
             game_mode_nonzero: desc.game_mode_nonzero,
             no_damage: desc.no_damage,
             free_radar: desc.free_radar,
+            ignore_global_ai_triggers: desc.ignore_global_ai_triggers,
             tiberium_grows_flag: desc.tiberium_grows_flag,
             tiberium_spreads_flag: desc.tiberium_spreads_flag,
             lighting: desc.lighting,
+            pixel_conversion_bounds: desc.pixel_conversion_bounds,
             map_width: desc.map_width,
             map_height: desc.map_height,
             local_left: desc.local_left,
@@ -438,11 +459,24 @@ mod tests {
 
     #[test]
     fn from_descriptor_equals_with_seed_widened() {
-        let a = Simulation::from_descriptor(&ScenarioDescriptor {
+        let mut a = Simulation::from_descriptor(&ScenarioDescriptor {
             seed: 0xDEAD_BEEF,
             ..Default::default()
         });
         let b = Simulation::with_seed(0xDEAD_BEEF);
+        assert_eq!(a.session.seed, 0xDEAD_BEEF_u64);
+        assert_eq!(a.scenario_rng.state(), b.scenario_rng.state());
+        assert_eq!(a.main_rng.state(), b.main_rng.state());
+        assert_eq!(a.mapgen_rng.state(), b.mapgen_rng.state());
+        // A production descriptor awaits its native Full_Init prefix; the
+        // test/dev constructor explicitly supplies a synthetic cursor. That
+        // authoritative difference must remain hashed. Compare the remaining
+        // constructor state only after declaring the same fixture boundary.
+        assert!(a.native_unique_ids.is_none());
+        assert_eq!(b.native_unique_ids.as_ref().unwrap().current_raw(), 0);
+        assert_ne!(a.state_hash(), b.state_hash());
+        a.native_unique_ids =
+            Some(crate::sim::native_identity::NativeUniqueIdCursor::for_synthetic_simulation());
         assert_eq!(a.state_hash(), b.state_hash());
     }
 
@@ -496,13 +530,15 @@ mod tests {
     fn mp_sibling_rng_state_matches_after_seed_sync() {
         use crate::map::entities::{EntityCategory, MapEntity};
         use crate::sim::command::{Command, CommandEnvelope};
-        use std::collections::BTreeMap;
 
         fn build(seed: u32) -> Simulation {
             let mut sim = Simulation::from_descriptor(&ScenarioDescriptor {
                 seed,
                 ..Default::default()
             });
+            // This synthetic fixture omits the production native Rules prefix.
+            sim.native_unique_ids =
+                Some(crate::sim::native_identity::NativeUniqueIdCursor::for_synthetic_simulation());
             let entity = MapEntity {
                 owner: "Americans".to_string(),
                 type_id: "MTNK".to_string(),
@@ -518,12 +554,13 @@ mod tests {
                 recruitable_a: true,
                 recruitable_b: true,
                 structure_upgrades: [None, None, None],
+                structure_ai_sellable: false,
+                structure_ai_repairable: false,
             };
-            sim.spawn_from_map(&[entity], None, &BTreeMap::new());
+            sim.spawn_from_map(&[entity], None);
             sim
         }
         fn run_300(sim: &mut Simulation) -> Vec<u64> {
-            let heights: BTreeMap<(u16, u16), u8> = BTreeMap::new();
             let owner = sim.interner.get("Americans").expect("owner interned");
             (0..300u64)
                 .map(|t| {
@@ -536,14 +573,12 @@ mod tests {
                                 target_rx: 20,
                                 target_ry: 2,
                                 queue: false,
-                                group_id: None,
                             },
                         )]
                     } else {
                         Vec::new()
                     };
-                    sim.advance_tick(&cmds, None, &heights, None, None, 67)
-                        .state_hash
+                    sim.advance_tick(&cmds, None, None, None, 67).state_hash
                 })
                 .collect()
         }
@@ -596,6 +631,10 @@ mod tests {
         let desc = ScenarioDescriptor {
             seed: 9,
             map_name: "tournamentb.map".into(),
+            pixel_conversion_bounds: crate::util::pixel_conversion::PixelConversionBounds {
+                width: 640,
+                height: 480,
+            },
             theater: "SNOW".into(),
             map_width: 100,
             map_height: 100,
@@ -614,6 +653,10 @@ mod tests {
             .sim;
         assert_eq!(restored.session.map_name, "tournamentb.map");
         assert_eq!(restored.session.theater, "SNOW");
+        assert_eq!(
+            restored.session.pixel_conversion_bounds,
+            desc.pixel_conversion_bounds
+        );
         assert_eq!(
             restored.session.mp_start_waypoints,
             sim.session.mp_start_waypoints

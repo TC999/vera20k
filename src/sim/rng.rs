@@ -8,10 +8,45 @@ use std::hash::{Hash, Hasher};
 
 use crate::rng_continuation::MapGenRngContinuation;
 
+/// The `double` at `0x007E3570` that scales a `RandomRanged(0, 0x7ffffffe)`
+/// draw onto `[0, 1]` for a unit-interval probability gate (Spark spawns, the
+/// `CrewEscape=` roll). Raw bytes `00 00 40 00 00 00 00 3E`, i.e.
+/// `1.0 / 2147483646.0` — the reciprocal of the draw's own inclusive top, NOT
+/// `2^-31`. The two differ by `2^-30` relative, which is a real bias in a
+/// deterministic gate, so this is carried as bits and never recomputed.
+pub(crate) const RANDOM_RANGED_UNIT_SCALE: crate::util::native_x87::NativeF64Bits =
+    crate::util::native_x87::NativeF64Bits::from_bits(0x3e00_0000_0040_0000);
+
 const RNG_TABLE_LEN: usize = 250;
 const RNG_INDEX_B_SEED: i32 = 0x67;
 const INIT_TABLE_1: [u32; 4] = [0xBAA9_6887, 0x1E17_D32C, 0x03BC_DC3C, 0x0F33_D1B2];
 const INIT_TABLE_2: [u32; 4] = [0x4B0F_3B58, 0xE874_F0C3, 0x6955_C5A6, 0x55A7_CA46];
+
+#[cfg(test)]
+thread_local! {
+    static DRAW_TRACE: std::cell::RefCell<Option<Vec<serde_json::Value>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Test-only observation of real production calls. It neither supplies words
+/// nor changes stream cursors; callers keep traces outside serialized state.
+#[cfg(test)]
+pub(crate) fn trace_draws<T>(run: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
+    DRAW_TRACE.with_borrow_mut(|trace| {
+        assert!(trace.is_none(), "nested RNG traces");
+        *trace = Some(Vec::new());
+    });
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            DRAW_TRACE.with_borrow_mut(|trace| *trace = None);
+        }
+    }
+    let reset = Reset;
+    let result = run();
+    let trace = DRAW_TRACE.with_borrow_mut(|trace| trace.take().unwrap());
+    drop(reset);
+    (result, trace)
+}
 
 /// Deterministic simulation RNG.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -54,6 +89,18 @@ impl SimRng {
         };
         rng.reseed(seed as u32);
         rng
+    }
+
+    /// A stand-in with no table, left in a `Simulation` while a caller holds
+    /// its scenario stream outside so it can lend the rest of the world
+    /// immutably (the Jumpjet cruise host). A draw from it panics.
+    pub(crate) const fn vacant() -> Self {
+        Self {
+            disabled: 0,
+            index_a: 0,
+            index_b: 0,
+            state: Vec::new(),
+        }
     }
 
     /// Adopt the exact post-RMG `g_MapGenRng` cursor without replaying draws.
@@ -99,6 +146,21 @@ impl SimRng {
         }
     }
 
+    /// The native Random2Class object bytes (`+0x00` disabled dword, the two
+    /// indices, then the table), as hex: the form the Unicorn oracles record
+    /// Scenario RNG states in.
+    #[cfg(test)]
+    pub(crate) fn native_state_hex(&self) -> String {
+        let mut bytes = Vec::with_capacity(0x3f4);
+        bytes.extend_from_slice(&u32::from(self.disabled).to_le_bytes());
+        bytes.extend_from_slice(&self.index_a.to_le_bytes());
+        bytes.extend_from_slice(&self.index_b.to_le_bytes());
+        for word in &self.state {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
     /// Copy every logical field into immutable boundary evidence.
     pub fn logical_state(&self) -> SimRngLogicalState {
         let mut words = [0; RNG_TABLE_LEN];
@@ -109,6 +171,16 @@ impl SimRng {
             index_b: self.index_b,
             words,
         }
+    }
+
+    /// The first seeded stream whose next `RandomRanged(low, high)` answers
+    /// `value`: how oracle replays make the Rust draw the native answer.
+    #[cfg(test)]
+    pub(crate) fn answering(low: i32, high: i32, value: i32) -> Self {
+        (0..)
+            .map(Self::new)
+            .find(|rng| rng.clone().next_range_i32_inclusive(low, high) == value)
+            .expect("some seed answers every in-range value")
     }
 
     /// Test/debug accessor for the secondary lag index. Used by the two-stream
@@ -179,6 +251,16 @@ impl SimRng {
             self.index_b = 0;
         }
 
+        #[cfg(test)]
+        DRAW_TRACE.with_borrow_mut(|trace| {
+            if let Some(trace) = trace {
+                trace.push(serde_json::json!({
+                    "before_indices": [a, b], "value": value,
+                    "callers": std::backtrace::Backtrace::force_capture().to_string(),
+                }));
+            }
+        });
+
         value
     }
 
@@ -190,38 +272,20 @@ impl SimRng {
         self.next_range_u32_inclusive(0, max_exclusive - 1)
     }
 
-    /// Inclusive ranged draw in gamemd's *scaled* (multiply-high) `RandomRanged`
-    /// shape — the variant used by the map-gen / bridge-tile RNG path, distinct
-    /// from `next_range_u32_inclusive` (which masks the LOW bits and rejects).
+    /// Take the high two bits of one raw draw, returning `0..=3`.
     ///
-    /// gamemd computes `lo + ftol(raw · range · (2^-32 + 2^-64))` with the FPU
-    /// in truncate-toward-zero mode, then loops while the result exceeds `hi`.
-    /// The scale `2^-32 + 2^-64` equals `(2^32 + 1) / 2^64`, so the truncated
-    /// product is exactly the integer `(raw · range · (2^32 + 1)) >> 64`, which
-    /// is provably in `0..=range-1` for every `raw` (max raw maps to range-1).
-    /// The original's rejection branch is therefore unreachable for this exact
-    /// integer form and is omitted.
+    /// This is the bridge walkers' MapGen `598030(0,3)` operation under the
+    /// original startup PC53/chop mode. Unlike the Scenario range helper, it
+    /// neither masks the low bits nor rejection-samples. A disabled stream
+    /// still receives its one Next call, which returns zero without advancing.
+    /// Native boundary values and complete states: `tools/spatial_oracle/mapgen_range`.
     ///
-    /// For the inclusive `(0, 3)` bridge-repair-variant range this reduces to
-    /// the high two bits of one draw (`raw >> 30`). Verified bit-identical to
-    /// the binary for that range; wider ranges (only reachable from the
-    /// random-map generator, which this engine does not run) are not separately
-    /// validated against the original's double-precision rounding.
-    ///
-    /// Unlike `next_range_u32_inclusive`, this consumes one draw even for equal
-    /// bounds — matching the binary, which has no equal-bounds early-out here.
-    pub fn next_range_u32_inclusive_scaled(&mut self, low: u32, high: u32) -> u32 {
-        let (lo, hi) = if low <= high {
-            (low, high)
-        } else {
-            (high, low)
-        };
-        let range = u64::from(hi - lo) + 1;
-        // (2^-32 + 2^-64) == (2^32 + 1) / 2^64
-        const SCALE_NUMERATOR: u128 = (1u128 << 32) + 1;
-        let raw = u128::from(self.next_u32());
-        let scaled = ((raw * u128::from(range) * SCALE_NUMERATOR) >> 64) as u32;
-        lo + scaled
+    /// This deliberately exposes only the operation our repair caller needs.
+    /// Wider/reversed native intervals and disturbed ambient FPU modes can
+    /// round or retry differently; the former generic integer approximation
+    /// was not valid for those inputs. RMG has its own range implementation.
+    pub(crate) fn next_high_two_bits(&mut self) -> u8 {
+        (self.next_u32() >> 30) as u8
     }
 
     /// Signed form of `Random__RandomRanged @ 0x0065C7E0`. The native compares
@@ -326,6 +390,60 @@ impl SimRng {
 #[cfg(test)]
 mod tests {
     use super::SimRng;
+
+    #[test]
+    fn high_two_bits_match_original_mapgen_range_and_all_retained_words() {
+        fn retained(hex: &str) -> SimRng {
+            let bytes: Vec<_> = hex
+                .as_bytes()
+                .chunks_exact(2)
+                .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+                .collect();
+            assert_eq!(bytes.len(), 0x3f4);
+            let word = |offset| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            SimRng {
+                disabled: bytes[0],
+                index_a: word(4) as i32,
+                index_b: word(8) as i32,
+                state: (0..250).map(|i| word(12 + i * 4)).collect(),
+            }
+        }
+        let corpus: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/spatial_oracle/mapgen_range.json"))
+                .unwrap();
+        let mut compared = 0;
+        for row in corpus["cases"].as_array().unwrap() {
+            for call in row["calls"].as_array().unwrap() {
+                // The generic native helper's other ranges and disturbed
+                // incoming precision/rounding are deliberate negative controls,
+                // outside the operation exposed by this Rust API.
+                if call["low"] != 0
+                    || call["high"] != 3
+                    || call["before_control"]["fpcw"].as_u64().unwrap() & 0xf00 != 0xe00
+                {
+                    continue;
+                }
+                let mut rng = retained(call["before_state_hex"].as_str().unwrap());
+                let after = retained(call["after_state_hex"].as_str().unwrap());
+                assert_eq!(
+                    u64::from(rng.next_high_two_bits()),
+                    call["result"].as_u64().unwrap(),
+                    "{}",
+                    row["input"]["name"]
+                );
+                assert_eq!(
+                    rng.logical_state(),
+                    after.logical_state(),
+                    "{}",
+                    row["input"]["name"]
+                );
+                assert_eq!(call["raw_draw_count"], 1);
+                assert_eq!(call["state_advance_count"], u64::from(rng.disabled == 0));
+                compared += 1;
+            }
+        }
+        assert_eq!(compared, 72, "all startup-mode bridge range requests");
+    }
 
     #[test]
     fn sim_rng_logical_view_and_state_expose_all_250_words_without_mutation() {

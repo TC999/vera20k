@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use crate::rules::ini_parser::IniFile;
+use crate::rules::ini_value::{crt_atoi, strtok};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionEntry {
@@ -18,6 +19,29 @@ pub struct ActionEntry {
     /// and parameter types 5/9/11. `None` safely represents native `-1` from
     /// a present non-alphabetic token.
     pub waypoint_index: Option<u32>,
+}
+
+impl ActionEntry {
+    /// Literal `TActionClass+0x90` value after `Read @ 0x006DD5B0`.
+    ///
+    /// Parameter type is params[0], not the action's numeric operand. Types
+    /// 0/11 read params[1]; types 5/9 replace the value with token 8. Other
+    /// literal types retain zero. Types 6/7/8 need sound/theme/speech registry
+    /// resolution and remain unsupported here, rather than becoming an index.
+    /// Native reader/dispatch comparisons: `trigger_action_values.json`.
+    pub fn literal_value(&self) -> Option<i32> {
+        let number = |index| {
+            self.params
+                .get(index)
+                .map_or(0, |value: &String| crt_atoi(value))
+        };
+        match number(0) {
+            0 | 11 => Some(number(1)),
+            5 | 9 => Some(number(6)),
+            6..=8 => None,
+            _ => Some(0),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +93,12 @@ fn ascii_waypoint_letter(byte: u8) -> Option<u32> {
 }
 
 /// Parse `[Actions]` into an id -> action record map.
+///
+/// The TriggerType read (`0x00727516..0x007275A5`) ReadStrings the trigger's
+/// entry into 0x200 bytes and takes `atoi` of the first `strtok(",")` token
+/// as the action count; `TActionClass::Read @ 0x006DD5B0` then consumes eight
+/// tokens per action from the same cursor. Empty comma fields are skipped;
+/// whitespace-only fields still consume a token.
 pub fn parse_actions(ini: &IniFile) -> ActionMap {
     let Some(section) = ini.section("Actions") else {
         return HashMap::new();
@@ -76,7 +106,7 @@ pub fn parse_actions(ini: &IniFile) -> ActionMap {
 
     let mut actions: ActionMap = HashMap::new();
     for key in section.keys() {
-        let Some(raw_value) = section.get(key) else {
+        let Some(value) = section.read_name(key, 0x200) else {
             continue;
         };
         let id = key.trim();
@@ -84,17 +114,13 @@ pub fn parse_actions(ini: &IniFile) -> ActionMap {
             continue;
         }
         let id = id.to_ascii_uppercase();
-        let raw_fields: Vec<&str> = raw_value.split(',').collect();
-        let fields: Vec<String> = raw_fields
-            .iter()
-            .map(|part| part.trim().to_string())
-            .collect();
-        let entries = parse_action_entries(&fields, &raw_fields);
+        let tokens: Vec<&str> = strtok(value, &[',']).collect();
+        let entries = parse_action_entries(&tokens);
         actions.insert(
             id.clone(),
             MapAction {
                 id,
-                fields,
+                fields: tokens.iter().map(|token| token.to_string()).collect(),
                 entries,
             },
         );
@@ -106,63 +132,29 @@ pub fn parse_actions(ini: &IniFile) -> ActionMap {
     actions
 }
 
-fn parse_action_entries(fields: &[String], raw_fields: &[&str]) -> Vec<ActionEntry> {
-    if fields.is_empty() {
+/// Native reads past the last token as `atoi(NULL)`; Rust stops at the
+/// tokens the line has.
+fn parse_action_entries(tokens: &[&str]) -> Vec<ActionEntry> {
+    let Some((count, payload)) = tokens.split_first() else {
         return Vec::new();
-    }
-
-    let declared_count = fields[0].trim().parse::<usize>().ok();
-    if let Some(count) = declared_count {
-        let payload = &fields[1..];
-        let chunk_len = 8;
-        if count > 0
-            && payload
-                .first()
-                .is_some_and(|kind| kind.parse::<i32>().is_ok())
-        {
-            let raw_payload = &raw_fields[1..];
-            return payload
-                .chunks(chunk_len)
-                .zip(raw_payload.chunks(chunk_len))
-                .take(count)
-                .filter_map(|(chunk, raw_chunk)| {
-                    let kind = chunk[0].trim().parse::<i32>().ok()?;
-                    let params = chunk[1..].to_vec();
-                    let waypoint_index = materialize_waypoint_index(
-                        chunk.get(1).map(String::as_str),
-                        raw_chunk.get(7).copied(),
-                    );
-                    Some(ActionEntry {
-                        kind,
-                        params,
-                        waypoint_index,
-                    })
-                })
-                .collect();
-        }
-    }
-
-    let kind = fields[0].trim().parse::<i32>().ok();
-    kind.map(|kind| {
-        let params = fields[1..].to_vec();
-        let waypoint_index = materialize_waypoint_index(
-            fields.get(1).map(String::as_str),
-            raw_fields.get(7).copied(),
-        );
-        vec![ActionEntry {
-            kind,
-            params,
-            waypoint_index,
-        }]
-    })
-    .unwrap_or_default()
+    };
+    let count = usize::try_from(crt_atoi(count)).unwrap_or(0);
+    payload
+        .chunks(8)
+        .take(count)
+        .map(|chunk| ActionEntry {
+            kind: crt_atoi(chunk[0]),
+            params: chunk[1..].iter().map(|param| param.to_string()).collect(),
+            waypoint_index: materialize_waypoint_index(
+                chunk.get(1).copied(),
+                chunk.get(7).copied(),
+            ),
+        })
+        .collect()
 }
 
 fn materialize_waypoint_index(param_type: Option<&str>, token_8: Option<&str>) -> Option<u32> {
-    if matches!(
-        param_type.and_then(|value| value.trim().parse::<i32>().ok()),
-        Some(5 | 9 | 11)
-    ) {
+    if matches!(param_type.map(crt_atoi), Some(5 | 9 | 11)) {
         // These parameter types parse token 8 numerically into other TAction
         // fields and leave the constructor-initialized +0x44 untouched.
         return Some(0);
@@ -238,12 +230,14 @@ mod tests {
             actions.get("AC_B").map(|action| action.fields.as_slice()),
             Some(&["11".to_string(), "Americans".to_string(), "5".to_string()][..])
         );
+        // The first token is the action count, so this line is eleven
+        // actions whose first kind is `atoi("Americans")`.
         assert_eq!(
             actions.get("AC_B").map(|action| action.entries.as_slice()),
             Some(
                 &[ActionEntry {
-                    kind: 11,
-                    params: vec!["Americans".to_string(), "5".to_string()],
+                    kind: 0,
+                    params: vec!["5".to_string()],
                     waypoint_index: Some(0),
                 }][..]
             )

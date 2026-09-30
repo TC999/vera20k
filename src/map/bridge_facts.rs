@@ -21,6 +21,30 @@ pub(crate) const RETAINED_CELLCLASS_BRIDGE_FLAG_MASK: u32 =
 /// The additional400/800 stores of SetBridgeDirection47E040/47E470.
 /// Anchor/F1/F2/opposite share them; F3/extra preserve both. This matches the
 /// existing full BridgeCellFacts Mark/Destroy writer without inventing relations.
+/// `TechnoClass::IsOnBridge_ForFiring @ 0x00703B10` (`mask` `0x100`) and its
+/// `0x00703CC0` twin (`0x400`), over the `CellClass+0x140` words of an object's
+/// own cell and of its S, N, E and W neighbours (`g_DirectionOffsets`
+/// `0x0089F688` indices 4, 0, 2, 6): the own cell carries `mask`, or a S/N
+/// neighbour carries it with the span axis bit `0x800`, or an E/W one without.
+/// A missing neighbour answers nothing. The OnBridge (`+0x8C`) exemption
+/// before the test belongs to the caller.
+pub(crate) fn near_bridge(
+    own: u32,
+    [south, north, east, west]: [Option<u32>; 4],
+    mask: u32,
+) -> bool {
+    let span = |flags: Option<u32>, axis: bool| {
+        flags.is_some_and(|flags| {
+            flags & mask != 0 && (flags & BRIDGE_FLAG_DIRECTION_ZERO != 0) == axis
+        })
+    };
+    own & mask != 0
+        || span(south, true)
+        || span(north, true)
+        || span(east, false)
+        || span(west, false)
+}
+
 pub(crate) fn apply_retained_cellclass_bridge_slot(
     flags: &mut u32,
     slot: BridgeStampSlot,
@@ -102,7 +126,10 @@ pub enum BridgeStampSlot {
 
 impl BridgeStampSlot {
     pub(crate) const fn writes_native_anchor(self) -> bool {
-        matches!(self, Self::Forward1 | Self::Forward2 | Self::Opposite | Self::ExtraDir6)
+        matches!(
+            self,
+            Self::Forward1 | Self::Forward2 | Self::Opposite | Self::ExtraDir6
+        )
     }
 }
 
@@ -216,21 +243,6 @@ pub struct BridgeAnchorRelation {
     pub direction: u8,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum BridgeRampKind {
-    TopRight,
-    TopLeft,
-    Middle1,
-    Middle2,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct BridgeRampTile {
-    pub kind: BridgeRampKind,
-    pub relative_tile_index: u16,
-    pub height_byte: u8,
-}
-
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Default,
 )]
@@ -244,7 +256,6 @@ pub struct BridgeCellFacts {
     /// Literal CellClass+0x2C. Native47E040 preserves this on Anchor/Forward3;
     /// the derived self relation above must not replace a retained pointer.
     pub native_anchor: Option<crate::map::cell_index::NativeCellIdentity>,
-    pub ramp_tile: Option<BridgeRampTile>,
 }
 
 impl BridgeCellFacts {
@@ -275,6 +286,7 @@ pub fn high_bridge_stamp_for_overlay(id: u8) -> Option<(BridgeStampFamily, u8)> 
     }
 }
 
+#[cfg(test)]
 pub fn stamp_set_bridge_direction(
     cells: &mut [BridgeCellFacts],
     width: u16,
@@ -429,6 +441,7 @@ fn set_direction_zero_flag(cell: &mut BridgeCellFacts, set: bool) {
     }
 }
 
+#[cfg(test)]
 fn stamp_slots(anchor: (u16, u16), direction: u8) -> [(BridgeStampSlot, Option<(u16, u16)>); 6] {
     let f1 = step(anchor, direction);
     let f2 = f1.and_then(|cell| step(cell, direction));
@@ -450,6 +463,7 @@ fn stamp_slots(anchor: (u16, u16), direction: u8) -> [(BridgeStampSlot, Option<(
     ]
 }
 
+#[cfg(test)]
 fn index(width: u16, height: u16, rx: u16, ry: u16) -> Option<usize> {
     if rx >= width || ry >= height {
         return None;
@@ -457,6 +471,7 @@ fn index(width: u16, height: u16, rx: u16, ry: u16) -> Option<usize> {
     Some(ry as usize * width as usize + rx as usize)
 }
 
+#[cfg(test)]
 fn step(cell: (u16, u16), direction: u8) -> Option<(u16, u16)> {
     let (dx, dy) = crate::util::direction::direction_delta(direction)?;
     let rx = cell.0 as i32 + dx;
@@ -691,37 +706,4 @@ pub enum Axis {
     /// Body cells stacked east–west (along X); ramps face north/south.
     /// State byte range 9–17.
     EW,
-}
-
-/// Per-cell anchor tile-class for bridgehead-adjacent cells.
-///
-/// Mirrors the four `IsoTileTypeIndex` slots used by the bridgehead state
-/// machine. Each value corresponds to a BridgeSet-relative tile_id offset
-/// (slot 0..3); the actual tile_ids are theater-portable via
-/// `BridgeMiddle1` / `BridgeMiddle2`.
-///
-/// - `Variant0` — pristine bridgehead (map-load default for cells with no
-///   author-damaged anchor placement).
-/// - `Variant1` — first DamageB intermediate. Reached only via neighbor
-///   `UpdateRamp_*_DamageB` progression on a Variant0 target.
-/// - `Damaged` — second DamageB intermediate. Reached only via neighbor
-///   `UpdateRamp_*_DamageB` progression on a Variant1 target. Also written
-///   by Collapse* paths advancing any non-AboutToFall variant.
-/// - `AboutToFall` — most-damaged variant. Two reach paths:
-///   1. **Direct hit on a bridgehead cell** — the bridgehead state machine
-///      writes the anchor straight to this slot (skipping Variant1/Damaged).
-///   2. **Map-load author-damaged anchor** — maps may place this tile_id
-///      directly; the renderer reflects it from frame 1.
-///
-/// Meaningful only when `BridgeRuntimeCell.role` is `Anchor` or
-/// `Bridgehead`; the renderer ignores it on other roles.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Default,
-)]
-pub enum BridgeheadAnchorClass {
-    #[default]
-    Variant0,
-    Variant1,
-    Damaged,
-    AboutToFall,
 }

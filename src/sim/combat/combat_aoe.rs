@@ -23,7 +23,7 @@ use crate::rules::ruleset::RuleSet;
 use crate::rules::warhead_type::WarheadType;
 use crate::sim::entity_store::EntityStore;
 use crate::sim::intern::StringInterner;
-use crate::sim::map::bridge_topology::{BRIDGE_DECK_HEIGHT_LEVELS, CellBridgeView, ListLayer};
+use crate::sim::map::bridge_topology::{CellBridgeView, ListLayer};
 use crate::sim::mission::authority::restore_entity_after_target_expiry;
 use crate::sim::mission::concrete_effects::represented_assign_target;
 use crate::sim::movement::locomotor::MovementLayer;
@@ -34,13 +34,15 @@ use crate::sim::occupancy::{
 use crate::sim::overlay_grid::WallMutation;
 use crate::sim::overlay_grid::{
     OverlayGrid, WallDamageTransactionHost, WallDirtyStep, WallPointerTarget,
-    WallZoneRepairKind, damage_wall_overlay_with_runtime_host,
+    damage_wall_overlay_with_runtime_host,
 };
+use crate::sim::pathfinding::zone_incremental::ZoneRepairKind;
 use crate::sim::rng::SimRng;
 use crate::sim::terrain_object::{TerrainObjectLifecycle, TerrainObjectState};
 #[cfg(test)]
 use crate::util::fixed_math::SIM_ZERO;
 use crate::util::fixed_math::SimFixed;
+use crate::util::lepton::BRIDGE_DECK_HEIGHT_LEVELS;
 use crate::util::lepton::{CELL_CENTER_LEPTON, LEPTONS_PER_LEVEL, ground_height_leptons};
 use crate::util::native_x87::{X87Chop53, sqrt_approx_f32};
 
@@ -95,7 +97,7 @@ pub(crate) trait AoECellPrelude {
         _terrain: &ResolvedTerrainGrid,
         _cell: (u16, u16),
         _navigation_changed: bool,
-        _repair: WallZoneRepairKind,
+        _repair: ZoneRepairKind,
     ) {
     }
 
@@ -121,7 +123,7 @@ impl WallDamageTransactionHost for AoEWallDamageHost<'_, '_> {
         terrain: &ResolvedTerrainGrid,
         cell: (u16, u16),
         navigation_changed: bool,
-        repair: WallZoneRepairKind,
+        repair: ZoneRepairKind,
     ) {
         if let Some(prelude) = self.prelude.as_deref_mut() {
             prelude.wall_navigation_step(terrain, cell, navigation_changed, repair);
@@ -130,7 +132,13 @@ impl WallDamageTransactionHost for AoEWallDamageHost<'_, '_> {
 
     fn pointer_expired(&mut self, target: WallPointerTarget) {
         if let WallPointerTarget::Real(rx, ry) = target {
-            expire_cell_target_references(self.entities, rx, ry, #[cfg(test)] self.trace);
+            expire_cell_target_references(
+                self.entities,
+                rx,
+                ry,
+                #[cfg(test)]
+                self.trace,
+            );
         }
     }
 }
@@ -241,7 +249,10 @@ pub(crate) fn air_impact_from_entity(
     Some(AoEAirImpact {
         sub_x: entity.position.sub_x,
         sub_y: entity.position.sub_y,
-        z_leptons: i32::try_from(super::in_range::effective_z_leptons(entity, terrain?)?).ok()?,
+        z_leptons: crate::sim::movement::ground_pose::object_world_z_leptons(
+            entity,
+            Some(terrain?),
+        ),
     })
 }
 
@@ -523,6 +534,8 @@ pub(crate) fn apply_aoe_damage_with_terrain_and_scenario<O: Into<AoEDamageOrigin
                     origin.source_id,
                     origin.source_house,
                     origin.warhead_ref,
+                    rules,
+                    interner,
                 );
             }
         }
@@ -572,7 +585,6 @@ pub(crate) fn apply_aoe_damage_with_terrain_and_scenario<O: Into<AoEDamageOrigin
                             impact_rx,
                             impact_ry,
                             exact_impact,
-                            layer_context.terrain.as_deref(),
                             spread_leptons,
                             base_damage,
                             origin.warhead_ref,
@@ -610,7 +622,6 @@ pub(crate) fn apply_aoe_damage_with_terrain_and_scenario<O: Into<AoEDamageOrigin
                     impact_rx,
                     impact_ry,
                     exact_impact,
-                    layer_context.terrain.as_deref(),
                     spread_leptons,
                     base_damage,
                     origin.warhead_ref,
@@ -757,6 +768,12 @@ pub(crate) fn expire_cell_target_references(
 ) {
     let listener_ids = entities.keys_sorted();
     for listener_id in listener_ids {
+        let saved_target_commits = entities.get(listener_id).is_some_and(|entity| {
+            crate::sim::mission::concrete_effects::assign_target_commits(
+                entities,
+                entity.suspended_attack_target,
+            )
+        });
         let Some(entity) = entities.get_mut(listener_id) else {
             continue;
         };
@@ -770,7 +787,8 @@ pub(crate) fn expire_cell_target_references(
         let mission_was_suspended =
             entity.mission.suspended() != crate::sim::mission::MissionId::NONE;
         represented_assign_target(entity, None);
-        let _restored = mission_was_suspended && restore_entity_after_target_expiry(entity);
+        let _restored = mission_was_suspended
+            && restore_entity_after_target_expiry(entity, saved_target_commits);
         #[cfg(test)]
         trace.push(CellTargetDetach {
             listener_id,
@@ -900,6 +918,8 @@ fn push_airborne_aoe_damage(
     source_id: u64,
     source_house: Option<crate::sim::intern::InternedId>,
     warhead_ref: crate::sim::intern::InternedId,
+    rules: &RuleSet,
+    interner: &StringInterner,
 ) {
     let Some(entity) = entities.get(entity_id) else {
         return;
@@ -907,11 +927,7 @@ fn push_airborne_aoe_damage(
     if entity.health.current == 0 || entity.dying {
         return;
     }
-    let Some(target_z) =
-        super::in_range::effective_z_leptons(entity, terrain).and_then(|z| i32::try_from(z).ok())
-    else {
-        return;
-    };
+    let target_z = crate::sim::movement::ground_pose::object_world_z_leptons(entity, Some(terrain));
     let impact_x = i32::from(impact_rx)
         .wrapping_mul(256)
         .wrapping_add(impact.sub_x.to_num::<i32>());
@@ -944,12 +960,16 @@ fn push_airborne_aoe_damage(
     // category test belongs to THIS site, not to `is_high_flying` — the native
     // predicate itself is universal over `ObjectClass`, so a Jumpjet
     // `UnitClass` like the stock Kirov is high-flying but is not halved here.
-    let distance_leptons =
-        if entity.category == EntityCategory::Aircraft && super::in_range::is_high_flying(entity) {
-            raw_distance_leptons / 2
-        } else {
-            raw_distance_leptons
-        };
+    let distance_leptons = if entity.category == EntityCategory::Aircraft
+        && crate::sim::movement::air_movement::is_high_flying(
+            entity,
+            Some(terrain),
+            Some((rules, interner)),
+        ) {
+        raw_distance_leptons / 2
+    } else {
+        raw_distance_leptons
+    };
     if i64::from(distance_leptons) > spread_leptons {
         return;
     }
@@ -1028,20 +1048,7 @@ fn push_entity_aoe_damage(
         let y = i32::from(entity.position.ry)
             .wrapping_mul(256)
             .wrapping_add(entity.position.sub_y.to_num::<i32>());
-        let z = terrain
-            .and_then(|terrain| super::in_range::effective_z_leptons(entity, terrain))
-            .and_then(|z| i32::try_from(z).ok())
-            .unwrap_or_else(|| {
-                i32::from(entity.position.z)
-                    .wrapping_mul(LEPTONS_PER_LEVEL as i32)
-                    .wrapping_add(
-                        entity
-                            .locomotor
-                            .as_ref()
-                            .map(|locomotor| locomotor.altitude.to_num::<i32>())
-                            .unwrap_or(0),
-                    )
-            });
+        let z = crate::sim::movement::ground_pose::object_world_z_leptons(entity, terrain);
         (x, y, z)
     };
     let distance_leptons = if entity.category == EntityCategory::Structure && center_cell {
@@ -1078,7 +1085,6 @@ fn push_terrain_aoe_damage(
     impact_rx: u16,
     impact_ry: u16,
     impact: AoEAirImpact,
-    terrain: Option<&ResolvedTerrainGrid>,
     spread_leptons: i64,
     base_damage: i32,
     warhead_ref: crate::sim::intern::InternedId,
@@ -1105,21 +1111,10 @@ fn push_terrain_aoe_damage(
     let impact_y = i32::from(impact_ry)
         .wrapping_mul(256)
         .wrapping_add(impact.sub_y.to_num::<i32>());
-    let target_x = i32::from(scan_rx)
-        .wrapping_mul(256)
-        .wrapping_add(CELL_CENTER_LEPTON.to_num::<i32>());
-    let target_y = i32::from(scan_ry)
-        .wrapping_mul(256)
-        .wrapping_add(CELL_CENTER_LEPTON.to_num::<i32>());
-    let target_z = terrain
-        .and_then(|grid| grid.cell(scan_rx, scan_ry))
-        .and_then(|cell| {
-            ground_height_leptons(cell.level, cell.slope_type, target_x, target_y).ok()
-        })
-        .unwrap_or(0);
+    let target_coord = object.world_coord();
     let distance_leptons = native_distance_leptons(
         (impact_x, impact_y, impact.z_leptons),
-        (target_x, target_y, target_z),
+        (target_coord.x, target_coord.y, target_coord.z),
     );
     if i64::from(distance_leptons) > spread_leptons {
         return;
@@ -1177,7 +1172,6 @@ mod tests {
     use crate::map::resolved_terrain::{ResolvedTerrainCell, ResolvedTerrainGrid};
     use crate::rules::ini_parser::IniFile;
     use crate::rules::ruleset::RuleSet;
-    use crate::rules::terrain_rules::{SpeedCostProfile, TerrainClass};
     use crate::sim::combat::{AttackTarget, TargetKind};
     use crate::sim::entity_store::EntityStore;
     use crate::sim::game_entity::GameEntity;
@@ -1440,6 +1434,7 @@ mod tests {
             (8_i32 + i32::from(wall_offset.1)) as u16,
         );
         let mut overlays = OverlayGrid::new(16, 16);
+        let mut terrain = crate::sim::tiberium::test_support::flat_terrain(16, 16);
         overlays.place_overlay(wall_cell.0, wall_cell.1, 2, 0);
         let mut scenario_rng = SimRng::new(91);
         let mut prelude = OreReseedDraw { cell: (8, 8) };
@@ -1458,7 +1453,7 @@ mod tests {
             (crate::sim::combat::RAD_NO_ATTACKER, None, warhead_ref),
             AoELayerContext {
                 occupancy: None,
-                terrain: None,
+                terrain: Some(&mut terrain),
                 overlay_grid: Some(&mut overlays),
                 overlay_registry: Some(&registry),
                 scenario_rng: Some(&mut scenario_rng),
@@ -1501,10 +1496,13 @@ mod tests {
             let mut air = GameEntity::test_default(stable_id, type_id, "Soviet", 5, 5);
             air.category = category;
             air.health.current = 1000;
-            air.health.max = 1000;
+            // Ordinary Aircraft41B920 reaches Object5F6B90: Object+74 must
+            // be marked before the physical GetHeight threshold is queried.
+            air.lifecycle.in_limbo = false;
+            air.lifecycle.cell_marked = true;
+            air.position.exact_z_leptons = Some(altitude);
             let mut locomotor = crate::sim::movement::locomotor::LocomotorState::from_object_type(
                 rules.object(type_id).unwrap(),
-                rules.general.flight_level,
                 0,
             );
             locomotor.layer = MovementLayer::Air;
@@ -1517,10 +1515,8 @@ mod tests {
         let mut interner = test_interner();
         let warhead_ref = interner.intern("BlastWH");
         let occupancy = OccupancyGrid::new();
-        let cells = (0..20)
-            .flat_map(|ry| (0..20).map(move |rx| test_terrain_cell(rx, ry)))
-            .collect();
-        let mut terrain = ResolvedTerrainGrid::from_cells(20, 20, cells);
+        let mut terrain =
+            crate::map::resolved_terrain::test_grid(20, 20, |rx, ry| test_terrain_cell(rx, ry));
 
         let at_ground = apply_aoe_damage(
             &mut entities,
@@ -1598,7 +1594,6 @@ mod tests {
             target.position.sub_x = SimFixed::from_num(sub_x);
             target.position.sub_y = CELL_CENTER_LEPTON;
             target.health.current = 300;
-            target.health.max = 300;
             entities.insert(target);
         }
         let mut interner = test_interner();
@@ -1624,10 +1619,8 @@ mod tests {
                 CellListInsertion::PrependNonBuilding,
             );
         }
-        let cells = (0..24)
-            .flat_map(|ry| (0..24).map(move |rx| test_terrain_cell(rx, ry)))
-            .collect();
-        let mut terrain = ResolvedTerrainGrid::from_cells(24, 24, cells);
+        let mut terrain =
+            crate::map::resolved_terrain::test_grid(24, 24, |rx, ry| test_terrain_cell(rx, ry));
 
         let result = apply_aoe_damage(
             &mut entities,
@@ -1675,7 +1668,6 @@ mod tests {
         let mut main_rng = SimRng::new(1);
         let mut scenario_rng = SimRng::new(2);
         let mut handled_deaths = Vec::new();
-        let mut resources = BTreeMap::new();
         let mut houses = BTreeMap::new();
         let mut fatal_lifecycle = None;
         let mut sound_sink = None;
@@ -1691,7 +1683,6 @@ mod tests {
             &mut main_rng,
             &mut scenario_rng,
             &mut handled_deaths,
-            &mut resources,
             None,
             None,
             Some(&mut terrain),
@@ -1727,7 +1718,6 @@ mod tests {
         let mut building = GameEntity::test_default(1, "BUILD", "Neutral", 5, 5);
         building.category = EntityCategory::Structure;
         building.health.current = 300;
-        building.health.max = 300;
         entities.insert(building);
         let mut occupancy = OccupancyGrid::new();
         occupancy.add(
@@ -1738,10 +1728,8 @@ mod tests {
             None,
             CellListInsertion::AppendBuilding,
         );
-        let cells = (0..12)
-            .flat_map(|ry| (0..12).map(move |rx| test_terrain_cell(rx, ry)))
-            .collect();
-        let mut terrain = ResolvedTerrainGrid::from_cells(12, 12, cells);
+        let mut terrain =
+            crate::map::resolved_terrain::test_grid(12, 12, |rx, ry| test_terrain_cell(rx, ry));
 
         for (impact_z, expected_distance) in [(208, 0), (256, 48)] {
             let result = apply_aoe_damage(
@@ -1784,7 +1772,7 @@ mod tests {
         fn run(
             protected_distance: i32,
             kind: InvulnKind,
-        ) -> (Vec<(u64, i32, bool)>, u16, Vec<u64>) {
+        ) -> (Vec<(u64, i32, bool)>, i32, Vec<u64>) {
             let ini = IniFile::from_str(
                 "[InfantryTypes]\n\
                  [VehicleTypes]\n0=TARGET\n\
@@ -1825,8 +1813,7 @@ mod tests {
             protected.lifecycle.in_limbo = false;
             protected.lifecycle.cell_marked = true;
             protected.invulnerability = Some(InvulnerabilityState {
-                start_frame: 0,
-                duration_frames: 100,
+                timer: crate::sim::timer::CdTimer::started(0, 100),
                 kind,
             });
             entities.insert(protected);
@@ -1845,10 +1832,8 @@ mod tests {
                     CellListInsertion::PrependNonBuilding,
                 );
             }
-            let cells = (0..12)
-                .flat_map(|ry| (0..12).map(move |rx| test_terrain_cell(rx, ry)))
-                .collect();
-            let mut terrain = ResolvedTerrainGrid::from_cells(12, 12, cells);
+            let mut terrain =
+                crate::map::resolved_terrain::test_grid(12, 12, |rx, ry| test_terrain_cell(rx, ry));
             let aoe = apply_aoe_damage(
                 &mut entities,
                 5,
@@ -1885,7 +1870,6 @@ mod tests {
             let mut main_rng = SimRng::new(1);
             let mut scenario_rng = SimRng::new(2);
             let mut handled_deaths = Vec::new();
-            let mut resources = BTreeMap::new();
             let mut houses = BTreeMap::new();
             let mut fatal_lifecycle = None;
             let mut sound_sink = None;
@@ -1901,7 +1885,6 @@ mod tests {
                 &mut main_rng,
                 &mut scenario_rng,
                 &mut handled_deaths,
-                &mut resources,
                 None,
                 None,
                 Some(&mut terrain),
@@ -1914,9 +1897,9 @@ mod tests {
                 records,
                 entities.get(1).unwrap().health.current,
                 effects
-                    .invulnerability_impact_effects
+                    .combat_light_requests
                     .iter()
-                    .map(|effect| effect.target_id)
+                    .filter_map(|effect| effect.target_id)
                     .collect(),
             )
         }
@@ -1949,7 +1932,7 @@ mod tests {
     #[test]
     fn gsi_04_07_damage_air_receivers_precede_center_first_ground_death_effects() {
         fn run(
-            hp: u16,
+            hp: i32,
         ) -> (
             Vec<u64>,
             crate::sim::combat::DeathEffects,
@@ -1972,20 +1955,19 @@ mod tests {
                  [TESTWALL]\nWall=yes\nArmor=concrete\nStrength=400\n",
             );
             let art = IniFile::from_str("[TESTWALL]\nDamageLevels=2\n");
-            let mut rules = RuleSet::from_ini(&ini).expect("air-first death rules");
+            let rules = RuleSet::from_ini(&ini).expect("air-first death rules");
             let blast = rules.warhead("BlastWH").unwrap().clone();
             let registry = OverlayTypeRegistry::from_ini(&ini, Some(&art));
 
             let make_air = |stable_id, rx, enter_order| {
                 let mut air = GameEntity::test_default(stable_id, "AIRBOMB", "Soviet", rx, 5);
                 air.category = EntityCategory::Aircraft;
+                air.lifecycle.in_limbo = false;
                 air.health.current = hp;
-                air.health.max = hp;
                 air.position.z = 0;
                 let mut air_locomotor =
                     crate::sim::movement::locomotor::LocomotorState::from_object_type(
                         rules.object("AIRBOMB").unwrap(),
-                        rules.general.flight_level,
                         0,
                     );
                 air_locomotor.layer = MovementLayer::Air;
@@ -2002,11 +1984,11 @@ mod tests {
             let air_perimeter = make_air(5, 3, 3);
 
             let mut center = GameEntity::test_default(20, "GROUNDBOMB", "Soviet", 5, 5);
+            center.lifecycle.in_limbo = false;
             center.health.current = hp;
-            center.health.max = hp;
             let mut east = GameEntity::test_default(10, "GROUNDBOMB", "Soviet", 7, 5);
+            east.lifecycle.in_limbo = false;
             east.health.current = hp;
-            east.health.max = hp;
 
             let mut entities = EntityStore::new();
             entities.insert(east);
@@ -2031,10 +2013,8 @@ mod tests {
                 None,
                 CellListInsertion::PrependNonBuilding,
             );
-            let cells = (0..10)
-                .flat_map(|ry| (0..10).map(move |rx| test_terrain_cell(rx, ry)))
-                .collect();
-            let mut terrain = ResolvedTerrainGrid::from_cells(10, 10, cells);
+            let mut terrain =
+                crate::map::resolved_terrain::test_grid(10, 10, |rx, ry| test_terrain_cell(rx, ry));
             let mut overlays = OverlayGrid::new(10, 10);
             for &(rx, ry) in &[(3, 5), (5, 5), (7, 5)] {
                 overlays.place_overlay(rx, ry, 0, 0);
@@ -2070,33 +2050,34 @@ mod tests {
                 },
             );
             let hit_order = hit_ids(&aoe.hits);
-            let damage_events = aoe.hits;
             let mut main_rng = SimRng::new(9);
             let mut handled_deaths = Vec::new();
-            let mut resources = BTreeMap::new();
             let mut houses = BTreeMap::new();
             let mut fatal_lifecycle = None;
             let mut sound_sink = None;
-            let (effects, pings) = crate::sim::combat::commit_damage_events(
-                &damage_events,
-                &mut entities,
-                &mut occupancy,
-                &rules,
-                &mut interner,
-                &mut houses,
-                &[],
-                &HouseAllianceMap::new(),
-                &mut main_rng,
-                &mut scenario_rng,
-                &mut handled_deaths,
-                &mut resources,
-                Some(&mut overlays),
-                Some(&registry),
-                Some(&mut terrain),
-                0,
-                &mut fatal_lifecycle,
-                &mut sound_sink,
-            );
+            // The production Apply_area_damage commit, whose dispatch gates
+            // re-read each record's object when its turn comes.
+            let (effects, pings) =
+                crate::sim::combat::receiver_fixture::commit_area_damage_receivers(
+                    &aoe.receivers,
+                    &mut entities,
+                    &mut occupancy,
+                    &rules,
+                    &mut interner,
+                    &mut houses,
+                    &[],
+                    &HouseAllianceMap::new(),
+                    &mut main_rng,
+                    &mut scenario_rng,
+                    &mut handled_deaths,
+                    Some(&mut overlays),
+                    Some(&registry),
+                    Some(&mut terrain),
+                    None,
+                    0,
+                    &mut fatal_lifecycle,
+                    &mut sound_sink,
+                );
             assert!(pings.is_empty());
             (hit_order, effects, overlays, entities, scenario_rng.state())
         }
@@ -2109,12 +2090,12 @@ mod tests {
         );
         assert_eq!(
             fatal.immediate_uninit_ids,
-            vec![30, 40, 30, 5, 20, 10],
+            vec![30, 40, 5, 20, 10],
             // Aircraft4165C0 calls Foot at4165EC before its concrete cleanup.
-            // Nested30 therefore finishes before40, then the captured outer30
-            // record repeats its zero-HP receiver (no Aircraft Alive guard).
-            // Native producer-entry proof: bridge_zero_health_deathweapon.json.
-            "nested aircraft cleanup precedes its parent; the captured outer record still repeats"
+            // Nested30 therefore finishes before40. The captured outer30 record
+            // is then skipped: Apply_area_damage's dispatch reads its Health
+            // (0) at 0x00489A79 before calling the receiver.
+            "nested aircraft cleanup precedes its parent; the dead outer record is not dispatched"
         );
         let direct_cells: Vec<_> = fatal
             .wall_mutations
@@ -2178,7 +2159,7 @@ mod tests {
              [WIDEWH]\nCellSpread=11\nPercentAtMax=1\n\
              Verses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
         );
-        let mut rules = RuleSet::from_ini(&ini).expect("band-11 rules");
+        let rules = RuleSet::from_ini(&ini).expect("band-11 rules");
         let wide = rules.warhead("WIDEWH").unwrap().clone();
         let mut stock = wide.clone();
         stock.cell_spread = SimFixed::from_num(10);
@@ -2189,7 +2170,6 @@ mod tests {
             entity.position.sub_x = SimFixed::from_num(sub_x);
             entity.position.sub_y = SimFixed::from_num(sub_y);
             entity.health.current = hp;
-            entity.health.max = hp;
             entity
         };
         let mut entities = EntityStore::new();
@@ -2211,10 +2191,8 @@ mod tests {
                 CellListInsertion::PrependNonBuilding,
             );
         }
-        let cells = (0..48)
-            .flat_map(|ry| (0..48).map(move |rx| test_terrain_cell(rx, ry)))
-            .collect();
-        let mut terrain = ResolvedTerrainGrid::from_cells(48, 48, cells);
+        let mut terrain =
+            crate::map::resolved_terrain::test_grid(48, 48, |rx, ry| test_terrain_cell(rx, ry));
         let mut interner = test_interner();
         let _handles =
             crate::sim::type_handle_table::ResolvedRuleHandles::resolve(&rules, &mut interner);
@@ -2272,7 +2250,6 @@ mod tests {
         let mut main_rng = SimRng::new(7);
         let mut scenario_rng = SimRng::new(9);
         let mut handled_deaths = Vec::new();
-        let mut resources = BTreeMap::new();
         let mut houses = BTreeMap::new();
         let mut fatal_lifecycle = None;
         let mut sound_sink = None;
@@ -2288,7 +2265,6 @@ mod tests {
             &mut main_rng,
             &mut scenario_rng,
             &mut handled_deaths,
-            &mut resources,
             None,
             None,
             Some(&mut terrain),
@@ -2311,6 +2287,7 @@ mod tests {
         let mut entities = EntityStore::new();
         let mut interner = test_interner();
         let mut overlays = OverlayGrid::new(16, 16);
+        let mut terrain = crate::sim::tiberium::test_support::flat_terrain(16, 16);
         overlays.place_overlay(8, 8, 0, 0);
         overlays.place_overlay(9, 7, 0, 0);
         let mut scenario_rng = SimRng::new(1);
@@ -2331,7 +2308,7 @@ mod tests {
             "Americans",
             AoELayerContext {
                 occupancy: None,
-                terrain: None,
+                terrain: Some(&mut terrain),
                 overlay_grid: Some(&mut overlays),
                 overlay_registry: Some(&registry),
                 scenario_rng: Some(&mut scenario_rng),
@@ -2372,6 +2349,7 @@ mod tests {
         let mut entities = EntityStore::new();
         let mut interner = test_interner();
         let mut overlays = OverlayGrid::new(32, 32);
+        let mut terrain = crate::sim::tiberium::test_support::flat_terrain(32, 32);
         overlays.place_overlay(16, 16, 0, 0);
         overlays.place_overlay(17, 15, 0, 0);
         let mut scenario_rng = SimRng::new(19);
@@ -2387,7 +2365,7 @@ mod tests {
             "Americans",
             AoELayerContext {
                 occupancy: None,
-                terrain: None,
+                terrain: Some(&mut terrain),
                 overlay_grid: Some(&mut overlays),
                 overlay_registry: Some(&registry),
                 scenario_rng: Some(&mut scenario_rng),
@@ -2416,6 +2394,7 @@ mod tests {
 
         let (rules, nuke, registry) = wall_aoe_fixture("10", "WallAbsoluteDestroyer=yes\nWall=yes");
         let mut overlays = OverlayGrid::new(40, 40);
+        let mut terrain = crate::sim::tiberium::test_support::flat_terrain(40, 40);
         let stock_cells = [(20, 20), (20, 10), (30, 20), (17, 29)];
         for &(rx, ry) in &stock_cells {
             overlays.place_overlay(rx, ry, 2, 0);
@@ -2433,7 +2412,7 @@ mod tests {
             "Americans",
             AoELayerContext {
                 occupancy: None,
-                terrain: None,
+                terrain: Some(&mut terrain),
                 overlay_grid: Some(&mut overlays),
                 overlay_registry: Some(&registry),
                 scenario_rng: Some(&mut scenario_rng),
@@ -2487,6 +2466,7 @@ mod tests {
         let mut interner = test_interner();
         let owner = crate::sim::intern::InternedId::from_index(7);
         let mut overlays = OverlayGrid::new(16, 16);
+        let mut terrain = crate::sim::tiberium::test_support::flat_terrain(16, 16);
         overlays.place_overlay(8, 8, 2, 0);
         overlays.place_owned_wall(8, 7, 2, 0x24, owner);
         let mut scenario_rng = SimRng::new(5);
@@ -2501,7 +2481,7 @@ mod tests {
             "Americans",
             AoELayerContext {
                 occupancy: None,
-                terrain: None,
+                terrain: Some(&mut terrain),
                 overlay_grid: Some(&mut overlays),
                 overlay_registry: Some(&registry),
                 scenario_rng: Some(&mut scenario_rng),
@@ -2635,7 +2615,7 @@ mod tests {
         ) -> (
             Vec<u64>,
             Vec<Option<crate::sim::intern::InternedId>>,
-            [u16; 3],
+            [i32; 3],
         ) {
             let ini = IniFile::from_str(&format!(
                 "[InfantryTypes]\n\
@@ -2650,7 +2630,7 @@ mod tests {
                  [CrushWH]\nCellSpread=0\nAffectsAllies=no\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
                 if damage_self { "yes" } else { "no" }
             ));
-            let mut rules = RuleSet::from_ini(&ini).expect("receiver admission fixture");
+            let rules = RuleSet::from_ini(&ini).expect("receiver admission fixture");
             let warhead = rules.warhead(warhead_name).unwrap().clone();
             let mut interner = test_interner();
             let _handles =
@@ -2686,10 +2666,8 @@ mod tests {
                     CellListInsertion::PrependNonBuilding,
                 );
             }
-            let cells = (0..3)
-                .flat_map(|ry| (0..3).map(move |rx| test_terrain_cell(rx, ry)))
-                .collect();
-            let mut terrain = ResolvedTerrainGrid::from_cells(3, 3, cells);
+            let mut terrain =
+                crate::map::resolved_terrain::test_grid(3, 3, |rx, ry| test_terrain_cell(rx, ry));
             let aoe = apply_aoe_damage(
                 &mut entities,
                 1,
@@ -2720,7 +2698,6 @@ mod tests {
             let mut main_rng = SimRng::new(1);
             let mut scenario_rng = SimRng::new(2);
             let mut handled_deaths = Vec::new();
-            let mut resources = BTreeMap::new();
             let mut houses = BTreeMap::new();
             let mut fatal_lifecycle = None;
             let mut sound_sink = None;
@@ -2736,7 +2713,6 @@ mod tests {
                 &mut main_rng,
                 &mut scenario_rng,
                 &mut handled_deaths,
-                &mut resources,
                 None,
                 None,
                 Some(&mut terrain),
@@ -2774,7 +2750,7 @@ mod tests {
 
     #[test]
     fn gsi_04_07_damage_object_immune_short_circuits_before_hp() {
-        fn run(immune: bool) -> (u16, usize, crate::sim::combat::DeathEffects) {
+        fn run(immune: bool) -> (i32, usize, crate::sim::combat::DeathEffects) {
             let ini = IniFile::from_str(&format!(
                 "[InfantryTypes]\n\
                  [VehicleTypes]\n0=MTNK\n\
@@ -2809,7 +2785,6 @@ mod tests {
             hut.type_ref = cabhut;
             hut.category = EntityCategory::Structure;
             hut.health.current = 2000;
-            hut.health.max = 2000;
             entities.insert(hut);
 
             let mut occupancy = OccupancyGrid::new();
@@ -2821,10 +2796,8 @@ mod tests {
                 None,
                 CellListInsertion::AppendBuilding,
             );
-            let cells = (0..8)
-                .flat_map(|ry| (0..8).map(move |rx| test_terrain_cell(rx, ry)))
-                .collect();
-            let mut terrain = ResolvedTerrainGrid::from_cells(8, 8, cells);
+            let mut terrain =
+                crate::map::resolved_terrain::test_grid(8, 8, |rx, ry| test_terrain_cell(rx, ry));
             let aoe = apply_aoe_damage(
                 &mut entities,
                 5,
@@ -2853,7 +2826,6 @@ mod tests {
             let mut main_rng = SimRng::new(1);
             let mut scenario_rng = SimRng::new(2);
             let mut handled_deaths = Vec::new();
-            let mut resources = BTreeMap::new();
             let mut houses = BTreeMap::new();
             let mut fatal_lifecycle = None;
             let mut sound_sink = None;
@@ -2869,7 +2841,6 @@ mod tests {
                 &mut main_rng,
                 &mut scenario_rng,
                 &mut handled_deaths,
-                &mut resources,
                 None,
                 None,
                 Some(&mut terrain),
@@ -2913,7 +2884,13 @@ mod tests {
         let rules = RuleSet::from_ini(&ini).expect("Rhino/Grizzly receiver fixture");
         let warhead = rules.warhead("AP").expect("AP").clone();
         assert_eq!(rules.weapon("RhinoGun").unwrap().damage, 90);
-        assert!(rules.object("MTNK").unwrap().veteran_stronger);
+        assert!(
+            rules
+                .object("MTNK")
+                .unwrap()
+                .veteran_abilities
+                .has(crate::rules::object_type::Ability::Stronger)
+        );
         assert_eq!(rules.general.veteran_armor, 1.5);
 
         let mut interner = test_interner();
@@ -2931,14 +2908,12 @@ mod tests {
         rookie.owner = american;
         rookie.type_ref = mtnk;
         rookie.health.current = 300;
-        rookie.health.max = 300;
         entities.insert(rookie);
         let mut veteran = GameEntity::test_default(3, "MTNK", "Americans", 5, 5);
         veteran.owner = american;
         veteran.type_ref = mtnk;
         veteran.health.current = 300;
-        veteran.health.max = 300;
-        veteran.veterancy = 100;
+        veteran.set_veterancy_rank(100);
         entities.insert(veteran);
 
         let mut occupancy = OccupancyGrid::new();
@@ -2952,10 +2927,8 @@ mod tests {
                 CellListInsertion::PrependNonBuilding,
             );
         }
-        let cells = (0..8)
-            .flat_map(|ry| (0..8).map(move |rx| test_terrain_cell(rx, ry)))
-            .collect();
-        let mut terrain = ResolvedTerrainGrid::from_cells(8, 8, cells);
+        let mut terrain =
+            crate::map::resolved_terrain::test_grid(8, 8, |rx, ry| test_terrain_cell(rx, ry));
         let aoe = apply_aoe_damage(
             &mut entities,
             5,
@@ -2988,7 +2961,6 @@ mod tests {
         let mut main_rng = SimRng::new(1);
         let mut scenario_rng = SimRng::new(2);
         let mut handled_deaths = Vec::new();
-        let mut resources = BTreeMap::new();
         let mut fatal_lifecycle = None;
         let mut sound_sink = None;
         let (death, pings) = crate::sim::combat::commit_damage_events(
@@ -3003,7 +2975,6 @@ mod tests {
             &mut main_rng,
             &mut scenario_rng,
             &mut handled_deaths,
-            &mut resources,
             None,
             None,
             Some(&mut terrain),
@@ -3065,7 +3036,6 @@ mod tests {
         target.owner = soviet;
         target.type_ref = target_type;
         target.health.current = 1000;
-        target.health.max = 1000;
         target.attack_target = Some(AttackTarget::new(1));
         entities.insert(target);
 
@@ -3073,7 +3043,6 @@ mod tests {
         allied.owner = yuri;
         allied.type_ref = target_type;
         allied.health.current = 1000;
-        allied.health.max = 1000;
         allied.attack_target = Some(AttackTarget::new(1));
         entities.insert(allied);
 
@@ -3081,7 +3050,6 @@ mod tests {
         immune.owner = soviet;
         immune.type_ref = immune_type;
         immune.health.current = 1000;
-        immune.health.max = 1000;
         immune.attack_target = Some(AttackTarget::new(1));
         entities.insert(immune);
 
@@ -3090,7 +3058,6 @@ mod tests {
         building.type_ref = building_type;
         building.category = EntityCategory::Structure;
         building.health.current = 1000;
-        building.health.max = 1000;
         building.attack_target = Some(AttackTarget::new(1));
         entities.insert(building);
 
@@ -3113,10 +3080,8 @@ mod tests {
             None,
             CellListInsertion::AppendBuilding,
         );
-        let cells = (0..12)
-            .flat_map(|ry| (0..12).map(move |rx| test_terrain_cell(rx, ry)))
-            .collect();
-        let mut terrain = ResolvedTerrainGrid::from_cells(12, 12, cells);
+        let mut terrain =
+            crate::map::resolved_terrain::test_grid(12, 12, |rx, ry| test_terrain_cell(rx, ry));
         let aoe = apply_aoe_damage(
             &mut entities,
             5,
@@ -3150,7 +3115,6 @@ mod tests {
         let mut main_rng = SimRng::new(1);
         let mut scenario_rng = SimRng::new(2);
         let mut handled_deaths = Vec::new();
-        let mut resources = BTreeMap::new();
         let mut houses = BTreeMap::new();
         let mut fatal_lifecycle = None;
         let mut sound_sink = None;
@@ -3166,7 +3130,6 @@ mod tests {
             &mut main_rng,
             &mut scenario_rng,
             &mut handled_deaths,
-            &mut resources,
             None,
             None,
             Some(&mut terrain),
@@ -3228,7 +3191,6 @@ mod tests {
             &mut main_rng,
             &mut scenario_rng,
             &mut handled_deaths,
-            &mut resources,
             None,
             None,
             Some(&mut terrain),
@@ -3254,6 +3216,8 @@ mod tests {
             "[General]\nFixtureOnly=1\n\
              [Normal]\nArmor=1.0\n\
              [Easy]\nArmor=1.2\n\
+             [Countries]\n0=EasyHouse\n\
+             [EasyHouse]\nArmorInfantryMult=1.2\n\
              [InfantryTypes]\n0=E1\n\
              [VehicleTypes]\n0=MTNK\n\
              [AircraftTypes]\n\
@@ -3286,7 +3250,6 @@ mod tests {
         target.type_ref = e1;
         target.category = EntityCategory::Infantry;
         target.health.current = 20;
-        target.health.max = 20;
         target.infantry = Some(crate::sim::game_entity::InfantryRuntime::new());
         target.infantry.as_mut().unwrap().is_prone = true;
         entities.insert(target);
@@ -3296,7 +3259,6 @@ mod tests {
         easy_prone.type_ref = e1;
         easy_prone.category = EntityCategory::Infantry;
         easy_prone.health.current = 100;
-        easy_prone.health.max = 100;
         easy_prone.infantry = Some(crate::sim::game_entity::InfantryRuntime::new());
         easy_prone.infantry.as_mut().unwrap().is_prone = true;
         entities.insert(easy_prone);
@@ -3306,7 +3268,6 @@ mod tests {
         easy_standing.type_ref = e1;
         easy_standing.category = EntityCategory::Infantry;
         easy_standing.health.current = 100;
-        easy_standing.health.max = 100;
         easy_standing.infantry = Some(crate::sim::game_entity::InfantryRuntime::new());
         entities.insert(easy_standing);
 
@@ -3321,10 +3282,8 @@ mod tests {
                 CellListInsertion::PrependNonBuilding,
             );
         }
-        let cells = (0..8)
-            .flat_map(|ry| (0..8).map(move |rx| test_terrain_cell(rx, ry)))
-            .collect();
-        let mut terrain = ResolvedTerrainGrid::from_cells(8, 8, cells);
+        let mut terrain =
+            crate::map::resolved_terrain::test_grid(8, 8, |rx, ry| test_terrain_cell(rx, ry));
         let aoe = apply_aoe_damage(
             &mut entities,
             5,
@@ -3360,7 +3319,6 @@ mod tests {
         let mut main_rng = SimRng::new(1);
         let mut scenario_rng = SimRng::new(2);
         let mut handled_deaths = Vec::new();
-        let mut resources = BTreeMap::new();
         let mut fatal_lifecycle = None;
         let mut sound_sink = None;
         let (death, _) = crate::sim::combat::commit_damage_events(
@@ -3375,7 +3333,6 @@ mod tests {
             &mut main_rng,
             &mut scenario_rng,
             &mut handled_deaths,
-            &mut resources,
             None,
             None,
             Some(&mut terrain),
@@ -3386,15 +3343,20 @@ mod tests {
 
         assert_eq!(entities.get(2).unwrap().health.current, 0);
         assert!(death.despawned_ids.contains(&2));
+        // The Easy house's `[Easy] Armor=1.2` divides nothing: it only feeds
+        // `House+0x1A0`, which no damage path reads. Its country's
+        // `ArmorInfantryMult=1.2` does (`GetArmorMultForType @ 0x0050BD30`),
+        // after the prone pre-scale: ftol(ftol(65 * .5) / 1.2) = 26. Dividing
+        // first would give ftol(ftol(65 / 1.2) * .5) = 27.
         assert_eq!(
             entities.get(3).unwrap().health.current,
             74,
-            "ftol(65 * .5)=32, then Easy armor 1.2 yields 26 (not 27)"
+            "ftol(65 * .5) = 32, then the country's 1.2 yields 26 (not 27)"
         );
         assert_eq!(
             entities.get(4).unwrap().health.current,
             46,
-            "standing Infantry bypasses the concrete prone pre-scale"
+            "standing Infantry bypasses the concrete prone pre-scale: 65 / 1.2 = 54"
         );
     }
 
@@ -3402,32 +3364,79 @@ mod tests {
     fn gsi_04_07_damage_nonfatal_infantry_scatter_precedes_fear() {
         #[derive(Debug)]
         struct Outcome {
-            health: u16,
+            health: i32,
             fear: u16,
             destination: Option<(u16, u16)>,
             queued_mission: MissionId,
             rng_changed: bool,
+            rng_indices: serde_json::Value,
+            setter: serde_json::Value,
         }
 
-        fn run(mission: MissionType, attacker_present: bool, health: u16) -> Outcome {
-            let ini = IniFile::from_str(
-                "[InfantryTypes]\n0=E1\n\
+        #[derive(Default)]
+        struct ScatterFixture {
+            doing: i32,
+            animation: Option<crate::sim::animation::SequenceKind>,
+            first_bridge: bool,
+            all_bridges: bool,
+            head: Option<crate::sim::components::DriveCoord>,
+            outside: bool,
+            entry_case: Option<serde_json::Value>,
+        }
+
+        fn run(
+            mission: MissionType,
+            attacker_present: bool,
+            health: i32,
+            fraidycat: bool,
+            human_control: Option<bool>,
+            team: bool,
+            nav: bool,
+        ) -> Outcome {
+            run_fixture(
+                mission,
+                attacker_present,
+                health,
+                fraidycat,
+                human_control,
+                team,
+                nav,
+                ScatterFixture {
+                    doing: -1,
+                    ..Default::default()
+                },
+            )
+        }
+
+        fn run_fixture(
+            mission: MissionType,
+            attacker_present: bool,
+            health: i32,
+            fraidycat: bool,
+            human_control: Option<bool>,
+            team: bool,
+            nav: bool,
+            fixture: ScatterFixture,
+        ) -> Outcome {
+            let ini = IniFile::from_str(&format!(
+                "[General]\nFixture=1\n[InfantryTypes]\n0=E1\n\
                  [VehicleTypes]\n0=ATTACKER\n\
                  [AircraftTypes]\n\
                  [BuildingTypes]\n\
                  [Warheads]\n0=WH\n\
                  [IQ]\nScatter=99\n\
                  [CombatDamage]\nPlayerScatter=no\nMaxDamage=10000\n\
-                 [Guard]\nScatter=yes\n\
+                 [Guard]\nScatter=yes\n[Enter]\nScatter=yes\n\
                  [Attack]\nScatter=no\n\
-                 [E1]\nStrength=125\nArmor=none\nSpeed=4\n\
-                 Locomotor={4A582744-9839-11d1-B709-00A024DDAFD1}\n\
-                 MovementZone=Infantry\n\
-                 [ATTACKER]\nStrength=100\nArmor=none\n\
+                 [E1]\nStrength=125\nArmor=none\nSpeed=4\nFraidycat={fraidycat}\n\
+                 Locomotor={{4A582744-9839-11d1-B709-00A024DDAFD1}}\n\
+                 MovementZone=Infantry\nSpeedType=Foot\n\
+                 [ATTACKER]\nStrength=100\nArmor=none\nOpenTopped=yes\n\
                  [WH]\nCellSpread=0\nPercentAtMax=1\n\
                  Verses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
-            );
-            let rules = RuleSet::from_ini(&ini).expect("damage-scatter fixture");
+            ));
+            let mut rules = RuleSet::from_ini(&ini).expect("damage-scatter fixture");
+            rules.general.blockage_path_delay_ticks = 22;
             let mut interner = test_interner();
             let attacker_house = interner.intern("AttackerHouse");
             let victim_house = interner.intern("VictimHouse");
@@ -3445,17 +3454,34 @@ mod tests {
             victim.owner = victim_house;
             victim.type_ref = victim_type;
             victim.category = EntityCategory::Infantry;
+            victim.mission_leaf = crate::sim::mission::leaf::MissionLeafState::for_entity_category(
+                EntityCategory::Infantry,
+            );
+            victim
+                .mission_leaf
+                .set_infantry_doing_verified(fixture.doing)
+                .unwrap();
+            victim.animation = fixture.animation.map(crate::sim::animation::Animation::new);
             victim.health.current = health;
-            victim.health.max = 125;
             victim.sub_cell = Some(2);
+            victim.on_bridge = fixture
+                .entry_case
+                .as_ref()
+                .and_then(|case| case["on_bridge"].as_bool())
+                .unwrap_or(false);
             victim.infantry = Some(crate::sim::game_entity::InfantryRuntime::new());
+            if nav {
+                victim.navigation.nav_com = Some(crate::sim::components::NavTargetRef::cell(8, 8));
+            }
             victim.locomotor = Some(
                 crate::sim::movement::locomotor::LocomotorState::from_object_type(
                     rules.object("E1").expect("E1 type"),
-                    rules.general.flight_level,
                     0,
                 ),
             );
+            if let Some(head) = fixture.head {
+                victim.locomotor.as_mut().unwrap().set_step_head(Some(head));
+            }
             victim.mission.apply_test_fixture(MissionTestFixture {
                 current: MissionId::from_known(mission),
                 suspended: MissionId::NONE,
@@ -3466,6 +3492,67 @@ mod tests {
                 ai_counter: 0,
                 dispatch_timer: MissionDispatchTimer::at_frame(0),
             });
+            if let Some(case) = fixture
+                .entry_case
+                .as_ref()
+                .filter(|c| c["live_setter"] == true)
+            {
+                use crate::sim::components::{DriveCoord, FootPathQueue};
+                use crate::sim::timer::CdTimer;
+                victim.body_facing.snap(0x4000, 0);
+                victim.infantry.as_mut().unwrap().cell_entry_blocked = true;
+                victim.navigation.nav_com_aux =
+                    Some(crate::sim::components::NavTargetRef::cell(1, 1));
+                victim.navigation.path_replay = FootPathQueue {
+                    directions: vec![2, 3, 4, 5],
+                    cursor: 0,
+                    reference_cell: Some((9, 8)),
+                };
+                let path = &mut victim.navigation.path_runtime;
+                path.movement_timer = CdTimer::started(50, 5);
+                path.blocked_timer = CdTimer::started(40, 6);
+                path.path_blocked = true;
+                path.retries_left = 7;
+                let loco = victim.locomotor.as_mut().unwrap();
+                loco.powered = case["power_off"] != true;
+                if let Some(head) = case["head"].as_array() {
+                    loco.set_step_head(Some(DriveCoord {
+                        x: head[0].as_i64().unwrap() as i32 - 1280,
+                        y: head[1].as_i64().unwrap() as i32 - 1280,
+                        z: head[2].as_i64().unwrap() as i32,
+                    }));
+                }
+                if case["moving"] == true {
+                    loco.set_walk_destination(Some(DriveCoord {
+                        x: 6528,
+                        y: 1408,
+                        z: 0,
+                    }));
+                }
+                victim.foot_locomotor_swap_active = case["swap_active"] == true;
+                if case["bunker"] == true {
+                    victim.bunker_link = crate::sim::game_entity::BunkerLink::Installed(1);
+                }
+                if case["warp_in"] == true || case["warp_out"] == true {
+                    use crate::sim::movement::teleport_movement::{TeleportPhase, TeleportState};
+                    victim.teleport_state = Some(TeleportState {
+                        phase: if case["warp_out"] == true {
+                            TeleportPhase::Relocate
+                        } else {
+                            TeleportPhase::ChronoDelay
+                        },
+                        target_rx: 8,
+                        target_ry: 8,
+                        being_warped_ticks: 3,
+                    });
+                }
+                if case["open_transport"] == true {
+                    victim.passenger_role = crate::sim::passenger::PassengerRole::Inside {
+                        transport_id: 1,
+                        open_topped: true,
+                    };
+                }
+            }
             entities.insert(victim);
 
             let mut occupancy = OccupancyGrid::new();
@@ -3478,10 +3565,58 @@ mod tests {
                 CellListInsertion::PrependNonBuilding,
             );
             let cells = (0..10)
-                .flat_map(|ry| (0..10).map(move |rx| test_terrain_cell(rx, ry)))
+                .flat_map(|ry| {
+                    (0..10).map(move |rx| {
+                        let mut cell = test_terrain_cell(rx, ry);
+                        cell.speed_costs.foot = Some(100);
+                        cell
+                    })
+                })
                 .collect();
             let mut terrain = ResolvedTerrainGrid::from_cells(10, 10, cells);
-            let event = EntityDamageEvent::area(
+            if fixture.first_bridge {
+                terrain.cell_mut(6, 4).unwrap().bridge_facts.raw_flags = 0x100;
+            }
+            if fixture.all_bridges {
+                for (dx, dy) in crate::util::direction::DIRECTION_DELTAS {
+                    terrain
+                        .cell_mut((5 + dx) as u16, (5 + dy) as u16)
+                        .unwrap()
+                        .bridge_facts
+                        .raw_flags = 0x100;
+                }
+            }
+            let mut raw = crate::sim::occupancy::RawCellOccupationGrid::new();
+            if let Some(case) = fixture.entry_case.as_ref() {
+                // Translate the native witness from (10,10) to this damage
+                // receiver fixture's (5,5); source heading and neighbours agree.
+                let xy = |v: &serde_json::Value| {
+                    (
+                        (v[0].as_u64().unwrap() - 5) as u16,
+                        (v[1].as_u64().unwrap() - 5) as u16,
+                    )
+                };
+                for cell in case["cells"].as_array().into_iter().flatten() {
+                    let (x, y) = xy(cell);
+                    let out = terrain.cell_mut(x, y).unwrap();
+                    out.level = cell[2].as_i64().unwrap() as u8;
+                    out.bridge_facts.raw_flags = cell[3].as_u64().unwrap() as u32;
+                }
+                for cell in case["slopes"].as_array().into_iter().flatten() {
+                    let (x, y) = xy(cell);
+                    terrain.cell_mut(x, y).unwrap().slope_type = cell[2].as_u64().unwrap() as u8;
+                }
+                for cell in case["blocked_terrain"].as_array().into_iter().flatten() {
+                    let (x, y) = xy(cell);
+                    terrain.cell_mut(x, y).unwrap().speed_costs.foot = Some(0);
+                }
+                for cell in case["raw"].as_array().into_iter().flatten() {
+                    let (x, y) = xy(cell);
+                    raw.mark_ground(x, y, cell[2].as_u64().unwrap() as u8);
+                    raw.mark_deck(x, y, cell[3].as_u64().unwrap() as u8);
+                }
+            }
+            let mut event = EntityDamageEvent::area(
                 2,
                 10,
                 0,
@@ -3493,35 +3628,64 @@ mod tests {
                 attacker_present.then_some(attacker_house),
                 warhead_ref,
             );
-            let mut scenario_rng = SimRng::new(1);
-            let before_rng = scenario_rng.state();
-            let mut main_rng = SimRng::new(7);
-            let mut handled_deaths = Vec::new();
-            let mut resources = BTreeMap::new();
-            let mut houses = BTreeMap::new();
-            let mut fatal_lifecycle = None;
-            let mut sound_sink = None;
-            let _ = crate::sim::combat::commit_damage_events(
-                std::slice::from_ref(&event),
-                &mut entities,
-                &mut occupancy,
-                &rules,
-                &mut interner,
-                &mut houses,
-                &[],
-                &HouseAllianceMap::new(),
-                &mut main_rng,
-                &mut scenario_rng,
-                &mut handled_deaths,
-                &mut resources,
-                None,
-                None,
-                Some(&mut terrain),
-                0,
-                &mut fatal_lifecycle,
-                &mut sound_sink,
+            if fixture
+                .entry_case
+                .as_ref()
+                .is_some_and(|c| c["warp_out"] == true || c["bunker"] == true)
+            {
+                // Ordinary damage is immune before Scatter in these states.
+                // Explicit ignore-defenses input reaches the same production
+                // receiver continuation so the native setter refusal is tested.
+                event.receiver_flags.as_mut().unwrap().ignore_defenses = true;
+            }
+            let mut world = crate::sim::world::Simulation::new();
+            world.substrate.entities = entities;
+            world.substrate.occupancy = occupancy;
+            world.substrate.raw_cell_occupation = raw;
+            world.interner = interner;
+            world.resolved_terrain = Some(terrain);
+            world.playfield_bounds = Some(
+                crate::sim::cell_rect::PlayfieldBounds::from_normalized_local_size(
+                    16, -16, -16, 64, 64,
+                ),
             );
-            let victim = entities.get(2).expect("victim remains represented");
+            if fixture.outside {
+                world.playfield_bounds = Some(
+                    crate::sim::cell_rect::PlayfieldBounds::from_normalized_local_size(
+                        16, 0, 0, 1, 1,
+                    ),
+                );
+            }
+            world.session.binary_frame = 100;
+            world.main_rng = SimRng::new(7);
+            world.scenario_rng = SimRng::new(1);
+            // Some(false) models campaign PlayerControl without IsHuman.
+            world.session.game_mode_nonzero = false;
+            let mut house =
+                HouseState::new(victim_house, 0, None, human_control == Some(true), 0, 10);
+            house.player_control = human_control.is_some();
+            world.houses.insert(victim_house, house);
+            if team {
+                let script = world.interner.intern("ScatterFixture");
+                world
+                    .team_script_vm
+                    .create_team(victim_house, script, vec![2], 0);
+            }
+            let before_rng = world.scenario_rng.state();
+            let mut receiver = crate::sim::combat::world_receiver::ReceiverRun::default();
+            crate::sim::combat::world_receiver::commit_entities(
+                &mut world,
+                &mut receiver,
+                std::slice::from_ref(&event),
+                None,
+                &rules,
+                None,
+            );
+            let victim = world
+                .substrate
+                .entities
+                .get(2)
+                .expect("victim remains represented");
             Outcome {
                 health: victim.health.current,
                 fear: victim
@@ -3532,37 +3696,219 @@ mod tests {
                 destination: victim
                     .movement_target
                     .as_ref()
-                    .map(|movement| *movement.path.last().expect("direct move has destination")),
+                    .and_then(|movement| movement.final_goal),
                 queued_mission: victim.mission.queued(),
-                rng_changed: scenario_rng.state() != before_rng,
+                rng_changed: world.scenario_rng.state() != before_rng,
+                rng_indices: {
+                    let state = world.scenario_rng.logical_state();
+                    serde_json::json!([state.index_a, state.index_b])
+                },
+                setter: {
+                    let loco = victim.locomotor.as_ref().unwrap();
+                    let path = &victim.navigation.path_runtime;
+                    let coord = |value: Option<crate::sim::components::DriveCoord>| {
+                        value.map_or([0, 0, 0], |v| [v.x + 1280, v.y + 1280, v.z])
+                    };
+                    let nav = victim.navigation.nav_com.and_then(|target| match target {
+                        crate::sim::components::NavTargetRef::Cell { rx, ry } => {
+                            Some([rx + 5, ry + 5])
+                        }
+                        _ => None,
+                    });
+                    serde_json::json!({
+                        "nav": nav, "aux": if victim.navigation.nav_com_aux.is_none() { 0 } else { 123 },
+                        "destination": coord(loco.walk_destination()), "head": coord(loco.step_head()),
+                        "queue": victim.navigation.path_replay.directions.iter().map(|&v| if v == 255 { -1 } else { i32::from(v) }).collect::<Vec<_>>(),
+                        "reference": victim.navigation.path_replay.reference_cell,
+                        "queued_mission": victim.mission.queued().raw(),
+                        "facing": u32::from(victim.body_facing.destination()) * 65537,
+                        "moving": u8::from(loco.walk_is_moving().unwrap()), "powered": u8::from(loco.powered),
+                        "blocked": u8::from(path.path_blocked),
+                        "movement_timer": [path.movement_timer.start_frame(), path.movement_timer.duration()],
+                        "blocked_timer": [path.blocked_timer.start_frame(), path.blocked_timer.duration()],
+                        "retries": path.retries_left,
+                        "entry_blocked": u8::from(victim.infantry.as_ref().unwrap().cell_entry_blocked),
+                    })
+                },
             }
         }
+
+        let run_scene = |fixture| {
+            run_fixture(
+                MissionType::Guard,
+                true,
+                125,
+                true,
+                None,
+                false,
+                false,
+                fixture,
+            )
+        };
+        let fixture = || ScatterFixture {
+            doing: -1,
+            ..Default::default()
+        };
+        // These witnesses execute original Scatter51D0D0 and Infantry51BF90
+        // together. Exercise the production damage receiver, including HP,
+        // queue/destination writes and fear, with the same entry prestates.
+        let corpus: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tools/spatial_oracle/infantry_scatter_entry.json"
+        ))
+        .unwrap();
+        assert_eq!(corpus.as_array().unwrap().len(), 14);
+        for row in corpus.as_array().unwrap() {
+            let output = run_scene(ScatterFixture {
+                entry_case: Some(row["input"].clone()),
+                ..fixture()
+            });
+            let expected = row["destination"].as_array().map(|xy| {
+                (
+                    (xy[0].as_u64().unwrap() - 5) as u16,
+                    (xy[1].as_u64().unwrap() - 5) as u16,
+                )
+            });
+            assert_eq!(output.destination, expected, "{}", row["input"]);
+            assert_eq!(
+                output.rng_indices, row["random_indices"],
+                "{}",
+                row["input"]
+            );
+            assert_eq!(output.health, 115);
+            assert_eq!(output.fear, 300);
+            assert_eq!(
+                output.queued_mission,
+                expected.map_or(MissionId::NONE, |_| {
+                    MissionId::from_known(MissionType::Move)
+                })
+            );
+        }
+        let destinations: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tools/spatial_oracle/infantry_scatter_destination.json"
+        ))
+        .unwrap();
+        assert_eq!(destinations.as_array().unwrap().len(), 18);
+        for row in destinations.as_array().unwrap() {
+            let mission = if row["input"]["mission"] == 7 {
+                MissionType::Enter
+            } else {
+                MissionType::Guard
+            };
+            let output = run_fixture(
+                mission,
+                true,
+                125,
+                true,
+                None,
+                false,
+                false,
+                ScatterFixture {
+                    entry_case: Some(row["input"].clone()),
+                    ..fixture()
+                },
+            );
+            assert_eq!(output.setter, row["setter"], "{}", row["input"]);
+            assert_eq!(
+                output.rng_indices, row["random_indices"],
+                "{}",
+                row["input"]
+            );
+            assert_eq!((output.health, output.fear), (115, 300));
+        }
+        let displayed_death = run_scene(ScatterFixture {
+            animation: Some(crate::sim::animation::SequenceKind::Die1),
+            ..fixture()
+        });
+        assert_eq!(
+            displayed_death.destination,
+            Some((6, 4)),
+            "display does not own Doing"
+        );
+        let refused_doing = run_scene(ScatterFixture {
+            doing: 7,
+            animation: Some(crate::sim::animation::SequenceKind::Stand),
+            ..fixture()
+        });
+        assert_eq!(refused_doing.destination, None);
+        assert!(!refused_doing.rng_changed);
+        let later_preferred = run_scene(ScatterFixture {
+            first_bridge: true,
+            ..fixture()
+        });
+        assert_eq!(later_preferred.destination, Some((6, 5)));
+        let fallback = run_scene(ScatterFixture {
+            all_bridges: true,
+            ..fixture()
+        });
+        assert_eq!(fallback.destination, Some((6, 4)));
+        let from_head = run_scene(ScatterFixture {
+            head: Some(crate::sim::components::DriveCoord {
+                x: 7 * 256 + 128,
+                y: 7 * 256 + 128,
+                z: 0,
+            }),
+            ..fixture()
+        });
+        assert_eq!(
+            from_head.destination,
+            Some((8, 6)),
+            "scan follows Foot head; heading follows physical source"
+        );
+        let outside = run_scene(ScatterFixture {
+            outside: true,
+            ..fixture()
+        });
+        assert_eq!(outside.destination, None);
+        assert!(
+            outside.rng_changed,
+            "selection failure keeps the preceding native draw"
+        );
 
         // Seed 1 yields RandomRanged(0,4)==1. With the attacker due west,
         // native base direction is E (2), so start=NE (1) and the first open
         // cell is (6,4). The Move/NavCom write is already visible when fear is
-        // subsequently latched to 100.
-        let guard = run(MissionType::Guard, true, 125);
+        // subsequently latched to 300 for Fraidycat (native518C7B).
+        let guard = run(MissionType::Guard, true, 125, true, None, false, false);
         assert_eq!(guard.health, 115);
         assert_eq!(guard.destination, Some((6, 4)));
         assert_eq!(
             guard.queued_mission,
             MissionId::from_known(MissionType::Move)
         );
-        assert_eq!(guard.fear, 100);
+        assert_eq!(guard.fear, 300);
         assert!(guard.rng_changed);
 
-        let null_attacker = run(MissionType::Guard, false, 125);
+        let null_attacker = run(MissionType::Guard, false, 125, true, None, false, false);
         assert_eq!(null_attacker.destination, None);
         assert!(!null_attacker.rng_changed);
 
-        let fatal = run(MissionType::Guard, true, 10);
+        let fatal = run(MissionType::Guard, true, 10, true, None, false, false);
         assert_eq!(fatal.health, 0);
         assert_eq!(fatal.destination, None);
 
-        let attack_mission = run(MissionType::Attack, true, 125);
+        let attack_mission = run(MissionType::Attack, true, 125, true, None, false, false);
         assert_eq!(attack_mission.destination, None);
         assert!(!attack_mission.rng_changed);
+
+        // Unforced damage must not make an ordinary combat infantryman flee,
+        // even if an AI owns it or its human owner has a Team and NavCom.
+        for control in [None, Some(true), Some(false)] {
+            let soldier = run(MissionType::Guard, true, 125, false, control, true, true);
+            assert_eq!(soldier.health, 115);
+            assert_eq!(soldier.destination, None);
+            assert!(!soldier.rng_changed, "{soldier:?}");
+        }
+        for control in [Some(true), Some(false)] {
+            let moving_civilian = run(MissionType::Guard, true, 125, true, control, false, true);
+            assert_eq!(moving_civilian.destination, None);
+            assert!(
+                !moving_civilian.rng_changed,
+                "NavCom cannot substitute for Team"
+            );
+            let team_civilian = run(MissionType::Guard, true, 125, true, control, true, false);
+            assert_eq!(team_civilian.destination, Some((6, 4)));
+            assert!(team_civilian.rng_changed);
+        }
     }
 
     fn bridge_layer_test_fixture() -> (
@@ -3638,59 +3984,7 @@ mod tests {
 
     fn test_terrain_cell(rx: u16, ry: u16) -> ResolvedTerrainCell {
         ResolvedTerrainCell {
-            rx,
-            ry,
-            source_tile_index: 0,
-            source_sub_tile: 0,
-            final_tile_index: 0,
-            final_sub_tile: 0,
-            is_wood_bridge_repair_tile: false,
-            level: 0,
-            filled_clear: false,
-            tileset_index: Some(0),
-            land_type: 0,
-            yr_cell_land_type: 0,
-            slope_type: 0,
-            template_height: 0,
-            render_offset_x: 0,
-            render_offset_y: 0,
-            terrain_class: TerrainClass::Clear,
-            speed_costs: SpeedCostProfile::default(),
-            is_water: false,
-            is_cliff_like: false,
-            is_rough: false,
-            is_road: false,
-            accepts_smudge: false,
-            allows_tiberium: false,
-            height_in_pixels: 0,
-            variant: 0,
-            has_ramp: false,
-            canonical_ramp: None,
-            ground_walk_blocked: false,
-            terrain_object_blocks: false,
-            terrain_object_occupation: None,
-            overlay_blocks: false,
-            overlay_zone_type: None,
-            outside_playfield: false,
-            zone_type: 0,
-            base_ground_walk_blocked: false,
-            base_build_blocked: false,
-            base_land_type: 0,
-            base_yr_cell_land_type: 0,
-            base_terrain_class: Default::default(),
-            base_speed_costs: Default::default(),
-            build_blocked: false,
-            has_bridge_deck: false,
-            bridge_walkable: false,
-            bridge_transition: false,
-            bridge_deck_level: 0,
-            bridge_layer: None,
-            bridge_facts: BridgeCellFacts::default(),
-            tube_index: None,
-            radar_left: [0, 0, 0],
-            radar_right: [0, 0, 0],
-            has_damaged_data: false,
-            bridgehead_anchor_class_at_load: None,
+            ..crate::map::resolved_terrain::test_flat_cell(rx, ry)
         }
     }
 
@@ -3732,7 +4026,6 @@ mod tests {
         air.position.sub_y = CELL_CENTER_LEPTON;
         let mut air_locomotor = crate::sim::movement::locomotor::LocomotorState::from_object_type(
             rules.object("AIR").expect("air type"),
-            rules.general.flight_level,
             0,
         );
         air_locomotor.layer = MovementLayer::Air;
@@ -3763,28 +4056,16 @@ mod tests {
         let mut terrain_objects = BTreeMap::new();
         let mut terrain_cells = BTreeMap::new();
         for (stable_id, rx) in [(100, 5), (101, 6), (102, 8)] {
-            terrain_objects.insert(
-                stable_id,
-                TerrainObjectState {
-                    stable_id,
-                    native_unique_id: None,
-                    in_logic_vector: false,
-                    type_ref: tree_ref,
-                    rx,
-                    ry: 5,
-                    health: 100,
-                    max_health: 100,
-                    occupation_bits: 4,
-                    lifecycle: TerrainObjectLifecycle::Live,
-                },
-            );
+            terrain_objects.insert(stable_id, {
+                let mut terrain = TerrainObjectState::for_test(stable_id, tree_ref, rx, 5);
+                terrain.occupation_bits = 4;
+                terrain
+            });
             terrain_cells.insert((rx, 5), stable_id);
         }
 
-        let cells = (0..12)
-            .flat_map(|ry| (0..12).map(move |rx| test_terrain_cell(rx, ry)))
-            .collect();
-        let mut terrain = ResolvedTerrainGrid::from_cells(12, 12, cells);
+        let mut terrain =
+            crate::map::resolved_terrain::test_grid(12, 12, |rx, ry| test_terrain_cell(rx, ry));
         let result = apply_aoe_damage_with_terrain(
             &mut entities,
             5,
@@ -3897,31 +4178,25 @@ mod tests {
              [OUTERWH]\nWood=yes\nCellSpread=0\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,0%,0%\n\
              [C4WH]\nWood=yes\nCellSpread=0\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,0%,0%\n",
         );
-        let mut rules = RuleSet::from_ini(&ini).expect("spawning Terrain rules");
+        let rules = RuleSet::from_ini(&ini).expect("spawning Terrain rules");
         let mut sim = crate::sim::world::Simulation::new();
         sim.resolve_type_handles(&rules);
         let victim_id = sim
-            .spawn_object("VICTIM", "VictimHouse", 5, 5, 0, &rules, &BTreeMap::new())
+            .spawn_object("VICTIM", "VictimHouse", 5, 5, 0, &rules)
             .expect("nested C4 victim spawns");
 
-        let cells = (0..10)
-            .flat_map(|ry| (0..10).map(move |rx| test_terrain_cell(rx, ry)))
-            .collect();
-        sim.resolved_terrain = Some(ResolvedTerrainGrid::from_cells(10, 10, cells));
+        sim.resolved_terrain = Some(crate::map::resolved_terrain::test_grid(10, 10, |rx, ry| {
+            test_terrain_cell(rx, ry)
+        }));
 
         let terrain_id = 900;
         let terrain_ref = sim.interner.intern("TIBTREE");
-        let terrain_state = TerrainObjectState {
-            stable_id: terrain_id,
-            native_unique_id: None,
-            in_logic_vector: false,
-            type_ref: terrain_ref,
-            rx: 5,
-            ry: 5,
-            health: 10,
-            max_health: 10,
-            occupation_bits: 4,
-            lifecycle: TerrainObjectLifecycle::Live,
+        let terrain_state = {
+            let mut terrain = TerrainObjectState::for_test(terrain_id, terrain_ref, 5, 5);
+            terrain.health = 10;
+            terrain.max_health = 10;
+            terrain.occupation_bits = 4;
+            terrain
         };
         sim.production
             .terrain_objects
@@ -3993,13 +4268,13 @@ mod tests {
             890,
             "nested raw-100 null-source C4 completes before the later parent receiver"
         );
-        assert_eq!(
+        assert!(
             sim.substrate
                 .entities
                 .get(victim_id)
                 .unwrap()
-                .last_attacker_id,
-            None,
+                .attack_target
+                .is_none(),
             "nested and parent null-source events do not fabricate an attacker"
         );
         let destroyed = &sim.production.terrain_objects[&terrain_id];
@@ -4057,34 +4332,25 @@ mod tests {
              [OUTERWH]\nWood=yes\nCellSpread=0\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,0%,0%\n\
              [C4WH]\nWood=yes\nCellSpread=0\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,0%,0%\n",
         );
-        let mut rules = RuleSet::from_ini(&ini).expect("inert Terrain rules");
+        let rules = RuleSet::from_ini(&ini).expect("inert Terrain rules");
         let mut sim = crate::sim::world::Simulation::new();
         sim.resolve_type_handles(&rules);
         let victim_id = sim
-            .spawn_object("VICTIM", "VictimHouse", 5, 5, 0, &rules, &BTreeMap::new())
+            .spawn_object("VICTIM", "VictimHouse", 5, 5, 0, &rules)
             .expect("inert receiver victim spawns");
-        let cells = (0..10)
-            .flat_map(|ry| (0..10).map(move |rx| test_terrain_cell(rx, ry)))
-            .collect();
-        sim.resolved_terrain = Some(ResolvedTerrainGrid::from_cells(10, 10, cells));
+        sim.resolved_terrain = Some(crate::map::resolved_terrain::test_grid(10, 10, |rx, ry| {
+            test_terrain_cell(rx, ry)
+        }));
 
         let terrain_id = 901;
         let terrain_ref = sim.interner.intern("TIBTREE");
-        sim.production.terrain_objects.insert(
-            terrain_id,
-            TerrainObjectState {
-                stable_id: terrain_id,
-                native_unique_id: None,
-                in_logic_vector: false,
-                type_ref: terrain_ref,
-                rx: 5,
-                ry: 5,
-                health: 10,
-                max_health: 10,
-                occupation_bits: 4,
-                lifecycle: TerrainObjectLifecycle::Live,
-            },
-        );
+        sim.production.terrain_objects.insert(terrain_id, {
+            let mut terrain = TerrainObjectState::for_test(terrain_id, terrain_ref, 5, 5);
+            terrain.health = 10;
+            terrain.max_health = 10;
+            terrain.occupation_bits = 4;
+            terrain
+        });
         sim.production
             .terrain_object_cells
             .insert((5, 5), terrain_id);

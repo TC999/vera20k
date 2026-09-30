@@ -126,6 +126,13 @@ pub(crate) enum PreparedLoadError {
 pub(crate) struct PreparedLoad {
     simulation: Simulation,
     map_restore: SnapshotMapRestoreOutput,
+    sinking_waterlines: Vec<(u64, i16)>,
+}
+
+/// Presentation changes released only after the validated world commits.
+pub(crate) struct CommittedLoadPresentation {
+    pub(crate) occupied_overlays: Vec<crate::map::overlay::OverlayEntry>,
+    pub(crate) sinking_waterlines: Vec<(u64, i16)>,
 }
 
 /// Immutable production input to an in-scenario load transaction.
@@ -193,18 +200,14 @@ impl PreparedLoad {
             .repository
             .read(path)
             .map_err(PreparedLoadError::ReadFile)?;
-        let (simulation, map_restore) = Self::prepare_candidate(
+        Self::prepare_candidate(
             &bytes,
             view.current_simulation,
             view.expected_map_hash,
             view.rules,
             view.terrain_template,
             view.overlay_registry,
-        )?;
-        Ok(Self {
-            simulation,
-            map_restore,
-        })
+        )
     }
 
     /// Perform every fallible validation and restoration step against owned
@@ -217,7 +220,7 @@ impl PreparedLoad {
         rules: Option<&RuleSet>,
         terrain_template: Option<&ResolvedTerrainGrid>,
         overlay_registry: Option<&OverlayTypeRegistry>,
-    ) -> Result<(Simulation, SnapshotMapRestoreOutput), PreparedLoadError> {
+    ) -> Result<Self, PreparedLoadError> {
         let current_simulation =
             current_simulation.ok_or(PreparedLoadError::MissingCurrentSimulation)?;
         let expected_map_hash = expected_map_hash.ok_or(PreparedLoadError::MissingMapHash)?;
@@ -233,9 +236,6 @@ impl PreparedLoad {
             .ok_or(PreparedLoadError::MissingTerrainTemplate)?;
 
         let terrain_speed_config = current_simulation.terrain_speed_config.clone();
-        let bridge_explosions = current_simulation.bridge_explosions.clone();
-        let metallic_debris = current_simulation.metallic_debris.clone();
-        let bridge_anim_sounds = current_simulation.bridge_anim_sounds.clone();
 
         let mut simulation = snapshot.sim;
         // This is the in-scenario Load Game route: native load reseeds
@@ -249,22 +249,29 @@ impl PreparedLoad {
         simulation.reconstruct_cellclass_dummy_for_map_resize();
         simulation.restore_after_snapshot_load()?;
         crate::sim::production::validate_restored_factory_state(&simulation, rules)?;
-        simulation.rebuild_caches_after_load(
-            terrain_template,
-            terrain_speed_config,
-            bridge_explosions,
-            metallic_debris,
-            bridge_anim_sounds,
-        );
+        simulation.rebuild_caches_after_load(terrain_template, terrain_speed_config, rules);
 
         let overlay_registry = overlay_registry.ok_or(PreparedLoadError::MissingOverlayRegistry)?;
         let map_restore =
             simulation.restore_map_authority_after_snapshot_load(rules, overlay_registry)?;
+        // Older headless saves may omit types that had never spawned. Add
+        // those canonical names without changing any saved ID, then build
+        // the handle table; a missing name must never become sidebar ID zero.
+        simulation.intern_rule_type_ids(rules);
         simulation.resolve_type_handles(rules);
         simulation.restore_move_sound_handles_after_load(rules)?;
         simulation.rebuild_lighting_sources_after_load(rules);
 
-        Ok((simulation, map_restore))
+        // A render cache can retain an outgoing ID until its next sweep. Only
+        // restored entity identities may re-enter the new presentation owner;
+        // do not infer +3CA from current height or from the sinking byte.
+        let mut sinking_waterlines = snapshot.sinking_waterlines;
+        sinking_waterlines.retain(|(id, _)| simulation.entities().contains(*id));
+        Ok(Self {
+            simulation,
+            map_restore,
+            sinking_waterlines,
+        })
     }
 
     pub(crate) fn native_tiberium_stats(
@@ -278,7 +285,7 @@ impl PreparedLoad {
     pub(crate) fn commit_into(
         mut self,
         runtime: &mut crate::sim::runtime::SimRuntime,
-    ) -> Vec<crate::map::overlay::OverlayEntry> {
+    ) -> CommittedLoadPresentation {
         // Commit the candidate's post-Resize fields and subsequent lookup
         // effects onto the live process identity only after all checks pass.
         // Resetting here would make its already-built hierarchy disagree.
@@ -286,7 +293,10 @@ impl PreparedLoad {
         live_dummy.adopt_prepared_load_state(&self.simulation.effective_shared_cell_dummy());
         self.simulation.bind_shared_cell_dummy(live_dummy);
         runtime.replace_simulation(self.simulation);
-        self.map_restore.occupied_overlays
+        CommittedLoadPresentation {
+            occupied_overlays: self.map_restore.occupied_overlays,
+            sinking_waterlines: self.sinking_waterlines,
+        }
     }
 }
 
@@ -496,10 +506,20 @@ impl SaveRepository {
     /// the diagnostic panel's embedded-time policy. The shared browser sorts
     /// these records with the established retail comparator after adding New.
     pub(crate) fn browser_entries(&self) -> Vec<(SaveEntry, u64)> {
-        let Ok(directory) = std::fs::read_dir(&self.directory) else {
-            return Vec::new();
-        };
-        directory
+        self.readable_entries().collect()
+    }
+
+    /// Whether any save reads: the scan stops at the first one, like
+    /// `LoadOptionsClass__HasLoadableSave` `0x00559C20`.
+    pub(crate) fn has_browser_entry(&self) -> bool {
+        self.readable_entries().next().is_some()
+    }
+
+    /// Saves whose header reads, with their file time, in directory order.
+    fn readable_entries(&self) -> impl Iterator<Item = (SaveEntry, u64)> + '_ {
+        std::fs::read_dir(&self.directory)
+            .into_iter()
+            .flatten()
             .filter_map(|item| {
                 let item = item.ok()?;
                 let path = item.path();
@@ -517,7 +537,6 @@ impl SaveRepository {
                 );
                 Some((SaveEntry { path, header }, ticks))
             })
-            .collect()
     }
 
     /// Quickload policy: select the `.bin` file with the newest filesystem
@@ -617,7 +636,8 @@ mod tests {
                 team: LaunchTeam::None,
                 difficulty: AiDifficulty::Easy,
             }],
-            pre_fill_house_roster: crate::skirmish_launch::PreFillHouseRoster::from_compact_skirmish(1),
+            pre_fill_house_roster:
+                crate::skirmish_launch::PreFillHouseRoster::from_compact_skirmish(1),
             options: SkirmishLaunchOptions::default(),
         }
     }
@@ -633,13 +653,16 @@ mod tests {
         let mut next_correlation = 1;
         let correlation =
             crate::match_bootstrap::allocate_match_correlation(&mut next_correlation).unwrap();
-        let startup =
-            crate::match_bootstrap::prepare_match_startup(correlation, accepted, &mut TestClock(seed));
+        let startup = crate::match_bootstrap::prepare_match_startup(
+            correlation,
+            accepted,
+            &mut TestClock(seed),
+        );
         let initial_simulation = Simulation::with_seed(u64::from(seed));
         let mut authority = MatchStartup::default();
         authority.begin(Some(correlation));
         authority
-            .acknowledge(startup, Some(&initial_simulation), true, false)
+            .acknowledge(startup, Some(&initial_simulation), true)
             .unwrap();
         authority
     }
@@ -667,6 +690,7 @@ mod tests {
             shared_cell_dummy
                 .apply_bridge_flag_slot(crate::map::bridge_facts::BridgeStampSlot::Anchor, true);
             let mut replay = ReplayLog::new(ReplayHeader {
+                pixel_conversion_bounds: Default::default(),
                 version: 1,
                 tick_hz: 15,
                 seed: simulation.session.seed,
@@ -761,6 +785,8 @@ mod tests {
 
     mod factory_restore_tests;
     mod infantry_terminal_restore_tests;
+    mod rule_cache_restore_tests;
+    mod sinking_waterline_restore_tests;
 
     include!("tube_hierarchy_restore_tests.rs");
 
@@ -779,8 +805,7 @@ mod tests {
     fn load_fixture_simulation(with_overlay_grid: bool) -> Simulation {
         let mut simulation = Simulation::with_seed(u64::from(LOAD_FIXTURE_SEED));
         simulation.session.map_name = LOAD_FIXTURE_MAP_NAME.to_string();
-        simulation.overlay_grid =
-            with_overlay_grid.then(|| OverlayGrid::new_with_retained_wall_plane(0, 0));
+        simulation.overlay_grid = with_overlay_grid.then(|| OverlayGrid::new(0, 0));
         simulation
     }
 
@@ -790,59 +815,11 @@ mod tests {
 
     fn compatibility_snapshot_cell(tile_index: i32) -> ResolvedTerrainCell {
         ResolvedTerrainCell {
-            rx: 0,
-            ry: 0,
             source_tile_index: tile_index,
-            source_sub_tile: 0,
             final_tile_index: tile_index,
-            final_sub_tile: 0,
-            is_wood_bridge_repair_tile: false,
-            level: 0,
-            filled_clear: false,
-            tileset_index: Some(0),
-            land_type: 0,
-            yr_cell_land_type: 0,
-            slope_type: 0,
-            template_height: 0,
-            height_in_pixels: 0,
-            render_offset_x: 0,
-            render_offset_y: 0,
-            terrain_class: TerrainClass::Clear,
-            speed_costs: SpeedCostProfile::default(),
-            is_water: false,
-            is_cliff_like: false,
-            is_rough: false,
-            is_road: false,
-            accepts_smudge: false,
-            allows_tiberium: false,
-            variant: 0,
-            has_ramp: false,
-            canonical_ramp: None,
-            ground_walk_blocked: false,
-            terrain_object_blocks: false,
-            terrain_object_occupation: None,
-            overlay_blocks: false,
-            overlay_zone_type: None,
-            outside_playfield: false,
             zone_type: crate::map::resolved_terrain::zone_class::GROUND,
-            base_ground_walk_blocked: false,
-            base_build_blocked: false,
-            base_land_type: 0,
-            base_yr_cell_land_type: 0,
             base_terrain_class: TerrainClass::Clear,
-            base_speed_costs: SpeedCostProfile::default(),
-            build_blocked: false,
-            has_bridge_deck: false,
-            bridge_walkable: false,
-            bridge_transition: false,
-            bridge_deck_level: 0,
-            bridge_layer: None,
-            bridge_facts: crate::map::bridge_facts::BridgeCellFacts::default(),
-            tube_index: None,
-            radar_left: [0, 0, 0],
-            radar_right: [0, 0, 0],
-            has_damaged_data: false,
-            bridgehead_anchor_class_at_load: None,
+            ..crate::map::resolved_terrain::test_flat_cell(0, 0)
         }
     }
 
@@ -1054,7 +1031,6 @@ mod tests {
         state.runtime.resources.rules = rules;
         state.runtime.resources.overlay_registry = registry;
         state.runtime.resources.terrain_template = Some(terrain);
-        state.runtime.resources.height_map.insert((3, 4), 7);
         state.runtime.resources.waypoints.insert(
             701,
             crate::map::waypoints::Waypoint {
@@ -1093,7 +1069,6 @@ mod tests {
         );
         let runtime = &mut state.runtime;
         let _occupied_overlays = prepared.commit_into(runtime);
-        assert_eq!(runtime.resources.height_map.get(&(3, 4)), Some(&7));
         assert_eq!(state.startup, startup_before);
         assert!(state.startup.admits_exact_step());
         assert_eq!(
@@ -1155,7 +1130,11 @@ mod tests {
             "[Houses]\n0=SavedPlayer\n1=OutgoingPlayer\n[SavedPlayer]\n[OutgoingPlayer]\n[Basic]\nPlayer=SavedPlayer\n",
         );
         let roster = crate::map::houses::parse_house_roster(&roster_ini, &[], Some(&rules));
-        crate::sim::scenario_bootstrap::initialize_map_roster_houses(&mut saved, &roster, Some(&rules));
+        crate::sim::scenario_bootstrap::initialize_map_roster_houses(
+            &mut saved,
+            &roster,
+            Some(&rules),
+        );
         crate::sim::scenario_bootstrap::initialize_campaign_current_house(
             &mut saved,
             &roster,
@@ -1188,7 +1167,11 @@ mod tests {
         let outgoing_hash = runtime.simulation.state_hash();
         let outgoing_rng = runtime.simulation.rng_state();
         let prepared = PreparedLoad::from_repository(
-            LoadPreparationView::from_runtime(&repository, Some(&runtime), Some(LOAD_FIXTURE_MAP_HASH)),
+            LoadPreparationView::from_runtime(
+                &repository,
+                Some(&runtime),
+                Some(LOAD_FIXTURE_MAP_HASH),
+            ),
             &path,
         )
         .expect("repository transaction prepares saved House identity");
@@ -1222,8 +1205,9 @@ mod tests {
         for (case_index, handle) in ["Neutral", "sPeCiAl", "COMPUTER1"].into_iter().enumerate() {
             let mut session = load_fixture_launch();
             session.player_name = handle.to_string();
-            let launch = crate::sim::scenario_bootstrap::MatchLaunchDescriptor::from_resolved(session)
-                .expect("existing display name remains admitted");
+            let launch =
+                crate::sim::scenario_bootstrap::MatchLaunchDescriptor::from_resolved(session)
+                    .expect("existing display name remains admitted");
             let mut saved = load_fixture_simulation(true);
             crate::sim::scenario_bootstrap::initialize_skirmish_launch_houses(
                 &mut saved,
@@ -1295,7 +1279,7 @@ mod tests {
         runtime_actual.radar_left = [31, 32, 33];
 
         let mut saved = load_fixture_simulation(false);
-        saved.overlay_grid = Some(OverlayGrid::new_with_retained_wall_plane(1, 1));
+        saved.overlay_grid = Some(OverlayGrid::new(1, 1));
         saved.install_resolved_terrain_for_new_map(translated_template.clone());
         saved
             .dynamic_terrain_cells
@@ -1303,8 +1287,8 @@ mod tests {
         let bytes = snapshot_bytes(&saved, &rules);
 
         let mut current = load_fixture_simulation(false);
-        current.overlay_grid = Some(OverlayGrid::new_with_retained_wall_plane(1, 1));
-        let (restored, _) = PreparedLoad::prepare_candidate(
+        current.overlay_grid = Some(OverlayGrid::new(1, 1));
+        let restored = PreparedLoad::prepare_candidate(
             &bytes,
             Some(&current),
             Some(LOAD_FIXTURE_MAP_HASH),
@@ -1312,7 +1296,8 @@ mod tests {
             Some(&translated_template),
             Some(&registry),
         )
-        .expect("full persistence prepare/serde/rebuild/restore route");
+        .expect("full persistence prepare/serde/rebuild/restore route")
+        .simulation;
 
         let restored_cell = restored
             .resolved_terrain

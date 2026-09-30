@@ -8,16 +8,11 @@
 //! lifetime here. The generic piggyback gate and other class policies stay with
 //! their existing owners. These helpers do not mutate Cell occupation.
 
-use super::drive_track::{DriveTrackState, ForcedDriveTrackState};
-use super::locomotor::LocomotorState;
 use crate::rules::locomotor_type::LocomotorKind;
-use crate::sim::components::DriveLocomotionRuntime;
 use crate::sim::game_entity::GameEntity;
 
 fn clear_drive_instance(entity: &mut GameEntity) {
     entity.drive_locomotion = None;
-    entity.drive_track = None;
-    entity.forced_drive_track = None;
 }
 
 pub(crate) fn begin_drive_for_teleporter(entity: &mut GameEntity, binary_frame: u32) -> bool {
@@ -36,22 +31,16 @@ pub(crate) fn begin_drive_for_teleporter(entity: &mut GameEntity, binary_frame: 
 }
 
 pub(crate) fn try_restore_primary(entity: &mut GameEntity) -> bool {
-    if entity
-        .locomotor
-        .as_ref()
-        .is_some_and(|locomotor| locomotor.active_kind() == LocomotorKind::Drive)
-    {
-        return try_end_drive_at_foot_idle(entity);
-    }
-    let gate = super::locomotor_end_gate_context(entity);
-    let admitted = entity.locomotor.as_ref().is_some_and(|locomotor| {
-        locomotor.can_restore_primary_from_piggyback(
-            gate.owner_moving,
-            gate.owner_teleporting,
-            gate.owner_deploying,
-        )
-    });
-    admitted && restore_admitted_primary(entity)
+    piggyback_end_admitted(entity) && restore_admitted_primary(entity)
+}
+
+/// The active locomotor's END gate for an entity-level caller. The one
+/// piggyback VERA installs is a Drive over a Teleport primary (the Unit
+/// setter's Teleporter arm), so the active Drive's own gate is the only one.
+/// A piggyback over any other primary needs the Chronosphere's
+/// ChangeLocomotorTo, which is not represented.
+pub(crate) fn piggyback_end_admitted(entity: &GameEntity) -> bool {
+    drive_end_admitted(entity)
 }
 
 /// Drive IsOKToEnd4AF970 at Foot EnterIdle4D833D, before NavQueue.
@@ -60,70 +49,47 @@ pub(crate) fn try_restore_primary(entity: &mut GameEntity) -> bool {
 /// This same class gate applies at other entity-level END callers. A missing
 /// lazily allocated Drive payload has its constructor's true permission.
 pub(crate) fn try_end_drive_at_foot_idle(entity: &mut GameEntity) -> bool {
-    let admitted = entity.locomotor.as_ref().is_some_and(|locomotor| {
+    drive_end_admitted(entity) && restore_admitted_primary(entity)
+}
+
+/// IsMoving here is the Drive's own order (+34 and its head): the Drive
+/// holds +34 until it arrives, so a Chrono Miner's Drive does not end
+/// mid-route.
+fn drive_end_admitted(entity: &GameEntity) -> bool {
+    entity.locomotor.as_ref().is_some_and(|locomotor| {
         locomotor.active_kind() == LocomotorKind::Drive && locomotor.piggyback.is_some()
     }) && entity
         .drive_locomotion
         .as_ref()
         .is_none_or(|drive| drive.end_permitted)
         && !super::drive_locomotion::drive_locomotor_is_moving(entity)
-        && !entity.foot_locomotor_swap_active;
-    admitted && restore_admitted_primary(entity)
+        && !entity.foot_locomotor_swap_active
 }
 
 /// The caller has already evaluated its END gate, at its own required point in
 /// the callback sequence. Keep that timing separate from the instance transfer.
 pub(crate) fn restore_admitted_primary(entity: &mut GameEntity) -> bool {
+    let physical = super::foot_coordinate::current_coordinate(entity);
     let Some(locomotor) = entity.locomotor.as_mut() else {
         return false;
     };
     let retired_drive = locomotor.active_kind() == LocomotorKind::Drive;
-    let restored = locomotor.restore_primary_from_piggyback();
+    let restored = locomotor.end_piggyback();
+    if restored {
+        // END transfers the controller without moving Object+9C. Restored
+        // altitude is controller state, not an addition to this exact XYZ.
+        entity.position.exact_z_leptons = Some(physical.z);
+    }
     if restored && retired_drive {
         clear_drive_instance(entity);
     }
     restored
 }
 
-/// Rollback for the existing miner command's failed-path transaction. Capture
-/// the complete state changed by Drive activation, including the class payload;
-/// restoring only kind/layer/phase would leave the newly installed instance's
-/// payload behind. This is a Rust command transaction, not a native END call.
-pub(crate) struct DriveActivationSnapshot {
-    locomotor: Option<LocomotorState>,
-    drive: Option<DriveLocomotionRuntime>,
-    curve: Option<DriveTrackState>,
-    forced: Option<ForcedDriveTrackState>,
-    path_replay: crate::sim::components::FootPathQueue,
-    path_runtime: crate::sim::components::FootPathRuntime,
-    foot_speed: crate::sim::components::FootSpeedState,
-    foot_occupation_enabled: bool,
-}
-
-impl DriveActivationSnapshot {
-    pub(crate) fn capture(entity: &GameEntity) -> Self {
-        Self {
-            locomotor: entity.locomotor.clone(),
-            drive: entity.drive_locomotion.clone(),
-            curve: entity.drive_track.clone(),
-            forced: entity.forced_drive_track.clone(),
-            path_replay: entity.navigation.path_replay.clone(),
-            path_runtime: entity.navigation.path_runtime,
-            foot_speed: entity.foot_speed.clone(),
-            foot_occupation_enabled: entity.foot_occupation_enabled,
-        }
-    }
-
-    pub(crate) fn restore(self, entity: &mut GameEntity) {
-        entity.locomotor = self.locomotor;
-        entity.drive_locomotion = self.drive;
-        entity.drive_track = self.curve;
-        entity.forced_drive_track = self.forced;
-        entity.navigation.path_replay = self.path_replay;
-        entity.navigation.path_runtime = self.path_runtime;
-        entity.foot_speed = self.foot_speed;
-        entity.foot_occupation_enabled = self.foot_occupation_enabled;
-    }
+/// Techno70C5B0/70C5C0 expose the represented warp bytes to Walk/Fly: the
+/// teleport's warp-out and warp-in and a Temporal warp.
+pub(crate) fn owner_is_warping(entity: &GameEntity) -> bool {
+    entity.is_warping_in() || entity.is_warped_out()
 }
 
 #[cfg(test)]

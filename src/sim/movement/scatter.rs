@@ -1,522 +1,417 @@
-//! Cell scatter system — displaces idle mobile units away from a target cell.
+//! `TechnoClass::Scatter` (vtable `+0x174`) with a null coordinate: the one
+//! dispatcher over the class receivers, the Unit receiver, and the cell
+//! dispatcher `CellClass::Scatter_Objects @ 0x00481670` that calls it.
 //!
-//! When a cell becomes blocked (building placed, terrain change, etc.), idle
-//! mobile units near that cell must scatter to nearby passable cells.
+//! Receivers:
+//! - Unit `0x00743A50`: [`Simulation::unit_scatter_null`].
+//! - Infantry `0x0051D0D0`: `infantry_scatter`.
+//! - Aircraft `0x0041A590`: when the current mission's MissionControl
+//!   `Scatter=` is set, `Enter_Idle_Mode(0, 1)` (`0x004176F0`); it reads
+//!   neither the coordinate nor the flags. RESIDUAL: not dispatched, because
+//!   no aircraft idle-mode owner is callable outside the aircraft mission
+//!   code. Trigger: a landed aircraft asked to scatter. Effect: it keeps its
+//!   mission instead of re-entering idle mode. Frequency: rare, since a
+//!   landed aircraft is seldom in a blocked cell.
+//! - Every other class inherits ObjectClass `0x005F43A0` (`RET 0xC`).
 //!
-//! **VERA-internal, gamemd equivalent UNCHECKED.** There is no
-//! `HouseClass::ScatterUnitsFromCell` in this program — the name this header
-//! used to carry was invented. The scatter functions that do exist are
-//! `CellClass::Scatter_Objects` @ `0x00481670`,
-//! `DriveLocomotionClass::Stop_And_Scatter` @ `0x004B4890`,
-//! `HouseClass::ScatterAllUnits` @ `0x004FC6D0`, `InfantryClass::Scatter` @
-//! `0x0051D0D0`, `ScatterCommandClass::Execute` @ `0x00730FE0` and
-//! `UnitClass::Scatter` @ `0x00743A50`. Every claim below — the periodic
-//! `TechnoClass::AI` scatter, `rules+0x1808` as its interval, 351 direction
-//! tries, the 350-entry global foundation offset table and
-//! `IDLE_SCATTER_INTERVAL` — is asserted with no address and is unverified.
-//! Trigger: any cell-blocked scatter. Player effect: idle units displace by
-//! VERA's own rule. Frequency: every building placement and terrain change.
-//! Downstream risk: `Scatter_Objects` is the verified mechanism and caps its
-//! collected list at ten; this file does not model that at all.
-//!
-//! ## Original engine behavior
-//! The original walks a global foundation offset table (350 entries of `(dx, dy)`
-//! short pairs) that spiral outward from the origin. For each
-//! idle foot-class unit (vehicles and infantry) owned by the house, it:
-//! 1. Picks the next spiral offset as a scatter destination
-//! 2. Checks if the destination cell is passable
-//! 3. Assigns a movement order to send the unit there
-//! 4. Tries up to 351 (`0x15F`) directions before giving up
-//!
-//! We reproduce this with a programmatically generated spiral pattern and the
-//! existing A* pathfinding infrastructure.
-//!
-//! ## Dependency rules
-//! - Part of sim/ — depends on sim/entity_store, sim/movement, sim/pathfinding,
-//!   sim/bump_crush.
-//! - sim/ NEVER depends on render/, ui/, sidebar/, audio/, net/.
-
-use std::collections::{BTreeMap, BTreeSet};
+//! A null coordinate is the all-zero CoordStruct each caller passes
+//! (`0x008B3DA8`, `0x00B1CFE8`); the receivers compare against their own zero
+//! globals (`0x00B1CFE8`, `0x00A8F200`).
 
 use crate::map::entities::EntityCategory;
-use crate::rules::locomotor_type::SpeedType;
+use crate::map::overlay_types::OverlayTypeRegistry;
+use crate::rules::locomotor_type::{LocomotorKind, MovementZone};
 use crate::rules::ruleset::RuleSet;
+use crate::sim::components::NavTargetRef;
 use crate::sim::entity_store::EntityStore;
-use crate::sim::movement;
-use crate::sim::movement::bump_crush;
-use crate::sim::movement::locomotor::MovementLayer;
-use crate::sim::occupancy::OccupancyGrid;
-use crate::sim::pathfinding::PathGrid;
-use crate::sim::pathfinding::terrain_cost::TerrainCostGrid;
-use crate::sim::rng::SimRng;
-use crate::util::fixed_math::SimFixed;
+use crate::sim::find_nearby_cell::{
+    NearbyAnchorGate, NearbyFootprint, NearbyQuery, PassabilityArgs, find_nearby_passable_cell,
+    map_owned_radius_cap,
+};
+use crate::sim::game_entity::GameEntity;
+use crate::sim::house_state::HouseState;
+use crate::sim::intern::{InternedId, StringInterner};
+use crate::sim::world::Simulation;
+use std::collections::{BTreeMap, BTreeSet};
 
-/// Maximum number of spiral directions to try per scatter operation.
-/// The original engine uses `0x15F` (351).
-const MAX_SCATTER_DIRECTIONS: usize = 351;
+use super::locomotor::MovementLayer;
 
-/// Maximum spiral search radius in cells.
-/// 351 offsets ≈ a square shell spiral out to radius ~10.
-const MAX_SPIRAL_RADIUS: i32 = 10;
+/// The two flags every Scatter call passes after its coordinate, under
+/// Westwood's names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ScatterFlags {
+    /// Second argument: overrides the current mission's MissionControl
+    /// `Scatter=` (Unit `0x00743AD8..0x00743AEA`). Infantry drops it while
+    /// its locomotor is moving (`0x0051D172`).
+    pub(super) forced: bool,
+    /// Third argument: a Unit with a NavCom scatters only with it
+    /// (`0x00743B1D..0x00743B2D`). Infantry reads it in its deploy arm and
+    /// its human-owner gate. `Scatter_Objects` passes its dispatch-all byte
+    /// here.
+    pub(super) no_kidding: bool,
+}
 
-/// How often idle scatter checks run (in simulation ticks).
-/// Original engine: `frame_counter % rules+0x1808 == 0`.
-/// ~10 seconds at 15 fps game speed.
-const IDLE_SCATTER_INTERVAL: u64 = 150;
-
-/// The 8 directional neighbor offsets in isometric cell coordinates.
-const NEIGHBOR_OFFSETS: [(i32, i32); 8] = [
-    (0, -1),
-    (1, -1),
-    (1, 0),
-    (1, 1),
-    (0, 1),
-    (-1, 1),
-    (-1, 0),
-    (-1, -1),
-];
-
-/// Periodic idle scatter: every `IDLE_SCATTER_INTERVAL` ticks, scan for idle
-/// mobile units sharing a cell with other occupants and scatter them to a
-/// random adjacent passable cell.
-///
-/// Reproduces `TechnoClass::AI` periodic scatter check:
-/// "Every N frames, idle infantry with no destination auto-scatter."
-pub fn tick_idle_scatter(
-    entities: &mut EntityStore,
-    rules: Option<&RuleSet>,
-    path_grid: Option<&PathGrid>,
-    terrain_costs: &BTreeMap<SpeedType, TerrainCostGrid>,
-    occupancy: &OccupancyGrid,
-    rng: &mut SimRng,
-    frame_counter: u64,
-    interner: &crate::sim::intern::StringInterner,
-    timing: crate::sim::movement::DestinationTiming,
-) {
-    if frame_counter == 0 || !frame_counter.is_multiple_of(IDLE_SCATTER_INTERVAL) {
-        return;
-    }
-    let Some(grid) = path_grid else { return };
-
-    // Collect idle mobile units sharing a cell with others. Deterministic order
-    // via keys_sorted() is critical for lockstep correctness.
-    let keys = entities.keys_sorted();
-    let mut scatter_commands: Vec<(u64, (u16, u16))> = Vec::new();
-
-    for &id in &keys {
-        let Some(entity) = entities.get(id) else {
-            continue;
-        };
-        // Must be idle mobile unit (no movement, no attack, no standing order).
-        if entity.movement_target.is_some()
-            || entity.attack_target.is_some()
-            || entity.order_intent.is_some()
-            || entity.dying
-            || entity.locomotor.is_none()
-        {
-            continue;
-        }
-        match entity.category {
-            EntityCategory::Unit | EntityCategory::Infantry => {}
-            _ => continue,
-        }
-
-        let pos = (entity.position.rx, entity.position.ry);
-
-        // Only scatter if sharing the cell with at least one other entity.
-        let sharing = occupancy.get(pos.0, pos.1).is_some_and(|occ| {
-            let total = occ.blockers(MovementLayer::Ground).count()
-                + occ.infantry(MovementLayer::Ground).count();
-            total > 1
-        });
-        if !sharing {
-            continue;
-        }
-
-        // Pick a random adjacent passable cell. Try up to 8 neighbors starting
-        // from a random direction, matching the original engine's usage.
-        let start_dir = rng.next_range_u32(8) as usize;
-        let mut dest: Option<(u16, u16)> = None;
-        for i in 0..8 {
-            let dir = (start_dir + i) % 8;
-            let (dx, dy) = NEIGHBOR_OFFSETS[dir];
-            let nx = pos.0 as i32 + dx;
-            let ny = pos.1 as i32 + dy;
-            if nx < 0 || ny < 0 {
-                continue;
-            }
-            let (rx, ry) = (nx as u16, ny as u16);
-            if rx >= grid.width() || ry >= grid.height() || !grid.is_walkable(rx, ry) {
-                continue;
-            }
-            // For infantry: must have a free sub-cell. For vehicles: must be empty.
-            let available = match entity.category {
-                EntityCategory::Infantry => bump_crush::cell_passable_for_infantry(
-                    occupancy.get(rx, ry),
-                    MovementLayer::Ground,
-                ),
-                _ => occupancy
-                    .get(rx, ry)
-                    .map_or(true, |o| !o.has_blockers_on(MovementLayer::Ground)),
-            };
-            if available {
-                dest = Some((rx, ry));
-                break;
-            }
-        }
-
-        if let Some(target) = dest {
-            if let Some(occ) = occupancy.get(pos.0, pos.1) {
-                let blockers: Vec<_> = occ.blockers(MovementLayer::Ground).collect();
-                let infantry: Vec<_> = occ.infantry(MovementLayer::Ground).collect();
-                log::info!(
-                    "IDLE_SCATTER entity={} {:?} at ({},{}) → ({},{}) blockers={:?} infantry={:?}",
-                    id,
-                    entity.category,
-                    pos.0,
-                    pos.1,
-                    target.0,
-                    target.1,
-                    blockers,
-                    infantry,
-                );
-            }
-            scatter_commands.push((id, target));
-        }
-    }
-
-    // Apply scatter commands outside the immutable entity iteration.
-    for (entity_id, dest) in scatter_commands {
-        let speed = resolve_entity_speed(entities, rules, entity_id, interner);
-        if speed <= SimFixed::from_num(0) {
-            continue;
-        }
-        let cost_grid = entities
-            .get(entity_id)
-            .and_then(|e| e.locomotor.as_ref())
-            .and_then(|l| terrain_costs.get(&l.speed_type));
-
-        movement::issue_move_command_with_layered(
-            entities, grid, entity_id, dest, speed, false, cost_grid,
-            None,  // no entity blocks for 1-cell scatter
-            None,  // resolved_terrain
-            None,  // zone_grid
-            None,  // entity_block_map
-            false, // mover_is_crusher — scatter doesn't need crusher logic
-            None,  // no resolved world substrate for exact blocker counts
-            None,  // no MapClass authority reaches this isolated helper
-            None,  // caller does not own the world occupation grid
-            timing,
-        );
+impl ScatterFlags {
+    pub(crate) const fn new(forced: bool, no_kidding: bool) -> Self {
+        Self { forced, no_kidding }
     }
 }
 
-/// Scatter idle mobile units owned by `owner` away from `target_cell`.
-///
-/// Iterates all vehicles and infantry owned by the specified house. For each
-/// idle (no active movement order) mobile entity, finds a nearby passable cell
-/// using a spiral search outward from `target_cell` and assigns a movement
-/// target to displace it there.
-///
-/// Returns the number of units that were successfully scattered.
-pub fn scatter_units_from_cell(
-    entities: &mut EntityStore,
-    rules: Option<&RuleSet>,
-    owner: crate::sim::intern::InternedId,
-    target_cell: (u16, u16),
-    path_grid: &PathGrid,
-    terrain_costs: &BTreeMap<SpeedType, TerrainCostGrid>,
-    occupancy: &OccupancyGrid,
-    interner: &crate::sim::intern::StringInterner,
-    timing: crate::sim::movement::DestinationTiming,
-) -> u32 {
-    let spiral = generate_spiral_offsets(MAX_SPIRAL_RADIUS, MAX_SCATTER_DIRECTIONS);
-
-    // Collect candidate entities: idle mobile units owned by this house.
-    // keys_sorted() takes &mut self, so .to_vec() releases the borrow before
-    // we read entity fields.
-    let keys = entities.keys_sorted();
-    let candidates: Vec<(u64, EntityCategory)> = keys
-        .iter()
-        .filter_map(|&id| {
-            let entity = entities.get(id)?;
-            if entity.owner() != owner {
-                return None;
-            }
-            match entity.category {
-                EntityCategory::Unit | EntityCategory::Infantry => {}
-                _ => return None,
-            }
-            // Skip units already moving (not idle).
-            if entity.movement_target.is_some() {
-                return None;
-            }
-            // Skip immobile entities.
-            if entity.locomotor.is_none() {
-                return None;
-            }
-            Some((id, entity.category))
-        })
-        .collect();
-
-    if candidates.is_empty() {
-        return 0;
-    }
-
-    let mut direction_idx: usize = 0;
-    let mut scattered: u32 = 0;
-
-    for (entity_id, category) in &candidates {
-        if direction_idx >= spiral.len() {
-            break;
-        }
-
-        // Find the next passable scatter cell from the current spiral direction.
-        let scatter_cell = find_passable_scatter_cell(
-            &spiral,
-            &mut direction_idx,
-            target_cell,
-            *category,
-            path_grid,
-            occupancy,
-        );
-
-        let Some(dest) = scatter_cell else {
-            // Exhausted all spiral directions — stop.
-            break;
-        };
-
-        // Resolve movement speed from rules.ini.
-        let speed = resolve_entity_speed(entities, rules, *entity_id, interner);
-        if speed <= SimFixed::from_num(0) {
-            continue;
-        }
-
-        // Resolve terrain cost grid for this entity's speed type.
-        let cost_grid = entities
-            .get(*entity_id)
-            .and_then(|e| e.locomotor.as_ref())
-            .and_then(|l| terrain_costs.get(&l.speed_type));
-
-        // Build a set of cells occupied by other entities to avoid during pathfinding.
-        let entity_blocks = build_entity_block_set(entities, *entity_id);
-
-        let success = movement::issue_move_command_with_layered(
-            entities,
-            path_grid,
-            *entity_id,
-            dest,
-            speed,
-            false, // don't queue — replace any existing movement
-            cost_grid,
-            Some(&entity_blocks),
-            None,  // resolved_terrain
-            None,  // zone_grid
-            None,  // entity_block_map
-            false, // mover_is_crusher
-            None,  // no resolved world substrate for exact blocker counts
-            None,  // no MapClass authority reaches this isolated helper
-            None,  // caller does not own the world occupation grid
-            timing,
-        );
-
-        if success {
-            scattered += 1;
-        }
-    }
-
-    scattered
+/// `Scatter(null, flags)` calls a movement-pass step makes while the pass
+/// holds the world split: the tube exit's blocked cell (`0x00735F55`) and the
+/// pass lane's cell-entry arms. The object turn runs them in call order once
+/// the pass returns ([`Simulation::run_scatter_requests`]), still inside that
+/// object's Process. Each object is asked at most once per pass.
+#[derive(Debug, Default)]
+pub(crate) struct ScatterRequests {
+    asked: BTreeSet<u64>,
+    pending: Vec<(u64, ScatterFlags)>,
 }
 
-/// Walk the spiral offset table from `direction_idx` to find the next cell
-/// that is walkable and available for the given entity category.
-///
-/// Advances `direction_idx` past each tested offset. Returns `None` if
-/// the spiral is exhausted without finding a passable cell.
-fn find_passable_scatter_cell(
-    spiral: &[(i16, i16)],
-    direction_idx: &mut usize,
-    target_cell: (u16, u16),
-    category: EntityCategory,
-    path_grid: &PathGrid,
-    occupancy: &OccupancyGrid,
-) -> Option<(u16, u16)> {
-    while *direction_idx < spiral.len() {
-        let (dx, dy) = spiral[*direction_idx];
-        *direction_idx += 1;
-
-        let cx = target_cell.0 as i32 + dx as i32;
-        let cy = target_cell.1 as i32 + dy as i32;
-        if cx < 0 || cy < 0 {
-            continue;
+impl ScatterRequests {
+    /// Queues `Scatter(null, flags)` on `id`; false when this pass already
+    /// asked it.
+    pub(super) fn request(&mut self, id: u64, flags: ScatterFlags) -> bool {
+        let first = self.asked.insert(id);
+        if first {
+            self.pending.push((id, flags));
         }
-        let rx = cx as u16;
-        let ry = cy as u16;
-
-        // Check grid bounds and walkability.
-        if rx >= path_grid.width() || ry >= path_grid.height() {
-            continue;
-        }
-        if !path_grid.is_walkable(rx, ry) {
-            continue;
-        }
-
-        // Check occupancy: infantry can share cells, vehicles cannot.
-        let available = match category {
-            EntityCategory::Infantry => {
-                bump_crush::cell_passable_for_infantry(occupancy.get(rx, ry), MovementLayer::Ground)
-            }
-            _ => occupancy
-                .get(rx, ry)
-                .map_or(true, |o| !o.has_blockers_on(MovementLayer::Ground)),
-        };
-        if !available {
-            continue;
-        }
-
-        return Some((rx, ry));
+        first
     }
-    None
+
+    /// The queued calls, in call order. The pass keeps whom it asked.
+    pub(super) fn take(&mut self) -> Vec<(u64, ScatterFlags)> {
+        std::mem::take(&mut self.pending)
+    }
 }
 
-/// Resolve a unit's movement speed from rules.ini + locomotor multiplier.
-fn resolve_entity_speed(
-    entities: &EntityStore,
-    rules: Option<&RuleSet>,
-    entity_id: u64,
-    interner: &crate::sim::intern::StringInterner,
-) -> SimFixed {
-    let Some(entity) = entities.get(entity_id) else {
-        return SimFixed::from_num(0);
+/// The current mission's MissionControl `Scatter=` (`0x005B3A00` indexes the
+/// table at `0x00A8E3A8` by `+0xAC`). No mission (-1) reads the byte before
+/// the table, `0x00A8E391`: the second byte of the vtable pointer
+/// `0x007E9E64` the static initializer stores at `0x00A8E390`
+/// (`0x004E6BFD`), which is nonzero, so it reads as permitted.
+pub(super) fn mission_permits_scatter(entity: &GameEntity, rules: &RuleSet) -> bool {
+    entity
+        .mission
+        .current()
+        .known()
+        .and_then(|mission| rules.mission_control.entry(mission))
+        .is_none_or(|entry| entry.scatter)
+}
+
+/// `UnitClass::Scatter` refusals before the coordinate
+/// (`0x00743A5C..0x00743BAA`), in native order:
+/// - `+0x28C` (`0x006F3280`): effective Sleep, Sticky or Unload, or
+///   `IsTrain=` (unparsed; no retail type sets it);
+/// - an active Teleport locomotor (the active class, not the installed slot:
+///   a Chrono Miner's temporary Drive is eligible);
+/// - the mission's `Scatter=` unless forced;
+/// - a rotating body (`+0x388`);
+/// - a NavCom unless no-kidding;
+/// - the deploy bytes `+0x6E0..+0x6E2` (`deploy_state`);
+/// - an unpowered locomotor (`ILocomotion+0x60`).
+///
+/// None draws RNG or writes state. Evidence for the flag-free prefix:
+/// tools/spatial_oracle/unit_scatter_state.{py,json,meta.json}.
+pub(super) fn unit_scatter_admitted(
+    unit: &GameEntity,
+    flags: ScatterFlags,
+    rules: &RuleSet,
+    binary_frame: u32,
+) -> bool {
+    if matches!(unit.mission.effective().raw(), 0 | 6 | 16) {
+        return false;
+    }
+    let Some(locomotor) = unit.locomotor.as_ref() else {
+        return false;
     };
-    // `FootClass::GetCurrentSpeed @ 0x004DB1A0`: FASTER scales the truncated
-    // per-frame type speed ahead of the locomotor fraction.
-    let obj = rules.and_then(|r| r.object(interner.resolve(entity.type_ref())));
-    let base_speed = crate::sim::combat::veterancy::entity_mover_speed_leptons_per_second(
-        entity,
-        obj,
-        obj.map_or(4, |o| o.speed),
-        rules.map_or(1.0, |r| r.general.veteran_speed),
-    );
-    let loco_mult = entity
-        .locomotor
-        .as_ref()
-        .map(|l| l.speed_multiplier)
-        .unwrap_or(SimFixed::from_num(1));
-    (base_speed * loco_mult).max(SimFixed::from_num(25))
+    locomotor.active_kind() != LocomotorKind::Teleport
+        && (flags.forced || mission_permits_scatter(unit, rules))
+        && !unit.body_facing.is_rotating(binary_frame)
+        && (flags.no_kidding || unit.navigation.nav_com.is_none())
+        && unit.deploy_state.is_none()
+        && locomotor.is_powered()
 }
 
-/// Build a set of cells occupied by entities other than `exclude_id`.
-///
-/// Used as the `entity_blocks` parameter for A* pathfinding so the scattered
-/// unit doesn't try to path through other units.
-fn build_entity_block_set(entities: &EntityStore, exclude_id: u64) -> BTreeSet<(u16, u16)> {
-    let mut blocks = BTreeSet::new();
-    for entity in entities.values() {
-        if entity.stable_id() == exclude_id || entity.dying || !entity.lifecycle.cell_marked {
-            continue;
+/// The veterancy `Scatter_Objects`' elite pre-scan asks each occupant's
+/// `VeterancyClass::IsElite` for.
+const ELITE_VETERANCY: u16 = 200;
+
+/// Live Techno inputs at one `Scatter_Objects` dispatch
+/// (`0x00481771..0x004817C1`). A non-Techno has none and passes only on a
+/// cell-wide term.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ScatterTechno {
+    pub(super) has_scatter_ability: bool,
+    pub(super) house_iq: i32,
+}
+
+impl ScatterTechno {
+    pub(super) fn from_entity(
+        entity: &GameEntity,
+        rules: Option<&RuleSet>,
+        houses: &BTreeMap<InternedId, HouseState>,
+        interner: &StringInterner,
+    ) -> Self {
+        use crate::sim::combat::veterancy::{has_weapon_ability, rank_from_u16};
+        Self {
+            has_scatter_ability: rules
+                .and_then(|rules| rules.object(interner.resolve(entity.type_ref())))
+                .is_some_and(|object| {
+                    has_weapon_ability(
+                        rank_from_u16(entity.veterancy()),
+                        object,
+                        crate::rules::object_type::Ability::Scatter,
+                    )
+                }),
+            // A rulesless/component fixture may omit its House. Runtime houses
+            // own CurrentIQ; zero is their constructor default, not a human/AI
+            // inference. The value is already saved/restored by HouseState.
+            house_iq: houses
+                .get(&entity.owner())
+                .map_or(0, |house| house.current_iq),
         }
-        // Only block cells occupied by vehicles/structures — infantry share cells.
+    }
+}
+
+/// Rules inputs of the `Scatter_Objects` dispatch gate.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ScatterEligibility {
+    /// `[CombatDamage] PlayerScatter` — stock `no`.
+    pub(super) player_scatter: bool,
+    /// `[IQ] Scatter` — stock `2`, constructor default `3`.
+    pub(super) iq_scatter: i32,
+}
+
+impl Default for ScatterEligibility {
+    /// The RulesClass constructor values, used when no ruleset is loaded.
+    fn default() -> Self {
+        Self {
+            player_scatter: false,
+            iq_scatter: 3,
+        }
+    }
+}
+
+impl ScatterEligibility {
+    pub(super) fn from_rules(rules: Option<&RuleSet>) -> Self {
+        rules.map_or_else(Self::default, |rules| Self {
+            player_scatter: rules.general.player_scatter,
+            iq_scatter: rules.general.iq_scatter,
+        })
+    }
+}
+
+/// Whether `Scatter_Objects` dispatches to one occupant:
+/// `eliteFound || no_kidding || PlayerScatter || HasWeaponAbility(SCATTER) ||
+/// IQ.Scatter <= occupantHouse.IQ`. `eliteFound` is the per-cell pre-scan;
+/// the ability and IQ terms are per occupant. Draws no RNG.
+/// Evidence: tools/spatial_oracle/cell_scatter.{py,json,meta.json} executes the
+/// original dispatcher and ability reader.
+pub(super) fn scatter_dispatch_allowed(
+    eligibility: ScatterEligibility,
+    no_kidding: bool,
+    elite_in_cell: bool,
+    techno: Option<ScatterTechno>,
+) -> bool {
+    elite_in_cell
+        || no_kidding
+        || eligibility.player_scatter
+        || techno.is_some_and(|facts| {
+            facts.has_scatter_ability || facts.house_iq >= eligibility.iq_scatter
+        })
+}
+
+/// `CellClass::Scatter_Objects`' dispatch walk (`0x00481670`): the objects of
+/// one cell list, in list order, its gate hands `Scatter(coord, forced,
+/// no_kidding)`. Without no-kidding the list is first pre-scanned for an
+/// elite, which releases every occupant. `caller` is the object asking when
+/// VERA already lists it in that cell (the pass lane's crusher); native
+/// never lists it there, so it is neither scanned nor dispatched.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn scatter_objects_admitted(
+    occupants: &[u64],
+    caller: Option<u64>,
+    no_kidding: bool,
+    rules: Option<&RuleSet>,
+    entities: &EntityStore,
+    houses: &BTreeMap<InternedId, HouseState>,
+    interner: &StringInterner,
+) -> Vec<u64> {
+    let listed = || occupants.iter().copied().filter(|&id| Some(id) != caller);
+    let eligibility = ScatterEligibility::from_rules(rules);
+    let elite_in_cell = !no_kidding
+        && listed().any(|id| {
+            entities
+                .get(id)
+                .is_some_and(|entity| entity.veterancy() >= ELITE_VETERANCY)
+        });
+    listed()
+        .filter(|&id| {
+            entities.get(id).is_some_and(|occupant| {
+                scatter_dispatch_allowed(
+                    eligibility,
+                    no_kidding,
+                    elite_in_cell,
+                    Some(ScatterTechno::from_entity(
+                        occupant, rules, houses, interner,
+                    )),
+                )
+            })
+        })
+        .collect()
+}
+
+impl Simulation {
+    /// `TechnoClass::Scatter` (vtable `+0x174`) with a null coordinate.
+    /// Answers whether an Infantry receiver's immediate Process changed bridge
+    /// state. Missing map state leaves the receiver where it stands; malformed
+    /// live class state is an error.
+    pub(crate) fn scatter_null(
+        &mut self,
+        id: u64,
+        flags: ScatterFlags,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+    ) -> Result<bool, String> {
+        let Some(entity) = self.substrate.entities.get(id) else {
+            return Ok(false);
+        };
         match entity.category {
-            EntityCategory::Unit | EntityCategory::Structure => {
-                blocks.insert((entity.position.rx, entity.position.ry));
+            EntityCategory::Unit => {
+                self.unit_scatter_null(id, flags, rules);
+                Ok(false)
             }
-            _ => {}
+            EntityCategory::Infantry => self.infantry_scatter_null(id, flags, rules, registry),
+            _ => Ok(false),
         }
     }
-    blocks
-}
 
-/// Generate a spiral of `(dx, dy)` cell offsets radiating outward from `(0, 0)`.
-///
-/// Reproduces the search pattern of the original engine's foundation offset table
-/// (350 entries spiraling outward). The spiral walks concentric
-/// square shells: radius 1 first (8 cells), then radius 2 (16 cells), etc.
-///
-/// Each shell visits cells in order: top edge (left→right), right edge (top→bottom),
-/// bottom edge (right→left), left edge (bottom→top).
-fn generate_spiral_offsets(max_radius: i32, max_entries: usize) -> Vec<(i16, i16)> {
-    let mut offsets = Vec::with_capacity(max_entries);
-    for r in 1..=max_radius {
-        // Top edge: y = -r, x from -r to r
-        for x in -r..=r {
-            offsets.push((x as i16, (-r) as i16));
-            if offsets.len() >= max_entries {
-                return offsets;
-            }
+    /// `UnitClass::Scatter @ 0x00743A50` with a null coordinate
+    /// (`0x00743BE0..0x00743C9B`): after [`unit_scatter_admitted`], the
+    /// nearby passable cell and `SetDestination(cell, 1)` (`0x00744063..
+    /// 0x00744070`), whose answer native does not read. This arm draws no
+    /// RNG, queues no mission and runs no Process. The setter
+    /// ([`Simulation::set_unit_destination`]) reaches the Move_To of
+    /// every retail Unit locomotor.
+    fn unit_scatter_null(&mut self, id: u64, flags: ScatterFlags, rules: &RuleSet) {
+        let Some(unit) = self.substrate.entities.get(id) else {
+            return;
+        };
+        if !unit_scatter_admitted(unit, flags, rules, self.session.binary_frame) {
+            return;
         }
-        // Right edge: x = r, y from -r+1 to r
-        for y in (-r + 1)..=r {
-            offsets.push((r as i16, y as i16));
-            if offsets.len() >= max_entries {
-                return offsets;
-            }
-        }
-        // Bottom edge: y = r, x from r-1 down to -r
-        for x in (-r..r).rev() {
-            offsets.push((x as i16, r as i16));
-            if offsets.len() >= max_entries {
-                return offsets;
-            }
-        }
-        // Left edge: x = -r, y from r-1 down to -r+1
-        for y in ((-r + 1)..r).rev() {
-            offsets.push(((-r) as i16, y as i16));
-            if offsets.len() >= max_entries {
-                return offsets;
-            }
+        if let Some(cell) = self.scatter_nearby_cell(id, rules) {
+            self.set_unit_destination(id, NavTargetRef::cell(cell.0, cell.1), rules);
         }
     }
-    offsets
+
+    /// `FootClass::Find_Nearby_Passable_Cell` as both null-coordinate Scatter
+    /// arms call it (Unit `0x00743C6B`, Infantry `0x0051D41D`, identical
+    /// arguments): from the navigation cell (`vt+0x4C`, `0x004DBDF0`), with the
+    /// type's SpeedType, zone -1, Normal, the Foot's bridge byte (`+0x8C`), a
+    /// 1x1 rectangle, flags (0,1,0,1) and a zeroed target cell. `None` when
+    /// the search finds nothing or the map has no native Size.
+    pub(super) fn scatter_nearby_cell(&self, id: u64, rules: &RuleSet) -> Option<(u16, u16)> {
+        let entity = self.substrate.entities.get(id)?;
+        let object = self.object_type(entity.type_ref(), rules)?;
+        let on_bridge = entity.on_bridge;
+        let seed = self.foot_navigation_coordinate(id).ok()?;
+        let seed = (
+            i32::from((seed.x / 256) as i16),
+            i32::from((seed.y / 256) as i16),
+        );
+        let size = self
+            .playfield_bounds
+            .zip(self.playfield_size_height)
+            .map(|(bounds, height)| (bounds.base, height))
+            .or_else(|| self.bridge_state.as_ref()?.native_zone_source_size())?;
+        let grid = self.path_grid_snapshot();
+        find_nearby_passable_cell(
+            seed,
+            &NearbyQuery {
+                native_cells: None,
+                raw_occupation: Some(&self.substrate.raw_cell_occupation),
+                passability: PassabilityArgs {
+                    speed_type: object.speed_type,
+                    required_zone_id: None,
+                    movement_zone: MovementZone::Normal,
+                    bridge_aware_zone: on_bridge,
+                },
+                footprint: NearbyFootprint::SINGLE,
+                anchor_gate: NearbyAnchorGate::NativeHeightAware,
+                allow_bridge_cells: true,
+                check_height: true,
+                check_occupancy: false,
+                radius_cap: map_owned_radius_cap(size.0, size.1),
+                target_cell: None,
+                path_grid: grid.as_deref(),
+                resolved_terrain: self.resolved_terrain.as_ref(),
+                overlay_grid: self.overlay_grid.as_ref(),
+                occupancy: Some(&self.substrate.occupancy),
+                entities: Some(&self.substrate.entities),
+                zone_grid: self.zone_grid.as_ref(),
+                playfield_bounds: self.playfield_bounds,
+            },
+            self.session.binary_frame,
+        )
+    }
+
+    /// Runs the Scatter calls a movement pass queued ([`ScatterRequests`]).
+    /// Without rules nothing can admit a receiver, so none runs. Answers
+    /// whether an Infantry receiver's immediate Process changed bridge state.
+    pub(crate) fn run_scatter_requests(
+        &mut self,
+        requests: Vec<(u64, ScatterFlags)>,
+        rules: Option<&RuleSet>,
+        registry: Option<&OverlayTypeRegistry>,
+    ) -> Result<bool, String> {
+        let Some(rules) = rules else {
+            return Ok(false);
+        };
+        let mut bridge_state_changed = false;
+        for (id, flags) in requests {
+            bridge_state_changed |= self.scatter_null(id, flags, rules, registry)?;
+        }
+        Ok(bridge_state_changed)
+    }
+
+    /// `CellClass::Scatter_Objects @ 0x00481670` with a null coordinate on
+    /// `layer`'s list (`+0xE4` ground, `+0xE8` deck): the list is
+    /// snapshotted, then each occupant [`scatter_objects_admitted`] selects
+    /// takes `Scatter(null, flags)` (`vt+0x174`) in list order. The gate
+    /// reads nothing a receiver writes, so selecting first dispatches the
+    /// same objects.
+    pub(crate) fn scatter_cell_objects(
+        &mut self,
+        cell: (u16, u16),
+        layer: MovementLayer,
+        flags: ScatterFlags,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+    ) -> Result<bool, String> {
+        let occupants = self
+            .substrate
+            .occupancy
+            .get(cell.0, cell.1)
+            .map_or_else(Vec::new, |occ| occ.snapshot_layer(layer));
+        let admitted = scatter_objects_admitted(
+            &occupants,
+            None,
+            flags.no_kidding,
+            Some(rules),
+            &self.substrate.entities,
+            &self.houses,
+            &self.interner,
+        );
+        let mut bridge_state_changed = false;
+        for id in admitted {
+            bridge_state_changed |= self.scatter_null(id, flags, rules, registry)?;
+        }
+        Ok(bridge_state_changed)
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn spiral_offsets_starts_at_radius_1() {
-        let offsets = generate_spiral_offsets(2, 100);
-        // Radius 1 shell: 8 cells.
-        // Top edge: (-1,-1), (0,-1), (1,-1)
-        assert_eq!(offsets[0], (-1, -1));
-        assert_eq!(offsets[1], (0, -1));
-        assert_eq!(offsets[2], (1, -1));
-        // Right edge: (1, 0), (1, 1)
-        assert_eq!(offsets[3], (1, 0));
-        assert_eq!(offsets[4], (1, 1));
-        // Bottom edge: (0, 1), (-1, 1)
-        assert_eq!(offsets[5], (0, 1));
-        assert_eq!(offsets[6], (-1, 1));
-        // Left edge: (-1, 0)
-        assert_eq!(offsets[7], (-1, 0));
-        // Radius 1 = 8 cells total.
-        assert_eq!(offsets.len(), 8 + 16); // radius 1 (8) + radius 2 (16)
-    }
-
-    #[test]
-    fn spiral_offsets_capped_at_max_entries() {
-        let offsets = generate_spiral_offsets(10, MAX_SCATTER_DIRECTIONS);
-        assert!(offsets.len() <= MAX_SCATTER_DIRECTIONS);
-    }
-
-    #[test]
-    fn spiral_offsets_no_duplicates() {
-        let offsets = generate_spiral_offsets(10, MAX_SCATTER_DIRECTIONS);
-        let unique: std::collections::BTreeSet<(i16, i16)> = offsets.iter().copied().collect();
-        assert_eq!(
-            offsets.len(),
-            unique.len(),
-            "spiral contains duplicate offsets"
-        );
-    }
-
-    #[test]
-    fn spiral_offsets_excludes_origin() {
-        let offsets = generate_spiral_offsets(10, MAX_SCATTER_DIRECTIONS);
-        assert!(
-            !offsets.contains(&(0, 0)),
-            "spiral should not contain origin (0,0)"
-        );
-    }
-}
+#[path = "scatter_tests.rs"]
+mod tests;

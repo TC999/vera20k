@@ -4,7 +4,7 @@ use crate::rules::ini_parser::IniFile;
 use crate::sim::combat::combat_weapon::WeaponSlot;
 use crate::sim::combat::{AttackTarget, TargetKind};
 use crate::sim::components::NavTargetRef;
-use crate::sim::game_entity::PendingBuildingFire;
+use crate::sim::game_entity::{DelayedFire, PendingBuildingFire};
 use crate::sim::snapshot::GameSnapshot;
 use crate::util::fixed_math::SimFixed;
 
@@ -277,7 +277,11 @@ fn stock_cloak_producer_honors_rank_selected_cloak_ability() {
         .spawn_object_at_height("RANKED", "Soviet", rx, ry, 0, 0, &rules)
         .unwrap();
     assert!(sim.substrate.entities.get(ranked).unwrap().cloak.is_none());
-    sim.substrate.entities.get_mut(ranked).unwrap().veterancy = 100;
+    sim.substrate
+        .entities
+        .get_mut(ranked)
+        .unwrap()
+        .set_veterancy_rank(100);
     tick_stock_cloak_producer(&mut sim, ranked, &rules);
     assert_eq!(
         sim.substrate
@@ -459,13 +463,12 @@ fn already_cloaked_object_is_refused_by_can_auto_cloak_step_two() {
         .unwrap();
     {
         let entity = sim.substrate.entities.get_mut(targeter).unwrap();
-        let mut attack = AttackTarget::new(cloaker);
-        attack.cooldown_ticks = 17;
-        attack.burst_remaining = 3;
-        attack.burst_delay_ticks = 4;
+        let attack = AttackTarget::new(cloaker);
+        entity.rearm_timer = crate::sim::timer::CdTimer::started(0, 17);
+        entity.weapon_burst.complete_shot(4);
         entity.pending_building_fire = Some(PendingBuildingFire {
             remaining_ticks: 7,
-            weapon_slot: WeaponSlot::Secondary,
+            fire: DelayedFire::Weapon(WeaponSlot::Secondary),
         });
         entity.attack_target = Some(attack);
         entity.passively_acquired_target = true;
@@ -499,14 +502,16 @@ fn already_cloaked_object_is_refused_by_can_auto_cloak_step_two() {
     );
     let attack = entity.attack_target.as_ref().unwrap();
     assert_eq!(attack.target, TargetKind::Entity(cloaker));
-    assert_eq!(attack.cooldown_ticks, 17);
-    assert_eq!(attack.burst_remaining, 3);
-    assert_eq!(attack.burst_delay_ticks, 4);
+    assert_eq!(
+        entity.rearm_timer,
+        crate::sim::timer::CdTimer::started(0, 17)
+    );
+    assert_eq!(entity.weapon_burst.index(), 1);
     assert_eq!(
         entity.pending_building_fire,
         Some(PendingBuildingFire {
             remaining_ticks: 7,
-            weapon_slot: WeaponSlot::Secondary,
+            fire: DelayedFire::Weapon(WeaponSlot::Secondary),
         })
     );
     assert_eq!(entity.mission, mission_before);
@@ -538,14 +543,8 @@ fn the_weapon_rearm_countdown_blocks_the_next_auto_cloak() {
     // as the ReCloak delay and left it unarmed, so a sub that surfaced to fire
     // could dive again on the very next tick.
     let (mut sim, rules, id) = spawned_sub();
-    sim.substrate
-        .entities
-        .get_mut(id)
-        .unwrap()
-        .cloak
-        .as_mut()
-        .unwrap()
-        .arm_rearm_gate(0, 20);
+    sim.substrate.entities.get_mut(id).unwrap().rearm_timer =
+        crate::sim::timer::CdTimer::started(0, 20);
 
     for frame in 0..20 {
         sim.session.binary_frame = frame;
@@ -607,6 +606,9 @@ fn a_non_allied_sensors_neighbour_surfaces_a_cloaked_mover_on_cell_entry() {
         &mut sim, id, &rules
     ));
     assert!(sim.sound_events.is_empty());
+    // Leave cell, Logic and display membership through their common owner
+    // before removing storage; raw erase left a dangling display identity.
+    sim.object_conceal(friendly);
     sim.substrate.entities.remove(friendly);
 
     // A hostile one with `Sensors=yes` forces the surface, with the cue.

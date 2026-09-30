@@ -4,11 +4,9 @@ An MCP server that exposes the `asset` CLI — the headless browser for retail
 RA2/YR assets — so Claude Code and Codex can call it as tools.
 
 The implementation is Rust, in `src/asset_tools/` behind `src/bin/asset.rs`.
-Unlike `tools/research_index/mcp_server.py`, which imports its library
-in-process, this server has nothing importable to reach for: every tool
-`subprocess.run`s the compiled binary and returns its stdout, which is JSON by
-contract. The CLI prints JSON on stdout even when it fails, so a caller parsing
-stdout always gets JSON.
+The server has nothing importable to reach for: every tool `subprocess.run`s the
+compiled binary and returns its stdout, which is JSON by contract. The CLI prints
+JSON on stdout even when it fails, so a caller parsing stdout always gets JSON.
 
 Read-only against the retail install. The only files it writes are PNGs, WAVs and
 extracted bytes under `target/asset`, which is gitignored.
@@ -16,12 +14,14 @@ extracted bytes under `target/asset`, which is gitignored.
 ## Prerequisite: build the binary
 
 ```powershell
-cargo build --release -p vera20k --bin asset
+python -m tools.cargo_run -- build --release -p vera20k --bin asset
 ```
 
-The server looks for `target/release/asset.exe` (Windows) or
-`target/release/asset`, and falls back to the `target/debug` build only if the
-release one is missing — in which case every result carries a note saying so.
+The server asks the [build owner](../README.md) for this checkout's most recent
+successful host release binary, falling back to debug with a note. The owner
+records the actual Cargo output and verifies its hash on discovery, even if the
+server and build shell have different `CARGO_TARGET_DIR` settings. Conventional
+`target/release` files are no longer guessed or used as a stale fallback.
 Use release: a debug build of this tool is many times slower over the ~8000-entry
 retail corpus, and `asset_scan` / `asset_parse_check` will likely hit the
 timeout.
@@ -32,8 +32,7 @@ appears in discovery.
 
 ## Registration
 
-Claude Code, in the repo-local `.mcp.json` — repo-relative path, no `cwd` key
-(this matches how `research-index` is registered):
+Claude Code, in the repo-local `.mcp.json` — repo-relative path, no `cwd` key:
 
 ```json
 {
@@ -123,25 +122,27 @@ result stays parseable.
 Nothing here is MCP-only; the binary does the same work directly.
 
 ```powershell
-cargo build --release -p vera20k --bin asset
+python -m tools.cargo_run -- build --release -p vera20k --bin asset
+$assetExe = python -m tools.cargo_run --resolve asset --profile release
+if ($LASTEXITCODE -ne 0) { throw "No verified release asset binary" }
 
-./target/release/asset --help
+& $assetExe --help
 
-./target/release/asset find POWERP.SHP
-./target/release/asset archives
-./target/release/asset ls ra2md.mix --format shp --limit 20
-./target/release/asset info POWERP.SHP --ascii --frame 0
-./target/release/asset render POWERP.SHP --house 0 --limit 4
-./target/release/asset palette-for POWERP.SHP
-./target/release/asset extract POWERP.SHP --out target/asset
-./target/release/asset csf-get Name:GAPOWR
-./target/release/asset csf-grep "Power Plant" --limit 10
-./target/release/asset bag-ls --prefix ir
-./target/release/asset sound irbuild --wav
-./target/release/asset art-for GAPOWR --theater sno
-./target/release/asset compare POWERP.SHP
-./target/release/asset scan --format vxl --limit 40
-./target/release/asset parse-check --format shp
+& $assetExe find POWERP.SHP
+& $assetExe archives
+& $assetExe ls ra2md.mix --format shp --limit 20
+& $assetExe info POWERP.SHP --ascii --frame 0
+& $assetExe render POWERP.SHP --house 0 --limit 4
+& $assetExe palette-for POWERP.SHP
+& $assetExe extract POWERP.SHP --out target/asset
+& $assetExe csf-get Name:GAPOWR
+& $assetExe csf-grep "Power Plant" --limit 10
+& $assetExe bag-ls --prefix ir
+& $assetExe sound irbuild --wav
+& $assetExe art-for GAPOWR --theater sno
+& $assetExe compare POWERP.SHP
+& $assetExe scan --format vxl --limit 40
+& $assetExe parse-check --format shp
 ```
 
 Global flags follow the verb, not precede it: `asset find X --ra2-dir <PATH>`,

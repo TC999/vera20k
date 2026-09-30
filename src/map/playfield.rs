@@ -109,7 +109,14 @@ impl PlayfieldBounds {
     /// supplies the selected CellClass's signed level and unsigned slope byte.
     pub const fn contains_height_aware_packed(self, x: i32, y: i32, level: i8, slope: u8) -> bool {
         let (x, y) = packed_cell_coord(x, y);
-        let sum = x.wrapping_add(y);
+        let height = self.slope_adjusted_height(x.wrapping_add(y), level, slope);
+        self.contains_with_height(x, y, height)
+    }
+
+    /// Shared signed-level/slope adjustment in Map578460 and Map586E50.
+    /// The clamp retains full i32 coordinates after correcting the side edges;
+    /// the membership query supplies its packed-cell sum instead.
+    pub(crate) const fn slope_adjusted_height(self, sum: i32, level: i8, slope: u8) -> i32 {
         let mut height = level as i32;
         let slope_threshold = self
             .base
@@ -119,7 +126,7 @@ impl PlayfieldBounds {
         if slope != 0 && sum < slope_threshold {
             height = height.wrapping_add(1);
         }
-        self.contains_with_height(x, y, height)
+        height
     }
 
     const fn contains_with_height(self, x: i32, y: i32, height: i32) -> bool {
@@ -143,6 +150,18 @@ impl PlayfieldBounds {
 
         low < sum && sum <= high && difference < right && difference.wrapping_neg() < left
     }
+}
+
+/// `MapClass::In_Bounds @ 0x00568300`: the diamond of the map `Size=` width
+/// (`MapClass+0xF4`) and height (`+0xF8`), in wrapping signed arithmetic.
+pub(crate) const fn size_diamond_contains(width: i32, height: i32, cell: (i16, i16)) -> bool {
+    let x = cell.0 as i32;
+    let y = cell.1 as i32;
+    let sum = x.wrapping_add(y);
+    width < sum
+        && x.wrapping_sub(y) < width
+        && y.wrapping_sub(x) < width
+        && sum <= width.wrapping_add(height.wrapping_mul(2))
 }
 
 /// Convert one LocalSize-relative coordinate through active

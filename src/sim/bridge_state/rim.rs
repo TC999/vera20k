@@ -1,4 +1,8 @@
-//! Native high bridge cleanup control flow (576770 -> 576200).
+//! Native bridge rim cleanup control flow: concrete 576770 -> 576200 and
+//! wooden 571050 -> 570AE0. Each wooden body is instruction-identical to its
+//! concrete twin except for the tileset base (0xABAD1C, not 0xAA0E28) and the
+//! selector's search bound ([`RimBounds`]); 570AE0 calls the NWSE setter
+//! 47E470, byte-identical to 47E040.
 //!
 //! The host owns live cells and executes group writes/callbacks synchronously.
 //! No precomputed mutation list may stand in for callback-time state here.
@@ -29,7 +33,7 @@ pub(crate) trait HighBridgeRimHost {
     /// Stable real-cell identity or the one shared dummy identity.
     type Cell: Copy;
     fn tiles(&self) -> HighBridgeRimTiles;
-    fn map_size(&self) -> (i32, i32);
+    fn bounds(&self) -> RimBounds;
     /// Same fixed-stride lookup and retained dummy effects as Get_CellClass.
     fn cell(&mut self, coord: RimCoord) -> Self::Cell;
     /// Read a retained object without another Get_CellClass/dummy stamp.
@@ -52,6 +56,28 @@ pub(crate) trait HighBridgeRimHost {
     fn mark_screen(&mut self);
 }
 
+/// The selector's search bound, tested before each cursor's lookup.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum RimBounds {
+    /// 576770: the Size diamond, from MapClass Size width and height.
+    Diamond { width: i32, height: i32 },
+    /// 571050: the inclusive MapClass+0x124..+0x130 rectangle
+    /// (0x005711D8..0x00571227 and the step test at 0x00571384).
+    Rect(crate::sim::scenario_bootstrap::NativeStartBounds),
+}
+
+impl RimBounds {
+    fn contains(self, cursor: RimCoord) -> bool {
+        match self {
+            Self::Diamond { width, height } => {
+                let (x, y) = (i32::from(cursor.0), i32::from(cursor.1));
+                !(x + y <= width || width <= x - y || width <= y - x || width + height * 2 < x + y)
+            }
+            Self::Rect(bounds) => bounds.contains(cursor),
+        }
+    }
+}
+
 pub(crate) fn step(coord: RimCoord, direction: u8) -> RimCoord {
     let delta = crate::util::direction::DIRECTION_DELTAS[usize::from(direction & 7)];
     (
@@ -64,6 +90,20 @@ pub(crate) fn step(coord: RimCoord, direction: u8) -> RimCoord {
 /// center, +1 perpendicular, -1 perpendicular, -2 perpendicular. The host must
 /// perform every lookup even without a CellTag: it may move the shared dummy.
 pub(crate) fn notify_span_cells(host: &mut impl HighBridgeRimHost, first: RimCoord, end: RimCoord) {
+    visit_span_cells(first, end, |coord| {
+        let cell = host.cell(coord);
+        host.notify_cell(cell);
+        host.read(cell).coord
+    });
+}
+
+/// Shared575EE0 traversal. Each visit returns the retained receiver's live
+/// coordinate after its callback, including shared-dummy lookup mutations.
+pub(crate) fn visit_span_cells(
+    first: RimCoord,
+    end: RimCoord,
+    mut visit: impl FnMut(RimCoord) -> RimCoord,
+) {
     let horizontal = first.1 == end.1;
     let reversed = if horizontal {
         end.0 < first.0
@@ -75,20 +115,17 @@ pub(crate) fn notify_span_cells(host: &mut impl HighBridgeRimHost, first: RimCoo
         let positive = if horizontal { 4 } else { 2 };
         let negative = (positive + 4) & 7;
         for coord in [cursor, step(cursor, positive)] {
-            let cell = host.cell(coord);
-            host.notify_cell(cell);
+            visit(coord);
         }
-        let third = host.cell(step(cursor, negative));
-        host.notify_cell(third);
+        let third = visit(step(cursor, negative));
         // 576073/5761A3 use the third retained CellClass +24 AFTER its Tag
         // callback. A real fixed-stride alias or a moved dummy matters here.
-        let fourth = host.cell(step(host.read(third).coord, negative));
-        host.notify_cell(fourth);
+        visit(step(third, negative));
         cursor = step(cursor, if horizontal { 2 } else { 4 });
     }
 }
 
-/// Original 576770 selector. Direction-order neighbor reads and anchor
+/// Original 576770/571050 selector. Direction-order neighbor reads and anchor
 /// resolution precede the independent theater scan; bridge roles are not input.
 pub(crate) fn update_adjacent(host: &mut impl HighBridgeRimHost, input: RimCoord) {
     let Some(neighbor) = (0..8).find_map(|direction| {
@@ -133,11 +170,10 @@ pub(crate) fn update_adjacent(host: &mut impl HighBridgeRimHost, input: RimCoord
         0
     };
     host.reset_span_marks();
-    let (width, height) = host.map_size();
+    let bounds = host.bounds();
     let tiles = host.tiles();
     loop {
-        let (x, y) = (i32::from(cursor.0), i32::from(cursor.1));
-        if x + y <= width || width <= x - y || width <= y - x || width + height * 2 < x + y {
+        if !bounds.contains(cursor) {
             return;
         }
         if host.allocated(cursor) {
@@ -154,7 +190,7 @@ pub(crate) fn update_adjacent(host: &mut impl HighBridgeRimHost, input: RimCoord
     }
 }
 
-/// Original 576200. Tail recursion restarts the complete search at the initial
+/// Original 576200/570AE0. Tail recursion restarts the complete search at the initial
 /// coordinate after every group clear. An iterative restart preserves that
 /// order without placing a native-length bound on Rust's call stack.
 pub(crate) fn update_edge(

@@ -202,6 +202,9 @@ pub struct SpeedCostProfile {
 impl SpeedCostProfile {
     pub fn cost_for_speed_type(&self, speed_type: SpeedType) -> Option<u8> {
         match speed_type {
+            // Keep the native parser's invalid index unavailable to live entry
+            // queries. Reading memory before the native table is not modeled.
+            SpeedType::Invalid => None,
             SpeedType::Foot => self.foot,
             SpeedType::Track => self.track,
             SpeedType::Wheel => self.wheel,
@@ -285,7 +288,7 @@ impl TerrainRules {
 
 fn build_semantics(section_name: &'static str, section: &IniSection) -> LandTypeSemantics {
     let mut semantics = built_in_semantics(section_name);
-    semantics.buildable = section.get_bool("Buildable").unwrap_or(false);
+    semantics.buildable = section.read_bool("Buildable", false);
     semantics.speed_costs = parse_speed_costs(section);
     semantics
 }
@@ -497,7 +500,7 @@ fn parse_speed_costs(section: &IniSection) -> SpeedCostProfile {
 ///   Trigger: a fractional percentage. Player effect: none in stock play, where
 ///   every authored value is a multiple of five percent.
 fn parse_cost(section: &IniSection, key: &str) -> Option<u8> {
-    let multiplier = section.get_percent(key).unwrap_or(1.0).clamp(0.0, 1.0);
+    let multiplier = (section.read_double(key, 1.0) as f32).clamp(0.0, 1.0);
     Some((multiplier * 100.0) as u8)
 }
 
@@ -507,8 +510,7 @@ mod tests {
 
     /// The sixteen dwords read out of `g_nTmpTerrainToLandTypeTable` at
     /// `0x008288E4`, in order, as raw `LandType` indices.
-    const NATIVE_TMP_TERRAIN_TABLE: [u8; 16] =
-        [0, 8, 8, 8, 8, 10, 9, 3, 3, 2, 6, 1, 1, 0, 7, 3];
+    const NATIVE_TMP_TERRAIN_TABLE: [u8; 16] = [0, 8, 8, 8, 8, 10, 9, 3, 3, 2, 6, 1, 1, 0, 7, 3];
 
     #[test]
     fn tmp_terrain_table_matches_the_native_dwords() {

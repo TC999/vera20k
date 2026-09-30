@@ -74,12 +74,15 @@ pub enum GameSoundEvent {
         source: Option<SoundSource>,
     },
 
-    /// Release one animation's active handle, then optionally play StopSound.
+    /// Hard-stop one owner's handle, then optionally play StopSound.
     AnimationStopped {
         anim_id: u64,
         stop_sound_id: Option<String>,
         source: Option<SoundSource>,
     },
+    /// `SoundEvent::Release @ 0x00406060` on one owner's handle: its loop
+    /// stops repeating and plays out; one-shots continue unchanged.
+    AnimationReleased { anim_id: u64 },
     /// A weapon fired — play the weapon's Report= sound.
     WeaponFired {
         /// sound.ini ID from the weapon's Report= field.
@@ -134,6 +137,11 @@ pub enum GameSoundEvent {
         source: Option<SoundSource>,
     },
 
+    /// Fly BeginTakeoff AuxSound1 or the one-shot landing AuxSound2.
+    AircraftPhase {
+        sound_id: String,
+        source: Option<SoundSource>,
+    },
     /// DeploySound on infantry stance entry or successful unit-to-building conversion.
     EntityDeployed {
         /// sound.ini ID from the entity's DeploySound= field.
@@ -186,6 +194,14 @@ pub enum GameSoundEvent {
     /// One-shot positional overlay `CrushSound=` played by
     /// `UnitClass::PerCellProcess @ 0x0073B04D` when a crusher flattens a wall.
     WallCrushed {
+        sound_id: String,
+        source: Option<SoundSource>,
+    },
+
+    /// One-shot rules-named sound: positional `VocClass::PlayAt`, or centred
+    /// full-volume `VocClass::PlayAtPos` when `source` is absent. Both resolve
+    /// only registered Voc entries, never raw audio-bag filenames.
+    VocAt {
         sound_id: String,
         source: Option<SoundSource>,
     },
@@ -253,14 +269,6 @@ pub enum GameSoundEvent {
         /// `Some("EVA_BridgeRepaired")` when the engineer's owner is the
         /// local human and the radar dedupe allowed it; `None` otherwise.
         eva_event: Option<String>,
-    },
-
-    /// Positional sound emitted when a world-effect animation starts.
-    WorldEffectStarted {
-        /// sound.ini ID for the selected animation's StartSound/Report.
-        sound_id: String,
-        /// Screen position for spatial audio.
-        source: Option<SoundSource>,
     },
 
     /// The `[AudioVisual] BaseUnderAttackSound` siren that rides with the
@@ -380,6 +388,7 @@ impl GameSoundEvent {
             | Self::UnitAttackOrder { sound_id, .. }
             | Self::EntityDestroyed { sound_id, .. }
             | Self::EntityCrushed { sound_id, .. }
+            | Self::AircraftPhase { sound_id, .. }
             | Self::EntityDeployed { sound_id, .. }
             | Self::LeaveTransport { sound_id, .. }
             | Self::EntityUndeployed { sound_id, .. }
@@ -387,6 +396,7 @@ impl GameSoundEvent {
             | Self::UnitPromoted { sound_id, .. }
             | Self::CloakSound { sound_id, .. }
             | Self::WallCrushed { sound_id, .. }
+            | Self::VocAt { sound_id, .. }
             | Self::UiSound { sound_id }
             | Self::CreditTick { sound_id }
             | Self::BaseUnderAttackSfx { sound_id }
@@ -399,9 +409,9 @@ impl GameSoundEvent {
             | Self::BuildingDamagedSfx { sound_id, .. }
             | Self::VoiceFeedback { sound_id, .. }
             | Self::LightningStrike { sound_id, .. }
-            | Self::SuperWeaponActivated { sound_id, .. }
-            | Self::WorldEffectStarted { sound_id, .. } => sound_id,
+            | Self::SuperWeaponActivated { sound_id, .. } => sound_id,
             Self::AnimationStopped { stop_sound_id, .. } => stop_sound_id.as_deref().unwrap_or(""),
+            Self::AnimationReleased { .. } => "",
             // The event name, not a sample: the sample is a per-side column
             // the `VoxClass` consumer resolves.
             Self::Eva { event, .. } => event,
@@ -416,6 +426,7 @@ impl GameSoundEvent {
             | Self::AnimationStopped { source, .. }
             | Self::EntityDestroyed { source, .. }
             | Self::EntityCrushed { source, .. }
+            | Self::AircraftPhase { source, .. }
             | Self::EntityDeployed { source, .. }
             | Self::LeaveTransport { source, .. }
             | Self::EntityUndeployed { source, .. }
@@ -423,6 +434,7 @@ impl GameSoundEvent {
             | Self::UnitPromoted { source, .. }
             | Self::CloakSound { source, .. }
             | Self::WallCrushed { source, .. }
+            | Self::VocAt { source, .. }
             | Self::BuildingGarrisonedSfx { source, .. }
             | Self::C4Planted { source, .. }
             | Self::RefineryExitSfx { source, .. }
@@ -432,8 +444,7 @@ impl GameSoundEvent {
             | Self::BuildingDamagedSfx { source, .. }
             | Self::VoiceFeedback { source, .. }
             | Self::LightningStrike { source, .. }
-            | Self::SuperWeaponActivated { source, .. }
-            | Self::WorldEffectStarted { source, .. } => *source,
+            | Self::SuperWeaponActivated { source, .. } => *source,
             _ => None,
         }
     }
@@ -472,13 +483,24 @@ impl GameSoundEvent {
 /// device-free decision module and `sim/` never learns about audio.
 ///
 /// **Still absent on the voice side.** `VoiceDeploy=`/`VoiceUndeploy=`
-/// (deploy/unload orders), `VoiceCrashing=` (7) and
-/// `VoiceSinking=`/`VoiceFalling=` are not parsed, and taunts reach an empty
-/// match arm. The native consumers of those slots were not isolated, so no
-/// mapping is asserted.
+/// (deploy/unload orders) and `VoiceFalling=` are not parsed,
+/// and taunts reach an empty match arm. The native consumers of those slots
+/// were not isolated, so no mapping is asserted.
 /// - Player effect: those orders and states stay silent.
-/// - Frequency: deploy orders are common; crashing/sinking lines need an
-///   aircraft or ship kill.
+/// - Frequency: deploy orders are common.
+///
+/// `VoiceSinking=`/`SinkingSound=` are resolved against fixed SOUNDMD by the
+/// Rules process owner. Foot's +3CD/+3CE edge (4DABC7) emits the positional
+/// voice then the object's held sound, with the AudioVisual fallback. The
+/// retained hull updates that handle's coordinate while it descends.
+///
+/// `VoiceCrashing=` and `CrashingSound=` are landed: `FootClass::AI`'s crash
+/// edge (`0x004DACDD`) plays the voice as a [`GameSoundEvent::VocAt`] for a
+/// human player's object and the sound on the object's own handle, keyed by
+/// its id ([`GameSoundEvent::AnimationStarted`]), released as the object goes
+/// ([`GameSoundEvent::AnimationReleased`]); the Fly impact plays `ImpactLandSound=` /
+/// `ImpactWaterSound=` with their `[AudioVisual]` fallbacks
+/// (`sim::world::crash`).
 ///
 /// `VoiceFeedback=` (133 stock authors) is **no longer among them** — see
 /// [`Self::VoiceFeedback`].
@@ -573,19 +595,18 @@ impl GameSoundEvent {
 /// - The seven `Crate*Sound` keys (`+0x1E4`..`+0x1FC`): `sim/crates` places
 ///   and regenerates crates but nothing picks one up, so there is no VERA
 ///   producer to hang them on. The gap is a crate-pickup gap, not an audio one.
-/// - `MindClearedSound` (`+0x264`) — native consumer
-///   `CaptureManagerClass::FreeUnit @ 0x004720C5`; `MasterMindOverloadDeath`‑
-///   `Sound` (`+0x258`) — `CaptureManagerClass::Update @ 0x00471B39`;
-///   `PlaceBeaconSound` (`+0x1CC`) — `RadarClass::PlaceBeacon @ 0x00430D8E`
-///   (each found by an operand sweep for that `RulesClass` offset, which is
-///   capped and therefore not an exhaustive enumeration of readers). VERA has
-///   no mind-control release path, no MasterMind overload and no beacons, so
-///   none of the three has a producer to wire.
-/// - `ImpactWaterSound` (`+0x200`): no producer; the native reader was not
-///   isolated. (`CreditTicks` (`+0x6D0`, count `+0x6DC`) is landed as
-///   [`GameSoundEvent::CreditTick`] — reader `CreditsClass::Draw @ 0x004A24F4`.)
-/// - **Dead on retail data, so not parsed:** `ImpactLandSound` (`+0x204`) and
-///   `IceCrackSounds` (`+0x644`) are both **empty** in stock `rulesmd.ini`;
+/// - `PlaceBeaconSound` (`+0x1CC`) — `RadarClass::PlaceBeacon @ 0x00430D8E`
+///   (found by an operand sweep for that `RulesClass` offset, which is capped
+///   and therefore not an exhaustive enumeration of readers). VERA has no
+///   beacons, so there is no producer to wire. (`MindClearedSound`,
+///   `MasterMindOverloadDeathSound` and `YuriMindControlSound` are landed as
+///   [`GameSoundEvent::VocAt`] from `sim/capture_manager.rs`.)
+/// - (`CreditTicks` (`+0x6D0`, count `+0x6DC`) is landed as
+///   [`GameSoundEvent::CreditTick`] — reader `CreditsClass::Draw @ 0x004A24F4`;
+///   `ImpactWaterSound`/`ImpactLandSound` (`+0x200`/`+0x204`) are the crash
+///   impact's fallbacks, see above.)
+/// - **Dead on retail data, so not parsed:** `IceCrackSounds` (`+0x644`) is
+///   **empty** in stock `rulesmd.ini`;
 ///   `GateUp`/`GateDown` (`+0x404`/`+0x408`) and `Construction` (`+0x6C8`) are
 ///   `Dummy`; `CreateUnitSound`/`CreateInfantrySound`/`CreateAircraftSound`
 ///   (`+0x178`..`+0x180`) and `LeaveGrinderSound` are empty. `Dummy` is one of

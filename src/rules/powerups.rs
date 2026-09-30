@@ -14,7 +14,7 @@
 //! | 1 | `0x0081DA8C` | `i32[19]` | `strtrim` then `atoi` |
 //! | 2 | `0x0081DAD8` | `i32[19]` | `strtrim` then `AnimTypeClass::Find_Index @ 0x00422B20` |
 //! | 3 | `0x0089ECC0` | `u8[19]` | `strtrim`, then exact `"yes"`/`"no"` compare |
-//! | 4 | `0x0089EC28` | `f64[19]` | `atof`, scaled by `0.01` when the token contains `%` |
+//! | 4 | `0x0089EC28` | `f64[19]` | `atof`; with a `%`, untrimmed and times the double 0.01 (`0x00673FAF`, chopped) |
 //!
 //! A missing token leaves that slot's previous value untouched — so the stock
 //! rows that stop after three tokens (`HealBase`, `Reveal`, `Veteran`, `Unit`,
@@ -29,7 +29,7 @@
 //! Part of `rules/` — INI parsing and rule data only.
 
 use crate::rules::ini_parser::IniFile;
-use crate::rules::ini_value::{strtrim_ascii, truncate_bytes};
+use crate::rules::ini_value::{crt_atoi, parse_leading_f64, scale_percent, strtok, strtrim_ascii};
 use crate::util::native_x87::NativeF64Bits;
 
 /// Slots in the hardcoded name table at `0x007E523C`. The loop bound is
@@ -38,7 +38,7 @@ use crate::util::native_x87::NativeF64Bits;
 pub const POWERUP_COUNT: usize = 19;
 
 /// Canonical slot order, read directly from the pointer table at `0x007E523C`
-/// and its target literals. This ordering is load-bearing: `CrateClass__PickupDispatch`
+/// and its target literals. This ordering is load-bearing: `CellClass__PickupCrate`
 /// indexes all four globals, the `[CrateRules]` solo mappings, and its own jump
 /// table by these positions, and the INI's own line order is irrelevant.
 pub const POWERUP_NAMES: [&str; POWERUP_COUNT] = [
@@ -107,7 +107,7 @@ pub fn powerup_from_name(name: &str) -> usize {
 /// consequence, while the fixed slot order does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PowerupTable {
-    /// Token 1 — selection weight. `CrateClass__PickupDispatch` sums all
+    /// Token 1 — selection weight. `CellClass__PickupCrate` sums all
     /// nineteen and draws `RandomRanged(1, total)`.
     pub weights: [i32; POWERUP_COUNT],
     /// Token 2 — the pickup animation. `None` is native's `-1`: either the
@@ -148,6 +148,7 @@ impl PowerupTable {
     /// named, native has already stored `-1` and keeps it, while VERA resolves
     /// the name against the finished set. That needs a multi-layer mod to
     /// reach; recorded as a deferred DRIFT rather than claimed equivalent.
+    #[cfg(test)]
     pub fn anim_for(&self, slot: usize, registered: &[String]) -> Option<&str> {
         let name = self.anims.get(slot)?.as_deref()?;
         registered
@@ -172,19 +173,14 @@ impl PowerupsAccumulator {
             // Native always parses, falling back to the literal `"0,NONE"`, so
             // an absent row still zeroes the weight and clears the animation
             // while leaving the flag and magnitude untouched.
-            // `CCINIClass__ReadString` is `strncpy` plus a forced terminator, so
-            // an over-long value is cut at 127 BYTES, not 127 characters.
-            let raw = truncate_bytes(
-                section.get(name).unwrap_or(DEFAULT_ROW),
-                READ_STRING_CAPACITY - 1,
-            );
+            let raw = section.read_string(name, DEFAULT_ROW, READ_STRING_CAPACITY);
             // `CRT__strtok` collapses runs of the delimiter and skips leading
             // ones, so an empty field is not a token at all: `20,,yes,2000`
             // yields three tokens, not four.
-            let mut tokens = raw.split(',').filter(|token| !token.is_empty());
+            let mut tokens = strtok(&raw, &[',']);
 
             if let Some(token) = tokens.next() {
-                self.0.weights[slot] = native_atoi(strtrim_ascii(token));
+                self.0.weights[slot] = crt_atoi(strtrim_ascii(token));
             }
             if let Some(token) = tokens.next() {
                 let token = strtrim_ascii(token);
@@ -206,12 +202,13 @@ impl PowerupsAccumulator {
                 }
             }
             if let Some(token) = tokens.next() {
-                // The percent branch skips `strtrim` and scales by 0.01; the
-                // plain branch trims first. Both then run the same `atof`.
+                // The percent branch skips `strtrim` and scales by 0.01 as
+                // ReadDouble does; the plain branch trims first. Both then run
+                // the same `atof`.
                 let value = if token.contains('%') {
-                    native_atof(token) * 0.01
+                    scale_percent(parse_leading_f64(token))
                 } else {
-                    native_atof(strtrim_ascii(token))
+                    parse_leading_f64(strtrim_ascii(token))
                 };
                 self.0.magnitudes[slot] = NativeF64Bits::from_bits(value.to_bits());
             }
@@ -221,71 +218,6 @@ impl PowerupsAccumulator {
     pub(crate) fn finish(self) -> PowerupTable {
         self.0
     }
-}
-
-/// CRT `atoi`: leading sign and digits only, everything from the first
-/// non-digit onward ignored, no failure mode.
-fn native_atoi(token: &str) -> i32 {
-    let bytes = token.as_bytes();
-    let mut index = 0;
-    let negative = match bytes.first() {
-        Some(b'-') => {
-            index = 1;
-            true
-        }
-        Some(b'+') => {
-            index = 1;
-            false
-        }
-        _ => false,
-    };
-    let mut value: i32 = 0;
-    while let Some(digit) = bytes
-        .get(index)
-        .and_then(|byte| (*byte as char).to_digit(10))
-    {
-        value = value.wrapping_mul(10).wrapping_add(digit as i32);
-        index += 1;
-    }
-    if negative {
-        value.wrapping_neg()
-    } else {
-        value
-    }
-}
-
-/// CRT `atof`: the longest leading floating-point prefix, or zero.
-fn native_atof(token: &str) -> f64 {
-    let token = token.trim_start();
-    let bytes = token.as_bytes();
-    let mut end = 0;
-    if matches!(bytes.first(), Some(b'+' | b'-')) {
-        end = 1;
-    }
-    while matches!(bytes.get(end), Some(byte) if byte.is_ascii_digit()) {
-        end += 1;
-    }
-    if matches!(bytes.get(end), Some(b'.')) {
-        end += 1;
-        while matches!(bytes.get(end), Some(byte) if byte.is_ascii_digit()) {
-            end += 1;
-        }
-    }
-    // CRT `atof` also accepts an exponent, but only when at least one digit
-    // follows it; otherwise the prefix ends before the `e`.
-    if matches!(bytes.get(end), Some(b'e' | b'E')) {
-        let mut exponent = end + 1;
-        if matches!(bytes.get(exponent), Some(b'+' | b'-')) {
-            exponent += 1;
-        }
-        if matches!(bytes.get(exponent), Some(byte) if byte.is_ascii_digit()) {
-            while matches!(bytes.get(exponent), Some(byte) if byte.is_ascii_digit()) {
-                exponent += 1;
-            }
-            end = exponent;
-        }
-    }
-    token[..end].parse::<f64>().unwrap_or(0.0)
 }
 
 #[cfg(test)]
@@ -457,6 +389,28 @@ mod tests {
         assert!(parsed.over_water[POWERUP_ARMOR]);
     }
 
+    /// Every integer percent reads the double native ReadDouble's executed
+    /// sweep stored (`tools/rules_oracle/read_double_percent.json`): `atof` of
+    /// an integer is the widened float, and `0x00673FAF` is the same chopped
+    /// `fmul qword [0x007E3808]` as ReadDouble's `0x0052857E`.
+    #[test]
+    fn percent_magnitude_is_the_chopped_native_product() {
+        let native: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tools/rules_oracle/read_double_percent.json"
+        ))
+        .unwrap();
+        let sweep = native["reader"]["percent_sweep"].as_array().unwrap();
+        assert_eq!(sweep.len(), 1001);
+        for (percent, bits) in sweep.iter().enumerate() {
+            let parsed = table(&format!("[Powerups]\nArmor=1,ARMOR,yes, {percent}%\n"));
+            assert_eq!(
+                parsed.magnitudes[POWERUP_ARMOR].bits(),
+                u64::from_str_radix(bits.as_str().unwrap(), 16).unwrap(),
+                "{percent}%"
+            );
+        }
+    }
+
     /// Token three recognises exactly two literals; anything else is inert.
     #[test]
     fn unrecognised_third_token_leaves_the_live_flag_untouched() {
@@ -570,16 +524,5 @@ mod tests {
             None,
             "an unregistered name still resolves to no animation"
         );
-    }
-
-    /// `atoi` stops at the first non-digit rather than failing.
-    #[test]
-    fn native_atoi_matches_crt_prefix_semantics() {
-        assert_eq!(native_atoi("20"), 20);
-        assert_eq!(native_atoi("-7"), -7);
-        assert_eq!(native_atoi("+3"), 3);
-        assert_eq!(native_atoi("12abc"), 12);
-        assert_eq!(native_atoi("abc"), 0);
-        assert_eq!(native_atoi(""), 0);
     }
 }

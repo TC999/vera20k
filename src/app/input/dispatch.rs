@@ -12,10 +12,9 @@ use winit::keyboard::KeyCode;
 
 use crate::app::AppState;
 use crate::app::input::commands::{
-    cancel_build_by_type, cancel_last_build, cycle_active_producer, cycle_local_owner,
-    place_ready_building_at_cursor, place_starter_base_for_local_owner, preferred_local_owner,
-    preferred_local_owner_name, queue_build_by_type, schedule_command,
-    spawn_test_units_for_local_owner, toggle_pause_build_queue,
+    cancel_build_by_type, cycle_active_producer, cycle_local_owner, place_ready_building_at_cursor,
+    place_starter_base_for_local_owner, preferred_local_owner, preferred_local_owner_name,
+    queue_build_by_type, schedule_command, spawn_test_units_for_local_owner, suspend_build,
 };
 use crate::app::input::context_order::try_queue_context_order_at_screen_point;
 use crate::app::input::entity_pick::{
@@ -63,7 +62,7 @@ pub(crate) fn handle_mouse_input(
     // Paused in-game Options overlay owns the mouse: route press/release/checkbox/
     // Back here and CONSUME the click so it never reaches the tactical viewport or
     // a gadget (no unit orders behind the overlay). KD-6.
-    if state.match_state.paused {
+    if state.match_state.paused() {
         // VERA-internal (gamemd has no pause overlay; gamemd equivalent
         // UNCHECKED): a release that arrives while the overlay owns the mouse
         // never reaches the tactical body, so the capture is dropped here.
@@ -73,17 +72,28 @@ pub(crate) fn handle_mouse_input(
             state.match_state.input.tactical_mouse.right_held = false;
             state.match_state.input.tactical_mouse.release();
         }
-        if state.match_state.match_presentation.in_game_menu == crate::ui::pause_menu::InGameMenuState::Sound {
-            crate::app::input::sound::mouse(state,button,pressed);
+        if state.match_state.match_presentation.in_game_menu
+            == crate::ui::pause_menu::InGameMenuState::Sound
+        {
+            crate::app::input::sound::mouse(state, button, pressed);
             return;
         }
-        if state.match_state.match_presentation.in_game_menu == crate::ui::pause_menu::InGameMenuState::AbortConfirm {
+        if state.match_state.match_presentation.in_game_menu
+            == crate::ui::pause_menu::InGameMenuState::AbortConfirm
+        {
             crate::app::input::abort::mouse(state, button, pressed);
             return;
         }
-        if matches!(state.match_state.match_presentation.in_game_menu, crate::ui::pause_menu::InGameMenuState::SavedGame(_)) {
-            if button == MouseButton::Left { crate::app::App::saved_game_mouse(state, pressed); }
-        } else if state.match_state.match_presentation.in_game_menu == crate::ui::pause_menu::InGameMenuState::Menu {
+        if matches!(
+            state.match_state.match_presentation.in_game_menu,
+            crate::ui::pause_menu::InGameMenuState::SavedGame(_)
+        ) {
+            if button == MouseButton::Left {
+                crate::app::App::saved_game_mouse(state, pressed);
+            }
+        } else if state.match_state.match_presentation.in_game_menu
+            == crate::ui::pause_menu::InGameMenuState::Menu
+        {
             crate::app::input::pause_menu::mouse(state, button, pressed);
         } else {
             crate::app::input::in_game_options::in_game_options_mouse(state, button, pressed);
@@ -333,12 +343,7 @@ pub(crate) fn tactical_mouse(state: &mut AppState, button: MouseButton, btn_stat
                                     state.rules(),
                                     Some(&sim.houses),
                                     &state.height_map(),
-                                    Some(
-                                        &state
-                                            .match_state
-                                            .match_presentation
-                                            .tactical_bridge_inverse_map,
-                                    ),
+                                    crate::app::match_runtime::sim_tick::tactical_bridge_cells(sim),
                                     Some(&sim.interner),
                                 );
                                 queued_selection = if let Some(clicked_id) = picked {
@@ -367,12 +372,7 @@ pub(crate) fn tactical_mouse(state: &mut AppState, button: MouseButton, btn_stat
                                         state.rules(),
                                         Some(&sim.houses),
                                         &state.height_map(),
-                                        Some(
-                                            &state
-                                                .match_state
-                                                .match_presentation
-                                                .tactical_bridge_inverse_map,
-                                        ),
+                                        crate::app::match_runtime::sim_tick::tactical_bridge_cells(sim),
                                         Some(&sim.interner),
                                         sim.playfield_bounds.is_some(),
                                     )
@@ -392,12 +392,7 @@ pub(crate) fn tactical_mouse(state: &mut AppState, button: MouseButton, btn_stat
                                     state.rules(),
                                     Some(&sim.houses),
                                     &state.height_map(),
-                                    Some(
-                                        &state
-                                            .match_state
-                                            .match_presentation
-                                            .tactical_bridge_inverse_map,
-                                    ),
+                                    crate::app::match_runtime::sim_tick::tactical_bridge_cells(sim),
                                     Some(&sim.interner),
                                     sim.playfield_bounds.is_some(),
                                 );
@@ -674,18 +669,27 @@ pub(crate) fn handle_cursor_moved_in_game(state: &mut AppState) {
     // Paused in-game Options overlay: drive a live slider drag (visual/stored only —
     // cadence applies on close, KD-8) and swallow the move so it can't begin a
     // selection drag or camera pan behind the overlay.
-    if state.match_state.paused {
-        if state.match_state.match_presentation.in_game_menu == crate::ui::pause_menu::InGameMenuState::Sound {
+    if state.match_state.paused() {
+        if state.match_state.match_presentation.in_game_menu
+            == crate::ui::pause_menu::InGameMenuState::Sound
+        {
             crate::app::input::sound::cursor_moved(state);
             return;
         }
-        if state.match_state.match_presentation.in_game_menu == crate::ui::pause_menu::InGameMenuState::AbortConfirm {
+        if state.match_state.match_presentation.in_game_menu
+            == crate::ui::pause_menu::InGameMenuState::AbortConfirm
+        {
             crate::app::input::abort::cursor_moved(state);
             return;
         }
-        if matches!(state.match_state.match_presentation.in_game_menu, crate::ui::pause_menu::InGameMenuState::SavedGame(_)) {
+        if matches!(
+            state.match_state.match_presentation.in_game_menu,
+            crate::ui::pause_menu::InGameMenuState::SavedGame(_)
+        ) {
             crate::app::App::update_saved_game_browser(state, true);
-        } else if state.match_state.match_presentation.in_game_menu == crate::ui::pause_menu::InGameMenuState::Menu {
+        } else if state.match_state.match_presentation.in_game_menu
+            == crate::ui::pause_menu::InGameMenuState::Menu
+        {
             crate::app::input::pause_menu::cursor_moved(state);
         } else {
             crate::app::input::in_game_options::in_game_options_drag(state);
@@ -801,7 +805,6 @@ mod item83_click_route_tests {
                     target_rx: 14,
                     target_ry: 15,
                     queue: false,
-                    group_id: None,
                 })
             },
         );
@@ -838,10 +841,7 @@ mod item83_click_route_tests {
                 0,
                 0,
                 owner,
-                Health {
-                    current: 100,
-                    max: 100,
-                },
+                Health { current: 100 },
                 type_ref,
                 EntityCategory::Unit,
                 0,
@@ -997,40 +997,59 @@ pub(crate) fn push_local_eva(state: &mut AppState, event: &str) {
         });
 }
 
-/// A left click on a build cameo — `SelectClass::Action @ 0x006AAD00`, the
-/// `(param_2 & 1)` branch. The cameo is only clickable when the option is
-/// enabled, which is the `HouseClass::CheckBuildLimit` pass the native line
-/// requires (`sidebar_eva::build_click_outcome`'s `buildable`).
-fn sidebar_build_click(state: &mut AppState, type_id: &str) {
-    let category = state
+/// A press on a build cameo: `SelectClass::Action @ 0x006AAD00`'s decision
+/// (`sidebar_eva::cameo_click`) against the local player's queue, then its
+/// `GUIBuildSound`, EVA line and event.
+fn sidebar_cameo_press(
+    state: &mut AppState,
+    type_id: &str,
+    press: sidebar_eva::CameoPress,
+    at_build_limit: bool,
+) {
+    let Some(category) = state
         .rules()
         .and_then(|rules| rules.object(type_id))
-        .map(crate::sim::production::category_for_object);
-    let Some(category) = category else {
-        queue_build_by_type(state, type_id);
+        .map(crate::sim::production::category_for_object)
+    else {
         return;
     };
     let queue = local_queue_view(state);
     let type_iid = local_interned(state, type_id);
-    match sidebar_eva::held_click(&queue, category, type_iid) {
-        sidebar_eva::HeldClick::Resume => {
-            push_local_eva(state, sidebar_eva::start_line_for(category));
-            toggle_pause_build_queue(state, category);
+    let click = sidebar_eva::cameo_click(&queue, category, type_iid, press, at_build_limit);
+    if click.sound {
+        let sound = state
+            .rules()
+            .and_then(|rules| rules.general.gui_build_sound.clone());
+        crate::app::App::play_shell_ui_sound_by_id(state, sound.as_deref());
+    }
+    if let Some(line) = click.eva {
+        push_local_eva(state, line);
+    }
+    match click.order {
+        None => {}
+        Some(sidebar_eva::CameoOrder::Produce) => queue_build_by_type(state, type_id),
+        Some(sidebar_eva::CameoOrder::Suspend) => suspend_build(state, category),
+        Some(sidebar_eva::CameoOrder::Abandon { all }) => {
+            cancel_build_by_type(state, type_id, all);
         }
-        sidebar_eva::HeldClick::NoFundsSameType => {
-            push_local_eva(state, sidebar_eva::start_line_for(category));
-        }
-        sidebar_eva::HeldClick::Fresh => {
-            let outcome = sidebar_eva::build_click_outcome(
-                category,
-                sidebar_eva::factory_busy(&queue, category),
-                true,
-            );
-            if let Some(line) = outcome.eva {
-                push_local_eva(state, line);
-            }
-            if outcome.queue {
-                queue_build_by_type(state, type_id);
+        // Residual (building path): `HouseClass::Manual_Place @ 0x004FB840`
+        // ignores the click while any placement is pending (`0x004FB852..
+        // 0x004FB859`); VERA's click leaves placement mode for the same
+        // building and switches it to another finished one.
+        Some(sidebar_eva::CameoOrder::Place) => {
+            let armed = state
+                .armed_building_type()
+                .is_some_and(|armed| armed.eq_ignore_ascii_case(type_id));
+            if armed {
+                state.match_state.input.targeting_mode = None;
+                state.match_state.input.building_placement_preview = None;
+            } else {
+                state.match_state.input.targeting_mode = Some(
+                    crate::app::types::TargetingMode::BuildingPlacement(type_id.to_string()),
+                );
+                let gadgets = &mut state.match_state.match_presentation.sidebar_gadget_state;
+                gadgets.repair_mode_on = false;
+                gadgets.sell_mode_on = false;
             }
         }
     }
@@ -1059,26 +1078,18 @@ pub(crate) fn apply_sidebar_action(state: &mut AppState, action: SidebarAction) 
                     .sidebar_scroll_rows_parked[tab_scroll_slot(tab)];
             }
         }
-        SidebarAction::BuildType(type_id) => {
-            sidebar_build_click(state, &type_id);
-        }
-        SidebarAction::ArmPlacement(type_id) => {
-            state.match_state.input.targeting_mode =
-                Some(crate::app::types::TargetingMode::BuildingPlacement(type_id));
-            state
-                .match_state
-                .match_presentation
-                .sidebar_gadget_state
-                .repair_mode_on = false;
-            state
-                .match_state
-                .match_presentation
-                .sidebar_gadget_state
-                .sell_mode_on = false;
-        }
-        SidebarAction::ClearPlacementMode => {
-            state.match_state.input.targeting_mode = None;
-            state.match_state.input.building_placement_preview = None;
+        SidebarAction::CameoPress {
+            type_id,
+            right,
+            shift,
+            at_build_limit,
+        } => {
+            let press = if right {
+                sidebar_eva::CameoPress::Right { shift }
+            } else {
+                sidebar_eva::CameoPress::Left
+            };
+            sidebar_cameo_press(state, &type_id, press, at_build_limit);
         }
         SidebarAction::ArmSuperWeapon(section) => {
             // `SelectClass::Action 0x006AAFA7`: a ready, targeted superweapon
@@ -1111,37 +1122,8 @@ pub(crate) fn apply_sidebar_action(state: &mut AppState, action: SidebarAction) 
             state.match_state.input.targeting_mode = None;
             log::info!("SuperWeapon targeting cleared");
         }
-        SidebarAction::TogglePauseQueue(category) => {
-            // `SelectClass::Action 0x006AB007/0x006AB108` (right click on the
-            // running build → `EVA_OnHold`) and `0x006AB498` (left click on
-            // the held build → `EVA_Building`/`EVA_Training`): VERA's pause
-            // button is that pair. Native needs a factory to hold.
-            let queue = local_queue_view(state);
-            if sidebar_eva::factory_busy(&queue, category) {
-                let paused = sidebar_eva::factory_paused(&queue, category);
-                push_local_eva(state, sidebar_eva::pause_toggle_line(category, paused));
-            }
-            toggle_pause_build_queue(state, category);
-        }
         SidebarAction::CycleProducer(category) => {
             cycle_active_producer(state, category);
-        }
-        SidebarAction::CancelBuild(type_id) => {
-            // `SelectClass::Action 0x006AAE39`: `EVA_Canceled`, see
-            // `sidebar_eva::cancel_line`.
-            let queue = local_queue_view(state);
-            let type_iid = local_interned(state, &type_id);
-            if let Some(line) = sidebar_eva::cancel_line(&queue, type_iid) {
-                push_local_eva(state, line);
-            }
-            cancel_build_by_type(state, &type_id);
-        }
-        SidebarAction::CancelLastBuild => {
-            let queue = local_queue_view(state);
-            if let Some(line) = sidebar_eva::cancel_line(&queue, None) {
-                push_local_eva(state, line);
-            }
-            cancel_last_build(state);
         }
         SidebarAction::CycleOwner => {
             cycle_local_owner(state);
@@ -1327,13 +1309,13 @@ pub(crate) fn toggle_pathgrid_overlay(state: &mut AppState) {
 /// On resume, local frame admission is re-anchored so elapsed modal time
 /// cannot cause a catch-up frame.
 pub(crate) fn toggle_debug_pause(state: &mut AppState) {
-    state.match_state.paused = !state.match_state.paused;
-    if !state.match_state.paused {
+    state.match_state.debug_pause = !state.match_state.paused();
+    if !state.match_state.paused() {
         state.platform.frame_pacer.reset_for_immediate_frame();
     }
     log::info!(
         "Debug pause: {}",
-        if state.match_state.paused {
+        if state.match_state.paused() {
             "ON"
         } else {
             "OFF"
@@ -1465,7 +1447,8 @@ fn dispatch_retail_hotkey(state: &mut AppState, command: HotkeyCommand) {
         HotkeyCommand::HealthNav => selection_navigation::execute_health_navigation(state),
         HotkeyCommand::CursorCheat => {
             // 537EF0: flag only; the next mouse move refreshes the tooltip.
-            state.match_state.input.cursor_coordinates = !state.match_state.input.cursor_coordinates;
+            state.match_state.input.cursor_coordinates =
+                !state.match_state.input.cursor_coordinates;
         }
         HotkeyCommand::StopObject => queue_stop_for_selected(state),
         HotkeyCommand::DeployObject => queue_deploy_undeploy_for_selected(state),
@@ -1491,23 +1474,14 @@ fn dispatch_retail_hotkey(state: &mut AppState, command: HotkeyCommand) {
         HotkeyCommand::ToggleSell => apply_sidebar_action(state, SidebarAction::ToggleSellMode),
         HotkeyCommand::CenterBase => jump_camera_to_base(state),
         HotkeyCommand::CenterOnRadarEvent => {
-            // Native's eight-cell review ring lives in RadarClass. Prefer the
-            // client-local EnemyObjectSensed history, then retain the older
-            // sim queue for event types whose producers have not migrated.
+            // Native's eight-cell review ring lives in RadarClass and holds
+            // the cell of every accepted event, whatever its type.
             let event = state
                 .match_state
                 .match_presentation
                 .minimap
                 .as_mut()
-                .and_then(|minimap| minimap.cycle_enemy_sensed_event(std::time::Instant::now()))
-                .or_else(|| {
-                    state
-                        .match_state
-                        .sim_runtime
-                        .as_mut()
-                        .map(|rt| &mut rt.simulation)
-                        .and_then(|sim| sim.cycle_radar_event())
-                });
+                .and_then(|minimap| minimap.cycle_radar_event(std::time::Instant::now()));
             if let Some((rx, ry)) = event {
                 crate::app::input::camera::center_camera_on_cell(state, rx, ry);
             }
@@ -1685,20 +1659,7 @@ pub(crate) fn dispatch_command_bar(state: &mut AppState, command: usize, right: 
 // Native 653952 -> GameState1 -> 48C9BA/4F10E0 opens the pause menu.
 // The button calls this directly; Escape's cancel/resume priority is separate.
 fn open_pause_menu(state: &mut AppState) {
-    state.match_state.paused = true;
-    state
-        .match_state
-        .match_presentation
-        .in_game_options
-        .on_open();
-    if state
-        .match_state
-        .match_presentation
-        .software_cursor
-        .is_some()
-    {
-        state.platform.window.set_cursor_visible(true);
-    }
+    crate::app::App::enter_in_game_menu_state(state, crate::ui::pause_menu::InGameMenuState::Menu);
     log::info!("Game paused");
 }
 
@@ -1709,8 +1670,11 @@ fn open_diplomacy_menu(_state: &mut AppState) {
 }
 
 fn handle_options_hotkey(state: &mut AppState) {
-    if state.match_state.paused {
-        state.match_state.paused = false;
+    // Only Escape reaches a hotkey while paused, and the in-game menu takes
+    // Escape whenever it is open, so the only pause seen here is the debug one.
+    debug_assert!(!state.match_state.match_presentation.in_game_menu.is_open());
+    if state.match_state.debug_pause {
+        state.match_state.debug_pause = false;
         state.platform.frame_pacer.reset_for_immediate_frame();
         if state
             .match_state
@@ -1785,7 +1749,7 @@ fn handle_dev_hotkey_pressed(state: &mut AppState, code: winit::keyboard::KeyCod
                 .match_presentation
                 .software_cursor
                 .is_some()
-                && !state.match_state.paused
+                && !state.match_state.paused()
             {
                 // Re-hide OS cursor so the software cursor takes over.
                 state.platform.window.set_cursor_visible(false);
@@ -1864,7 +1828,7 @@ fn handle_dev_hotkey_pressed(state: &mut AppState, code: winit::keyboard::KeyCod
             toggle_debug_pause(state);
         }
         KeyCode::Period => {
-            if state.match_state.paused {
+            if state.match_state.paused() {
                 state.diag.debug_frame_step_requested = true;
             }
         }
@@ -2027,7 +1991,9 @@ pub(crate) fn reconcile_selection_order_after_sim(state: &mut AppState) {
     };
     // 733160 removes expired objects from the retained navigation snapshot.
     state.match_state.input.health_navigation.retain(|id| {
-        sim.entities().get(*id).is_some_and(|entity| entity.lifecycle.object_alive)
+        sim.entities()
+            .get(*id)
+            .is_some_and(|entity| entity.lifecycle.object_alive)
     });
     if state.match_state.input.selection_order_pending {
         let before_retain = state.match_state.input.selection_order.len();
@@ -2115,10 +2081,7 @@ fn apply_selection_mutation(
         let type_id = sim.interner.resolve(entity.type_ref());
         let admitted = entity.lifecycle.object_alive
             && !entity.lifecycle.in_limbo
-            && !entity
-                .teleport_state
-                .as_ref()
-                .is_some_and(|teleport| teleport.warp_out_active())
+            && !entity.is_warped_out()
             && state
                 .rules()
                 .is_none_or(|rules| rules.object(type_id).is_none_or(|object| object.selectable));
@@ -2247,10 +2210,7 @@ mod item83_selection_order_tests {
                     0,
                     0,
                     owner,
-                    Health {
-                        current: 100,
-                        max: 100,
-                    },
+                    Health { current: 100 },
                     type_ref,
                     EntityCategory::Infantry,
                     0,

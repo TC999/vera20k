@@ -6,7 +6,7 @@
 use crate::rules::object_type::{ObjectCategory, ObjectType};
 use crate::rules::ruleset::RuleSet;
 use crate::sim::ai_buildable::{
-    candidate_allowed, country_bit, first_buildable_from_array, owner_allows,
+    candidate_allowed, country_bit, first_buildable_from_array, first_owner_compatible_harvester,
 };
 use crate::sim::base_plan::{BasePlanNode, BasePlanState};
 use crate::sim::house_state::HouseDifficulty;
@@ -255,13 +255,6 @@ fn recalc_candidate_allowed(
         && candidate.tech_level <= tech_level
 }
 
-fn first_owner_compatible_harvester(rules: &RuleSet, country_bit: u32) -> Option<&ObjectType> {
-    rules.harvester_unit_types.iter().find_map(|type_id| {
-        let candidate = rules.object_in_category(ObjectCategory::Vehicle, type_id)?;
-        owner_allows(candidate, country_bit, rules).then_some(candidate)
-    })
-}
-
 fn move_eligible_seed<'a>(
     eligible: &mut Vec<&'a ObjectType>,
     selected: &mut [bool],
@@ -286,9 +279,13 @@ fn move_eligible_seed<'a>(
     selected[target] = false;
 }
 
-fn prerequisites_satisfied(
+/// `HouseClass @ 0x00505360`: every `Prerequisite=` of `candidate` is among
+/// `present`, a generic one (`POWER`, `FACTORY`, `BARRACKS`, `RADAR`, `TECH`,
+/// `PROC`) through any type of its `[AI]` list. Recalc passes the types it
+/// has planned; the base defense choice the house's own building types.
+pub(crate) fn prerequisites_satisfied(
     candidate: &ObjectType,
-    priority_at_pass_start: &[&ObjectType],
+    present: &[&ObjectType],
     rules: &RuleSet,
 ) -> bool {
     candidate.prerequisite.iter().all(|token| {
@@ -302,18 +299,18 @@ fn prerequisites_satisfied(
             _ => None,
         };
         if let Some(family) = family {
-            return priority_at_pass_start.iter().any(|present| {
+            return present.iter().any(|ty| {
                 family
                     .iter()
-                    .any(|type_id| type_id.eq_ignore_ascii_case(&present.id))
+                    .any(|type_id| type_id.eq_ignore_ascii_case(&ty.id))
             });
         }
         let Some(required_index) = rules.building_type_index(token) else {
             return false;
         };
-        priority_at_pass_start
+        present
             .iter()
-            .any(|present| present.base_plan_type_index == required_index)
+            .any(|ty| ty.base_plan_type_index == required_index)
     })
 }
 

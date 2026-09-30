@@ -92,6 +92,7 @@ impl ModalKind {
 /// (The three target modals only ever populate up to `third`, so the
 /// fourth-without-third ordering is not produced in practice; the cascade follows
 /// the "fourth slot present -> 0x121" rule regardless.)
+#[cfg(test)]
 pub fn message_box_kind(third_slot: Option<&str>, fourth_slot: Option<&str>) -> ModalKind {
     if slot_populated(fourth_slot) {
         ModalKind::ThreeButton
@@ -104,6 +105,7 @@ pub fn message_box_kind(third_slot: Option<&str>, fourth_slot: Option<&str>) -> 
 
 /// A CSF slot is populated iff present with a non-null first char (the native test
 /// is a non-null pointer AND `*ptr != 0`).
+#[cfg(test)]
 fn slot_populated(slot: Option<&str>) -> bool {
     matches!(slot, Some(s) if !s.is_empty())
 }
@@ -139,6 +141,7 @@ impl ModalResult {
     /// Map a resolved message-box control id to its native result, or `None` for a
     /// control that produces no result (the body static). OK(`0x5AE`)->0,
     /// Cancel(control 2)->1, third(`0x5AF`)->2.
+    #[cfg(test)]
     pub fn from_message_box_control(control: u16) -> Option<ModalResult> {
         let code = match control {
             control::OK => 0,
@@ -152,6 +155,7 @@ impl ModalResult {
     /// Quit-confirm (0x120) semantics: ONLY the OK click (message-box result 0)
     /// quits; Cancel(1), third(2), and dismissed(-1) all stay. ESC resolves to
     /// IDCANCEL -> result 1 -> stay.
+    #[cfg(test)]
     pub fn quit_confirm_quits(self) -> bool {
         matches!(self, ModalResult::MessageBox(0))
     }
@@ -249,16 +253,38 @@ pub const MESSAGE_BOX_W: i32 = 450;
 pub const MESSAGE_BOX_H: i32 = 325;
 
 /// Screen-relative pixel rects for the quit-confirm (0x120) modal: the centered
-/// PUDLGBGN panel plus its body static and the two POPULATED buttons. Rects mirror
-/// the native template controls — body static `0x5B0` (40,40,220,50), OK `0x5AE`
-/// (207,135,83,15), Cancel control 2 (207,175,83,15). The unpopulated `0x5AF`
-/// (207,155) is not part of the visible quit dialog and is intentionally absent.
+/// PUDLGBGN panel plus its body static and its two buttons. Rects mirror the
+/// RT_DIALOG `0x120` template (`0x00C00A68`): body static `0x5B0`
+/// (40,40,220,50), OK `0x5AE` (207,155,83,15) directly above Cancel control 2
+/// (207,175,83,15). (OK at y 135 belongs to the three-button `0x121`, whose
+/// third button `0x5AF` takes y 155.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QuitConfirmLayout {
     pub dialog: RectPx,
     pub body: RectPx,
     pub ok: RectPx,
     pub cancel: RectPx,
+}
+
+/// Screen-relative pixel rects for a one-button message box: `0xCE` (the
+/// skirmish validation and saved-map notices) and `0xD0` (the Westwood Online
+/// `TXT_APIMISSING` box) share this geometry: body static `0x5B0`
+/// (40,40,220,50) and OK (207,175,83,15). The box centres on the live
+/// screen, not inside the 800x600 shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BodyOkLayout {
+    pub dialog: RectPx,
+    pub body: RectPx,
+    pub ok: RectPx,
+}
+
+pub fn body_ok_layout(screen_w: i32, screen_h: i32) -> BodyOkLayout {
+    let dialog = centered_modal_dialog(screen_w, screen_h, MESSAGE_BOX_W, MESSAGE_BOX_H);
+    BodyOkLayout {
+        dialog,
+        body: modal_child(dialog, geom::dlu_rect(40, 40, 220, 50)),
+        ok: modal_child(dialog, geom::dlu_rect(207, 175, 83, 15)),
+    }
 }
 
 /// Center the modal panel on the live screen, then place each control at its
@@ -269,7 +295,7 @@ pub fn quit_confirm_layout(screen_w: i32, screen_h: i32) -> QuitConfirmLayout {
     QuitConfirmLayout {
         dialog,
         body: modal_child(dialog, geom::dlu_rect(40, 40, 220, 50)),
-        ok: modal_child(dialog, geom::dlu_rect(207, 135, 83, 15)),
+        ok: modal_child(dialog, geom::dlu_rect(207, 155, 83, 15)),
         cancel: modal_child(dialog, geom::dlu_rect(207, 175, 83, 15)),
     }
 }
@@ -453,11 +479,24 @@ mod tests {
             RectPx::new(l.dialog.x + local.x, l.dialog.y + local.y, local.w, local.h)
         };
         assert_eq!(l.body, child(40, 40, 220, 50));
-        assert_eq!(l.ok, child(207, 135, 83, 15));
+        assert_eq!(l.ok, child(207, 155, 83, 15));
         assert_eq!(l.cancel, child(207, 175, 83, 15));
-        // OK sits above Cancel (DLU y=135 vs 175), both right-aligned at DLU x=207.
+        // OK sits directly above Cancel (DLU y=155 vs 175), both right-aligned at
+        // DLU x=207, as in the 0x120 template and the retail capture.
         assert!(l.ok.y < l.cancel.y);
         assert_eq!(l.ok.x, l.cancel.x);
+    }
+
+    #[test]
+    fn body_ok_layout_centres_on_the_live_screen() {
+        // (800-450+1)/2 = 175, (600-325+1)/2 = 138.
+        let l = body_ok_layout(800, 600);
+        assert_eq!(l.dialog, RectPx::new(175, 138, 450, 325));
+        assert_eq!(l.body, RectPx::new(235, 203, 330, 81));
+        assert_eq!(l.ok, RectPx::new(486, 422, 125, 24));
+        // Not inside an 800x600 sub-box: (1024-450+1)/2 = 287.
+        let wide = body_ok_layout(1024, 768);
+        assert_eq!(wide.dialog, RectPx::new(287, 222, 450, 325));
     }
 
     #[test]

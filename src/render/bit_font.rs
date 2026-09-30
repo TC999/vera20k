@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use crate::assets::fnt_file::{FntFile, FntGlyph};
 use crate::render::batch::{BatchRenderer, BatchTexture, SpriteInstance};
 use crate::render::gpu::GpuContext;
-use crate::render::shell_text_reveal::{PathAReveal, encoded_srgb_to_linear, encoded_unit_rgb};
+use crate::render::shell_text_reveal::{PathAReveal, encoded_unit_rgb};
 
 /// Hardcoded inter-glyph spacing.
 pub const CHAR_SPACING: u32 = 1;
@@ -110,64 +110,18 @@ impl BitFont {
         tint: [f32; 3],
         camera_offset: [f32; 2],
     ) -> Vec<SpriteInstance> {
-        self.build_text_revealed(text, x, y, scale, depth, tint, camera_offset, None)
-            .0
-    }
-
-    /// Glyph emission with an optional kind-1 character reveal cutoff.
-    ///
-    /// `reveal_cutoff` is `(already_consumed, count)`: `already_consumed` is the
-    /// number of revealable characters that preceded this segment (for threading
-    /// the window across wrapped lines), and `count` is the global reveal count.
-    /// Only characters whose running revealable index is `< count` are emitted;
-    /// the rest are cut (left-to-right wipe). Returns the emitted instances plus
-    /// the updated revealable-character count so the caller can thread the next
-    /// wrapped segment.
-    ///
-    /// Counting matches native `wcslen`: every wide char advances the count
-    /// except `\r`/`\n`, which are layout-only and never revealable cells.
-    /// With `reveal_cutoff == None` the output is byte-identical to the plain
-    /// `build_text` path (the cutoff branch never fires).
-    #[allow(clippy::too_many_arguments)]
-    pub fn build_text_revealed(
-        &self,
-        text: &str,
-        x: f32,
-        y: f32,
-        scale: f32,
-        depth: f32,
-        tint: [f32; 3],
-        camera_offset: [f32; 2],
-        reveal_cutoff: Option<(u32, u32)>,
-    ) -> (Vec<SpriteInstance>, u32) {
-        let (already_consumed, reveal_count) = match reveal_cutoff {
-            Some((consumed, count)) => (consumed, Some(count)),
-            None => (0, None),
-        };
         let mut instances = Vec::with_capacity(text.len());
         let mut cursor_x = x;
         let spacing = self.char_spacing as f32 * scale;
         let h = self.bitmap_rows as f32 * scale;
         let missing_tint = Self::missing_color_xor(tint);
         let mut emitted = 0u32;
-        let mut consumed = already_consumed;
 
         for ch in text.chars() {
-            // \r/\n are layout-only control chars: native wcslen counts them but
-            // the reveal renderer never advances or reveals on them, so they are
-            // not revealable cells. Skip before the cutoff so they cost no step.
+            // \r/\n are layout-only control chars.
             if ch == '\r' || ch == '\n' {
                 continue;
             }
-            // Reveal cutoff (v1 wipe): a char at revealable index >= count is not
-            // emitted. Because chars run left-to-right, the first cut char ends
-            // the segment. `consumed` is the running 0-based revealable index.
-            if let Some(count) = reveal_count {
-                if consumed >= count {
-                    break;
-                }
-            }
-            consumed += 1;
             match ch {
                 '\t' => {
                     let cell_x = ((cursor_x - x) / scale) as u32;
@@ -214,16 +168,14 @@ impl BitFont {
             cursor_x += w;
             emitted += 1;
         }
-        (instances, consumed)
+        instances
     }
 
     /// Glyph emission for the verified BITFONT Path-A UTF-16 reveal/tint path.
     ///
-    /// This is deliberately separate from [`Self::build_text_revealed`], whose
-    /// scalar wipe remains the existing Skirmish implementation. Every UTF-16
-    /// code unit consumes a one-based reveal position; spaces/tabs consume a
-    /// unit without emitting a quad, and surrogate halves independently take
-    /// the existing missing-glyph path.
+    /// Every UTF-16 code unit consumes a one-based reveal position;
+    /// spaces/tabs consume a unit without emitting a quad, and surrogate
+    /// halves independently take the existing missing-glyph path.
     #[allow(clippy::too_many_arguments)]
     pub fn build_text_path_a(
         &self,
@@ -274,7 +226,9 @@ impl BitFont {
                 _ => {}
             }
 
-            let tint = encoded_srgb_to_linear(encoded_rgb);
+            // UI tints multiply the encoded texel (`palette_light`), so the
+            // encoded COLORREF bytes are the tint.
+            let tint = encoded_rgb.map(|channel| f32::from(channel) / 255.0);
             let missing_tint = Self::missing_color_xor(tint);
             let (entry, use_missing_tint) = match self.glyphs.get(&code_unit) {
                 Some(glyph) => (Some(*glyph), false),
@@ -495,7 +449,9 @@ impl BitFont {
     pub fn missing_color_xor(rgb: [f32; 3]) -> [f32; 3] {
         fn xor_565(c: f32, bits: u32, mask: u8) -> f32 {
             let max_val = (1u32 << bits) - 1;
-            let quantized = ((c.clamp(0.0, 1.0) * max_val as f32) as u32) as u8;
+            // The surface unit of the encoded byte, as the presenter packs it.
+            let byte = (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let quantized = byte >> (8 - bits);
             let flipped = (quantized ^ mask) & (max_val as u8);
             (flipped as f32) / (max_val as f32)
         }
@@ -821,6 +777,31 @@ pub(crate) mod tests {
         assert!((xored[0] - 21.0 / 31.0).abs() < 0.01, "R = {}", xored[0]);
         assert!((xored[1] - 21.0 / 63.0).abs() < 0.01, "G = {}", xored[1]);
         assert!((xored[2] - 10.0 / 31.0).abs() < 0.01, "B = {}", xored[2]);
+    }
+
+    #[test]
+    fn path_a_tint_is_the_encoded_colorref() {
+        // UI tints multiply the encoded texel (`palette_light`): the terminal
+        // highlight unit's (248, 252, 30) must reach the surface as blue 30.
+        let font = make_test_font(&[(b'a' as u16, 6)], 4);
+        let reveal = PathAReveal {
+            count: 9,
+            range: 8,
+            base_rgb: [255, 255, 0],
+            highlight_rgb: [255, 255, 255],
+        };
+        let (instances, _) = font.build_text_path_a("a", 0.0, 0.0, 1.0, 0.5, [0.0; 2], 0, reveal);
+        assert_eq!(
+            instances[0].tint,
+            [248.0 / 255.0, 252.0 / 255.0, 30.0 / 255.0]
+        );
+    }
+
+    #[test]
+    fn missing_color_xor_starts_from_the_surface_unit() {
+        // Path-A yellow is (248, 252, 0) in bytes, (31, 63, 0) in units.
+        let xored = BitFont::missing_color_xor([248.0 / 255.0, 252.0 / 255.0, 0.0]);
+        assert_eq!(xored, [21.0 / 31.0, 21.0 / 63.0, 21.0 / 31.0]);
     }
 
     #[test]

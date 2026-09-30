@@ -53,11 +53,6 @@ pub struct MmpbRegionRect {
     pub height: i32,
 }
 
-/// Per-axis screen nudge applied to a projected marker before the region origin
-/// is added (verified marker projection: X gets `-3`, Y gets `-2`).
-pub const MMPB_MARKER_NUDGE_X: i32 = -3;
-pub const MMPB_MARKER_NUDGE_Y: i32 = -2;
-
 /// Select the marker projection region rect for the current screen width.
 ///
 /// Native uses equality for its dedicated 800 and 1024 branches. Every other
@@ -126,6 +121,7 @@ pub enum LoadingArtVariant {
 }
 
 impl LoadingArtVariant {
+    #[cfg(test)]
     pub fn from_country_name(country: &str) -> Option<Self> {
         match country.to_ascii_lowercase().as_str() {
             "yuricountry" | "yuri" => Some(Self::Yuri),
@@ -254,25 +250,6 @@ struct RenderedLoadingEntry {
     width: u32,
     height: u32,
     rgba: Vec<u8>,
-}
-
-pub fn build_loading_screen_atlas(
-    gpu: &GpuContext,
-    batch: &BatchRenderer,
-    assets: &AssetManager,
-    variant: LoadingArtVariant,
-    width: LoadingScreenWidth,
-    progress_ramp: &[Color; 16],
-) -> Option<LoadingScreenAtlas> {
-    build_loading_screen_atlas_with_composition(
-        gpu,
-        batch,
-        assets,
-        variant,
-        width,
-        progress_ramp,
-        None,
-    )
 }
 
 /// Build the native loading atlas with optional selected-map preview/marker
@@ -882,8 +859,11 @@ mod tests {
         if !config.paths.ra2_dir.exists() {
             return;
         }
-        let assets = crate::assets::asset_manager::AssetManager::new(&config.paths.ra2_dir)
-            .expect("install loads");
+        let assets = crate::assets::asset_manager::AssetManager::new(
+            &config.paths.ra2_dir,
+            crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+        )
+        .expect("install loads");
         let bytes = assets.get_ref("PROGBARM.SHP").expect("progbarm");
         let shp = crate::assets::shp_file::ShpFile::from_bytes(bytes).expect("parse shp");
         let f = &shp.frames[0];
@@ -957,12 +937,17 @@ mod tests {
             Ok(config) => config,
             Err(_) => return,
         };
-        if !config.paths.ra2_dir.exists() {
+        // Without config.toml the fallback root is the test binary's folder;
+        // require an actual install.
+        if !config.paths.ra2_dir.join("ra2md.mix").exists() {
             return;
         }
 
-        let mut assets = crate::assets::asset_manager::AssetManager::new(&config.paths.ra2_dir)
-            .expect("configured RA2 install should load");
+        let mut assets = crate::assets::asset_manager::AssetManager::new(
+            &config.paths.ra2_dir,
+            crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+        )
+        .expect("configured RA2 install should load");
         assert!(
             assets
                 .register_loading_archives()

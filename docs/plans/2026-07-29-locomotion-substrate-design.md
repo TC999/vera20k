@@ -3,7 +3,7 @@ title: LocomotionClass as an engine substrate service — design study
 date: 2026-07-29
 scope: gamemd.exe LocomotionClass / ILocomotion / IPiggyback, and the VERA20k Rust replacement boundary
 kind: design study (docs/plans) — analysis only, no Rust landed in this session
-supersedes: nothing. Corrects docs/research/ILOCOMOTION_COM_PROTOCOL_SPEC.md (§11 below)
+supersedes: nothing. Corrects [docs/research/ILOCOMOTION_COM_PROTOCOL_SPEC.md](https://github.com/YuriPlanet/vera20k/blob/108924bc237d14342b68b8bb78f2bba0400d2443/docs/research/ILOCOMOTION_COM_PROTOCOL_SPEC.md) (§11 below)
 updated: 2026-07-29 — open-question closeout pass, then an OQ4/OQ5 re-run (see Changelog); §11b holds self-corrections
 ---
 
@@ -270,7 +270,7 @@ self-consistent, because slots 0/1/2 of the ILocomotion vtable are `-4` adjustor
 its own identically-shaped thunks `0x0054DFF0/E000/E010` (`read_memory 0x007ECD68 len 16`;
 `disassemble_bytes 0x0054DFF0 len 48`) — the only class examined that does. Why is **[U]**.
 
-`ILOCOMOTION_COM_PROTOCOL_SPEC.md`'s addresses and the thunk addresses are **both correct
+[ILOCOMOTION_COM_PROTOCOL_SPEC.md](https://github.com/YuriPlanet/vera20k/blob/108924bc237d14342b68b8bb78f2bba0400d2443/docs/research/ILOCOMOTION_COM_PROTOCOL_SPEC.md)'s addresses and the thunk addresses are **both correct
 and describe different things** — the doc lists the real implementations; the vtable slots
 hold the thunks. See §11 C1.
 
@@ -342,7 +342,7 @@ discrepancies** (`read_memory <vtable> len 160` on all 12 vtables).
 † Mech / DropPod / Tunnel are **DORMANT-TS** — see §3.
 
 **Naming caveat [U]:** the 40 slot *names* come from
-`docs/research/ILOCOMOTION_COM_PROTOCOL_SPEC.md` and remain **navigation hints**. Names
+[docs/research/ILOCOMOTION_COM_PROTOCOL_SPEC.md](https://github.com/YuriPlanet/vera20k/blob/108924bc237d14342b68b8bb78f2bba0400d2443/docs/research/ILOCOMOTION_COM_PROTOCOL_SPEC.md) and remain **navigation hints**. Names
 confirmed against a body or a caller this study: 3 (stores an object pointer), 5 vs 6
 (constant-null coord vs live object coord — the reverse assignment is nonsensical), 13
 (`FootClass::GetVisualState` first-refusal protocol, `decompile_function 0x004DA4E8`), 16,
@@ -548,7 +548,7 @@ they need a reachability answer first.
 | `Visual_Character` (13) | **DORMANT-TS (live call, constant result)** | `FootClass::GetVisualState` `0x004DA4E8` gives the locomotor first refusal, but only Tunnel overrides `0x0055ABC0` | always falls through to the TechnoClass default in stock YR. **[R]** `render-query-slots.md` called it a MIXED boundary cut |
 | **Mech** locomotor (whole class) | **DORMANT-TS** | `{55D141B8-…}` appears in `rulesmd.ini` only inside `;` comments — Westwood's own conversion notes, e.g. `Locomotor={4A582741-…};<-drive   mech->{55D141B8-…}` | units were re-pointed at Drive for RA2 |
 | **DropPod** locomotor + its IPiggyback | **DORMANT-TS** | zero occurrences of `{4A582745-…}` in either INI, not even in a comment; its only installer `0x004DB8A0` has **no references of any kind** (`get_xrefs_to 0x004DB8A0`) | unreachable |
-| **Tunnel** locomotor (whole class) | **DORMANT-TS** | zero occurrences of `{4A582743-…}` in either INI; `grep -rn "4A582743" ini/` → no matches | subterranean is on ENGINE.md's known-dormant list |
+| **Tunnel** locomotor (whole class) | **DORMANT-TS** | zero occurrences of `{4A582743-…}` in either INI; `grep -rn "4A582743" ini/` → no matches | subterranean is on AGENTS.md's known-dormant list |
 | Carryall raw locomotor swap `AircraftClass::Carryall_Pickup` | **DORMANT in stock skirmish** | the mechanism is real (`disassemble_bytes 0x00416b40`), but the sole `Carryall=yes` unit is `[HIND]`, `TechLevel=-1`, absent from `[AircraftTypes]`. **[R]** `host-contract.md` called it "common in games with carryall play" | zero frequency in stock skirmish. **[R]** the earlier note "the raw-swap idiom still ships — via Magnetron" is wrong: the Magnetron piggybacks (§11 C15). **These two stores are now the only RAW swap left in the binary**, and `[HIND] TechLevel=-1` was not re-verified this pass (§9 item 16e) |
 | Tunnel branch of the war-factory exit (`CLSID_Tunnel` compare at `0x0044DEDD`) | **DORMANT-TS** | no `Locomotor=` names Tunnel; Tunnel does not implement IPiggyback, so the branch would fault if reached | dead comparison |
 | Locomotor-spawned dust anim gated on `RulesClass+0x94` | **UNCHECKED** | neither `RulesClass+0x94` nor `TypeClass+0xEC` was traced to a `ReadINI` site by any lane | a RulesClass boolean gating a visual is exactly a possibly-off default |
@@ -1403,7 +1403,7 @@ CHECKED, and it *justifies* the handle shape for a concrete reason: gamemd persi
 indirection paid at design time instead of at load time. But a **byte-level comparison
 against a gamemd save is impossible** — the stream carries raw process pointers and a
 swizzle table. S3's save/load acceptance can therefore assert only **semantic**
-correspondence: the set of persisted facts and the host-then-stash ordering. Per ENGINE.md
+correspondence: the set of persisted facts and the host-then-stash ordering. Per AGENTS.md
 that is not an executable gamemd-derived check, so **the save/load parity status stays
 UNVERIFIED**, and a Rust-vs-prior-Rust snapshot hash remains a ratchet. The OLE contract
 step itself (what `OleSaveToStream`/`OleLoadFromStream` do internally) is **[I]** — ole32
@@ -1684,6 +1684,10 @@ documented as matching native `Horizontal_Step` zones; this fourth zone is bolte
 **Replacement:** the native `FlyLocomotionClass::Process` flight model, including its real
 map-boundary handling (deflect ±0x80 leptons for FlyBy types, else scatter) instead of
 `.min(511)`.
+**Status (2026-09-24):** the distance tiers (`approach_target_speed`) and the fine-approach
+halving are deleted; Process's own target-speed writer (`0x004CE145..0x004CE2DB`,
+`air_movement::write_fly_target_speed`) replaces them. The snap arrival and the map bound
+remain; see the Fly target speed residuals in `2026-09-21-combat-parity.md`.
 
 ### R9 — Hardcoded 25 lep/s speed floor and `Speed=4` default, five copies
 `movement_tick.rs:553–557`, `scatter.rs:368–377`, `world/world_commands.rs:86–89`,
@@ -1735,7 +1739,7 @@ same number as `mod.rs:120 MIN_BRAKE_FRACTION`), `bump_crush.rs:61` (sub-cell ce
 ### What is already right — do not disturb
 
 `movement_tick.rs:486–546` (three `pending_arrival_clear` re-arms, each labelled
-VERA-internal with "the gamemd fallback is UNCHECKED" — the exact ENGINE.md form);
+VERA-internal with "the gamemd fallback is UNCHECKED" — the exact AGENTS.md form);
 `movement_step.rs:204–217` (`hover_steer` hold-position, disclosed as an approximation with
 the native behaviour stated, the residual bounded, and a plan doc named);
 `pathfinding/terrain_speed.rs:11–14` (records a *removed* invented crowd-jam factor and
@@ -1747,7 +1751,7 @@ and the absence of any unit-name string matching in `src/sim/movement/`.
 
 ## 8. Migration slices and acceptance tests
 
-Each slice is independently landable and independently revertible. Per ENGINE.md, **a
+Each slice is independently landable and independently revertible. Per AGENTS.md, **a
 shadow-mode slice flips to authoritative within two sessions or gets reverted** — the
 shadow windows below are stated in sessions, not "eventually".
 
@@ -1774,7 +1778,7 @@ a ratchet, it says so, and the parity claim stays `UNCHECKED`.
 > check.** Its `expected` array is a **verbatim duplicate** of the `INHERITS_BASE_DEFAULT`
 > constant under test, so it can only catch someone editing one copy and not the other. The
 > `PARITY:` comment claims the cells are byte-decoded from `read_memory`, but nothing in the
-> test verifies that; per ENGINE.md prose never upgrades a status. **The underlying data is
+> test verifies that; per AGENTS.md prose never upgrades a status. **The underlying data is
 > sound** — this review independently re-decoded three rows from live vtable reads and all
 > matched exactly, including the two most distinctive claims:
 > Drive (`read_memory 0x007E7EB0 len 160`) → `[f,t,f,f,f,t,f,f,f]`;
@@ -1942,7 +1946,7 @@ This section was rewritten once already, on the basis of the **slot-4** bodies. 
 wrong predicate: the Mission gate reads **slot 32 (`Is_Moving_Now`)**, never slot 4. Slot 4
 matters only as an inner term, because Drive/Ship/Walk/Hover's slot 32 opens with `slot4()`.
 Both earlier framings of this gap are therefore superseded. Settled contract and citations:
-`docs/research/ILOCOMOTION_IS_MOVING_NOW_SLOT32_AND_MISSION_GATE_GHIDRA_REPORT.md`.
+[docs/research/ILOCOMOTION_IS_MOVING_NOW_SLOT32_AND_MISSION_GATE_GHIDRA_REPORT.md](https://github.com/YuriPlanet/vera20k/blob/108924bc237d14342b68b8bb78f2bba0400d2443/docs/research/ILOCOMOTION_IS_MOVING_NOW_SLOT32_AND_MISSION_GATE_GHIDRA_REPORT.md).
 
 What survived re-grounding on the right slot: **all six Rust predicates were already
 slot-32 shapes** — term set, conjunction structure, short-circuit order and signedness. The
@@ -2193,7 +2197,7 @@ Plus a live-observe run: a Chrono Miner exits a war factory, drives out, and pop
 not change that.** oq6's `obj[+0x38]` and oq9's Chrono-Miner-inbound precondition are both
 closed (§5.3, §5.4 row 3b) — S4 can now be written against the *correct* predicate, which
 is real progress. But `end_order_matches_native` as specified is a **hand-transcribed
-golden with a prose citation**, precisely the category ENGINE.md records as having produced
+golden with a prose citation**, precisely the category AGENTS.md records as having produced
 wrong references here before. The evidence that the risk is live is inside this very wave:
 the lane whose entire brief was offset conversion, and which opens with a correct statement
 of the conversion rule, mis-converted one instruction and published a wrong field semantic
@@ -2271,7 +2275,7 @@ today.
 >    the `REP MOVSD` at `0x004b4607` is shared-tail behaviour. The bug was a *second*
 >    increment on top of the ordinary advance. Fix: delete one line.
 >    See §11 C20 and the correction banner added to
->    `docs/research/DRIVE_SHARP_TURN_FALLBACK_RE.md`.
+>    [docs/research/DRIVE_SHARP_TURN_FALLBACK_RE.md](https://github.com/YuriPlanet/vera20k/blob/108924bc237d14342b68b8bb78f2bba0400d2443/docs/research/DRIVE_SHARP_TURN_FALLBACK_RE.md).
 > 2. **The full octant path-node re-representation did NOT land** and is not required to
 >    retire either gate. `TubePathStepResult::Blocked` was deleted outright, which makes the
 >    abort unrepresentable by type — the stated goal — without changing how `MovementTarget`
@@ -2328,7 +2332,7 @@ re-add the gate.
 > of those changes the hashed discriminant **will** shift the replay baseline, so it must
 > own a coordinated re-baseline. Note `docs/scans/PENDING_REBASELINES.md` already lists
 > this baseline as red from another session's in-flight deltas including an UNATTRIBUTED
-> entry, so per ENGINE.md no re-baseline may be taken until the tree is clean of those.
+> entry, so per AGENTS.md no re-baseline may be taken until the tree is clean of those.
 >
 > **Also corrected:** this slice claimed `world_hash` and snapshot "arms" for the two
 > states. There were none — `tunnel_state` and `droppod_state` were never hashed. Deleting
@@ -2370,7 +2374,7 @@ note that only `rulesmd.ini`/`rules.ini` were checked; campaign and map INIs are
 > `screen_x`/`screen_y` are cached `f32` fields on `Position` itself
 > (`src/sim/components.rs:43-48`, `#[serde(skip)]`), not on a locomotor type. Live
 > reference counts: **app ~183, sim 92, map 60, render 30, util 5 — roughly 370 sites
-> across every layer.** Extracting them is a cross-layer bulk refactor, which ENGINE.md
+> across every layer.** Extracting them is a cross-layer bulk refactor, which AGENTS.md
 > requires explicit approval for, and it delivers **no player-visible change**. It should
 > be planned as its own multi-slice piece of work, not carried as one bullet here.
 >
@@ -2634,7 +2638,7 @@ Stated plainly, so no one mistakes silence for a decision.
   a store-only function, and `emulate_function 0x005F6940` returns **registers only**. It
   confirmed `ECX = this + 0x9C` from a seeded `ECX = 0x01000000`, but two different
   memory-seeding formats both failed to land, so the three stores are unobservable and the
-  result cannot be witnessed. ENGINE.md's route to `VERIFIED` — a gamemd-derived executable
+  result cannot be witnessed. AGENTS.md's route to `VERIFIED` — a gamemd-derived executable
   check — **has no known instrument here**. Live capture or a debugger watchpoint on
   `+0x9C` would supply one; neither was attempted. Until then any Rust `set_position` test is
   a well-provenanced ratchet, and no pass should label it otherwise. **No recommendation on
@@ -2664,9 +2668,9 @@ Stated plainly, so no one mistakes silence for a decision.
 ## 11. Corrections to existing docs
 
 Every place this study contradicts a doc in `docs/research/`. The main target is
-`ILOCOMOTION_COM_PROTOCOL_SPEC.md`.
+[ILOCOMOTION_COM_PROTOCOL_SPEC.md](https://github.com/YuriPlanet/vera20k/blob/108924bc237d14342b68b8bb78f2bba0400d2443/docs/research/ILOCOMOTION_COM_PROTOCOL_SPEC.md).
 
-### C1 — Not a contradiction; two different things (`ILOCOMOTION_COM_PROTOCOL_SPEC.md` §3, slots 0/1/2)
+### C1 — Not a contradiction; two different things ([ILOCOMOTION_COM_PROTOCOL_SPEC.md](https://github.com/YuriPlanet/vera20k/blob/108924bc237d14342b68b8bb78f2bba0400d2443/docs/research/ILOCOMOTION_COM_PROTOCOL_SPEC.md) §3, slots 0/1/2)
 
 The doc lists base fallbacks `0x0055A9B0`/`0x0055A950`/`0x0055A970` for QI/AddRef/Release.
 Those are the **real implementations**. The base ILocomotion vtable *slots* hold `-4`
@@ -2735,7 +2739,7 @@ helper with an out-buffer". The "surrogate token in +0x674" reading is unsupport
 vtables rewritten at `0x00744521`–`0x00744534` are `UnitClass`'s own. **`+0x674` is NULL
 after a load and the re-acquisition path is UNKNOWN.**
 
-### C7 — `INDEX_PATHFINDING_LOCOMOTION.md` §6: `0x812D50` / `0x814A58` are not init-dispatch tables
+### C7 — [INDEX_PATHFINDING_LOCOMOTION.md](https://github.com/YuriPlanet/vera20k/blob/108924bc237d14342b68b8bb78f2bba0400d2443/docs/research/pathfinding/INDEX_PATHFINDING_LOCOMOTION.md) §6: `0x812D50` / `0x814A58` are not init-dispatch tables
 
 The doc lists them as unresearched per-class dispatch tables holding
 `Compute_*HeightStep` / `Compute_*BridgeZOffset` / `InitNullCoords`. **All of that is
@@ -2812,7 +2816,7 @@ Factory vtable: Hover's is **`0x007F3CA8`** (`read_memory 0x007F3CA8 len 48` →
 `0x006C4310`, exactly the `CreateInstance` push-shove names), not `0x007F3CC0`, which is
 Rocket's.
 
-### C11 — `LOCOMOTION_PUSH_SHOVE_CALLER_PROVENANCE_GHIDRA_REPORT.md` (2026-05-14): counts wrong, hedge should retire
+### C11 — [LOCOMOTION_PUSH_SHOVE_CALLER_PROVENANCE_GHIDRA_REPORT.md](https://github.com/YuriPlanet/vera20k/blob/108924bc237d14342b68b8bb78f2bba0400d2443/docs/research/LOCOMOTION_PUSH_SHOVE_CALLER_PROVENANCE_GHIDRA_REPORT.md) (2026-05-14): counts wrong, hedge should retire
 
 The doc's core findings all re-verify — override matrix, base-stub disassembly, the
 `Shove → Push` callsite at `0x00516FCD`, the data-only xrefs, the false-positive families.
@@ -2831,7 +2835,7 @@ Note the asymmetry the doc should record: **the `Shove` half of the verdict is s
 than the `Push` half.** The sweep covers the direct `CALL [reg+off]` form; a two-step
 `MOV reg,[vtbl+0x68]; CALL reg` would evade it. That residual cannot rescue `Shove`.
 
-### C12 — `MAGNETRON_SYSTEM_GHIDRA_REPORT.md`: the IPiggyback anchor is not corroborated
+### C12 — [MAGNETRON_SYSTEM_GHIDRA_REPORT.md](https://github.com/YuriPlanet/vera20k/blob/108924bc237d14342b68b8bb78f2bba0400d2443/docs/research/MAGNETRON_SYSTEM_GHIDRA_REPORT.md): the IPiggyback anchor is not corroborated
 
 The complete IPiggyback enumeration (5 direct QI sites via `get_xrefs_to 0x00819088`, 18
 helper sites via `search_instructions CALL 0x0045af20`, 13 creation sites via
@@ -2843,7 +2847,7 @@ piggyback. This is the best-sourced live example of raw replacement in stock YR.
 
 ### C13 — Ghidra label drift recorded (read-only passes; nothing was written back)
 
-Per ENGINE.md these should be written into Ghidra by whoever next holds the write lock,
+Per AGENTS.md these should be written into Ghidra by whoever next holds the write lock,
 with the evidence citation in the plate comment. Inferred items stay unlabelled.
 
 | Address | Current label | Reality | Evidence |
@@ -2972,7 +2976,7 @@ Complete Object Locator pointer at `0x007E7F78`, giving `(0x7E7F78 − 0x7E7EB0)
 class-specific virtuals appended after the interface, and two of them are the setters for
 the `Is_Ok_To_End` guard byte this document previously listed as UNKNOWN. §2.4's 40×11
 matrix is **correct for the interface**; the inventory framing "of the 40 slots" is what is
-incomplete. **Null impact on the Rust design** — ENGINE.md forbids porting the C++ dispatch
+incomplete. **Null impact on the Rust design** — AGENTS.md forbids porting the C++ dispatch
 architecture and `LocomotorSlot` has no slot table to size (§6.1). Recorded in §2.7.
 
 ### C21 — §5.6 / §9 OQ5: downgrading "`+0xF0`/`+0xF4` = occupancy mark/unmark" to [U] and floating a getter/setter reading was **WRONG**

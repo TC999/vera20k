@@ -57,7 +57,10 @@ impl TeamScriptVm {
         // of each native registry.
         for team_type in registry.team_type_read_sequence() {
             let id = interner.intern(&team_type.id);
-            let script_name = team_type.get("Script").unwrap_or("<none>");
+            let fields = team_type.section();
+            // TeamTypeClass::Read_INI: ReadString 0x80 for both references
+            // (`0x006F1496`, `0x006F14CF`).
+            let script_name = fields.read_name("Script", 0x80).unwrap_or("<none>");
             let script_resolution = find_or_allocate_definition(
                 script_name,
                 &mut vm.scripts,
@@ -82,7 +85,7 @@ impl TeamScriptVm {
                 }
             };
 
-            let task_force_name = team_type.get("TaskForce").unwrap_or("<none>");
+            let task_force_name = fields.read_name("TaskForce", 0x80).unwrap_or("<none>");
             let task_force_resolution = find_or_allocate_definition(
                 task_force_name,
                 &mut vm.task_forces,
@@ -112,8 +115,10 @@ impl TeamScriptVm {
                 id,
                 script_id,
                 task_force_id,
-                priority: team_type.read_int("Priority", 7),
-                is_base_defense: team_type.read_bool("IsBaseDefense", false),
+                priority: fields.read_int("Priority", 7),
+                is_base_defense: fields.read_bool("IsBaseDefense", false),
+                suicide: fields.read_bool("Suicide", false),
+                aggressive: fields.read_bool("Aggressive", false),
                 combined_movement_zone: MovementZone::Fly,
                 base_zone_relation_enforced: true,
                 transport_crossing_required: false,
@@ -121,11 +126,20 @@ impl TeamScriptVm {
             vm.team_type_ini.insert(
                 id,
                 TeamTypeIniMetadata {
-                    max_teams: team_type.read_int("Max", -1),
-                    autocreate: team_type.read_bool("Autocreate", false),
-                    are_team_members_recruitable: team_type
+                    max_teams: fields.read_int("Max", -1),
+                    autocreate: fields.read_bool("Autocreate", false),
+                    are_team_members_recruitable: fields
                         .read_bool("AreTeamMembersRecruitable", true),
-                    raw_fields: team_type.fields.clone(),
+                    reinforce: fields.read_bool("Reinforce", false),
+                    group: fields.read_int("Group", -1),
+                    recruiter: fields.read_bool("Recruiter", false),
+                    annoyance: fields.read_bool("Annoyance", false),
+                    guard_slower: fields.read_bool("GuardSlower", false),
+                    transports_return_on_unload: fields
+                        .read_bool("TransportsReturnOnUnload", false),
+                    mind_control_decision: fields.read_int("MindControlDecision", 0),
+                    droppod: fields.read_bool("Droppod", false),
+                    only_target_house_enemy: fields.read_bool("OnlyTargetHouseEnemy", false),
                     source: team_type.source,
                 },
             );
@@ -229,8 +243,8 @@ impl TeamScriptVm {
                 object_type,
                 comparison_mask: trigger.comparison_mask,
                 weights: trigger.weights,
-                storage_flag_d0: trigger.storage_flag_d0,
-                storage_i32_ac: trigger.storage_i32_ac,
+                multiplayer: trigger.multiplayer,
+                side: trigger.side,
                 storage_flag_d1: trigger.storage_flag_d1,
                 secondary_team_type,
                 difficulty_enabled: trigger.difficulty_enabled,
@@ -246,6 +260,7 @@ impl TeamScriptVm {
         (vm, diagnostics)
     }
 
+    #[cfg(test)]
     pub(crate) fn registry_counts(&self) -> (usize, usize, usize, usize) {
         (
             self.task_forces.len(),
@@ -255,10 +270,12 @@ impl TeamScriptVm {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn team_type_order(&self) -> &[InternedId] {
         &self.team_type_order
     }
 
+    #[cfg(test)]
     pub(crate) fn script_order(&self) -> &[InternedId] {
         &self.script_order
     }
@@ -267,26 +284,32 @@ impl TeamScriptVm {
         self.scripts.get(&id)
     }
 
+    #[cfg(test)]
     pub(crate) fn task_force_order(&self) -> &[InternedId] {
         &self.task_force_order
     }
 
+    #[cfg(test)]
     pub(crate) fn task_force(&self, id: InternedId) -> Option<&TeamTaskForceDefinition> {
         self.task_forces.get(&id)
     }
 
+    #[cfg(test)]
     pub(crate) fn ai_trigger_order(&self) -> &[InternedId] {
         &self.ai_trigger_order
     }
 
+    #[cfg(test)]
     pub(crate) fn ai_trigger(&self, id: InternedId) -> Option<&TeamAiTriggerDefinition> {
         self.ai_triggers.get(&id)
     }
 
+    #[cfg(test)]
     pub(crate) fn team_type_ini(&self, id: InternedId) -> Option<&TeamTypeIniMetadata> {
         self.team_type_ini.get(&id)
     }
 
+    #[cfg(test)]
     pub(crate) fn team_type(&self, id: InternedId) -> Option<&TeamTypeDefinition> {
         self.team_types.get(&id)
     }
@@ -464,10 +487,7 @@ fn derive_team_type_zone_fields(vm: &mut TeamScriptVm, interner: &StringInterner
     }
 }
 
-fn same_install_issue(
-    left: &TeamAiInstallDiagnostic,
-    right: &TeamAiInstallDiagnostic,
-) -> bool {
+fn same_install_issue(left: &TeamAiInstallDiagnostic, right: &TeamAiInstallDiagnostic) -> bool {
     match (left, right) {
         (
             TeamAiInstallDiagnostic::UnknownTaskForceMember {

@@ -1,4 +1,4 @@
-//! Complete accepted cell arrivals for ordinary crossings and Drive track jumps.
+//! Complete accepted cell arrivals for nontrack ground crossings.
 //!
 //! VERA-internal ownership boundary, gamemd equivalent UNCHECKED. Preserve the
 //! represented crossing order: fresh serialized list stamp, list relink,
@@ -13,7 +13,6 @@ use crate::sim::components::{DriveLocomotionRuntime, Position};
 use crate::sim::movement::bump_crush;
 use crate::sim::movement::locomotor::{LocomotorState, MovementLayer};
 use crate::sim::occupancy::{CellListInsertion, CellOccupationGrid, OccupancyGrid};
-use crate::sim::world::EnterOrderCounter;
 
 use super::MovementTickStats;
 
@@ -32,8 +31,6 @@ pub(super) struct CellArrival<'a> {
     pub drive_locomotion: &'a mut Option<DriveLocomotionRuntime>,
     pub foot_occupation_enabled: &'a mut bool,
     pub sub_cell: &'a mut Option<u8>,
-    pub occupancy_enter_order: &'a mut u64,
-    pub next_occupancy_enter_order: &'a mut EnterOrderCounter,
     pub occupancy: &'a mut OccupancyGrid,
     pub cell_occupation: &'a mut CellOccupationGrid,
     pub stats: &'a mut MovementTickStats,
@@ -50,15 +47,7 @@ impl CellArrival<'_> {
         self.finish(next_layer);
     }
 
-    /// Track jumps have already committed the path layer during bridge
-    /// resolution, before publishing the cell-list transition.
-    pub(super) fn track_jump(mut self, active_layer: MovementLayer) {
-        self.relink();
-        self.finish(active_layer);
-    }
-
     fn relink(&mut self) {
-        *self.occupancy_enter_order = self.next_occupancy_enter_order.next();
         self.occupancy.move_entity_layered(
             self.from.0,
             self.from.1,
@@ -242,7 +231,7 @@ mod tests {
         // Independent AirTracker registrations/order are saved as their own
         // authority; they neither remove nor manufacture a ground list.
         for id in [5, 4] {
-            let order = sim.substrate.next_occupancy_enter_order.next();
+            let order = sim.substrate.next_air_tracker_order.next();
             let entity = sim.substrate.entities.get_mut(id).unwrap();
             entity.air_spatial_bucket = Some(7);
             entity.air_spatial_enter_order = order;
@@ -284,7 +273,10 @@ mod tests {
                 crate::sim::combat::ScanMission::Guard,
                 None,
                 crate::sim::combat::line_of_fire::LineOfFireInputs::default(),
+                Some(sim),
+                None,
             )
+            .target()
         };
         assert_eq!(list(&sim, (6, 5)), vec![2, 3]);
         assert_eq!(acquire(&sim, &sim.substrate.occupancy), Some(2));
@@ -310,7 +302,8 @@ mod tests {
         for id in [2, 3] {
             assert_eq!(
                 crate::sim::occupancy::cell_list_layer_for_entity(
-                    restored.substrate.entities.get(id).unwrap()
+                    restored.substrate.entities.get(id).unwrap(),
+                    restored.resolved_terrain.as_ref(),
                 ),
                 None
             );
@@ -345,8 +338,6 @@ mod tests {
             drive_locomotion: &mut entity.drive_locomotion,
             foot_occupation_enabled: &mut entity.foot_occupation_enabled,
             sub_cell: &mut entity.sub_cell,
-            occupancy_enter_order: &mut entity.occupancy_enter_order,
-            next_occupancy_enter_order: &mut substrate.next_occupancy_enter_order,
             occupancy: &mut substrate.occupancy,
             cell_occupation: &mut substrate.cell_occupation,
             stats: &mut stats,

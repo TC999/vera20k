@@ -11,12 +11,11 @@ use crate::sim::debug_event_log::DebugEventKind;
 use crate::sim::movement::locomotor::{LocomotorState, MovementLayer};
 use crate::sim::pathfinding::LayeredEntityBlockMap;
 use crate::sim::pathfinding::terrain_cost::TerrainCostGrid;
-use crate::sim::rng::SimRng;
 use crate::util::fixed_math::{SIM_ZERO, SimFixed};
 
 use super::movement_path::{supports_layered_bridge_pathing, try_repath_after_block};
 use super::path_markers::BridgeMarkerContext;
-use super::{MovementConfig, MovementTickStats, PathfindingContext};
+use super::{MovementConfig, MovementTickStats, MoverPathFacts, PathfindingContext};
 
 /// Shared logic for handling a blocked movement tick.
 ///
@@ -35,8 +34,8 @@ pub(super) fn handle_blocked_tick(
     path_replay: &mut crate::sim::components::FootPathQueue,
     target: &mut MovementTarget,
     path_runtime: &mut crate::sim::components::FootPathRuntime,
-    facing: &mut u8,
-    body_facing: Option<super::FacingClass>,
+    // The body heading (`+0x388`) at `mcfg.binary_frame`.
+    body_facing: u16,
     locomotor: &Option<LocomotorState>,
     drive_locomotion: &mut Option<crate::sim::components::DriveLocomotionRuntime>,
     ship_locomotion: &mut Option<crate::sim::components::ShipLocomotionRuntime>,
@@ -51,22 +50,16 @@ pub(super) fn handle_blocked_tick(
     entity_cost_grid: Option<&TerrainCostGrid>,
     entity_blocks: Option<&BTreeSet<(u16, u16)>>,
     entity_block_map: Option<&LayeredEntityBlockMap>,
-    too_big_to_fit_under_bridge: bool,
     mcfg: MovementConfig,
-    rng: &mut SimRng,
     sim_tick: u64,
     path_stuck_init: u32,
-    mover_is_crusher: bool,
-    is_infantry: bool,
+    facts: MoverPathFacts,
     allow_zone_hierarchy: bool,
     skip_grace_period: bool,
     close_enough_abort: bool,
     marker_context: Option<BridgeMarkerContext<'_>>,
     occupancy: &crate::sim::occupancy::OccupancyGrid,
 ) -> Vec<(u32, DebugEventKind)> {
-    let walk = locomotor
-        .as_ref()
-        .is_some_and(|l| l.kind == crate::rules::locomotor_type::LocomotorKind::Walk);
     let mut deferred_events: Vec<(u32, DebugEventKind)> = Vec::new();
     stats.blocked_attempts = stats.blocked_attempts.saturating_add(1);
     let next_cell = target.path.get(target.next_index).copied();
@@ -83,7 +76,6 @@ pub(super) fn handle_blocked_tick(
             } else {
                 mcfg.blockage_path_delay_ticks
             },
-            walk,
         );
         if let Some((nx, ny)) = next_cell {
             deferred_events.push((
@@ -98,7 +90,7 @@ pub(super) fn handle_blocked_tick(
         // Terrain/impassable block reached while a code-2 grace timer is
         // still running from a prior entity block. gamemd code-7 path has
         // no grace — reset so urgency=2 fires this tick.
-        path_runtime.start_blocked(mcfg.binary_frame, 0, walk);
+        path_runtime.start_blocked(mcfg.binary_frame, 0);
     }
 
     // The `CloseEnough` give-up radius is not consulted by every block code.
@@ -180,7 +172,6 @@ pub(super) fn handle_blocked_tick(
             occupancy,
             entity_id,
             current_pos,
-            *facing,
             body_facing,
             on_bridge,
             urgency,
@@ -196,22 +187,21 @@ pub(super) fn handle_blocked_tick(
     let repath_ok = try_repath_after_block(
         target,
         path_runtime,
-        walk,
-        facing,
         current_pos,
         active_layer,
         layered_pathing_for_repath,
         ctx,
         entity_cost_grid,
         entity_blocks,
-        rng,
         repath_mz,
-        too_big_to_fit_under_bridge,
         mcfg,
         entity_block_map,
-        urgency,
-        mover_is_crusher,
-        is_infantry,
+        // `urgency` is computed in this function, not carried by the mover, so
+        // it overrides the request-level value the caller supplied. Folding the
+        // three loose scalars into one value nearly lost this: a mechanical
+        // replace dropped the local and would have sent every blocked repath at
+        // the caller's urgency instead of the escalated one.
+        MoverPathFacts { urgency, ..facts },
         allow_zone_hierarchy,
         marker_search.as_ref(),
     );
@@ -244,7 +234,7 @@ pub(super) fn handle_blocked_tick(
             _ => {}
         }
         stats.repath_successes = stats.repath_successes.saturating_add(1);
-        if is_infantry
+        if facts.is_infantry
             && !locomotor
                 .as_ref()
                 .is_some_and(|l| l.kind == crate::rules::locomotor_type::LocomotorKind::Walk)
@@ -305,7 +295,7 @@ pub(super) fn handle_blocked_tick(
     } else {
         // urgency=1 grace-period failure: set a short movement_delay to
         // rate-limit A* calls while the blocked_delay counter keeps ticking.
-        path_runtime.start_movement(mcfg.binary_frame, mcfg.path_delay_ticks, walk);
+        path_runtime.start_movement(mcfg.binary_frame, mcfg.path_delay_ticks);
     }
     // Walk restarts PathDelay after every actual FindPath attempt, including
     // success and urgency-2 failure (0x75B98C..0x75B9B1). Drive does not.
@@ -313,7 +303,7 @@ pub(super) fn handle_blocked_tick(
         .as_ref()
         .is_some_and(|l| l.kind == crate::rules::locomotor_type::LocomotorKind::Walk)
     {
-        path_runtime.start_movement(mcfg.binary_frame, mcfg.path_delay_ticks, walk);
+        path_runtime.start_movement(mcfg.binary_frame, mcfg.path_delay_ticks);
     }
     deferred_events
 }
@@ -366,19 +356,17 @@ mod native_walk_timer_tests {
                 final_goal: Some((10, 12)),
                 ..Default::default()
             };
-            let mut path_runtime = crate::sim::components::FootPathRuntime {
-                path_blocked: b("already_blocked"),
-                blocked_timer: crate::sim::timer::CdTimer::from_raw(
-                    n("grace_start") as i32,
-                    n("grace_duration") as i32,
-                ),
-                movement_timer: crate::sim::timer::CdTimer::from_raw(
-                    n("movement_start") as i32,
-                    n("movement_duration") as i32,
-                ),
-                retries_left: 10,
-            };
-            let mut facing = 64;
+            let mut path_runtime = crate::sim::components::FootPathRuntime::at_frame(0);
+            path_runtime.path_blocked = b("already_blocked");
+            path_runtime.blocked_timer = crate::sim::timer::CdTimer::from_raw(
+                n("grace_start") as i32,
+                n("grace_duration") as i32,
+            );
+            path_runtime.movement_timer = crate::sim::timer::CdTimer::from_raw(
+                n("movement_start") as i32,
+                n("movement_duration") as i32,
+            );
+            path_runtime.retries_left = 10;
             let mut stats = MovementTickStats::default();
             let mut finished = Vec::new();
             let mut aborted = false;
@@ -386,8 +374,7 @@ mod native_walk_timer_tests {
                 &mut Default::default(),
                 &mut target,
                 &mut path_runtime,
-                &mut facing,
-                None,
+                0x4000,
                 &locomotor,
                 &mut None,
                 &mut None,
@@ -399,7 +386,7 @@ mod native_walk_timer_tests {
                 &mut finished,
                 &mut aborted,
                 PathfindingContext {
-                    wall_cost: None,
+                    wall_tables: None,
                     path_grid: Some(&grid),
                     zone_grid: None,
                     resolved_terrain: None,
@@ -409,18 +396,15 @@ mod native_walk_timer_tests {
                 None,
                 None,
                 None,
-                false,
                 MovementConfig {
                     binary_frame: frame as u32,
                     close_enough: SIM_ZERO,
                     path_delay_ticks: 3,
-                    blockage_path_delay_ticks: n("configured_grace") as u16,
+                    blockage_path_delay_ticks: n("configured_grace") as i32,
                 },
-                &mut SimRng::new(7),
                 frame as u64,
                 10,
-                false,
-                true,
+                super::MoverPathFacts::without_wall_arm(0, false, true),
                 true,
                 false,
                 false,

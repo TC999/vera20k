@@ -26,7 +26,6 @@ use super::spark_world::{SparkCollisionWorld, SparkWorldError};
 
 // Errors retained at the production Spark begin/query/finish boundary. Railgun
 // alone remains dormant in the behavior dispatch below.
-#[allow(dead_code)]
 #[derive(Debug, Error)]
 pub(crate) enum SparkSystemTickError {
     #[error("particle type {0:?} is not behavior-3 Spark")]
@@ -274,7 +273,6 @@ mod tests {
             lifetime,
             spark_spawn_frames: 0,
             facing: 0x1D,
-            directionless: false,
             attached_entity: None,
             owner_entity: None,
             target_coords: IVec3::ZERO,
@@ -287,7 +285,7 @@ mod tests {
         let stable_id = sim.allocate_stable_id();
         system.stable_id = stable_id;
         sim.particle_systems_mut().insert(system);
-        assert!(sim.reveal_particle_system(stable_id));
+        assert!(sim.reveal_particle_system(stable_id, None));
         stable_id
     }
 
@@ -304,7 +302,6 @@ mod tests {
         Particle {
             type_id: ParticleTypeId(0),
             coords: IVec3::new(x, 0, 100),
-            previous_coords: IVec3::ZERO,
             origin: IVec3::ZERO,
             direction: [SimFixed::from_num(0); 3],
             velocity: SimFixed::from_num(0),
@@ -313,14 +310,10 @@ mod tests {
             state_ai_advance: 0,
             animation_state: 0,
             translucency: 0,
-            hit_ground: false,
             marked_for_deletion: false,
             drift_x: 0,
             drift_y: 0,
             drift_z: 0,
-            current_color: [0; 3],
-            color_index: 0,
-            color_accumulator: SimFixed::from_num(0),
             spark: Some(SparkRuntimeState {
                 velocity_x: NativeF32Bits::POSITIVE_ZERO,
                 velocity_y: NativeF32Bits::POSITIVE_ZERO,
@@ -636,7 +629,10 @@ SpawnSparkPercentage=1
             .unwrap()
             .query(motion)
             .unwrap();
-        assert!(facts.slope_matrix.is_some(), "a selected collision performs the final slope lookup");
+        assert!(
+            facts.slope_matrix.is_some(),
+            "a selected collision performs the final slope lookup"
+        );
         let particle_type = rules.particle_type(collision_particle.type_id);
         finish_particle_tick(
             &mut collision_particle,
@@ -652,7 +648,10 @@ SpawnSparkPercentage=1
         assert_eq!(collision_particle.lifetime_remaining, 1);
         let mut expected_rng = SimRng::new(790);
         expected_rng.next_range_u32_inclusive(0, 0x7fff_fffe);
-        assert_eq!(collision_sim.rng_views().scenario, expected_rng.logical_view());
+        assert_eq!(
+            collision_sim.rng_views().scenario,
+            expected_rng.logical_view()
+        );
     }
 
     mod advance_state_tests {
@@ -671,7 +670,6 @@ SpawnSparkPercentage=1
             Particle {
                 type_id: ParticleTypeId(0),
                 coords: IVec3::ZERO,
-                previous_coords: IVec3::ZERO,
                 origin: IVec3::ZERO,
                 direction: [SimFixed::from_num(0); 3],
                 velocity: SimFixed::from_num(0),
@@ -680,14 +678,10 @@ SpawnSparkPercentage=1
                 state_ai_advance: pt.state_ai_advance,
                 animation_state: pt.start_state_ai,
                 translucency: pt.translucency,
-                hit_ground: false,
                 marked_for_deletion: false,
                 drift_x: 0,
                 drift_y: 0,
                 drift_z: 0,
-                current_color: [0; 3],
-                color_index: 0,
-                color_accumulator: SimFixed::from_num(0),
                 spark: None,
                 prev_delta: [SimFixed::from_num(0); 3],
                 state_advance_counter: 0,
@@ -803,5 +797,52 @@ SpawnSparkPercentage=1
             // 260 ticks / denom 5 = 52 advances expected. EndStateAI=99, no reset.
             assert_eq!(p.animation_state, 52);
         }
+    }
+
+    /// One BigGreySmokeSys-shaped system through the production system tick:
+    /// it spawns particles and their state AI advances.
+    #[test]
+    fn smoke_animation_state_advances_over_ticks() {
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[Particles]\n1=LargeGreySmoke\n\
+             [LargeGreySmoke]\nBehavesLike=Smoke\nImage=LGRYSMK1\nMaxEC=80\n\
+             Translucency=50\nEndStateAI=20\nStateAIAdvance=4\nDeleteOnStateLimit=yes\n\
+             [ParticleSystems]\n1=BigGreySmokeSys\n\
+             [BigGreySmokeSys]\nBehavesLike=Smoke\nHoldsWhat=LargeGreySmoke\nSpawns=yes\n\
+             SpawnFrames=10\nParticleCap=15\n",
+        ))
+        .expect("rules parse");
+        let mut sim = crate::sim::world::Simulation::new();
+        sim.spawn_particle_system(
+            ParticleSystemTypeId(0),
+            IVec3::new(1024, 1024, 0),
+            None,
+            None,
+            IVec3::ZERO,
+            None,
+            &rules,
+        )
+        .expect("spawn");
+
+        // SpawnFrames=10 puts the first particle at tick 10. Without a retail
+        // asset binder the missing-SHP fallback yields denom = (0+1) + 4 = 5;
+        // rules/asset binding and the odd stock LGRYSMK1 count are covered by
+        // the library boundary tests.
+        for _ in 0..30 {
+            tick_particle_systems(&mut sim, &rules);
+            sim.session.tick += 1;
+        }
+
+        // The tick removes, advances and reinserts each system, so read the
+        // single survivor from the store.
+        let (_, system) = sim.particle_systems().iter().next().expect("system alive");
+        assert!(
+            !system.particles.is_empty(),
+            "should have spawned particles"
+        );
+        assert!(
+            system.particles[0].animation_state > 0,
+            "animation_state should advance"
+        );
     }
 }

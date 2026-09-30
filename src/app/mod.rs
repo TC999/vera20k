@@ -54,7 +54,11 @@ pub(crate) mod presentation;
 pub(crate) mod process_assets;
 pub(crate) mod renderer_state;
 pub(crate) mod scenario_catalog;
+mod shell_campaign;
+mod shell_load_saved_game;
+mod shell_wol;
 mod shell_main_menu;
+mod shell_movies_credits;
 mod shell_random_map;
 mod shell_saved_seeds;
 mod shell_saved_games;
@@ -64,13 +68,12 @@ pub(crate) mod shell_route;
 mod shell_skirmish;
 pub(crate) mod sidebar_projection;
 mod state;
+mod window_icon;
 
 pub(crate) use shell_random_map::{
     RandomMapGenerationRetention,
 };
 pub(crate) use state::{AppState, PlatformState, reset_scenario_exit_runtime};
-
-const DEV_SKIRMISH_SHELL_ENV: &str = "RA2_DEV_SKIRMISH_SHELL";
 
 /// Top-level application. Implements winit's ApplicationHandler.
 pub struct App {
@@ -101,13 +104,6 @@ impl StartupAudioDisposition {
             load_audio_indices: audio_enabled,
         }
     }
-}
-
-/// Keep initial and later scenario audio-index loads on the same process-start
-/// decision. This deliberately does not inspect the optional output players:
-/// an enabled DirectSound/output initialization may independently fail.
-pub(crate) const fn should_load_audio_indices(audio_indices_enabled: bool) -> bool {
-    audio_indices_enabled
 }
 
 impl Default for StartupAudioDisposition {
@@ -182,20 +178,6 @@ mod tests {
         assert!(disposition.initialize_music_output);
         assert!(disposition.initialize_sfx_output);
         assert!(disposition.load_audio_indices);
-    }
-
-    #[test]
-    fn gsi_01_01_audio_index_decision_survives_scenario_transitions() {
-        for audio_enabled in [false, true] {
-            let startup = StartupAudioDisposition::for_audio_enabled(audio_enabled);
-            let persisted_in_state = startup.load_audio_indices;
-
-            assert_eq!(
-                should_load_audio_indices(startup.load_audio_indices),
-                audio_enabled
-            );
-            assert_eq!(should_load_audio_indices(persisted_in_state), audio_enabled);
-        }
     }
 
     #[test]

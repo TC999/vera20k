@@ -27,6 +27,9 @@ pub const FX_DISGUISE: u32 = 1 << 5;
 /// sprite shader ignores the palette and darkens whatever is beneath, the way
 /// the native shadow blitter (`Blitter_selector(0x2001)`) does.
 pub const FX_SHADOW: u32 = 1 << 6;
+/// Voxel body waterline clip. `effect_tint.w` carries Techno+3CA's retained
+/// world row; RGB brightness and ordinary alpha remain in their own lanes.
+pub(crate) const FX_SINKING_CLIP: u32 = 1 << 7;
 
 /// Native cloak state values consumed by YR draw selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,7 +102,8 @@ pub struct DrawDecision {
 /// means full viewport). This shader-specific transport does not alter effects.
 /// `effect_tint` carries the scalar as RGB so SHP and voxel shaders apply the same
 /// native brightness channel after their normal palette/light work. The layout is
-/// part of `SpriteInstance`'s vertex ABI.
+/// part of `SpriteInstance`'s vertex ABI. Its W lane is unused by tinting;
+/// voxel draws with FX_SINKING_CLIP carry a retained world row there.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct DrawState {
@@ -195,11 +199,7 @@ impl DrawState {
         remap_row: u32,
         observer: ObserverDrawContext,
     ) -> DrawDecision {
-        let (warp_out, warp_in) = entity
-            .teleport_state
-            .as_ref()
-            .map(|teleport| (teleport.warp_out_active(), teleport.warp_in_active()))
-            .unwrap_or_default();
+        let (warp_out, warp_in) = (entity.is_warped_out(), entity.is_warping_in());
         Self::resolve(
             DrawStateInput {
                 cloak: entity.cloak.as_ref().and_then(|cloak| {
@@ -358,10 +358,7 @@ mod tests {
             0,
             0,
             InternedId::from_index(0),
-            Health {
-                current: 100,
-                max: 100,
-            },
+            Health { current: 100 },
             InternedId::from_index(0),
             EntityCategory::Unit,
             0,
@@ -489,8 +486,7 @@ mod tests {
     fn invulnerability_without_native_mode_remains_an_explicit_residual() {
         let mut entity = entity();
         entity.invulnerability = Some(InvulnerabilityState {
-            start_frame: 40,
-            duration_frames: 20,
+            timer: crate::sim::timer::CdTimer::started(40, 20),
             kind: InvulnKind::IronCurtain,
         });
         let state = DrawState::for_entity(&entity, 45, 3, ObserverDrawContext::default()).state;
@@ -503,8 +499,7 @@ mod tests {
     fn expired_invulnerability_keeps_normal_draw_state() {
         let mut entity = entity();
         entity.invulnerability = Some(InvulnerabilityState {
-            start_frame: 40,
-            duration_frames: 5,
+            timer: crate::sim::timer::CdTimer::started(40, 5),
             kind: InvulnKind::ForceShield,
         });
         let state = DrawState::for_entity(&entity, 45, 2, ObserverDrawContext::default()).state;

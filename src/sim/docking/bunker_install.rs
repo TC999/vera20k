@@ -3,20 +3,18 @@
 //! Models the `Bunker=yes` mission helper: a facing-driven 6-state machine that,
 //! once a candidate unit is on the footprint, shoves blockers, turns the unit to
 //! face the building, force-tracks it onto the building cell, turns it South,
-//! plays entry anims, then installs (hide + reciprocal link + up sound). The
+//! plays entry anims, then installs (deselect + reciprocal link + up sound). The
 //! inter-state waits are turn/track completions — NOT frame-count timers.
 //!
 //! sim/ only — never render/ui/sidebar/audio/net.
 use crate::map::entities::EntityCategory;
+use crate::map::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::game_entity::BunkerLink;
 use crate::sim::movement;
-use crate::sim::movement::bump_crush::scatter_blocker;
-use crate::sim::movement::drive_track::begin_forced_turn_track;
+use crate::sim::movement::ScatterFlags;
 use crate::sim::movement::facing_from_delta;
-use crate::sim::movement::locomotor::MovementLayer;
 use crate::sim::occupancy::entity_occupancy_cells;
-use crate::sim::pathfinding::PathGrid;
 use crate::sim::world::Simulation;
 use serde::{Deserialize, Serialize};
 
@@ -68,20 +66,27 @@ impl BunkerRuntime {
 /// states are facing-turn / force-track completions, NOT frame-count timers.
 /// `ClearWait` actively scatters other units off the footprint (gamemd Scatter())
 /// so the installing unit can take the install cell.
-pub fn tick_bunker_install(sim: &mut Simulation, rules: &RuleSet, path_grid: Option<&PathGrid>) {
+pub fn tick_bunker_install(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    registry: Option<&OverlayTypeRegistry>,
+) {
     for building_id in sim.substrate.entities.keys_sorted() {
+        // The install is the bunker's mission, which holds while the bunker
+        // is warped (`GameEntity::ai_frozen`).
         let active = sim.substrate.entities.get(building_id).is_some_and(|b| {
-            matches!(
-                b.bunker_runtime.map(|rt| rt.state),
-                Some(BunkerState::ArriveWait)
-                    | Some(BunkerState::ClearWait)
-                    | Some(BunkerState::TurnToBuilding)
-                    | Some(BunkerState::TrackStep)
-                    | Some(BunkerState::TurnSouth)
-            )
+            !b.ai_frozen()
+                && matches!(
+                    b.bunker_runtime.map(|rt| rt.state),
+                    Some(BunkerState::ArriveWait)
+                        | Some(BunkerState::ClearWait)
+                        | Some(BunkerState::TurnToBuilding)
+                        | Some(BunkerState::TrackStep)
+                        | Some(BunkerState::TurnSouth)
+                )
         });
         if active {
-            step_install(sim, rules, path_grid, building_id);
+            step_install(sim, rules, registry, building_id);
         }
     }
 }
@@ -89,7 +94,7 @@ pub fn tick_bunker_install(sim: &mut Simulation, rules: &RuleSet, path_grid: Opt
 fn step_install(
     sim: &mut Simulation,
     rules: &RuleSet,
-    path_grid: Option<&PathGrid>,
+    registry: Option<&OverlayTypeRegistry>,
     building_id: u64,
 ) {
     let Some((state, candidate)) = sim
@@ -125,14 +130,12 @@ fn step_install(
         BunkerState::ClearWait => {
             if footprint_clear_of_others(sim, building_id, unit_id) {
                 if let Some(f) = facing_to_anchor(sim, building_id, unit_id) {
-                    if let Some(u) = sim.substrate.entities.get_mut(unit_id) {
-                        u.facing_target = Some(f);
-                    }
+                    turn_unit(sim, unit_id, f);
                 }
                 set_state(sim, building_id, BunkerState::TurnToBuilding, Some(unit_id));
             } else {
                 // Shove the blockers off the footprint (gamemd Scatter()); wait.
-                shove_footprint_blockers(sim, rules, path_grid, building_id, unit_id);
+                shove_footprint_blockers(sim, rules, registry, building_id, unit_id);
             }
         }
         BunkerState::TurnToBuilding => {
@@ -141,24 +144,20 @@ fn step_install(
                     set_state(sim, building_id, BunkerState::TrackStep, Some(unit_id));
                 } else {
                     // Already on the install cell: skip the slide, turn South.
-                    if let Some(u) = sim.substrate.entities.get_mut(unit_id) {
-                        u.facing_target = Some(SOUTH_FACING);
-                    }
+                    turn_unit(sim, unit_id, SOUTH_FACING);
                     set_state(sim, building_id, BunkerState::TurnSouth, Some(unit_id));
                 }
             }
         }
         BunkerState::TrackStep => {
             if !is_moving(sim, unit_id) {
-                if let Some(u) = sim.substrate.entities.get_mut(unit_id) {
-                    u.facing_target = Some(SOUTH_FACING);
-                }
+                turn_unit(sim, unit_id, SOUTH_FACING);
                 set_state(sim, building_id, BunkerState::TurnSouth, Some(unit_id));
             }
         }
         BunkerState::TurnSouth => {
             if !is_turning(sim, unit_id) {
-                // Walls rise just before the unit hides (health-gated variant).
+                // Walls rise before reciprocal install/deselection (health-gated variant).
                 crate::sim::docking::bunker_link::emit_bunker_wall_anim(
                     sim,
                     building_id,
@@ -186,18 +185,26 @@ fn set_state(sim: &mut Simulation, building_id: u64, state: BunkerState, unit: O
     }
 }
 
+/// Turn the unit's body (`+0x388` `Set`) toward the 8-bit `facing`.
+fn turn_unit(sim: &mut Simulation, unit_id: u64, facing: u8) {
+    let frame = sim.session.binary_frame;
+    if let Some(u) = sim.substrate.entities.get_mut(unit_id) {
+        u.body_facing.set(u16::from(facing) << 8, frame);
+    }
+}
+
 fn is_turning(sim: &Simulation, unit_id: u64) -> bool {
+    let frame = sim.session.binary_frame;
     sim.substrate
         .entities
         .get(unit_id)
-        .is_some_and(|u| u.facing_target.is_some())
+        .is_some_and(|u| u.body_facing.is_rotating(frame))
 }
 
 fn is_moving(sim: &Simulation, unit_id: u64) -> bool {
-    sim.substrate
-        .entities
-        .get(unit_id)
-        .is_some_and(|u| u.forced_drive_track.is_some() || u.movement_target.is_some())
+    sim.substrate.entities.get(unit_id).is_some_and(|u| {
+        movement::track_head::committed_track_head(u).is_some() || u.movement_target.is_some()
+    })
 }
 
 /// The candidate is on one of the bunker's footprint cells and not moving.
@@ -212,7 +219,8 @@ fn on_footprint_and_stopped(sim: &Simulation, building_id: u64, unit_id: u64) ->
     let on = footprint
         .iter()
         .any(|&(cx, cy)| cx == unit.position.rx && cy == unit.position.ry);
-    on && unit.movement_target.is_none() && unit.forced_drive_track.is_none()
+    on && unit.movement_target.is_none()
+        && movement::track_head::committed_track_head(unit).is_none()
 }
 
 /// No live vehicle/infantry other than the candidate stands on the footprint.
@@ -232,15 +240,19 @@ fn footprint_clear_of_others(sim: &Simulation, building_id: u64, unit_id: u64) -
     })
 }
 
-/// Issue a Scatter move to every live vehicle/infantry (other than the installer)
-/// standing on the bunker footprint, so the install cell clears. Uses the
-/// scenario RNG stream (the documented forced-scatter routing). Each blocker
-/// walks one cell via normal locomotion; the machine waits in `ClearWait` until
-/// the footprint is physically clear.
+/// Asks every live vehicle/infantry (other than the installer) standing on the
+/// bunker footprint to scatter, so the install cell clears; the machine waits
+/// in `ClearWait` until the footprint is physically clear. Each blocker takes
+/// `TechnoClass::Scatter(null, 1, 1)` ([`Simulation::scatter_null`]).
+/// RESIDUAL: this state machine is VERA's model; the native install's
+/// clearing call is not traced, so the flags keep the forced routing the
+/// former adapter gave it. Trigger: a unit or man on a bunker footprint while
+/// a tank installs. Effect: which receivers admit follows those flags.
+/// Frequency: occasional. A receiver error is logged and leaves that blocker.
 fn shove_footprint_blockers(
     sim: &mut Simulation,
     rules: &RuleSet,
-    path_grid: Option<&PathGrid>,
+    registry: Option<&OverlayTypeRegistry>,
     building_id: u64,
     unit_id: u64,
 ) {
@@ -264,21 +276,11 @@ fn shove_footprint_blockers(
         .map(|(id, _)| id)
         .collect();
     for blocker_id in blockers {
-        scatter_blocker(
-            &mut sim.substrate.entities,
-            blocker_id,
-            path_grid,
-            sim.resolved_terrain.as_ref(),
-            &sim.substrate.occupancy,
-            MovementLayer::Ground,
-            &mut sim.scenario_rng,
-            Some(rules),
-            &sim.interner,
-            crate::sim::movement::DestinationTiming::new(
-                sim.session.binary_frame,
-                sim.blockage_path_delay_ticks,
-            ),
-        );
+        if let Err(cause) =
+            sim.scatter_null(blocker_id, ScatterFlags::new(true, true), rules, registry)
+        {
+            log::debug!("bunker footprint blocker {blocker_id} did not scatter: {cause}");
+        }
     }
 }
 
@@ -322,7 +324,7 @@ fn octant_install_track(facing: u8) -> u8 {
 /// already on the anchor cell (no slide needed).
 fn start_install_force_track(
     sim: &mut Simulation,
-    rules: &RuleSet,
+    _rules: &RuleSet,
     building_id: u64,
     unit_id: u64,
 ) -> bool {
@@ -339,11 +341,11 @@ fn start_install_force_track(
     else {
         return false;
     };
-    let Some((ux, uy, tref)) = sim
+    let Some((ux, uy)) = sim
         .substrate
         .entities
         .get(unit_id)
-        .map(|u| (u.position.rx, u.position.ry, u.type_ref()))
+        .map(|u| (u.position.rx, u.position.ry))
     else {
         return false;
     };
@@ -354,38 +356,22 @@ fn start_install_force_track(
     }
     let facing = facing_from_delta(dcx, dcy);
     let track = octant_install_track(facing);
-    // `FootClass::GetCurrentSpeed @ 0x004DB1A0`: the install turn track is a
-    // drive-track like any other, so the FASTER stage applies.
-    let install_obj = sim.object_type(tref, rules);
-    let speed_raw = install_obj.map(|o| o.speed).unwrap_or(4).max(1);
-    let speed = match sim.substrate.entities.get(unit_id) {
-        Some(unit) => crate::sim::combat::veterancy::entity_mover_speed_leptons_per_second(
-            unit,
-            install_obj,
-            speed_raw,
-            rules.general.veteran_speed,
-        ),
-        None => crate::util::fixed_math::ra2_speed_to_leptons_per_second(speed_raw),
-    };
-    // Native passes the building's exact GetCoords result, not merely its cell
-    // origin. Express that absolute head relative to the unit's current origin.
-    let Some(forced) = begin_forced_turn_track(
-        track,
-        dcx * 256 + building_sub_x,
-        dcy * 256 + building_sub_y,
-        speed,
-        false,
-    ) else {
-        return false;
-    };
-    let (entities, cell_occupation) = (
-        &mut sim.substrate.entities,
-        &mut sim.substrate.cell_occupation,
+    let admitted = sim.force_drive_track(
+        unit_id,
+        i32::from(track),
+        crate::sim::components::DriveCoord {
+            x: i32::from(bx) * 256 + building_sub_x,
+            y: i32::from(by) * 256 + building_sub_y,
+            z: building_z,
+        },
     );
-    let Some(unit) = entities.get_mut(unit_id) else {
-        return false;
-    };
-    movement::install_forced_drive_track(unit, cell_occupation, forced, building_z)
+    // Building4591AF calls Force_Track, then4591BE explicitly sets Foot's
+    // applied fraction. The generic locomotor admission does not own speed.
+    if let Some(unit) = sim.substrate.entities.get_mut(unit_id) {
+        unit.foot_speed
+            .set_speed_fraction(crate::util::fixed_math::SIM_ONE);
+    }
+    admitted
 }
 
 #[cfg(test)]
@@ -393,6 +379,7 @@ mod tests {
     use super::*;
     use crate::sim::components::Health;
     use crate::sim::game_entity::GameEntity;
+    use crate::sim::movement::locomotor::MovementLayer;
     use crate::sim::world::RevealOutcome;
 
     fn rules() -> RuleSet {
@@ -415,10 +402,7 @@ mod tests {
             0,
             0,
             owner_id,
-            Health {
-                current: 1000,
-                max: 1000,
-            },
+            Health { current: 1000 },
             type_id,
             EntityCategory::Structure,
             0,
@@ -432,23 +416,26 @@ mod tests {
     fn spawn_tank_on(sim: &mut Simulation, sid: u64, rx: u16, ry: u16) {
         let owner_id = sim.interner.intern("Americans");
         let type_id = sim.interner.intern("TANK");
-        let ge = GameEntity::new_at_frame_zero_for_test(
+        let mut ge = GameEntity::new_at_frame_zero_for_test(
             sid,
             rx,
             ry,
             0,
             0,
             owner_id,
-            Health {
-                current: 400,
-                max: 400,
-            },
+            Health { current: 400 },
             type_id,
             EntityCategory::Unit,
             0,
             5,
             true,
         );
+        ge.locomotor = Some(
+            crate::sim::movement::locomotor::LocomotorState::for_test_kind(
+                crate::rules::locomotor_type::LocomotorKind::Drive,
+            ),
+        );
+        ge.drive_locomotion = Some(Default::default());
         sim.substrate.entities.insert(ge);
     }
 
@@ -484,12 +471,6 @@ mod tests {
 
         assert!(start_install_force_track(&mut sim, &rules, 2, 1));
         let unit = sim.substrate.entities.get(1).unwrap();
-        let forced = unit
-            .forced_drive_track
-            .as_ref()
-            .expect("bunker Force_Track installed");
-        assert_eq!(forced.track.head_offset_x, 256 + 96);
-        assert_eq!(forced.track.head_offset_y, 160);
         let exact_head = crate::sim::components::DriveCoord {
             x: 10 * 256 + 96,
             y: 10 * 256 + 160,
@@ -545,12 +526,23 @@ mod tests {
         tick_bunker_install(&mut sim, &rules, None);
         assert_eq!(rt(&sim, 2).state, BunkerState::TurnSouth);
         assert_eq!(
-            sim.substrate.entities.get(1).unwrap().facing_target,
-            Some(SOUTH_FACING)
+            sim.substrate
+                .entities
+                .get(1)
+                .unwrap()
+                .body_facing
+                .destination(),
+            u16::from(SOUTH_FACING) << 8
         );
 
-        // Simulate the South turn completing (movement clears facing_target).
-        sim.substrate.entities.get_mut(1).unwrap().facing_target = None;
+        // Let the South turn finish.
+        let frame = sim.session.binary_frame;
+        sim.substrate
+            .entities
+            .get_mut(1)
+            .unwrap()
+            .body_facing
+            .snap(u16::from(SOUTH_FACING) << 8, frame);
 
         // TurnSouth -> install.
         tick_bunker_install(&mut sim, &rules, None);
@@ -564,13 +556,13 @@ mod tests {
             BunkerLink::Installed(2)
         );
         assert!(
-            !sim.substrate.entities.get(1).unwrap().in_logic_vector,
-            "installed unit is hidden"
+            sim.substrate.entities.get(1).unwrap().in_logic_vector,
+            "installed unit remains in LogicVector"
         );
         let installed = sim.substrate.entities.get(1).unwrap();
         assert!(installed.lifecycle.object_alive);
-        assert!(installed.lifecycle.in_limbo);
-        assert!(!installed.lifecycle.cell_marked);
+        assert!(!installed.lifecycle.in_limbo);
+        assert!(installed.lifecycle.cell_marked);
         assert_eq!(
             sim.bunker_wall_events.iter().filter(|e| e.up).count(),
             1,
@@ -596,6 +588,8 @@ mod tests {
     fn install_shoves_a_footprint_blocker() {
         let mut sim = Simulation::new();
         let rules = rules();
+        // The blocker's Unit receiver searches the map for its cell.
+        crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
         spawn_bunker(&mut sim, 2);
         spawn_tank_on(&mut sim, 1, 10, 10); // installer on the anchor
         spawn_tank_on(&mut sim, 3, 10, 10); // blocker on the same footprint cell
@@ -620,7 +614,8 @@ mod tests {
                 .entities
                 .get(3)
                 .unwrap()
-                .movement_target
+                .navigation
+                .nav_com
                 .is_some(),
             "the footprint blocker was scattered"
         );

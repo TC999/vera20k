@@ -5,7 +5,7 @@ description: "Review VERA20k Rust for determinism, state/lifecycle, correctness,
 
 # Rust scan
 
-Apply `ENGINE.md` and [review guidance](../_shared/review.md). Read relevant
+Apply `AGENTS.md` and [review guidance](../_shared/review.md). Read relevant
 [general](references/general-review.md) and [simulation](references/sim-risks.md)
 lenses, including code outside `sim/` that feeds authoritative state.
 
@@ -33,7 +33,7 @@ implementations. Follow the live `advance_tick`/`SPINE REGION` boundaries for
 ordering and lifecycle risks. Use `architecture-scan` for broader placement questions.
 
 Run this skill's `scripts/run_clippy.ps1` only when requested, from inside the
-repo. It checks Cargo ownership and uses the library target. Preserve diagnostics
+repo. It delegates build ownership to `tools.cargo_run` and uses the library target. Preserve diagnostics
 and exit status; unrelated build failure means incomplete validation.
 
 Report source-backed consequences, trigger/frequency, fix direction, scope/HEAD,

@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::rules::{art_data::ArtRegistry, ini_parser::IniFile};
+use crate::sim::command::Command;
 use crate::sim::game_entity::GameEntity;
 use crate::sim::projectile::{ProjectileCoord, ProjectilePayload, ProjectileTarget};
 
@@ -34,7 +35,7 @@ fn consequence_rules() -> RuleSet {
     for name in ["DEATHFX", "DESTROYFX"] {
         art.bind_anim_frame_count_for_test(name, 80);
     }
-    rules.art_registry = art;
+    rules.replace_art_registry_for_test(art);
     rules
 }
 
@@ -49,7 +50,6 @@ fn consequence_world() -> (Simulation, u64, u64) {
     ] {
         let mut entity = GameEntity::test_default(id, kind, owner, rx, 5);
         entity.health.current = hp;
-        entity.health.max = hp;
         sim.substrate.entities.insert(entity);
     }
     sim.interner = crate::sim::intern::test_interner();
@@ -89,6 +89,9 @@ fn delivered_ids(sim: &Simulation) -> Vec<u64> {
     ids
 }
 
+/// The kill lands in the bullet's tail slot, whose commit admits the death
+/// anims (their `Report=`) before it queues the die sound. RESIDUAL: the
+/// order of same-frame sound starts is not taken from gamemd; inaudible.
 fn delivery_sounds(sim: &Simulation) -> Vec<String> {
     sim.sound_events
         .iter()
@@ -117,14 +120,7 @@ fn advance_lethal_shot(sim: &mut Simulation, rules: &RuleSet, attacker: u64, vic
     ));
     for _ in 0..60 {
         let commands = sim.take_due_commands();
-        sim.advance_tick(
-            &commands,
-            Some(rules),
-            &BTreeMap::new(),
-            Some(&grid),
-            None,
-            100,
-        );
+        sim.advance_tick(&commands, Some(rules), Some(&grid), None, 100);
         if !sim.substrate.voxel_anims.is_empty() {
             return;
         }
@@ -153,21 +149,25 @@ fn ordinary_lethal_fire_commits_debris_animations_and_sparks_once() {
     );
     assert_eq!(
         delivery_sounds(&sim),
-        ["DieA", "DEATHREPORT", "DESTROYREPORT"]
+        ["DEATHREPORT", "DESTROYREPORT", "DieA"]
     );
     assert!(sim.substrate.entities.get(victim).is_none());
-    // Captured from the real frame on pre-refactor 8a27b871; Rust regression,
-    // not a gamemd-derived golden. Fingerprint includes the complete debris body.
-    assert_eq!(sim.scenario_rng.state(), 13042760425816376097);
-    assert_eq!(sim.main_rng.state(), 2066545679410230777);
-    assert_eq!(debris_fingerprint(&sim, ids[0]), 14700842514585490858);
+    // Rust regression, not a gamemd-derived golden. Fingerprint includes the
+    // complete debris body. Re-captured when the debris and Explosion= draws
+    // moved to the Scenario stream (`0x007022C8`, `0x007386A7`); only the
+    // death sound stays on the main stream.
+    assert_eq!(sim.scenario_rng.state(), 3954386809370758752);
+    assert_eq!(sim.main_rng.state(), 6706932826526710953);
+    // Re-captured when the shot became a bullet: the body is unchanged but
+    // for its stable id, one later (the bullet took the one before it).
+    assert_eq!(debris_fingerprint(&sim, ids[0]), 17414601428498543321);
     let next_id = sim.allocate_stable_id();
     assert_eq!(next_id, spark + 1);
-    sim.advance_tick(&[], Some(&rules), &BTreeMap::new(), Some(&grid), None, 100);
+    sim.advance_tick(&[], Some(&rules), Some(&grid), None, 100);
     assert_eq!(delivered_ids(&sim), ids[..3]);
     assert_eq!(
         delivery_sounds(&sim),
-        ["DieA", "DEATHREPORT", "DESTROYREPORT"]
+        ["DEATHREPORT", "DESTROYREPORT", "DieA"]
     );
     assert_eq!(sim.particle_systems().len(), 1);
 }
@@ -181,6 +181,7 @@ fn ordinary_fatal_transport_finishes_cargo_lifecycle_before_consequence_admissio
     let mut entity = GameEntity::test_default(passenger, "TARGET", "Soviet", 8, 5);
     entity.passenger_role = PassengerRole::Inside {
         transport_id: carrier,
+        open_topped: false,
     };
     sim.substrate.entities.insert(entity);
     let mut cargo = PassengerCargo::new(1, 1);
@@ -204,13 +205,14 @@ fn ordinary_fatal_transport_finishes_cargo_lifecycle_before_consequence_admissio
         })
         .collect();
     assert_eq!(cleared, vec![passenger, carrier]);
+    // `passenger + 1` is the shot's bullet.
     assert_eq!(
         delivered_ids(&sim),
-        vec![passenger + 1, passenger + 2, passenger + 3]
+        vec![passenger + 2, passenger + 3, passenger + 4]
     );
     assert_eq!(
         delivery_sounds(&sim),
-        ["DieA", "DEATHREPORT", "DESTROYREPORT"]
+        ["DEATHREPORT", "DESTROYREPORT", "DieA"]
     );
 }
 
@@ -224,12 +226,11 @@ fn immediate_bullet_commits_before_return_with_its_original_sound_order() {
     spawn.origin = impact;
     spawn.target = ProjectileTarget::Entity(victim);
     spawn.initial_target_position = impact;
-    spawn.payload = ProjectilePayload {
-        base_damage: 40,
-        warhead: sim.interner.intern("AP"),
-        weapon: sim.interner.intern("CoilBolt"),
-        owner: sim.interner.intern("Americans"),
-    };
+    spawn.payload = ProjectilePayload::new(
+        40,
+        sim.interner.intern("AP"),
+        sim.interner.intern("CoilBolt"),
+    );
     sim.admit_projectile(projectile, spawn);
     assert!(sim.object_ai_visit_one(projectile, Some(&rules), ObjectAiCtx::default()));
     let ids = delivered_ids(&sim);
@@ -252,9 +253,11 @@ fn immediate_bullet_commits_before_return_with_its_original_sound_order() {
         ["DEATHREPORT", "DESTROYREPORT", "DieA"]
     );
     assert!(sim.particle_systems().is_empty());
-    // Captured from the real Bullet AI on pre-refactor 8a27b871.
-    assert_eq!(sim.scenario_rng.state(), 3542812114296063344);
-    assert_eq!(sim.main_rng.state(), 2066545679410230777);
+    // Rust regression from the real Bullet AI, re-captured when the debris and
+    // Explosion= draws moved to the Scenario stream; only the death sound
+    // stays on the main stream.
+    assert_eq!(sim.scenario_rng.state(), 2066545679410230777);
+    assert_eq!(sim.main_rng.state(), 6706932826526710953);
     assert_eq!(debris_fingerprint(&sim, ids[0]), 8120097345519581533);
     // Retired objects remain physically resolvable until the shared drain.
     // Visiting again must not deliver another death transaction.

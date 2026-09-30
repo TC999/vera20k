@@ -55,6 +55,7 @@ impl MissionId {
     }
 
     /// Return the dispatch-table index only for known dispatched missions.
+    #[cfg(test)]
     pub fn dispatch_index(self) -> Option<usize> {
         let raw = self.0;
         (0..MISSION_COUNT as i32)
@@ -171,6 +172,12 @@ impl MissionCom {
         self.movement_bypass_latch = 0;
     }
 
+    /// `+0xB0 = -1` outside a Restore: an object leaving its team drops its
+    /// suspended mission (`TeamClass::Remove_Member @ 0x006EA9A3`).
+    pub(crate) fn clear_suspended(&mut self) {
+        self.suspended = MissionId::NONE;
+    }
+
     pub(super) fn restore_transition(&mut self) {
         self.current = self.suspended;
         self.suspended = MissionId::NONE;
@@ -179,6 +186,16 @@ impl MissionCom {
 
     pub(crate) fn increment_ai_counter(&mut self) {
         self.ai_counter = self.ai_counter.wrapping_add(1);
+    }
+
+    /// `+0xC4 = 0` outside an assignment: Unit and Infantry PerCellProcess
+    /// zero it as the object enters a transport or building (`0x0073A6FC`,
+    /// `0x0073A29E`, `0x0051A40E`, `0x0051A2B0`); a building's Mission_Attack
+    /// and Mission_Guard zero it after their Gattling calls and on
+    /// Mission_Attack's drop, CLOAKED and aim-only arms
+    /// (`world::techno_ai::building_missions`).
+    pub(crate) fn clear_ai_counter(&mut self) {
+        self.ai_counter = 0;
     }
 
     pub(crate) fn write_dispatch_epilogue(&mut self, start_frame: i32, delay: i32) {
@@ -199,7 +216,8 @@ impl MissionCom {
         self.movement_bypass_latch = 1;
     }
 
-    #[cfg(test)]
+    /// `+0xB8 = 1` after an exact `Queue_Mission` its caller verified
+    /// (`JumpjetLocomotionClass::Move_To`'s lift tail, `0x0054B496`).
     pub(super) fn set_movement_bypass_after_verified_queue(&mut self) {
         self.set_movement_bypass_latch();
     }

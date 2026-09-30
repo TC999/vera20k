@@ -1,10 +1,11 @@
-//! Smudge spawn dispatcher — fired from combat tick at explosion emission and
-//! at building destruction. Mirrors AnimClass::Start, BuildingClass::DestructionEffects,
-//! and BuildingClass::SpawnSurvivors smudge logic from gamemd.exe.
+//! Smudge spawn dispatcher: the marks of `AnimClass::Middle @ 0x00424F00`
+//! (run by the anim runtime at Start or at its middle frame),
+//! `BuildingClass::DestructionEffects`' centre mark and
+//! `BuildingClass::SpawnSurvivors`' cell marks.
 //!
 //! Dependency rules: depends on rules/, map/, sim/. Never render/ui/audio/net.
 
-use crate::sim::combat::inviso_scatter::{coord_to_cell_truncating, random_direction_coord};
+use crate::sim::combat::inviso_scatter::{RandomDirectionSnap, random_direction_coord};
 use crate::sim::rng::SimRng;
 use crate::sim::smudge_grid::SimCoord;
 
@@ -13,24 +14,14 @@ use crate::rules::art_data::ArtRegistry;
 use crate::rules::locomotor_type::SpeedType;
 use crate::rules::smudge_type::SmudgeTypeRegistry;
 use crate::sim::combat::SmudgeSpawnRequest;
-use crate::sim::intern::StringInterner;
-use crate::sim::miner::ResourceNode;
 use crate::sim::occupancy::{OccupancyGrid, RawCellOccupationGrid};
 use crate::sim::ore_growth::OreGrowthState;
 use crate::sim::overlay_grid::OverlayGrid;
 use crate::sim::smudge_grid::{SmudgeGrid, SmudgeKind};
 use crate::sim::tiberium::{ReduceTiberiumContext, reduce_tiberium};
 
-use std::collections::BTreeMap;
-
-/// Strict altitude gate from ledger #3: smudges only spawn when the anim
-/// is within 30 leptons of the ground.
-const SMUDGE_ALTITUDE_GATE_LEPTONS: i32 = 30;
-
 /// Hardcoded ore-reduction amount on `AnimClass::Middle @ 0x00424F00`'s
-/// crater branch. (Ghidra labels `0x00424F00` `AnimClass__Start`; the label is
-/// transposed with `0x00424CE0` — `0x00424F00` is the particle/scorch/crater
-/// body and plays no sound, so it is `Middle`. The address is right.)
+/// crater branch (the particle/scorch/crater body; it plays no sound).
 const CRATER_ORE_REDUCTION: u16 = 6;
 
 /// Damage values passed to `SmudgeGrid::try_place` for building destruction
@@ -44,7 +35,6 @@ const SURVIVOR_OFFSET_MAGNITUDE: i32 = 0x80;
 
 /// Mutable ore/tiberium state touched by crater smudge dispatch.
 pub struct SmudgeTiberiumContext<'a> {
-    pub resource_nodes: &'a mut BTreeMap<(u16, u16), ResourceNode>,
     pub overlay_grid: &'a mut OverlayGrid,
     pub ore_growth_state: &'a mut OreGrowthState,
     pub overlay_registry: Option<&'a crate::map::overlay_types::OverlayTypeRegistry>,
@@ -72,7 +62,6 @@ impl SmudgeTiberiumContext<'_> {
         rng: &mut SimRng,
     ) {
         let mut ctx = ReduceTiberiumContext {
-            resource_nodes: &mut *self.resource_nodes,
             overlay_grid: Some(&mut *self.overlay_grid),
             ore_growth_state: &mut *self.ore_growth_state,
             overlay_registry: self.overlay_registry,
@@ -91,101 +80,114 @@ impl SmudgeTiberiumContext<'_> {
     }
 }
 
-/// Try to dispatch a smudge for an animation that just spawned at `coord`.
+/// The marks `AnimClass::Middle @ 0x00424F00` makes once its height gate has
+/// passed: the AnimType's `Scorch=` (`+0x36B`), `Crater=` (`+0x36D`) and
+/// `ForceBigCraters=` (`+0x36E`), and the middle frame's size (`+0x29C` /
+/// `+0x2A0`; 30 x 30 with no image).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnimMiddleMarks {
+    pub scorch: bool,
+    pub crater: bool,
+    pub force_big_craters: bool,
+    pub width: i32,
+    pub height: i32,
+}
+
+/// Where Middle's marks land.
+pub(crate) trait MiddleMarkSink {
+    /// `CellClass::Reduce_Tiberium(6)` (`0x00480A80`) on the anim's cell.
+    fn reduce_tiberium(&mut self, amount: u16, rng: &mut SimRng);
+    /// The scorch placer (`0x006B59A0`, Burn types) or the crater placer
+    /// (`0x006B5C90`, Crater types).
+    fn place(&mut self, kind: SmudgeKind, width: i32, height: i32, force: bool, rng: &mut SimRng);
+}
+
+/// `AnimClass::Middle @ 0x00424F00` past its height gate
+/// (`0x0042505A..0x0042513A`): Scorch alone scorches; Scorch and Crater
+/// flip one `RandomRanged(0, 0x7FFFFFFE)` (scorch below half); Crater reduces
+/// the cell's ore by 6, then craters, `ForceBigCraters=` at 300 x 300 forced.
 ///
-/// Reads scorch/crater/force_big_craters bools from the AnimType's ArtEntry.
-/// Performs the altitude gate, the 50/50 random pick when both flags are set,
-/// the `reduce_tiberium(6)` side effect for crater path, and finally calls
-/// `SmudgeGrid::try_place`.
-#[allow(clippy::too_many_arguments)]
-pub fn try_dispatch_anim_smudge(
-    art: &ArtRegistry,
-    smudge_types: &SmudgeTypeRegistry,
-    anim_name: &str,
+/// Native execution: `tools/spatial_oracle/anim_middle.py`.
+pub(crate) fn anim_middle_marks(
+    marks: &AnimMiddleMarks,
+    sink: &mut impl MiddleMarkSink,
+    rng: &mut SimRng,
+) {
+    if marks.scorch && (!marks.crater || rng_below_half_normalized(rng)) {
+        sink.place(SmudgeKind::Burn, marks.width, marks.height, false, rng);
+        return;
+    }
+    if marks.crater {
+        sink.reduce_tiberium(CRATER_ORE_REDUCTION, rng);
+        if marks.force_big_craters {
+            sink.place(SmudgeKind::Crater, 300, 300, true, rng);
+        } else {
+            sink.place(SmudgeKind::Crater, marks.width, marks.height, false, rng);
+        }
+    }
+}
+
+/// The world's [`MiddleMarkSink`]: the smudge grid at the anim's coordinate.
+struct GridMarks<'g, 't, 'c> {
     coord: SimCoord,
-    ground_z: i32,
+    smudge_grid: &'g mut SmudgeGrid,
+    smudge_types: &'g SmudgeTypeRegistry,
+    occupancy: &'g OccupancyGrid,
+    terrain: &'g mut ResolvedTerrainGrid,
+    tiberium: &'t mut SmudgeTiberiumContext<'c>,
+}
+
+impl MiddleMarkSink for GridMarks<'_, '_, '_> {
+    fn reduce_tiberium(&mut self, amount: u16, rng: &mut SimRng) {
+        // Middle's cell is the coordinate divided toward zero
+        // (`0x00424F17..0x00424F3E`), then MapClass::GetCell.
+        let (rx, ry) = (self.coord.x / 256, self.coord.y / 256);
+        if (0..i32::from(self.smudge_grid.width())).contains(&rx)
+            && (0..i32::from(self.smudge_grid.height())).contains(&ry)
+        {
+            self.tiberium
+                .reduce((rx as u16, ry as u16), amount, self.terrain, rng);
+        }
+    }
+
+    fn place(&mut self, kind: SmudgeKind, width: i32, height: i32, force: bool, rng: &mut SimRng) {
+        self.smudge_grid.try_place(
+            kind,
+            self.coord,
+            width,
+            height,
+            force,
+            self.smudge_types,
+            self.terrain,
+            self.tiberium.overlay_grid(),
+            self.occupancy,
+            rng,
+        );
+    }
+}
+
+/// Middle's marks at `coord` (the anim's vt+0x48 coordinate) on the world's
+/// smudge grid.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_anim_middle_marks(
+    marks: &AnimMiddleMarks,
+    coord: SimCoord,
     smudge_grid: &mut SmudgeGrid,
+    smudge_types: &SmudgeTypeRegistry,
     occupancy: &OccupancyGrid,
     terrain: &mut ResolvedTerrainGrid,
     tiberium: &mut SmudgeTiberiumContext<'_>,
     rng: &mut SimRng,
 ) {
-    let Some(entry) = art.get(anim_name) else {
-        return;
+    let mut sink = GridMarks {
+        coord,
+        smudge_grid,
+        smudge_types,
+        occupancy,
+        terrain,
+        tiberium,
     };
-
-    if (coord.z - ground_z) >= SMUDGE_ALTITUDE_GATE_LEPTONS {
-        return;
-    }
-
-    let dmg: i32 = entry.frame_width as i32;
-    let dmg2: i32 = entry.frame_height as i32;
-
-    if entry.scorch {
-        if !entry.crater {
-            smudge_grid.try_place(
-                SmudgeKind::Burn,
-                coord,
-                dmg,
-                dmg2,
-                false,
-                smudge_types,
-                terrain,
-                tiberium.overlay_grid(),
-                occupancy,
-                rng,
-            );
-            return;
-        }
-        if rng_below_half_normalized(rng) {
-            smudge_grid.try_place(
-                SmudgeKind::Burn,
-                coord,
-                dmg,
-                dmg2,
-                false,
-                smudge_types,
-                terrain,
-                tiberium.overlay_grid(),
-                occupancy,
-                rng,
-            );
-            return;
-        }
-    }
-    if entry.crater {
-        let rx = (coord.x >> 8).clamp(0, smudge_grid.width() as i32 - 1) as u16;
-        let ry = (coord.y >> 8).clamp(0, smudge_grid.height() as i32 - 1) as u16;
-        tiberium.reduce((rx, ry), CRATER_ORE_REDUCTION, terrain, rng);
-
-        if entry.force_big_craters {
-            smudge_grid.try_place(
-                SmudgeKind::Crater,
-                coord,
-                300,
-                300,
-                true,
-                smudge_types,
-                terrain,
-                tiberium.overlay_grid(),
-                occupancy,
-                rng,
-            );
-        } else {
-            smudge_grid.try_place(
-                SmudgeKind::Crater,
-                coord,
-                dmg,
-                dmg2,
-                false,
-                smudge_types,
-                terrain,
-                tiberium.overlay_grid(),
-                occupancy,
-                rng,
-            );
-        }
-    }
+    anim_middle_marks(marks, &mut sink, rng);
 }
 
 /// gamemd's anim scorch-vs-crater 50/50: draw `RandomRanged(0, 0x7FFFFFFE)`,
@@ -202,9 +204,15 @@ fn rng_below_half_normalized(rng: &mut SimRng) -> bool {
     rng.next_range_u32_inclusive(0, SMUDGE_5050_RANGED_HIGH) < SMUDGE_SCORCH_ACCEPT_BELOW
 }
 
-/// Building destruction center smudge — fires once per >=2x2 building.
-/// Each dimension greater than two consumes one discarded ranged draw before
-/// the scorch/crater roll; a 2x2 foundation consumes only the roll.
+/// `BuildingClass::DestructionEffects` step 7 (`0x0044177E..0x004418EC`):
+/// the centre mark of a building at least 2x2 (Width `0x0045EC90`, Height
+/// `0x0045ECA0`). Each dimension greater than two consumes one discarded
+/// `RandomRanged(0, dimension - 2)` (`0x004417D3`, `0x00441805`) before the
+/// `RandomRanged(0, 99)` roll (`0x00441819`); below 50 the Burn placer, else
+/// the Crater placer, with force and size 0x64 at the Location cell's centre.
+/// Native execution: `tools/spatial_oracle/smudge_can_place.py`
+/// (`centre_mark`, all 22 foundations) and, on retail Dustbowl through the
+/// production receiver, `building_death_anims.py`.
 #[allow(clippy::too_many_arguments)]
 pub fn try_dispatch_building_destruction_smudges(
     rx: u16,
@@ -332,9 +340,15 @@ pub(crate) fn try_dispatch_building_survivor_smudges(
         let roll: u32 = rng.next_range_u32(100);
         let base_x = (cell_rx as i32) * 256 + 128;
         let base_y = (cell_ry as i32) * 256 + 128;
-        let (off_x, off_y) = random_direction_coord(rng, base_x, base_y, SURVIVOR_OFFSET_MAGNITUDE);
-        let snap_rx = coord_to_cell_truncating(off_x) as u16;
-        let snap_ry = coord_to_cell_truncating(off_y) as u16;
+        let (off_x, off_y) = random_direction_coord(
+            rng,
+            base_x,
+            base_y,
+            SURVIVOR_OFFSET_MAGNITUDE,
+            RandomDirectionSnap::Preserve,
+        );
+        let snap_rx = crate::util::lepton::lepton_to_cell(off_x) as u16;
+        let snap_ry = crate::util::lepton::lepton_to_cell(off_y) as u16;
         let coord = SimCoord {
             x: (snap_rx as i32) * 256 + 128,
             y: (snap_ry as i32) * 256 + 128,
@@ -380,7 +394,6 @@ pub(crate) fn drain_smudge_spawn_requests(
     requests: &[SmudgeSpawnRequest],
     art: &ArtRegistry,
     smudge_types: &SmudgeTypeRegistry,
-    interner: &StringInterner,
     smudge_grid: &mut SmudgeGrid,
     occupancy: &OccupancyGrid,
     terrain: &mut ResolvedTerrainGrid,
@@ -390,38 +403,12 @@ pub(crate) fn drain_smudge_spawn_requests(
 ) {
     for req in requests {
         match req {
-            SmudgeSpawnRequest::Anim {
-                anim_name,
-                rx,
-                ry,
-                sub_x,
-                sub_y,
-                world_z_leptons,
-            } => {
-                let coord = SimCoord {
-                    x: (*rx as i32) * 256 + sub_x.to_num::<i32>(),
-                    y: (*ry as i32) * 256 + sub_y.to_num::<i32>(),
-                    z: *world_z_leptons,
-                };
-                let Some(cell) = terrain.cell(*rx, *ry) else {
-                    continue;
-                };
-                let Ok(ground_z) = crate::util::lepton::ground_height_leptons(
-                    cell.level,
-                    cell.slope_type,
-                    coord.x,
-                    coord.y,
-                ) else {
-                    continue;
-                };
-                let name = interner.resolve(*anim_name);
-                try_dispatch_anim_smudge(
-                    art,
-                    smudge_types,
-                    name,
-                    coord,
-                    ground_z,
+            SmudgeSpawnRequest::AnimMiddle { coord, marks } => {
+                dispatch_anim_middle_marks(
+                    marks,
+                    *coord,
                     smudge_grid,
+                    smudge_types,
                     occupancy,
                     terrain,
                     tiberium,
@@ -496,14 +483,152 @@ mod tests {
 }
 
 #[cfg(test)]
+mod oracle_tests {
+    use super::*;
+
+    /// The oracle's placer: CanPlace answers the row's admit mask per type
+    /// index, and cell (0, 0) places nothing.
+    struct OracleMarks<'a> {
+        table: &'a [(bool, bool, u8, u8)],
+        admit_mask: u64,
+        cell_zero: bool,
+        events: Vec<String>,
+    }
+
+    impl MiddleMarkSink for OracleMarks<'_> {
+        fn reduce_tiberium(&mut self, amount: u16, _rng: &mut SimRng) {
+            self.events.push(format!("reduce {amount}"));
+        }
+
+        fn place(
+            &mut self,
+            kind: SmudgeKind,
+            width: i32,
+            height: i32,
+            force: bool,
+            rng: &mut SimRng,
+        ) {
+            if self.cell_zero {
+                return;
+            }
+            let mut placeable = Vec::new();
+            for (index, &(burn, crater, w, h)) in self.table.iter().enumerate() {
+                if !matches!(kind, SmudgeKind::Burn if burn)
+                    && !matches!(kind, SmudgeKind::Crater if crater)
+                {
+                    continue;
+                }
+                self.events
+                    .push(format!("can_place {index} {}", u8::from(force)));
+                if self.admit_mask >> index & 1 != 0 {
+                    placeable.push((index as u16, w, h));
+                }
+            }
+            if let Some(chosen) = crate::sim::smudge_grid::pick_smudge_candidate(
+                &placeable, width, height, force, rng,
+            ) {
+                self.events.push(format!("smudge {chosen}"));
+            }
+        }
+    }
+
+    /// `AnimClass::Middle @ 0x00424F00` with the real placers
+    /// (`tools/spatial_oracle/anim_middle.py`): the height gate, the
+    /// scorch/crater choice and its draw, the ore reduction, the CanPlace
+    /// sweep and the candidate pick, event for event and RNG state for state.
+    /// The size fed in is Middle's: the cached middle-frame size (Rust binds
+    /// it at load), fetched when uncached, 30 x 30 without an image. Particle
+    /// events are not compared (the SpawnsParticle loop is a residual).
+    #[test]
+    fn anim_middle_marks_match_the_original() {
+        let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../../tools/spatial_oracle/anim_middle.json"
+        ))
+        .unwrap();
+        assert!(rows.len() >= 290);
+        for row in &rows {
+            let input = &row["input"];
+            let int = |key: &str| input[key].as_i64().unwrap();
+            let pair = |key: &str| {
+                let value = input[key].as_array().unwrap();
+                (
+                    value[0].as_i64().unwrap() as i32,
+                    value[1].as_i64().unwrap() as i32,
+                )
+            };
+            let table: Vec<(bool, bool, u8, u8)> = input["table"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| {
+                    let e = |i: usize| entry[i].as_i64().unwrap();
+                    (e(0) != 0, e(1) != 0, e(2) as u8, e(3) as u8)
+                })
+                .collect();
+            let (width, height) = if int("image") == 0 {
+                (30, 30)
+            } else {
+                let (cached, fetched) = (pair("cached_size"), pair("frame_size"));
+                let pick = |c: i32, f: i32| if c == -1 { f } else { c };
+                (pick(cached.0, fetched.0), pick(cached.1, fetched.1))
+            };
+            let coord = input["coord"].as_array().unwrap();
+            let cell = |i: usize| coord[i].as_i64().unwrap() / 256;
+            let mut sink = OracleMarks {
+                table: &table,
+                admit_mask: int("admit_mask") as u64,
+                cell_zero: cell(0) == 0 && cell(1) == 0,
+                events: Vec::new(),
+            };
+            let mut rng = SimRng::new(int("seed") as u64);
+            assert_eq!(
+                rng.native_state_hex(),
+                row["rng_before"].as_str().unwrap(),
+                "{input}"
+            );
+            if int("height") < i64::from(crate::sim::anim_class::ANIM_MIDDLE_MAX_HEIGHT) {
+                let marks = AnimMiddleMarks {
+                    scorch: int("scorch") != 0,
+                    crater: int("crater") != 0,
+                    force_big_craters: int("force_big") != 0,
+                    width,
+                    height,
+                };
+                anim_middle_marks(&marks, &mut sink, &mut rng);
+            }
+            let native: Vec<String> = row["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|event| {
+                    let field = |key: &str| event[key].as_i64().unwrap();
+                    match event["call"].as_str().unwrap() {
+                        "reduce" => Some(format!("reduce {}", field("amount"))),
+                        "can_place" => {
+                            Some(format!("can_place {} {}", field("type"), field("force")))
+                        }
+                        "smudge" => Some(format!("smudge {}", field("type"))),
+                        _ => None,
+                    }
+                })
+                .collect();
+            assert_eq!(sink.events, native, "{input}");
+            assert_eq!(
+                rng.native_state_hex(),
+                row["rng_after"].as_str().unwrap(),
+                "{input}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod dispatch_tests {
     use super::*;
     use crate::map::resolved_terrain::ResolvedTerrainCell;
     use crate::sim::ore_growth::OreGrowthState;
-    use crate::util::fixed_math::SimFixed;
 
     fn tiberium_ctx<'a>(
-        resource_nodes: &'a mut BTreeMap<(u16, u16), ResourceNode>,
         overlay_grid: &'a mut OverlayGrid,
         ore_growth_state: &'a mut OreGrowthState,
         radar_dirty_cells: &'a mut Vec<(u16, u16)>,
@@ -511,7 +636,6 @@ mod dispatch_tests {
         tactical_dirty_cells: &'a mut Vec<(u16, u16)>,
     ) -> SmudgeTiberiumContext<'a> {
         SmudgeTiberiumContext {
-            resource_nodes,
             overlay_grid,
             ore_growth_state,
             overlay_registry: None,
@@ -543,16 +667,14 @@ mod dispatch_tests {
         )
     }
 
-    fn make_art(scorch: bool, crater: bool, force_big: bool) -> ArtRegistry {
-        let scorch_str = if scorch { "yes" } else { "no" };
-        let crater_str = if crater { "yes" } else { "no" };
-        let big_str = if force_big { "yes" } else { "no" };
-        let ini_text = format!(
-            "[ANIM]\nScorch={}\nCrater={}\nForceBigCraters={}\n",
-            scorch_str, crater_str, big_str,
-        );
-        let ini = crate::rules::ini_parser::IniFile::from_bytes(ini_text.as_bytes()).unwrap();
-        ArtRegistry::from_ini(&ini)
+    fn marks(scorch: bool, crater: bool, force_big_craters: bool) -> AnimMiddleMarks {
+        AnimMiddleMarks {
+            scorch,
+            crater,
+            force_big_craters,
+            width: 30,
+            height: 30,
+        }
     }
 
     fn make_smudge_registry() -> SmudgeTypeRegistry {
@@ -566,330 +688,17 @@ mod dispatch_tests {
     }
 
     fn flat_terrain(w: u16, h: u16) -> ResolvedTerrainGrid {
-        let mut cells: Vec<ResolvedTerrainCell> = Vec::with_capacity((w * h) as usize);
-        for ry in 0..h {
-            for rx in 0..w {
-                cells.push(test_default_cell(rx, ry));
-            }
-        }
-        ResolvedTerrainGrid::from_cells(w, h, cells)
+        crate::map::resolved_terrain::test_grid(w, h, test_default_cell)
     }
 
     fn test_default_cell(rx: u16, ry: u16) -> ResolvedTerrainCell {
-        // Reuse Task 7's defaults via copy-paste; intentionally not extracted to
-        // a shared helper to keep tasks self-contained.
         ResolvedTerrainCell {
-            rx,
-            ry,
-            source_tile_index: 0,
-            source_sub_tile: 0,
-            final_tile_index: 0,
-            final_sub_tile: 0,
-            is_wood_bridge_repair_tile: false,
-            level: 0,
-            filled_clear: true,
-            tileset_index: Some(0),
-            land_type: 0,
-            yr_cell_land_type: 0,
-            slope_type: 0,
-            template_height: 0,
-            render_offset_x: 0,
-            render_offset_y: 0,
-            terrain_class: Default::default(),
             speed_costs: crate::rules::terrain_rules::SpeedCostProfile {
                 track: Some(100),
                 ..Default::default()
             },
-            is_water: false,
-            is_cliff_like: false,
-            is_rough: false,
-            is_road: false,
-            height_in_pixels: 0,
-            variant: 0,
-            has_ramp: false,
-            canonical_ramp: None,
-            ground_walk_blocked: false,
-            terrain_object_blocks: false,
-            terrain_object_occupation: None,
-            overlay_blocks: false,
-            overlay_zone_type: None,
-            outside_playfield: false,
-            zone_type: 0,
-            base_ground_walk_blocked: false,
-            base_build_blocked: false,
-            base_land_type: 0,
-            base_yr_cell_land_type: 0,
-            base_terrain_class: Default::default(),
-            base_speed_costs: Default::default(),
-            build_blocked: false,
-            has_bridge_deck: false,
-            bridge_walkable: false,
-            bridge_transition: false,
-            bridge_deck_level: 0,
-            bridge_layer: None,
-            bridge_facts: crate::map::bridge_facts::BridgeCellFacts::default(),
-            tube_index: None,
-            radar_left: [0; 3],
-            radar_right: [0; 3],
-            accepts_smudge: true,
-            allows_tiberium: false,
-            has_damaged_data: false,
-            bridgehead_anchor_class_at_load: None,
+            ..crate::map::resolved_terrain::test_unclassified_cell(rx, ry)
         }
-    }
-
-    #[test]
-    fn altitude_gate_blocks_above_30_leptons() {
-        let art = make_art(false, true, false);
-        let smudge_reg = make_smudge_registry();
-        let mut grid = SmudgeGrid::new(8, 8);
-        let mut terrain = flat_terrain(8, 8);
-        let mut overlay = OverlayGrid::new(8, 8);
-        let occupancy = OccupancyGrid::new();
-        let mut rng = SimRng::new(1);
-        let mut nodes = BTreeMap::new();
-        let mut growth = OreGrowthState::new(8, 8);
-        let mut radar_dirty = Vec::new();
-        let mut radar_generation = 0;
-        let mut tactical_dirty = Vec::new();
-        let coord = SimCoord {
-            x: 4 * 256 + 128,
-            y: 4 * 256 + 128,
-            z: 100,
-        };
-        let mut tiberium = tiberium_ctx(
-            &mut nodes,
-            &mut overlay,
-            &mut growth,
-            &mut radar_dirty,
-            &mut radar_generation,
-            &mut tactical_dirty,
-        );
-        try_dispatch_anim_smudge(
-            &art,
-            &smudge_reg,
-            "ANIM",
-            coord,
-            0,
-            &mut grid,
-            &occupancy,
-            &mut terrain,
-            &mut tiberium,
-            &mut rng,
-        );
-        assert!(grid.iter_occupied().count() == 0);
-    }
-
-    #[test]
-    fn altitude_gate_strict_less_than_30() {
-        let art = make_art(false, true, false);
-        let smudge_reg = make_smudge_registry();
-        let mut grid = SmudgeGrid::new(8, 8);
-        let mut terrain = flat_terrain(8, 8);
-        let mut overlay = OverlayGrid::new(8, 8);
-        let occupancy = OccupancyGrid::new();
-        let mut rng = SimRng::new(1);
-        let mut nodes = BTreeMap::new();
-        let mut growth = OreGrowthState::new(8, 8);
-        let mut radar_dirty = Vec::new();
-        let mut radar_generation = 0;
-        let mut tactical_dirty = Vec::new();
-        let mut tiberium = tiberium_ctx(
-            &mut nodes,
-            &mut overlay,
-            &mut growth,
-            &mut radar_dirty,
-            &mut radar_generation,
-            &mut tactical_dirty,
-        );
-        // z - ground_z = 30 exactly -> must FAIL (strict <)
-        let coord = SimCoord {
-            x: 4 * 256 + 128,
-            y: 4 * 256 + 128,
-            z: 30,
-        };
-        try_dispatch_anim_smudge(
-            &art,
-            &smudge_reg,
-            "ANIM",
-            coord,
-            0,
-            &mut grid,
-            &occupancy,
-            &mut terrain,
-            &mut tiberium,
-            &mut rng,
-        );
-        assert!(grid.iter_occupied().count() == 0);
-        // z - ground_z = 29 -> must PASS
-        let coord = SimCoord {
-            x: 4 * 256 + 128,
-            y: 4 * 256 + 128,
-            z: 29,
-        };
-        try_dispatch_anim_smudge(
-            &art,
-            &smudge_reg,
-            "ANIM",
-            coord,
-            0,
-            &mut grid,
-            &occupancy,
-            &mut terrain,
-            &mut tiberium,
-            &mut rng,
-        );
-        assert_eq!(grid.iter_occupied().count(), 1);
-    }
-
-    #[test]
-    fn gsi_04_11_elevated_ground_uses_absolute_lepton_altitude_gate() {
-        let art = make_art(false, true, false);
-        let smudge_reg = make_smudge_registry();
-        let mut grid = SmudgeGrid::new(8, 8);
-        let mut terrain = flat_terrain(8, 8);
-        let cell = terrain.cell_mut(4, 4).unwrap();
-        cell.level = 3;
-        cell.slope_type = 0;
-        let world_x = 4 * 256 + 96;
-        let world_y = 4 * 256 + 160;
-        let ground_z = crate::util::lepton::ground_height_leptons(
-            cell.level,
-            cell.slope_type,
-            world_x,
-            world_y,
-        )
-        .unwrap();
-        let mut overlay = OverlayGrid::new(8, 8);
-        let occupancy = OccupancyGrid::new();
-        let raw_occupation = RawCellOccupationGrid::new();
-        let mut interner = StringInterner::new();
-        let anim_name = interner.intern("ANIM");
-        let mut rng = SimRng::new(41);
-        let before_reject = rng.logical_state();
-        let mut nodes = BTreeMap::new();
-        let mut growth = OreGrowthState::new(8, 8);
-        let mut radar_dirty = Vec::new();
-        let mut radar_generation = 0;
-        let mut tactical_dirty = Vec::new();
-        let mut tiberium = tiberium_ctx(
-            &mut nodes,
-            &mut overlay,
-            &mut growth,
-            &mut radar_dirty,
-            &mut radar_generation,
-            &mut tactical_dirty,
-        );
-
-        drain_smudge_spawn_requests(
-            &[SmudgeSpawnRequest::Anim {
-                anim_name,
-                rx: 4,
-                ry: 4,
-                sub_x: SimFixed::from_num(96),
-                sub_y: SimFixed::from_num(160),
-                world_z_leptons: ground_z + 30,
-            }],
-            &art,
-            &smudge_reg,
-            &interner,
-            &mut grid,
-            &occupancy,
-            &mut terrain,
-            &raw_occupation,
-            &mut tiberium,
-            &mut rng,
-        );
-        assert_eq!(rng.logical_state(), before_reject);
-        assert_eq!(grid.iter_occupied().count(), 0);
-
-        drain_smudge_spawn_requests(
-            &[SmudgeSpawnRequest::Anim {
-                anim_name,
-                rx: 4,
-                ry: 4,
-                sub_x: SimFixed::from_num(96),
-                sub_y: SimFixed::from_num(160),
-                world_z_leptons: ground_z,
-            }],
-            &art,
-            &smudge_reg,
-            &interner,
-            &mut grid,
-            &occupancy,
-            &mut terrain,
-            &raw_occupation,
-            &mut tiberium,
-            &mut rng,
-        );
-        assert_eq!(
-            rng.logical_state(),
-            before_reject,
-            "the sole placeable crater candidate uses RandomRanged(0, 0)"
-        );
-        assert_eq!(grid.iter_occupied().count(), 1);
-    }
-
-    #[test]
-    fn gsi_04_11_parachute_object_height_rejects_smudge_without_rng() {
-        let art = make_art(false, true, false);
-        let smudge_reg = make_smudge_registry();
-        let mut grid = SmudgeGrid::new(8, 8);
-        let mut terrain = flat_terrain(8, 8);
-        let mut entity =
-            crate::sim::game_entity::GameEntity::test_default(7, "E1", "Americans", 4, 4);
-        entity.parachute_state = Some(
-            crate::sim::movement::parachute_descent::ParachuteDescentState {
-                rate: -1,
-                altitude: SimFixed::from_num(64),
-            },
-        );
-        let world_z_leptons = crate::sim::combat::object_world_z_leptons(&entity, Some(&terrain));
-        assert_eq!(world_z_leptons, 64);
-
-        let mut overlay = OverlayGrid::new(8, 8);
-        let occupancy = OccupancyGrid::new();
-        let raw_occupation = RawCellOccupationGrid::new();
-        let mut interner = StringInterner::new();
-        let anim_name = interner.intern("ANIM");
-        let mut rng = SimRng::new(17);
-        let before_reject = rng.logical_state();
-        let mut nodes = BTreeMap::new();
-        let mut growth = OreGrowthState::new(8, 8);
-        let mut radar_dirty = Vec::new();
-        let mut radar_generation = 0;
-        let mut tactical_dirty = Vec::new();
-        let mut tiberium = tiberium_ctx(
-            &mut nodes,
-            &mut overlay,
-            &mut growth,
-            &mut radar_dirty,
-            &mut radar_generation,
-            &mut tactical_dirty,
-        );
-
-        drain_smudge_spawn_requests(
-            &[SmudgeSpawnRequest::Anim {
-                anim_name,
-                rx: entity.position.rx,
-                ry: entity.position.ry,
-                sub_x: entity.position.sub_x,
-                sub_y: entity.position.sub_y,
-                world_z_leptons,
-            }],
-            &art,
-            &smudge_reg,
-            &interner,
-            &mut grid,
-            &occupancy,
-            &mut terrain,
-            &raw_occupation,
-            &mut tiberium,
-            &mut rng,
-        );
-
-        assert_eq!(rng.logical_state(), before_reject);
-        assert_eq!(grid.iter_occupied().count(), 0);
     }
 
     #[test]
@@ -897,7 +706,7 @@ mod dispatch_tests {
         // Seed the authoritative overlay byte with 10 density levels (raw 9),
         // more than the 6-unit reduction, so the cell stays present after the
         // native partial reduction.
-        let art = make_art(false, true, false);
+        let crater_marks = marks(false, true, false);
         let smudge_reg = make_smudge_registry();
         let mut grid = SmudgeGrid::new(8, 8);
         let mut terrain = flat_terrain(8, 8);
@@ -907,7 +716,6 @@ mod dispatch_tests {
         overlay.place_overlay(4, 4, ore_id, 9);
         let occupancy = OccupancyGrid::new();
         let mut rng = SimRng::new(1);
-        let mut nodes = BTreeMap::new();
         let mut growth = OreGrowthState::new(8, 8);
         let mut radar_dirty = Vec::new();
         let mut radar_generation = 0;
@@ -919,7 +727,6 @@ mod dispatch_tests {
         };
         {
             let mut tiberium = tiberium_ctx(
-                &mut nodes,
                 &mut overlay,
                 &mut growth,
                 &mut radar_dirty,
@@ -928,13 +735,11 @@ mod dispatch_tests {
             );
             tiberium.overlay_registry = Some(&overlay_registry);
             tiberium.tiberium_types = Some(&tiberium_types);
-            try_dispatch_anim_smudge(
-                &art,
-                &smudge_reg,
-                "ANIM",
+            dispatch_anim_middle_marks(
+                &crater_marks,
                 coord,
-                0,
                 &mut grid,
+                &smudge_reg,
                 &occupancy,
                 &mut terrain,
                 &mut tiberium,
@@ -949,7 +754,7 @@ mod dispatch_tests {
 
     #[test]
     fn gsi_04_11_anim_crater_reduces_ore_before_zero_zero_sentinel_rejection() {
-        let art = make_art(false, true, false);
+        let crater_marks = marks(false, true, false);
         let smudge_reg = make_smudge_registry();
         let mut grid = SmudgeGrid::new(8, 8);
         let mut terrain = flat_terrain(8, 8);
@@ -959,14 +764,12 @@ mod dispatch_tests {
         overlay.place_overlay(0, 0, ore_id, 9);
         let occupancy = OccupancyGrid::new();
         let mut rng = SimRng::new(1);
-        let mut nodes = BTreeMap::new();
         let mut growth = OreGrowthState::new(8, 8);
         let mut radar_dirty = Vec::new();
         let mut radar_generation = 0;
         let mut tactical_dirty = Vec::new();
         {
             let mut tiberium = tiberium_ctx(
-                &mut nodes,
                 &mut overlay,
                 &mut growth,
                 &mut radar_dirty,
@@ -975,17 +778,15 @@ mod dispatch_tests {
             );
             tiberium.overlay_registry = Some(&overlay_registry);
             tiberium.tiberium_types = Some(&tiberium_types);
-            try_dispatch_anim_smudge(
-                &art,
-                &smudge_reg,
-                "ANIM",
+            dispatch_anim_middle_marks(
+                &crater_marks,
                 SimCoord {
                     x: 128,
                     y: 128,
                     z: 0,
                 },
-                0,
                 &mut grid,
+                &smudge_reg,
                 &occupancy,
                 &mut terrain,
                 &mut tiberium,
@@ -999,20 +800,17 @@ mod dispatch_tests {
 
     #[test]
     fn scorch_only_anim_spawns_burn() {
-        let art = make_art(true, false, false);
         let smudge_reg = make_smudge_registry();
         let mut grid = SmudgeGrid::new(8, 8);
         let mut terrain = flat_terrain(8, 8);
         let mut overlay = OverlayGrid::new(8, 8);
         let occupancy = OccupancyGrid::new();
         let mut rng = SimRng::new(1);
-        let mut nodes = BTreeMap::new();
         let mut growth = OreGrowthState::new(8, 8);
         let mut radar_dirty = Vec::new();
         let mut radar_generation = 0;
         let mut tactical_dirty = Vec::new();
         let mut tiberium = tiberium_ctx(
-            &mut nodes,
             &mut overlay,
             &mut growth,
             &mut radar_dirty,
@@ -1024,13 +822,11 @@ mod dispatch_tests {
             y: 4 * 256 + 128,
             z: 0,
         };
-        try_dispatch_anim_smudge(
-            &art,
-            &smudge_reg,
-            "ANIM",
+        dispatch_anim_middle_marks(
+            &marks(true, false, false),
             coord,
-            0,
             &mut grid,
+            &smudge_reg,
             &occupancy,
             &mut terrain,
             &mut tiberium,
@@ -1047,97 +843,60 @@ mod dispatch_tests {
     mod building_dispatch_tests {
         use super::*;
 
+        /// `BuildingClass::DestructionEffects` step 7 executed over MapClass's
+        /// cell table (`tools/spatial_oracle/smudge_can_place.py`,
+        /// `centre_mark`: `0x0044177E..0x004418EC` for all 22 foundation
+        /// indices at four Locations and two seeds): the >= 2x2 gate, the
+        /// discarded RandomRanged per dimension over two (the oracle requires
+        /// the rows to pin each range, `centre_mark_discard_pins`), the roll,
+        /// the placer's CanPlace sweep and pick, Place's footprint, the shared
+        /// dummy and the Scenario RNG afterwards.
         #[test]
-        fn destruction_skipped_for_1x1_foundation() {
-            let smudge_reg = make_smudge_registry();
-            let mut grid = SmudgeGrid::new(8, 8);
+        fn centre_mark_matches_the_original_for_every_foundation() {
+            use crate::sim::smudge_grid::oracle_fixture::{self, corpus, int};
+            let registry = oracle_fixture::registry();
             let art = ArtRegistry::empty();
-            let mut terrain = flat_terrain(8, 8);
-            let mut overlay = OverlayGrid::new(8, 8);
-            let occupancy = OccupancyGrid::new();
-            let mut rng = SimRng::new(1);
-            let mut nodes = BTreeMap::new();
-            let mut growth = OreGrowthState::new(8, 8);
-            let mut radar_dirty = Vec::new();
-            let mut radar_generation = 0;
-            let mut tactical_dirty = Vec::new();
-            let mut tiberium = tiberium_ctx(
-                &mut nodes,
-                &mut overlay,
-                &mut growth,
-                &mut radar_dirty,
-                &mut radar_generation,
-                &mut tactical_dirty,
-            );
-            try_dispatch_building_destruction_smudges(
-                4,
-                4,
-                0,
-                1,
-                1, // 1x1 foundation
-                &art,
-                &smudge_reg,
-                &mut grid,
-                &occupancy,
-                &mut terrain,
-                &mut tiberium,
-                &mut rng,
-            );
-            assert_eq!(grid.iter_occupied().count(), 0);
-        }
-
-        fn run_center_smudge(foundation_w: u8, foundation_h: u8) -> SimRng {
-            let smudge_reg = make_smudge_registry();
-            let mut grid = SmudgeGrid::new(8, 8);
-            let art = ArtRegistry::empty();
-            let mut terrain = flat_terrain(8, 8);
-            let mut overlay = OverlayGrid::new(8, 8);
-            let occupancy = OccupancyGrid::new();
-            let mut nodes = BTreeMap::new();
-            let mut growth = OreGrowthState::new(8, 8);
-            let mut radar_dirty = Vec::new();
-            let mut radar_generation = 0;
-            let mut tactical_dirty = Vec::new();
-            let mut tiberium = tiberium_ctx(
-                &mut nodes,
-                &mut overlay,
-                &mut growth,
-                &mut radar_dirty,
-                &mut radar_generation,
-                &mut tactical_dirty,
-            );
-            let mut rng = SimRng::new(42);
-            try_dispatch_building_destruction_smudges(
-                4,
-                4,
-                0,
-                foundation_w,
-                foundation_h,
-                &art,
-                &smudge_reg,
-                &mut grid,
-                &occupancy,
-                &mut terrain,
-                &mut tiberium,
-                &mut rng,
-            );
-            assert_eq!(grid.iter_occupied().count(), 1);
-            rng
-        }
-
-        #[test]
-        fn gsi_04_11_center_smudge_2x2_roll_only_3x3_discards_both_dimensions() {
-            let actual_2x2 = run_center_smudge(2, 2);
-            let mut expected_2x2 = SimRng::new(42);
-            expected_2x2.next_range_u32(100);
-            assert_eq!(actual_2x2.logical_state(), expected_2x2.logical_state());
-
-            let actual_3x3 = run_center_smudge(3, 3);
-            let mut expected_3x3 = SimRng::new(42);
-            expected_3x3.next_range_u32(2);
-            expected_3x3.next_range_u32(2);
-            expected_3x3.next_range_u32(100);
-            assert_eq!(actual_3x3.logical_state(), expected_3x3.logical_state());
+            let rows = corpus()["centre_mark"].as_array().unwrap();
+            assert_eq!(rows.len(), 176);
+            for row in rows {
+                let input = &row["input"];
+                let mut map = oracle_fixture::map(input["map"].as_str().unwrap());
+                let before = map.smudges.clone();
+                let location = input["location"].as_array().unwrap();
+                let size = row["foundation_size"].as_array().unwrap();
+                let mut growth = OreGrowthState::new(oracle_fixture::SIDE, oracle_fixture::SIDE);
+                let mut radar_dirty = Vec::new();
+                let mut radar_generation = 0;
+                let mut tactical_dirty = Vec::new();
+                let mut tiberium = tiberium_ctx(
+                    &mut map.overlay,
+                    &mut growth,
+                    &mut radar_dirty,
+                    &mut radar_generation,
+                    &mut tactical_dirty,
+                );
+                let mut rng = oracle_fixture::seeded_rng(row);
+                try_dispatch_building_destruction_smudges(
+                    (int(&location[0]) / 256) as u16,
+                    (int(&location[1]) / 256) as u16,
+                    int(&location[2]) as i32,
+                    int(&size[0]) as u8,
+                    int(&size[1]) as u8,
+                    &art,
+                    &registry,
+                    &mut map.smudges,
+                    &map.occupancy,
+                    &mut map.terrain,
+                    &mut tiberium,
+                    &mut rng,
+                );
+                oracle_fixture::assert_marks(&before, &map.smudges, &map.terrain, row);
+                assert_eq!(
+                    rng.native_state_hex(),
+                    row["rng_after"].as_str().unwrap(),
+                    "{input}"
+                );
+            }
         }
 
         #[test]
@@ -1232,7 +991,6 @@ mod dispatch_tests {
             let art = ArtRegistry::empty();
             let occupancy = OccupancyGrid::new();
             let mut grid = SmudgeGrid::new(8, 8);
-            let mut nodes = BTreeMap::new();
             let mut growth = OreGrowthState::new(8, 8);
             let mut radar_dirty = Vec::new();
             let mut radar_generation = 0;
@@ -1240,7 +998,6 @@ mod dispatch_tests {
             let mut rng = SimRng::new(17);
             let before = rng.logical_state();
             let mut tiberium = SmudgeTiberiumContext {
-                resource_nodes: &mut nodes,
                 overlay_grid: &mut overlay,
                 ore_growth_state: &mut growth,
                 overlay_registry: Some(&overlay_registry),
@@ -1296,7 +1053,6 @@ mod dispatch_tests {
             }
             survivor_overlay.take_dirty_cells();
             let raw = RawCellOccupationGrid::new();
-            let mut survivor_nodes = BTreeMap::new();
             let mut survivor_growth = OreGrowthState::new(8, 8);
             let mut survivor_radar = Vec::new();
             let mut survivor_generation = 0;
@@ -1309,10 +1065,10 @@ mod dispatch_tests {
                 4 * 256 + 128,
                 4 * 256 + 128,
                 SURVIVOR_OFFSET_MAGNITUDE,
+                RandomDirectionSnap::Preserve,
             );
             {
                 let mut tiberium = tiberium_ctx(
-                    &mut survivor_nodes,
                     &mut survivor_overlay,
                     &mut survivor_growth,
                     &mut survivor_radar,
@@ -1342,8 +1098,13 @@ mod dispatch_tests {
             }
             assert_eq!(survivor_grid.iter_occupied().count(), 0);
             assert!(survivor_overlay.take_dirty_cells().is_empty());
-            assert!(survivor_growth.growth_queue_entries().is_empty());
-            assert!(survivor_growth.spread_queue_entries().is_empty());
+            assert!(
+                survivor_growth
+                    .native_tiberium_state()
+                    .classes
+                    .iter()
+                    .all(|class| class.growth.is_empty() && class.spread.is_empty())
+            );
             assert!(survivor_radar.is_empty());
             assert_eq!(survivor_generation, 0);
             assert!(survivor_tactical.is_empty());

@@ -14,6 +14,11 @@ path = "src/main.rs"
 name = "parity-digest"
 path = "src/bin/parity-digest.rs"
 
+# Release-build simulation tick benchmark at scale (see its module doc).
+[[bin]]
+name = "sim-bench"
+path = "src/bin/sim-bench.rs"
+
 [[bin]]
 name = "mix-browser"
 path = "src/bin/mix-browser.rs"
@@ -28,24 +33,8 @@ name = "extract-ini"
 path = "src/bin/extract-ini.rs"
 
 [[bin]]
-name = "inspect-maps"
-path = "src/bin/inspect-maps.rs"
-
-[[bin]]
-name = "audit-assets"
-path = "src/bin/audit-assets.rs"
-
-[[bin]]
 name = "bik-player"
 path = "src/bin/bik-player.rs"
-
-[[bin]]
-name = "bik-survey"
-path = "src/bin/bik-survey.rs"
-
-[[bin]]
-name = "measure-atlas"
-path = "src/bin/measure-atlas.rs"
 
 [[bin]]
 name = "extract-bridge-frames"
@@ -54,18 +43,6 @@ path = "src/bin/extract-bridge-frames.rs"
 [[bin]]
 name = "inspect-water-tiles"
 path = "src/bin/inspect-water-tiles.rs"
-
-[[bin]]
-name = "inspect-pcx-palette"
-path = "src/bin/inspect-pcx-palette.rs"
-
-[[bin]]
-name = "inspect-yro-render"
-path = "src/bin/inspect-yro-render.rs"
-
-[[bin]]
-name = "bridge-oracle-compare"
-path = "src/bin/bridge-oracle-compare.rs"
 
 [dependencies]
 # --- GPU rendering ---
@@ -141,16 +118,31 @@ num-traits = "0.2"
 # (same team behind cpal). Covers all RA2 needs: SFX, music, volume control.
 rodio = "0.22"
 
-# --- Build speed ---
-# Optimize all code at opt-level 1 in dev builds. The game rebuilds sprite
-# instances, sorts them, and iterates over thousands of cells every frame —
-# unoptimized Rust is 10-50x slower than opt-level 1. Incremental recompiles
-# stay fast because opt-level 1 is lightweight (no heavy inlining/LTO).
+# --- Unix saved-list timestamps ---
+# Local time and the user's locale (src/util/native_file_time.rs). The
+# lockfile already carries libc 0.2.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# --- macOS application icon ---
+# macOS has no per-window icon; the Dock shows NSApplication's icon image, which
+# `app::window_icon` sets at startup. These are the objc2 0.6 / AppKit 0.3 versions
+# already in the lock (via arboard/glutin); default features are off because they
+# enable every AppKit framework class.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
+
 [lints.clippy]
 # A side effect inside `debug_assert!` vanishes from release builds. This
 # hid every scheduler anim (wakes, explosions) in shipped binaries for weeks.
 debug_assert_with_mut_call = "deny"
 
+# --- Build speed ---
+# Optimize all code at opt-level 1 in dev builds. The game rebuilds sprite
+# instances, sorts them, and iterates over thousands of cells every frame —
+# unoptimized Rust is 10-50x slower than opt-level 1.
 [profile.dev]
 opt-level = 1
 # Emit line-table debuginfo only (keeps panic/backtrace line numbers) instead of
@@ -161,3 +153,10 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 1
+
+# `cargo test` inherits the dev profile (dependencies stay at opt-level 1) but
+# compiles vera20k unoptimized. Measured on an M4 Mac mini on 2026-09-26:
+# incremental lib test builds fell from 78-117 s to 24-59 s, while the full lib
+# suite's run time rose from 12 s to 55-93 s. Run timing benchmarks with --release.
+[profile.test]
+opt-level = 0

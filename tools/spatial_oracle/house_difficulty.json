@@ -1,0 +1,1370 @@
+[
+  {
+    "difficulty": 0,
+    "input": {
+      "array_index": 0,
+      "country_rof": "3ff0000000000000",
+      "difficulty": 0,
+      "mode": 5,
+      "row_rof": [
+        "3fe99999a0000000",
+        "3ff0000000000000",
+        "3ff3333340000000"
+      ]
+    },
+    "rof_bias": "3fe99999a0000000",
+    "team_timer": [
+      100,
+      11
+    ]
+  },
+  {
+    "difficulty": 0,
+    "input": {
+      "array_index": 1,
+      "country_rof": "3ff0000000000000",
+      "difficulty": 0,
+      "mode": 5,
+      "row_rof": [
+        "3fe6666660000000",
+        "3ff4ccccc0000000",
+        "0000000000000000"
+      ]
+    },
+    "rof_bias": "3fe6666660000000",
+    "team_timer": [
+      100,
+      186
+    ]
+  },
+  {
+    "difficulty": 0,
+    "input": {
+      "array_index": 7,
+      "country_rof": "3ff0000000000000",
+      "difficulty": 0,
+      "mode": 5,
+      "row_rof": [
+        "0000000000000000",
+        "bfe0000000000000",
+        "3fefffffffffffff"
+      ]
+    },
+    "rof_bias": "0000000000000000",
+    "team_timer": [
+      100,
+      1236
+    ]
+  },
+  {
+    "difficulty": 1,
+    "input": {
+      "array_index": 16777217,
+      "country_rof": "3ff0000000000000",
+      "difficulty": 1,
+      "mode": 5,
+      "row_rof": [
+        "3fe99999a0000000",
+        "3ff0000000000000",
+        "3ff3333340000000"
+      ]
+    },
+    "rof_bias": "3ff0000000000000",
+    "team_timer": [
+      100,
+      -1358954299
+    ]
+  },
+  {
+    "difficulty": 1,
+    "input": {
+      "array_index": 0,
+      "country_rof": "3ff0000000000000",
+      "difficulty": 1,
+      "mode": 5,
+      "row_rof": [
+        "3fe6666660000000",
+        "3ff4ccccc0000000",
+        "0000000000000000"
+      ]
+    },
+    "rof_bias": "3ff4ccccc0000000",
+    "team_timer": [
+      100,
+      22
+    ]
+  },
+  {
+    "difficulty": 1,
+    "input": {
+      "array_index": 1,
+      "country_rof": "3ff0000000000000",
+      "difficulty": 1,
+      "mode": 5,
+      "row_rof": [
+        "0000000000000000",
+        "bfe0000000000000",
+        "3fefffffffffffff"
+      ]
+    },
+    "rof_bias": "bfe0000000000000",
+    "team_timer": [
+      100,
+      197
+    ]
+  },
+  {
+    "difficulty": 2,
+    "input": {
+      "array_index": 7,
+      "country_rof": "3ff0000000000000",
+      "difficulty": 2,
+      "mode": 5,
+      "row_rof": [
+        "3fe99999a0000000",
+        "3ff0000000000000",
+        "3ff3333340000000"
+      ]
+    },
+    "rof_bias": "3ff3333340000000",
+    "team_timer": [
+      100,
+      1258
+    ]
+  },
+  {
+    "difficulty": 2,
+    "input": {
+      "array_index": 16777217,
+      "country_rof": "3ff0000000000000",
+      "difficulty": 2,
+      "mode": 5,
+      "row_rof": [
+        "3fe6666660000000",
+        "3ff4ccccc0000000",
+        "0000000000000000"
+      ]
+    },
+    "rof_bias": "0000000000000000",
+    "team_timer": [
+      100,
+      -1358954288
+    ]
+  },
+  {
+    "difficulty": 2,
+    "input": {
+      "array_index": 0,
+      "country_rof": "3ff0000000000000",
+      "difficulty": 2,
+      "mode": 5,
+      "row_rof": [
+        "0000000000000000",
+        "bfe0000000000000",
+        "3fefffffffffffff"
+      ]
+    },
+    "rof_bias": "3fefffffffffffff",
+    "team_timer": [
+      100,
+      33
+    ]
+  },
+  {
+    "difficulty": 0,
+    "input": {
+      "array_index": 1,
+      "country_rof": "3ff19999a0000000",
+      "difficulty": 0,
+      "mode": 5,
+      "row_rof": [
+        "3fe99999a0000000",
+        "3ff0000000000000",
+        "3ff3333340000000"
+      ]
+    },
+    "rof_bias": "3fec28f5d3d70a40",
+    "team_timer": [
+      100,
+      186
+    ]
+  },
+  {
+    "difficulty": 0,
+    "input": {
+      "array_index": 7,
+      "country_rof": "3ff19999a0000000",
+      "difficulty": 0,
+      "mode": 5,
+      "row_rof": [
+        "3fe6666660000000",
+        "3ff4ccccc0000000",
+        "0000000000000000"
+      ]
+    },
+    "rof_bias": "3fe8a3d70c28f5c0",
+    "team_timer": [
+      100,
+      1236
+    ]
+  },
+  {
+    "difficulty": 0,
+    "input": {
+      "array_index": 16777217,
+      "country_rof": "3ff19999a0000000",
+      "difficulty": 0,
+      "mode": 5,
+      "row_rof": [
+        "0000000000000000",
+        "bfe0000000000000",
+        "3fefffffffffffff"
+      ]
+    },
+    "rof_bias": "0000000000000000",
+    "team_timer": [
+      100,
+      -1358954310
+    ]
+  },
+  {
+    "difficulty": 1,
+    "input": {
+      "array_index": 0,
+      "country_rof": "3ff19999a0000000",
+      "difficulty": 1,
+      "mode": 5,
+      "row_rof": [
+        "3fe99999a0000000",
+        "3ff0000000000000",
+        "3ff3333340000000"
+      ]
+    },
+    "rof_bias": "3ff19999a0000000",
+    "team_timer": [
+      100,
+      22
+    ]
+  },
+  {
+    "difficulty": 1,
+    "input": {
+      "array_index": 1,
+      "country_rof": "3ff19999a0000000",
+      "difficulty": 1,
+      "mode": 5,
+      "row_rof": [
+        "3fe6666660000000",
+        "3ff4ccccc0000000",
+        "0000000000000000"
+      ]
+    },
+    "rof_bias": "3ff6e147a851eb80",
+    "team_timer": [
+      100,
+      197
+    ]
+  },
+  {
+    "difficulty": 1,
+    "input": {
+      "array_index": 7,
+      "country_rof": "3ff19999a0000000",
+      "difficulty": 1,
+      "mode": 5,
+      "row_rof": [
+        "0000000000000000",
+        "bfe0000000000000",
+        "3fefffffffffffff"
+      ]
+    },
+    "rof_bias": "bfe19999a0000000",
+    "team_timer": [
+      100,
+      1247
+    ]
+  },
+  {
+    "difficulty": 2,
+    "input": {
+      "array_index": 16777217,
+      "country_rof": "3ff19999a0000000",
+      "difficulty": 2,
+      "mode": 5,
+      "row_rof": [
+        "3fe99999a0000000",
+        "3ff0000000000000",
+        "3ff3333340000000"
+      ]
+    },
+    "rof_bias": "3ff51eb867ae1480",
+    "team_timer": [
+      100,
+      -1358954288
+    ]
+  },
+  {
+    "difficulty": 2,
+    "input": {
+      "array_index": 0,
+      "country_rof": "3ff19999a0000000",
+      "difficulty": 2,
+      "mode": 5,
+      "row_rof": [
+        "3fe6666660000000",
+        "3ff4ccccc0000000",
+        "0000000000000000"
+      ]
+    },
+    "rof_bias": "0000000000000000",
+    "team_timer": [
+      100,
+      33
+    ]
+  },
+  {
+    "difficulty": 2,
+    "input": {
+      "array_index": 1,
+      "country_rof": "3ff19999a0000000",
+      "difficulty": 2,
+      "mode": 5,
+      "row_rof": [
+        "0000000000000000",
+        "bfe0000000000000",
+        "3fefffffffffffff"
+      ]
+    },
+    "rof_bias": "3ff199999fffffff",
+    "team_timer": [
+      100,
+      208
+    ]
+  },
+  {
+    "difficulty": 0,
+    "input": {
+      "array_index": 7,
+      "country_rof": "3fefffffffffffff",
+      "difficulty": 0,
+      "mode": 5,
+      "row_rof": [
+        "3fe99999a0000000",
+        "3ff0000000000000",
+        "3ff3333340000000"
+      ]
+    },
+    "rof_bias": "3fe999999fffffff",
+    "team_timer": [
+      100,
+      1236
+    ]
+  },
+  {
+    "difficulty": 0,
+    "input": {
+      "array_index": 16777217,
+      "country_rof": "3fefffffffffffff",
+      "difficulty": 0,
+      "mode": 5,
+      "row_rof": [
+        "3fe6666660000000",
+        "3ff4ccccc0000000",
+        "0000000000000000"
+      ]
+    },
+    "rof_bias": "3fe666665fffffff",
+    "team_timer": [
+      100,
+      -1358954310
+    ]
+  },
+  {
+    "difficulty": 0,
+    "input": {
+      "array_index": 0,
+      "country_rof": "3fefffffffffffff",
+      "difficulty": 0,
+      "mode": 5,
+      "row_rof": [
+        "0000000000000000",
+        "bfe0000000000000",
+        "3fefffffffffffff"
+      ]
+    },
+    "rof_bias": "0000000000000000",
+    "team_timer": [
+      100,
+      11
+    ]
+  },
+  {
+    "difficulty": 1,
+    "input": {
+      "array_index": 1,
+      "country_rof": "3fefffffffffffff",
+      "difficulty": 1,
+      "mode": 5,
+      "row_rof": [
+        "3fe99999a0000000",
+        "3ff0000000000000",
+        "3ff3333340000000"
+      ]
+    },
+    "rof_bias": "3fefffffffffffff",
+    "team_timer": [
+      100,
+      197
+    ]
+  },
+  {
+    "difficulty": 1,
+    "input": {
+      "array_index": 7,
+      "country_rof": "3fefffffffffffff",
+      "difficulty": 1,
+      "mode": 5,
+      "row_rof": [
+        "3fe6666660000000",
+        "3ff4ccccc0000000",
+        "0000000000000000"
+      ]
+    },
+    "rof_bias": "3ff4ccccbfffffff",
+    "team_timer": [
+      100,
+      1247
+    ]
+  },
+  {
+    "difficulty": 1,
+    "input": {
+      "array_index": 16777217,
+      "country_rof": "3fefffffffffffff",
+      "difficulty": 1,
+      "mode": 5,
+      "row_rof": [
+        "0000000000000000",
+        "bfe0000000000000",
+        "3fefffffffffffff"
+      ]
+    },
+    "rof_bias": "bfdfffffffffffff",
+    "team_timer": [
+      100,
+      -1358954299
+    ]
+  },
+  {
+    "difficulty": 2,
+    "input": {
+      "array_index": 0,
+      "country_rof": "3fefffffffffffff",
+      "difficulty": 2,
+      "mode": 5,
+      "row_rof": [
+        "3fe99999a0000000",
+        "3ff0000000000000",
+        "3ff3333340000000"
+      ]
+    },
+    "rof_bias": "3ff333333fffffff",
+    "team_timer": [
+      100,
+      33
+    ]
+  },
+  {
+    "difficulty": 2,
+    "input": {
+      "array_index": 1,
+      "country_rof": "3fefffffffffffff",
+      "difficulty": 2,
+      "mode": 5,
+      "row_rof": [
+        "3fe6666660000000",
+        "3ff4ccccc0000000",
+        "0000000000000000"
+      ]
+    },
+    "rof_bias": "0000000000000000",
+    "team_timer": [
+      100,
+      208
+    ]
+  },
+  {
+    "difficulty": 2,
+    "input": {
+      "array_index": 7,
+      "country_rof": "3fefffffffffffff",
+      "difficulty": 2,
+      "mode": 5,
+      "row_rof": [
+        "0000000000000000",
+        "bfe0000000000000",
+        "3fefffffffffffff"
+      ]
+    },
+    "rof_bias": "3feffffffffffffe",
+    "team_timer": [
+      100,
+      1258
+    ]
+  },
+  {
+    "difficulty": 0,
+    "input": {
+      "array_index": 16777217,
+      "country_rof": "3fecccccc0000000",
+      "difficulty": 0,
+      "mode": 5,
+      "row_rof": [
+        "3fe99999a0000000",
+        "3ff0000000000000",
+        "3ff3333340000000"
+      ]
+    },
+    "rof_bias": "3fe70a3d6c28f5c0",
+    "team_timer": [
+      100,
+      -1358954310
+    ]
+  },
+  {
+    "difficulty": 0,
+    "input": {
+      "array_index": 0,
+      "country_rof": "3fecccccc0000000",
+      "difficulty": 0,
+      "mode": 5,
+      "row_rof": [
+        "3fe6666660000000",
+        "3ff4ccccc0000000",
+        "0000000000000000"
+      ]
+    },
+    "rof_bias": "3fe428f5b3d70a40",
+    "team_timer": [
+      100,
+      11
+    ]
+  },
+  {
+    "difficulty": 0,
+    "input": {
+      "array_index": 1,
+      "country_rof": "3fecccccc0000000",
+      "difficulty": 0,
+      "mode": 5,
+      "row_rof": [
+        "0000000000000000",
+        "bfe0000000000000",
+        "3fefffffffffffff"
+      ]
+    },
+    "rof_bias": "0000000000000000",
+    "team_timer": [
+      100,
+      186
+    ]
+  },
+  {
+    "difficulty": 1,
+    "input": {
+      "array_index": 7,
+      "country_rof": "3fecccccc0000000",
+      "difficulty": 1,
+      "mode": 5,
+      "row_rof": [
+        "3fe99999a0000000",
+        "3ff0000000000000",
+        "3ff3333340000000"
+      ]
+    },
+    "rof_bias": "3fecccccc0000000",
+    "team_timer": [
+      100,
+      1247
+    ]
+  },
+  {
+    "difficulty": 1,
+    "input": {
+      "array_index": 16777217,
+      "country_rof": "3fecccccc0000000",
+      "difficulty": 1,
+      "mode": 5,
+      "row_rof": [
+        "3fe6666660000000",
+        "3ff4ccccc0000000",
+        "0000000000000000"
+      ]
+    },
+    "rof_bias": "3ff2b851d7ae1480",
+    "team_timer": [
+      100,
+      -1358954299
+    ]
+  },
+  {
+    "difficulty": 1,
+    "input": {
+      "array_index": 0,
+      "country_rof": "3fecccccc0000000",
+      "difficulty": 1,
+      "mode": 5,
+      "row_rof": [
+        "0000000000000000",
+        "bfe0000000000000",
+        "3fefffffffffffff"
+      ]
+    },
+    "rof_bias": "bfdcccccc0000000",
+    "team_timer": [
+      100,
+      22
+    ]
+  },
+  {
+    "difficulty": 2,
+    "input": {
+      "array_index": 1,
+      "country_rof": "3fecccccc0000000",
+      "difficulty": 2,
+      "mode": 5,
+      "row_rof": [
+        "3fe99999a0000000",
+        "3ff0000000000000",
+        "3ff3333340000000"
+      ]
+    },
+    "rof_bias": "3ff147ae1851eb80",
+    "team_timer": [
+      100,
+      208
+    ]
+  },
+  {
+    "difficulty": 2,
+    "input": {
+      "array_index": 7,
+      "country_rof": "3fecccccc0000000",
+      "difficulty": 2,
+      "mode": 5,
+      "row_rof": [
+        "3fe6666660000000",
+        "3ff4ccccc0000000",
+        "0000000000000000"
+      ]
+    },
+    "rof_bias": "0000000000000000",
+    "team_timer": [
+      100,
+      1258
+    ]
+  },
+  {
+    "difficulty": 2,
+    "input": {
+      "array_index": 16777217,
+      "country_rof": "3fecccccc0000000",
+      "difficulty": 2,
+      "mode": 5,
+      "row_rof": [
+        "0000000000000000",
+        "bfe0000000000000",
+        "3fefffffffffffff"
+      ]
+    },
+    "rof_bias": "3fecccccbfffffff",
+    "team_timer": [
+      100,
+      -1358954288
+    ]
+  },
+  {
+    "difficulty": 0,
+    "input": {
+      "array_index": 0,
+      "country_rof": "3ff0000000000000",
+      "difficulty": 0,
+      "mode": 0,
+      "row_rof": [
+        "3fe99999a0000000",
+        "3ff0000000000000",
+        "3ff3333340000000"
+      ]
+    },
+    "rof_bias": "3fe99999a0000000",
+    "team_timer": [
+      100,
+      11
+    ]
+  },
+  {
+    "difficulty": 0,
+    "input": {
+      "array_index": 1,
+      "country_rof": "3ff0000000000000",
+      "difficulty": 0,
+      "mode": 0,
+      "row_rof": [
+        "3fe6666660000000",
+        "3ff4ccccc0000000",
+        "0000000000000000"
+      ]
+    },
+    "rof_bias": "3fe6666660000000",
+    "team_timer": [
+      100,
+      186
+    ]
+  },
+  {
+    "difficulty": 0,
+    "input": {
+      "array_index": 7,
+      "country_rof": "3ff0000000000000",
+      "difficulty": 0,
+      "mode": 0,
+      "row_rof": [
+        "0000000000000000",
+        "bfe0000000000000",
+        "3fefffffffffffff"
+      ]
+    },
+    "rof_bias": "0000000000000000",
+    "team_timer": [
+      100,
+      1236
+    ]
+  },
+  {
+    "difficulty": 1,
+    "input": {
+      "array_index": 16777217,
+      "country_rof": "3ff0000000000000",
+      "difficulty": 1,
+      "mode": 0,
+      "row_rof": [
+        "3fe99999a0000000",
+        "3ff0000000000000",
+        "3ff3333340000000"
+      ]
+    },
+    "rof_bias": "3ff0000000000000",
+    "team_timer": [
+      100,
+      -1358954299
+    ]
+  },
+  {
+    "difficulty": 1,
+    "input": {
+      "array_index": 0,
+      "country_rof": "3ff0000000000000",
+      "difficulty": 1,
+      "mode": 0,
+      "row_rof": [
+        "3fe6666660000000",
+        "3ff4ccccc0000000",
+        "0000000000000000"
+      ]
+    },
+    "rof_bias": "3ff4ccccc0000000",
+    "team_timer": [
+      100,
+      22
+    ]
+  },
+  {
+    "difficulty": 1,
+    "input": {
+      "array_index": 1,
+      "country_rof": "3ff0000000000000",
+      "difficulty": 1,
+      "mode": 0,
+      "row_rof": [
+        "0000000000000000",
+        "bfe0000000000000",
+        "3fefffffffffffff"
+      ]
+    },
+    "rof_bias": "bfe0000000000000",
+    "team_timer": [
+      100,
+      197
+    ]
+  },
+  {
+    "difficulty": 2,
+    "input": {
+      "array_index": 7,
+      "country_rof": "3ff0000000000000",
+      "difficulty": 2,
+      "mode": 0,
+      "row_rof": [
+        "3fe99999a0000000",
+        "3ff0000000000000",
+        "3ff3333340000000"
+      ]
+    },
+    "rof_bias": "3ff3333340000000",
+    "team_timer": [
+      100,
+      1258
+    ]
+  },
+  {
+    "difficulty": 2,
+    "input": {
+      "array_index": 16777217,
+      "country_rof": "3ff0000000000000",
+      "difficulty": 2,
+      "mode": 0,
+      "row_rof": [
+        "3fe6666660000000",
+        "3ff4ccccc0000000",
+        "0000000000000000"
+      ]
+    },
+    "rof_bias": "0000000000000000",
+    "team_timer": [
+      100,
+      -1358954288
+    ]
+  },
+  {
+    "difficulty": 2,
+    "input": {
+      "array_index": 0,
+      "country_rof": "3ff0000000000000",
+      "difficulty": 2,
+      "mode": 0,
+      "row_rof": [
+        "0000000000000000",
+        "bfe0000000000000",
+        "3fefffffffffffff"
+      ]
+    },
+    "rof_bias": "3fefffffffffffff",
+    "team_timer": [
+      100,
+      33
+    ]
+  },
+  {
+    "difficulty": 0,
+    "input": {
+      "array_index": 1,
+      "country_rof": "3ff19999a0000000",
+      "difficulty": 0,
+      "mode": 0,
+      "row_rof": [
+        "3fe99999a0000000",
+        "3ff0000000000000",
+        "3ff3333340000000"
+      ]
+    },
+    "rof_bias": "3fe99999a0000000",
+    "team_timer": [
+      100,
+      186
+    ]
+  },
+  {
+    "difficulty": 0,
+    "input": {
+      "array_index": 7,
+      "country_rof": "3ff19999a0000000",
+      "difficulty": 0,
+      "mode": 0,
+      "row_rof": [
+        "3fe6666660000000",
+        "3ff4ccccc0000000",
+        "0000000000000000"
+      ]
+    },
+    "rof_bias": "3fe6666660000000",
+    "team_timer": [
+      100,
+      1236
+    ]
+  },
+  {
+    "difficulty": 0,
+    "input": {
+      "array_index": 16777217,
+      "country_rof": "3ff19999a0000000",
+      "difficulty": 0,
+      "mode": 0,
+      "row_rof": [
+        "0000000000000000",
+        "bfe0000000000000",
+        "3fefffffffffffff"
+      ]
+    },
+    "rof_bias": "0000000000000000",
+    "team_timer": [
+      100,
+      -1358954310
+    ]
+  },
+  {
+    "difficulty": 1,
+    "input": {
+      "array_index": 0,
+      "country_rof": "3ff19999a0000000",
+      "difficulty": 1,
+      "mode": 0,
+      "row_rof": [
+        "3fe99999a0000000",
+        "3ff0000000000000",
+        "3ff3333340000000"
+      ]
+    },
+    "rof_bias": "3ff0000000000000",
+    "team_timer": [
+      100,
+      22
+    ]
+  },
+  {
+    "difficulty": 1,
+    "input": {
+      "array_index": 1,
+      "country_rof": "3ff19999a0000000",
+      "difficulty": 1,
+      "mode": 0,
+      "row_rof": [
+        "3fe6666660000000",
+        "3ff4ccccc0000000",
+        "0000000000000000"
+      ]
+    },
+    "rof_bias": "3ff4ccccc0000000",
+    "team_timer": [
+      100,
+      197
+    ]
+  },
+  {
+    "difficulty": 1,
+    "input": {
+      "array_index": 7,
+      "country_rof": "3ff19999a0000000",
+      "difficulty": 1,
+      "mode": 0,
+      "row_rof": [
+        "0000000000000000",
+        "bfe0000000000000",
+        "3fefffffffffffff"
+      ]
+    },
+    "rof_bias": "bfe0000000000000",
+    "team_timer": [
+      100,
+      1247
+    ]
+  },
+  {
+    "difficulty": 2,
+    "input": {
+      "array_index": 16777217,
+      "country_rof": "3ff19999a0000000",
+      "difficulty": 2,
+      "mode": 0,
+      "row_rof": [
+        "3fe99999a0000000",
+        "3ff0000000000000",
+        "3ff3333340000000"
+      ]
+    },
+    "rof_bias": "3ff3333340000000",
+    "team_timer": [
+      100,
+      -1358954288
+    ]
+  },
+  {
+    "difficulty": 2,
+    "input": {
+      "array_index": 0,
+      "country_rof": "3ff19999a0000000",
+      "difficulty": 2,
+      "mode": 0,
+      "row_rof": [
+        "3fe6666660000000",
+        "3ff4ccccc0000000",
+        "0000000000000000"
+      ]
+    },
+    "rof_bias": "0000000000000000",
+    "team_timer": [
+      100,
+      33
+    ]
+  },
+  {
+    "difficulty": 2,
+    "input": {
+      "array_index": 1,
+      "country_rof": "3ff19999a0000000",
+      "difficulty": 2,
+      "mode": 0,
+      "row_rof": [
+        "0000000000000000",
+        "bfe0000000000000",
+        "3fefffffffffffff"
+      ]
+    },
+    "rof_bias": "3fefffffffffffff",
+    "team_timer": [
+      100,
+      208
+    ]
+  },
+  {
+    "difficulty": 0,
+    "input": {
+      "array_index": 7,
+      "country_rof": "3fefffffffffffff",
+      "difficulty": 0,
+      "mode": 0,
+      "row_rof": [
+        "3fe99999a0000000",
+        "3ff0000000000000",
+        "3ff3333340000000"
+      ]
+    },
+    "rof_bias": "3fe99999a0000000",
+    "team_timer": [
+      100,
+      1236
+    ]
+  },
+  {
+    "difficulty": 0,
+    "input": {
+      "array_index": 16777217,
+      "country_rof": "3fefffffffffffff",
+      "difficulty": 0,
+      "mode": 0,
+      "row_rof": [
+        "3fe6666660000000",
+        "3ff4ccccc0000000",
+        "0000000000000000"
+      ]
+    },
+    "rof_bias": "3fe6666660000000",
+    "team_timer": [
+      100,
+      -1358954310
+    ]
+  },
+  {
+    "difficulty": 0,
+    "input": {
+      "array_index": 0,
+      "country_rof": "3fefffffffffffff",
+      "difficulty": 0,
+      "mode": 0,
+      "row_rof": [
+        "0000000000000000",
+        "bfe0000000000000",
+        "3fefffffffffffff"
+      ]
+    },
+    "rof_bias": "0000000000000000",
+    "team_timer": [
+      100,
+      11
+    ]
+  },
+  {
+    "difficulty": 1,
+    "input": {
+      "array_index": 1,
+      "country_rof": "3fefffffffffffff",
+      "difficulty": 1,
+      "mode": 0,
+      "row_rof": [
+        "3fe99999a0000000",
+        "3ff0000000000000",
+        "3ff3333340000000"
+      ]
+    },
+    "rof_bias": "3ff0000000000000",
+    "team_timer": [
+      100,
+      197
+    ]
+  },
+  {
+    "difficulty": 1,
+    "input": {
+      "array_index": 7,
+      "country_rof": "3fefffffffffffff",
+      "difficulty": 1,
+      "mode": 0,
+      "row_rof": [
+        "3fe6666660000000",
+        "3ff4ccccc0000000",
+        "0000000000000000"
+      ]
+    },
+    "rof_bias": "3ff4ccccc0000000",
+    "team_timer": [
+      100,
+      1247
+    ]
+  },
+  {
+    "difficulty": 1,
+    "input": {
+      "array_index": 16777217,
+      "country_rof": "3fefffffffffffff",
+      "difficulty": 1,
+      "mode": 0,
+      "row_rof": [
+        "0000000000000000",
+        "bfe0000000000000",
+        "3fefffffffffffff"
+      ]
+    },
+    "rof_bias": "bfe0000000000000",
+    "team_timer": [
+      100,
+      -1358954299
+    ]
+  },
+  {
+    "difficulty": 2,
+    "input": {
+      "array_index": 0,
+      "country_rof": "3fefffffffffffff",
+      "difficulty": 2,
+      "mode": 0,
+      "row_rof": [
+        "3fe99999a0000000",
+        "3ff0000000000000",
+        "3ff3333340000000"
+      ]
+    },
+    "rof_bias": "3ff3333340000000",
+    "team_timer": [
+      100,
+      33
+    ]
+  },
+  {
+    "difficulty": 2,
+    "input": {
+      "array_index": 1,
+      "country_rof": "3fefffffffffffff",
+      "difficulty": 2,
+      "mode": 0,
+      "row_rof": [
+        "3fe6666660000000",
+        "3ff4ccccc0000000",
+        "0000000000000000"
+      ]
+    },
+    "rof_bias": "0000000000000000",
+    "team_timer": [
+      100,
+      208
+    ]
+  },
+  {
+    "difficulty": 2,
+    "input": {
+      "array_index": 7,
+      "country_rof": "3fefffffffffffff",
+      "difficulty": 2,
+      "mode": 0,
+      "row_rof": [
+        "0000000000000000",
+        "bfe0000000000000",
+        "3fefffffffffffff"
+      ]
+    },
+    "rof_bias": "3fefffffffffffff",
+    "team_timer": [
+      100,
+      1258
+    ]
+  },
+  {
+    "difficulty": 0,
+    "input": {
+      "array_index": 16777217,
+      "country_rof": "3fecccccc0000000",
+      "difficulty": 0,
+      "mode": 0,
+      "row_rof": [
+        "3fe99999a0000000",
+        "3ff0000000000000",
+        "3ff3333340000000"
+      ]
+    },
+    "rof_bias": "3fe99999a0000000",
+    "team_timer": [
+      100,
+      -1358954310
+    ]
+  },
+  {
+    "difficulty": 0,
+    "input": {
+      "array_index": 0,
+      "country_rof": "3fecccccc0000000",
+      "difficulty": 0,
+      "mode": 0,
+      "row_rof": [
+        "3fe6666660000000",
+        "3ff4ccccc0000000",
+        "0000000000000000"
+      ]
+    },
+    "rof_bias": "3fe6666660000000",
+    "team_timer": [
+      100,
+      11
+    ]
+  },
+  {
+    "difficulty": 0,
+    "input": {
+      "array_index": 1,
+      "country_rof": "3fecccccc0000000",
+      "difficulty": 0,
+      "mode": 0,
+      "row_rof": [
+        "0000000000000000",
+        "bfe0000000000000",
+        "3fefffffffffffff"
+      ]
+    },
+    "rof_bias": "0000000000000000",
+    "team_timer": [
+      100,
+      186
+    ]
+  },
+  {
+    "difficulty": 1,
+    "input": {
+      "array_index": 7,
+      "country_rof": "3fecccccc0000000",
+      "difficulty": 1,
+      "mode": 0,
+      "row_rof": [
+        "3fe99999a0000000",
+        "3ff0000000000000",
+        "3ff3333340000000"
+      ]
+    },
+    "rof_bias": "3ff0000000000000",
+    "team_timer": [
+      100,
+      1247
+    ]
+  },
+  {
+    "difficulty": 1,
+    "input": {
+      "array_index": 16777217,
+      "country_rof": "3fecccccc0000000",
+      "difficulty": 1,
+      "mode": 0,
+      "row_rof": [
+        "3fe6666660000000",
+        "3ff4ccccc0000000",
+        "0000000000000000"
+      ]
+    },
+    "rof_bias": "3ff4ccccc0000000",
+    "team_timer": [
+      100,
+      -1358954299
+    ]
+  },
+  {
+    "difficulty": 1,
+    "input": {
+      "array_index": 0,
+      "country_rof": "3fecccccc0000000",
+      "difficulty": 1,
+      "mode": 0,
+      "row_rof": [
+        "0000000000000000",
+        "bfe0000000000000",
+        "3fefffffffffffff"
+      ]
+    },
+    "rof_bias": "bfe0000000000000",
+    "team_timer": [
+      100,
+      22
+    ]
+  },
+  {
+    "difficulty": 2,
+    "input": {
+      "array_index": 1,
+      "country_rof": "3fecccccc0000000",
+      "difficulty": 2,
+      "mode": 0,
+      "row_rof": [
+        "3fe99999a0000000",
+        "3ff0000000000000",
+        "3ff3333340000000"
+      ]
+    },
+    "rof_bias": "3ff3333340000000",
+    "team_timer": [
+      100,
+      208
+    ]
+  },
+  {
+    "difficulty": 2,
+    "input": {
+      "array_index": 7,
+      "country_rof": "3fecccccc0000000",
+      "difficulty": 2,
+      "mode": 0,
+      "row_rof": [
+        "3fe6666660000000",
+        "3ff4ccccc0000000",
+        "0000000000000000"
+      ]
+    },
+    "rof_bias": "0000000000000000",
+    "team_timer": [
+      100,
+      1258
+    ]
+  },
+  {
+    "difficulty": 2,
+    "input": {
+      "array_index": 16777217,
+      "country_rof": "3fecccccc0000000",
+      "difficulty": 2,
+      "mode": 0,
+      "row_rof": [
+        "0000000000000000",
+        "bfe0000000000000",
+        "3fefffffffffffff"
+      ]
+    },
+    "rof_bias": "3fefffffffffffff",
+    "team_timer": [
+      100,
+      -1358954288
+    ]
+  }
+]

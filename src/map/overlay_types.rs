@@ -18,23 +18,15 @@ pub(crate) use crate::rules::overlay_types::{
 
 /// Check if an overlay index is one of the four high-bridge map-load anchors
 /// that dispatch through `SetBridgeDirection`.
+#[cfg(test)]
 pub fn is_high_bridge_anchor_overlay_index(id: u8) -> bool {
     crate::map::bridge_facts::high_bridge_stamp_for_overlay(id).is_some()
 }
 
 /// Get the binary `SetBridgeDirection` direction for a high-bridge anchor.
+#[cfg(test)]
 pub fn high_bridge_stamp_direction(id: u8) -> Option<u8> {
     crate::map::bridge_facts::high_bridge_stamp_for_overlay(id).map(|(_, dir)| dir)
-}
-
-/// Get the bridge direction from a high bridge overlay index.
-/// Returns None for low bridges or non-bridge indices.
-pub fn high_bridge_direction(id: u8) -> Option<u8> {
-    match id {
-        24 | 237 => Some(1), // Direction 1 (EW / NE-SW)
-        25 | 238 => Some(2), // Direction 2 (NS / NW-SE)
-        _ => None,
-    }
 }
 
 #[cfg(test)]

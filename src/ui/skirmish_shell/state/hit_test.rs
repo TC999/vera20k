@@ -4,9 +4,9 @@ use crate::map::scenario_menu::MapMenuEntry;
 use crate::skirmish_launch::SKIRMISH_PLAYER_SLOT_COUNT;
 
 use super::super::layout::{
-    COMBO_DROPDOWN_ROW_H, ChooseMapModalButton, ChooseMapModalLayout, ColorComboId, RectPx,
-    SKIRMISH_AI_ROW_COUNT, SkirmishCheckboxId, SkirmishShellLayout, SkirmishTrackbarId,
-    choose_map_listbox_row_at, combo_face_rect,
+    COMBO_DROPDOWN_ROW_H, ChooseMapModalButton, ChooseMapModalLayout, ColorComboId,
+    RandomMapSetupControl, RectPx, SKIRMISH_AI_ROW_COUNT, SkirmishCheckboxId, SkirmishShellLayout,
+    SkirmishTrackbarId, combo_face_rect,
 };
 use super::trackbars::{trackbar_ids, trackbar_rect};
 use super::{
@@ -182,7 +182,6 @@ pub fn status_help_key_for_hover(target: SkirmishHoverTarget) -> Option<&'static
 pub fn hovered_choose_map_modal_control(
     layout: &ChooseMapModalLayout,
     modal: &ChooseMapModalState,
-    mode_count: usize,
     x: i32,
     y: i32,
 ) -> Option<ChooseMapHoverTarget> {
@@ -196,10 +195,13 @@ pub fn hovered_choose_map_modal_control(
         return Some(ChooseMapHoverTarget::Preview0x468);
     }
     if layout.mode_list.contains(x, y) {
-        if let Some(mode_index) =
-            choose_map_listbox_row_at(layout.mode_list, mode_count, modal.mode_top_index, x, y)
+        let rows = modal.mode_rows();
+        if let Some(row) =
+            modal
+                .mode_geometry(layout)
+                .row_at(rows.len(), modal.mode_top_index, x, y)
         {
-            return Some(ChooseMapHoverTarget::ModeListRow0x6eb { mode_index });
+            return Some(ChooseMapHoverTarget::ModeListRow0x6eb { mode_id: rows[row] });
         }
         return Some(ChooseMapHoverTarget::ModeList0x6eb);
     }
@@ -226,6 +228,27 @@ pub fn status_help_key_for_choose_map_hover(target: ChooseMapHoverTarget) -> Opt
         ChooseMapHoverTarget::Button(ChooseMapModalButton::Cancel0x5c0) => {
             Some("STT:ScenarioButtonCancel")
         }
+    }
+}
+
+/// The random-map dialog `0x105`'s status help: the table lookup
+/// `0x006040B0` for its controls (`tools/storage_oracle/shell_help_keys.py`).
+pub fn status_help_key_for_random_map_setup(control: RandomMapSetupControl) -> &'static str {
+    use RandomMapSetupControl as C;
+    match control {
+        C::MapType0x405 => "STT:GenerateCBoxEnvironment",
+        C::Time0x3ea => "STT:GenerateCBoxTime",
+        C::Theater0x407 => "STT:GenerateCBoxTheater",
+        C::Size0x406 => "STT:GenerateCBoxMapSize",
+        C::Resources0x408 => "STT:GenerateCBoxResources",
+        C::Players0x3eb => "STT:GenerateSliderNumPlayers",
+        C::Randomize0x621 => "STT:GenerateButtonSurprise",
+        C::Generate0x620 => "STT:GenerateButtonPreview",
+        C::Ok0x6c5 => "STT:GenerateButtonUseMap",
+        C::Load0x6c2 => "STT:GenerateButtonLoadMap",
+        C::Save0x6c3 => "STT:GenerateButtonSaveMap",
+        C::Delete0x6c4 => "STT:GenerateButtonDeleteMap",
+        C::Cancel0x5c0 => "STT:GenerateButtonCancel",
     }
 }
 

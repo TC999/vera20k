@@ -1,13 +1,13 @@
-//! Cell entry classification — unified Can_Enter_Cell result codes.
+//! Cell entry classification for the legacy movement pass, and the terrain arm.
 //!
 //! The original RA2 engine returns 8 distinct codes when a unit
 //! tries to enter a cell. Each code triggers a different movement response.
-//! This module centralizes the classification logic that was previously
-//! scattered as inline boolean checks in movement.rs.
-//!
-//! Two-phase design for borrow checker compatibility:
-//! - Phase 1 (`check_terrain`): terrain + occupancy presence, no EntityStore needed
-//! - Phase 2 (`classify_occupied_cell`): blocker friendship/crush, needs &EntityStore
+//! The classes' own `Can_Enter_Cell` ports are `Simulation::foot_can_enter`
+//! and `aircraft_can_enter` (`world/object_entry.rs`). This module keeps the
+//! legacy movement pass's blocker classification
+//! (`classify_occupied_cell_with_occupation_and_slave_query`, which reads
+//! `&EntityStore` outside the pass's mutable borrow; #689) and the
+//! terrain-only `evaluate_can_enter_cell`.
 //!
 //! Bridge legality is now driven by A*'s `path_layers` (set per-step by `astar_search`
 //! with the Ground→Bridge gates verified against the reference predicate), which
@@ -40,22 +40,14 @@
 //! does not, recorded rather than guessed and ordered by ordinary-skirmish
 //! impact:
 //!
-//! - **`Gate=` buildings take the garrison arm.** [`classify_blocker`] maps a
-//!   closed or opening `BuildingGateRuntime` to `ScatterRequired` (code 3), but
-//!   code 3 in gamemd is `BuildingTypeClass+0x16B7` plus
-//!   `!BuildingClass::CanGarrison()` — the garrison flag, read at `0x004525F9`.
-//!   `Gate=` is a different field, `+0x16C0` (read by
-//!   `BuildingClass::TogglePowerOrGate` @ `0x004471CB`), and its arm is its own
-//!   branch, and it never reads the gate's open/closed state at all: the
-//!   occupant is **skipped whole**, leaving the running code untouched, whenever
-//!   `occupant->Owner+0x1FA` is clear, and is **`return 7`** when it is set. A
-//!   gate never yields code 3. Trigger: any
-//!   move order whose path crosses a friendly gate. Player effect: VERA's code 3
-//!   routes into the scatter arm, which asks a *structure* to move out of the
-//!   way; retail either walks through or treats it as solid. Frequency: common
-//!   from mid-game on, in every walled base. Downstream risk: the test
-//!   `friendly_closed_or_opening_gate_returns_code_3_not_code_6` pins the wrong
-//!   mapping and must be re-baselined with the fix.
+//! - **Gate identity corrected (2026-09-22).** `BuildingType+16B7` is `Gate=`:
+//!   ReadINI4609EA..460A13 reads literal81AA8C. `4525F0` is gate passability,
+//!   requiring Open mission24 and stable-open animation state. Unit73F6E8
+//!   skips an open gate; a closed allied gate raises3, armed enemy raises5,
+//!   unarmed enemy returns7. The old garrison interpretation was false.
+//!   `+16C0` is the separate FirestormWall flag. Complete Unit-call evidence:
+//!   `tools/spatial_oracle/unit_entry`. This establishes classification, not
+//!   the downstream gate-opening/scatter response for every caller.
 //! - **The wall arm produces the wrong code, not no code.** `cell_rect`'s
 //!   `is_wall_overlay` / `WallBlocked` path is live and MovementZone-keyed, and
 //!   its Destroyer-class escape set matches native's `{2, 3, 8, 0xC}` at
@@ -63,9 +55,15 @@
 //!   a friendly wall and **5** for an enemy one (Unit: `OverlayTypeClass+0x2A8`
 //!   at `0x0073F420` with the `Crushable=` gate `+0x22D` at `0x0073F42E`;
 //!   Infantry: `5 - isAlly`), and 4 and 5 both still expand in the A*. Retail
-//!   therefore routes *through* a wall line at 60×/20× cost and stops at it;
-//!   VERA reports no path. [`CellEntryResult::FriendlyWall`] consequently has no
-//!   producer. Trigger: any expansion into a `Wall=yes` overlay cell. Player
+//!   therefore routes *through* a wall line at 60×/20× cost and stops at it.
+//!   **Partly addressed by I9b (2026-09-16):** the runtime cell crossing now
+//!   produces 4 and 5 and dispatches the wall-attack Override, so
+//!   [`CellEntryResult::FriendlyWall`] has a producer there. The **A\*** still
+//!   hard-blocks, which is what the rest of this paragraph describes and what
+//!   bounds the fix: because order-time search never routes into a wall cell,
+//!   the arm fires only where a wall appears across an already-moving mover's
+//!   path and the following repath fails. Trigger: any expansion into a
+//!   `Wall=yes` overlay cell. Player
 //!   effect: a move order whose destination is enclosed by walls is refused
 //!   outright instead of routing to the wall and stopping. Frequency: pre-placed
 //!   civilian fences appear on most stock maps, so this fires many times a match
@@ -139,25 +137,25 @@
 //!   at `0x0051C821` — in the allied-occupier arm `counter == 3 ? 6 : 2`
 //!   (`0x0051C826`-`0x0051C830`: `SUB / NEG / SBB / AND 0xFFFFFFFC / ADD 6`, so
 //!   a counter of exactly 3 gives 6 and anything else gives 2), where `counter`
-//!   counts the non-moving allied infantry found during the walk. VERA's
-//!   `check_terrain` returns
-//!   `NeedsBlockerCheck` with no counter and no `0x1C` test. Trigger: a fourth
+//!   counts the non-moving allied infantry found during the walk. The legacy
+//!   classifier keeps no counter and no `0x1C` test. Trigger: a fourth
 //!   infantryman ordered into a full friendly cell. Player effect: VERA yields 6
 //!   (scatter) where retail yields 2 (wait) or 7. Frequency: constant in
 //!   infantry-heavy play. Downstream risk: the counter has to be threaded
 //!   through the walk, which is the one structural change on this list.
-//! - **Code 1 is the wrong producer.** VERA emits `Crushable` (code 1) for a
-//!   successful crush; gamemd returns **0** for a crush on the Unit latch path
-//!   and 2 when a vehicle also occupies the cell. Code 1 comes from an unrelated
-//!   `+0x220 == 2` test in the non-allied branch — where the base is **not** the
-//!   occupant but the return value of `FUN_0040DD20()`, and both the receiver's
-//!   type and the field's meaning are UNCHECKED. Trigger: any crush. Player effect: **none today** — movement
-//!   groups `Clear | Crushable` at the same call site. Frequency: n/a while the
-//!   cost table is unwired. Downstream risk: the moment `0x0081870C` is wired,
-//!   code 1 costs 1000× where code 0 costs 1×, so every crushable cell becomes a
-//!   near-wall to the search. The crush-latch comment on
-//!   [`classify_occupied_cell_with_layers_and_ignored`] is correct for
-//!   `UnitClass` and **false for Infantry**, which has no crush latch at all.
+//! - **Mixed crush/vehicle occupation uses the native tail.** The semantic
+//!   `Crushable` payload now maps to code0: Unit73FB67 sets the latch without
+//!   raising the accumulator, and73FD37 returns0. Admission leaves killing to
+//!   PerCell. With the independent vehicle bit set,73FCF6..73FD23 instead
+//!   queries GetUnit and IsCrushableBy, returning2 unless that vehicle is also
+//!   crushable. The runtime wrapper reads the selected raw plane and queries
+//!   the first GROUND-list Unit, including self/allied entries. The supplied
+//!   post-walk continuation is compared in `cell_entry_crush_tail_tests.rs`.
+//!   The preceding latch producer still uses `bump_crush`'s recorded capability,
+//!   target-category and frame-independent eligibility approximations; this is
+//!   not complete Unit CanEnter parity.
+//!   Native code1 comes from the unrelated non-allied +220 branch. The Unit
+//!   latch must not be generalized to Infantry, which has no such latch.
 //! - **`MovementRestrictedTo=`** (`UnitTypeClass+0xDFC`, Unit only): when set,
 //!   the cell's land type must equal it. LandType 10 (Tunnel) is exempt from the
 //!   equality test but carries its own rule — `g_IsometricTileTypeClass_Array`
@@ -215,7 +213,7 @@ use crate::sim::entity_store::EntityStore;
 use crate::sim::game_entity::GameEntity;
 use crate::sim::movement::bump_crush;
 use crate::sim::movement::locomotor::MovementLayer;
-use crate::sim::occupancy::{CellOccupationGrid, OccupancyGrid};
+use crate::sim::occupancy::{CellOccupationGrid, OccupancyGrid, RawCellOccupationGrid};
 
 // ---------------------------------------------------------------------------
 // Result enums
@@ -230,7 +228,8 @@ use crate::sim::occupancy::{CellOccupationGrid, OccupancyGrid};
 pub enum CellEntryResult {
     /// Code 0: Cell is passable. Enter freely.
     Clear,
-    /// Code 1: Cell contains crushable occupants. Crush and enter.
+    /// Code 0 with crushable occupants. Admission does not kill them; the
+    /// Unit PerCell receiver owns crushing after movement reaches the cell.
     Crushable { victims: Vec<u64> },
     /// Code 2: Blocked by a moving friendly unit. Wait, then repath.
     TemporaryBlock { blocker_id: u64 },
@@ -239,11 +238,11 @@ pub enum CellEntryResult {
     TemporaryOccupation,
     /// Code 3: Allied building/scatter-required soft block.
     ScatterRequired { blocker_id: Option<u64> },
-    /// Code 4: Friendly wall/overlay soft block.
-    ///
-    /// **No producer.** VERA does not classify wall overlays at cell entry; see
-    /// the module header for the native arm and its residual.
+    /// Code 4: Friendly wall/overlay soft block, targeting the queried cell.
     FriendlyWall,
+    /// Code 5: Enemy or unowned wall, targeting the queried cell rather than
+    /// inventing an object-list blocker identity.
+    EnemyWall,
     /// Code 5: Enemy unit occupying. Attack blocker while waiting.
     OccupiedEnemy { blocker_id: u64 },
     /// Code 6: Friendly stationary non-building occupant.
@@ -256,29 +255,17 @@ impl CellEntryResult {
     pub fn yr_code(&self) -> u8 {
         match self {
             Self::Clear => 0,
-            Self::Crushable { .. } => 1,
+            // Unit73FB67 sets the crush latch without raising the code;
+            // its clear tail73FD37 returns0. Native code1 is unrelated.
+            Self::Crushable { .. } => 0,
             Self::TemporaryBlock { .. } | Self::TemporaryOccupation => 2,
             Self::ScatterRequired { .. } => 3,
             Self::FriendlyWall => 4,
-            Self::OccupiedEnemy { .. } => 5,
+            Self::EnemyWall | Self::OccupiedEnemy { .. } => 5,
             Self::FriendlyStationary { .. } => 6,
             Self::Impassable => 7,
         }
     }
-}
-
-/// Phase 1 result — terrain and basic occupancy check (no EntityStore needed).
-///
-/// Computed inside the mutable entity borrow where we cannot also access
-/// EntityStore for blocker lookups.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TerrainCheckResult {
-    /// Cell is passable (terrain OK, occupancy clear or sub-cell available).
-    Clear,
-    /// Terrain impassable for this unit type.
-    Impassable,
-    /// Cell has occupants — needs Phase 2 EntityStore lookup to classify.
-    NeedsBlockerCheck,
 }
 
 /// Terrain-only result for native-shaped cell-entry checks above `PathGrid`.
@@ -331,9 +318,9 @@ pub struct SearchCellCostDecision {
 /// mechanism nothing in stock YR enables — latent, not live.
 pub fn search_cell_cost_decision(
     raw_cost_class: u8,
-    coerce_to_zero_gate: bool,
+    mover_is_train: bool,
 ) -> SearchCellCostDecision {
-    let effective_cost_class = if coerce_to_zero_gate && raw_cost_class < 7 {
+    let effective_cost_class = if mover_is_train && raw_cost_class < 7 {
         0
     } else {
         raw_cost_class
@@ -354,16 +341,6 @@ impl CanEnterCellResult {
     }
 }
 
-/// Caller flavor for the terrain-entry slice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TerrainEntryMode {
-    AStarNeighbor,
-    RuntimeTransition,
-    Smoothing,
-    Scatter,
-    SpawnLike,
-}
-
 /// Native-shaped known-input context for the terrain/layer portion of cell entry.
 ///
 /// This deliberately stops before the unresolved search-only cost class and the
@@ -379,7 +356,6 @@ pub struct CanEnterCellContext<'a> {
     pub resolved_terrain: Option<&'a ResolvedTerrainGrid>,
     pub terrain_costs: Option<&'a TerrainCostGrid>,
     pub bypass_grid: bool,
-    pub mode: TerrainEntryMode,
     /// Selects the infantry view of terrain-object occupation. Retail terrain
     /// objects occupy sub-cells, and only the infantry entry gate reads that
     /// mask; vehicles stay blocked by the whole cell.
@@ -391,6 +367,39 @@ pub struct CanEnterCellContext<'a> {
     /// Wall-arm inputs. `None` keeps the coarse pre-I9b answer (a wall is a
     /// hard block), which is what every caller without a resolved mover wants.
     pub wall: Option<WallArmContext<'a>>,
+}
+
+/// The map-global tables the wall arm needs, carried on the pathfinding context.
+///
+/// Split from [`WallArmContext`] deliberately, and the split is the whole point
+/// of the seam. These three are map-global — identical for every mover — so they
+/// ride on `PathfindingContext` and no caller ever supplies them. The *mover*
+/// facts (`owner`, `is_armed`, the two warhead bools) have a different lifetime,
+/// one per mover, and are resolved by exactly two authorities: `snapshot_mover`
+/// on the tick path and `resolve_move_info` on the order path.
+///
+/// Ledger row I9c is the counter-example this shape exists to avoid: a mover
+/// fact (`mover_is_crusher`) was derived independently at each call site, and the
+/// sites lacking context silently passed `false`, so the same unit behaved
+/// differently depending on which function issued its move. Tables that no
+/// caller passes cannot diverge that way.
+///
+/// The interner is deliberately **not** here. [`WallArmContext`] is built per
+/// mover at the point of use, where an immutable reborrow is already in scope;
+/// holding `&StringInterner` on a context that outlives the whole pass would
+/// collide with the `&mut` the pass still needs (movement_tick.rs:4023, :4049,
+/// :4114, :3855).
+#[derive(Clone, Copy)]
+pub struct WallArmTables<'a> {
+    pub overlay_grid: Option<&'a crate::sim::overlay_grid::OverlayGrid>,
+    pub overlay_registry: Option<&'a crate::map::overlay_types::OverlayTypeRegistry>,
+    pub alliances: Option<&'a crate::map::houses::HouseAllianceMap>,
+    /// Map-global like the other three: the ally test resolves the wall's owner
+    /// name through it before `HouseClass::Is_Ally_ByIndex @ 0x004F9A10`. It
+    /// used to be supplied separately at the one runtime site that built a
+    /// `WallArmContext`, which left the search site unable to build one at all
+    /// without threading a second value; it belongs with the tables.
+    pub interner: Option<&'a crate::sim::intern::StringInterner>,
 }
 
 /// Everything the wall arm of `Can_Enter_Cell` reads that terrain alone cannot
@@ -457,6 +466,13 @@ impl WallArmContext<'_> {
         else {
             return false;
         };
+        // RESIDUAL (ledger I9b): `is_allied_with` normalizes both names, i.e. two
+        // String allocations per query, and this runs once per refused neighbour
+        // inside the A* loop. Pre-existing, not introduced here. An id-keyed
+        // lookup is the right fix but must be built once per *frame* and cached
+        // (`MovementPassCache`) — a first attempt rebuilt it per object per frame,
+        // which is strictly worse, and silently dropped alliance rows for house
+        // names carrying whitespace because the interner does not trim.
         crate::map::houses::is_allied_with(
             alliances,
             interner.resolve(mover),
@@ -548,7 +564,6 @@ impl crate::sim::pathfinding::SearchCellCostClassifier for WallSearchCostClassif
             resolved_terrain: self.resolved_terrain,
             terrain_costs: self.terrain_costs,
             bypass_grid: false,
-            mode: TerrainEntryMode::AStarNeighbor,
             is_infantry: self.is_infantry,
             mover_is_crusher: self.mover_is_crusher,
         }) {
@@ -564,6 +579,47 @@ impl crate::sim::pathfinding::SearchCellCostClassifier for WallSearchCostClassif
             CanEnterCellResult::WallBlocked { cost_class } => cost_class,
             CanEnterCellResult::HardBlocked => 7,
         }
+    }
+}
+
+/// The Foot `+0x1AC` cost class for a slave: `InfantryClass::Can_Enter_Cell`
+/// (`0x0051C29E..0x0051C2CA`) clears the master Building's occupation on the
+/// slave's own deposit Cells (`SlaveManagerClass 0x006B0880`), so
+/// `AStar_main_loop @ 0x00429A90` can end a path inside the refinery. The
+/// ground Cell's terrain still decides; every other Cell goes to `inner`.
+pub struct SlaveDepositSearchClassifier<'a> {
+    pub cells: [Option<(u16, u16)>; 2],
+    pub inner: Option<&'a dyn crate::sim::pathfinding::SearchCellCostClassifier>,
+    pub path_grid: Option<&'a PathGrid>,
+    pub resolved_terrain: Option<&'a ResolvedTerrainGrid>,
+    pub terrain_costs: Option<&'a TerrainCostGrid>,
+    pub movement_zone: Option<MovementZone>,
+    pub speed_type: Option<SpeedType>,
+}
+
+impl crate::sim::pathfinding::SearchCellCostClassifier for SlaveDepositSearchClassifier<'_> {
+    fn classify(&self, from: (u16, u16), candidate: (u16, u16), bridge: bool) -> u8 {
+        if !bridge && self.cells.contains(&Some(candidate)) {
+            return match evaluate_can_enter_cell(CanEnterCellContext {
+                wall: None,
+                target: candidate,
+                terrain_layer: MovementLayer::Ground,
+                movement_zone: self.movement_zone,
+                speed_type: self.speed_type,
+                path_grid: self.path_grid,
+                resolved_terrain: self.resolved_terrain,
+                terrain_costs: self.terrain_costs,
+                bypass_grid: true,
+                is_infantry: true,
+                mover_is_crusher: false,
+            }) {
+                CanEnterCellResult::Clear => 0,
+                CanEnterCellResult::WallBlocked { cost_class } => cost_class,
+                CanEnterCellResult::HardBlocked => 7,
+            };
+        }
+        self.inner
+            .map_or(7, |inner| inner.classify(from, candidate, bridge))
     }
 }
 
@@ -778,9 +834,12 @@ fn evaluate_shared_cell_leaf(
         // is); `0x0073F455..F46C`: `MovementZone=CrusherAll` (+0x5B4 == 0xC)
         // enters any `Wall=`; everything else, and every infantryman
         // (`0x0051BF90` has no crusher route), takes the weapon/warhead route
-        // that answers 4/5 or 7. The 4/5 codes have no producer yet, so that
-        // route is the hard block below; the allied-wall 4 and ability 0x11
-        // are likewise unmodelled.
+        // that answers 4/5 or 7. The runtime crossing produces 4/5 since
+        // 2026-09-16; the A* search does only for Walk orders
+        // (`walk_path.rs` builds the classifier; the order path and the Drive
+        // tick contexts leave it off, ledger I9b), so elsewhere that route is
+        // the hard block below; the allied-wall 4 and ability 0x11 are
+        // likewise unmodelled.
         let crushable_wall =
             terrain_cell.is_some_and(|cell| cell.zone_type == zone_class::CRUSHABLE);
         let crushable_wall_admitted =
@@ -817,7 +876,14 @@ fn evaluate_shared_cell_leaf(
         // 0.0`); a zero row returns 7 at `0x0073FAD0` whatever the arm
         // accumulated, and `InfantryClass` does the same at `0x0051C7D0`. So a
         // wall overlay on terrain whose speed row refuses this mover answers 7,
-        // not 4/5 — the classes survive only where the terrain itself admits.
+        // not 4/5 - the classes survive only where the LAND ROW admits, which
+        // is not the same as the terrain beneath. Review corrected this:
+        // `OverlayTypeFlags::no_use_tile_land_type` defaults **true**, so a
+        // stock wall overlay writes its own `Clear` row into the cell and a
+        // wall over water or rock reads as passable here. Native reads the
+        // same stored LandType at `0x0073FAB5`, so this is plausibly parity
+        // rather than a defect, and stock maps do not place walls on water -
+        // but what the code checks is the stored row, not the ground.
         //
         // `land_row_passable` is that row alone, deliberately not
         // `land_passable`: see this function's doc for why the wider term would
@@ -902,65 +968,6 @@ impl CanEnterLayerContext {
             occupancy_bits_layer: layer,
         }
     }
-}
-
-/// Read-only cell-entry oracle row preserving gamemd's split layer decisions.
-#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
-pub struct CellEntryOracleRow {
-    pub target: (u16, u16),
-    pub terrain_layer: MovementLayer,
-    pub object_list_layer: MovementLayer,
-    pub occupancy_bits_layer: MovementLayer,
-    pub terrain_result: String,
-    pub yr_code: Option<u8>,
-    pub occupancy_ground_present: bool,
-    pub occupancy_bridge_present: bool,
-}
-
-impl CellEntryOracleRow {
-    pub fn from_terrain_result(
-        target: (u16, u16),
-        layers: CanEnterLayerContext,
-        result: TerrainCheckResult,
-        occupancy: &OccupancyGrid,
-    ) -> Self {
-        let occ = occupancy.get(target.0, target.1);
-        Self {
-            target,
-            terrain_layer: layers.terrain_layer,
-            object_list_layer: layers.object_list_layer,
-            occupancy_bits_layer: layers.occupancy_bits_layer,
-            terrain_result: format!("{:?}", result),
-            yr_code: match result {
-                TerrainCheckResult::Clear => Some(CellEntryResult::Clear.yr_code()),
-                TerrainCheckResult::Impassable => Some(CellEntryResult::Impassable.yr_code()),
-                TerrainCheckResult::NeedsBlockerCheck => None,
-            },
-            occupancy_ground_present: occ.is_some_and(|o| !o.is_empty_on(MovementLayer::Ground)),
-            occupancy_bridge_present: occ.is_some_and(|o| !o.is_empty_on(MovementLayer::Bridge)),
-        }
-    }
-}
-
-/// Opt-in diagnostic wrapper for Phase-1 cell entry checks.
-pub fn check_terrain_with_layers_oracle(
-    target: (u16, u16),
-    layers: CanEnterLayerContext,
-    mover_category: EntityCategory,
-    path_grid: Option<&PathGrid>,
-    cost_grid: Option<&TerrainCostGrid>,
-    occupancy: &OccupancyGrid,
-) -> (TerrainCheckResult, CellEntryOracleRow) {
-    let result = check_terrain_with_layers(
-        target,
-        layers,
-        mover_category,
-        path_grid,
-        cost_grid,
-        occupancy,
-    );
-    let row = CellEntryOracleRow::from_terrain_result(target, layers, result, occupancy);
-    (result, row)
 }
 
 /// Vehicle-only building entry branch that may reach the live row helper.
@@ -1060,94 +1067,6 @@ pub fn decide_live_vehicle_building_entry(
 }
 
 // ---------------------------------------------------------------------------
-// Phase 1: terrain + occupancy presence
-// ---------------------------------------------------------------------------
-
-/// Check terrain walkability and basic occupancy for a target cell.
-///
-/// This is Phase 1 of the two-phase cell entry check. It does NOT access
-/// EntityStore, so it can run inside a mutable entity borrow.
-///
-/// For infantry movers, also checks sub-cell availability.
-pub fn check_terrain(
-    target: (u16, u16),
-    target_layer: MovementLayer,
-    mover_category: EntityCategory,
-    path_grid: Option<&PathGrid>,
-    cost_grid: Option<&TerrainCostGrid>,
-    occupancy: &OccupancyGrid,
-) -> TerrainCheckResult {
-    check_terrain_with_layers(
-        target,
-        CanEnterLayerContext::single(target_layer),
-        mover_category,
-        path_grid,
-        cost_grid,
-        occupancy,
-    )
-}
-
-/// Check terrain and occupancy using explicit CanEnter layer selections.
-pub fn check_terrain_with_layers(
-    target: (u16, u16),
-    layers: CanEnterLayerContext,
-    mover_category: EntityCategory,
-    path_grid: Option<&PathGrid>,
-    cost_grid: Option<&TerrainCostGrid>,
-    occupancy: &OccupancyGrid,
-) -> TerrainCheckResult {
-    let (nx, ny) = target;
-
-    // --- Terrain walkability ---
-    let terrain_walkable = evaluate_can_enter_cell(CanEnterCellContext {
-        wall: None,
-        target,
-        terrain_layer: layers.terrain_layer,
-        movement_zone: None,
-        speed_type: None,
-        path_grid,
-        resolved_terrain: None,
-        terrain_costs: cost_grid,
-        bypass_grid: false,
-        mode: TerrainEntryMode::RuntimeTransition,
-        is_infantry: mover_category == EntityCategory::Infantry,
-        // No resolved terrain is supplied here, so the wall arm never runs.
-        mover_is_crusher: false,
-    })
-    .is_clear();
-    if !terrain_walkable {
-        return TerrainCheckResult::Impassable;
-    }
-
-    // --- Occupancy ---
-    let occ = occupancy.get(nx, ny);
-
-    if mover_category == EntityCategory::Infantry {
-        let selected_list_blocked =
-            occ.is_some_and(|o| o.has_blockers_on(layers.object_list_layer));
-        let sub =
-            bump_crush::allocate_sub_cell_with_reserved(occ, layers.occupancy_bits_layer, None);
-        if sub.is_some() && !selected_list_blocked {
-            return TerrainCheckResult::Clear;
-        }
-        // No sub-cell available — needs blocker classification.
-        return TerrainCheckResult::NeedsBlockerCheck;
-    }
-
-    // Vehicle/aircraft/structure: cell must be unoccupied on this layer.
-    match occ {
-        None => TerrainCheckResult::Clear,
-        Some(o)
-            if o.is_empty_on(layers.object_list_layer)
-                && o.is_empty_on(layers.occupancy_bits_layer) =>
-        {
-            TerrainCheckResult::Clear
-        }
-        Some(_) => TerrainCheckResult::NeedsBlockerCheck,
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Phase 2: blocker classification (needs EntityStore)
 // ---------------------------------------------------------------------------
 
@@ -1165,7 +1084,9 @@ pub fn check_terrain_with_layers(
 /// The terrain and layer half of the native predicate runs before this, in
 /// [`evaluate_can_enter_cell`]. The arms of the native walk this phase does not
 /// produce — the wall/overlay codes and the head-on facing test — are recorded
-/// in the module header rather than approximated here.
+/// in the module header rather than approximated here. Headings are sampled
+/// at frame 0, which a settled fixture heading ignores.
+#[cfg(test)]
 pub fn classify_occupied_cell(
     target: (u16, u16),
     target_layer: MovementLayer,
@@ -1179,7 +1100,7 @@ pub fn classify_occupied_cell(
     alliances: &HouseAllianceMap,
     interner: &crate::sim::intern::StringInterner,
 ) -> CellEntryResult {
-    classify_occupied_cell_with_layers(
+    classify_occupied_cell_with_layers_and_ignored_and_occupation(
         target,
         CanEnterLayerContext::single(target_layer),
         mover_id,
@@ -1187,78 +1108,14 @@ pub fn classify_occupied_cell(
         mover_owner,
         mover_locomotor,
         mover_bypass_grid,
-        occupancy,
-        entities,
-        alliances,
-        interner,
-    )
-}
-
-/// Classify an occupied cell using explicit CanEnter layer selections.
-#[allow(clippy::too_many_arguments)]
-pub fn classify_occupied_cell_with_layers(
-    target: (u16, u16),
-    layers: CanEnterLayerContext,
-    mover_id: u64,
-    crush_capability: bump_crush::CrushCapability,
-    mover_owner: &str,
-    mover_locomotor: LocomotorKind,
-    mover_bypass_grid: bool,
-    occupancy: &OccupancyGrid,
-    entities: &EntityStore,
-    alliances: &HouseAllianceMap,
-    interner: &crate::sim::intern::StringInterner,
-) -> CellEntryResult {
-    classify_occupied_cell_with_layers_and_ignored(
-        target,
-        layers,
-        mover_id,
-        crush_capability,
-        mover_owner,
-        mover_locomotor,
-        mover_bypass_grid,
         None,
         occupancy,
+        &CellOccupationGrid::new(),
+        &RawCellOccupationGrid::new(),
+        0,
         entities,
         alliances,
         interner,
-    )
-}
-
-/// Classify an occupied cell while ignoring a caller-supplied subset of live
-/// object-list occupants. This is the runtime UnitClass path used by refinery
-/// pads and repair/bunker rows where gamemd skips only the checked building
-/// occupant, then continues scanning the same cell list.
-#[allow(clippy::too_many_arguments)]
-pub fn classify_occupied_cell_with_layers_and_ignored(
-    target: (u16, u16),
-    layers: CanEnterLayerContext,
-    mover_id: u64,
-    crush_capability: bump_crush::CrushCapability,
-    mover_owner: &str,
-    mover_locomotor: LocomotorKind,
-    mover_bypass_grid: bool,
-    ignored_blockers: Option<&BTreeSet<u64>>,
-    occupancy: &OccupancyGrid,
-    entities: &EntityStore,
-    alliances: &HouseAllianceMap,
-    interner: &crate::sim::intern::StringInterner,
-) -> CellEntryResult {
-    classify_occupied_cell_with_slave_query(
-        target,
-        layers,
-        mover_id,
-        crush_capability,
-        mover_owner,
-        mover_locomotor,
-        mover_bypass_grid,
-        ignored_blockers,
-        occupancy,
-        entities,
-        alliances,
-        interner,
-        None,
-        &mut false,
     )
 }
 
@@ -1276,11 +1133,13 @@ fn classify_occupied_cell_with_slave_query(
     mover_bypass_grid: bool,
     ignored_blockers: Option<&BTreeSet<u64>>,
     occupancy: &OccupancyGrid,
+    current_frame: u32,
     entities: &EntityStore,
     alliances: &HouseAllianceMap,
     interner: &crate::sim::intern::StringInterner,
     slave_query: Option<&crate::sim::slave_deposit::SlaveDepositQuery<'_>>,
     slave_cleared_vehicle: &mut bool,
+    native_unit_tail: bool,
 ) -> CellEntryResult {
     let _ = mover_bypass_grid;
     // --- Crush candidates ---
@@ -1288,13 +1147,23 @@ fn classify_occupied_cell_with_slave_query(
     // the cell list and consults it only after the walk, when nothing else
     // raised the running code above 0. An occupant the mover can crush does not
     // contribute a code; one it cannot crush raises the code like any blocker.
-    let victims = bump_crush::collect_crush_victims(
-        target,
-        occupancy,
-        layers.object_list_layer,
-        crush_capability,
-        entities,
-    );
+    let ally_gate = bump_crush::CrushAllyGate::new(mover_owner, alliances, interner);
+    // Infantry's native predicate has no Unit crush latch.
+    let victims = if entities
+        .get(mover_id)
+        .is_some_and(|mover| mover.category == EntityCategory::Unit)
+    {
+        bump_crush::collect_crush_victims(
+            target,
+            occupancy,
+            layers.object_list_layer,
+            crush_capability,
+            entities,
+            ally_gate,
+        )
+    } else {
+        Vec::new()
+    };
     let crushable: BTreeSet<u64> = victims.iter().copied().collect();
 
     // --- Walk the WHOLE selected cell list, worst occupant wins ---
@@ -1339,6 +1208,7 @@ fn classify_occupied_cell_with_slave_query(
                 entities,
                 alliances,
                 interner,
+                current_frame,
             );
             // **VERA-internal generalisation, gamemd equivalent UNCHECKED.** A
             // running code of 7 aborts the walk here. Native has no such
@@ -1380,22 +1250,15 @@ fn classify_occupied_cell_with_slave_query(
         // backstop, not a modelled rule. Downstream risk: it converts any future
         // occupancy desync from a silent inconsistency into a visible refused
         // order, which is arguably the safer failure but is not parity.
-        if ignored_blockers.is_some() {
+        if native_unit_tail || ignored_blockers.is_some() {
             return apply_overrides(CellEntryResult::Clear, mover_locomotor);
         }
         return apply_overrides(CellEntryResult::Impassable, mover_locomotor);
     }
 
-    if worst == CellEntryResult::Clear
-        && !victims.is_empty()
-        && bump_crush::cell_passable_after_crush(
-            target,
-            occupancy,
-            layers.occupancy_bits_layer,
-            crush_capability,
-            entities,
-        )
-    {
+    // Victims exist only for a live Unit mover, whose post-latch tail
+    // (`0x0073FCF6`) the wrapper runs.
+    if worst == CellEntryResult::Clear && !victims.is_empty() {
         return apply_overrides(CellEntryResult::Crushable { victims }, mover_locomotor);
     }
 
@@ -1405,6 +1268,7 @@ fn classify_occupied_cell_with_slave_query(
 /// Phase-2 classification including the independent Unit occupation plane.
 /// A bit-only reservation has no destination-list blocker to attack or scatter,
 /// so it keeps native code 2 without inventing a `CellOccupant`.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn classify_occupied_cell_with_layers_and_ignored_and_occupation(
     target: (u16, u16),
@@ -1417,6 +1281,8 @@ pub(crate) fn classify_occupied_cell_with_layers_and_ignored_and_occupation(
     ignored_blockers: Option<&BTreeSet<u64>>,
     occupancy: &OccupancyGrid,
     cell_occupation: &CellOccupationGrid,
+    raw_cell_occupation: &RawCellOccupationGrid,
+    current_frame: u32,
     entities: &EntityStore,
     alliances: &HouseAllianceMap,
     interner: &crate::sim::intern::StringInterner,
@@ -1432,6 +1298,8 @@ pub(crate) fn classify_occupied_cell_with_layers_and_ignored_and_occupation(
         ignored_blockers,
         occupancy,
         cell_occupation,
+        raw_cell_occupation,
+        current_frame,
         entities,
         alliances,
         interner,
@@ -1451,12 +1319,17 @@ pub(crate) fn classify_occupied_cell_with_occupation_and_slave_query(
     ignored_blockers: Option<&BTreeSet<u64>>,
     occupancy: &OccupancyGrid,
     cell_occupation: &CellOccupationGrid,
+    raw_cell_occupation: &RawCellOccupationGrid,
+    current_frame: u32,
     entities: &EntityStore,
     alliances: &HouseAllianceMap,
     interner: &crate::sim::intern::StringInterner,
     slave_query: Option<&crate::sim::slave_deposit::SlaveDepositQuery<'_>>,
 ) -> CellEntryResult {
     let mut slave_cleared_vehicle = false;
+    let native_unit_tail = entities
+        .get(mover_id)
+        .is_some_and(|mover| mover.category == EntityCategory::Unit);
     let result = classify_occupied_cell_with_slave_query(
         target,
         layers,
@@ -1467,12 +1340,54 @@ pub(crate) fn classify_occupied_cell_with_occupation_and_slave_query(
         mover_bypass_grid,
         ignored_blockers,
         occupancy,
+        current_frame,
         entities,
         alliances,
         interner,
         slave_query,
         &mut slave_cleared_vehicle,
+        native_unit_tail,
     );
+    if native_unit_tail {
+        // Unit73FC24 preserves every nonzero accumulated code. With a crush
+        // latch,73FCF6 only consults vehicle bit5, then GetUnit(false) on the
+        // GROUND list. There is no self/ignored-ID filter in that lookup and
+        // no owner attribution in the raw byte. Object walk and bit plane are
+        // intentionally independent. See tools/spatial_oracle/cell_entry_crush_tail.
+        if result.yr_code() != 0 || slave_cleared_vehicle {
+            return result;
+        }
+        let raw = match layers.occupancy_bits_layer {
+            MovementLayer::Ground => raw_cell_occupation.ground_bits(target.0, target.1),
+            MovementLayer::Bridge => raw_cell_occupation.deck_bits(target.0, target.1),
+            _ => 0,
+        };
+        if raw & 0x20 == 0 {
+            return result;
+        }
+        if matches!(result, CellEntryResult::Crushable { .. })
+            && occupancy.get(target.0, target.1).is_some_and(|cell| {
+                cell.iter_layer(MovementLayer::Ground)
+                    .filter_map(|occupant| entities.get(occupant.entity_id))
+                    .find(|entity| entity.category == EntityCategory::Unit)
+                    .is_some_and(|unit| {
+                        unit_tail_is_crushable_by(
+                            unit,
+                            crush_capability,
+                            houses::is_allied_with(
+                                alliances,
+                                mover_owner,
+                                interner.resolve(unit.owner()),
+                            ),
+                            current_frame,
+                        )
+                    })
+            })
+        {
+            return result;
+        }
+        return apply_overrides(CellEntryResult::TemporaryOccupation, mover_locomotor);
+    }
     if !slave_cleared_vehicle
         && matches!(result, CellEntryResult::Clear | CellEntryResult::Impassable)
         && cell_occupation.occupied_by_other(
@@ -1487,6 +1402,30 @@ pub(crate) fn classify_occupied_cell_with_occupation_and_slave_query(
         result
     }
 }
+
+/// The Unit-target subset of Object::IsCrushableBy5F6CD0, reached by the
+/// post-latch GetUnit(false) exception at73FD17. The caller has already supplied
+/// a latch; this leaf does not retest Crusher/ability or apply kills. Both native
+/// arms test mover-house alliance and the target's +160 invulnerability slot.
+/// A rejected Omni arm falls through to ordinary Crushable, which does not
+/// read OmniCrushResistant or the mover's regular-crusher flag.
+pub(crate) fn unit_tail_is_crushable_by(
+    unit: &GameEntity,
+    capability: bump_crush::CrushCapability,
+    mover_considers_target_allied: bool,
+    current_frame: u32,
+) -> bool {
+    debug_assert_eq!(unit.category, EntityCategory::Unit);
+    let target = bump_crush::CrushTarget::from_entity(unit, current_frame);
+    // Live Unit entities carry Techno abstract flag1. Deploy crush immunity
+    // is written only by Infantry deploy; it is always clear on this subset.
+    !mover_considers_target_allied
+        && bump_crush::object_is_crushable_by(capability.omni_crusher, target)
+}
+
+#[cfg(test)]
+#[path = "cell_entry_crush_tail_tests.rs"]
+mod crush_tail_tests;
 
 /// First blocker entity in the selected layer's cell list.
 ///
@@ -1522,9 +1461,8 @@ fn find_primary_blocker(
 /// The head-on exit of `UnitClass::Can_Enter_Cell`, `0x0073F8D4..FA26`.
 ///
 /// Taken for an allied occupant that is moving. Octants are the native
-/// `((facing16 >> 12) + 1 >> 1) & 7`; the byte facing is the high byte of that
-/// word, so `((facing8 >> 4) + 1 >> 1) & 7` is the same value. The occupant's
-/// facing is reversed by adding `0x7FFF` in the 16-bit word (`0x0073F914`)
+/// `((facing16 >> 12) + 1 >> 1) & 7` of each body's `+0x388` Current. The
+/// occupant's facing is reversed by adding `0x7FFF` in the 16-bit word (`0x0073F914`)
 /// before its octant is taken. When the mover's octant equals that reversed
 /// octant — the two are facing each other — the 3-D lepton distance
 /// `Sqrt_Approx(dx² + dz² + dy²)` (`0x0073F9DA..FA03`) goes through `ftol`
@@ -1533,11 +1471,11 @@ fn find_primary_blocker(
 /// (`Math::atan2(mover.y − occ.y, occ.x − mover.x)` centred and scaled at
 /// `0x0073F97B..F98A`) must land in the mover's own octant for the exit to
 /// fire (`0x0073FA24 CMP ECX,EBP / JZ 0x0073FCD0`, return 7).
-fn head_on_with_moving_ally(mover: &GameEntity, occupant: &GameEntity) -> bool {
+fn head_on_with_moving_ally(mover: &GameEntity, occupant: &GameEntity, frame: u32) -> bool {
     head_on_exit(
-        mover.facing,
+        mover.body_facing_current(frame),
         entity_world_leptons(mover),
-        occupant.facing,
+        occupant.body_facing_current(frame),
         entity_world_leptons(occupant),
     )
 }
@@ -1545,30 +1483,25 @@ fn head_on_with_moving_ally(mover: &GameEntity, occupant: &GameEntity) -> bool {
 /// An object's native coordinate triple in leptons: cell origin plus sub-cell
 /// offset, and the exact Z when the mover retains one, else the level height.
 pub(crate) fn entity_world_leptons(entity: &GameEntity) -> [i32; 3] {
-    use crate::util::lepton::GROUND_LEVEL_HEIGHT_LEPTONS;
-    let [x, y] = crate::sim::movement::ground_pose::position_world_xy(&entity.position);
-    let z = entity
-        .position
-        .exact_z_leptons
-        .unwrap_or_else(|| i32::from(entity.position.z as i8) * GROUND_LEVEL_HEIGHT_LEPTONS);
-    [x, y, z]
+    let coord = crate::sim::movement::ground_pose::position_world_coord(&entity.position);
+    [coord.x, coord.y, coord.z]
 }
 
 /// The head-on exit over raw inputs; see [`head_on_with_moving_ally`] for the
 /// native trace. Shared with the Drive selection lane, which evaluates it
 /// against its owner snapshot of moving allies.
 pub(crate) fn head_on_exit(
-    mover_facing: u8,
+    mover_facing: u16,
     mover_world: [i32; 3],
-    occupant_facing: u8,
+    occupant_facing: u16,
     occupant_world: [i32; 3],
 ) -> bool {
     use crate::util::direction_tables::facing16_from_delta;
     use crate::util::native_x87::{X87Chop53, sqrt_approx_f32};
 
     let octant16 = |word: u32| ((word >> 12).wrapping_add(1) >> 1) & 7;
-    let mover_octant = octant16(u32::from(mover_facing) << 8);
-    let occupant_reversed = (u32::from(occupant_facing) << 8).wrapping_add(0x7FFF) & 0xFFFF;
+    let mover_octant = octant16(u32::from(mover_facing));
+    let occupant_reversed = u32::from(occupant_facing).wrapping_add(0x7FFF) & 0xFFFF;
     if mover_octant != octant16(occupant_reversed) {
         return false;
     }
@@ -1607,6 +1540,7 @@ fn classify_blocker(
     entities: &EntityStore,
     alliances: &HouseAllianceMap,
     interner: &crate::sim::intern::StringInterner,
+    frame: u32,
 ) -> CellEntryResult {
     let Some(blocker) = entities.get(blocker_id) else {
         return CellEntryResult::Impassable;
@@ -1651,11 +1585,24 @@ fn classify_blocker(
     // `movement_target` test; native's NavCom/rotating/`Is_Moving` triple
     // (`0x0073F865..F8C0`) is a recorded gap, unchanged here. The head-on exit
     // that precedes this arm is `head_on_with_moving_ally` above.
+    //
+    // RESIDUAL (duplicate Unit73F0A0): `bridge_repair_admission::foot_entry`
+    // is the native-compared Unit CanEnterCell (unit_entry/traversal/boundary/
+    // air_motion corpora) and owns the triple via `motion_query`, but only
+    // Infantry and repair's ==7 projection reach it. Drive/Ship admission
+    // still classifies here. Trigger: a Drive/Ship mover meets an allied
+    // stationary blocker that is rotating its body or holds a NavCom without a
+    // VERA path. Effect: FriendlyStationary (scatter request) where native
+    // takes the moving arm (head-on 7 / raise 2 / skip). Frequency: allied
+    // traffic jams. Risk: vehicle routing/scatter order; no determinism or
+    // lifecycle effect. Consolidate onto `foot_entry` with the Drive/Ship
+    // Process path owner (wip/track-order-deferred-path).
     if blocker.movement_target.is_some() {
         // The head-on exit precedes the locomotor question and exists only in
         // the Unit implementation (`0x0073F8D4`); Infantry `+0x1AC` has none.
         if mover.is_some_and(|mover| {
-            mover.category == EntityCategory::Unit && head_on_with_moving_ally(mover, blocker)
+            mover.category == EntityCategory::Unit
+                && head_on_with_moving_ally(mover, blocker, frame)
         }) {
             return CellEntryResult::Impassable;
         }
@@ -1679,18 +1626,17 @@ fn classify_blocker(
 /// 861" — is not an address or a named research doc and does not meet the
 /// provenance form; it is dropped rather than dressed up.
 ///
-/// The nearest native mechanism runs the other way round.
 /// `FootClass::LocomotorPassabilityCheck` @ `0x004D9C10` dispatches the mover's
-/// locomotor vtable `+0x1C` and **seeds** the running code before the occupant
-/// walk, is Unit-only, is gated on a caller flag byte, and can only be raised
-/// afterwards — nothing in either `Can_Enter_Cell` lowers an accumulated code at
-/// the end. What `JumpjetLocomotionClass+0x1C` returns is UNCHECKED. Trigger:
-/// any jumpjet mover meeting an occupied or soft-blocked cell. Player effect:
-/// jumpjets ignore ground traffic, which is the retail feel; whether they ignore
-/// it by this route is unverified. Frequency: every Rocketeer and Floating Disc
-/// order. Downstream risk: replacing this with the native seed changes where the
-/// locomotor hook sits relative to the walk, so it is a restructure rather than
-/// a swap.
+/// locomotor vtable `+0x1C` before Unit's occupant walk when the caller enables
+/// it. All eight active retail locomotors, including Jumpjet, point that slot
+/// at the constant-zero `0x0055ABF0`; the 48 original calls in
+/// `tools/spatial_oracle/foot_locomotor_entry.{py,json,meta.json}` reproduce it.
+/// That seed does not justify clearing an accumulated result after the walk.
+/// Trigger: any jumpjet mover meeting an occupied or soft-blocked cell. Player
+/// effect: this compatibility override ignores soft blockers. Frequency: every
+/// Rocketeer and Floating Disc order. Downstream risk: migrating these callers
+/// requires their native class entry and locomotor paths; the constant-zero
+/// seed alone does not establish the final movement decision.
 fn apply_overrides(result: CellEntryResult, locomotor: LocomotorKind) -> CellEntryResult {
     if locomotor == LocomotorKind::Jumpjet && !matches!(result, CellEntryResult::Impassable) {
         return CellEntryResult::Clear;
@@ -1712,41 +1658,56 @@ mod tests {
     /// three gates alone releases it.
     #[test]
     fn head_on_exit_requires_opposed_facings_range_and_bearing() {
-        // Mover faces east (64 → octant 2), occupant faces west (192 → reversed
-        // octant 2), occupant 256 leptons due east, same height.
+        // Mover faces east (0x4000 → octant 2), occupant faces west (0xC000 →
+        // reversed octant 2), occupant 256 leptons due east, same height.
         let mover = [10 * 256 + 128, 10 * 256 + 128, 0];
         let east_256 = [11 * 256 + 128, 10 * 256 + 128, 0];
-        assert!(head_on_exit(64, mover, 192, east_256));
+        assert!(head_on_exit(0x4000, mover, 0xC000, east_256));
         // Distance gate: 511 fires, 512 does not (`CMP EAX,0x1FF / JG`).
-        assert!(head_on_exit(64, mover, 192, [mover[0] + 511, mover[1], 0]));
-        assert!(!head_on_exit(64, mover, 192, [mover[0] + 512, mover[1], 0]));
+        assert!(head_on_exit(
+            0x4000,
+            mover,
+            0xC000,
+            [mover[0] + 511, mover[1], 0]
+        ));
+        assert!(!head_on_exit(
+            0x4000,
+            mover,
+            0xC000,
+            [mover[0] + 512, mover[1], 0]
+        ));
         // Height enters the 3-D distance.
         assert!(!head_on_exit(
-            64,
+            0x4000,
             mover,
-            192,
+            0xC000,
             [mover[0] + 500, mover[1], 120]
         ));
         // Occupant facing the same way (a column) is not head-on.
-        assert!(!head_on_exit(64, mover, 64, east_256));
+        assert!(!head_on_exit(0x4000, mover, 0x4000, east_256));
         // Occupant behind the mover, still facing it: bearing is west, not east.
         assert!(!head_on_exit(
-            64,
+            0x4000,
             mover,
-            192,
+            0xC000,
             [9 * 256 + 128, 10 * 256 + 128, 0]
         ));
         // Occupant off to the side (south-east) leaves the mover's octant.
         assert!(!head_on_exit(
-            64,
+            0x4000,
             mover,
-            192,
+            0xC000,
             [11 * 256 + 128, 11 * 256 + 128, 0]
         ));
-        // Octant rounding: facing 48..79 all read as octant 2.
-        assert!(head_on_exit(48, mover, 208, east_256));
-        assert!(head_on_exit(79, mover, 177, east_256));
-        assert!(!head_on_exit(80, mover, 192, east_256));
+        // Octant rounding: facing 0x3000..0x4FFF all read as octant 2.
+        assert!(head_on_exit(0x3000, mover, 0xD000, east_256));
+        assert!(head_on_exit(0x4F00, mover, 0xB100, east_256));
+        assert!(!head_on_exit(0x5000, mover, 0xC000, east_256));
+        // The occupant's reversal carries its low byte: 0xB080 + 0x7FFF =
+        // 0x307F reads octant 2, where its high byte alone (0xB000 + 0x7FFF =
+        // 0x2FFF) would read octant 1.
+        assert!(head_on_exit(0x4000, mover, 0xB080, east_256));
+        assert!(!head_on_exit(0x4000, mover, 0xB000, east_256));
     }
 
     fn crushable_wall_grid() -> ResolvedTerrainGrid {
@@ -1782,7 +1743,6 @@ mod tests {
             resolved_terrain: Some(terrain),
             terrain_costs: None,
             bypass_grid: false,
-            mode: TerrainEntryMode::RuntimeTransition,
             is_infantry,
             mover_is_crusher,
         })
@@ -1866,7 +1826,6 @@ mod tests {
             resolved_terrain: Some(&terrain),
             terrain_costs: None,
             bypass_grid: false,
-            mode: TerrainEntryMode::RuntimeTransition,
             is_infantry: false,
             mover_is_crusher: false,
         });
@@ -1935,7 +1894,7 @@ mod tests {
     fn moving_ally(id: u64, rx: u16, ry: u16, facing: u8, in_transit: bool) -> GameEntity {
         let mut ally = GameEntity::test_default(id, "MTNK", "Americans", rx, ry);
         ally.category = EntityCategory::Unit;
-        ally.facing = facing;
+        ally.body_facing.snap(u16::from(facing) << 8, 0);
         ally.foot_occupation_enabled = !in_transit;
         ally.movement_target = Some(crate::sim::components::MovementTarget {
             path: vec![(rx, ry), (rx.wrapping_sub(1), ry)],
@@ -1964,12 +1923,12 @@ mod tests {
         let alliances = HouseAllianceMap::new();
         let interner = crate::sim::intern::test_interner();
         assert_eq!(
-            classify_blocker(100, None, "Americans", &entities, &alliances, &interner),
+            classify_blocker(100, None, "Americans", &entities, &alliances, &interner, 0),
             CellEntryResult::Clear,
             "hover in transit: skipped"
         );
         assert_eq!(
-            classify_blocker(101, None, "Americans", &entities, &alliances, &interner),
+            classify_blocker(101, None, "Americans", &entities, &alliances, &interner, 0),
             CellEntryResult::TemporaryBlock { blocker_id: 101 },
             "hover with its enable set: code 2"
         );
@@ -1991,17 +1950,17 @@ mod tests {
         let interner = crate::sim::intern::test_interner();
 
         assert_eq!(
-            classify_blocker(100, None, "Americans", &entities, &alliances, &interner),
+            classify_blocker(100, None, "Americans", &entities, &alliances, &interner, 0),
             CellEntryResult::Clear,
             "in transit, no retained track: skipped"
         );
         assert_eq!(
-            classify_blocker(101, None, "Americans", &entities, &alliances, &interner),
+            classify_blocker(101, None, "Americans", &entities, &alliances, &interner, 0),
             CellEntryResult::TemporaryBlock { blocker_id: 101 },
             "standing moving ally still raises 2"
         );
         assert_eq!(
-            classify_blocker(102, None, "Americans", &entities, &alliances, &interner),
+            classify_blocker(102, None, "Americans", &entities, &alliances, &interner, 0),
             CellEntryResult::Clear,
             "moving infantry: Walk slot answers false"
         );
@@ -2016,10 +1975,10 @@ mod tests {
         entities.insert(moving_ally(100, 11, 10, 192, true));
         let mut tank = GameEntity::test_default(1, "MTNK", "Americans", 10, 10);
         tank.category = EntityCategory::Unit;
-        tank.facing = 64;
+        tank.body_facing.snap(0x4000, 0);
         let mut soldier = GameEntity::test_default(2, "E1", "Americans", 10, 10);
         soldier.category = EntityCategory::Infantry;
-        soldier.facing = 64;
+        soldier.body_facing.snap(0x4000, 0);
         let alliances = HouseAllianceMap::new();
         let interner = crate::sim::intern::test_interner();
 
@@ -2030,7 +1989,8 @@ mod tests {
                 "Americans",
                 &entities,
                 &alliances,
-                &interner
+                &interner,
+                0
             ),
             CellEntryResult::Impassable
         );
@@ -2041,11 +2001,12 @@ mod tests {
                 "Americans",
                 &entities,
                 &alliances,
-                &interner
+                &interner,
+                0
             ),
             CellEntryResult::Clear
         );
-        tank.facing = 192;
+        tank.body_facing.snap(0xC000, 0);
         assert_eq!(
             classify_blocker(
                 100,
@@ -2053,126 +2014,12 @@ mod tests {
                 "Americans",
                 &entities,
                 &alliances,
-                &interner
+                &interner,
+                0
             ),
             CellEntryResult::Clear,
             "a tank facing away is not head-on"
         );
-    }
-
-    fn empty_occ() -> OccupancyGrid {
-        OccupancyGrid::new()
-    }
-
-    #[test]
-    fn test_clear_empty_cell() {
-        let result = check_terrain(
-            (5, 5),
-            MovementLayer::Ground,
-            EntityCategory::Unit,
-            None,
-            None,
-            &empty_occ(),
-        );
-        assert_eq!(result, TerrainCheckResult::Clear);
-    }
-
-    #[test]
-    fn test_impassable_blocked_grid() {
-        use crate::sim::pathfinding::PathGrid;
-        let mut grid = PathGrid::new(10, 10);
-        grid.set_blocked(5, 5, true);
-        let result = check_terrain(
-            (5, 5),
-            MovementLayer::Ground,
-            EntityCategory::Unit,
-            Some(&grid),
-            None,
-            &empty_occ(),
-        );
-        assert_eq!(result, TerrainCheckResult::Impassable);
-    }
-
-    #[test]
-    fn test_vehicle_occupied_needs_check() {
-        let mut occ = OccupancyGrid::new();
-        occ.add(
-            5,
-            5,
-            42,
-            MovementLayer::Ground,
-            None,
-            CellListInsertion::PrependNonBuilding,
-        );
-        let result = check_terrain(
-            (5, 5),
-            MovementLayer::Ground,
-            EntityCategory::Unit,
-            None,
-            None,
-            &occ,
-        );
-        assert_eq!(result, TerrainCheckResult::NeedsBlockerCheck);
-    }
-
-    #[test]
-    fn test_infantry_subcell_available() {
-        let mut occ = OccupancyGrid::new();
-        occ.add(
-            5,
-            5,
-            10,
-            MovementLayer::Ground,
-            Some(2),
-            CellListInsertion::PrependNonBuilding,
-        );
-        let result = check_terrain(
-            (5, 5),
-            MovementLayer::Ground,
-            EntityCategory::Infantry,
-            None,
-            None,
-            &occ,
-        );
-        assert_eq!(result, TerrainCheckResult::Clear);
-    }
-
-    #[test]
-    fn test_infantry_cell_full() {
-        let mut occ = OccupancyGrid::new();
-        occ.add(
-            5,
-            5,
-            10,
-            MovementLayer::Ground,
-            Some(2),
-            CellListInsertion::PrependNonBuilding,
-        );
-        occ.add(
-            5,
-            5,
-            11,
-            MovementLayer::Ground,
-            Some(3),
-            CellListInsertion::PrependNonBuilding,
-        );
-        occ.add(
-            5,
-            5,
-            12,
-            MovementLayer::Ground,
-            Some(4),
-            CellListInsertion::PrependNonBuilding,
-        );
-        let result = check_terrain(
-            (5, 5),
-            MovementLayer::Ground,
-            EntityCategory::Infantry,
-            None,
-            None,
-            &occ,
-        );
-        assert_eq!(result, TerrainCheckResult::NeedsBlockerCheck);
     }
 
     #[test]
@@ -2202,7 +2049,7 @@ mod tests {
     #[test]
     fn cell_entry_result_yr_codes_match_verified_table() {
         assert_eq!(CellEntryResult::Clear.yr_code(), 0);
-        assert_eq!(CellEntryResult::Crushable { victims: vec![1] }.yr_code(), 1);
+        assert_eq!(CellEntryResult::Crushable { victims: vec![1] }.yr_code(), 0);
         assert_eq!(
             CellEntryResult::TemporaryBlock { blocker_id: 1 }.yr_code(),
             2
@@ -2239,7 +2086,7 @@ mod tests {
         let alliances = HouseAllianceMap::new();
         let interner = crate::sim::intern::test_interner();
 
-        let result = classify_blocker(100, None, "Americans", &entities, &alliances, &interner);
+        let result = classify_blocker(100, None, "Americans", &entities, &alliances, &interner, 0);
         assert_eq!(
             result,
             CellEntryResult::ScatterRequired {
@@ -2253,7 +2100,7 @@ mod tests {
             phase: BuildingGatePhase::Opening,
             ..Default::default()
         });
-        let result = classify_blocker(100, None, "Americans", &entities, &alliances, &interner);
+        let result = classify_blocker(100, None, "Americans", &entities, &alliances, &interner, 0);
         assert_eq!(
             result,
             CellEntryResult::ScatterRequired {
@@ -2275,7 +2122,7 @@ mod tests {
         let alliances = HouseAllianceMap::new();
         let interner = crate::sim::intern::test_interner();
 
-        let result = classify_blocker(200, None, "Americans", &entities, &alliances, &interner);
+        let result = classify_blocker(200, None, "Americans", &entities, &alliances, &interner, 0);
         assert_eq!(result, CellEntryResult::Impassable);
         assert_eq!(result.yr_code(), 7);
     }
@@ -2292,12 +2139,101 @@ mod tests {
         let alliances = HouseAllianceMap::new();
         let interner = crate::sim::intern::test_interner();
 
-        let result = classify_blocker(201, None, "Americans", &entities, &alliances, &interner);
+        let result = classify_blocker(201, None, "Americans", &entities, &alliances, &interner, 0);
         assert_eq!(
             result,
             CellEntryResult::FriendlyStationary { blocker_id: 201 }
         );
         assert_eq!(result.yr_code(), 6);
+    }
+
+    /// A tank moving from the next cell west, as the legacy pass supplies its
+    /// mover to the classifier.
+    fn live_unit_mover(id: u64, owner: &str) -> crate::sim::game_entity::GameEntity {
+        let mut mover = crate::sim::game_entity::GameEntity::test_default(id, "MTNK", owner, 4, 5);
+        mover.category = EntityCategory::Unit;
+        mover
+    }
+
+    /// The player-visible half of A7 D1: a crusher classifies its own infantry
+    /// as a friendly blocker, not as something to crush.
+    ///
+    /// `UnitClass::Can_Enter_Cell` asks the alliance question at
+    /// `0x0073F8C0..0x0073F8CE` - `MOV ECX,[EBX+0x21c]` (the occupant's house),
+    /// `PUSH ESI`, `CALL 0x004F9A90`, `TEST AL,AL`, `JZ 0x0073FAFF` - *before*
+    /// the crush latch at `0x0073FB2A`, and only the not-ally fall-through
+    /// reaches it. A stationary ally then answers **6** at `0x0073FAF4`.
+    ///
+    /// The unit tests below pin `collect_crush_victims` directly; this one pins
+    /// the answer a mover actually acts on, which is what stalled: admission
+    /// said `Crushable`, the kill site refused, and the tank sat on its own GI.
+    #[test]
+    fn a_crusher_classifies_its_own_infantry_as_friendly_not_crushable() {
+        use crate::sim::entity_store::EntityStore;
+        use crate::sim::game_entity::GameEntity;
+
+        let mut entities = EntityStore::new();
+        let mut gi = GameEntity::test_default(7, "E1", "Americans", 5, 5);
+        gi.category = EntityCategory::Infantry;
+        gi.crushable = true;
+        gi.sub_cell = Some(2);
+        entities.insert(gi);
+        entities.insert(live_unit_mover(1, "Americans"));
+
+        let occupancy = {
+            let mut grid = OccupancyGrid::new();
+            grid.add(
+                5,
+                5,
+                7,
+                MovementLayer::Ground,
+                Some(2),
+                CellListInsertion::PrependNonBuilding,
+            );
+            grid
+        };
+        let alliances = HouseAllianceMap::new();
+        let interner = crate::sim::intern::test_interner();
+
+        let own = classify_occupied_cell(
+            (5, 5),
+            MovementLayer::Ground,
+            1,
+            bump_crush::CrushCapability::new(true, false),
+            "Americans",
+            LocomotorKind::Drive,
+            false,
+            &occupancy,
+            &entities,
+            &alliances,
+            &interner,
+        );
+        assert_eq!(
+            own,
+            CellEntryResult::FriendlyStationary { blocker_id: 7 },
+            "a crusher must read its own infantry as a friendly blocker"
+        );
+        assert_eq!(own.yr_code(), 6, "which is native's code 6");
+
+        // The same cell, an enemy crusher: still crushable, so the refusal is
+        // about alliance and not about something incidental to the fixture.
+        let enemy = classify_occupied_cell(
+            (5, 5),
+            MovementLayer::Ground,
+            1,
+            bump_crush::CrushCapability::new(true, false),
+            "Soviets",
+            LocomotorKind::Drive,
+            false,
+            &occupancy,
+            &entities,
+            &alliances,
+            &interner,
+        );
+        assert!(
+            matches!(enemy, CellEntryResult::Crushable { .. }),
+            "an enemy crusher still crushes it, got {enemy:?}"
+        );
     }
 
     #[test]
@@ -2317,6 +2253,7 @@ mod tests {
         let mut foe = GameEntity::test_default(301, "HTNK", "Soviets", 5, 5);
         foe.category = EntityCategory::Unit;
         entities.insert(foe);
+        entities.insert(live_unit_mover(999, "Americans"));
         let alliances = HouseAllianceMap::new();
         let interner = crate::sim::intern::test_interner();
 
@@ -2367,6 +2304,7 @@ mod tests {
         let mut refinery = GameEntity::test_default(311, "GAREFN", "Americans", 5, 5);
         refinery.category = EntityCategory::Structure;
         entities.insert(refinery);
+        entities.insert(live_unit_mover(999, "Americans"));
         let alliances = HouseAllianceMap::new();
         let interner = crate::sim::intern::test_interner();
 
@@ -2417,7 +2355,7 @@ mod tests {
         let alliances = HouseAllianceMap::new();
         let interner = crate::sim::intern::test_interner();
 
-        let result = classify_blocker(100, None, "Americans", &entities, &alliances, &interner);
+        let result = classify_blocker(100, None, "Americans", &entities, &alliances, &interner, 0);
         assert_eq!(result, CellEntryResult::OccupiedEnemy { blocker_id: 100 });
         assert_eq!(result.yr_code(), 5);
     }
@@ -2686,162 +2624,6 @@ mod tests {
     }
 
     #[test]
-    fn split_context_uses_occupancy_bits_layer_for_presence() {
-        use crate::sim::pathfinding::PathGrid;
-
-        let mut grid = PathGrid::new(10, 10);
-        grid.set_cell_for_test(5, 5, 0, true, true);
-        let mut occ = OccupancyGrid::new();
-        occ.add(
-            5,
-            5,
-            10,
-            MovementLayer::Ground,
-            None,
-            CellListInsertion::PrependNonBuilding,
-        );
-
-        let result = check_terrain_with_layers(
-            (5, 5),
-            CanEnterLayerContext {
-                terrain_layer: MovementLayer::Bridge,
-                object_list_layer: MovementLayer::Bridge,
-                occupancy_bits_layer: MovementLayer::Ground,
-            },
-            EntityCategory::Unit,
-            Some(&grid),
-            None,
-            &occ,
-        );
-
-        assert_eq!(result, TerrainCheckResult::NeedsBlockerCheck);
-    }
-
-    #[test]
-    fn infantry_under_span_occupation_uses_ground_subcells_and_blockers() {
-        let mut grid = PathGrid::new(1, 1);
-        grid.set_cell_for_test(0, 0, 2, true, true);
-        let check = |occupation: &OccupancyGrid| {
-            check_terrain_with_layers(
-                (0, 0),
-                CanEnterLayerContext::single(MovementLayer::Ground),
-                EntityCategory::Infantry,
-                Some(&grid),
-                None,
-                occupation,
-            )
-        };
-        let mut occupation = OccupancyGrid::new();
-        occupation.add(
-            0,
-            0,
-            10,
-            MovementLayer::Bridge,
-            None,
-            CellListInsertion::PrependNonBuilding,
-        );
-        assert_eq!(
-            check(&occupation),
-            TerrainCheckResult::Clear,
-            "a deck vehicle must not block the ground"
-        );
-        occupation.add(
-            0,
-            0,
-            11,
-            MovementLayer::Ground,
-            None,
-            CellListInsertion::PrependNonBuilding,
-        );
-        assert_eq!(
-            check(&occupation),
-            TerrainCheckResult::NeedsBlockerCheck,
-            "ground vehicles still require classification"
-        );
-        occupation.remove_on_layer(0, 0, 11, MovementLayer::Ground);
-        for (index, slot) in bump_crush::FUNCTIONAL_SUB_CELLS.into_iter().enumerate() {
-            occupation.add(
-                0,
-                0,
-                20 + index as u64,
-                MovementLayer::Ground,
-                Some(slot),
-                CellListInsertion::PrependNonBuilding,
-            );
-        }
-        assert_eq!(
-            check(&occupation),
-            TerrainCheckResult::NeedsBlockerCheck,
-            "three ground infantry fill the functional subcells"
-        );
-        occupation.remove_on_layer(0, 0, 20, MovementLayer::Ground);
-        assert_eq!(
-            check(&occupation),
-            TerrainCheckResult::Clear,
-            "the freed ground subcell must admit infantry"
-        );
-    }
-
-    #[test]
-    fn oracle_wrapper_preserves_split_layers_and_yr_code() {
-        use crate::sim::pathfinding::PathGrid;
-
-        let mut grid = PathGrid::new(10, 10);
-        grid.set_cell_for_test(5, 5, 0, true, true);
-        let layers = CanEnterLayerContext {
-            terrain_layer: MovementLayer::Bridge,
-            object_list_layer: MovementLayer::Bridge,
-            occupancy_bits_layer: MovementLayer::Ground,
-        };
-        let (result, row) = check_terrain_with_layers_oracle(
-            (5, 5),
-            layers,
-            EntityCategory::Unit,
-            Some(&grid),
-            None,
-            &empty_occ(),
-        );
-
-        assert_eq!(result, TerrainCheckResult::Clear);
-        assert_eq!(row.terrain_layer, MovementLayer::Bridge);
-        assert_eq!(row.object_list_layer, MovementLayer::Bridge);
-        assert_eq!(row.occupancy_bits_layer, MovementLayer::Ground);
-        assert_eq!(row.yr_code, Some(0));
-    }
-
-    #[test]
-    fn split_context_uses_object_list_layer_for_selected_blockers() {
-        use crate::sim::pathfinding::PathGrid;
-
-        let mut grid = PathGrid::new(10, 10);
-        grid.set_cell_for_test(5, 5, 0, true, true);
-        let mut occ = OccupancyGrid::new();
-        occ.add(
-            5,
-            5,
-            10,
-            MovementLayer::Bridge,
-            None,
-            CellListInsertion::PrependNonBuilding,
-        );
-
-        let result = check_terrain_with_layers(
-            (5, 5),
-            CanEnterLayerContext {
-                terrain_layer: MovementLayer::Bridge,
-                object_list_layer: MovementLayer::Bridge,
-                occupancy_bits_layer: MovementLayer::Ground,
-            },
-            EntityCategory::Unit,
-            Some(&grid),
-            None,
-            &occ,
-        );
-
-        assert_eq!(result, TerrainCheckResult::NeedsBlockerCheck);
-    }
-
-    #[test]
     fn split_context_scans_object_list_layer_for_primary_blocker() {
         use crate::sim::entity_store::EntityStore;
         use crate::sim::game_entity::GameEntity;
@@ -2871,10 +2653,11 @@ mod tests {
         let mut bridge = GameEntity::test_default(20, "HTNK", "Soviets", 5, 5);
         bridge.category = EntityCategory::Unit;
         entities.insert(bridge);
+        entities.insert(live_unit_mover(42, "Allies"));
 
         let alliances = HouseAllianceMap::new();
         let interner = crate::sim::intern::test_interner();
-        let result = classify_occupied_cell_with_layers(
+        let result = classify_occupied_cell_with_layers_and_ignored_and_occupation(
             (5, 5),
             CanEnterLayerContext {
                 terrain_layer: MovementLayer::Bridge,
@@ -2886,7 +2669,11 @@ mod tests {
             "Allies",
             LocomotorKind::Drive,
             false,
+            None,
             &occ,
+            &CellOccupationGrid::new(),
+            &RawCellOccupationGrid::new(),
+            0,
             &entities,
             &alliances,
             &interner,
@@ -3126,7 +2913,6 @@ mod tests {
                 resolved_terrain: Some(&terrain),
                 terrain_costs: None,
                 bypass_grid: false,
-                mode: TerrainEntryMode::AStarNeighbor,
                 is_infantry: false,
                 mover_is_crusher: false,
             })

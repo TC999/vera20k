@@ -1,8 +1,8 @@
 //! Live crate slot clear, identity-specific overlay removal, and the per-tick
 //! `CrateRegen` scan.
 //!
-//! `MapClass__UpdateCrateRegenTimers @ 0x0056BBE0` is the only runtime owner of
-//! the 256 persistent crate slots after scenario start. `LogicClass__PerTickUpdate
+//! `MapClass__UpdateCrateRegenTimers @ 0x0056BBE0` maintains the 256 persistent
+//! crate slots alongside pickup removal at `0x0056C020`. `LogicClass__PerTickUpdate
 //! @ 0x0055AFB0` calls it once per tick at `0x0055B65A`, after
 //! `AlphaShapeClass::PurgeDisabled` and before the Tactical, Factory and House
 //! callbacks, and it does nothing at all unless the game mode is nonzero and the
@@ -27,13 +27,12 @@ use crate::map::lighting::LightingProfileUnits;
 use crate::map::overlay_types::OverlayTypeRegistry;
 use crate::rules::crate_rules::CrateRules;
 use crate::rules::ruleset::RuleSet;
-use crate::sim::pathfinding::PathGrid;
 use crate::sim::world::Simulation;
 
-use super::state::{CRATE_SLOT_CAPACITY, CrateSlot};
+use super::state::CRATE_SLOT_CAPACITY;
 use super::{
-    CrateMarkCellRef, ForcedPostPrecheckFailure, OneCrateResult, map_cell_in_bounds,
-    place_one_random_crate, resolve_crate_mark_cell,
+    CrateMarkCellRef, ForcedPostPrecheckFailure, OneCrateResult, place_one_random_crate,
+    resolve_crate_mark_cell,
 };
 
 /// Outcome of one `MapClass__UpdateCrateRegenTimers` pass.
@@ -67,7 +66,7 @@ pub(crate) fn remove_crate_overlay_from_cell(
     registry: &OverlayTypeRegistry,
     cell: (i16, i16),
 ) -> bool {
-    if !map_cell_in_bounds(sim, cell) {
+    if !sim.map_cell_in_bounds(cell) {
         return false;
     }
     let cell_ref = resolve_crate_mark_cell(sim, cell);
@@ -84,6 +83,10 @@ pub(crate) fn remove_crate_overlay_from_cell(
     if !is_live_crate_image(&rules.crate_rules, registry, overlay_id) {
         return false;
     }
+    clear_crate_overlay_fields(sim, cell_ref)
+}
+
+fn clear_crate_overlay_fields(sim: &mut Simulation, cell_ref: CrateMarkCellRef) -> bool {
     match cell_ref {
         CrateMarkCellRef::Real(rx, ry) => {
             let (Some(grid), Some(terrain)) =
@@ -98,6 +101,48 @@ pub(crate) fn remove_crate_overlay_from_cell(
             true
         }
     }
+}
+
+/// `MapClass` pickup removal at `0x0056C020`, called by Cell481A00 before
+/// replacement generation and the selected effect. Native comparisons:
+/// `tools/spatial_oracle/crate_pickup.json` (removal-reaching rows).
+///
+/// Multiplayer clears only the first occupied slot with this coordinate. A
+/// missing slot leaves even a visible crate untouched. Solo instead looks up
+/// the cell directly, without the In_Bounds diamond test, and accepts any
+/// OverlayType whose Crate flag is set; it never modifies runtime slots.
+pub(super) fn remove_pickup_crate(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    registry: &OverlayTypeRegistry,
+    cell: (i16, i16),
+) -> bool {
+    if sim.session.game_mode_nonzero {
+        let Some(index) = sim
+            .crate_authority
+            .slots()
+            .iter()
+            .position(|slot| !slot.is_empty() && (slot.cell_x, slot.cell_y) == cell)
+        else {
+            return false;
+        };
+        return clear_crate_slot(sim, rules, registry, index, sim.session.binary_frame as i32);
+    }
+    let cell_ref = resolve_crate_mark_cell(sim, cell);
+    let overlay_id = match &cell_ref {
+        CrateMarkCellRef::Real(rx, ry) => sim
+            .overlay_grid
+            .as_ref()
+            .and_then(|grid| grid.cell(*rx, *ry).overlay_id),
+        CrateMarkCellRef::Dummy(dummy) => dummy.overlay_fields().0,
+    };
+    if !overlay_id
+        .and_then(|id| registry.flags(id))
+        .is_some_and(|flags| flags.crate_type)
+    {
+        return false;
+    }
+    clear_crate_overlay_fields(sim, cell_ref)
 }
 
 /// Exact `Rules+0xF8`/`+0xFC`/`+0x100` pointer identity, expressed over the
@@ -140,15 +185,10 @@ pub(crate) fn clear_crate_slot(
     let slot = sim.crate_authority.slot_mut(slot_index);
     slot.cell_x = 0;
     slot.cell_y = 0;
-    if slot.start_frame != -1 {
-        let elapsed = current_frame.wrapping_sub(slot.start_frame);
-        slot.duration = if elapsed < slot.duration {
-            slot.duration.wrapping_sub(elapsed)
-        } else {
-            0
-        };
-        slot.start_frame = -1;
-    }
+    let mut timer = slot.timer();
+    timer.pause(current_frame);
+    slot.start_frame = timer.start_frame();
+    slot.duration = timer.duration();
     true
 }
 
@@ -163,7 +203,6 @@ pub(crate) fn tick_crate_regeneration(
     sim: &mut Simulation,
     rules: &RuleSet,
     overlay_registry: &OverlayTypeRegistry,
-    path_grid: Option<&PathGrid>,
     lighting_profile: LightingProfileUnits,
 ) -> CrateRegeneration {
     let mut result = CrateRegeneration::default();
@@ -175,7 +214,9 @@ pub(crate) fn tick_crate_regeneration(
         // Reload the live slot: an earlier expiry in this same pass may have
         // reinstalled a crate at or below this index.
         let slot = sim.crate_authority.slots()[index];
-        if slot.is_empty() || !crate_slot_timer_expired(slot, current_frame) {
+        // `0x0056BC1C..0x0056BC35`: a paused slot expires once its stored
+        // time is zero, and then on every tick until a crate takes it.
+        if slot.is_empty() || !slot.timer().expired(current_frame) {
             continue;
         }
         result.expired = result.expired.wrapping_add(1);
@@ -184,7 +225,6 @@ pub(crate) fn tick_crate_regeneration(
             sim,
             rules,
             overlay_registry,
-            path_grid,
             lighting_profile,
             ForcedPostPrecheckFailure::None,
         ) {
@@ -197,30 +237,6 @@ pub(crate) fn tick_crate_regeneration(
         }
     }
     result
-}
-
-/// The expiry predicate at `0x0056BC1C..0x0056BC35`.
-///
-/// A paused slot (`start == -1`) expires only once its stored duration has
-/// already reached zero — and then it re-fires on every following tick until a
-/// replacement takes the slot. A running slot expires as soon as the signed
-/// elapsed frame count reaches its duration.
-///
-/// Native reaches the shared `TEST ECX,ECX` at `0x0056BC33` from both branches,
-/// but for a running slot it is dead: `remaining == 0` would need
-/// `duration == elapsed`, which the preceding `JGE` already took. The shared
-/// tail is reproduced as one expression because it is the paused branch's whole
-/// test, not because the running branch can reach it.
-fn crate_slot_timer_expired(slot: CrateSlot, current_frame: i32) -> bool {
-    let mut remaining = slot.duration;
-    if slot.start_frame != -1 {
-        let elapsed = current_frame.wrapping_sub(slot.start_frame);
-        if elapsed >= remaining {
-            return true;
-        }
-        remaining = remaining.wrapping_sub(elapsed);
-    }
-    remaining == 0
 }
 
 #[cfg(test)]
@@ -236,40 +252,121 @@ mod tests {
         ParsedLightingProfiles::default().normal
     }
 
-    /// The three timer shapes the native predicate distinguishes, including the
-    /// paused-at-zero slot that re-fires every tick.
     #[test]
-    fn crate_regen_expiry_predicate_matches_native_branches() {
-        let running = |start: i32, duration: i32| CrateSlot {
-            start_frame: start,
-            aux: 0,
-            duration,
-            cell_x: 3,
-            cell_y: 4,
-        };
-        // Running: expires exactly when elapsed reaches duration.
-        assert!(!crate_slot_timer_expired(running(100, 50), 149));
-        assert!(crate_slot_timer_expired(running(100, 50), 150));
-        assert!(crate_slot_timer_expired(running(100, 50), 151));
-        // Zero-duration running slot expires on its own placement frame.
-        assert!(crate_slot_timer_expired(running(100, 0), 100));
-        // Paused: only a zero remainder expires, and it keeps expiring.
-        assert!(!crate_slot_timer_expired(running(-1, 1), i32::MAX));
-        assert!(crate_slot_timer_expired(running(-1, 0), 0));
-        assert!(crate_slot_timer_expired(running(-1, 0), i32::MIN));
-        // Negative duration is already past due for a running slot — this is
-        // the assertion that pins the native `JGE` over an unsigned compare.
-        assert!(crate_slot_timer_expired(running(100, -5), 100));
-        // Elapsed is computed with wrapping subtraction across the signed
-        // boundary, and the comparison stays signed.
-        assert!(crate_slot_timer_expired(
-            running(i32::MAX, 4),
-            i32::MIN.wrapping_add(3)
-        ));
-        assert!(!crate_slot_timer_expired(
-            running(i32::MAX, 6),
-            i32::MIN.wrapping_add(3)
-        ));
+    fn pickup_removal_matches_original_cell_pickup_outputs() {
+        // Compare only rows that reach Map56C020; guard/selection/effect
+        // coverage belongs to the complete pickup dispatcher, not this owner.
+        let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
+            "../../../tools/spatial_oracle/crate_pickup.json"
+        ))
+        .unwrap();
+        let mut compared = 0;
+        for row in rows {
+            if !row["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e == "0056c020")
+            {
+                continue;
+            }
+            let input = &row["input"];
+            let name = input["name"].as_str().unwrap();
+            let cell = input["cell"].as_array().map_or((10, 10), |v| {
+                (v[0].as_i64().unwrap() as i16, v[1].as_i64().unwrap() as i16)
+            });
+            let mut sim = sim_with_grid(31);
+            sim.session.game_mode_nonzero = input["mode"].as_i64() != Some(0);
+            sim.session.binary_frame = 100;
+            sim.playfield_bounds.as_mut().unwrap().base = 10;
+            sim.playfield_size_height = Some(10);
+            let mut rules = crate_ruleset("");
+            if input["different_image"] == true {
+                rules.crate_rules.wood_crate_img = Some("SILVER".into());
+            }
+            let registry = crate_registry();
+            let wood = registry.id_for_name("WOOD").unwrap();
+            sim.overlay_grid.as_mut().unwrap().place_overlay(
+                cell.0 as u16,
+                cell.1 as u16,
+                wood,
+                input["selection"].as_u64().unwrap_or(10) as u8,
+            );
+            // The native fixture explicitly zeroes the slot memory.
+            for (index, start, aux, duration) in [(0, 50, 777, 100), (1, 60, 888, 200)] {
+                let occupied = if index == 0 {
+                    input["registered"] != false
+                } else {
+                    input["duplicate_slot"] == true
+                };
+                *sim.crate_authority.slot_mut(index) = if occupied {
+                    CrateSlot {
+                        start_frame: start,
+                        aux,
+                        duration,
+                        cell_x: cell.0,
+                        cell_y: cell.1,
+                    }
+                } else {
+                    CrateSlot {
+                        start_frame: 0,
+                        ..CrateSlot::default()
+                    }
+                };
+            }
+            let removed = remove_pickup_crate(&mut sim, &rules, &registry, cell);
+            assert_eq!(
+                serde_json::json!([u8::from(removed)]),
+                row["removal_returns"],
+                "{name}"
+            );
+            let actual = sim
+                .overlay_grid
+                .as_ref()
+                .unwrap()
+                .cell(cell.0 as u16, cell.1 as u16);
+            assert_eq!(
+                actual.overlay_id,
+                (row["overlay"] != -1).then_some(wood),
+                "{name}"
+            );
+            assert_eq!(
+                i64::from(actual.overlay_data),
+                row["selection"].as_i64().unwrap(),
+                "{name}"
+            );
+            for (index, key) in [(0, "slot"), (1, "second_slot")] {
+                let slot = sim.crate_authority.slots()[index];
+                assert_eq!(
+                    serde_json::json!([
+                        slot.start_frame,
+                        slot.aux,
+                        slot.duration,
+                        slot.cell_x,
+                        slot.cell_y
+                    ]),
+                    row[key],
+                    "{name} {key}"
+                );
+            }
+            let dirty = sim
+                .overlay_grid
+                .as_mut()
+                .unwrap()
+                .take_removed_render_cells();
+            assert_eq!(
+                dirty.len(),
+                row["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|e| *e == "dirty_screen")
+                    .count(),
+                "{name}"
+            );
+            compared += 1;
+        }
+        assert_eq!(compared, 24);
     }
 
     /// Clear frees the coordinate, rebases a live timer, and pauses the slot.
@@ -481,7 +578,7 @@ mod tests {
             };
             let rng_before = sim.scenario_rng.state();
 
-            let regen = tick_crate_regeneration(&mut sim, &rules, &registry, None, lighting());
+            let regen = tick_crate_regeneration(&mut sim, &rules, &registry, lighting());
 
             assert_eq!(regen, CrateRegeneration::default());
             assert_eq!(sim.crate_authority.slots()[0].cell_x, 8);
@@ -520,7 +617,7 @@ mod tests {
         };
         let untouched = sim.crate_authority.slots()[0];
 
-        let regen = tick_crate_regeneration(&mut sim, &rules, &registry, None, lighting());
+        let regen = tick_crate_regeneration(&mut sim, &rules, &registry, lighting());
 
         assert_eq!(regen.expired, 1, "only the due slot expires");
         assert_eq!(regen.accepted, 1, "one replacement placer call");
@@ -561,7 +658,7 @@ mod tests {
             };
         }
 
-        let regen = tick_crate_regeneration(&mut sim, &rules, &registry, None, lighting());
+        let regen = tick_crate_regeneration(&mut sim, &rules, &registry, lighting());
 
         assert_eq!(regen.expired, 3, "each due slot expires exactly once");
         assert_eq!(regen.accepted, 3);
@@ -605,7 +702,7 @@ mod tests {
             cell_y: 15,
         };
 
-        let regen = tick_crate_regeneration(&mut sim, &rules, &registry, None, lighting());
+        let regen = tick_crate_regeneration(&mut sim, &rules, &registry, lighting());
 
         assert_eq!(regen.expired, 1);
         assert_eq!(regen.visible, 1);
@@ -702,11 +799,8 @@ mod tests {
     /// regeneration rung, and the same tick with the Crates option off does not.
     #[test]
     fn advance_tick_reaches_crate_regeneration_only_while_crates_are_on() {
-        use std::collections::BTreeMap;
-
         let rules = crate_ruleset("");
         let registry = crate_registry();
-        let height_map: BTreeMap<(u16, u16), u8> = BTreeMap::new();
 
         let due_slot = CrateSlot {
             start_frame: -1,
@@ -720,7 +814,7 @@ mod tests {
         on.session.game_mode_nonzero = true;
         on.session.game_options.crates = true;
         *on.crate_authority.slot_mut(0) = due_slot;
-        on.advance_tick(&[], Some(&rules), &height_map, None, Some(&registry), 33);
+        on.advance_tick(&[], Some(&rules), None, Some(&registry), 33);
         let regenerated = on.crate_authority.slots()[0];
         assert_ne!(
             regenerated, due_slot,
@@ -749,7 +843,7 @@ mod tests {
         off.session.game_mode_nonzero = true;
         off.session.game_options.crates = false;
         *off.crate_authority.slot_mut(0) = due_slot;
-        off.advance_tick(&[], Some(&rules), &height_map, None, Some(&registry), 33);
+        off.advance_tick(&[], Some(&rules), None, Some(&registry), 33);
         assert_eq!(
             off.crate_authority.slots()[0],
             due_slot,
@@ -787,7 +881,7 @@ mod tests {
         };
 
         for _ in 0..3 {
-            let regen = tick_crate_regeneration(&mut sim, &rules, &registry, None, lighting());
+            let regen = tick_crate_regeneration(&mut sim, &rules, &registry, lighting());
             assert_eq!(
                 regen.expired, 1,
                 "the paused zero-duration slot expires on every pass"

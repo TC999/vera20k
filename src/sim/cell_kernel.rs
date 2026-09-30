@@ -3,8 +3,9 @@
 //! These helpers intentionally keep floor, deck, coordinate lookup, and object-list
 //! selection separate: YR composes them at their individual call sites.
 
-use crate::sim::map::bridge_topology::BRIDGE_DECK_HEIGHT_LEPTONS;
 use crate::util::fixed_math::isqrt_i64;
+#[cfg(test)]
+use crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS;
 use crate::util::lepton::{
     GROUND_LEVEL_HEIGHT_LEPTONS, UnsupportedGroundSlope, ground_height_leptons,
 };
@@ -69,21 +70,17 @@ pub fn cell_center(cell: CellCoordinate, floor_z: i32) -> WorldCoordinate {
     }
 }
 
-/// `Coord2Cell` uses signed division truncating toward zero, not mathematical floor.
-pub fn world_to_cell_trunc(world: i32) -> i32 {
-    world / LEPTONS_PER_CELL
-}
-
 /// Native invalid-cell coordinates are process-global sentinels. At the Rust map
 /// boundary, represent that unproven raw value as `None` rather than manufacture it.
+#[cfg(test)]
 pub fn checked_cell_from_world(
     world_x: i32,
     world_y: i32,
     width: u16,
     height: u16,
 ) -> Option<(u16, u16)> {
-    let x = world_to_cell_trunc(world_x);
-    let y = world_to_cell_trunc(world_y);
+    let x = crate::util::lepton::lepton_to_cell(world_x);
+    let y = crate::util::lepton::lepton_to_cell(world_y);
     if x < 0 || y < 0 || x >= i32::from(width) || y >= i32::from(height) {
         return None;
     }
@@ -102,6 +99,7 @@ pub fn cell_floor_height(
 }
 
 /// Apply the high-bridge deck only when a caller has already selected that layer.
+#[cfg(test)]
 pub fn selected_cell_surface_height(floor_z: i32, deck_selected: bool) -> i32 {
     if deck_selected {
         floor_z.wrapping_add(BRIDGE_DECK_HEIGHT_LEPTONS)
@@ -133,6 +131,12 @@ pub(crate) fn native_xy_distance(dx: i32, dy: i32) -> i32 {
 /// `(dz*dz + dy*dy) + dx*dx`, `Sqrt_Approx` and the truncating `Math_ftol`.
 pub(crate) fn native_xyz_distance(dx: i32, dy: i32, dz: i32) -> i32 {
     native_distance([dz, dy, dx])
+}
+
+/// `CoordStruct::Distance3D` 0x0041C380 over a signed delta: `(x*x + y*y)
+/// + z*z` in x87, `Sqrt_Approx` 0x4CAC40 and the truncating `Math_ftol`.
+pub(crate) fn native_coord_distance(dx: i32, dy: i32, dz: i32) -> i32 {
+    native_distance([dx, dy, dz])
 }
 
 /// Shared x87 shape: squares are accumulated in the given order, each square
@@ -250,7 +254,6 @@ mod tests {
         assert_eq!(cell_floor_height(0, 1, 255, 0), Ok(103));
         assert_eq!(cell_floor_height(0, 13, 255, 255), Ok(207));
         assert_eq!(cell_floor_height(0, 20, 255, 255), Ok(52));
-        assert_eq!(world_to_cell_trunc(-1), 0);
         assert_eq!(checked_cell_from_world(-1, 255, 2, 2), Some((0, 0)));
         assert_eq!(checked_cell_from_world(-257, 0, 2, 2), None);
         assert_eq!(

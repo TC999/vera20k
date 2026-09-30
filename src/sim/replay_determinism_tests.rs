@@ -4,8 +4,6 @@
 //! (`Simulation::advance_tick`, `ReplayRunner::run_fixture`) are `#[cfg(test)]`
 //! since F09, so this coverage must live inside the lib test harness.
 
-use std::collections::BTreeMap;
-
 use crate::map::entities::{EntityCategory, MapEntity};
 use crate::sim::command::{Command, CommandEnvelope};
 use crate::sim::pathfinding::PathGrid;
@@ -31,9 +29,10 @@ fn make_test_sim() -> Simulation {
         recruitable_a: true,
         recruitable_b: true,
         structure_upgrades: [None, None, None],
+        structure_ai_sellable: false,
+        structure_ai_repairable: false,
     };
-    let heights: BTreeMap<(u16, u16), u8> = BTreeMap::new();
-    sim.spawn_from_map(&[entity], None, &heights);
+    sim.spawn_from_map(&[entity], None);
     sim
 }
 
@@ -46,7 +45,6 @@ fn make_move_command() -> CommandEnvelope {
             target_rx: 12,
             target_ry: 2,
             queue: false,
-            group_id: None,
         },
     )
 }
@@ -54,11 +52,11 @@ fn make_move_command() -> CommandEnvelope {
 fn run_with_frame_profile(total_ms: u32, frame_ms: u32) -> (u64, Vec<u64>, ReplayLog) {
     let mut sim = make_test_sim();
     let grid = PathGrid::new(32, 32);
-    let height_map: BTreeMap<(u16, u16), u8> = BTreeMap::new();
     let mut pending = vec![make_move_command()];
     let mut acc_ms: u64 = 0;
     let mut hashes: Vec<u64> = Vec::new();
     let mut replay = ReplayLog::new(ReplayHeader {
+        pixel_conversion_bounds: sim.session.pixel_conversion_bounds,
         version: 1,
         tick_hz: 30,
         seed: 123_456,
@@ -85,7 +83,7 @@ fn run_with_frame_profile(total_ms: u32, frame_ms: u32) -> (u64, Vec<u64>, Repla
                 }
             });
 
-            let result = sim.advance_tick(&due, None, &height_map, Some(&grid), None, TICK_MS);
+            let result = sim.advance_tick(&due, None, Some(&grid), None, TICK_MS);
             hashes.push(result.state_hash);
             replay.record_tick(result.tick, due, result.state_hash);
         }
@@ -124,6 +122,9 @@ fn replay_reapplies_header_seed() {
 
     fn sim_with_unit(desc: &ScenarioDescriptor) -> Simulation {
         let mut sim = Simulation::from_descriptor(desc);
+        // This synthetic fixture omits the production native Rules prefix.
+        sim.native_unique_ids =
+            Some(crate::sim::native_identity::NativeUniqueIdCursor::for_synthetic_simulation());
         let entity = MapEntity {
             owner: "Americans".to_string(),
             type_id: "MTNK".to_string(),
@@ -139,9 +140,10 @@ fn replay_reapplies_header_seed() {
             recruitable_a: true,
             recruitable_b: true,
             structure_upgrades: [None, None, None],
+            structure_ai_sellable: false,
+            structure_ai_repairable: false,
         };
-        let heights: BTreeMap<(u16, u16), u8> = BTreeMap::new();
-        sim.spawn_from_map(&[entity], None, &heights);
+        sim.spawn_from_map(&[entity], None);
         sim
     }
 
@@ -151,12 +153,16 @@ fn replay_reapplies_header_seed() {
     let desc = ScenarioDescriptor {
         seed: 0x00A1_1CE5,
         map_name: "seed_roundtrip".to_string(),
+        pixel_conversion_bounds: crate::util::pixel_conversion::PixelConversionBounds {
+            width: 640,
+            height: 480,
+        },
         ..Default::default()
     };
     let mut sim = sim_with_unit(&desc);
     let grid = PathGrid::new(32, 32);
-    let heights: BTreeMap<(u16, u16), u8> = BTreeMap::new();
     let mut replay = ReplayLog::new(ReplayHeader {
+        pixel_conversion_bounds: sim.session.pixel_conversion_bounds,
         version: 1,
         tick_hz: 30,
         // The descriptor seed/map name are what the sim was constructed from;
@@ -178,7 +184,7 @@ fn replay_reapplies_header_seed() {
                 true
             }
         });
-        let r = sim.advance_tick(&due, None, &heights, Some(&grid), None, TICK_MS);
+        let r = sim.advance_tick(&due, None, Some(&grid), None, TICK_MS);
         replay.record_tick(r.tick, due, r.state_hash);
         live.push(r.state_hash);
     }
@@ -187,10 +193,11 @@ fn replay_reapplies_header_seed() {
     let descriptor_from_header = |header: &ReplayHeader| ScenarioDescriptor {
         seed: u32::try_from(header.seed).expect("diagnostic replay seed fits native width"),
         map_name: header.map_name.clone(),
+        pixel_conversion_bounds: header.pixel_conversion_bounds,
         ..Default::default()
     };
     let mut playback = sim_with_unit(&descriptor_from_header(&replay.header));
-    let replayed = ReplayRunner::run_fixture(&mut playback, &replay, None, &heights, Some(&grid), TICK_MS);
+    let replayed = ReplayRunner::run_fixture(&mut playback, &replay, None, Some(&grid), TICK_MS);
     assert_eq!(
         live, replayed,
         "playback from header.seed must match the recorded timeline"
@@ -200,7 +207,7 @@ fn replay_reapplies_header_seed() {
     let mut corrupted = replay.clone();
     corrupted.header.seed ^= 1;
     let mut wrong = sim_with_unit(&descriptor_from_header(&corrupted.header));
-    let diverged = ReplayRunner::run_fixture(&mut wrong, &corrupted, None, &heights, Some(&grid), TICK_MS);
+    let diverged = ReplayRunner::run_fixture(&mut wrong, &corrupted, None, Some(&grid), TICK_MS);
     assert_ne!(
         live, diverged,
         "a corrupted header seed must not reproduce the timeline"
@@ -213,15 +220,8 @@ fn replay_playback_matches_live_hash_timeline() {
 
     let mut replay_sim = make_test_sim();
     let grid = PathGrid::new(32, 32);
-    let height_map: BTreeMap<(u16, u16), u8> = BTreeMap::new();
-    let playback_timeline = ReplayRunner::run_fixture(
-        &mut replay_sim,
-        &replay,
-        None,
-        &height_map,
-        Some(&grid),
-        TICK_MS,
-    );
+    let playback_timeline =
+        ReplayRunner::run_fixture(&mut replay_sim, &replay, None, Some(&grid), TICK_MS);
 
     assert_eq!(
         live_timeline, playback_timeline,

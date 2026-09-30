@@ -15,6 +15,9 @@
 //! - render/ NEVER mutates sim state — strictly read-only access
 //! - render/ does NOT depend on: ui/, sidebar/, audio/, net/
 
+pub(crate) mod atlas_growth;
+#[cfg(test)]
+mod atlas_refresh_retail_tests;
 pub mod batch;
 pub mod bink_movie;
 pub mod bit_font;
@@ -29,6 +32,7 @@ pub mod egui_integration;
 pub mod frame_readback;
 pub(crate) mod foot_depth;
 pub mod gpu;
+pub(crate) mod line_trail;
 pub mod loading_screen_chrome;
 pub mod locomotor_visual;
 pub mod main_menu_shell_chrome;
@@ -36,7 +40,6 @@ pub mod minimap;
 mod current_radar_cell;
 mod minimap_interaction;
 mod minimap_helpers;
-mod minimap_legacy_events;
 mod minimap_projection;
 mod native_radar_surface;
 mod native_radar_terrain;
@@ -68,6 +71,7 @@ pub mod shell_text;
 pub mod shell_text_reveal;
 pub mod shell_transition_pass;
 pub mod shroud_buffer;
+pub(crate) mod sinking;
 pub mod sidebar_cameo_atlas;
 pub mod sidebar_chrome;
 pub mod sidebar_text;
@@ -78,11 +82,11 @@ pub mod tactical_compat;
 pub mod tactical_draw_plan;
 pub mod tile_atlas;
 pub mod unit_atlas;
+pub mod unit_pose_cache;
 pub mod unit_slope_transition_cache;
 pub mod upscale_pass;
 #[cfg(test)]
 mod voxel_parity_tests;
-pub mod vxl_compute;
 pub mod vxl_normals;
 pub mod vxl_raster;
 pub mod wave_geometry;

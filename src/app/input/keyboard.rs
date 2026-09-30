@@ -46,7 +46,6 @@ pub(crate) fn open(state: &mut AppState, parent: KeyboardParent) {
         crate::app::persistence::options::accept_in_game_options(state);
         state.match_state.match_presentation.in_game_menu =
             crate::ui::pause_menu::InGameMenuState::Keyboard;
-        state.match_state.paused = true;
     }
     let commands = registered_commands()
         .iter()
@@ -76,7 +75,7 @@ fn reload(state: &mut AppState, reset: bool) {
     };
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KeyboardExit {
+pub(crate) enum KeyboardExit {
     Back,
     Cancel,
     PumpTerminated,
@@ -106,7 +105,26 @@ impl KeyboardExit {
 pub(crate) fn prepare_terminal_exit(state: &mut AppState) {
     close(state, KeyboardExit::PumpTerminated);
 }
+/// Back or Cancel. The front-end page slides out first (`0x005FBEF0`
+/// tears A3 down through `0x00622720`); the in-game page closes at once.
 fn close(state: &mut AppState, exit: KeyboardExit) {
+    let launcher = state
+        .frontend
+        .keyboard_dialog
+        .as_ref()
+        .is_some_and(|dialog| dialog.parent == KeyboardParent::Launcher);
+    if launcher && exit != KeyboardExit::PumpTerminated {
+        App::leave_shell_dialog(
+            state,
+            crate::app::frontend::shell_transition::ShellExitThen::KeyboardClose(exit),
+        );
+    } else {
+        commit_close(state, exit);
+    }
+}
+
+/// A3 is gone: save or reload the bindings and rebuild the parent.
+pub(crate) fn commit_close(state: &mut AppState, exit: KeyboardExit) {
     let Some(dialog) = state.frontend.keyboard_dialog.take() else {
         return;
     };

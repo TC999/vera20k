@@ -5,7 +5,7 @@
 //! into the live world. Final House projection, opening forces, shroud, AI
 //! credits, and alliances remain behind the same simulation authority boundary.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use crate::map::entities::EntityCategory;
 use crate::map::houses::HouseRoster;
@@ -16,7 +16,7 @@ use crate::map::waypoints::Waypoint;
 use crate::rng_continuation::MapGenRngContinuation;
 use crate::rules::locomotor_type::{MovementZone, SpeedType};
 use crate::rules::ruleset::RuleSet;
-use crate::sim::ai::AiPlayerState;
+#[cfg(test)]
 use crate::sim::cell_rect::PlayfieldBounds;
 use crate::sim::find_nearby_cell::{
     NearbyAnchorGate, NearbyFootprint, NearbyQuery, PassabilityArgs, find_nearby_passable_cell,
@@ -88,6 +88,15 @@ impl NativeStartBounds {
             width: extent_x.saturating_sub(1),
             height: extent_y.saturating_sub(1),
         }
+    }
+
+    /// The inclusive test native walks make against `+0x124..+0x130`:
+    /// `left <= x <= left + width`, and the same for y. Both CABHUT tails
+    /// walk inside it (repair `0x005738B1`, death `0x005744F7..0x00574531`).
+    pub(crate) fn contains(self, at: (i16, i16)) -> bool {
+        let (left, top) = (i32::from(self.min_rx), i32::from(self.min_ry));
+        (left..=left + i32::from(self.width)).contains(&i32::from(at.0))
+            && (top..=top + i32::from(self.height)).contains(&i32::from(at.1))
     }
 
     fn max_rx(self) -> u16 {
@@ -334,6 +343,7 @@ pub(crate) enum StockOfflineStartCallbackFamily {
 #[derive(Debug)]
 pub(crate) struct PreFillScenarioPrefixPlan {
     projection: StockOfflinePrefixProjection,
+    #[cfg(test)]
     first_gathered_starts: Vec<Waypoint>,
     first_house_timers: Vec<u32>,
     second_house_timers: Vec<u32>,
@@ -408,10 +418,12 @@ impl PreFillScenarioPrefixPlan {
         &self.first_gathered_starts
     }
 
+    #[cfg(test)]
     pub(crate) fn final_gathered_starts(&self) -> &[Waypoint] {
         self.projection.final_gathered_starts()
     }
 
+    #[cfg(test)]
     pub(crate) fn assignment(&self) -> &NativeStartAssignment {
         self.projection.assignment()
     }
@@ -570,9 +582,8 @@ pub(crate) fn prepare_stock_offline_scenario_prefix_plan(
         StockOfflineStartCallbackFamily::Cooperative => {
             let human_start_spots = map_data
                 .ini
-                .section("Header")
-                .and_then(|header| header.get_i32("NumCoopHumanStartSpots"))
-                .unwrap_or(0)
+                .section_or_empty("Header")
+                .read_int("NumCoopHumanStartSpots", 0)
                 .max(0) as usize;
             native_assign_cooperative_starts_from_preassignment(
                 session,
@@ -604,6 +615,7 @@ pub(crate) fn prepare_stock_offline_scenario_prefix_plan(
             final_gathered_starts,
             assignment,
         },
+        #[cfg(test)]
         first_gathered_starts,
         first_house_timers,
         second_house_timers,
@@ -1073,8 +1085,9 @@ impl MatchLaunchDescriptor {
 /// Active YR `ScenarioClass__Full_Init @ 0x00686B20` calls
 /// `ScenarioClass__Create_Houses @ 0x00687F10` before terrain and Techno map
 /// sections. The standard offline order is the human participant, AI slots,
-/// then Neutral and Special. Object Reveal can therefore commit owned counts
-/// and house-indexed base reservations directly, without a repair pass.
+/// then Neutral and Special. Object construction and Reveal can therefore
+/// commit the house tracking counts and house-indexed base reservations
+/// directly, without a repair pass.
 pub(crate) fn initialize_skirmish_launch_houses(
     sim: &mut Simulation,
     house_roster: &HouseRoster,
@@ -1085,7 +1098,6 @@ pub(crate) fn initialize_skirmish_launch_houses(
     assert!(
         sim.houses.is_empty()
             && sim.session.house_order.is_empty()
-            && sim.ai_players.is_empty()
             && sim.entities().is_empty()
             && sim.production.terrain_objects.is_empty(),
         "skirmish houses must be initialized before map objects"
@@ -1126,7 +1138,6 @@ pub(crate) fn apply_explicit_skirmish_launch_session(
     map_data: &MapFile,
     house_roster: &HouseRoster,
     rules: &RuleSet,
-    height_map: &BTreeMap<(u16, u16), u8>,
     resolved_terrain: &ResolvedTerrainGrid,
     descriptor: &MatchLaunchDescriptor,
 ) -> SkirmishLaunchApplyResult {
@@ -1135,34 +1146,9 @@ pub(crate) fn apply_explicit_skirmish_launch_session(
         map_data,
         house_roster,
         rules,
-        height_map,
         resolved_terrain,
         descriptor,
         None,
-        LaunchStartResolution::PostFillTestCompatibility,
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn apply_explicit_skirmish_launch_session_with_overlay_registry(
-    sim: &mut Simulation,
-    map_data: &MapFile,
-    house_roster: &HouseRoster,
-    rules: &RuleSet,
-    height_map: &BTreeMap<(u16, u16), u8>,
-    resolved_terrain: &ResolvedTerrainGrid,
-    descriptor: &MatchLaunchDescriptor,
-    overlay_registry: &OverlayTypeRegistry,
-) -> SkirmishLaunchApplyResult {
-    apply_resolved_skirmish_launch_session(
-        sim,
-        map_data,
-        house_roster,
-        rules,
-        height_map,
-        resolved_terrain,
-        descriptor,
-        Some(overlay_registry),
         LaunchStartResolution::PostFillTestCompatibility,
     )
 }
@@ -1176,7 +1162,6 @@ pub(crate) fn apply_pre_fill_scenario_prefix_launch_session(
     map_data: &MapFile,
     house_roster: &HouseRoster,
     rules: &RuleSet,
-    height_map: &BTreeMap<(u16, u16), u8>,
     resolved_terrain: &ResolvedTerrainGrid,
     descriptor: &MatchLaunchDescriptor,
     plan: &StockOfflinePrefixProjection,
@@ -1186,7 +1171,6 @@ pub(crate) fn apply_pre_fill_scenario_prefix_launch_session(
         map_data,
         house_roster,
         rules,
-        height_map,
         resolved_terrain,
         descriptor,
         None,
@@ -1200,7 +1184,6 @@ pub(crate) fn apply_pre_fill_scenario_prefix_launch_session_with_overlay_registr
     map_data: &MapFile,
     house_roster: &HouseRoster,
     rules: &RuleSet,
-    height_map: &BTreeMap<(u16, u16), u8>,
     resolved_terrain: &ResolvedTerrainGrid,
     descriptor: &MatchLaunchDescriptor,
     overlay_registry: &OverlayTypeRegistry,
@@ -1211,7 +1194,6 @@ pub(crate) fn apply_pre_fill_scenario_prefix_launch_session_with_overlay_registr
         map_data,
         house_roster,
         rules,
-        height_map,
         resolved_terrain,
         descriptor,
         Some(overlay_registry),
@@ -1230,7 +1212,6 @@ fn apply_resolved_skirmish_launch_session(
     map_data: &MapFile,
     house_roster: &HouseRoster,
     rules: &RuleSet,
-    height_map: &BTreeMap<(u16, u16), u8>,
     resolved_terrain: &ResolvedTerrainGrid,
     descriptor: &MatchLaunchDescriptor,
     overlay_registry: Option<&OverlayTypeRegistry>,
@@ -1309,9 +1290,8 @@ fn apply_resolved_skirmish_launch_session(
             let assignment = if cooperative {
                 let human_start_spots = map_data
                     .ini
-                    .section("Header")
-                    .and_then(|header| header.get_i32("NumCoopHumanStartSpots"))
-                    .unwrap_or(0)
+                    .section_or_empty("Header")
+                    .read_int("NumCoopHumanStartSpots", 0)
                     .max(0) as usize;
                 sim.assign_native_cooperative_starts(session, &starts, human_start_spots)
             } else {
@@ -1339,7 +1319,6 @@ fn apply_resolved_skirmish_launch_session(
                 waypoint.ry,
                 bounds,
                 rules,
-                height_map,
                 resolved_terrain,
                 overlay_registry,
             )
@@ -1374,7 +1353,6 @@ fn apply_resolved_skirmish_launch_session(
         sim,
         &slots,
         rules,
-        height_map,
         resolved_terrain,
         bounds,
         session.options.unit_count,
@@ -1466,7 +1444,7 @@ fn assign_launch_base_centers(
             &slot.owner_name,
             &sim.interner,
         ) {
-            house.base_center = Some((waypoint.rx, waypoint.ry));
+            house.set_base_center((waypoint.rx, waypoint.ry));
             if let Some(waypoint_edge) = waypoint_edge {
                 house.waypoint_edge = waypoint_edge;
             }
@@ -1560,6 +1538,7 @@ pub(crate) fn populate_special_houses(
         // what this house is being built as.
         house.multiplay_passive =
             crate::sim::house_state::resolve_multiplay_passive(Some(rules), Some(country_name));
+        house.project_country_cost_mults(rules, &sim.interner);
         sim.houses.insert(name_id, house);
         sim.session.house_order.push(name_id);
     }
@@ -1588,7 +1567,18 @@ pub(crate) fn populate_launch_houses(
             sim.session.game_options.starting_credits,
             sim.session.game_options.tech_level,
         );
-        house.difficulty = slot.difficulty;
+        // `ScenarioClass::Create_Houses` passes every launch house through
+        // `HouseClass::SetDifficulty` (humans with 1, `0x00688132`; computer
+        // slots with their own, `0x006882B9`); Neutral and Special are never
+        // passed and keep the constructor's values.
+        house.set_difficulty(
+            slot.difficulty,
+            &rules.general,
+            rules.country_rof(country_name),
+            sim.session.game_mode_nonzero,
+            sim.session.house_order.len() as i32,
+            sim.session.binary_frame as i32,
+        );
         // ScenarioClass::Create_Houses leaves generated human CurrentIQ at
         // the constructor value zero and stamps generated computer slots with
         // Rules.MaxIQLevels in non-campaign sessions.
@@ -1597,12 +1587,9 @@ pub(crate) fn populate_launch_houses(
         }
         house.multiplay_passive =
             crate::sim::house_state::resolve_multiplay_passive(Some(rules), Some(country_name));
+        house.project_country_cost_mults(rules, &sim.interner);
         sim.houses.insert(name_id, house);
         sim.session.house_order.push(name_id);
-        if !slot.is_human {
-            sim.ai_players.push(AiPlayerState::new(name_id));
-            log::info!("AI player registered: {}", slot.owner_name);
-        }
     }
 }
 
@@ -1629,7 +1616,7 @@ pub(crate) fn native_ai_opening_grant(coefficient: i32, money: i32) -> i32 {
     .expect("0.01 is a finite normal double");
     let scaled = X87Chop53::mul(X87Chop53::load_i32(coefficient), percent);
     let product = X87Chop53::mul(scaled, X87Chop53::load_i32(money));
-    X87Chop53::ftol_i64(product).map_or(0, |value| value as i32)
+    X87Chop53::ftol_i32_low_masked(product)
 }
 
 /// Apply the generated skirmish AI opening-credit grant at the Post_Map_Init handoff.
@@ -1649,10 +1636,7 @@ pub(crate) fn native_ai_opening_grant(coefficient: i32, money: i32) -> i32 {
 /// (pure integer arithmetic on the native side: `CDQ/SAR/IDIV` budget thirds
 /// and integer cost subtraction, no x87 involvement).
 pub(crate) fn apply_skirmish_ai_opening_credits(sim: &mut Simulation, rules: &RuleSet) {
-    for ai in &sim.ai_players {
-        let Some(house) = sim.houses.get_mut(&ai.owner) else {
-            continue;
-        };
+    for house in sim.houses.values_mut() {
         if house.is_human || house.multiplay_passive {
             continue;
         }
@@ -1662,8 +1646,8 @@ pub(crate) fn apply_skirmish_ai_opening_credits(sim: &mut Simulation, rules: &Ru
             .get(house.difficulty.table_index())
             .copied()
             .unwrap_or(0);
-        let grant = native_ai_opening_grant(coefficient, house.credits);
-        house.credits = house.credits.wrapping_add(grant);
+        let grant = native_ai_opening_grant(coefficient, house.economy.credits);
+        house.economy.credits = house.economy.credits.wrapping_add(grant);
     }
 }
 
@@ -1740,7 +1724,6 @@ fn place_starting_mcv(
     base_ry: u16,
     bounds: NativeStartBounds,
     rules: &RuleSet,
-    height_map: &BTreeMap<(u16, u16), u8>,
     resolved_terrain: &ResolvedTerrainGrid,
     overlay_registry: Option<&OverlayTypeRegistry>,
 ) -> Option<u64> {
@@ -1754,7 +1737,6 @@ fn place_starting_mcv(
         1,
         bounds,
         rules,
-        height_map,
         resolved_terrain,
         overlay_registry,
     )
@@ -1770,12 +1752,13 @@ fn place_starting_object_near_base(
     start_radius: i32,
     bounds: NativeStartBounds,
     rules: &RuleSet,
-    height_map: &BTreeMap<(u16, u16), u8>,
     resolved_terrain: &ResolvedTerrainGrid,
     overlay_registry: Option<&OverlayTypeRegistry>,
 ) -> Option<u64> {
     let category = rules.object(type_id)?.category;
-    let initial_z = height_map.get(&(base_rx, base_ry)).copied().unwrap_or(0);
+    let initial_z = resolved_terrain
+        .cell(base_rx, base_ry)
+        .map_or(0, |cell| cell.level);
     // Active retail constructs one Techno before exact/fallback Unlimbo. The
     // one constructor draw therefore precedes every placement-search draw and
     // remains spent even when every attempt fails.
@@ -1830,7 +1813,7 @@ fn place_starting_object_near_base(
                 {
                     continue;
                 }
-                let z = height_map.get(&(rx, ry)).copied().unwrap_or(0);
+                let z = resolved_terrain.cell(rx, ry).map_or(0, |cell| cell.level);
                 if sim
                     .reveal_constructed_object_at_height_with_unit_context(
                         stable_id,
@@ -1870,11 +1853,11 @@ pub(crate) fn starting_unit_prefers_vehicle(spent: i32, budget: i32) -> bool {
     spent < budget.wrapping_sub(budget / 3)
 }
 
+#[cfg(test)]
 pub(crate) fn seed_starting_extra_units(
     sim: &mut Simulation,
     slots: &[NormalizedSkirmishSlot],
     rules: &RuleSet,
-    height_map: &BTreeMap<(u16, u16), u8>,
     resolved_terrain: &ResolvedTerrainGrid,
     bounds: NativeStartBounds,
     unit_count: i32,
@@ -1884,7 +1867,6 @@ pub(crate) fn seed_starting_extra_units(
         sim,
         slots,
         rules,
-        height_map,
         resolved_terrain,
         bounds,
         unit_count,
@@ -1898,7 +1880,6 @@ fn seed_starting_extra_units_with_overlay_registry(
     sim: &mut Simulation,
     slots: &[NormalizedSkirmishSlot],
     rules: &RuleSet,
-    height_map: &BTreeMap<(u16, u16), u8>,
     resolved_terrain: &ResolvedTerrainGrid,
     bounds: NativeStartBounds,
     unit_count: i32,
@@ -1968,7 +1949,6 @@ fn seed_starting_extra_units_with_overlay_registry(
                 STARTING_EXTRA_UNIT_FALLBACK_START_RADIUS,
                 bounds,
                 rules,
-                height_map,
                 resolved_terrain,
                 overlay_registry,
             ) else {
@@ -2016,7 +1996,7 @@ fn seed_starting_extra_units_with_overlay_registry(
             )
             && !house.multiplay_passive
         {
-            house.credits = house.credits.wrapping_add(remaining);
+            house.economy.credits = house.economy.credits.wrapping_add(remaining);
         }
     }
 
@@ -2316,37 +2296,6 @@ impl ScenarioBootstrapRng {
         Ok((simulation, projection))
     }
 
-    /// Borrow the two independent load-time consumers without exposing either
-    /// raw cursor or allowing one callback to draw from the other stream.
-    pub(crate) fn terrain_draws(&mut self) -> (ScenarioFillRng<'_>, VariantMainRng<'_>) {
-        (
-            ScenarioFillRng {
-                rng: &mut self.scenario,
-            },
-            VariantMainRng {
-                rng: &mut self.main,
-            },
-        )
-    }
-
-    /// Consume the launch generation's ordered Building constructor trace on
-    /// the same Scenario owner that already passed through the stock-offline
-    /// prefix and terrain Fill. Successful rows retain their low word for later
-    /// projection; discarded rows spend the word and deliberately bind none.
-    ///
-    /// gamemd provenance: TechnoClass constructor 0x006F3254 consumes one raw
-    /// Scenario word before RMG placement can succeed or fail. Launch reader
-    /// 0x00684620 regenerates the accepted `.SED` after match RNG reseeding.
-    pub(crate) fn replay_generated_construction_trace(
-        &mut self,
-        trace: &crate::map::construction_trace::RmgConstructionTrace,
-    ) -> Result<
-        crate::sim::world::GeneratedTechnoInitTable,
-        crate::sim::world::GeneratedTechnoInitError,
-    > {
-        replay_generated_construction_trace_with_rng(&mut self.scenario, trace)
-    }
-
     #[cfg(test)]
     pub(crate) fn logical_states_for_test(
         &self,
@@ -2376,6 +2325,7 @@ impl ScenarioBootstrapRng {
 
 fn replay_generated_construction_trace_with_rng(
     scenario: &mut SimRng,
+    native_ids: &mut Option<crate::sim::native_identity::NativeUniqueIdCursor>,
     trace: &crate::map::construction_trace::RmgConstructionTrace,
 ) -> Result<crate::sim::world::GeneratedTechnoInitTable, crate::sim::world::GeneratedTechnoInitError>
 {
@@ -2390,6 +2340,10 @@ fn replay_generated_construction_trace_with_rng(
             );
         }
         let techno_ctor_random_word = (scenario.next_u32() & 0xFFFF) as u16;
+        // Building43BA15 assigns after base Techno6F3254, before placement.
+        // Discarded construction attempts spend both effects, like live rows.
+        let native_unique_id =
+            crate::sim::native_identity::NativeUniqueIdCursor::assign_runtime(native_ids);
         if let crate::map::construction_trace::RmgConstructionOutcome::Emitted {
             entity_index,
             cell,
@@ -2400,6 +2354,7 @@ fn replay_generated_construction_trace_with_rng(
                 techno_type: event.techno_type.clone(),
                 cell: *cell,
                 techno_ctor_random_word,
+                native_unique_id,
             });
         }
     }
@@ -2422,6 +2377,15 @@ impl Simulation {
 
     /// Replay accepted launch-generation constructor effects on the staged
     /// Scenario stream after Fill, before authored object-section projection.
+    ///
+    /// Consume the launch generation's ordered Building constructor trace on
+    /// the same Scenario owner that already passed through the stock-offline
+    /// prefix and terrain Fill. Successful rows retain their low word for later
+    /// projection; discarded rows spend the word and deliberately bind none.
+    ///
+    /// gamemd provenance: TechnoClass constructor 0x006F3254 consumes one raw
+    /// Scenario word before RMG placement can succeed or fail. Launch reader
+    /// 0x00684620 regenerates the accepted `.SED` after match RNG reseeding.
     pub(crate) fn replay_staged_generated_construction_trace(
         &mut self,
         trace: &crate::map::construction_trace::RmgConstructionTrace,
@@ -2429,7 +2393,11 @@ impl Simulation {
         crate::sim::world::GeneratedTechnoInitTable,
         crate::sim::world::GeneratedTechnoInitError,
     > {
-        replay_generated_construction_trace_with_rng(&mut self.scenario_rng, trace)
+        replay_generated_construction_trace_with_rng(
+            &mut self.scenario_rng,
+            &mut self.native_unique_ids,
+            trace,
+        )
     }
 
     #[cfg(test)]
@@ -2480,48 +2448,6 @@ impl Simulation {
     }
 }
 
-impl Simulation {
-    /// Register an AI player for every playable roster house except the local
-    /// owner (F10 boundary method: the app names the local owner, sim owns
-    /// the writes). Neutral/civilian/special houses never receive AI.
-    pub(crate) fn register_ai_players_from_roster(
-        &mut self,
-        house_roster: &HouseRoster,
-        local_owner: &str,
-    ) {
-        use crate::sim::ai::AiPlayerState;
-
-        for house in &house_roster.houses {
-            let up = house.name.to_ascii_uppercase();
-            if matches!(
-                up.as_str(),
-                "NEUTRAL" | "SPECIAL" | "CIVILIAN" | "GOODGUY" | "BADGUY" | "JP"
-            ) {
-                continue;
-            }
-            if house.name.eq_ignore_ascii_case(local_owner) {
-                continue;
-            }
-            self.ai_players
-                .push(AiPlayerState::new(self.interner.intern(&house.name)));
-            log::info!("AI player registered: {}", house.name);
-        }
-    }
-
-    /// Mark the named house human-controlled (F10 boundary method). Returns
-    /// false when the owner is not interned or owns no house.
-    pub(crate) fn mark_house_human(&mut self, owner: &str) -> bool {
-        let Some(owner_id) = self.interner.get(owner) else {
-            return false;
-        };
-        let Some(house) = self.houses.get_mut(&owner_id) else {
-            return false;
-        };
-        house.is_human = true;
-        true
-    }
-}
-
 /// Campaign68ACAA chooses Basic.Player with a 20-byte ReadString buffer,
 /// byte-exact House name lookup50C170, and index0 fallback on a miss.
 /// Evidence: docs/research/PHASE3_CURRENT_HOUSE_IDENTITY_GHIDRA_REPORT.md.
@@ -2564,6 +2490,7 @@ pub(crate) fn initialize_campaign_current_house(
 
 /// Map-roster house construction shared by app and headless (F09):
 /// native order requires houses before every object section.
+#[cfg(test)]
 pub(crate) fn initialize_map_roster_houses(
     sim: &mut Simulation,
     house_roster: &HouseRoster,
@@ -2598,6 +2525,17 @@ pub(crate) fn initialize_map_roster_houses(
             sim.session.game_options.tech_level,
         );
         house_state.player_control = player_control;
+        // RESIDUAL: a map-declared house keeps the constructor's difficulty,
+        // ROF bias 1.0 (`HouseClass+0x1A8`) and repair delay 0.0 (`+0x1C0`);
+        // only launch slots pass through `set_difficulty`. In a campaign,
+        // `HouseClass::Read_INI` passes every map house through SetDifficulty
+        // after its section (`0x00500AA4..0x00500ADE`): a human-controlled
+        // one with the scenario's player difficulty (`Scenario+0x60C`), any
+        // other with its computer difficulty (`+0x610`); VERA's campaigns do
+        // not launch yet, so neither value exists. Trigger: a weapon reload,
+        // or the computer's auto-repair start, of such a house. Effect: its
+        // GetROF lacks the difficulty row; its auto-repair latch releases at
+        // the same frame's house update.
         house_state.base_plan.percent_built = house.base_plan.percent_built;
         house_state.base_plan.nodes = house
             .base_plan
@@ -2612,15 +2550,20 @@ pub(crate) fn initialize_map_roster_houses(
             .collect();
         // HouseClass::Read_Scenario_INI reads `IQ=` from this exact named
         // house section, defaults it to zero, and changes a value above
-        // MaxIQLevels to literal one before storing CurrentIQ (+0x24C).
+        // MaxIQLevels to literal one before storing it as both the authored
+        // IQ (+0x1D0) and CurrentIQ (+0x24C) (0x00500DBA..0x00500DC0).
         house_state.current_iq = rules.map_or_else(
-            || house.iq.unwrap_or(0),
+            || house.iq,
             |rules| house.scenario_current_iq(rules.general.max_iq_levels),
         );
+        house_state.authored_iq = house_state.current_iq;
         // MultiplayPassive lives on the country/house type. A roster section
         // with no `Country=` resolves through `[Countries]` entry zero.
         house_state.multiplay_passive =
             crate::sim::house_state::resolve_multiplay_passive(rules, house.country.as_deref());
+        if let Some(rules) = rules {
+            house_state.project_country_cost_mults(rules, &sim.interner);
+        }
         sim.houses.insert(name_id, house_state);
         sim.session.house_order.push(name_id);
     }
@@ -2699,10 +2642,8 @@ mod tests {
             "negative chops toward zero"
         );
     }
-    use crate::map::bridge_facts::BridgeCellFacts;
-    use crate::map::resolved_terrain::{ResolvedTerrainCell, zone_class};
+    use crate::map::resolved_terrain::ResolvedTerrainCell;
     use crate::rules::ini_parser::IniFile;
-    use crate::rules::terrain_rules::{LandType, SpeedCostProfile, TerrainClass};
 
     fn descriptor(seed: u32) -> ScenarioDescriptor {
         ScenarioDescriptor {
@@ -2758,7 +2699,6 @@ mod tests {
                 local_height: 40,
             },
             basic: Default::default(),
-            briefing: Default::default(),
             preview: Default::default(),
             cells: Vec::new(),
             iso_map_pack_lookups: Vec::new(),
@@ -2868,6 +2808,7 @@ mod tests {
                         rules_ini.clone(),
                         None,
                         IniFile::from_str(""),
+                        std::sync::Arc::default(),
                     )
                     .expect("cold process Rules authority");
                 let (rules, _, _, rules_receipt) = rules_owner
@@ -2879,6 +2820,7 @@ mod tests {
                     .into_stock_offline_staged_simulation(&scenario, bound_prefix)
                     .expect("production admission installs the paired RNG/native-ID prefix");
                 assert!(sim.native_unique_ids.is_some());
+                let native_before_map = sim.native_unique_ids.as_ref().unwrap().current_raw();
                 let mut terrain = techno_constructor_flat_start_terrain(96);
                 let overlay_grid = crate::sim::overlay_grid::OverlayGrid::new(96, 96);
                 crate::sim::runtime::populate_staged_scenario_with_generated_inits(
@@ -2887,8 +2829,6 @@ mod tests {
                     &terrain,
                     "TEMPERATE",
                     Some(&rules),
-                    None,
-                    &BTreeMap::new(),
                     Some(&overlays),
                     Some(&overlay_grid),
                     crate::map::basic::BridgeDestroyabilityMode::SkirmishOrMultiplayer {
@@ -2910,6 +2850,11 @@ mod tests {
                 )
                 .expect("shared staged object construction");
                 assert_eq!(sim.entities().len(), 1, "map object actually constructed");
+                assert_eq!(
+                    sim.entities().values().next().unwrap().native_unique_id,
+                    native_before_map.wrapping_add(1) as i32,
+                    "production admission retains its concrete native constructor ID",
+                );
                 let player = sim.interner.get(owner_key).unwrap();
                 assert_eq!(sim.session.current_house, Some(player));
                 if block_placement {
@@ -2925,7 +2870,6 @@ mod tests {
                     &map,
                     &roster,
                     &rules,
-                    &BTreeMap::new(),
                     &terrain,
                     &launch,
                     &overlays,
@@ -3032,77 +2976,11 @@ mod tests {
     }
 
     fn techno_constructor_flat_start_terrain(size: u16) -> ResolvedTerrainGrid {
-        let land_type = LandType::Clear.as_index();
-        let speed_costs = SpeedCostProfile {
-            foot: Some(100),
-            track: Some(100),
-            wheel: Some(100),
-            float: Some(100),
-            amphibious: Some(100),
-            float_beach: Some(100),
-            hover: Some(100),
-        };
-        let mut cells = Vec::with_capacity(usize::from(size) * usize::from(size));
-        for ry in 0..size {
-            for rx in 0..size {
-                cells.push(ResolvedTerrainCell {
-                    rx,
-                    ry,
-                    source_tile_index: 0,
-                    source_sub_tile: 0,
-                    final_tile_index: 0,
-                    final_sub_tile: 0,
-                    is_wood_bridge_repair_tile: false,
-                    level: 0,
-                    filled_clear: false,
-                    tileset_index: Some(0),
-                    land_type,
-                    yr_cell_land_type: land_type,
-                    slope_type: 0,
-                    template_height: 0,
-                    height_in_pixels: 0,
-                    render_offset_x: 0,
-                    render_offset_y: 0,
-                    terrain_class: TerrainClass::Clear,
-                    speed_costs,
-                    is_water: false,
-                    is_cliff_like: false,
-                    is_rough: false,
-                    is_road: false,
-                    accepts_smudge: true,
-                    allows_tiberium: true,
-                    variant: 0,
-                    has_ramp: false,
-                    canonical_ramp: None,
-                    ground_walk_blocked: false,
-                    terrain_object_blocks: false,
-                    terrain_object_occupation: None,
-                    overlay_blocks: false,
-                    overlay_zone_type: None,
-                    outside_playfield: false,
-                    zone_type: zone_class::GROUND,
-                    base_ground_walk_blocked: false,
-                    base_build_blocked: false,
-                    base_land_type: land_type,
-                    base_yr_cell_land_type: land_type,
-                    base_terrain_class: TerrainClass::Clear,
-                    base_speed_costs: speed_costs,
-                    build_blocked: false,
-                    has_bridge_deck: false,
-                    bridge_walkable: false,
-                    bridge_transition: false,
-                    bridge_deck_level: 0,
-                    bridge_layer: None,
-                    bridge_facts: BridgeCellFacts::default(),
-                    tube_index: None,
-                    radar_left: [0; 3],
-                    radar_right: [0; 3],
-                    has_damaged_data: false,
-                    bridgehead_anchor_class_at_load: None,
-                });
-            }
-        }
-        ResolvedTerrainGrid::from_cells(size, size, cells)
+        crate::map::resolved_terrain::test_grid(size, size, |rx, ry| ResolvedTerrainCell {
+            speed_costs: crate::map::resolved_terrain::TEST_OPEN_SPEED_COSTS,
+            base_speed_costs: crate::map::resolved_terrain::TEST_OPEN_SPEED_COSTS,
+            ..crate::map::resolved_terrain::test_tiberium_cell(rx, ry)
+        })
     }
 
     fn techno_constructor_start_sim(seed: u64, size: u16) -> Simulation {
@@ -3144,7 +3022,6 @@ mod tests {
             1,
             bounds,
             &rules,
-            &BTreeMap::new(),
             &terrain,
             None,
         )
@@ -3161,7 +3038,7 @@ mod tests {
         let mut fallback_expected = SimRng::new(seed);
         let blocker_word = (fallback_expected.next_u32() & 0xFFFF) as u16;
         let blocker = fallback
-            .spawn_object("MTNK", "Americans", 6, 5, 0, &rules, &BTreeMap::new())
+            .spawn_object("MTNK", "Americans", 6, 5, 0, &rules)
             .unwrap();
         assert_eq!(
             fallback
@@ -3184,7 +3061,6 @@ mod tests {
             1,
             bounds,
             &rules,
-            &BTreeMap::new(),
             &terrain,
             None,
         )
@@ -3240,7 +3116,6 @@ mod tests {
                 1,
                 bounds,
                 &rules,
-                &BTreeMap::new(),
                 &terrain,
                 None,
             )
@@ -3283,7 +3158,6 @@ mod tests {
             1,
             bounds,
             &rules,
-            &BTreeMap::new(),
             &terrain,
             None,
         )
@@ -3325,7 +3199,7 @@ mod tests {
         let mut expected = SimRng::new(seed);
         let blocker_word = (expected.next_u32() & 0xFFFF) as u16;
         let blocker = sim
-            .spawn_object("MTNK", "Americans", 6, 5, 0, &rules, &BTreeMap::new())
+            .spawn_object("MTNK", "Americans", 6, 5, 0, &rules)
             .expect("starting-cell blocker");
         assert_eq!(
             sim.substrate
@@ -3341,16 +3215,7 @@ mod tests {
         let _fallback_start_direction = expected.next_range_u32_inclusive(0, 7);
 
         assert_eq!(
-            seed_starting_extra_units(
-                &mut sim,
-                &slots,
-                &rules,
-                &BTreeMap::new(),
-                &terrain,
-                bounds,
-                1,
-                false,
-            ),
+            seed_starting_extra_units(&mut sim, &slots, &rules, &terrain, bounds, 1, false,),
             1
         );
         let entity = sim.substrate.entities.get(2).unwrap();
@@ -3406,13 +3271,13 @@ mod tests {
     #[test]
     fn main_variant_draws_do_not_advance_scenario_cursor() {
         let seed = 0x51C0_1002;
-        let mut owner = ScenarioBootstrapRng::new(seed);
+        let mut sim = ScenarioBootstrapRng::new(seed).into_simulation(&descriptor(seed));
         {
-            let (scenario, mut main) = owner.terrain_draws();
+            let (scenario, mut main) = sim.terrain_load_draws();
             let _ = main.next_u32();
             drop(scenario);
         }
-        let actual = owner.into_simulation(&descriptor(seed)).rng_state();
+        let actual = sim.rng_state();
         let mut expected_main = SimRng::new(u64::from(seed));
         let _ = expected_main.next_u32();
 
@@ -3424,15 +3289,15 @@ mod tests {
     }
 
     #[test]
-    fn terrain_scenario_draws_transfer_without_advancing_main() {
+    fn terrain_scenario_draws_do_not_advance_main() {
         let seed = 0x51C0_1003;
-        let mut owner = ScenarioBootstrapRng::new(seed);
+        let mut sim = ScenarioBootstrapRng::new(seed).into_simulation(&descriptor(seed));
         {
-            let (mut scenario, main) = owner.terrain_draws();
+            let (mut scenario, main) = sim.terrain_load_draws();
             let _ = scenario.next_range_u32_inclusive(5, 17);
             drop(main);
         }
-        let actual = owner.into_simulation(&descriptor(seed)).rng_state();
+        let actual = sim.rng_state();
         let mut expected_scenario = SimRng::new(u64::from(seed));
         let _ = expected_scenario.next_range_u32_inclusive(5, 17);
 
@@ -3572,6 +3437,7 @@ mod tests {
                 IniFile::from_bytes(b"").unwrap(),
                 None,
                 IniFile::from_bytes(b"").unwrap(),
+                std::sync::Arc::default(),
             )
             .unwrap();
         let native_load = native_rules
@@ -3861,6 +3727,8 @@ mod tests {
             recruitable_a: true,
             recruitable_b: true,
             structure_upgrades: [None, None, None],
+            structure_ai_sellable: false,
+            structure_ai_repairable: false,
         });
         let launch = one_player_battle_launch("payload.mmx");
         let plan_a =
@@ -4030,12 +3898,7 @@ mod tests {
         let launch = one_player_battle_launch("mp01t4.map");
         let plan = prepare_stock_offline_scenario_prefix_plan(&launch, &map, &map.waypoints, seed)
             .expect("stock Battle prefix");
-        let mut owner = ScenarioBootstrapRng::new(seed);
-        {
-            let (mut scenario_fill, main) = owner.terrain_draws();
-            let _ = scenario_fill.next_range_u32_inclusive(1, 2);
-            drop(main);
-        }
+        let mut owner = ScenarioBootstrapRng::new(seed ^ 1);
 
         assert!(matches!(
             owner.install_pre_fill_scenario_prefix_plan(plan),
@@ -4051,6 +3914,9 @@ mod tests {
         let mut reference = SimRng::new(u64::from(seed));
         let owner = ScenarioBootstrapRng::new(seed);
         let mut sim = owner.into_simulation(&descriptor(seed));
+        // This isolated RNG fixture omits the full native Rules prefix.
+        sim.native_unique_ids =
+            Some(crate::sim::native_identity::NativeUniqueIdCursor::for_synthetic_simulation());
         sim.session.binary_frame = 77;
         let retained_handle = sim.allocate_stable_id();
 
@@ -4108,8 +3974,13 @@ mod tests {
         owner
             .install_pre_fill_scenario_prefix_plan(plan)
             .expect("fresh launch owner accepts the Full-Init prefix");
+        // The match load stages the Simulation here, before Fill.
+        let mut sim = owner.into_simulation(&descriptor(seed));
+        // This isolated RNG fixture omits the full native Rules prefix.
+        sim.native_unique_ids =
+            Some(crate::sim::native_identity::NativeUniqueIdCursor::for_synthetic_simulation());
         {
-            let (mut scenario_fill, main) = owner.terrain_draws();
+            let (mut scenario_fill, main) = sim.terrain_load_draws();
             let actual = scenario_fill.next_range_u32_inclusive(5, 17);
             let expected = reference.next_range_u32_inclusive(5, 17);
             assert_eq!(actual, expected);
@@ -4134,8 +4005,8 @@ mod tests {
         let _discarded_word = reference.next_u32();
         let second_word = (reference.next_u32() & 0xFFFF) as u16;
 
-        let bindings = owner
-            .replay_generated_construction_trace(&trace)
+        let bindings = sim
+            .replay_staged_generated_construction_trace(&trace)
             .expect("ordered trace binds emitted constructors");
         assert_eq!(
             bindings
@@ -4153,7 +4024,7 @@ mod tests {
         );
         assert!(bindings.entry(1).is_none(), "discarded row binds no entity");
 
-        let actual = owner.into_simulation(&descriptor(seed)).rng_state();
+        let actual = sim.rng_state();
         assert_eq!(actual.scenario, reference.logical_state());
         assert_eq!(actual.main, before.logical_state());
     }
@@ -4265,8 +4136,24 @@ mod tests {
         let projection = owner
             .install_pre_fill_scenario_prefix_plan(plan)
             .expect("one authoritative Full-Init prefix");
+        // The match load stages the Simulation here, before Fill.
+        let mut scenario = descriptor(seed);
+        scenario.map_name = "RandMap.SED".to_string();
+        scenario.theater = "TEMPERATE".to_string();
+        scenario.game_mode_nonzero = true;
+        scenario.map_width = SIZE;
+        scenario.map_height = SIZE;
+        scenario.local_left = 2;
+        scenario.local_top = 2;
+        scenario.local_width = 36;
+        scenario.local_height = 32;
+        scenario.mp_start_waypoints.insert(0, (start.rx, start.ry));
+        let mut sim = owner.into_simulation(&scenario);
+        // This isolated RNG fixture omits the full native Rules prefix.
+        sim.native_unique_ids =
+            Some(crate::sim::native_identity::NativeUniqueIdCursor::for_synthetic_simulation());
         {
-            let (mut scenario_fill, main) = owner.terrain_draws();
+            let (mut scenario_fill, main) = sim.terrain_load_draws();
             let actual = scenario_fill.next_range_u32_inclusive(5, 17);
             let expected = reference.next_range_u32_inclusive(5, 17);
             assert_eq!(actual, expected, "terrain Fill continues the prefix");
@@ -4290,8 +4177,8 @@ mod tests {
         let first_trace_word = (reference.next_u32() & 0xFFFF) as u16;
         let _discarded_trace_word = reference.next_u32();
         let second_trace_word = (reference.next_u32() & 0xFFFF) as u16;
-        let bindings = owner
-            .replay_generated_construction_trace(&trace)
+        let bindings = sim
+            .replay_staged_generated_construction_trace(&trace)
             .expect("ordered trace binds emitted constructors");
         assert_eq!(
             bindings.entry(0).unwrap().techno_ctor_random_word,
@@ -4303,24 +4190,12 @@ mod tests {
         );
         assert!(bindings.entry(2).is_none());
         assert_eq!(
-            owner.logical_states_for_test().0,
+            sim.rng_state().scenario,
             reference.logical_state(),
             "the independently walked intermediate cursor must match after replay"
         );
 
-        let mut scenario = descriptor(seed);
-        scenario.map_name = "RandMap.SED".to_string();
-        scenario.theater = "TEMPERATE".to_string();
-        scenario.game_mode_nonzero = true;
-        scenario.map_width = SIZE;
-        scenario.map_height = SIZE;
-        scenario.local_left = 2;
-        scenario.local_top = 2;
-        scenario.local_width = 36;
-        scenario.local_height = 32;
-        scenario.mp_start_waypoints.insert(0, (start.rx, start.ry));
         let terrain = techno_constructor_flat_start_terrain(SIZE);
-        let mut sim = owner.into_simulation(&scenario);
         sim.install_resolved_terrain_for_new_map(terrain.clone());
         sim.overlay_grid = Some(crate::sim::overlay_grid::OverlayGrid::new(SIZE, SIZE));
         sim.install_playfield_from_map_header(&map.header);
@@ -4331,7 +4206,6 @@ mod tests {
             sim.spawn_generated_from_map_with_resolved(
                 &map.entities,
                 &rules,
-                &BTreeMap::new(),
                 Some(&terrain),
                 &bindings,
             )
@@ -4360,7 +4234,6 @@ mod tests {
             &map,
             &house_roster,
             &rules,
-            &BTreeMap::new(),
             &terrain,
             &launch,
             &overlays,
@@ -4393,17 +4266,26 @@ mod tests {
             "controlled first crate draw must need no FNPC displacement"
         );
         let _crate_timer = reference.next_range_u32_inclusive(0, 0x7FFF_FFFE);
+        // The queues are built where the load builds them, before the post-map
+        // tail, which leaves them alone.
+        let overlay_grid_for_queues = sim.overlay_grid.clone();
+        let _ = crate::sim::runtime::initialize_native_tiberium_queues(
+            &mut sim,
+            &map.basic,
+            &map.special_flags,
+            &rules,
+            &overlays,
+            overlay_grid_for_queues.as_ref(),
+            (SIZE, SIZE),
+        );
         let output = sim.finalize_scenario_post_map(ScenarioPostMapInput {
             map_width: SIZE,
             map_height: SIZE,
-            basic: &map.basic,
-            special_flags: &map.special_flags,
             normal_lighting: crate::map::lighting::parse_lighting_profiles(&map.ini).normal,
             rules: &rules,
             overlay_registry: &overlays,
             house_roster: &house_roster,
             skirmish_session: Some(&launch),
-            tiberium_queues_preinitialized: false,
         });
         assert_eq!(
             output.crates,
@@ -4433,7 +4315,7 @@ mod tests {
     #[test]
     fn generated_trace_rejects_bad_ordinal_before_spending_scenario() {
         let seed = 0x51C0_1007;
-        let mut owner = ScenarioBootstrapRng::new(seed);
+        let mut sim = ScenarioBootstrapRng::new(seed).into_simulation(&descriptor(seed));
         let mut trace = crate::map::construction_trace::RmgConstructionTrace::default();
         trace.push_discarded(
             crate::map::construction_trace::RmgConstructionPhase::NeutralTech,
@@ -4442,7 +4324,7 @@ mod tests {
         trace.events[0].ordinal = 4;
 
         assert!(matches!(
-            owner.replay_generated_construction_trace(&trace),
+            sim.replay_staged_generated_construction_trace(&trace),
             Err(
                 crate::sim::world::GeneratedTechnoInitError::TraceOrdinalMismatch {
                     expected: 0,
@@ -4450,9 +4332,8 @@ mod tests {
                 }
             )
         ));
-        let actual = owner.into_simulation(&descriptor(seed)).rng_state();
         assert_eq!(
-            actual.scenario,
+            sim.rng_state().scenario,
             SimRng::new(u64::from(seed)).logical_state()
         );
     }

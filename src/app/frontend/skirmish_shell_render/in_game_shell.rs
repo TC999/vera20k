@@ -69,13 +69,6 @@ pub(crate) fn native_in_game_shell_active(state: &AppState) -> bool {
         )
 }
 
-pub(crate) fn native_in_game_options_active(state: &AppState) -> bool {
-    state.match_state.match_presentation.in_game_menu
-        == crate::ui::pause_menu::InGameMenuState::Options
-        && state.frontend.skirmish_shell_chrome.is_some()
-        && native_in_game_shell_active(state)
-}
-
 pub(crate) fn current_in_game_shell_layout(
     state: &AppState,
 ) -> Option<(InGameShellLayout, [i32; 2])> {
@@ -358,7 +351,11 @@ pub(super) fn render_shell_frame(
         .iter()
         .map(|d| batch.create_instance_buffer(gpu, &d.instances))
         .collect();
-    let mut cursor: Vec<_> = super::shell_cursor_instance(state).into_iter().collect();
+    let mut cursor: Vec<_> =
+        crate::app::frontend::shell_pass::software_cursor(state, super::SHELL_CURSOR_DEPTH)
+            .map(|(_, instance)| instance)
+            .into_iter()
+            .collect();
     let (cursor_x, cursor_y) = state.window_cursor_position();
     for instance in &mut cursor {
         instance.position[0] += cursor_x - state.match_state.input.cursor_x;

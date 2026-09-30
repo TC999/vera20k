@@ -15,7 +15,6 @@ use crate::rules::ruleset::RuleSet;
 /// Current Rust producers whose animation names have not yet been lifted into
 /// parsed rules fields. Keep the producer and this binding root list together
 /// until that follow-up is complete.
-const GENETIC_CONVERTER_INVOKE_ANIM: &str = "IONBLAST";
 const LIGHTNING_BOLT_ANIMS: [&str; 3] = ["WCLBOLT1", "WCLBOLT2", "WCLBOLT3"];
 
 /// Raw and consumer-visible frame counts for one authoritative effect asset.
@@ -37,8 +36,7 @@ impl EffectAssetFrameCounts {
     }
 }
 
-/// Deterministic match input derived from authoritative world-effect and
-/// particle SHPs.
+/// Deterministic match input derived from particle image SHPs.
 ///
 /// Keys are trimmed, uppercase asset IDs. A `BTreeMap` is deliberate: binding
 /// and hashing must not inherit `HashMap`'s process-random iteration order.
@@ -48,7 +46,7 @@ pub struct EffectAssetCatalog {
 }
 
 impl EffectAssetCatalog {
-    /// Bind every currently authoritative world-effect and particle root.
+    /// Bind every particle image root.
     ///
     /// Missing or malformed assets are optional at this layer: the entry is
     /// omitted after a warning and each simulation consumer retains its
@@ -64,9 +62,9 @@ impl EffectAssetCatalog {
         let mut catalog = Self::default();
 
         for name in authoritative_effect_roots(rules) {
-            let image_id = rules.art_registry.resolve_effective_image_id(&name, &name);
+            let image_id = rules.art().resolve_effective_image_id(&name, &name);
             let candidates = art_data::anim_shp_candidates(
-                Some(&rules.art_registry),
+                Some(rules.art()),
                 &name,
                 &image_id,
                 theater_ext,
@@ -92,9 +90,9 @@ impl EffectAssetCatalog {
                     continue;
                 }
             };
-            let scheduler_owned = rules.art_registry.scheduler_anim_types().contains(&name);
+            let scheduler_owned = rules.art().scheduler_anim_types().contains(&name);
             let shadow = rules
-                .art_registry
+                .art()
                 .anim_runtime_config(&name)
                 .is_some_and(|config| config.shadow);
             let available = available_effect_anim_frame_count(raw, scheduler_owned, shadow);
@@ -104,15 +102,9 @@ impl EffectAssetCatalog {
         catalog
     }
 
-    /// Consumer-visible frame count used for authoritative world-effect timing.
+    /// Consumer-visible frame count (particle image timing).
     pub fn effect_frame_count(&self, name: &str) -> Option<u16> {
         self.entry(name).map(|counts| counts.available)
-    }
-
-    /// Alias spelling for callers that need to distinguish this value from the
-    /// literal SHP header count.
-    pub fn available_frame_count(&self, name: &str) -> Option<u16> {
-        self.effect_frame_count(name)
     }
 
     /// Literal unsigned SHP header frame count.
@@ -121,12 +113,14 @@ impl EffectAssetCatalog {
     /// AnimType body/shadow split. Native behavior for a modded particle image
     /// carrying `Shadow=yes` remains UNCHECKED; retaining both values prevents
     /// the catalog from baking that policy decision into asset binding.
+    #[cfg(test)]
     pub fn raw_frame_count(&self, name: &str) -> Option<u16> {
         self.entry(name).map(|counts| counts.raw)
     }
 
-    /// Iterate entries in canonical asset-name order.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, EffectAssetFrameCounts)> {
+    /// Entries in canonical asset-name order.
+    #[cfg(test)]
+    fn iter(&self) -> impl Iterator<Item = (&str, EffectAssetFrameCounts)> {
         self.entries
             .iter()
             .map(|(name, counts)| (name.as_str(), *counts))
@@ -158,7 +152,7 @@ impl EffectAssetCatalog {
     }
 }
 
-/// Number of SHP frames visible to the existing world-effect consumer.
+/// Number of SHP frames visible to the frame-count consumer.
 ///
 /// gamemd's `AnimTypeClass` INI load at `0x00427D00` calls the SHP loader at
 /// `0x00427B50`, which seeds `End` from the signed SHP header count and halves
@@ -182,25 +176,38 @@ pub fn available_effect_anim_frame_count(
     }
 }
 
-/// Every animation name the combat tick can turn into an `AnimClass` instance.
+/// Animation types `Simulation`'s cliff-collapse producer names literally.
+pub(crate) const CLIFF_COLLAPSE_ANIMS: [&str; 3] = ["XGRYMED1", "XGRYMED2", "XGRYSML1"];
+
+/// The smoke a burning or crashing aircraft trails: `AircraftClass::AI` finds
+/// it by this literal (`0x004150EF..0x00415102`), no rules key names it.
+pub(crate) const AIRCRAFT_SMOKE_ANIM: &str = "SGRYSMK1";
+
+/// Every animation name the simulation can turn into an `AnimClass` instance,
+/// which the loader must bind before the match starts.
 ///
-/// Exactly the three producers that fill `CombatResult::explosion_effects`:
+/// Combat fills `CombatResult::explosion_effects` from three producers:
 /// - the killing warhead's `AnimList=` pick
 ///   (`WarheadTypeClass::Detonate` -> `Warhead::SelectExplosionAnim @ 0x0048A4F0`),
 /// - the infantry death animation for the warhead's `InfDeath=`,
-/// - the dying object's own `Explosion=` / `DestroyAnim=` pick
-///   (`UnitClass::Death_Explosion @ 0x00738680`).
+/// - the dying object's own `Explosion=` / `DestroyAnim=` picks
+///   (`UnitClass::Death_Explosion @ 0x00738680`,
+///   `BuildingClass::DestructionEffects @ 0x004415F0`, and the Aircraft death
+///   arm at `0x0041661F`, which picks `Explosion=` only).
 ///
-/// The list is derived from loaded rules, never hand-written: over retail
-/// `rulesmd.ini` it resolves to 58 distinct names (34 `AnimList=`, 14
-/// `Explosion=`, 13 `DestroyAnim=`, plus the infantry-death family), which is
-/// why the binder that consumes it must tolerate the handful retail authors
-/// with no art section.
-pub fn combat_explosion_anim_roots(rules: &RuleSet) -> Vec<String> {
+/// The other roots (muzzle flashes, warps, superweapon and bridge animations,
+/// ore twinkle, cliff collapse) are named at their inserts below.
+///
+/// The list is derived from loaded rules, never hand-written, and retail
+/// authors several names with no art section or sprite, which is why the
+/// binder that consumes it is the tolerant one.
+pub fn anim_class_roots(rules: &RuleSet) -> Vec<String> {
     let mut roots = BTreeSet::new();
     let mut insert = |name: &str| {
-        if let Some(name) = canonical_asset_id(name) {
-            roots.insert(name);
+        // Type factory references are literal IDs: comma tokens may contain
+        // spaces. Particle asset filenames use their own canonicalizer below.
+        if !name.is_empty() {
+            roots.insert(name.to_ascii_uppercase());
         }
     };
     for warhead in rules.warheads_iter() {
@@ -208,33 +215,93 @@ pub fn combat_explosion_anim_roots(rules: &RuleSet) -> Vec<String> {
             insert(name);
         }
     }
-    for name in rules.general.infantry_death_anims.iter().flatten() {
-        insert(name);
-    }
-    for object in rules.all_objects() {
-        for name in object.explosion_anims.iter().chain(&object.destroy_anims) {
+    // Muzzle animations `TechnoClass::Fire_At` constructs
+    // (`sim::world::damage_consequences`, `combat::fire_coord`).
+    for weapon in rules.weapons_iter() {
+        for name in weapon.anim.iter().chain(&weapon.occupant_anim) {
             insert(name);
         }
     }
+    for name in rules.general.infantry_death_anims.iter().flatten() {
+        insert(name);
+    }
+    // Death debris chunks (`TechnoClass::ReceiveDamage 0x00702281`): a
+    // type's own `DebrisAnims=` or `[General] MetallicDebris=`.
+    for object in rules.all_objects() {
+        for name in object
+            .explosion_anims
+            .iter()
+            .chain(&object.destroy_anims)
+            .chain(&object.debris_anims)
+        {
+            insert(name);
+        }
+    }
+    for name in &rules.general.metallic_debris {
+        insert(name);
+    }
+    // A chunk landing in water below the deck: `Wake=` and the first
+    // `SplashList=` entry (`AnimClass::AI 0x00423D46..0x00423DDD`).
+    insert(&rules.general.wake.name);
+    for name in &rules.combat_damage.splash_list {
+        insert(name);
+    }
+    // SelectAnim48A594 returns this retained AnimType for LightningWarhead.
+    insert(&rules.general.weather_con_bolt_explosion);
+    // Bullet46A2A1 substitutes this after an Iron Curtain area receipt2.
+    insert(&rules.general.weapon_nullify_anim);
+    // `[General] Parachute=`: the canopy `ObjectClass::Paradrop` attaches to a
+    // dropped object (`sim::movement::parachute_descent`).
+    if let Some(name) = rules.general.parachute_shp.as_deref() {
+        insert(name);
+    }
+    // `[General] WarpOut=`: the teleport locomotor constructs it at both ends
+    // of a relocation (`sim::movement::teleport_movement`).
+    insert(&rules.general.warp_out.name);
+    // `SuperClass::Launch` invoke animations (`sim::superweapon`).
+    insert(&rules.general.iron_curtain_invoke_anim);
+    insert(&rules.general.force_shield_invoke_anim);
+    insert(&rules.general.ion_blast_anim);
+    // Lightning Storm bolts (`sim::superweapon::lightning_storm`).
+    for name in LIGHTNING_BOLT_ANIMS {
+        insert(name);
+    }
+    // `[General] BridgeExplosions=`: `CellClass::BlowUpBridge` and the
+    // `CollapseBridge_*` walkers construct them (`world::bridge_orchestrator`).
+    // Stock lists the same four types in `[TankOGas] AnimList=`, but nothing
+    // ties the two lists together.
+    for name in &rules.bridge_rules.explosions {
+        insert(name);
+    }
+    // `[General] OreTwinkle=`: the post-`Full_Init` twinkle tail
+    // (`sim::ore_twinkle`). No other list names it, so without this root every
+    // twinkle failed to construct.
+    if let Some(name) = rules.general.ore_twinkle.as_deref() {
+        insert(name);
+    }
+    // The cliff-collapse debris types are literals in the producer
+    // (`sim::world`); stock binds them only through warhead `AnimList=`.
+    for name in CLIFF_COLLAPSE_ANIMS {
+        insert(name);
+    }
+    // The aircraft smoke (`sim::world::crash`): without this root SGRYSMK1
+    // never bound and every puff failed to construct.
+    insert(AIRCRAFT_SMOKE_ANIM);
     roots.into_iter().collect()
 }
 
-/// Report how many combat-explosion roots the tolerant binder could not bind.
+/// Report how many `anim_class_roots` the tolerant binder could not bind.
 ///
 /// The binder already emits a per-name `warn!`, but a per-name line is invisible
-/// in aggregate: a data change that breaks ten roots reads the same as retail's
-/// standing three unless the count is stated once. Retail's own baseline is
-/// three (`MININUKE - ADDED 11/30`, `GTPOWEXP`, `TSTLEXP` — see
-/// `ArtRegistry::bind_combat_explosion_anim_assets`), so anything above that is
-/// new and worth looking at.
+/// in aggregate unless the count is stated once. Retail's standing count on a
+/// TEMPERATE map is 35, all building animation names: 28 belong to art sections
+/// no `[BuildingTypes]` entry uses, 7 to real buildings whose files no archive
+/// holds. A data change shows up as a different number.
 pub fn log_unbound_combat_explosion_roots(unbound: usize) {
     if unbound == 0 {
         return;
     }
-    log::info!(
-        "{unbound} combat explosion animation root(s) have no art section and stay on the \
-         legacy effect path (retail's own baseline is 3)"
-    );
+    log::info!("{unbound} AnimClass animation root(s) did not bind and will draw nothing");
 }
 
 fn authoritative_effect_roots(rules: &RuleSet) -> BTreeSet<String> {
@@ -245,28 +312,9 @@ fn authoritative_effect_roots(rules: &RuleSet) -> BTreeSet<String> {
         }
     };
 
-    insert(&rules.general.warp_out.name);
-    insert(&rules.general.wake.name);
-    for name in rules.general.infantry_death_anims.iter().flatten() {
-        insert(name);
-    }
-    for warhead in rules.warheads_iter() {
-        for name in &warhead.anim_list {
-            insert(name);
-        }
-    }
-    for name in &rules.bridge_rules.explosions {
-        insert(name);
-    }
-    for name in &rules.general.metallic_debris {
-        insert(name);
-    }
-    insert(&rules.general.iron_curtain_invoke_anim);
-    insert(&rules.general.force_shield_invoke_anim);
-    insert(GENETIC_CONVERTER_INVOKE_ANIM);
-    for name in LIGHTNING_BOLT_ANIMS {
-        insert(name);
-    }
+    // Particle images are the only frame counts a consumer asks for
+    // (`sim::particles::system_ai`). Every animation producer constructs an
+    // `AnimClass`, whose frame bounds come from `bind_anim_class_assets`.
     for particle in rules.particle_types_iter() {
         if let Some(name) = particle.image.as_deref() {
             insert(name);
@@ -331,23 +379,59 @@ mod tests {
         let assets = AssetManager::from_loose_root_for_test(root.path());
 
         let ini = IniFile::from_str(
-            "[General]\n\
-             WarpOut=missing\n\
-             Wake=broken\n\
-             [Particles]\n\
+            "[Particles]\n\
              0=Cloud\n\
+             1=Torn\n\
+             2=Absent\n\
              [Cloud]\n\
-             Image=FX\n",
+             Image=FX\n\
+             [Torn]\n\
+             Image=BROKEN\n\
+             [Absent]\n\
+             Image=MISSING\n",
         );
         let mut rules = RuleSet::from_ini(&ini).expect("effect catalog rules");
         let art = ArtRegistry::from_ini(&IniFile::from_str("[FX]\nShadow=yes\n"));
-        rules.merge_art_data(&art);
+        rules.install_art_data(art);
 
         let catalog = EffectAssetCatalog::bind(&rules, &assets, "TEM", "TEMPERATE");
 
         assert_eq!(catalog.raw_frame_count("FX"), Some(6));
         assert_eq!(catalog.effect_frame_count("FX"), Some(3));
         assert_eq!(catalog.raw_frame_count("BROKEN"), None);
+    }
+
+    /// A root whose SHP is missing is skipped, not fatal, and a bound root's
+    /// `Next=` chain is bound with it. Retail art names building animations
+    /// (`[CAARAY] ActiveAnim=CAARAY_A`) whose sprites never shipped.
+    #[test]
+    fn tolerant_binder_skips_missing_roots_and_follows_next_chains() {
+        let root = TestRoot::new();
+        std::fs::write(
+            root.path().join("ALPHA.SHP"),
+            shp_with_undecodable_pixels(6),
+        )
+        .expect("write root SHP");
+        std::fs::write(root.path().join("BETA.SHP"), shp_with_undecodable_pixels(4))
+            .expect("write chained SHP");
+        let assets = AssetManager::from_loose_root_for_test(root.path());
+        let mut art = ArtRegistry::from_ini(&IniFile::from_str(
+            "[ALPHA]\nNext=BETA\n[BETA]\nRate=450\n[ABSENT]\nRate=450\n",
+        ));
+
+        let skipped = art.bind_anim_class_assets(
+            &["ABSENT".to_string(), "ALPHA".to_string()],
+            &assets,
+            "TEM",
+            "TEMPERATE",
+        );
+
+        assert_eq!(skipped, 1, "the missing sprite is counted, not fatal");
+        let bound = art.scheduler_anim_types();
+        assert!(bound.contains("ALPHA"));
+        assert!(bound.contains("BETA"), "Next= chain is bound with its root");
+        assert!(!bound.contains("ABSENT"));
+        assert_eq!(art.anim_runtime_config("BETA").unwrap().end, 4);
     }
 
     fn catalog_hash(catalog: &EffectAssetCatalog) -> u64 {
@@ -396,5 +480,89 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod anim_class_root_tests {
+    use super::anim_class_roots;
+    use crate::rules::ini_parser::IniFile;
+    use crate::rules::ruleset::RuleSet;
+
+    #[test]
+    fn bridge_roots_preserve_literal_factory_tokens_and_unread_types() {
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[General]\nMetallicDebris=ONE, FX, none, ,D,ONE\n\
+             BridgeExplosions=FX, FX,none,<none>\n",
+        ))
+        .unwrap();
+        let roots = anim_class_roots(&rules);
+        for name in ["ONE", " FX", " NONE", " ", "D", "FX"] {
+            assert!(roots.iter().any(|root| root == name), "{name:?}: {roots:?}");
+        }
+        assert!(!roots.iter().any(|root| root == "NONE"));
+    }
+
+    /// Every producer that constructs an `AnimClass` needs its type bound by
+    /// the loader, or the animation silently draws nothing. The roots come
+    /// from rules, so a renamed `[General]` key must show up here.
+    #[test]
+    fn roots_cover_teleport_superweapon_and_lightning_producers() {
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[General]\nWarpOut=MYWARP\nIronCurtainInvokeAnim=MYIRON\n\
+             ForceShieldInvokeAnim=MYSHIELD\nIonBlast=MYRING\n",
+        ))
+        .expect("rules");
+        let roots = anim_class_roots(&rules);
+        for name in [
+            "MYWARP", "MYIRON", "MYSHIELD", "MYRING", "WCLBOLT1", "WCLBOLT2", "WCLBOLT3",
+        ] {
+            assert!(
+                roots.iter().any(|root| root == name),
+                "{name} missing: {roots:?}"
+            );
+        }
+    }
+
+    /// Bridge collapse explosions are AnimClass objects; their types must be
+    /// roots in their own right, not through a warhead that happens to list
+    /// the same names.
+    #[test]
+    fn roots_cover_bridge_explosions_without_a_matching_warhead() {
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[General]\nBridgeExplosions=MYBRIDGE1,MYBRIDGE2\n",
+        ))
+        .expect("rules");
+        let roots = anim_class_roots(&rules);
+        for name in ["MYBRIDGE1", "MYBRIDGE2"] {
+            assert!(
+                roots.iter().any(|root| root == name),
+                "{name} missing: {roots:?}"
+            );
+        }
+    }
+
+    /// Producers that name their type outside any warhead list: the ore
+    /// twinkle and the cliff-collapse literals.
+    #[test]
+    fn roots_cover_ore_twinkle_and_cliff_collapse_literals() {
+        let rules = RuleSet::from_ini(&IniFile::from_str("[General]\nOreTwinkle=MYTWINKLE\n"))
+            .expect("rules");
+        let roots = anim_class_roots(&rules);
+        for name in ["MYTWINKLE", "XGRYMED1", "XGRYMED2", "XGRYSML1"] {
+            assert!(
+                roots.iter().any(|root| root == name),
+                "{name} missing: {roots:?}"
+            );
+        }
+    }
+
+    /// `RulesClass+0x298` defaults to a null type: without `IonBlast=` the
+    /// Genetic Mutator constructs no animation, and no empty root is bound.
+    #[test]
+    fn absent_ion_blast_adds_no_root() {
+        let rules = RuleSet::from_ini(&IniFile::from_str("[General]\n")).expect("rules");
+        assert_eq!(rules.general.ion_blast_anim, "");
+        assert!(anim_class_roots(&rules).iter().all(|root| !root.is_empty()));
     }
 }

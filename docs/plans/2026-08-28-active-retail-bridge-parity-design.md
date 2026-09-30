@@ -1586,7 +1586,7 @@ For every dependency-coherent implementation transaction:
 4. Commit each coherent evidence-backed slice after focused validation. Keep the branch reviewable and buildable; do not defer a multi-slice transaction into one giant commit.
 5. Give a fresh read-only critic who did not build the transaction its complete requirement, native/retail evidence, exact cumulative diff, preservation obligations, and literal validation output. If the transaction is the last contributor to a split mechanism, include that mechanism's complete earlier transaction history and row-level closure bundle.
 6. If it fails, the builder fixes the largest finding and commits the correction. Give the full updated bundle to a new fresh critic, who must recheck every prior finding plus the new diff. Repeat until a fresh critic passes with no material finding.
-7. After the fresh pass, check Cargo ownership and run `cargo test -p vera20k --lib` exactly once as that PR's full readiness certification. Do not rerun it for the same PR unless a later code correction invalidates the certification; such a correction reopens readiness and requires the rule in `ENGINE.md` to decide the new certification boundary.
+7. After the fresh pass, check Cargo ownership and run `cargo test -p vera20k --lib` exactly once as that PR's full readiness certification. Do not rerun it for the same PR unless a later code correction invalidates the certification; such a correction reopens readiness and requires the rule in `AGENTS.md` to decide the new certification boundary.
 8. Push the dedicated branch and open or update its PR targeting `main`; publication is preauthorized by this goal. Record the contract, exact commits, critic chain, focused literal output, and full-suite literal output. Take the PR through review and merge before beginning any dependent transaction. Never stack a dependent branch or rewrite around this boundary.
 9. Refresh the living inventory from the resulting `main`. A passed transaction closes only the exact contributions it contains. Approximate, unverified, missing, or residual behavior keeps its mechanism and owning GSI row open; a split mechanism closes only at its final cumulative row review.
 
@@ -2089,7 +2089,7 @@ builder/fresh-critic chain, focused validation, PR-readiness full suite, or merg
 - `docs/research/bridges/00-system-models/ACTIVE_RETAIL_BRIDGE_COVERAGE_REINVESTIGATION_GHIDRA_REPORT.md`
 - `docs/research/bridges/00-system-models/RMG_BRIDGE_DUAL_RNG_LIFECYCLE_REINVESTIGATION_GHIDRA_REPORT.md`
 - `docs/research/bridges/00-system-models/RMG_PREVIEW_ANIM_BUILDING_IDENTITY_LIFECYCLE_REINVESTIGATION_GHIDRA_REPORT.md`
-- `docs/research/bridges/00-system-models/SCENARIO_PREFIX_PLAN_INELIGIBLE_FALLBACK_REINVESTIGATION_GHIDRA_REPORT.md`
+- [docs/research/bridges/00-system-models/SCENARIO_PREFIX_PLAN_INELIGIBLE_FALLBACK_REINVESTIGATION_GHIDRA_REPORT.md](https://github.com/YuriPlanet/vera20k/blob/108924bc237d14342b68b8bb78f2bba0400d2443/docs/research/bridges/00-system-models/SCENARIO_PREFIX_PLAN_INELIGIBLE_FALLBACK_REINVESTIGATION_GHIDRA_REPORT.md)
 - `docs/research/bridges/01-assets-map-load-overlay/LOW_OVERLAY_MARK_FIXED_MAP_STAMP_RNG_TRANSACTION_GHIDRA_REPORT.md`
 - `docs/research/bridges/01-assets-map-load-overlay/LOW_OVERLAY_MARK_SCENARIO_LOAD_ACTIVATION_BOUNDARY_GHIDRA_REPORT.md`
 - `docs/research/bridges/01-assets-map-load-overlay/LOW_OVERLAY_MARK_ALL_LOAD_CONTEXT_SCENARIO_RNG_LIFECYCLE_GHIDRA_REPORT.md`
@@ -2113,5 +2113,5 @@ builder/fresh-critic chain, focused validation, PR-readiness full suite, or merg
 - active `gamemd.exe` addresses and retail inputs enumerated by those reports
 - current Rust owners at freshly fetched `origin/main` snapshot
   `50e4b7ba4732fd3fb48e5b819e1abc55327ec557`
-- `docs/system-map/topology.v2.json` `bridge-helpers` service boundary
+- [docs/system-map/topology.v2.json](https://github.com/YuriPlanet/vera20k/blob/1dbaf80c89c9348df493ab618dbefed8663aef96/docs/system-map/topology.v2.json) `bridge-helpers` service boundary
 - `C:\Users\enok\Documents\OpenTS` correspondence ledger, as navigation leads only

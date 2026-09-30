@@ -213,6 +213,7 @@ impl CommandRecord {
         &self.bytes
     }
 
+    #[cfg(test)]
     #[inline]
     pub fn into_bytes(self) -> [u8; COMMAND_RECORD_LEN] {
         self.bytes
@@ -451,15 +452,6 @@ impl TryFrom<&[u8]> for CommandRecord {
     }
 }
 
-/// Queueing behavior for build/production commands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum QueueMode {
-    /// Replace existing queued path/intent.
-    Replace,
-    /// Append to existing queue/waypoint chain.
-    Append,
-}
-
 /// One gameplay command payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Command {
@@ -469,16 +461,12 @@ pub enum Command {
         additive: bool,
     },
     /// Move one entity to a target cell.
-    /// Speed is resolved at dispatch time from rules.ini (ObjectType.speed)
-    /// multiplied by the entity's locomotor speed_multiplier.
+    /// Speed is resolved at dispatch time by `movement::order_speed`.
     Move {
         entity_id: u64,
         target_rx: u16,
         target_ry: u16,
         queue: bool,
-        /// When multiple units are ordered together, they share a group_id.
-        /// The movement system syncs their speed to the slowest member.
-        group_id: Option<u32>,
     },
     /// Stop movement/combat intent on one entity.
     Stop { entity_id: u64 },
@@ -503,49 +491,40 @@ pub enum Command {
     /// Undeploy a structure back into its mobile unit (e.g. ConYard → MCV).
     /// Reads UndeploysInto from rules.ini to determine the spawned unit type.
     UndeployBuilding { entity_id: u64 },
-    /// Set production rally point for owner and the explicit selected producers.
+    /// Archive a rally cell on each selected factory the command owner owns.
     SetRally {
-        owner: InternedId,
         rx: u16,
         ry: u16,
         producer_ids: Vec<u64>,
     },
-    /// Enqueue a production item.
-    QueueProduction {
-        owner: InternedId,
-        type_id: InternedId,
-        mode: QueueMode,
-    },
-    /// Pause/resume the active production item for one owner/category queue.
-    TogglePauseProduction {
-        owner: InternedId,
-        category: ProductionCategory,
-    },
-    /// Cycle the active producer facility for one owner/category.
-    CycleProducerFocus {
-        owner: InternedId,
-        category: ProductionCategory,
-    },
+    // The production commands act on the envelope's house, as a native
+    // production event acts on its header's house id (`EventClass::Execute
+    // 0x004C6CB0` reads it at `0x004C6CC4`); none names another.
+    /// PRODUCE (`EventClass::Execute` type 14 → `HouseClass::Begin_Production
+    /// @ 0x004FA350`): start, queue or resume a build of this type.
+    QueueProduction { type_id: InternedId },
+    /// SUSPEND (type 15 → `HouseClass::Suspend_Production @ 0x004FA910`):
+    /// put the category's running build on hold.
+    SuspendProduction { category: ProductionCategory },
+    /// Cycle the active producer facility of one category.
+    CycleProducerFocus { category: ProductionCategory },
     /// Place one completed building that is waiting for placement.
     PlaceReadyBuilding {
-        owner: InternedId,
         type_id: InternedId,
         rx: u16,
         ry: u16,
     },
-    /// Cancel the last queued production item for owner.
-    CancelLastProduction { owner: InternedId },
-    /// Cancel one queued item of a specific type (right-click cameo).
-    CancelProductionByType {
-        owner: InternedId,
-        type_id: InternedId,
-    },
+    /// ABANDON (type 16) or, with `all`, ABANDON_ALL (type 46) →
+    /// `HouseClass::Abandon_Production @ 0x004FAA10`: cancel a queued copy, or
+    /// every copy, of this type and then the active build of it.
+    CancelProductionByType { type_id: InternedId, all: bool },
     /// Sell a building, refunding a percentage of its cost and despawning it.
     SellBuilding { entity_id: u64 },
     /// Toggle repair mode on a building (spend credits to heal over time).
     ToggleRepair { entity_id: u64 },
     /// Force a miner to return to its refinery (right-click on own refinery or 'D' key).
-    /// Chrono Miners teleport; War Miners drive back.
+    /// Both kinds run the Harvest return; a Chrono Miner warps onto the pad
+    /// from within `ChronoHarvTooFarDistance`.
     MinerReturn {
         entity_id: u64,
         /// Explicit refinery clicked by the player. Keyboard/generic forced
@@ -571,7 +550,7 @@ pub enum Command {
     /// (the hidden occupant is not selectable in this slice); the occupant
     /// reappears on a passable cell SW of the bunker and drives out.
     EjectBunker { bunker_id: u64 },
-    /// Order a transport to unload all passengers to adjacent cells (one per tick).
+    /// Order a transport or garrison to unload: the Unload mission of its class.
     UnloadPassengers { transport_id: u64 },
     /// Direct a harvester to go harvest a specific ore cell.
     /// The miner will path to the cell, then enter Harvest state on arrival.

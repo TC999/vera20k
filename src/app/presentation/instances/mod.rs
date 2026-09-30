@@ -8,7 +8,7 @@
 //! - `helpers` — depth sorting, interpolation, visibility checks
 //! - `units` — voxel unit instance generation (turrets, harvest overlays)
 //! - `shp` — SHP building/infantry instances (building anims, bibs)
-//! - `overlays` — map overlays, world effects, fog snapshots
+//! - `overlays` — map overlays, AnimClass objects, fog snapshots
 //!
 //! ## Dependency rules
 //! - Part of the app layer — may depend on everything.
@@ -25,6 +25,9 @@ pub(crate) use shp::*;
 
 mod overlays;
 pub(crate) use overlays::*;
+
+mod projectiles;
+pub(crate) use projectiles::*;
 
 mod particles;
 pub(crate) use particles::*;

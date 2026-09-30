@@ -8,13 +8,11 @@
 //! draws). The app submits immutable map/session inputs and consumes only the
 //! receipt.
 
-use std::collections::BTreeSet;
-
-use crate::map::basic::{BasicSection, SpecialFlagsSection};
 use crate::map::houses::HouseRoster;
 use crate::map::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::crates::CratePlacement;
+#[cfg(test)]
 use crate::sim::ore_growth::NativeTiberiumRebuildStats;
 use crate::sim::world::Simulation;
 #[cfg(test)]
@@ -24,22 +22,16 @@ use crate::skirmish_launch::SkirmishLaunchSession;
 pub(crate) struct ScenarioPostMapInput<'a> {
     pub(crate) map_width: u16,
     pub(crate) map_height: u16,
-    pub(crate) basic: &'a BasicSection,
-    pub(crate) special_flags: &'a SpecialFlagsSection,
     pub(crate) normal_lighting: crate::map::lighting::LightingProfileUnits,
     pub(crate) rules: &'a RuleSet,
     pub(crate) overlay_registry: &'a OverlayTypeRegistry,
     pub(crate) house_roster: &'a HouseRoster,
     pub(crate) skirmish_session: Option<&'a crate::sim::scenario_bootstrap::MatchLaunchDescriptor>,
-    /// Authored Full_Init has already completed the native growth-all then
-    /// spread-all queue scans between Terrain and Techno sections.
-    pub(crate) tiberium_queues_preinitialized: bool,
 }
 
 /// Presentation/logging facts returned after authoritative initialization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ScenarioPostMapOutput {
-    pub(crate) tiberium_queues: Option<NativeTiberiumRebuildStats>,
     pub(crate) navigation_published: bool,
     pub(crate) crates: Option<CratePlacement>,
     pub(crate) ore_twinkle: crate::sim::ore_twinkle::OreTwinkleReceipt,
@@ -69,70 +61,15 @@ impl Simulation {
         // regeneration rung reaches `OverlayClass::Mark` with the same source
         // this startup pass uses.
         self.scenario_normal_lighting = input.normal_lighting;
-        let tiberium_queues = if input.tiberium_queues_preinitialized {
-            None
-        } else if let Some(overlay_grid) = self.overlay_grid.as_ref() {
-            self.production.ore_growth_config = crate::sim::ore_growth::OreGrowthConfig::resolve(
-                &input.rules.general,
-                input.basic,
-                input.special_flags,
-                &self.session,
-            );
-            self.production.ore_growth_state =
-                crate::sim::ore_growth::OreGrowthState::new(input.map_width, input.map_height);
-            // `CellClass+0xE4 FirstObject != 0`: terrain objects plus every
-            // ground-list Techno already constructed.
-            let mut source_object_cells: BTreeSet<(u16, u16)> = self
-                .production
-                .terrain_object_cells
-                .keys()
-                .copied()
-                .collect();
-            source_object_cells.extend(
-                self.substrate.occupancy.occupied_cells_on_layer(
-                    crate::sim::movement::locomotor::MovementLayer::Ground,
-                ),
-            );
-            Some(
-                self.production
-                    .ore_growth_state
-                    .rebuild_native_tiberium_queues_from_overlays(
-                        overlay_grid,
-                        input.overlay_registry,
-                        &input.rules.tiberium_types,
-                        self.resolved_terrain.as_ref(),
-                        &source_object_cells,
-                        self.production.ore_growth_config.grows,
-                        self.production.ore_growth_config.spreads,
-                        self.session.binary_frame,
-                        (input.map_width, input.map_height),
-                    ),
-            )
-        } else {
-            self.production.ore_growth_config = crate::sim::ore_growth::OreGrowthConfig::resolve(
-                &input.rules.general,
-                input.basic,
-                input.special_flags,
-                &self.session,
-            );
-            self.production.ore_growth_state =
-                crate::sim::ore_growth::OreGrowthState::new(input.map_width, input.map_height);
-            self.production
-                .ore_growth_state
-                .reset_native_tiberium_classes(0, self.session.binary_frame);
-            None
-        };
-
         // Runtime rebuilds use this same sim-owned publication seam. Crate
-        // placement below pins the newly published path snapshot.
-        let mut navigation_published = self.rebuild_dynamic_navigation(input.rules);
+        // placement below reads the newly published canonical grid.
+        let navigation_published = self.rebuild_dynamic_navigation(input.rules);
 
         #[cfg(test)]
         let mut skirmish_order = [None; 3];
         let crates = if let Some(descriptor) = input.skirmish_session {
             let session = descriptor.session();
             let player_count = crate::sim::crates::human_player_count(self);
-            let initial_path = self.path_grid_snapshot();
             #[cfg(test)]
             {
                 skirmish_order[0] = Some(ScenarioPostMapStep::StartupCrates);
@@ -141,18 +78,12 @@ impl Simulation {
                 self,
                 input.rules,
                 input.overlay_registry,
-                initial_path.as_deref(),
                 player_count,
                 input.normal_lighting,
             );
             // Startup OverlayClass::Mark completes synchronously before native
-            // proceeds to AI credits. Rust's BridgeRuntimeState is a derived
-            // cache built earlier in the load funnel, so rebuild it from the
-            // now-final CellClass projection and publish matching first-frame
-            // navigation without consuming OverlayGrid's dirty receipt.
-            if self.refresh_bridge_runtime_after_crate_mark() {
-                navigation_published = self.rebuild_dynamic_navigation(input.rules);
-            }
+            // proceeds to AI credits; the placement refreshed the bridge
+            // records and navigation from the now-final CellClass state.
             #[cfg(test)]
             {
                 skirmish_order[1] = Some(ScenarioPostMapStep::AiOpeningCredits);
@@ -202,7 +133,6 @@ impl Simulation {
         );
 
         ScenarioPostMapOutput {
-            tiberium_queues,
             navigation_published,
             crates,
             ore_twinkle,
@@ -211,11 +141,11 @@ impl Simulation {
         }
     }
 
-    /// Rebuild the derived bridge runtime cache after a crate `OverlayClass::Mark`
+    /// Rebuild the derived bridge record vector after a crate `OverlayClass::Mark`
     /// batch. Native Mark mutates live CellClass state synchronously; Rust builds
     /// `BridgeRuntimeState` earlier in the load funnel, so both the startup batch
     /// and the per-tick regeneration rung refresh it from the now-final CellClass
-    /// projection.
+    /// state.
     pub(crate) fn refresh_bridge_runtime_after_crate_mark(&mut self) -> bool {
         let Some((destroyable, bridge_strength)) = self
             .bridge_state
@@ -250,13 +180,11 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fmt::Write as _;
 
-    use crate::map::bridge_facts::BridgeCellFacts;
+    use crate::map::basic::{BasicSection, SpecialFlagsSection};
     use crate::map::houses::HouseDefinition;
-    use crate::map::resolved_terrain::{ResolvedTerrainCell, ResolvedTerrainGrid, zone_class};
+    use crate::map::resolved_terrain::{ResolvedTerrainCell, ResolvedTerrainGrid};
     use crate::rules::house_colors::HouseColorIndex;
     use crate::rules::ini_parser::IniFile;
-    use crate::rules::terrain_rules::{LandType, SpeedCostProfile, TerrainClass};
-    use crate::sim::ai::AiPlayerState;
     use crate::sim::house_state::HouseState;
     use crate::sim::overlay_grid::OverlayGrid;
     use crate::skirmish_launch::{
@@ -307,77 +235,11 @@ mod tests {
     }
 
     fn flat_terrain() -> ResolvedTerrainGrid {
-        let land_type = LandType::Clear.as_index();
-        let speed_costs = SpeedCostProfile {
-            foot: Some(100),
-            track: Some(100),
-            wheel: Some(100),
-            float: Some(100),
-            amphibious: Some(100),
-            float_beach: Some(100),
-            hover: Some(100),
-        };
-        let mut cells = Vec::with_capacity(MAP_SIZE as usize * MAP_SIZE as usize);
-        for ry in 0..MAP_SIZE {
-            for rx in 0..MAP_SIZE {
-                cells.push(ResolvedTerrainCell {
-                    rx,
-                    ry,
-                    source_tile_index: 0,
-                    source_sub_tile: 0,
-                    final_tile_index: 0,
-                    final_sub_tile: 0,
-                    is_wood_bridge_repair_tile: false,
-                    level: 0,
-                    filled_clear: false,
-                    tileset_index: Some(0),
-                    land_type,
-                    yr_cell_land_type: land_type,
-                    slope_type: 0,
-                    template_height: 0,
-                    render_offset_x: 0,
-                    render_offset_y: 0,
-                    terrain_class: TerrainClass::Clear,
-                    speed_costs,
-                    is_water: false,
-                    is_cliff_like: false,
-                    is_rough: false,
-                    is_road: false,
-                    accepts_smudge: true,
-                    allows_tiberium: true,
-                    height_in_pixels: 0,
-                    variant: 0,
-                    has_ramp: false,
-                    canonical_ramp: None,
-                    ground_walk_blocked: false,
-                    terrain_object_blocks: false,
-                    terrain_object_occupation: None,
-                    overlay_blocks: false,
-                    overlay_zone_type: None,
-                    outside_playfield: false,
-                    zone_type: zone_class::GROUND,
-                    base_ground_walk_blocked: false,
-                    base_build_blocked: false,
-                    base_land_type: land_type,
-                    base_yr_cell_land_type: land_type,
-                    base_terrain_class: TerrainClass::Clear,
-                    base_speed_costs: speed_costs,
-                    build_blocked: false,
-                    has_bridge_deck: false,
-                    bridge_walkable: false,
-                    bridge_transition: false,
-                    bridge_deck_level: 0,
-                    bridge_layer: None,
-                    bridge_facts: BridgeCellFacts::default(),
-                    tube_index: None,
-                    radar_left: [0; 3],
-                    radar_right: [0; 3],
-                    has_damaged_data: false,
-                    bridgehead_anchor_class_at_load: None,
-                });
-            }
-        }
-        ResolvedTerrainGrid::from_cells(MAP_SIZE, MAP_SIZE, cells)
+        crate::map::resolved_terrain::test_grid(MAP_SIZE, MAP_SIZE, |rx, ry| ResolvedTerrainCell {
+            speed_costs: crate::map::resolved_terrain::TEST_OPEN_SPEED_COSTS,
+            base_speed_costs: crate::map::resolved_terrain::TEST_OPEN_SPEED_COSTS,
+            ..crate::map::resolved_terrain::test_tiberium_cell(rx, ry)
+        })
     }
 
     fn twinkle_rules_and_overlays() -> (RuleSet, OverlayTypeRegistry) {
@@ -407,7 +269,7 @@ mod tests {
             "[TWNK1]\nLoopCount=-1\nRandomLoopDelay=120,300\nDetailLevel=2\nHideIfNoOre=true\nRate=450\n",
         ));
         art.bind_anim_frame_count_for_test("TWNK1", 8);
-        rules.art_registry = art;
+        rules.replace_art_registry_for_test(art);
         (rules, OverlayTypeRegistry::from_ini(&ini, None))
     }
 
@@ -419,21 +281,13 @@ mod tests {
         ScenarioPostMapInput {
             map_width: MAP_SIZE,
             map_height: MAP_SIZE,
-            basic: &BASIC_DEFAULT,
-            special_flags: &SPECIAL_FLAGS_DEFAULT,
             normal_lighting: crate::map::lighting::ParsedLightingProfiles::default().normal,
             rules,
             overlay_registry: overlays,
             house_roster,
             skirmish_session: None,
-            tiberium_queues_preinitialized: true,
         }
     }
-
-    static BASIC_DEFAULT: std::sync::LazyLock<BasicSection> =
-        std::sync::LazyLock::new(BasicSection::default);
-    static SPECIAL_FLAGS_DEFAULT: std::sync::LazyLock<SpecialFlagsSection> =
-        std::sync::LazyLock::new(SpecialFlagsSection::default);
 
     /// `FUN_00684C30 @ 0x0068504D..0x006850F3`: one `RandomRanged(0, N-1)`
     /// Scenario draw per resource cell in `CellIterator` order, one native ID
@@ -615,7 +469,7 @@ mod tests {
         );
         let id = sim
             .spawn_load_anim_at_world(
-                &rules.art_registry,
+                &rules,
                 descriptor,
                 crate::sim::anim_class::AnimWorldCoord {
                     x: 7 * 256 + 128,
@@ -664,6 +518,7 @@ mod tests {
     #[test]
     fn post_load_ore_twinkle_pass_is_inert_without_the_rules_anim() {
         let (rules, overlays) = post_map_rules_and_overlays();
+        assert!(rules.general.ore_twinkle.is_none());
         let mut sim = Simulation::with_seed(0x0037_7EA6);
         sim.session.map_width = MAP_SIZE;
         sim.session.map_height = MAP_SIZE;
@@ -672,12 +527,26 @@ mod tests {
         overlay_grid.place_overlay(7, 7, 0, 3);
         sim.overlay_grid = Some(overlay_grid);
         let scenario_before = sim.scenario_rng.state();
+        let native_before = sim.native_unique_ids.as_ref().unwrap().current_raw();
         let roster = HouseRoster::default();
 
         let output =
             sim.finalize_scenario_post_map(generic_post_map_input(&rules, &overlays, &roster));
 
-        assert_eq!(output.ore_twinkle, Default::default());
+        // Original68503B constructs GasCloudSys before685052 tests the
+        // OreTwinkle pointer. with_seed now supplies the same explicit cursor
+        // prerequisite as other synthetic constructor fixtures.
+        assert_eq!(
+            output.ore_twinkle,
+            crate::sim::ore_twinkle::OreTwinkleReceipt {
+                particle_system_id_consumed: true,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            sim.native_unique_ids.as_ref().unwrap().current_raw(),
+            native_before.wrapping_add(1)
+        );
         assert_eq!(sim.scenario_rng.state(), scenario_before);
         assert_eq!(sim.substrate.anims.iter().count(), 0);
     }
@@ -753,7 +622,6 @@ mod tests {
             computer,
             HouseState::new(computer, 1, None, false, 5_000, 10),
         );
-        sim.ai_players.push(AiPlayerState::new(computer));
 
         let mut expected_rng = sim.scenario_rng.clone();
         let expected_crate_cell = (
@@ -769,21 +637,30 @@ mod tests {
         )
         .expect("fixture session is fully resolved");
 
+        // The queues are built where the load builds them, before the post-map
+        // tail, which leaves them alone.
+        let overlay_grid_for_queues = sim.overlay_grid.clone();
+        let queue_stats = crate::sim::runtime::initialize_native_tiberium_queues(
+            &mut sim,
+            &basic,
+            &special_flags,
+            &rules,
+            &overlays,
+            overlay_grid_for_queues.as_ref(),
+            (MAP_SIZE, MAP_SIZE),
+        );
         let output = sim.finalize_scenario_post_map(ScenarioPostMapInput {
             map_width: MAP_SIZE,
             map_height: MAP_SIZE,
-            basic: &basic,
-            special_flags: &special_flags,
             normal_lighting: crate::map::lighting::ParsedLightingProfiles::default().normal,
             rules: &rules,
             overlay_registry: &overlays,
             house_roster: &roster,
             skirmish_session: Some(&descriptor),
-            tiberium_queues_preinitialized: false,
         });
 
         assert_eq!(
-            output.tiberium_queues,
+            queue_stats,
             Some(NativeTiberiumRebuildStats {
                 growth_entries: 1,
                 spread_entries: 1,
@@ -795,10 +672,10 @@ mod tests {
         assert_eq!(native.classes[0].spread_bitmap, BTreeSet::from([(5, 5)]));
         assert!(output.navigation_published);
         assert!(sim.path_grid().is_some());
-        assert_eq!(sim.houses[&player].credits, 5_000);
+        assert_eq!(sim.houses[&player].economy.credits, 5_000);
         // The fixture AI is Easy and the fixture rules carry no MultiplayerAICM
         // entry for it, so Post_Map_Init adds ftol(0 * 0.01 * 5000) = 0.
-        assert_eq!(sim.houses[&computer].credits, 5_000);
+        assert_eq!(sim.houses[&computer].economy.credits, 5_000);
         assert_eq!(
             output.crates,
             Some(CratePlacement {
@@ -869,20 +746,16 @@ mod tests {
         assert_eq!(seeded.growth_entries, 1);
         assert_eq!(seeded.spread_entries, 1);
 
-        let output = sim.finalize_scenario_post_map(ScenarioPostMapInput {
+        sim.finalize_scenario_post_map(ScenarioPostMapInput {
             map_width: MAP_SIZE,
             map_height: MAP_SIZE,
-            basic: &BasicSection::default(),
-            special_flags: &SpecialFlagsSection::default(),
             normal_lighting: crate::map::lighting::ParsedLightingProfiles::default().normal,
             rules: &rules,
             overlay_registry: &overlays,
             house_roster: &HouseRoster::default(),
             skirmish_session: None,
-            tiberium_queues_preinitialized: true,
         });
 
-        assert_eq!(output.tiberium_queues, None);
         let native = sim.production.ore_growth_state.native_tiberium_state();
         assert_eq!(native.classes[0].growth_bitmap, BTreeSet::from([(5, 5)]));
         assert_eq!(native.classes[0].spread_bitmap, BTreeSet::from([(5, 5)]));
@@ -938,17 +811,26 @@ mod tests {
         )
         .expect("fixture session is fully resolved");
 
+        // The queues are built where the load builds them, before the post-map
+        // tail, which leaves them alone.
+        let overlay_grid_for_queues = sim.overlay_grid.clone();
+        let _ = crate::sim::runtime::initialize_native_tiberium_queues(
+            &mut sim,
+            &BasicSection::default(),
+            &SpecialFlagsSection::default(),
+            &rules,
+            &overlays,
+            overlay_grid_for_queues.as_ref(),
+            (MAP_SIZE, MAP_SIZE),
+        );
         let output = sim.finalize_scenario_post_map(ScenarioPostMapInput {
             map_width: MAP_SIZE,
             map_height: MAP_SIZE,
-            basic: &BasicSection::default(),
-            special_flags: &SpecialFlagsSection::default(),
             normal_lighting: crate::map::lighting::ParsedLightingProfiles::default().normal,
             rules: &rules,
             overlay_registry: &overlays,
             house_roster: &HouseRoster::default(),
             skirmish_session: Some(&descriptor),
-            tiberium_queues_preinitialized: false,
         });
 
         assert_eq!(
@@ -965,12 +847,12 @@ mod tests {
             .next()
             .expect("one startup crate anchor");
         let bridge_cell = sim
-            .bridge_state
+            .resolved_terrain
             .as_ref()
-            .and_then(|state| state.cell(anchor.0, anchor.1))
-            .expect("startup high anchor reaches BridgeRuntimeState");
-        assert!(bridge_cell.deck_present);
-        assert_eq!(bridge_cell.overlay_byte, 0x18);
+            .and_then(|terrain| terrain.cell(anchor.0, anchor.1))
+            .expect("startup high anchor cell");
+        assert!(bridge_cell.bridge_facts.has_structural_bridge());
+        assert_eq!(bridge_cell.bridge_facts.overlay_id, Some(0x18));
         let path_cell = sim
             .path_grid()
             .and_then(|grid| grid.cell(anchor.0, anchor.1))
@@ -998,7 +880,6 @@ mod tests {
         let owner = sim.interner.intern("HouseA");
         sim.houses
             .insert(owner, HouseState::new(owner, 0, None, false, 7_500, 10));
-        sim.ai_players.push(AiPlayerState::new(owner));
         let rng_before = sim.scenario_rng.state();
         let roster = HouseRoster {
             houses: vec![
@@ -1008,7 +889,7 @@ mod tests {
                     country: None,
                     side: None,
                     player_control: Some(false),
-                    iq: None,
+                    iq: 0,
                     allies: vec!["HouseB".to_string()],
                     base_plan: Default::default(),
                 },
@@ -1018,32 +899,40 @@ mod tests {
                     country: None,
                     side: None,
                     player_control: Some(true),
-                    iq: None,
+                    iq: 0,
                     allies: Vec::new(),
                     base_plan: Default::default(),
                 },
             ],
         };
 
+        // The queues are built where the load builds them, before the post-map
+        // tail, which leaves them alone.
+        let overlay_grid_for_queues = sim.overlay_grid.clone();
+        let _ = crate::sim::runtime::initialize_native_tiberium_queues(
+            &mut sim,
+            &BasicSection::default(),
+            &SpecialFlagsSection::default(),
+            &rules,
+            &overlays,
+            overlay_grid_for_queues.as_ref(),
+            (MAP_SIZE, MAP_SIZE),
+        );
         let output = sim.finalize_scenario_post_map(ScenarioPostMapInput {
             map_width: MAP_SIZE,
             map_height: MAP_SIZE,
-            basic: &BasicSection::default(),
-            special_flags: &SpecialFlagsSection::default(),
             normal_lighting: crate::map::lighting::ParsedLightingProfiles::default().normal,
             rules: &rules,
             overlay_registry: &overlays,
             house_roster: &roster,
             skirmish_session: None,
-            tiberium_queues_preinitialized: false,
         });
 
-        assert_eq!(output.tiberium_queues, None);
         assert!(output.navigation_published);
         assert_eq!(output.crates, None);
         assert_eq!(output.skirmish_order, [None; 3]);
         assert_eq!(sim.scenario_rng.state(), rng_before);
-        assert_eq!(sim.houses[&owner].credits, 7_500);
+        assert_eq!(sim.houses[&owner].economy.credits, 7_500);
         assert!(
             sim.production
                 .ore_growth_state

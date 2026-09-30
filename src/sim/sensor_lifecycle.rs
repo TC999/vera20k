@@ -369,22 +369,6 @@ impl Simulation {
         let _ = self.remove_cached_sensor_deposit(stable_id, Some(rules));
     }
 
-    /// FootClass::PerCellProcess old-remove/new-add pair. TubeMovement owns an
-    /// early-return turn and is intentionally not routed here until its native
-    /// completion writer lands.
-    pub(crate) fn move_unit_sensor_after_cell_change(
-        &mut self,
-        stable_id: u64,
-        old_cell: Option<(u16, u16)>,
-        new_cell: Option<(u16, u16)>,
-        rules: &RuleSet,
-    ) {
-        if old_cell == new_cell {
-            return;
-        }
-        self.refresh_unit_sensor_at_per_cell(stable_id, rules);
-    }
-
     /// Foot4D8611/4D8621 executes both receivers for PerCellProcess(2),
     /// including a terminal or chain callback in the same cell.
     pub(crate) fn refresh_unit_sensor_at_per_cell(&mut self, stable_id: u64, rules: &RuleSet) {
@@ -532,9 +516,8 @@ mod tests {
             "the overlapping second deposit remains positive"
         );
 
-        let old = Some((40, 30));
         sim.substrate.entities.get_mut(second).unwrap().position.rx = 50;
-        sim.move_unit_sensor_after_cell_change(second, old, Some((50, 30)), &rules);
+        sim.refresh_unit_sensor_at_per_cell(second, &rules);
         assert!(!sim.fog.has_sensor_for_house(americans, 33, 30));
         assert!(sim.fog.has_sensor_for_house(americans, 57, 30));
 
@@ -586,18 +569,12 @@ mod tests {
                 .sensor_deposit
                 .is_none()
         );
-        sim.substrate.entities.get_mut(id).unwrap().building_up = Some(BuildingUp {
-            elapsed_ticks: 0,
-            total_ticks: 1,
-        });
-        sim.advance_tick(
-            &[],
-            Some(&rules),
-            &std::collections::BTreeMap::new(),
-            None,
-            None,
-            67,
-        );
+        sim.substrate
+            .entities
+            .get_mut(id)
+            .unwrap()
+            .install_building_up(BuildingUp::completing_in_ticks(1, 0), 0);
+        sim.advance_tick(&[], Some(&rules), None, None, 67);
         assert!(
             sim.substrate
                 .entities
@@ -636,18 +613,12 @@ mod tests {
             .spawn_object_at_height("NAPSIS", "Soviet", 40, 40, 0, 0, &rules)
             .unwrap();
         let soviet = sim.substrate.entities.get(id).unwrap().owner;
-        sim.substrate.entities.get_mut(id).unwrap().building_up = Some(BuildingUp {
-            elapsed_ticks: 0,
-            total_ticks: 1,
-        });
-        sim.advance_tick(
-            &[],
-            Some(&rules),
-            &std::collections::BTreeMap::new(),
-            None,
-            None,
-            67,
-        );
+        sim.substrate
+            .entities
+            .get_mut(id)
+            .unwrap()
+            .install_building_up(BuildingUp::completing_in_ticks(1, 0), 0);
+        sim.advance_tick(&[], Some(&rules), None, None, 67);
         assert!(sim.fog.has_sensor_for_house(soviet, 54, 40));
         assert!(sim.fog.detects_disguise_for_house(soviet, 54, 40));
 
@@ -715,18 +686,12 @@ mod tests {
             .spawn_object_at_height("NAPSIS", "Soviet", 40, 40, 0, 0, &rules)
             .unwrap();
         let soviet = sim.substrate.entities.get(id).unwrap().owner;
-        sim.substrate.entities.get_mut(id).unwrap().building_up = Some(BuildingUp {
-            elapsed_ticks: 0,
-            total_ticks: 1,
-        });
-        sim.advance_tick(
-            &[],
-            Some(&rules),
-            &std::collections::BTreeMap::new(),
-            None,
-            None,
-            67,
-        );
+        sim.substrate
+            .entities
+            .get_mut(id)
+            .unwrap()
+            .install_building_up(BuildingUp::completing_in_ticks(1, 0), 0);
+        sim.advance_tick(&[], Some(&rules), None, None, 67);
 
         let americans = sim.interner.intern("Americans");
         sim.change_owner(id, americans);
@@ -868,7 +833,6 @@ mod tests {
             .flat_map(|ry| (0u16..64).map(move |rx| (rx, ry)))
             .find(|&(rx, ry)| !bounds.contains_height_aware_packed(rx.into(), ry.into(), 0, 0))
             .expect("mode-one outside cell");
-        let height = std::collections::BTreeMap::new();
         sim.spawn_from_map(
             &[
                 MapEntity {
@@ -886,6 +850,8 @@ mod tests {
                     recruitable_a: true,
                     recruitable_b: true,
                     structure_upgrades: [None, None, None],
+                    structure_ai_sellable: false,
+                    structure_ai_repairable: false,
                 },
                 MapEntity {
                     owner: "Soviet".into(),
@@ -902,10 +868,11 @@ mod tests {
                     recruitable_a: true,
                     recruitable_b: true,
                     structure_upgrades: [None, None, None],
+                    structure_ai_sellable: false,
+                    structure_ai_repairable: false,
                 },
             ],
             Some(&rules),
-            &height,
         );
         assert_eq!(
             sim.substrate

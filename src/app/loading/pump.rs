@@ -30,9 +30,8 @@ use crate::render::batch::BatchRenderer;
 use crate::render::bit_font::BitFont;
 use crate::render::gpu::GpuContext;
 use crate::render::loading_screen_chrome::{
-    LoadingArtVariant, LoadingScreenAtlas, LoadingScreenCompositionAtlasInput,
-    LoadingScreenWidth, MmpbMarkerRemap, PreparedLoadingPreviewRgba,
-    build_loading_screen_atlas_with_composition,
+    LoadingArtVariant, LoadingScreenAtlas, LoadingScreenCompositionAtlasInput, LoadingScreenWidth,
+    MmpbMarkerRemap, PreparedLoadingPreviewRgba, build_loading_screen_atlas_with_composition,
 };
 use crate::render::shell_surface_present::ShellSurfacePresenter;
 use crate::rules::color_scheme::{
@@ -43,7 +42,6 @@ use crate::rules::house_colors::{HouseColorIndex, HouseColorRamps};
 use crate::sim::scenario_bootstrap::StockOfflinePrefixProjection;
 use crate::skirmish_launch::{LaunchCountry, SkirmishLaunchSession};
 use crate::ui::game_screen::GameScreen;
-use crate::ui::main_menu::SkirmishSettings;
 use std::path::{Path, PathBuf};
 
 const STANDARD_SKIRMISH_PROGRESS_MAX: f64 = 100.0;
@@ -69,6 +67,7 @@ impl LoadingProgressState {
         }
     }
 
+    #[cfg(test)]
     pub fn max_value(&self) -> f64 {
         self.max_value
     }
@@ -157,10 +156,11 @@ impl NativeLoadingProgressCadence {
     /// Whether native has resolved Scenario inputs before the first loading frame.
     ///
     /// Selected maps also need their parsed preview. Random maps take pixels
-    /// from `RandMap.img`, but Full Init has already regenerated the `.SED`,
-    /// copied accepted start staging, and run both selected-mode callbacks
-    /// before DrawLoadingScreen. Both branches therefore swallow the loader's
-    /// raw 8 here and hand it to the first post-frame pump.
+    /// from `RandMap.img`; both branches swallow the loader's raw 8 here and
+    /// hand it to the first post-frame pump. Native generates a random map
+    /// after its first loading frame (Full_Init inside Generate, the
+    /// generation reported as 50–99%), which VERA20k does before it — a
+    /// recorded residual of the random-map chain.
     fn prepares_scenario_before_first_frame(self) -> bool {
         match self {
             Self::SelectedMap | Self::RandomMapHalved => true,
@@ -252,26 +252,20 @@ pub(crate) struct LoadingRequest {
     /// Setup-generated preview retained only as a loading-composition fallback.
     /// It never supplies gameplay map data, RNG continuation, or constructors.
     random_map_preview: Option<crate::map::rmg::GeneratedMap>,
-    fallback_skirmish_settings: SkirmishSettings,
 }
 
 impl LoadingRequest {
-    pub(crate) fn accepted_skirmish(
-        startup: PreparedMatchStartup,
-        fallback_skirmish_settings: SkirmishSettings,
-    ) -> Self {
+    pub(crate) fn accepted_skirmish(startup: PreparedMatchStartup) -> Self {
         Self {
             startup: LoadingStartup::Accepted(startup),
             accepted_rmg_start_staging: None,
             random_map_preview: None,
-            fallback_skirmish_settings,
         }
     }
 
     pub(crate) fn unverified_legacy_skirmish(
         skirmish_launch_session: SkirmishLaunchSession,
         seed: crate::match_bootstrap::MatchSeed,
-        fallback_skirmish_settings: SkirmishSettings,
     ) -> Self {
         Self {
             startup: LoadingStartup::UnverifiedLegacy {
@@ -280,21 +274,17 @@ impl LoadingRequest {
             },
             accepted_rmg_start_staging: None,
             random_map_preview: None,
-            fallback_skirmish_settings,
         }
     }
 
-    pub(crate) fn generic_map_load(
-        selected_map_file: impl Into<String>,
-        fallback_skirmish_settings: SkirmishSettings,
-    ) -> Self {
+    #[cfg(test)]
+    pub(crate) fn generic_map_load(selected_map_file: impl Into<String>) -> Self {
         Self {
             startup: LoadingStartup::Generic {
                 selected_map_file: selected_map_file.into(),
             },
             accepted_rmg_start_staging: None,
             random_map_preview: None,
-            fallback_skirmish_settings,
         }
     }
 
@@ -310,11 +300,13 @@ impl LoadingRequest {
         &self,
         ra2_dir: std::path::PathBuf,
         asset_manager: &mut AssetManager,
+        native_rules: Option<&crate::rules::process_owner::NativeRulesProcessOwner>,
         progress: &mut dyn LoadingProgressSink,
     ) -> anyhow::Result<MapLoadInitial> {
         init::load_map_initial_with_assets(
             ra2_dir,
             asset_manager,
+            native_rules,
             Some(self.selected_map_file()),
             progress,
         )
@@ -377,9 +369,10 @@ impl LoadingRequest {
         self,
         ra2_dir: PathBuf,
         assets: &mut AssetManager,
+        native_rules: Option<&crate::rules::process_owner::NativeRulesProcessOwner>,
         progress: &mut dyn LoadingProgressSink,
     ) -> anyhow::Result<PreparedScenarioLoad> {
-        let initial = self.load_initial_with_assets(ra2_dir, assets, progress)?;
+        let initial = self.load_initial_with_assets(ra2_dir, assets, native_rules, progress)?;
         self.prepare_initial(initial)
     }
 
@@ -388,9 +381,10 @@ impl LoadingRequest {
         self,
         ra2_dir: PathBuf,
         assets: &mut AssetManager,
+        native_rules: Option<&crate::rules::process_owner::NativeRulesProcessOwner>,
         progress: &mut dyn LoadingProgressSink,
     ) -> anyhow::Result<init::RandomMapLaunchSnapshot> {
-        let prepared = self.prepare(ra2_dir, assets, progress)?;
+        let prepared = self.prepare(ra2_dir, assets, native_rules, progress)?;
         Ok(prepared
             .initial
             .into_random_map_launch_snapshot(assets, prepared.context))
@@ -523,7 +517,13 @@ pub(crate) struct LoadingSession {
     stage: LoadingStage,
     native: Option<NativeLoadingScreenState>,
     job: LoadingJob,
-    first_frame_presented: bool,
+    /// The loading frame the next present draws. Native sessions start with
+    /// the black frame that replaces the closed shell: Main_Game hides the
+    /// cursor, fills the hidden surface black and blits it
+    /// (`0x0052E64C..0x0052E69E`) before Start_Scenario reads the map, and
+    /// nothing else reaches the screen until the loading screen's first
+    /// repaint. Generic sessions start at their first frame.
+    next_frame: NextLoadingFrame,
 }
 
 impl LoadingSession {
@@ -558,9 +558,13 @@ impl LoadingSession {
         };
         Self {
             stage: LoadingStage::Selected(request),
+            next_frame: if native.is_some() {
+                NextLoadingFrame::Blank
+            } else {
+                NextLoadingFrame::First
+            },
             native,
             job: LoadingJob::new(),
-            first_frame_presented: false,
         }
     }
 }
@@ -732,17 +736,6 @@ fn retire_failed_loading_attempt(
     policy
 }
 
-/// The handle the player launched this skirmish under, as shown on the loading
-/// screen's progress row. `None` outside a skirmish launch.
-pub(crate) fn launch_player_name(state: &AppState) -> Option<String> {
-    state
-        .frontend
-        .loading_session
-        .as_ref()
-        .and_then(|session| session.stage.request().skirmish_launch_session())
-        .map(|launch| launch.player_name.clone())
-}
-
 fn is_native_loading_session(state: &AppState) -> bool {
     state
         .frontend
@@ -809,7 +802,7 @@ fn pump_loading_after_present(state: &mut AppState) -> LoadingPump {
         // snapping once.
         //
         // Pre-copy the by-value pieces before borrowing so the disjoint
-        // split-borrows (gpu/depth_view/batch shared, vxl_compute &mut,
+        // split-borrows (gpu/depth_view/batch shared,
         // native.progress &mut, native.atlas shared, request shared) all
         // hold simultaneously.
         let render_size = [
@@ -884,10 +877,8 @@ fn pump_loading_after_present(state: &mut AppState) -> LoadingPump {
                 initial,
                 startup,
                 fresh_scenario_context,
-                &request.fallback_skirmish_settings,
                 progress.native_theater_cache_mismatch,
                 progress.runtime_color_scheme_count,
-                state.renderer.vxl_compute.as_mut(),
                 native_rules_owner,
                 shared_cell_dummy,
                 tile_variant_selector_cache,
@@ -978,10 +969,22 @@ fn ensure_session_job_asset_manager(
                     .ra2_dir
                     .as_deref()
                     .expect("RA2 directory was initialized above"),
+                process_assets.media_archive_mode(),
             )?
         };
         session.job.asset_manager = Some(asset_manager);
     }
+    // The job owns the manager before this fallible step so retirement returns
+    // it on failure. A recovered process must have Rules before request.prepare.
+    process_assets
+        .initialize_sources_if_needed(
+            session
+                .job
+                .asset_manager
+                .as_ref()
+                .expect("asset setup stores manager"),
+        )
+        .map_err(anyhow::Error::msg)?;
     Ok(())
 }
 
@@ -1011,7 +1014,7 @@ fn prepare_loading_session(
         stage,
         mut native,
         mut job,
-        first_frame_presented,
+        next_frame,
     } = session;
     let stage = match stage {
         LoadingStage::Prepared(prepared) => LoadingStage::Prepared(prepared),
@@ -1029,9 +1032,14 @@ fn prepare_loading_session(
                     progress: &mut native.progress,
                     cadence: native.progress_cadence,
                 };
-                request.prepare(ra2_dir, assets, &mut sink)
+                request.prepare(ra2_dir, assets, process_assets.native_rules(), &mut sink)
             } else {
-                request.prepare(ra2_dir, assets, &mut NoopProgressSink)
+                request.prepare(
+                    ra2_dir,
+                    assets,
+                    process_assets.native_rules(),
+                    &mut NoopProgressSink,
+                )
             };
             match prepared {
                 Ok(prepared) => LoadingStage::Prepared(prepared),
@@ -1047,7 +1055,7 @@ fn prepare_loading_session(
         stage,
         native,
         job,
-        first_frame_presented,
+        next_frame,
     })
 }
 
@@ -1418,11 +1426,20 @@ fn encode_loading_screen(
     if !is_native_loading_session(state) {
         return Ok(LoadingRenderResult::GenericFallback);
     }
+    if state
+        .frontend
+        .loading_session
+        .as_ref()
+        .is_some_and(|session| session.next_frame == NextLoadingFrame::Blank)
+    {
+        render::encode_blank_loading_frame(&state.renderer, encoder, destination);
+        return Ok(LoadingRenderResult::NativeRendered);
+    }
     if let Err(err) = ensure_native_loading_atlas(state) {
         return Err(err);
     }
     if let Some(session) = state.frontend.loading_session.as_mut()
-        && !session.first_frame_presented
+        && session.next_frame == NextLoadingFrame::First
         && let Some(native) = session.native.as_mut()
     {
         // Retail composes the LS country surface first, then ProgressClass
@@ -1448,6 +1465,14 @@ fn encode_loading_screen(
 /// owns acknowledgement, continuation and terminal disposition as one step.
 pub(crate) fn after_loading_frame_presented(state: &mut AppState) {
     if !matches!(state.frontend.screen, GameScreen::Loading) {
+        return;
+    }
+    // The black frame is up: the scenario is read under it on the next frame.
+    if let Some(session) = state.frontend.loading_session.as_mut()
+        && session.next_frame == NextLoadingFrame::Blank
+    {
+        session.next_frame = NextLoadingFrame::First;
+        state.platform.window.request_redraw();
         return;
     }
     loading_screen_presented(state);
@@ -1489,12 +1514,40 @@ fn fail_loading(state: &mut AppState, policy: LoadingFailurePolicy, err: anyhow:
     }
 }
 
+/// Which loading frame the next native present draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NextLoadingFrame {
+    /// The black frame that replaces the closed shell.
+    Blank,
+    /// The loading screen's first frame (3%), after the scenario is read.
+    First,
+    /// A later loading frame.
+    Later,
+}
+
+pub(crate) fn next_native_loading_frame(state: &AppState) -> Option<NextLoadingFrame> {
+    let session = state.frontend.loading_session.as_ref()?;
+    session.native.as_ref()?;
+    Some(session.next_frame)
+}
+
+/// After the load gamemd switches to the game mode and shows black until
+/// the first game frame (`0x00683E07..0x00683E1C`, again at
+/// `0x0052EAA1..0x0052EAEB`); the tactical install runs under it.
+pub(crate) fn present_game_mode_blank(state: &AppState) {
+    if let Err(err) =
+        render::present_blank(&state.renderer.gpu, &state.renderer.shell_surface_presenter)
+    {
+        log::warn!("Game-mode blank frame failed: {err:#}");
+    }
+}
+
 fn loading_screen_presented(state: &mut AppState) {
     let Some(session) = state.frontend.loading_session.as_mut() else {
         state.frontend.loading_progress.advance_progress(3);
         return;
     };
-    session.first_frame_presented = true;
+    session.next_frame = NextLoadingFrame::Later;
     log::debug!(target: "vera20k::loading_attempt", "frame_presented native_progress={:?}", session.native.as_ref().map(|n| n.progress.current_value()));
 }
 

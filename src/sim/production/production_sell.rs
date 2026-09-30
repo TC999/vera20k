@@ -1,246 +1,523 @@
-//! Building sell/repair logic: refund calculation, crew ejection, repair tick.
+//! Building sale: the Selling mission's visits, the refund and the garrison
+//! ejection. The computer's low-credit sale is `BuildingClass::
+//! UpdateRepairAndPower`'s (`production_repair`).
 //!
-//! Extracted from production_placement.rs for file-size limits.
+//! A sale starts at `BuildingClass::Sell_Back @ 0x00447110` ([`sell_back`];
+//! a Slave Miner refinery's relocation queues the mission itself,
+//! [`begin_selling`]): the building takes the Selling mission, and each
+//! later frame the building's LogicVector visit
+//! (`Simulation::visit_building_down`) runs `BuildingClass::Sell @
+//! 0x00449C30` ([`BuildingDown`], `sim::building_construction`):
+//! - stage 0 ([`sell_stage_zero`]): an undeploy's `DeploySound=`, the bunker
+//!   release, RUN_AWAY to every contact and the damage fires put out;
+//! - stage 1 ([`sell_stage_one`]): OVER_OUT to every contact, then (unless a
+//!   dock still tethers the building) its absorbed passengers, garrison and
+//!   crew leave (`sim::crew_survival`), the owner's player hears the sale,
+//!   and the build-up starts playing in reverse;
+//! - stage 2 ([`sell_complete`]), on the animation's last frame: an
+//!   `UndeploysInto=` building converts (`Simulation::finish_undeploy`);
+//!   any other is refunded and removed.
+//!
+//! Evidence: `tools/spatial_oracle/building_sale.json` (Sell_Back and the
+//! visits' timing in `route` rows, stage 1 in `crew` rows, the refund in
+//! `refund` rows, the computer's low-credit sale in `ai_sale` rows), replayed
+//! by `sim::building_construction`'s and `building_sale_oracle_tests`'s tests.
+//!
+//! RESIDUALS:
+//! - `RegisterDestruction(null)` at the sale (`vt+0xE0`, `0x0044A1F9`, after
+//!   `+0x53C = -1` keeps the house's buildings-lost count unchanged): a
+//!   tagged building's "destroyed" trigger events 48 and 29 (VERA has no
+//!   per-object tags) and a radar refresh. Trigger: selling a map-tagged
+//!   building. Effect: its trigger does not fire.
+//! - House `+0x1FC`, set at the completing visit, makes the owner's next
+//!   House AI recheck its tech tree (`0x004F926C..0x004F92FD`); VERA
+//!   refreshes the owner's super weapon grants at the sale instead.
+//! - Presentation: stage 1 re-selects a building selected at its entry
+//!   (`vt+0x14C`, `0x0044A8C9`; VERA's selection never lapses; its tag event
+//!   0x21 has no tags to reach), the `PackupSound=` handle (`+0x6A0`, stopped
+//!   at a conversion `0x0044A1C8`) and stage 2's looping sound update
+//!   (`0x00750D40`).
+//! - Dormant in retail data: stage 0's upgrade sale (`+0x702`; no type sets
+//!   `PowersUpBuilding=`), its Artillary/TickTank arm, the LaserFencePost
+//!   recalc (`0x004533A0`), the sale's CloakGenerator arm (`Type+0x16C7`,
+//!   `0x0044A292`) and `BuildingClass::SetTarget`'s computer sale of a
+//!   `TickTank=`/`Artillary=` building (`Type+0x16C4`/`+0x16CA`, which
+//!   queues and commences Selling itself at `0x00443C42`; no retail
+//!   building sets either key).
+//! - Stage 2's ore payout (`0x0044A232..0x0044A285`: the building's
+//!   StorageClass `+0x33C`, through `HouseClass::GiveTiberium 0x004F9610`)
+//!   pays nothing in retail play: the storage adders (`0x006C9690`,
+//!   `0x006C9740`) fill a harvester's, a slave's, the house's and a `Full=`
+//!   team member's storage (`0x0065DE7B`), and no retail TaskForce holds a
+//!   building (reading level: the adders' callers).
+//! - Stage 0's Slave Miner arm (`0x0044AA3D..0x0044AA9F`: HandleReturnedSlaves
+//!   for an archived ore cell) needs the retail undeploy click's cell, which
+//!   VERA's undeploy order does not carry.
+//! - A unit's sale on a repair depot (the SELL event's unit arm,
+//!   `0x004C6F5A..0x004C6F96`) is its own mechanism.
 
 use crate::map::entities::EntityCategory;
-use crate::rules::object_type::ObjectCategory;
+use crate::map::resolved_terrain::NativeCellQuery;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::combat::DestroyedGarrisonBuilding;
-use crate::sim::components::{Health, Position};
+use crate::sim::components::BuildingDown;
 use crate::sim::intern::InternedId;
-use crate::sim::mission::MissionType;
-use crate::sim::movement;
-use crate::sim::movement::locomotor::MovementLayer;
+use crate::sim::mission::{MissionId, MissionType};
+use crate::sim::movement::infantry_entry::{InfantryEntryArgs, InfantryEntryClass};
 use crate::sim::passenger::PassengerRole;
-use crate::sim::pathfinding::cell_entry::{TerrainCheckResult, check_terrain};
 use crate::sim::world::{
     PlacementEvidence, RevealOutcome, RevealPosition, RevealRequest, SimSoundEvent, Simulation,
     UninitContext,
 };
 use crate::util::lepton;
 
-use super::production_queue::{credits_entry_for_owner, credits_for_owner};
 use super::production_tech::foundation_dimensions;
 
-/// RA2 sell refund: 50% of cost (integer percentage).
-const SELL_REFUND_PERCENT: u32 = 50;
-
-const SCATTER_DIRECTION_OFFSETS: [(i16, i16); 8] = [
-    (0, -1),
-    (1, -1),
-    (1, 0),
-    (1, 1),
-    (0, 1),
-    (-1, 1),
-    (-1, 0),
-    (-1, -1),
-];
-
-/// Health as integer percentage (0–100).
-fn health_percent(current: u16, max: u16) -> u32 {
-    if max == 0 {
-        return 100;
-    }
-    ((current as u32) * 100 / max as u32).min(100)
-}
-
-fn sell_refund_for_building(
-    obj: &crate::rules::object_type::ObjectType,
-    health: Option<Health>,
+/// `TechnoTypeClass::GetRefund @ 0x00711F60` (type vtable `+0xB8`) for a live
+/// house (`RET 8`), in its x87 order under the chop control word:
+///
+/// ```text
+/// pct = (float)RefundPercent            ; FLD double, FSTP float
+/// if (full) pct = 1.0f
+/// m1 = country Cost*Mult (0x0050BDF0); m2 = FactoryPlant product (0x0050BEB0)
+/// if (Soylent) return ftol(Soylent * m1)
+/// v = ftol(GetCost() * m2 * m1)         ; vt+0xAC, RuleSet::type_cost
+/// if (human (0x0050B730)) v = ftol(v * pct)
+/// ```
+///
+/// A sale credits it with `full` clear (`TechnoClass vt+0x2BC` =
+/// `0x0070ADA0`, `0x0044A215`); a refinery's unplaceable free unit with `full`
+/// set (`0x00446E82`, `0x00446ED0`). `factors` are the House's
+/// ([`Simulation::house_cost_factors`]).
+pub(crate) fn type_refund(
+    rules: &RuleSet,
+    object: &crate::rules::object_type::ObjectType,
+    house: &crate::sim::house_state::HouseState,
+    factors: &crate::rules::ruleset::HouseCostFactors,
+    game_mode_nonzero: bool,
+    full: bool,
 ) -> i32 {
-    let hp_pct: u32 = health
-        .map(|hp| health_percent(hp.current, hp.max))
-        .unwrap_or(100);
-    // refund = cost * sell% * health% / 10000
-    (obj.cost.max(0) as u64 * SELL_REFUND_PERCENT as u64 * hp_pct as u64 / 10000) as i32
-}
+    use crate::util::native_x87::{MaskedX87Chop53 as X87, NativeF32Bits};
 
-/// Survivor divisor for the given owner's side, from `[General]` INI keys.
-/// Uses HouseState.side_index (0=Allied, 1=Soviet, 2=Yuri) instead of
-/// the old string-matching classify_owner_side hack.
-fn survivor_divisor_for_owner(sim: &Simulation, rules: &RuleSet, owner: &str) -> i32 {
-    let side = sim
-        .interner
-        .get(owner)
-        .and_then(|id| sim.houses.get(&id))
-        .map(|h| h.side_index)
-        .unwrap_or(0);
-    match side {
-        1 => rules.general.soviet_survivor_divisor,
-        2 => rules.general.third_survivor_divisor,
-        _ => rules.general.allied_survivor_divisor,
-    }
-}
-
-/// Compute survivor count using the RA2 formula: sell_refund / SurvivorDivisor.
-///
-/// The original engine divides the health-scaled sell refund by a per-side
-/// divisor from `[General]`. Buildings at 0 HP produce no survivors. The
-/// `Crewed=yes` flag must be set.
-fn sell_survivor_limit(
-    sim: &Simulation,
-    obj: &crate::rules::object_type::ObjectType,
-    health: Option<Health>,
-    rules: &RuleSet,
-    owner: &str,
-) -> usize {
-    if !obj.crewed {
-        return 0;
-    }
-    let refund = sell_refund_for_building(obj, health);
-    if refund <= 0 {
-        return 0;
-    }
-    let divisor = survivor_divisor_for_owner(sim, rules, owner).max(1);
-    (refund / divisor).max(0) as usize
-}
-
-fn sell_survivor_type(sim: &Simulation, rules: &RuleSet, owner: &str) -> Option<String> {
-    let side = sim
-        .interner
-        .get(owner)
-        .and_then(|id| sim.houses.get(&id))
-        .map(|h| h.side_index)
-        .unwrap_or(0);
-    let mut preferred: Vec<&str> = match side {
-        2 => vec!["INIT", "E2", "E1"],
-        1 => vec!["E2", "E1", "INIT"],
-        _ => vec!["E1", "E2", "INIT"],
+    let pct = if full {
+        NativeF32Bits::ONE
+    } else {
+        X87::store_f32_masked_chop(X87::load_f64(rules.general.refund_percent))
     };
-    preferred.extend(rules.infantry_ids.iter().map(String::as_str));
-
-    preferred.into_iter().find_map(|id| {
-        let obj = rules.object(id)?;
-        if obj.category != ObjectCategory::Infantry {
-            return None;
-        }
-        if !obj.owner.is_empty() && !obj.owner.iter().any(|h| h.eq_ignore_ascii_case(owner)) {
-            return None;
-        }
-        Some(id.to_string())
-    })
-}
-
-fn sell_survivor_positions(rx: u16, ry: u16, width: u16, height: u16) -> Vec<(u16, u16)> {
-    let mut cells = Vec::new();
-    let min_x = i32::from(rx) - 1;
-    let max_x = i32::from(rx) + i32::from(width);
-    let min_y = i32::from(ry) - 1;
-    let max_y = i32::from(ry) + i32::from(height);
-
-    for y in min_y..=max_y {
-        for x in min_x..=max_x {
-            if x < 0 || y < 0 {
-                continue;
-            }
-            let inside_x = x >= i32::from(rx) && x < i32::from(rx) + i32::from(width);
-            let inside_y = y >= i32::from(ry) && y < i32::from(ry) + i32::from(height);
-            if inside_x && inside_y {
-                continue;
-            }
-            cells.push((x as u16, y as u16));
-        }
+    let slot = object.factor_slot();
+    let (m1, m2) = (factors.country[slot], factors.factory_plant[slot]);
+    if object.soylent != 0 {
+        return X87::ftol_i32_low_masked(X87::mul(
+            X87::load_i32(object.soylent),
+            X87::load_f32(m1),
+        ));
     }
-
-    cells.sort_by_key(|&(cx, cy)| {
-        let dx = i32::from(cx) - (i32::from(rx) + i32::from(width) - 1);
-        let dy = i32::from(cy) - (i32::from(ry) + i32::from(height) - 1);
-        let dist_sq = dx * dx + dy * dy;
-        (dist_sq, cy, cx)
-    });
-    cells
+    let value = X87::ftol_i32_low_masked(X87::mul(
+        X87::mul(X87::load_i32(rules.type_cost(object)), X87::load_f32(m2)),
+        X87::load_f32(m1),
+    ));
+    if house.is_controlled_by_human(game_mode_nonzero) {
+        X87::ftol_i32_low_masked(X87::mul(X87::load_i32(value), X87::load_f32(pct)))
+    } else {
+        value
+    }
 }
 
-fn eject_sell_survivors(
-    sim: &mut Simulation,
-    rules: &RuleSet,
-    owner: &str,
-    building_type: &crate::rules::object_type::ObjectType,
-    building_pos: Position,
-    health: Option<Health>,
-) -> usize {
-    let Some(infantry_type) = sell_survivor_type(sim, rules, owner) else {
-        return 0;
+/// Who orders a sale; `BuildingClass::Sell_Back @ 0x00447110` reads its
+/// control argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SellOrder {
+    /// The SELL event's control -1 (`EventClass::Execute 0x004C6F9C`): the
+    /// player's sell cursor.
+    Player,
+    /// The player's undeploy order: VERA's stand-in for the retail undeploy
+    /// click (`BuildingClass::Active_Click_With 0x004436F0`), whose SELL event
+    /// follows the event that sets the building's ArchiveTarget.
+    Undeploy,
+    /// Control 1: the computer's low-credit sale
+    /// (`BuildingClass::UpdateRepairAndPower 0x0045080D`).
+    Computer,
+}
+
+/// `BuildingClass::Sell_Back @ 0x00447110` (vt+0x1A0). A building whose
+/// Buildup SHP is bound (`+0x6E9`) sells: a player's order starts the
+/// Selling mission unless the building is already on it; the computer's
+/// order also stands down while the building is Selling or carries planted
+/// C4 (`+0x6DF`). Each accepted order clicks for the owner's player
+/// (`VocClass::PlayAtPos 0x00750920` with `[AudioVisual] GenericClick=`,
+/// behind `HouseClass::IsHumanPlayer @ 0x0050B6F0`; the app applies that
+/// gate). Without a Buildup only a `FirestormWall=` type (`Type+0x16C0`)
+/// takes the order (`0x004471C5`): it leaves the map (`vt+0xD4`) and is
+/// uninitialised (`vt+0xF8`) at once, with no click or refund (the branch
+/// computes Cost_Of `Type vt+0x84` and asks `0x0050B730`, and discards
+/// both). Returns whether the order was taken.
+pub fn sell_back(sim: &mut Simulation, rules: &RuleSet, id: u64, order: SellOrder) -> bool {
+    let Some((owner, buildup, firestorm_wall, selling, c4)) =
+        sim.substrate.entities.get(id).and_then(|entity| {
+            if entity.category != EntityCategory::Structure {
+                return None;
+            }
+            let type_id = sim.interner.resolve(entity.type_ref());
+            Some((
+                entity.owner(),
+                rules.has_buildup(type_id),
+                rules
+                    .object(type_id)
+                    .is_some_and(|object| object.firestorm_wall),
+                // Get_Mission (`vt+0x184`): the current mission, else the
+                // queued one.
+                entity.mission.effective().known() == Some(MissionType::Selling),
+                entity.pending_c4_detonation.is_some(),
+            ))
+        })
+    else {
+        return false;
     };
-    let survivor_limit = sell_survivor_limit(sim, building_type, health, rules, owner);
-    if survivor_limit == 0 {
-        return 0;
+    if !buildup {
+        if firestorm_wall {
+            let _ = sim.techno_limbo_with_rules(id, rules);
+            sim.uninit_with_rules(id, rules);
+        }
+        return firestorm_wall;
     }
+    match order {
+        SellOrder::Player | SellOrder::Undeploy if !selling => {
+            begin_selling(sim, rules, id, order == SellOrder::Undeploy);
+        }
+        SellOrder::Player | SellOrder::Undeploy => {}
+        SellOrder::Computer if selling || c4 => return false,
+        SellOrder::Computer => begin_selling(sim, rules, id, false),
+    }
+    sim.sound_events.push(SimSoundEvent::SellClick { owner });
+    true
+}
 
-    let (width, height) = foundation_dimensions(&building_type.foundation);
-    let mut spawned = 0;
-    for (spawn_rx, spawn_ry) in
-        sell_survivor_positions(building_pos.rx, building_pos.ry, width, height)
-            .into_iter()
-            .take(survivor_limit)
+/// `Queue_Mission(Selling, 0)` then Commence (Sell_Back, `0x00447176`): the
+/// building leaves its mission for Selling, whose visits start the next
+/// frame ([`BuildingDown`]). `undeploy_order` marks the player's undeploy
+/// order. A building already Selling keeps its sale (Queue_Mission refuses
+/// while Selling). A repair runs on until the first visit stops it
+/// (`ToggleRepair(0)`, `0x00449C41`): the computer's order at `0x0045080D`
+/// falls through to that frame's repair step (`0x00450813`).
+pub(crate) fn begin_selling(sim: &mut Simulation, rules: &RuleSet, id: u64, undeploy_order: bool) {
+    let now = sim.session.binary_frame;
+    let selling = MissionId::from_known(MissionType::Selling);
+    let readiness = crate::sim::mission::authority::LiveReadyInputProvider { rules };
+    if sim
+        .mission_queue_exact(id, selling, 0, now, &readiness)
+        .is_err()
+        || sim.mission_commence_exact(id, now).is_err()
     {
-        if sim
-            .spawn_object_at_height(
-                &infantry_type,
-                owner,
-                spawn_rx,
-                spawn_ry,
-                64,
-                building_pos.z,
-                rules,
-            )
-            .is_some()
-        {
-            spawned += 1;
+        return;
+    }
+    let Some(control) = sim
+        .substrate
+        .entities
+        .get(id)
+        .map(|entity| rules.buildup_control(sim.interner.resolve(entity.type_ref())))
+    else {
+        return;
+    };
+    let Some(entity) = sim.substrate.entities.get_mut(id) else {
+        return;
+    };
+    if entity.mission.current() != selling || entity.building_down.is_some() {
+        return;
+    }
+    entity.install_building_down(BuildingDown::commenced(control, now as i32, undeploy_order));
+}
+
+/// `BuildingClass::CanSell @ 0x004494C0` (vt+0x98), which the sell cursor
+/// asks of the local player's building (`DisplayClass::DetermineAction
+/// 0x006929F2`): never while drained (`+0x1D0`) or for an `Unsellable=`
+/// type (`+0x1579`); otherwise a building with a Buildup SHP (`+0x6E9`), out
+/// of BState 0 (`+0x534`) and on neither Selling nor Construction (VERA's
+/// build-up, `building_up`), or else any `FirestormWall=` type
+/// (`0x00449512`; its owner test, House `+0x1FA`, reads a flag only the
+/// House constructor writes, 0).
+pub fn can_sell_building(sim: &Simulation, rules: &RuleSet, id: u64) -> bool {
+    let Some(entity) = sim.substrate.entities.get(id) else {
+        return false;
+    };
+    let Some(object) = sim.object_type(entity.type_ref(), rules) else {
+        return false;
+    };
+    let buildup_sale = rules.has_buildup(&object.id)
+        && !entity.in_construction_bstate()
+        && entity.building_up.is_none()
+        && !matches!(
+            entity.mission.effective().known(),
+            Some(MissionType::Selling | MissionType::Construction)
+        );
+    entity.category == EntityCategory::Structure
+        && entity.draining_me.is_none()
+        && !object.unsellable
+        && (buildup_sale || object.firestorm_wall)
+}
+
+/// A building type's `UndeploysInto=` unit type (`Type+0x408`), resolved as
+/// the type pointer is: a name no type answers undeploys into nothing.
+pub(crate) fn undeploy_target<'r>(rules: &'r RuleSet, type_id: &str) -> Option<&'r str> {
+    let target = rules.object(type_id)?.undeploys_into.as_deref()?;
+    rules.object(target).map(|_| target)
+}
+
+pub(super) fn undeploys(rules: &RuleSet, object: &crate::rules::object_type::ObjectType) -> bool {
+    undeploy_target(rules, &object.id).is_some()
+}
+
+/// UpdateAnimation's archive-less sale (`0x00451186..0x004511DF`): an
+/// `UndeploysInto=` building with no ArchiveTarget completes its pack-up at
+/// stage `0x17`.
+pub(crate) fn archive_less_sale(
+    rules: Option<&RuleSet>,
+    type_id: &str,
+    entity: &crate::sim::game_entity::GameEntity,
+) -> bool {
+    rules.is_some_and(|rules| undeploy_target(rules, type_id).is_some()) && !sale_archive(entity)
+}
+
+/// The building's ArchiveTarget (`+0x218`); the player's undeploy order
+/// stands for the click that sets one.
+fn sale_archive(entity: &crate::sim::game_entity::GameEntity) -> bool {
+    entity.archive_target().is_some()
+        || entity.building_down.is_some_and(|down| down.undeploy_order)
+}
+
+/// Sell's undeploy test (`0x0044A8DF`, `0x0044A7CF`, `0x00449CEA`): an
+/// `UndeploysInto=` building converts instead of being sold, except that a
+/// Construction Yard (`+0x16B9`) converts only in a multiplayer game
+/// (`0x00A8B238`) with an ArchiveTarget, a human owner
+/// (`HouseClass::IsControlledByHuman @ 0x0050B730`), `MCVRedeploy`
+/// (`0x00A8B320`) and no mind controller (`+0x2C0`).
+fn qualifying_undeploy(sim: &Simulation, rules: &RuleSet, id: u64) -> bool {
+    let Some(entity) = sim.substrate.entities.get(id) else {
+        return false;
+    };
+    let Some(object) = sim.object_type(entity.type_ref(), rules) else {
+        return false;
+    };
+    if !undeploys(rules, object) {
+        return false;
+    }
+    if !object.construction_yard {
+        return true;
+    }
+    let game_mode = sim.session.game_mode_nonzero;
+    game_mode
+        && sale_archive(entity)
+        && sim
+            .houses
+            .get(&entity.owner())
+            .is_some_and(|house| house.is_controlled_by_human(game_mode))
+        && sim.session.game_options.mcv_redeploy
+        && !entity.mind_control.is_mind_controlled()
+}
+
+/// Sell's stage-0 visit (`0x0044A8DF..0x0044ABAC`): an undeploy's
+/// `DeploySound=` (`+0x56C`) at the building's Location (after its undeploy
+/// voice `vt+0x36C`, unplayed: VERA parses no `VoiceDeploy=`), a Tank
+/// Bunker's vehicle released (`+0x2E4`, `0x004593A0`), RUN_AWAY to every
+/// contact (`0x0044AB68`) and the damage-fire anims released (`+0x5C8`,
+/// `0x0044AB87..0x0044ABAA`).
+pub(crate) fn sell_stage_zero(sim: &mut Simulation, rules: Option<&RuleSet>, id: u64) {
+    if let Some(rules) = rules
+        && qualifying_undeploy(sim, rules, id)
+    {
+        let sound = sim.substrate.entities.get(id).and_then(|entity| {
+            let sound = sim
+                .object_type(entity.type_ref(), rules)?
+                .deploy_sound
+                .clone()?;
+            Some((sound, entity.position.rx, entity.position.ry))
+        });
+        if let Some((sound, rx, ry)) = sound {
+            let deploy_sound_id = sim.interner.intern(&sound);
+            sim.sound_events.push(SimSoundEvent::EntityDeployed {
+                deploy_sound_id,
+                rx,
+                ry,
+            });
         }
+    }
+    if sim
+        .substrate
+        .entities
+        .get(id)
+        .and_then(|building| building.bunker_occupant)
+        .is_some()
+    {
+        crate::sim::docking::bunker_link::release_sell_destroy(sim, id);
+    }
+    crate::sim::radio::broadcast(sim, id, crate::sim::radio::RadioMessage::RunAway, rules);
+    sim.clear_building_damage_fire_slots(id, rules);
+}
+
+/// Sell's stage-1 visit (`0x0044A2EE..0x0044A8DE`): OVER_OUT to every
+/// contact (`vt+0x280(3)`); a building a dock still tethers after it
+/// (`+0x418`) visits stage 1 again next frame. Otherwise, unless it is an
+/// archive-bearing undeploy, its absorbed passengers, garrison and crew
+/// leave ([`sale_survivors`]); the owner's player hears the sale
+/// ([`sale_sounds`]); and stage 2 begins (`Begin_Mode(0)`). Returns whether
+/// an object entered the map.
+pub(crate) fn sell_stage_one(
+    sim: &mut Simulation,
+    rules: Option<&RuleSet>,
+    registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
+    id: u64,
+) -> bool {
+    crate::sim::radio::broadcast_break(sim, id, rules);
+    if sim
+        .substrate
+        .entities
+        .get(id)
+        .is_none_or(|building| building.dock_entered_with.is_some())
+    {
+        return false;
+    }
+    let spawned = rules.is_some_and(|rules| {
+        let spawned = sale_survivors(sim, rules, registry, id);
+        sale_sounds(sim, rules, id);
+        spawned
+    });
+    let now = sim.session.binary_frame as i32;
+    if let Some(building) = sim.substrate.entities.get_mut(id) {
+        let mut status = building.mission.handler_state();
+        if building.building_down.is_some() {
+            building.begin_building_pack_up_stage_two(&mut status, now);
+        }
+        building.mission.set_handler_state(status);
     }
     spawned
 }
 
-/// Eject survivors from a crewed building destroyed in combat.
-///
-/// In the original RA2 engine, destroyed crewed buildings always eject at
-/// least one infantry survivor regardless of the building's remaining HP (which
-/// is 0). The survivor type is side-dependent (E1 for Allied, E2 for Soviet,
-/// INIT for Yuri).
-pub fn eject_destruction_survivors(
+/// Stage 1's survivors (`0x0044A309..0x0044A7A3`), which an
+/// `UndeploysInto=` building with an ArchiveTarget skips: the survivor count
+/// (`vt+0x2D0`, How_Many_Survivors) taken first, then the absorbed
+/// passengers over the occupy list (`vt+0x108`), the garrison (SellBuilding
+/// `0x00457DE0` when occupied) and the crew (`sim::crew_survival`). The
+/// building is alive, so NoSurvivor (`+0x6E0`, written only by
+/// DestructionEffects) is clear.
+fn sale_survivors(
     sim: &mut Simulation,
     rules: &RuleSet,
-    type_id: InternedId,
-    owner: InternedId,
-    rx: u16,
-    ry: u16,
-    z: u8,
-) -> usize {
-    let type_str = sim.interner.resolve(type_id);
-    let owner_str = sim.interner.resolve(owner);
-    let Some(obj) = rules.object(type_str) else {
-        return 0;
+    registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
+    id: u64,
+) -> bool {
+    let Some((skip, cells)) = sim.substrate.entities.get(id).and_then(|entity| {
+        let object = sim.object_type(entity.type_ref(), rules)?;
+        Some((
+            sale_archive(entity) && undeploys(rules, object),
+            crate::sim::crew_survival::foundation_cells(
+                entity.position.rx,
+                entity.position.ry,
+                &object.foundation,
+            ),
+        ))
+    }) else {
+        return false;
     };
-    if !obj.crewed {
-        return 0;
+    if skip {
+        return false;
     }
-    let Some(infantry_type) = sell_survivor_type(sim, rules, owner_str) else {
-        return 0;
+    let count = sim.building_survivor_count(rules, id, false);
+    let passengers = sim.eject_absorbed_passengers(rules, registry, id, &cells, false);
+    let garrison = eject_garrison_occupants(sim, rules, registry, id);
+    let crew = sim.spawn_sale_crew(rules, registry, id, count, &cells);
+    passengers > 0 || garrison > 0 || crew
+}
+
+/// Stage 1's sounds (`0x0044A7A9..0x0044A899`) for the owner's player (the
+/// app applies `HouseClass::IsHumanPlayer @ 0x0050B6F0`): `[AudioVisual]
+/// SellSound=` unless the building converts, then the type's
+/// `PackupSound=`, both at its Location (`VocClass::PlayAt @ 0x007509E0`). An
+/// `UndeploysInto=` type on a 1x1 foundation plays neither (`vt+0x80`,
+/// `0x00465D40`).
+fn sale_sounds(sim: &mut Simulation, rules: &RuleSet, id: u64) {
+    let Some((owner, position, one_cell_undeploy, packup)) =
+        sim.substrate.entities.get(id).and_then(|entity| {
+            let object = sim.object_type(entity.type_ref(), rules)?;
+            Some((
+                entity.owner(),
+                entity.position.clone(),
+                undeploys(rules, object) && foundation_dimensions(&object.foundation) == (1, 1),
+                object.packup_sound.clone(),
+            ))
+        })
+    else {
+        return;
     };
-    // Clone owner string for spawn calls — rare path (building destruction only).
-    let owner_owned = owner_str.to_string();
-    let (width, height) = foundation_dimensions(&obj.foundation);
-    // Always eject at least 1 survivor on destruction.
-    let positions = sell_survivor_positions(rx, ry, width, height);
-    let mut spawned = 0;
-    for (spawn_rx, spawn_ry) in positions.into_iter().take(1) {
-        if sim
-            .spawn_object_at_height(
-                &infantry_type,
-                &owner_owned,
-                spawn_rx,
-                spawn_ry,
-                64,
-                z,
-                rules,
-            )
-            .is_some()
-        {
-            spawned += 1;
-        }
+    if one_cell_undeploy {
+        return;
     }
-    spawned
+    let audible_to = Some([owner, owner]);
+    if !qualifying_undeploy(sim, rules, id)
+        && let Some(sound) = rules.general.sell_sound.clone()
+    {
+        sim.sound_events
+            .push(SimSoundEvent::voc_at_for(sound, audible_to, &position));
+    }
+    if let Some(sound) = packup {
+        sim.sound_events
+            .push(SimSoundEvent::voc_at_for(sound, audible_to, &position));
+    }
+}
+
+/// The stage-2 visit that finds `+0x6DD` (`0x00449CA7`): the building's
+/// target cleared (`vt+0x3C8(0)`, `0x00443B90` on Selling), `EVA_StructureSold`
+/// for the owner's player unless it undeploys (`+0x41A`, `0x00449CE5`), then
+/// the conversion into its `UndeploysInto=` unit
+/// ([`Simulation::finish_undeploy`]) or the sale (`0x0044A1E8`): light off
+/// (`+0x614`), the refund credited ([`type_refund`], `full` clear,
+/// before Limbo), then Limbo and UnInit. Returns whether a unit entered the
+/// map.
+pub(crate) fn sell_complete(
+    sim: &mut Simulation,
+    rules: Option<&RuleSet>,
+    registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
+    id: u64,
+) -> bool {
+    let Some(rules) = rules else {
+        sim.uninit(id);
+        return false;
+    };
+    let _ = sim.assign_target_represented(id, None, Some(rules));
+    let Some((owner, undeploys)) = sim.substrate.entities.get(id).and_then(|entity| {
+        let object = sim.object_type(entity.type_ref(), rules)?;
+        Some((entity.owner(), undeploys(rules, object)))
+    }) else {
+        return false;
+    };
+    if !undeploys {
+        sim.sound_events
+            .push(SimSoundEvent::StructureSold { owner });
+    }
+    if qualifying_undeploy(sim, rules, id) {
+        sim.finish_undeploy(id, rules, registry);
+        return true;
+    }
+    let refund = sim.substrate.entities.get(id).and_then(|entity| {
+        let object = sim.object_type(entity.type_ref(), rules)?;
+        let house = sim.houses.get(&owner)?;
+        Some(type_refund(
+            rules,
+            object,
+            house,
+            &sim.house_cost_factors(owner)?,
+            sim.session.game_mode_nonzero,
+            false,
+        ))
+    });
+    sim.set_building_light_active(id, false);
+    if let Some(refund) = refund {
+        // Add_Credits (`0x0044A222`).
+        crate::sim::credit_income::add_credits(sim, owner, refund);
+    }
+    sim.uninit_with_context(id, UninitContext::with_rules(rules));
+    if sim.session.game_options.super_weapons {
+        crate::sim::superweapon::refresh_super_weapons_for_owner(sim, rules, owner);
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,53 +561,17 @@ fn garrison_sellbuilding_exit_cells(rx: u16, ry: u16, width: u16, height: u16) -
     cells
 }
 
-/// Closest current Rust stand-in for native `Can_Enter_Cell(cell,-1,-1,0,1) == 0`.
-///
-/// `SellBuilding` probes only occupant slot 0 while choosing the single exit
-/// cell. Rust does not have the exact InfantryClass predicate bound here yet;
-/// this uses the shared Can_Enter_Cell phase-1 terrain/sub-cell check with the
-/// verified available inputs and leaves terrain-cost/layer details unchecked.
-fn garrison_first_occupant_can_enter_cell(
-    sim: &Simulation,
-    first_occupant_id: u64,
-    rx: u16,
-    ry: u16,
-) -> bool {
-    garrison_infantry_can_enter_cell(sim, first_occupant_id, rx, ry, true)
-}
-
-fn garrison_infantry_can_enter_cell(
-    sim: &Simulation,
-    infantry_id: u64,
-    rx: u16,
-    ry: u16,
-    require_inside_transport: bool,
-) -> bool {
-    let Some(infantry) = sim.substrate.entities.get(infantry_id) else {
-        return false;
-    };
-    if !infantry.is_alive() {
-        return false;
-    }
-    if require_inside_transport && !infantry.passenger_role.is_inside_transport() {
-        return false;
-    }
-
-    matches!(
-        check_terrain(
-            (rx, ry),
-            MovementLayer::Ground,
-            infantry.category,
-            None,
-            None,
-            &sim.substrate.occupancy,
-        ),
-        TerrainCheckResult::Clear
-    )
-}
-
+/// `SellBuilding @ 0x00457DE0` picks one exit cell before its occupant loop:
+/// the first ring cell where Occupants[0]'s own `Can_Enter_Cell(cell, -1,
+/// -1, NULL, 1)` (vt+0x1AC, pushed at `0x00457E79..0x00457EB9` and its four
+/// ring twins) answers zero. Infantry `0x0051BF90` never reads the fifth
+/// argument. It asks the building-side list and never reads the occupant's
+/// own Transporter link, which a killing hit's Destroy broadcast has already
+/// cleared (`0x007078C0..0x007078D5`: the transport has Health 0).
 fn choose_garrison_exit_cell(
     sim: &Simulation,
+    rules: &RuleSet,
+    registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
     rx: u16,
     ry: u16,
     width: u16,
@@ -338,9 +579,21 @@ fn choose_garrison_exit_cell(
     passenger_ids: &[u64],
 ) -> Option<(u16, u16)> {
     let first_occupant_id = *passenger_ids.first()?;
+    let cells = NativeCellQuery::canonical(sim.resolved_terrain.as_ref()?);
     garrison_sellbuilding_exit_cells(rx, ry, width, height)
         .into_iter()
-        .find(|&(cx, cy)| garrison_first_occupant_can_enter_cell(sim, first_occupant_id, cx, cy))
+        .find(|&(cx, cy)| {
+            matches!(
+                sim.infantry_can_enter(
+                    first_occupant_id,
+                    cells.lookup((cx as i16, cy as i16)),
+                    InfantryEntryArgs::REPAIR,
+                    rules,
+                    registry,
+                ),
+                Ok(InfantryEntryClass::Clear)
+            )
+        })
 }
 
 fn garrison_inside_foundation_fallback(rx: u16, ry: u16, width: u16, height: u16) -> (u16, u16) {
@@ -362,9 +615,14 @@ fn uninit_garrison_passenger_without_exit(
     sim.uninit_with_context(passenger_id, context);
 }
 
+/// `SellBuilding @ 0x00457DE0` hands each ejected occupant to its own
+/// `Scatter(building->GetCoords(), 1, 1)` (vt+0x174 at `0x0045810A`, the
+/// coordinate from the building's vt+0x48 at `0x00458104`). The building
+/// GetCoords (`0x00447AC0`) is its foundation centre.
 fn sellbuilding_direct_scatter_handoff(
     sim: &mut Simulation,
     rules: &RuleSet,
+    registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
     passenger_id: u64,
     building_rx: u16,
     building_ry: u16,
@@ -374,7 +632,6 @@ fn sellbuilding_direct_scatter_handoff(
     let Some(pax) = sim.substrate.entities.get(passenger_id) else {
         return;
     };
-
     if pax.category != EntityCategory::Infantry
         || !pax.is_alive()
         || pax.dying
@@ -383,59 +640,19 @@ fn sellbuilding_direct_scatter_handoff(
     {
         return;
     }
-
-    let target_rx = building_rx.saturating_add(building_width / 2);
-    let target_ry = building_ry.saturating_add(building_height / 2);
-    let base_dir = garrison_scatter_direction_index(
-        i32::from(target_rx) - i32::from(pax.position.rx),
-        i32::from(target_ry) - i32::from(pax.position.ry),
+    let source = (
+        i32::from(building_rx) * 256 + i32::from(building_width) * 128,
+        i32::from(building_ry) * 256 + i32::from(building_height) * 128,
     );
-    let start_cell = (pax.position.rx, pax.position.ry);
-    let type_name = sim.interner.resolve(pax.type_ref()).to_string();
-    // `FootClass::GetCurrentSpeed @ 0x004DB1A0`: a veteran garrison occupant
-    // ejected by the sale scatters at its FASTER speed.
-    let sell_obj = rules.object(&type_name);
-    let speed = crate::sim::combat::veterancy::entity_mover_speed_leptons_per_second(
-        pax,
-        sell_obj,
-        sell_obj.map_or(4, |obj| obj.speed),
-        rules.general.veteran_speed,
-    );
-
-    let jitter = sim.scatter_rng().next_range_u32_inclusive(0, 4) as i32 - 2;
-    let start_dir = ((base_dir as i32 + jitter) & 7) as usize;
-    let mut dest = None;
-    for i in 0..8 {
-        let (dx, dy) = SCATTER_DIRECTION_OFFSETS[(start_dir + i) & 7];
-        let cx = i32::from(start_cell.0) + i32::from(dx);
-        let cy = i32::from(start_cell.1) + i32::from(dy);
-        if cx < 0 || cy < 0 {
-            continue;
-        }
-        let candidate = (cx as u16, cy as u16);
-        if garrison_infantry_can_enter_cell(sim, passenger_id, candidate.0, candidate.1, false) {
-            dest = Some(candidate);
-            break;
-        }
+    if let Err(cause) = sim.infantry_scatter_from(
+        passenger_id,
+        source,
+        crate::sim::movement::ScatterFlags::new(true, true),
+        rules,
+        registry,
+    ) {
+        log::debug!("ejected occupant {passenger_id} did not scatter: {cause}");
     }
-
-    if let Some(dest) = dest {
-        let timing = movement::DestinationTiming::new(
-            sim.session.binary_frame,
-            sim.blockage_path_delay_ticks,
-        );
-        let _ = movement::issue_direct_move(
-            &mut sim.substrate.entities,
-            passenger_id,
-            dest,
-            speed,
-            timing,
-        );
-    }
-}
-
-fn garrison_scatter_direction_index(dx: i32, dy: i32) -> usize {
-    usize::from(movement::facing_from_delta(dx, dy) / 32) & 7
 }
 
 fn place_garrison_passenger_at_cell(
@@ -452,9 +669,8 @@ fn place_garrison_passenger_at_cell(
     building_height: u16,
     context: UninitContext<'_>,
 ) -> bool {
-    // Owner transfer (if any) goes through the substrate chokepoint first, so
-    // the by_owner index stays in sync; then take the mutable borrow for the
-    // remaining field writes. change_owner is a no-op if the id is absent —
+    // Owner transfer (if any) goes through the substrate chokepoint first;
+    // then take the mutable borrow for the remaining field writes. change_owner is a no-op if the id is absent —
     // the get_mut below still guards absence.
     if let Some(owner) = owner_override {
         sim.change_owner_with_rules(passenger_id, owner, rules);
@@ -491,10 +707,16 @@ fn place_garrison_passenger_at_cell(
     if !matches!(reveal, RevealOutcome::Revealed { .. }) {
         return false;
     }
+    // A Reveal with rules made Unlimbo's barrel elevation writes; one without
+    // leaves them here.
+    if context.rules().is_none() {
+        sim.unlimbo_barrel_elevation(passenger_id, rules);
+    }
 
     sellbuilding_direct_scatter_handoff(
         sim,
         rules,
+        context.registry(),
         passenger_id,
         building_rx,
         building_ry,
@@ -522,14 +744,22 @@ fn eject_garrison_passengers_at_edges(
         return 0;
     }
 
-    let exit_cell = choose_garrison_exit_cell(sim, rx, ry, width, height, passenger_ids).or_else(
-        || match mode {
-            GarrisonEjectMode::PlayerSell => {
-                Some(garrison_inside_foundation_fallback(rx, ry, width, height))
-            }
-            GarrisonEjectMode::DestructionNoExitRemove => None,
-        },
-    );
+    let exit_cell = choose_garrison_exit_cell(
+        sim,
+        rules,
+        uninit_context.registry(),
+        rx,
+        ry,
+        width,
+        height,
+        passenger_ids,
+    )
+    .or_else(|| match mode {
+        GarrisonEjectMode::PlayerSell => {
+            Some(garrison_inside_foundation_fallback(rx, ry, width, height))
+        }
+        GarrisonEjectMode::DestructionNoExitRemove => None,
+    });
     let mut ejected: usize = 0;
 
     let Some((exit_rx, exit_ry)) = exit_cell else {
@@ -570,7 +800,12 @@ fn eject_garrison_passengers_at_edges(
 /// southeast inside-foundation cell.
 ///
 /// Returns the number of occupants successfully ejected.
-fn eject_garrison_occupants(sim: &mut Simulation, rules: &RuleSet, building_id: u64) -> usize {
+fn eject_garrison_occupants(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
+    building_id: u64,
+) -> usize {
     // Snapshot building data before mutation.
     let (rx, ry, z, width, height, passenger_ids) = {
         let entity = match sim.substrate.entities.get(building_id) {
@@ -607,7 +842,7 @@ fn eject_garrison_occupants(sim: &mut Simulation, rules: &RuleSet, building_id: 
         &passenger_ids,
         None,
         GarrisonEjectMode::PlayerSell,
-        UninitContext::default(),
+        UninitContext::default().with_registry(registry),
     );
 
     // Clear player-sell cargo only. Native SellBuilding is an ejection helper;
@@ -639,6 +874,38 @@ pub(crate) fn eject_destruction_garrison(
     event: &DestroyedGarrisonBuilding,
 ) -> usize {
     eject_destruction_garrison_with_context(sim, rules, event, UninitContext::default())
+}
+
+/// A player's sale ([`sell_back`]) run to its end at once, for fixtures
+/// without frames: the next frame's operational visit
+/// (`Simulation::visit_building_operational`: a Psychic Tower frees its
+/// captives), then the stage-0, stage-1 and completing visits. As in play,
+/// only a type with a Buildup control sells. Returns whether the sale
+/// completed.
+#[cfg(test)]
+pub(crate) fn sell_building_now_for_test(sim: &mut Simulation, rules: &RuleSet, id: u64) -> bool {
+    if !sell_back(sim, rules, id, SellOrder::Player)
+        || sim
+            .substrate
+            .entities
+            .get(id)
+            .is_none_or(|building| building.building_down.is_none())
+    {
+        return false;
+    }
+    sim.visit_building_operational(id, rules);
+    sell_stage_zero(sim, Some(rules), id);
+    sell_stage_one(sim, Some(rules), None, id);
+    if sim
+        .substrate
+        .entities
+        .get(id)
+        .is_none_or(|building| building.mission.handler_state() < 2)
+    {
+        return false;
+    }
+    sell_complete(sim, Some(rules), None, id);
+    true
 }
 
 pub(crate) fn eject_destruction_garrison_with_context(
@@ -674,14 +941,14 @@ pub(crate) fn eject_destruction_garrison_with_context(
     )
 }
 
-/// Eject garrison occupants from a red-HP `CanBeOccupied` building.
-///
-/// Native `CheckAutoSellOrCivilian` calls the same `SellBuilding` occupant
-/// helper when a garrisoned building is at red HP, but the building remains
-/// alive and ownership reconciliation continues afterward.
-pub(crate) fn eject_red_hp_garrison(
+/// `SellBuilding(0, 0)` on a living `CanBeOccupied` building: the red-health
+/// ejection in `CheckAutoSellOrCivilian` (`0x00458229`) and a building's
+/// Unload mission (`0x0044D89C`). The building stays alive; ownership
+/// reconciliation continues afterward.
+pub(crate) fn sell_building_occupants(
     sim: &mut Simulation,
     rules: &RuleSet,
+    registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
     building_id: u64,
 ) -> usize {
     let (rx, ry, z, width, height, owner, passenger_ids) = {
@@ -723,7 +990,7 @@ pub(crate) fn eject_red_hp_garrison(
         &passenger_ids,
         Some(owner),
         GarrisonEjectMode::DestructionNoExitRemove,
-        UninitContext::default(),
+        UninitContext::default().with_registry(registry),
     );
 
     if let Some(building) = sim.substrate.entities.get_mut(building_id) {
@@ -735,264 +1002,48 @@ pub(crate) fn eject_red_hp_garrison(
     ejected
 }
 
-/// Sell a building entity: refund part of its current value, eject crew, and despawn it.
-///
-/// Captured civilian `CanBeOccupied` garrisons use the same player-sell
-/// transaction once they are owned by the seller: occupants eject through
-/// the SellBuilding-style helper, then the building is removed/refunded.
-/// Revert-to-civilian belongs to empty-garrison reconciliation, not player sell.
-pub fn sell_building(sim: &mut Simulation, rules: &RuleSet, stable_id: u64) -> bool {
-    let (owner_name, type_id, position, health) = {
-        let Some(entity) = sim.substrate.entities.get(stable_id) else {
-            return false;
-        };
-        if entity.category != EntityCategory::Structure {
-            return false;
-        }
-        (
-            sim.interner.resolve(entity.owner()).to_string(),
-            sim.interner.resolve(entity.type_ref()).to_string(),
-            entity.position.clone(),
-            Some(entity.health),
-        )
-    };
-    let Some(obj) = rules.object(&type_id) else {
-        return false;
-    };
-
-    let refund = sell_refund_for_building(obj, health);
-    let ejected = eject_sell_survivors(sim, rules, &owner_name, obj, position, health);
-    // Eject garrison occupants alive before removing the building (gamemd SellBuilding).
-    let garrison_ejected = eject_garrison_occupants(sim, rules, stable_id);
-    let interrupted_miners =
-        crate::sim::miner::interrupt_refinery_docked_miners(sim, rules, stable_id);
-    // Eject a bunkered unit before the bunker is removed (gamemd UndockUnit: place
-    // at the building cell, no sound/anim/Move). Must precede uninit so the unit
-    // is revealed/placed before the despawn safety net would clear the link.
-    if sim
-        .substrate
-        .entities
-        .get(stable_id)
-        .and_then(|b| b.bunker_occupant)
-        .is_some()
-    {
-        crate::sim::docking::bunker_link::release_sell_destroy(sim, stable_id);
-    }
-    sim.set_building_light_active(stable_id, false);
-    sim.uninit_with_context(stable_id, UninitContext::with_rules(rules));
-    let owner_id = sim.interner.intern(&owner_name);
-    // Refresh superweapon grants — sold building may have been providing a SW.
-    if sim.session.game_options.super_weapons {
-        crate::sim::superweapon::refresh_super_weapons_for_owner(sim, rules, owner_id);
-    }
-    if refund > 0 {
-        *credits_entry_for_owner(sim, &owner_name) += refund;
-    }
-    // `BuildingClass::Sell 0x00449C99..0x00449CE5` (sell state 2, the
-    // building is gone): `[this+0x6DD]` — the build-animation-complete flag,
-    // set at `0x004467C9` (construction complete), cleared in sell state 0
-    // and again at the end of sell state 1, so state 2 waits for the
-    // sell-down animation — `[this+0x41A]` (owner is the local player) and
-    // `UndeploysInto=` (`Type+0x408`) null → `PlayEVA("EVA_StructureSold")`.
-    // A Construction Yard undeploys into its MCV instead and stays silent.
-    // The app applies the local-owner half.
-    if obj.undeploys_into.is_none() {
-        sim.sound_events
-            .push(SimSoundEvent::StructureSold { owner: owner_id });
-    }
-    log::info!(
-        "Building {} sold by {}: refunded {} credits, ejected {} crew + {} garrison, undocked {} miners",
-        type_id,
-        owner_name,
-        refund,
-        ejected,
-        garrison_ejected,
-        interrupted_miners
-    );
-    true
-}
-
-/// Toggle repair mode on a building. If already repairing, stop. Otherwise start.
-pub fn toggle_repair(sim: &mut Simulation, stable_id: u64) -> bool {
-    let Some(entity) = sim.substrate.entities.get_mut(stable_id) else {
-        return false;
-    };
-    if entity.category != EntityCategory::Structure {
-        return false;
-    }
-    if entity.repairing {
-        entity.repairing = false;
-        log::info!("Repair stopped on entity {}", stable_id);
-    } else {
-        entity.repairing = true;
-        log::info!("Repair started on entity {}", stable_id);
-        // `BuildingClass::ToggleRepair @ 0x00446FF0`: once the flag is on
-        // and `Health != Type.Strength` (`0x00447059`), the local owner
-        // (`0x004470A4 CALL 0x0050B6F0`) gets the sidebar flash and
-        // `PlayEVA("EVA_Repairing")` (`0x004470B7`). The app applies the
-        // local-owner half.
-        if entity.health.current != entity.health.max {
-            let owner = entity.owner();
-            sim.sound_events.push(SimSoundEvent::Repairing { owner });
-        }
-    }
-    true
-}
-
-/// Repair cost: 25% of building cost spread across all HP.
-const REPAIR_COST_PERCENT: u32 = 25;
-/// HP healed per sim tick (at 15 Hz this is ~60 HP/sec).
-const REPAIR_HP_PER_TICK: u16 = 4;
-
-/// Run the `WasAttackedByEnemy` consumer from
-/// `BuildingClass::UpdateRepairAndPower @ 0x00450630` in stable building order.
-///
-/// CurrentIQ is persisted per house because named scenario houses can carry a
-/// lower `IQ=` than generated skirmish computer houses. The sale itself uses
-/// the existing authoritative building-sale transaction.
-fn tick_ai_low_credit_sell_decisions(sim: &mut Simulation, rules: &RuleSet) {
-    let building_ids: Vec<u64> = sim
-        .substrate
-        .entities
-        .values()
-        .filter(|entity| entity.category == EntityCategory::Structure)
-        .map(|entity| entity.stable_id())
-        .collect();
-
-    for stable_id in building_ids {
-        let Some((owner, eligible_building)) =
-            sim.substrate.entities.get(stable_id).map(|entity| {
-                let mission = entity.mission.current().known();
-                let below_red = entity.health.max != 0
-                    && f64::from(entity.health.current) / f64::from(entity.health.max)
-                        < f64::from(rules.general.condition_red);
-                (
-                    entity.owner(),
-                    entity.is_active()
-                        && !entity.lifecycle.in_limbo
-                        && entity.was_attacked_by_enemy
-                        && !matches!(
-                            mission,
-                            Some(MissionType::Selling | MissionType::Construction)
-                        )
-                        && below_red,
-                )
-            })
-        else {
-            continue;
-        };
-        if !eligible_building {
-            continue;
-        }
-
-        let Some(house) = sim.houses.get(&owner) else {
-            continue;
-        };
-        let house_iq = house.current_iq;
-        if house_iq < rules.general.iq_repair_sell
-            || house.credits >= rules.general.credit_reserve
-            || house_iq < rules.general.iq_sell_back
-        {
-            continue;
-        }
-        // Native draws inclusive RandomRanged(0, 0x32), then performs an
-        // unsigned comparison against HouseClass TechLevel.
-        let roll = sim.scenario_rng.next_range_u32_inclusive(0, 0x32);
-        if roll >= house.tech_level as u32 {
-            continue;
-        }
-
-        // The native vslot starts the Building sell/construction path. VERA's
-        // existing building-sale authority completes that same gameplay
-        // transaction synchronously; keeping it here preserves stable-ID and
-        // RNG/credit visibility for the next building decision.
-        let _ = sell_building(sim, rules, stable_id);
-    }
-}
-
-/// Tick all repairing buildings: heal HP and deduct credits.
-pub fn tick_repairs(sim: &mut Simulation, rules: &RuleSet) {
-    // UpdateRepairAndPower evaluates the low-credit sale arm before its active
-    // repair tick for the same building.
-    tick_ai_low_credit_sell_decisions(sim, rules);
-    // Collect snapshot of repairing structures.
-    let actions: Vec<(u64, String, String, u16, u16)> = sim
-        .substrate
-        .entities
-        .values()
-        .filter(|e| {
-            // A Dying building corpse (destroyed this tick, awaiting the end-of-
-            // tick drain) must not be auto-repaired — no credits spent on a dead
-            // building.
-            !e.dying
-                && e.repairing
-                && e.category == EntityCategory::Structure
-                && e.health.current < e.health.max
-        })
-        .map(|e| {
-            (
-                e.stable_id(),
-                sim.interner.resolve(e.owner()).to_string(),
-                sim.interner.resolve(e.type_ref()).to_string(),
-                e.health.current,
-                e.health.max,
-            )
-        })
-        .collect();
-    let mut stop_repairing: Vec<u64> = Vec::new();
-    for (stable_id, owner, type_id, current_hp, max_hp) in actions {
-        let cost_per_hp: i32 = rules
-            .object(&type_id)
-            .map(|obj| {
-                // total_repair_cost = cost * 25 / 100, then / max_hp (ceiling division)
-                let total_repair_cost: u32 = obj.cost.max(0) as u32 * REPAIR_COST_PERCENT / 100;
-                total_repair_cost.div_ceil(max_hp.max(1) as u32).max(1) as i32
-            })
-            .unwrap_or(1);
-        let credits = credits_for_owner(sim, &owner);
-        if credits < cost_per_hp {
-            stop_repairing.push(stable_id);
-            continue;
-        }
-        let heal = REPAIR_HP_PER_TICK.min(max_hp - current_hp);
-        if heal == 0 {
-            stop_repairing.push(stable_id);
-            continue;
-        }
-        *credits_entry_for_owner(sim, &owner) -= cost_per_hp * heal as i32;
-        if let Some(entity) = sim.substrate.entities.get_mut(stable_id) {
-            entity.health.current = (entity.health.current + heal).min(entity.health.max);
-            entity.refresh_building_damage_state_gate(rules.general.condition_yellow_x1000);
-            if entity.health.current >= entity.health.max {
-                stop_repairing.push(stable_id);
-            }
-        }
-    }
-    for stable_id in stop_repairing {
-        if let Some(entity) = sim.substrate.entities.get_mut(stable_id) {
-            entity.repairing = false;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::production_queue::credits_for_owner;
     use super::*;
     use crate::rules::ini_parser::IniFile;
     use crate::rules::locomotor_type::LocomotorKind;
-    use crate::sim::components::Health;
     use crate::sim::game_entity::GameEntity;
     use crate::sim::movement::locomotor::LocomotorState;
-    use crate::sim::occupancy::CellListInsertion;
+
+    /// A clear map with its playfield: `SellBuilding`'s exit probe and the
+    /// occupants' Scatter read the live cells.
+    fn garrison_map(rules: &RuleSet) -> Simulation {
+        let mut sim = Simulation::new();
+        crate::sim::arena_fixture::flat_ground(&mut sim, rules);
+        sim
+    }
 
     fn garrison_edge_rules() -> RuleSet {
-        let ini = IniFile::from_str(
+        garrison_edge_rules_with_strength(400)
+    }
+
+    fn garrison_edge_rules_with_strength(strength: i32) -> RuleSet {
+        garrison_rules("CAGAS01", strength)
+    }
+
+    /// The Soviet Battle Bunker: retail's one `CanBeOccupied=` type with a
+    /// Buildup (`NABNKRMK`), so the one garrison a player sells.
+    fn battle_bunker_rules_with_strength(strength: i32) -> RuleSet {
+        let mut rules = garrison_rules("NABNKR", strength);
+        rules.set_buildup_control_for_test("NABNKR", [0, 25, 2]);
+        rules
+    }
+
+    fn garrison_rules(type_id: &str, strength: i32) -> RuleSet {
+        let ini = IniFile::from_str(&format!(
             "[InfantryTypes]\n\
              0=E1\n\
              [VehicleTypes]\n\
+             0=BLOCKER\n\
              [AircraftTypes]\n\
              [BuildingTypes]\n\
-             0=CAGAS01\n\
+             0={type_id}\n\
              [E1]\n\
              Name=GI\n\
              Cost=200\n\
@@ -1004,29 +1055,21 @@ mod tests {
              Owner=Americans,Neutral\n\
              Occupier=yes\n\
              Size=1\n\
-             [CAGAS01]\n\
-             Name=GasStation\n\
+             [BLOCKER]\n\
+             Strength=100\n\
+             Armor=heavy\n\
+             Speed=4\n\
+             Owner=Neutral\n\
+             [{type_id}]\n\
              Cost=400\n\
-             Strength=400\n\
+             Strength={strength}\n\
              Armor=wood\n\
              Foundation=2x2\n\
              CanBeOccupied=yes\n\
              CanOccupyFire=yes\n\
              MaxNumberOccupants=5\n",
-        );
+        ));
         RuleSet::from_ini(&ini).expect("garrison edge rules should parse")
-    }
-
-    fn repair_damage_state_rules() -> RuleSet {
-        let ini = IniFile::from_str(
-            "[InfantryTypes]\n\
-             [VehicleTypes]\n\
-             [AircraftTypes]\n\
-             [BuildingTypes]\n0=GAPOWR\n\n\
-             [GAPOWR]\nStrength=100\nArmor=wood\nCost=800\n\n\
-             [AudioVisual]\nConditionYellow=50%\n",
-        );
-        RuleSet::from_ini(&ini).expect("repair damage-state rules should parse")
     }
 
     fn insert_hidden_passenger_with_subcell(
@@ -1038,10 +1081,16 @@ mod tests {
     ) -> u64 {
         let mut pax = GameEntity::test_default(stable_id, "E1", owner, 0, 0);
         pax.category = EntityCategory::Infantry;
+        pax.mission_leaf = crate::sim::mission::leaf::MissionLeafState::for_entity_category(
+            EntityCategory::Infantry,
+        );
         pax.sub_cell = sub_cell;
         pax.owner = sim.interner.intern(owner);
         pax.type_ref = sim.interner.intern("E1");
-        pax.passenger_role = PassengerRole::Inside { transport_id };
+        pax.passenger_role = PassengerRole::Inside {
+            transport_id,
+            open_topped: false,
+        };
         sim.substrate.entities.insert(pax);
         stable_id
     }
@@ -1055,33 +1104,14 @@ mod tests {
         insert_hidden_passenger_with_subcell(sim, stable_id, transport_id, owner, Some(2))
     }
 
-    fn insert_live_blocker(sim: &mut Simulation, stable_id: u64, rx: u16, ry: u16) {
-        let mut blocker = GameEntity::test_default(stable_id, "BLOCKER", "Neutral", rx, ry);
-        blocker.category = EntityCategory::Unit;
-        sim.substrate.entities.insert(blocker);
-        sim.substrate.occupancy.add(
-            rx,
-            ry,
-            stable_id,
-            MovementLayer::Ground,
-            None,
-            CellListInsertion::PrependNonBuilding,
-        );
+    fn insert_live_blocker(sim: &mut Simulation, rules: &RuleSet, rx: u16, ry: u16) {
+        sim.spawn_object("BLOCKER", "Neutral", rx, ry, 0, rules)
+            .expect("blocker vehicle spawns");
     }
 
-    fn insert_map_infantry(sim: &mut Simulation, stable_id: u64, rx: u16, ry: u16, sub_cell: u8) {
-        let mut infantry = GameEntity::test_default(stable_id, "E1", "Neutral", rx, ry);
-        infantry.category = EntityCategory::Infantry;
-        infantry.sub_cell = Some(sub_cell);
-        sim.substrate.entities.insert(infantry);
-        sim.substrate.occupancy.add(
-            rx,
-            ry,
-            stable_id,
-            MovementLayer::Ground,
-            Some(sub_cell),
-            CellListInsertion::PrependNonBuilding,
-        );
+    fn insert_map_infantry(sim: &mut Simulation, rules: &RuleSet, rx: u16, ry: u16) {
+        sim.spawn_object("E1", "Neutral", rx, ry, 0, rules)
+            .expect("map infantry spawns");
     }
 
     fn give_walk_locomotor(sim: &mut Simulation, stable_id: u64) {
@@ -1092,51 +1122,39 @@ mod tests {
             .locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Walk));
     }
 
-    fn block_all_garrison_exit_cells(sim: &mut Simulation, rx: u16, ry: u16, w: u16, h: u16) {
-        for (idx, (block_rx, block_ry)) in garrison_sellbuilding_exit_cells(rx, ry, w, h)
-            .into_iter()
-            .enumerate()
-        {
-            insert_live_blocker(sim, 10_000 + idx as u64, block_rx, block_ry);
+    fn block_all_garrison_exit_cells(
+        sim: &mut Simulation,
+        rules: &RuleSet,
+        rx: u16,
+        ry: u16,
+        w: u16,
+        h: u16,
+    ) {
+        let mut cells = garrison_sellbuilding_exit_cells(rx, ry, w, h);
+        cells.sort_unstable();
+        cells.dedup();
+        for (block_rx, block_ry) in cells {
+            insert_live_blocker(sim, rules, block_rx, block_ry);
         }
     }
 
     #[test]
-    fn building_repair_crossing_above_condition_yellow_clears_building_damage_state() {
-        let rules = repair_damage_state_rules();
-        let mut sim = Simulation::new();
-        let owner = sim.interner.intern("Americans");
-        let type_ref = sim.interner.intern("GAPOWR");
-        let mut building = GameEntity::new_at_frame_zero_for_test(
-            1,
-            10,
-            10,
-            0,
-            0,
-            owner,
-            Health {
-                current: 49,
-                max: 100,
-            },
-            type_ref,
-            EntityCategory::Structure,
-            0,
-            5,
-            false,
-        );
-        building.repairing = true;
-        building.building_damage_state_active = true;
-        sim.substrate.entities.insert(building);
-
-        tick_repairs(&mut sim, &rules);
-
-        let building = sim
-            .substrate
-            .entities
-            .get(1)
-            .expect("building should remain");
-        assert_eq!(building.health.current, 53);
-        assert!(!building.building_damage_state_active);
+    fn selling_refund_does_not_scale_with_signed_health_or_strength() {
+        for (actual, strength) in [
+            (0, 0),
+            (-1, -10),
+            (1, 100),
+            (70_000, 100_000),
+            (i32::MAX, i32::MIN),
+        ] {
+            let rules = battle_bunker_rules_with_strength(strength);
+            let mut sim = Simulation::new();
+            insert_garrisoned_battle_bunker(&mut sim, 10, 11);
+            sim.substrate.entities.get_mut(10).unwrap().health.current = actual;
+            let before = credits_for_owner(&sim, "Americans");
+            assert!(sell_building_now_for_test(&mut sim, &rules, 10));
+            assert_eq!(credits_for_owner(&sim, "Americans") - before, 200);
+        }
     }
 
     fn insert_captured_player_owned_garrison(
@@ -1144,15 +1162,31 @@ mod tests {
         building_id: u64,
         passenger_id: u64,
     ) {
-        let americans = sim.interner.intern("Americans");
-        let neutral = sim.interner.intern("Neutral");
+        insert_player_owned_garrison(sim, "CAGAS01", building_id, passenger_id);
+    }
 
-        let mut building = GameEntity::test_default(building_id, "CAGAS01", "Americans", 10, 10);
+    fn insert_garrisoned_battle_bunker(sim: &mut Simulation, building_id: u64, passenger_id: u64) {
+        insert_player_owned_garrison(sim, "NABNKR", building_id, passenger_id);
+    }
+
+    fn insert_player_owned_garrison(
+        sim: &mut Simulation,
+        type_id: &str,
+        building_id: u64,
+        passenger_id: u64,
+    ) {
+        let americans = sim.interner.intern("Americans");
+        // The refund (`0x0070ADA0`) reads the owner house.
+        sim.houses.insert(
+            americans,
+            crate::sim::house_state::HouseState::new(americans, 0, None, true, 0, 10),
+        );
+
+        let mut building = GameEntity::test_default(building_id, type_id, "Americans", 10, 10);
         building.category = EntityCategory::Structure;
         building.foundation = "2x2".to_string();
         building.owner = americans;
-        building.type_ref = sim.interner.intern("CAGAS01");
-        building.garrison_original_owner = Some(neutral);
+        building.type_ref = sim.interner.intern(type_id);
         building.passenger_role = PassengerRole::Transport {
             cargo: crate::sim::passenger::PassengerCargo::new(5, 1),
         };
@@ -1199,55 +1233,57 @@ mod tests {
 
     #[test]
     fn garrison_exit_probe_uses_first_occupant_only() {
-        let mut sim = Simulation::new();
+        let rules = garrison_edge_rules();
+        let mut sim = garrison_map(&rules);
         insert_hidden_passenger(&mut sim, 12, 10, "Neutral");
 
         assert_eq!(
-            choose_garrison_exit_cell(&sim, 10, 10, 2, 2, &[11, 12]),
+            choose_garrison_exit_cell(&sim, &rules, None, 10, 10, 2, 2, &[11, 12]),
             None,
             "slot 0 drives the scan; a later valid passenger must not be probed"
         );
 
         insert_hidden_passenger(&mut sim, 11, 10, "Neutral");
         assert_eq!(
-            choose_garrison_exit_cell(&sim, 10, 10, 2, 2, &[11, 12]),
+            choose_garrison_exit_cell(&sim, &rules, None, 10, 10, 2, 2, &[11, 12]),
             Some((12, 12))
         );
     }
 
     #[test]
     fn garrison_exit_probe_uses_infantry_subcell_entry_predicate() {
-        let mut sim = Simulation::new();
+        let rules = garrison_edge_rules();
+        let mut sim = garrison_map(&rules);
         insert_hidden_passenger(&mut sim, 11, 10, "Neutral");
-        insert_map_infantry(&mut sim, 100, 12, 12, 2);
+        insert_map_infantry(&mut sim, &rules, 12, 12);
 
         assert_eq!(
-            choose_garrison_exit_cell(&sim, 10, 10, 2, 2, &[11]),
+            choose_garrison_exit_cell(&sim, &rules, None, 10, 10, 2, 2, &[11]),
             Some((12, 12)),
             "one exterior infantry leaves a free sub-cell, so slot-0 Can_Enter_Cell accepts"
         );
 
-        insert_map_infantry(&mut sim, 101, 12, 12, 3);
-        insert_map_infantry(&mut sim, 102, 12, 12, 4);
+        insert_map_infantry(&mut sim, &rules, 12, 12);
+        insert_map_infantry(&mut sim, &rules, 12, 12);
 
         assert_eq!(
-            choose_garrison_exit_cell(&sim, 10, 10, 2, 2, &[11]),
+            choose_garrison_exit_cell(&sim, &rules, None, 10, 10, 2, 2, &[11]),
             Some((12, 11)),
             "full exterior infantry sub-cells reject the selected cell and continue the scan"
         );
     }
 
     #[test]
-    fn captured_civilian_garrison_player_sell_removes_building_and_refunds() {
-        let rules = garrison_edge_rules();
-        let mut sim = Simulation::new();
+    fn a_garrisoned_battle_bunker_sale_ejects_refunds_and_removes_it() {
+        let rules = battle_bunker_rules_with_strength(400);
+        let mut sim = garrison_map(&rules);
         let building_id = 10;
         let passenger_id = 11;
-        insert_captured_player_owned_garrison(&mut sim, building_id, passenger_id);
+        insert_garrisoned_battle_bunker(&mut sim, building_id, passenger_id);
 
         let before = credits_for_owner(&sim, "Americans");
 
-        assert!(sell_building(&mut sim, &rules, building_id));
+        assert!(sell_building_now_for_test(&mut sim, &rules, building_id));
 
         // Deferred-delete: drain at end-of-tick to free the sold building's slot.
         sim.flush_pending_delete();
@@ -1292,15 +1328,17 @@ mod tests {
     #[test]
     fn sellbuilding_helper_ejects_without_owner_revert() {
         let rules = garrison_edge_rules();
-        let mut sim = Simulation::new();
+        let mut sim = garrison_map(&rules);
         let building_id = 20;
         let passenger_id = 21;
         insert_captured_player_owned_garrison(&mut sim, building_id, passenger_id);
 
         let americans = sim.interner.intern("Americans");
-        let neutral = sim.interner.intern("Neutral");
 
-        assert_eq!(eject_garrison_occupants(&mut sim, &rules, building_id), 1);
+        assert_eq!(
+            eject_garrison_occupants(&mut sim, &rules, None, building_id),
+            1
+        );
 
         let building = sim
             .substrate
@@ -1310,11 +1348,6 @@ mod tests {
         assert_eq!(
             building.owner, americans,
             "SellBuilding-style helper must not ChangeOwner"
-        );
-        assert_eq!(
-            building.garrison_original_owner,
-            Some(neutral),
-            "helper must not consume reconciliation state during player-sell ejection"
         );
         assert!(
             building
@@ -1336,7 +1369,7 @@ mod tests {
     #[test]
     fn garrison_sellbuilding_reuses_single_exit_coord_for_all_lifo_occupants() {
         let rules = garrison_edge_rules();
-        let mut sim = Simulation::new();
+        let mut sim = garrison_map(&rules);
         let building_id = 10;
         let pax1 =
             insert_hidden_passenger_with_subcell(&mut sim, 11, building_id, "Neutral", Some(4));
@@ -1415,7 +1448,7 @@ mod tests {
     #[test]
     fn garrison_destruction_detaches_cargo_before_building_uninit() {
         let rules = garrison_edge_rules();
-        let mut sim = Simulation::new();
+        let mut sim = garrison_map(&rules);
         let building_id = 60;
         let passenger_id = 61;
         insert_captured_player_owned_garrison(&mut sim, building_id, passenger_id);
@@ -1456,11 +1489,11 @@ mod tests {
     #[test]
     fn garrison_player_sell_no_exit_uses_inside_foundation_fallback() {
         let rules = garrison_edge_rules();
-        let mut sim = Simulation::new();
+        let mut sim = garrison_map(&rules);
         let building_id = 30;
         let passenger_id = 31;
         insert_captured_player_owned_garrison(&mut sim, building_id, passenger_id);
-        block_all_garrison_exit_cells(&mut sim, 10, 10, 2, 2);
+        block_all_garrison_exit_cells(&mut sim, &rules, 10, 10, 2, 2);
         if let Some(cargo) = sim
             .substrate
             .entities
@@ -1471,7 +1504,10 @@ mod tests {
         }
         let rng_before = sim.scenario_rng.state();
 
-        assert_eq!(eject_garrison_occupants(&mut sim, &rules, building_id), 1);
+        assert_eq!(
+            eject_garrison_occupants(&mut sim, &rules, None, building_id),
+            1
+        );
 
         let passenger = sim
             .substrate
@@ -1496,7 +1532,7 @@ mod tests {
     #[test]
     fn garrison_direct_scatter_uses_random_ranged_0_4_and_sets_destination() {
         let rules = garrison_edge_rules();
-        let mut sim = Simulation::new();
+        let mut sim = garrison_map(&rules);
         let building_id = 50;
         let passenger_id = insert_hidden_passenger(&mut sim, 51, building_id, "Neutral");
         give_walk_locomotor(&mut sim, passenger_id);
@@ -1524,9 +1560,15 @@ mod tests {
         );
 
         let passenger = sim.substrate.entities.get(passenger_id).unwrap();
+        // Scatter(building GetCoords, 1, 1): the away-from-centre arm takes
+        // the class setter's cell NavCom.
         assert!(
-            passenger.movement_target.is_some(),
-            "successful direct Scatter should install a movement destination after RNG"
+            matches!(
+                passenger.navigation.nav_com,
+                Some(crate::sim::components::NavTargetRef::Cell { .. })
+            ),
+            "successful Scatter should set a cell NavCom after its RNG draw: {:?}",
+            passenger.navigation.nav_com
         );
         assert!(
             passenger.order_intent.is_none(),
@@ -1537,11 +1579,11 @@ mod tests {
     #[test]
     fn garrison_destruction_no_exit_removes_without_rng_or_scatter() {
         let rules = garrison_edge_rules();
-        let mut sim = Simulation::new();
+        let mut sim = garrison_map(&rules);
         let building_id = 40;
         let passenger_id = insert_hidden_passenger(&mut sim, 41, building_id, "Neutral");
         let owner = sim.interner.intern("Americans");
-        block_all_garrison_exit_cells(&mut sim, 10, 10, 2, 2);
+        block_all_garrison_exit_cells(&mut sim, &rules, 10, 10, 2, 2);
         let rng_before = sim.scenario_rng.state();
 
         let event = DestroyedGarrisonBuilding {
@@ -1583,7 +1625,11 @@ mod tests {
              [GAPOWR]\nStrength=100\nArmor=wood\nCost=800\n\n\
              [GACNST]\nStrength=1000\nArmor=wood\nCost=3000\nConstructionYard=yes\nUndeploysInto=AMCV\n",
         );
-        RuleSet::from_ini(&ini).expect("sell eva rules should parse")
+        let mut rules = RuleSet::from_ini(&ini).expect("sell eva rules should parse");
+        for type_id in ["GAPOWR", "GACNST"] {
+            rules.set_buildup_control_for_test(type_id, [0, 25, 2]);
+        }
+        rules
     }
 
     fn insert_structure(sim: &mut Simulation, id: u64, type_id: &str, owner: &str) {
@@ -1617,7 +1663,7 @@ mod tests {
         insert_structure(&mut sim, 1, "GAPOWR", "Americans");
         insert_structure(&mut sim, 2, "GACNST", "Americans");
 
-        assert!(sell_building(&mut sim, &rules, 1));
+        assert!(sell_building_now_for_test(&mut sim, &rules, 1));
         assert_eq!(
             sold_events(&sim, owner),
             1,
@@ -1625,52 +1671,11 @@ mod tests {
         );
 
         sim.sound_events.clear();
-        assert!(sell_building(&mut sim, &rules, 2));
+        assert!(sell_building_now_for_test(&mut sim, &rules, 2));
         assert_eq!(
             sold_events(&sim, owner),
             0,
             "a Construction Yard (UndeploysInto=) sale is silent"
         );
-    }
-
-    /// `BuildingClass::ToggleRepair 0x00447053..0x004470B7`: the line needs the
-    /// flag to end up ON and `Health != Type.Strength`.
-    #[test]
-    fn repair_toggle_announces_only_when_switching_on_a_damaged_building() {
-        let mut sim = Simulation::new();
-        let owner = sim.interner.intern("Americans");
-        insert_structure(&mut sim, 1, "GAPOWR", "Americans");
-        insert_structure(&mut sim, 2, "GAPOWR", "Americans");
-        {
-            let damaged = sim.substrate.entities.get_mut(1).expect("damaged plant");
-            damaged.health = Health {
-                current: 40,
-                max: 100,
-            };
-            let intact = sim.substrate.entities.get_mut(2).expect("intact plant");
-            intact.health = Health {
-                current: 100,
-                max: 100,
-            };
-        }
-        let repairing = |sim: &Simulation| {
-            sim.sound_events
-                .iter()
-                .filter(
-                    |event| matches!(event, SimSoundEvent::Repairing { owner: o } if *o == owner),
-                )
-                .count()
-        };
-
-        assert!(toggle_repair(&mut sim, 1));
-        assert_eq!(
-            repairing(&sim),
-            1,
-            "switching repair on a damaged building speaks"
-        );
-        assert!(toggle_repair(&mut sim, 1));
-        assert_eq!(repairing(&sim), 1, "switching it off is silent");
-        assert!(toggle_repair(&mut sim, 2));
-        assert_eq!(repairing(&sim), 1, "a building at full strength is silent");
     }
 }

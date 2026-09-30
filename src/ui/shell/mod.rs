@@ -17,13 +17,17 @@ pub mod pause_menu;
 pub mod saved_games;
 pub mod saved_file_input;
 pub mod layout;
+pub mod menu_page;
 pub mod modal;
 pub mod slide;
 pub mod static_reveal;
+pub mod warning_monitor;
 pub mod abort;
 pub mod button;
 
 pub mod sound;
+
+pub mod trackbar;
 
 pub mod list;
 

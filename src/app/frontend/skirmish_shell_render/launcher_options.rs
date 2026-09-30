@@ -1,5 +1,8 @@
 //! Retail launcher Options (D5): physical shell paint over the retained model.
 //! Active owner55FC80, resourceD5, common static6153E0 and trackbar61D950.
+//! At the main menu D5 is a family page: its heading, status line and
+//! monitor are the shared family statics, and its column slides in and out
+//! (`0x006071E0`).
 
 use super::{chrome::*, controls::*, *};
 use crate::app::AppState;
@@ -9,73 +12,7 @@ use crate::render::shell_text_reveal::PathAReveal;
 use crate::ui::main_menu_dialogs::options::shell::{LauncherLabelAlign, LauncherOptionsLayout};
 use crate::ui::main_menu_dialogs::options::{LauncherTrackbarId, OptionsDialogState};
 use crate::ui::shell::geom::RectPx;
-use crate::ui::shell::static_reveal::{Kind1PaintWindow, Kind1RevealReceipt, Kind1StaticReveal};
-use std::time::{Duration, Instant};
-
-#[derive(Default)]
-pub(crate) struct LauncherOptionsPresentation {
-    pub(crate) title: Kind1StaticReveal,
-    warning: WarningAnimation,
-}
-
-/// Static71C has a one-millisecond startup gate, then a timer interval equal
-/// to the SHP frame count (91), not a continuously advancing 1ms animation.
-/// 60A9C8..60AA0B initializes;6153E0 WM_TIMER invalidates and WM_PAINT advances.
-#[derive(Default)]
-struct WarningAnimation {
-    started: Option<Instant>,
-    next_timer: Option<Instant>,
-    displayed: Option<usize>,
-    next_frame: usize,
-    dirty: bool,
-}
-
-impl WarningAnimation {
-    fn prepare(&mut self, now: Instant, frames: usize) -> (Option<usize>, bool) {
-        if frames == 0 {
-            return (None, false);
-        }
-        let started = *self.started.get_or_insert(now);
-        if now.saturating_duration_since(started) <= Duration::from_millis(1) {
-            return (None, false);
-        }
-        if self.next_timer.is_none_or(|deadline| now >= deadline) {
-            self.next_timer = Some(now + Duration::from_millis(frames as u64));
-            self.dirty = true;
-        }
-        if self.dirty {
-            (Some(self.next_frame % frames), true)
-        } else {
-            (self.displayed, false)
-        }
-    }
-
-    fn presented(&mut self, frame: usize) {
-        self.displayed = Some(frame);
-        self.next_frame = frame + 1;
-        self.dirty = false;
-    }
-}
-
-pub(crate) struct LauncherPaintReceipt {
-    title: Option<Kind1RevealReceipt>,
-    warning: Option<usize>,
-}
-
-impl LauncherOptionsPresentation {
-    pub(crate) fn record_presented(&mut self, receipt: LauncherPaintReceipt) -> bool {
-        if receipt
-            .title
-            .is_some_and(|r| !self.title.record_presented(r))
-        {
-            return false;
-        }
-        if let Some(frame) = receipt.warning {
-            self.warning.presented(frame);
-        }
-        true
-    }
-}
+use std::time::Instant;
 
 fn text_draw(
     font: &BitFont,
@@ -97,32 +34,27 @@ fn text_draw(
         align,
         [0.0, 0.0],
         SHELL_CONTROL_TEXT_DEPTH,
-        None,
     )
 }
 
+/// The left-side controls, and the right-panel buttons unless a slide draws
+/// the column in their place.
 fn build_controls(
     atlas: &SkirmishShellChromeAtlas,
     layout: &LauncherOptionsLayout,
     dialog: &OptionsDialogState,
+    buttons: bool,
 ) -> Vec<SpriteInstance> {
     let mut out = Vec::new();
     let chrome = atlas.control_chrome();
     for (id, rect) in layout.trackbars {
-        let thumb_px = dialog.shell_trackbar_thumb_left(id, rect.w) - 1;
-        let plain = matches!(
-            id,
-            LauncherTrackbarId::Detail
-                | LauncherTrackbarId::Difficulty
-                | LauncherTrackbarId::Scroll
-        );
         paint_control(
             &mut out,
             &chrome,
-            if plain {
-                ControlPaint::PlainTrackbar { rect, thumb_px }
-            } else {
-                ControlPaint::Trackbar { rect, thumb_px }
+            ControlPaint::Trackbar {
+                rect,
+                thumb_left: dialog.shell_trackbar_thumb_left(id, rect.w),
+                plaque: id.plaque_reserve() > 0,
             },
         );
     }
@@ -146,7 +78,7 @@ fn build_controls(
             disabled: false,
         },
     );
-    for (id, rect) in layout.buttons {
+    for (id, rect) in layout.buttons.into_iter().filter(|_| buttons) {
         push_right_panel_button_shp(
             &mut out,
             atlas,
@@ -164,6 +96,7 @@ fn build_text(
     layout: &LauncherOptionsLayout,
     dialog: &OptionsDialogState,
     title: Option<crate::ui::shell::static_reveal::Kind1RevealWindow>,
+    buttons: bool,
 ) -> Vec<ShellTextDraw> {
     let mut out = Vec::new();
     for label in dialog.shell_labels(layout) {
@@ -221,7 +154,7 @@ fn build_text(
             out.push(text_draw(
                 font,
                 &dialog.trackbar_position(id).to_string(),
-                crate::ui::skirmish_shell::trackbar_value_text_rect(rect),
+                crate::ui::shell::trackbar::value_text_rect(rect),
                 ShellAlign::H_CENTER | ShellAlign::V_CENTER,
                 if dialog.launcher_audio_available() {
                     SHELL_LABEL_TEXT_RGB
@@ -243,7 +176,7 @@ fn build_text(
         ShellAlign::V_CENTER,
         SHELL_LABEL_TEXT_RGB,
     ));
-    for (id, rect) in layout.buttons {
+    for (id, rect) in layout.buttons.into_iter().filter(|_| buttons) {
         let pressed = dialog.shell_button_pressed(id);
         // 612B70 type1: ordinary press retains AC18A4 foreground; the text
         // rectangle changes at61358D..6135CD, independently of SHP geometry.
@@ -281,7 +214,7 @@ pub(super) fn launcher_background_instances(
     if let Some(background) = background {
         push_entry_native(&mut out, background, 0, 0, SHELL_PARENT_BACKGROUND_DEPTH);
     }
-    push_right_panel_base_instances(&mut out, atlas, &common, 0, false);
+    push_right_panel_base_instances(&mut out, atlas, &common, false);
     push_lower_strip_instance(&mut out, atlas, &common);
     out
 }
@@ -290,34 +223,64 @@ pub(crate) fn render_launcher_options(
     state: &mut AppState,
     encoder: &mut wgpu::CommandEncoder,
     destination: &wgpu::Texture,
-) -> anyhow::Result<LauncherPaintReceipt> {
+) -> anyhow::Result<()> {
+    use crate::app::frontend::shell_transition::ShellSlideKind;
     let now = Instant::now();
+    let layout =
+        LauncherOptionsLayout::new(state.render_width() as i32, state.render_height() as i32);
+    // The teardown slide starts with a full dialog repaint (`0x00622C4F`) and
+    // pumps no messages until it ends: every child stays blank. The entry
+    // slide suppresses the heading, status line, monitor and column buttons
+    // (`0x00606800`); the left-side controls paint.
+    let exit_wave =
+        crate::app::frontend::shell_transition::shell_exit_wave(state, ShellSlideKind::Options)
+            .cloned();
+    let leaving = exit_wave.is_some();
+    let wave = exit_wave.or_else(|| state.frontend.shell_first_paint_slide.clone());
+    let sliding = wave.is_some();
+    // Like the sibling family pages, the monitor shows its current frame
+    // with no timer while the entry slide runs.
+    let frames = state
+        .frontend
+        .skirmish_shell_chrome
+        .as_ref()
+        .map_or(0, |atlas| atlas.launcher_warning_frames.len());
+    let monitor_frame = if leaving {
+        None
+    } else {
+        state.frontend.shell_monitor.paint(now, frames, !sliding)
+    };
+    let (title, status_label) = if sliding {
+        (None, None)
+    } else {
+        let title = state.frontend.shell_page_title.paint(now);
+        let status_text = state
+            .frontend
+            .options_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.shell_status_help())
+            .map(|key| crate::app::frontend::shell_pass::resolve_csf(state, key).into_owned())
+            .unwrap_or_default();
+        let status = crate::app::frontend::menu_page_render::paint_shell_status_line(
+            state,
+            status_text,
+            layout.status_help,
+        );
+        (title, status)
+    };
     let dialog = state
         .frontend
         .options_dialog
         .as_ref()
         .expect("launcher active");
-    let presentation = &mut state.frontend.launcher_options_presentation;
-    presentation.title.start(dialog.shell_title_text(), now);
-    presentation.title.poll_timer(now);
-    let (title, title_receipt) = match presentation.title.paint_window() {
-        Kind1PaintWindow::Hidden => (None, None),
-        Kind1PaintWindow::Retained(window) => (Some(window), None),
-        Kind1PaintWindow::Due { window, receipt } => (Some(window), Some(receipt)),
-    };
     let atlas = state
         .frontend
         .skirmish_shell_chrome
         .as_ref()
         .expect("launcher atlas");
-    let (warning, warning_dirty) = presentation
-        .warning
-        .prepare(now, atlas.launcher_warning_frames.len());
-    let layout =
-        LauncherOptionsLayout::new(state.render_width() as i32, state.render_height() as i32);
     let mut instances =
         launcher_background_instances(atlas, state.render_width(), state.render_height());
-    if let Some(frame) = warning.and_then(|i| atlas.launcher_warning_frames.get(i)) {
+    if let Some(frame) = monitor_frame.and_then(|frame| atlas.launcher_warning_frames.get(frame)) {
         push_flag_entry_native_clipped_centered(
             &mut instances,
             *frame,
@@ -325,11 +288,27 @@ pub(crate) fn render_launcher_options(
             SHELL_CONTROL_DEPTH,
         );
     }
-    instances.extend(build_controls(atlas, &layout, dialog));
-    let texts = build_text(&state.renderer.bit_font, &layout, dialog, title);
+    let mut texts = Vec::new();
+    if let Some(wave) = wave.as_ref() {
+        push_slide_column(
+            &mut instances,
+            atlas,
+            &compute_layout(state.render_width(), state.render_height()),
+            &wave.button_draws(),
+            SHELL_CONTROL_DEPTH,
+        );
+    }
+    if !leaving {
+        instances.extend(build_controls(atlas, &layout, dialog, !sliding));
+        texts = build_text(&state.renderer.bit_font, &layout, dialog, title, !sliding);
+    }
+    texts.extend(crate::render::shell_paint::paint_labels(
+        &state.renderer.bit_font,
+        &status_label.into_iter().collect::<Vec<_>>(),
+    ));
     let mut popup_instances = Vec::new();
     let mut popup_text = Vec::new();
-    if let Some(popup) = dialog.shell_popup(&layout) {
+    if let Some(popup) = dialog.shell_popup(&layout).filter(|_| !leaving) {
         push_solid_rect_px(
             &mut popup_instances,
             atlas.white_pixel,
@@ -406,7 +385,11 @@ pub(crate) fn render_launcher_options(
         .iter()
         .map(|d| batch.create_instance_buffer(gpu, &d.instances))
         .collect();
-    let cursor: Vec<_> = shell_cursor_instance(state).into_iter().collect();
+    let cursor: Vec<_> =
+        crate::app::frontend::shell_pass::software_cursor(state, SHELL_CURSOR_DEPTH)
+            .map(|(_, instance)| instance)
+            .into_iter()
+            .collect();
     let cursor_buffer = batch.create_instance_buffer(gpu, &cursor);
     let cursor_texture = state
         .match_state
@@ -491,8 +474,5 @@ pub(crate) fn render_launcher_options(
         .shell_surface_presenter
         .encode_present(encoder, destination);
     state.platform.window.request_redraw();
-    Ok(LauncherPaintReceipt {
-        title: title_receipt,
-        warning: warning.filter(|_| warning_dirty),
-    })
+    Ok(())
 }

@@ -8,16 +8,17 @@
 use std::time::Instant;
 
 use super::startup_splash;
-use crate::app::loading::init::MapMenuEntry;
 use crate::app::shell_random_map::{RandomMapGenerationJob, RandomMapGenerationRetention};
 use crate::map::overlay_types::OverlayTypeRegistry;
 use crate::ui::game_screen::GameScreen;
-use crate::ui::main_menu::SkirmishSettings;
 
 pub(crate) struct FrontendState {
-    /// Opt-in research shell path. Defaults off so the egui Skirmish setup is visible.
-    pub(crate) dev_skirmish_shell_enabled: bool,
+    /// The Skirmish setup dialog's state.
     pub(crate) skirmish_shell_state: crate::ui::skirmish_shell::SkirmishShellState,
+    /// Choose Map's last clicked game-type row `[0x008316FC]`: starts at -1,
+    /// written only by a game-type click and never reset, so it outlives
+    /// every chooser visit.
+    pub(crate) choose_map_last_mode_row: Option<usize>,
     /// Process-lifetime offline shell snapshot, Scenario cursor, and
     /// Cooperative progress authority.
     pub(crate) offline_skirmish_runtime: crate::app::frontend::skirmish_session::OfflineSkirmishRuntime,
@@ -40,7 +41,8 @@ pub(crate) struct FrontendState {
     pub(crate) main_menu_movie_identity:
         Option<crate::app::frontend::main_menu_shell_render::Ra2tsMovieSessionIdentity>,
     pub(crate) main_menu_movie_last_step: Instant,
-    pub(crate) main_menu_shell_failed: bool,
+    /// Terminal menu failure; retained for the error screen and input gate.
+    pub(crate) main_menu_shell_error: Option<String>,
     /// Numeric internal-version string used by the bottom-right main-menu line.
     /// Resolution follows the retail 16-byte/CR-only cached contract.
     pub(crate) version_txt: String,
@@ -54,6 +56,22 @@ pub(crate) struct FrontendState {
     pub(crate) shell_slide_active_shell: Option<crate::app::frontend::shell_transition::ShellSlideKind>,
     /// Monotonic identity for each newly armed exact Main Menu `0xE2` instance.
     pub(crate) shell_slide_generation: u64,
+    /// Static `0x71C` of the showing main-menu family dialog (`0xE2`, `0x100`,
+    /// `0x101`, `0x129`). Reset for every new dialog instance by the shell
+    /// lifecycle reducer; drawn by the family renderers and committed after
+    /// present.
+    pub(crate) shell_monitor: crate::ui::shell::warning_monitor::WarningMonitor,
+    /// Heading static `0x694` of the showing menu page (`0x100`, `0x101`,
+    /// `0x129`): hidden until the page's first-paint slide completes, then a
+    /// kind-1 reveal. Main menu `0xE2` keeps its own presented-entry reveal.
+    pub(crate) shell_page_title: crate::ui::shell::static_reveal::PresentedKind1Static,
+    /// Status line `0x695` of the showing main-menu family dialog (`0xE2`,
+    /// `0x100`, `0x101`, `0x129`): hover help, hidden until the dialog's SHOW
+    /// completion, then a kind-1 reveal that restarts on every text change.
+    pub(crate) shell_status_line: crate::ui::shell::static_reveal::PresentedKind1Static,
+    /// The showing family dialog's teardown slide-out while it runs; its
+    /// continuation commits the route change when the slide ends.
+    pub(crate) shell_exit: Option<crate::app::frontend::shell_transition::ShellExit>,
     /// Active graceful quit cascade (music fade → trailing-voice wait → hard stop
     /// → exit). Some only between Exit-confirm OK and window close; freezes shell
     /// input while it runs.
@@ -68,19 +86,35 @@ pub(crate) struct FrontendState {
     pub(crate) options_dialog: Option<crate::ui::main_menu_dialogs::OptionsDialogState>,
     /// Shared A3 child, reached from launcher Options or paused Game Controls.
     pub(crate) keyboard_dialog: Option<crate::ui::shell::keyboard::KeyboardState>,
-    pub(crate) launcher_options_presentation: super::skirmish_shell_render::LauncherOptionsPresentation,
-    /// Movies & Credits sub-panel (open-level shell; playback not implemented).
-    pub(crate) movies_credits_dialog:
-        Option<crate::ui::main_menu_dialogs::MoviesCreditsDialogState>,
-    /// Campaign selector dialog (Single Player -> New Campaign; launch mapping
-    /// not decoded).
-    pub(crate) campaign_select: Option<crate::ui::main_menu_dialogs::CampaignSelectState>,
-    /// End-of-match score presentation, decorated from the sim-owned terminal
-    /// snapshot and held until the player leaves the screen. `None` for result
-    /// screens with no native score analogue (a load failure, a trigger-driven
-    /// campaign end), which keep the non-art fallback.
-    pub(crate) score_screen: Option<crate::ui::score_shell::ScoreScreenModel>,
-    pub(crate) score_shell_state: crate::ui::score_shell::ScoreShellState,
+    /// Movie list `0x129` instance while `ShellRoute::MovieList` is shown.
+    pub(crate) movie_list: Option<crate::ui::movies_credits_shell::MovieListState>,
+    /// `DAT_00825C80`: the list row last played, retained for the process
+    /// (initially -1) and reapplied when `0x129` is recreated.
+    pub(crate) movie_list_selection: i32,
+    /// Full-screen Play_Movie session (Sneak Peeks or a movie-list entry).
+    pub(crate) fullscreen_movie: Option<crate::app::frontend::fullscreen_movie::FullscreenMovie>,
+    /// Show_Credits session.
+    pub(crate) credits_roll: Option<crate::app::frontend::credits_roll::CreditsRollSession>,
+    /// Campaign selection `0x94` instance while its route shows.
+    pub(crate) campaign: Option<crate::ui::campaign_shell::CampaignShellState>,
+    /// Its emblem and background art (`0x0072D9A0`), loaded with the dialog
+    /// and freed when it closes (`0x0072DAA0`).
+    pub(crate) campaign_art: Option<crate::render::main_menu_shell_chrome::CampaignShellArt>,
+    /// Westwood Online welcome `0x10E` (and its box) while its route shows.
+    pub(crate) wol_welcome: Option<crate::ui::wol_shell::WolWelcomeState>,
+    /// Its background and icon art (`0x0072C7E0`).
+    pub(crate) wol_welcome_art: Option<crate::render::main_menu_shell_chrome::WolWelcomeArt>,
+    /// Single Player's Load Saved Game `0xB7` while its route shows.
+    pub(crate) load_saved_game:
+        Option<crate::ui::skirmish_shell::SavedSeedBrowserState<std::path::PathBuf>>,
+    /// The score dialog `0x108` after a finished match, decorated from the
+    /// sim-owned terminal snapshot and held until Continue's teardown. `None`
+    /// for result screens with no native score analogue (a load failure, a
+    /// trigger-driven campaign end), which keep the non-art fallback.
+    pub(crate) score_page: Option<crate::ui::score_shell::ScorePage>,
+    /// `0x108`'s side art, loaded for the open page (`0x0072D730`) and
+    /// released with it (`0x0072D780`).
+    pub(crate) score_art: Option<crate::render::main_menu_shell_chrome::ScoreArt>,
     /// Number of matches finished this session — the score screen's `Game: n`.
     /// gamemd increments the same counter as it tears the scenario down.
     pub(crate) finished_game_count: u32,
@@ -89,15 +123,11 @@ pub(crate) struct FrontendState {
     pub(crate) shell_route: crate::app::shell_route::ShellRoute,
     /// Which screen is currently active (MainMenu, Loading, InGame).
     pub(crate) screen: GameScreen,
-    /// Available maps from the RA2 directory for menu selection.
-    pub(crate) available_maps: Vec<MapMenuEntry>,
     /// Scenario records + their projected shell map entries (F11): one owner,
     /// projection re-derived on every mutation so indices cannot drift.
     pub(crate) scenario_catalog: crate::app::scenario_catalog::ScenarioCatalog,
     /// MPModes rows used by the native Choose Map modal.
     pub(crate) skirmish_modes: Vec<crate::skirmish_modes::SkirmishGameMode>,
-    /// Player-configured skirmish settings (map, country, credits, etc.).
-    pub(crate) skirmish_settings: SkirmishSettings,
     pub(crate) loading_session: Option<crate::app::loading::pump::LoadingSession>,
     /// Process-owned front-end Main stream. RMG Randomize/derived-option work
     /// and the first preview selector reach share this cursor; the setup-entry

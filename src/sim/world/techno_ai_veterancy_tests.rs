@@ -111,24 +111,21 @@ fn gsi_08_12_promotion_step_announces_each_crossing_once() {
 /// Issue the ordinary player `Command::Move` and read back the speed the
 /// resulting path actually runs at.
 fn move_order_speed(sim: &mut Simulation, rules: &RuleSet, id: u64) -> SimFixed {
-    let heights: std::collections::BTreeMap<(u16, u16), u8> = std::collections::BTreeMap::new();
     let grid = crate::sim::pathfinding::PathGrid::new(64, 64);
+    sim.install_fixture_path_grid(Some(&grid));
     let (rx, ry) = {
         let e = sim.substrate.entities.get(id).expect("mover");
         (e.position.rx, e.position.ry)
     };
     let issued = sim.apply_command(
         "Soviet",
-        &crate::sim::world::Command::Move {
+        &crate::sim::command::Command::Move {
             entity_id: id,
             target_rx: rx + 6,
             target_ry: ry + 6,
             queue: false,
-            group_id: None,
         },
         Some(rules),
-        Some(&grid),
-        &heights,
     );
     assert!(issued, "the ordinary move command must issue");
     sim.substrate

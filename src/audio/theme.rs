@@ -451,6 +451,43 @@ impl ThemeRuntime {
         }
     }
 
+    /// `WOL_Main` entry (`0x0077B2D7..0x0077B31D`): with INTRO current,
+    /// `Queue(-3)`; the score shuffle flag `[0x00A83D22]` is saved and forced
+    /// on; then the lobby-music rule `0x0077E110`: with `LobMusic`, when no
+    /// stream plays (`Still_Playing` `0x00720FD0`) or INTRO is still current,
+    /// `Stop(0)` and `Queue(-2)` (Theme AI then shuffles the next track);
+    /// without it, `Queue(-3)`. Returns the shuffle flag to restore on leaving.
+    pub(crate) fn enter_wol_lobby(
+        &mut self,
+        lobby_music: bool,
+        gates: ThemeGates,
+        physical: MusicOutputState,
+        wall_ms: u64,
+    ) -> (ThemeAction, bool) {
+        let intro = self.from_name(MENU_THEME_SECTION);
+        let mut action = ThemeAction::default();
+        if self.current_song() == intro {
+            action = action.then(self.queue_song(THEME_HOLD, gates, physical, wall_ms));
+        }
+        let saved_shuffle = std::mem::replace(&mut self.shuffle, true);
+        if lobby_music {
+            if !self.still_playing(physical, wall_ms) || self.current_song() == intro {
+                action = action.then(self.stop(gates, false, physical, wall_ms));
+                action = action.then(self.queue_song(THEME_AUTO, gates, physical, wall_ms));
+            }
+        } else {
+            action = action.then(self.queue_song(THEME_HOLD, gates, physical, wall_ms));
+        }
+        (action, saved_shuffle)
+    }
+
+    /// Every `WOL_Main` exit restores the saved shuffle flag
+    /// (`0x0077B549`, `0x0077B56D`, `0x0077B59C`, ...); the menu then plays
+    /// INTRO again.
+    pub(crate) fn leave_wol_lobby(&mut self, saved_shuffle: bool) {
+        self.shuffle = saved_shuffle;
+    }
+
     /// Fade bookkeeping shared by AI/Queue/Play/Stop: when fading and the
     /// interpolator reached its target (`0x004080D0 == 0`), `StreamPlayer__Stop`.
     fn settle_fade(&mut self, wall_ms: u64) -> ThemeAction {
@@ -796,10 +833,11 @@ pub(crate) fn catalog_from_ini(ini: &IniFile) -> Vec<ThemeEntry> {
     let Some(themes) = ini.section("Themes") else {
         return entries;
     };
-    for key in themes.get_values() {
-        if key.is_empty() {
+    // Each entry through ReadString(0x20) (`0x007205DE`).
+    for entry_name in themes.keys() {
+        let Some(key) = themes.read_name(entry_name, 0x20) else {
             continue;
-        }
+        };
         let existing = entries
             .iter()
             .position(|entry| entry.key.eq_ignore_ascii_case(key));
@@ -825,22 +863,21 @@ pub(crate) fn catalog_from_ini(ini: &IniFile) -> Vec<ThemeEntry> {
         let Some(section) = find_section(ini, &entry.key) else {
             continue;
         };
-        if let Some(sound) = section.get("Sound") {
-            entry.sound = sound.trim_start_matches(['$', '#']).to_string();
-        }
-        if let Some(scenario) = section.get_i32("Scenario") {
-            entry.scenario = scenario;
-        }
-        if let Some(normal) = section.get_bool("Normal") {
-            entry.normal = normal;
-        }
+        // `0x00720480`: ReadString 0x100 over an empty default, then
+        // ReadInt/ReadBool over each field and the side-name read
+        // (`0x004756F0`, 0x80 bytes).
+        entry.sound = section
+            .read_string("Sound", "", 0x100)
+            .trim_start_matches(['$', '#'])
+            .to_string();
+        entry.scenario = section.read_int("Scenario", entry.scenario);
+        entry.normal = section.read_bool("Normal", entry.normal);
         if entry.normal {
-            entry.name_key = section.get("Name").unwrap_or("").to_owned();
+            // The string-table label read `0x00529160` copies up to 0x3FF bytes.
+            entry.name_key = section.read_string("Name", "", 0x400);
         }
-        if let Some(repeat) = section.get_bool("Repeat") {
-            entry.repeat = repeat;
-        }
-        if let Some(side) = section.get("Side") {
+        entry.repeat = section.read_bool("Repeat", entry.repeat);
+        if let Some(side) = section.read_name("Side", 0x80) {
             entry.side_name = Some(side.to_string());
         }
     }
@@ -883,6 +920,44 @@ mod tests {
             samples: vec![0.0, 0.0],
             sample_rate: 22_050,
         })
+    }
+
+    #[test]
+    fn entering_wol_cuts_intro_and_shuffles_until_leaving() {
+        let mut theme = stock_runtime();
+        let mut ok = |stem: &str| prepared(stem);
+        theme.play_song(0, gates(true), MusicOutputState::Idle, 0, &mut ok);
+        assert_eq!(theme.current_song(), 0, "INTRO plays");
+        let (action, saved) =
+            theme.enter_wol_lobby(true, gates(true), MusicOutputState::Playing, 100);
+        assert!(!saved, "stock IsScoreShuffle is off");
+        // Queue(-3) started a fade on INTRO; Stop(0) then stops the stream
+        // at once and, like native, leaves the fading flag for Play to clear.
+        assert!(
+            action.stop_output,
+            "Stop(0) cuts INTRO without waiting for the fade"
+        );
+        assert_eq!(theme.slots().pending, THEME_AUTO);
+        // Theme AI starts a shuffled normal track, never INTRO.
+        let started = theme.ai(gates(true), MusicOutputState::Idle, 200, &mut ok);
+        let stem = started
+            .start
+            .map(|track| track.stem)
+            .expect("a lobby track");
+        assert_ne!(theme.current_song(), 0, "{stem}");
+        assert!(theme.shuffle);
+        theme.leave_wol_lobby(saved);
+        assert!(!theme.shuffle);
+    }
+
+    #[test]
+    fn wol_without_lobby_music_holds_the_current_song() {
+        let mut theme = stock_runtime();
+        let mut ok = |stem: &str| prepared(stem);
+        theme.play_song(0, gates(true), MusicOutputState::Idle, 0, &mut ok);
+        let (action, _) = theme.enter_wol_lobby(false, gates(true), MusicOutputState::Playing, 100);
+        assert!(!action.stop_output);
+        assert_eq!(theme.slots().pending, THEME_HOLD);
     }
 
     #[test]

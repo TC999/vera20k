@@ -50,7 +50,7 @@ class ProfileTests(unittest.TestCase):
             self.assertEqual(len(launch["options"]), 18)
             self.assertEqual(
                 [stage["tick_cap"] for stage in profile.budgets["stages"]],
-                [48, 640, 48, 2048, 48, 1024, 48, 4096, 18],
+                [48, 640, 64, 2048, 64, 1024, 64, 4096, 18],
             )
             self.assertEqual(profile.budgets["child_timeout_seconds"], 720)
             self.assertEqual(
@@ -100,7 +100,7 @@ class ProfileTests(unittest.TestCase):
             encoding="utf-8"
         )
         with tempfile.TemporaryDirectory() as temporary:
-            duplicate = Path(temporary).absolute() / "duplicate.json"
+            duplicate = Path(temporary).resolve() / "duplicate.json"
             duplicate.write_text(
                 valid.replace(
                     '"schema_version": "vera20k.tactical-profile.v2",',
@@ -113,7 +113,7 @@ class ProfileTests(unittest.TestCase):
             with self.assertRaisesRegex(ValidationError, "duplicate"):
                 load_profile(duplicate)
 
-            nonfinite = Path(temporary).absolute() / "nonfinite.json"
+            nonfinite = Path(temporary).resolve() / "nonfinite.json"
             nonfinite.write_text('{"value": Infinity}', encoding="utf-8")
             with self.assertRaisesRegex(ValidationError, "non-finite"):
                 load_profile(nonfinite)
@@ -138,7 +138,7 @@ class ProfileTests(unittest.TestCase):
         validate_contract_source_coverage(contract)
 
         with tempfile.TemporaryDirectory() as temporary:
-            drifted = Path(temporary).absolute() / "contract.json"
+            drifted = Path(temporary).resolve() / "contract.json"
             drifted.write_bytes(contract.snapshot.raw + b"\n")
             with self.assertRaisesRegex(ValidationError, "bytes differ"):
                 load_contract(drifted)

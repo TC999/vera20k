@@ -17,15 +17,15 @@
 //!   rules/weapon_type, rules/warhead_type.
 //! - No dependencies on sim/, render/, ui/, etc.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 use crate::rules::combat_damage::CombatDamageDefaults;
 use crate::rules::crate_rules::CrateRules;
 use crate::rules::error::RulesError;
-use crate::rules::ini_parser::{IniFile};
-use crate::rules::native_processing::{ProcessedRulesLayers, RulesLayerStack};
+use crate::rules::ini_parser::{IniFile, IniSection, is_native_none_type_name};
 use crate::rules::mission_data::MissionControl;
+use crate::rules::native_processing::{ProcessedRulesLayers, RulesLayerStack};
 use crate::rules::object_type::{BuildCategory, FactoryType, ObjectCategory, ObjectType};
 use crate::rules::particle_system_type::{
     ParticleSystemType, ParticleSystemTypeId, PendingParticleSystemType,
@@ -41,7 +41,8 @@ use crate::rules::tiberium_type::TiberiumTypeRegistry;
 use crate::rules::voxel_anim_type::{VoxelAnimType, VoxelAnimTypeId};
 use crate::rules::warhead_type::WarheadType;
 use crate::rules::weapon_type::WeaponType;
-use crate::util::fixed_math::{SimFixed, sim_from_f32};
+use crate::util::fixed_math::{SIM_ONE, SimFixed, sim_from_f32};
+use crate::util::native_x87::{NativeF32Bits, NativeF64Bits};
 
 /// Country-level fields needed by gameplay systems.
 #[derive(Debug, Clone)]
@@ -55,16 +56,37 @@ pub struct CountryRules {
     /// commented out in stock rulesmd). Applied at ore/gem deposit time to BOTH the base
     /// credits and the OrePurifier-bonus credits.
     pub income_ppm: i64,
-    /// `Armor=` global country armor multiplier. Native stores this as a
-    /// double and folds it into the house armor value when difficulty is set.
-    pub armor: f64,
-    /// Per-target category armor multipliers. Native stores these as f32 and
-    /// reads the selected slot live for every receiver call.
+    /// Per-target category armor multipliers (HouseType `+0x100..+0x110`).
+    /// Native stores these as f32 and `HouseClass::GetArmorMultForType @
+    /// 0x0050BD30` reads the selected slot live for every receiver call.
+    ///
+    /// The country's `Armor=` (HouseType `+0xE0`) is not represented: native
+    /// folds it with the difficulty `Armor=` into `House+0x1A0`
+    /// (`HouseClass::SetDifficulty 0x004F6F54`), whose only reader is the
+    /// house CRC (`0x00502DD2`); no damage path reads it.
     pub armor_infantry_mult: f32,
     pub armor_units_mult: f32,
     pub armor_aircraft_mult: f32,
     pub armor_buildings_mult: f32,
     pub armor_defenses_mult: f32,
+    /// `CostInfantryMult=`, `CostUnitsMult=`, `CostAircraftMult=`,
+    /// `CostBuildingsMult=` and `CostDefensesMult=` (HouseType
+    /// `+0x114..+0x124`, in [`ObjectType::factor_slot`] order): ReadDouble
+    /// into floats (`0x00511B64..0x00511BF9`), the constructor's 1.0
+    /// (`0x005114A8..0x005114C0`) as default, no clamp.
+    /// `HouseClass::GetCostBonus @ 0x0050BDF0` returns the slot. No retail
+    /// country sets them.
+    pub cost_mults: [NativeF32Bits; 5],
+    /// `BuildTimeInfantryMult=`, `BuildTimeUnitsMult=`, `BuildTimeAircraftMult=`,
+    /// `BuildTimeBuildingsMult=` and `BuildTimeDefensesMult=` (HouseType
+    /// `+0x134..+0x144`): ReadDouble into floats (`0x00511C70..0x00511CEC`),
+    /// the constructor's 1.0 (`0x005114D8..0x005114F0`) as default, no clamp.
+    /// No retail country sets them.
+    pub build_time_mults: [NativeF32Bits; 5],
+    /// `ROF=` (HouseType `+0xE8`; constructor 1.0 at `0x00511457`, ReadDouble
+    /// at `0x00511A0C`). `HouseClass::SetDifficulty` multiplies it into the
+    /// house's ROF bias outside campaigns. No retail country sets it.
+    pub rof: f64,
     /// `UIName=` — the country's string-table key (e.g. `Name:Americans`).
     /// gamemd fills a house's stored display name from this key's localized text,
     /// which is what the end-of-match score screen shows in the Player column.
@@ -77,6 +99,28 @@ pub struct CountryRules {
 /// PPM scale for `IncomeMult` (1_000_000 = 1.0×). Must equal `apply_income_mult`'s divisor.
 pub const INCOME_PPM_SCALE: i64 = 1_000_000;
 
+/// The House factors [`RuleSet::cost_of`] multiplies in, each indexed by
+/// [`ObjectType::factor_slot`]: the country's `Cost*Mult=` and the
+/// House's FactoryPlant product (House `+0x5390..+0x53A0`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HouseCostFactors {
+    pub country: [NativeF32Bits; 5],
+    pub factory_plant: [NativeF32Bits; 5],
+}
+
+impl HouseCostFactors {
+    /// `TechnoTypeClass::Cost_Of @ 0x00711F00` past its null-House arm:
+    /// `ftol(cost * plant * country)` for factor `slot`
+    /// (`0x00711F35..0x00711F41`).
+    pub(crate) fn adjust(&self, cost: i32, slot: usize) -> i32 {
+        use crate::util::native_x87::MaskedX87Chop53 as X87;
+        X87::ftol_i32_low_masked(X87::mul(
+            X87::mul(X87::load_i32(cost), X87::load_f32(self.factory_plant[slot])),
+            X87::load_f32(self.country[slot]),
+        ))
+    }
+}
+
 impl Default for CountryRules {
     fn default() -> Self {
         // Hand-written (NOT derived): a derived Default would zero `income_ppm`, which would
@@ -86,12 +130,14 @@ impl Default for CountryRules {
             multiplay_passive: false,
             wall_owner: true,
             income_ppm: INCOME_PPM_SCALE,
-            armor: 1.0,
             armor_infantry_mult: 1.0,
             armor_units_mult: 1.0,
             armor_aircraft_mult: 1.0,
             armor_buildings_mult: 1.0,
             armor_defenses_mult: 1.0,
+            cost_mults: [NativeF32Bits::ONE; 5],
+            build_time_mults: [NativeF32Bits::ONE; 5],
+            rof: 1.0,
             ui_name: None,
             name: None,
         }
@@ -101,28 +147,40 @@ impl Default for CountryRules {
 impl CountryRules {
     fn from_ini_section(section: &crate::rules::ini_parser::IniSection) -> Self {
         Self {
-            multiplay_passive: section.get_bool("MultiplayPassive").unwrap_or(false),
-            wall_owner: section.get_bool("WallOwner").unwrap_or(true),
+            multiplay_passive: section.read_bool("MultiplayPassive", false),
+            wall_owner: section.read_bool("WallOwner", true),
             // IncomeMult is a raw multiplier (NOT a percent). Round in f64 to avoid f32
             // drift; absent -> the neutral 1.0 (stock).
-            income_ppm: section
-                .get_f32("IncomeMult")
-                .map(|v| (v as f64 * INCOME_PPM_SCALE as f64).round() as i64)
-                .unwrap_or(INCOME_PPM_SCALE),
-            armor: section.get_f64("Armor").unwrap_or(1.0),
-            armor_infantry_mult: section.get_f32("ArmorInfantryMult").unwrap_or(1.0),
-            armor_units_mult: section.get_f32("ArmorUnitsMult").unwrap_or(1.0),
-            armor_aircraft_mult: section.get_f32("ArmorAircraftMult").unwrap_or(1.0),
-            armor_buildings_mult: section.get_f32("ArmorBuildingsMult").unwrap_or(1.0),
-            armor_defenses_mult: section.get_f32("ArmorDefensesMult").unwrap_or(1.0),
-            ui_name: section
-                .get("UIName")
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty()),
-            name: section
-                .get("Name")
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty()),
+            // HouseTypeClass::ReadINI stores these as floats (`FSTP dword` at
+            // 0x00511ADD..0x00511B59 and 0x00511D0B).
+            income_ppm: (f64::from(section.read_float("IncomeMult", 1.0)) * INCOME_PPM_SCALE as f64)
+                .round() as i64,
+            armor_infantry_mult: section.read_float("ArmorInfantryMult", 1.0),
+            armor_units_mult: section.read_float("ArmorUnitsMult", 1.0),
+            armor_aircraft_mult: section.read_float("ArmorAircraftMult", 1.0),
+            armor_buildings_mult: section.read_float("ArmorBuildingsMult", 1.0),
+            armor_defenses_mult: section.read_float("ArmorDefensesMult", 1.0),
+            cost_mults: [
+                "CostInfantryMult",
+                "CostUnitsMult",
+                "CostAircraftMult",
+                "CostBuildingsMult",
+                "CostDefensesMult",
+            ]
+            .map(|key| section.read_double_to_float(key, NativeF32Bits::ONE)),
+            build_time_mults: [
+                "BuildTimeInfantryMult",
+                "BuildTimeUnitsMult",
+                "BuildTimeAircraftMult",
+                "BuildTimeBuildingsMult",
+                "BuildTimeDefensesMult",
+            ]
+            .map(|key| section.read_double_to_float(key, NativeF32Bits::ONE)),
+            rof: section.read_double("ROF", 1.0),
+            // AbstractTypeClass::ReadINI: `Name` into 0x31 bytes (0x00410AA0),
+            // `UIName` into 0x20 (0x00410AFB).
+            ui_name: section.read_name("UIName", 0x20).map(str::to_owned),
+            name: section.read_name("Name", 0x31).map(str::to_owned),
         }
     }
 }
@@ -143,66 +201,44 @@ const TYPE_REGISTRIES: &[(&str, ObjectCategory)] = &[
     ("BuildingTypes", ObjectCategory::Building),
 ];
 
-/// Production timing rules parsed from `[General]`.
-///
-/// The `_ppm` (parts-per-million) fields are pre-computed at INI parse time from the
-/// corresponding f32 fields so that sim code can use pure integer arithmetic.
-/// 1_000_000 = 1.0×. The f32 originals are kept for logging/debugging.
+/// The `[General]` keys `TechnoClass::Time_To_Build @ 0x006F47A0` reads,
+/// stored as the RulesClass fields hold them. The reader (`0x0066D530`) reads
+/// each with `INIClass::ReadDouble @ 0x005283D0`, the field's current value as
+/// default and no clamp; the values below are the constructor's
+/// (`RulesClass @ 0x00665650`).
 #[derive(Debug, Clone, Copy)]
 pub struct ProductionRules {
-    /// Minutes to build an object that costs 1000 credits before per-object modifiers.
-    pub build_speed: f32,
-    /// Time multiplier applied for each extra matching factory.
-    pub multiple_factory: f32,
-    /// Severity of the low-power speed penalty.
-    pub low_power_penalty_modifier: f32,
-    /// Lower bound on production speed while low power is active.
-    pub min_low_power_production_speed: f32,
-    /// Upper bound on production speed while low power is active.
-    pub max_low_power_production_speed: f32,
-    // -- Pre-computed integer-scaled values for deterministic sim math --
-    /// `multiple_factory` scaled to PPM (e.g., 0.8 → 800_000).
-    pub multiple_factory_ppm: u64,
-    /// `low_power_penalty_modifier` scaled to PPM.
-    pub low_power_penalty_modifier_ppm: u64,
-    /// `min_low_power_production_speed` scaled to PPM.
-    pub min_low_power_production_speed_ppm: u64,
-    /// `max_low_power_production_speed` scaled to PPM.
-    pub max_low_power_production_speed_ppm: u64,
-    /// `build_speed` pre-scaled ×1000 for deterministic build-time computation.
-    pub build_speed_x1000: u64,
-    /// Speed coefficient applied to wall building production after all other
-    /// queue time scaling. Parsed from `WallBuildSpeedCoefficient=` in [General].
-    pub wall_build_speed_coefficient: f32,
-}
-
-/// PPM scale constant (1_000_000 = 1.0×) used for f32→integer conversion at parse time.
-const PRODUCTION_PPM: u64 = 1_000_000;
-
-/// Convert an f32 value clamped to `[min, ∞)` into PPM u64 at parse time only.
-fn f32_to_ppm(val: f32, min: f32) -> u64 {
-    (val.max(min) as f64 * PRODUCTION_PPM as f64) as u64
+    /// `BuildSpeed=`: minutes to build a 1000-credit object (`+0x1748`, double;
+    /// 1.0).
+    pub build_speed: NativeF64Bits,
+    /// `MultipleFactory=`: the time factor per extra factory (`+0x57C`, float;
+    /// 1.0).
+    pub multiple_factory: NativeF32Bits,
+    /// `LowPowerPenaltyModifier=` (`+0x578`, float; 1.0).
+    pub low_power_penalty_modifier: NativeF32Bits,
+    /// `MinLowPowerProductionSpeed=` (`+0x570`, float; 0.5).
+    pub min_low_power_production_speed: NativeF32Bits,
+    /// `MaxLowPowerProductionSpeed=` (`+0x574`, float; 0.9).
+    pub max_low_power_production_speed: NativeF32Bits,
+    /// `WallBuildSpeedCoefficient=`: a wall's time factor (`+0x758`, double;
+    /// 0.5).
+    pub wall_build_speed_coefficient: NativeF64Bits,
 }
 
 impl Default for ProductionRules {
     fn default() -> Self {
         Self {
-            build_speed: 1.0,
-            multiple_factory: 0.8,
-            low_power_penalty_modifier: 1.0,
-            min_low_power_production_speed: 0.5,
-            max_low_power_production_speed: 0.9,
-            multiple_factory_ppm: f32_to_ppm(0.8, 0.01),
-            low_power_penalty_modifier_ppm: f32_to_ppm(1.0, 0.0),
-            min_low_power_production_speed_ppm: f32_to_ppm(0.5, 0.0),
-            max_low_power_production_speed_ppm: f32_to_ppm(0.9, 0.0),
-            build_speed_x1000: (1.0f64 * 1000.0) as u64,
-            wall_build_speed_coefficient: 1.0,
+            build_speed: NativeF64Bits::ONE,
+            multiple_factory: NativeF32Bits::ONE,
+            low_power_penalty_modifier: NativeF32Bits::ONE,
+            min_low_power_production_speed: NativeF32Bits::from_bits(0.5_f32.to_bits()),
+            max_low_power_production_speed: NativeF32Bits::from_bits(0x3F66_6666),
+            wall_build_speed_coefficient: NativeF64Bits::HALF,
         }
     }
 }
 
-/// A world-effect animation reference parsed from rules.ini + art.ini.
+/// A `[General]` animation reference parsed from rules.ini + art.ini.
 ///
 /// The name comes from rules.ini `[General]` (e.g., WarpIn=WARPIN).
 /// The rate comes from the anim's own art.ini section (e.g., `[WARPIN]` Rate=120).
@@ -220,41 +256,22 @@ pub struct AnimRef {
     pub frame_delay: u16,
 }
 
-/// Static art.ini metadata for the `[General] Parachute=` SHP.
-///
-/// Loaded once at startup from the art.ini section named by `[General] Parachute=`.
-/// Pure render-side data: consumed by the parachute anim lifecycle and renderer.
-#[derive(Debug, Clone)]
-pub struct ParachuteRenderConfig {
-    /// SHP section name from `[General] Parachute=` (e.g., "PARACH"). Uppercased.
-    pub shp_name: String,
-    /// Native gameplay-frame delay derived from art.ini `Rate=`.
-    pub frame_delay: u16,
-    /// Frame to wrap to after `frame >= end_frame`. From art.ini `LoopStart=`.
-    pub loop_start: u16,
-    /// Wraparound bound (exclusive). Set to `LoopEnd + 1` from art.ini.
-    /// Frames `0..end_frame` play once on first cycle, then wrap to `loop_start`.
-    pub end_frame: u16,
-    /// Depth-sort offset (signed, leptons; -10 for PARACH). Used by the renderer
-    /// to put the chute slightly above the GI body in the same depth band.
-    pub z_adjust: i16,
-    /// Whether to use the unit/Convert palette instead of the standard anim
-    /// palette. From art.ini `AltPalette=`. NOT owner-tinted.
-    pub alt_palette: bool,
-}
-
-/// Global gameplay constants from `[General]` that affect vision, gap generators, etc.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DamageFireHealthRatio {
-    pub numerator: i32,
-    pub denominator: i32,
-}
-
 /// Convert RulesClass `[AudioVisual] SavourDelay` minutes to the signed timer's
 /// ordinary non-negative frame domain. Native multiplies by 900.0 and calls
 /// `Math__ftol`, whose active x87 control word truncates toward zero.
 pub(crate) fn savour_delay_frames(minutes: f64) -> u64 {
     (minutes * 900.0).clamp(0.0, u64::MAX as f64).trunc() as u64
+}
+
+/// `ftol(minutes * 900.0)` under the process's 53-bit chop control word: the
+/// frames of a rules value authored in minutes (the 900.0 is the double at
+/// `0x007E27F8`).
+pub(crate) fn native_minutes_to_frames(minutes: f64) -> i32 {
+    use crate::util::native_x87::{MaskedX87Chop53 as X87, NativeF64Bits};
+    X87::ftol_i32_low_masked(X87::mul(
+        X87::load_f64(NativeF64Bits::from_bits(minutes.to_bits())),
+        X87::load_i32(900),
+    ))
 }
 
 /// Global gameplay constants from `[General]` that affect vision, gap generators, etc.
@@ -271,6 +288,8 @@ pub struct GeneralRules {
     /// Gravity=` (NOT `[General]` — stock rulesmd.ini defines it under
     /// [AudioVisual], value 6; the engine's code default is 3). Native stores a
     /// signed integer and converts to f32 at the behavior-3 tick boundary.
+    /// Also the ballistic gravity: `WeaponTypeClass::GetSpeed @ 0x00773070`
+    /// derives every `ROT=0` launch speed from it.
     pub gravity: i32,
     /// `[General] VeteranSight=` — `RulesClass+0x680`, a double.
     ///
@@ -292,11 +311,39 @@ pub struct GeneralRules {
     /// `[General] VeteranROF=` — `RulesClass+0x690`, read at `0x0066EF61`.
     /// `TechnoClass::GetROF @ 0x006FCFA0` multiplies the jittered reload by it
     /// at `0x006FD136..0x006FD145` for a `ROF`-ability holder. Constructor
-    /// default UNCHECKED.
+    /// default 1.0 (`0x00665F86`).
     pub veteran_rof: f64,
+    /// `[Easy]`, `[Normal]` and `[Difficult]` `ROF=`, the `ROF` field
+    /// (`+0x20`) of the three difficulty rows at `RulesClass+0x1538`
+    /// (stride `0x50`), in that order. `RulesClass::Process` reads them at
+    /// `0x00668EF5..0x00668F26` through `ReadDifficulty @ 0x0066D270`, which
+    /// runs only when the section exists and reads `ROF` with ReadDouble and
+    /// an explicit default of 1.0 (`0x0066D2E9..0x0066D2FD`). The row index is
+    /// `HouseClass+0x184` ([`HouseDifficulty`](crate::sim::house_state::HouseDifficulty)
+    /// order: 0 is a Hard AI, 2 an Easy AI). The constructor leaves the rows
+    /// unset (it skips from `+0x1530` to `+0x1638`, `0x006673E2`), so a
+    /// missing section is undefined natively; retail defines all three, and
+    /// VERA reads a missing one as 1.0.
+    pub difficulty_rof: [f64; 3],
+    /// The same rows' `RepairDelay=` (`+0x38`, ReadDouble with an explicit
+    /// default of .02, `0x0066D317`; retail `.02`, `.02`, `.05`).
+    /// `HouseClass::SetDifficulty` copies the house's row into `+0x1C0`; the
+    /// computer's auto-repair start draws its latch time from it
+    /// (`0x00450727`). A missing section skips every read
+    /// (`0x0066D27C..0x0066D288`) and leaves the row the constructor never
+    /// writes, undefined natively as the ROF rows are; VERA reads a missing
+    /// one as the key's default .02.
+    pub difficulty_repair_delay: [f64; 3],
     /// Receiver-side divisor selected by the rank-specific `STRONGER`
     /// ability (`VeteranArmor=` in `[General]`).
     pub veteran_armor: f64,
+    /// `[General] CurleyShuffle=` — `RulesClass+0x17E1`, read at `0x0066FD4A`
+    /// (ReadBool with the field as its default; the constructor writes 0).
+    /// `AircraftClass::Mission_Attack` reads it in states 4 and 5
+    /// (`0x004183C3`, `0x00418671`, `0x00418733`, `0x00418782`): a helicopter
+    /// that fired or missed goes back to state 1 and picks a new firing spot.
+    /// Retail: yes.
+    pub curley_shuffle: bool,
     /// `[General] RepairRate=` in minutes — `RulesClass+0x16E0`.
     ///
     /// The self-heal pulse (`FUN_0070BE80`) divides the frame counter by
@@ -310,16 +357,78 @@ pub struct GeneralRules {
     /// read at `0x0066EF94`. Stock `2`, which is exactly the elite threshold,
     /// so elite is terminal.
     pub veteran_cap: f64,
-    /// Difficulty armor doubles in native Hard/Normal/Easy table order.
-    pub difficulty_armor: [f64; 3],
-    /// `[General] ComputerBaseDefenseResponse=`. The active House responder
-    /// forms its signed/wrapping budget as `attacker Cost * this value`.
+    /// `[AI] ComputerBaseDefenseResponse=` (ReadAI673E41..673E61).
+    /// The active House responder forms its signed/wrapping budget as
+    /// `attacker ThreatPosed * this value` (7080BA..7080C4).
     pub computer_base_defense_response: i32,
     /// Signed `[General] MaximumBuildingPlacementFailures=` at `Rules+0xE48`.
     /// Native constructor default is `5`; both active retail rules files
     /// override it with `3`. Building exit compares strictly after incrementing;
     /// negative mod values remain literal.
     pub maximum_building_placement_failures: i32,
+    /// `[General] PlacementDelay=` in minutes (`Rules+0x5F8`, ReadDouble at
+    /// `0x0066F208`, constructor .05 at `0x00665E8C`): how long a computer
+    /// Construction Yard waits after a blocked placement before it tries its
+    /// finished building again ([`Self::placement_delay_frames`]).
+    pub placement_delay: f64,
+    /// `[General] AIAlternateProductionCreditCutoff=` (`Rules+0x1300`,
+    /// ReadInt at `0x0066FDFB`, constructor 1000 at `0x0066703B`): the credits
+    /// below which the computer's production mode leaves its normal state.
+    pub ai_alternate_production_credit_cutoff: i32,
+    /// `[General] AIRestrictReplaceTime=` (`Rules+0xDF0`, ReadInt at
+    /// `0x00670110`, constructor 500 at `0x006668D4`; retail 400): the frames
+    /// after a building of the house is attacked during which the computer
+    /// replans a lost building only if it is armed, a wall or a power plant.
+    pub ai_restrict_replace_time: i32,
+    /// `[General] TeamDelays=` (`Rules+0x1158`, items `+0x115C`; the
+    /// `0x00475D70` vector read at `0x0066FD8B`, constructor empty): the frames
+    /// between a computer house's team creation passes, by House difficulty
+    /// (`sim::ai_team_creation`). Retail: 2000,2500,3500.
+    pub team_delays: Vec<i32>,
+    /// `[General] TotalAITeamCap=` (`Rules+0x13C8`, items `+0x13CC`, read at
+    /// `0x0066FF30`): the teams a computer house may own before it stops
+    /// creating more. Retail: 30,30,30.
+    pub total_ai_team_cap: Vec<i32>,
+    /// `[General] MinimumAIDefensiveTeams=` (`Rules+0x1390`, items `+0x1394`,
+    /// read at `0x0066FEBD`). Retail: 1,1,1.
+    pub minimum_ai_defensive_teams: Vec<i32>,
+    /// `[General] MaximumAIDefensiveTeams=` (`Rules+0x13AC`, items `+0x13B0`,
+    /// read at `0x0066FEF6`). Retail: 2,2,2.
+    pub maximum_ai_defensive_teams: Vec<i32>,
+    /// `[General] UseMinDefenseRule=` (`Rules+0x17F3`, GetBool at
+    /// `0x0066FF60`, constructor 1): while a house owns fewer base-defense
+    /// teams than the minimum, only base-defense AI triggers qualify.
+    pub use_min_defense_rule: bool,
+    /// `[General] FillEarliestTeamProbability=` (`Rules+0x13F0`, items
+    /// `+0x13F4`, read at `0x0066FE83`): the percent chance a unit chooser
+    /// fills the earliest forming team's need. Retail: 100,100,100.
+    pub fill_earliest_team_probability: Vec<i32>,
+    /// `[General] DissolveUnfilledTeamDelay=` (`Rules+0x1190`, ReadInt at
+    /// `0x0066FF80`, constructor 5000): the frames an empty team lasts in a
+    /// multiplayer game (`TeamClass::AI @ 0x006E9140`).
+    pub dissolve_unfilled_team_delay: i32,
+    /// `[General] AISafeDistance=` (`Rules+0xD74`, ReadInteger at
+    /// `0x0066FFA7`, constructor 8 at `0x0066682A`): the cells from its base
+    /// centre a team gathers at on script action 54 (`0x006EFB69`).
+    /// Retail: 20.
+    pub ai_safe_distance: i32,
+    /// `[General] AITriggerSuccessWeightDelta=` (`Rules+0xC0`, ReadDouble at
+    /// `0x006718EC`, constructor 1.0; retail 20).
+    pub ai_trigger_success_weight_delta: NativeF64Bits,
+    /// `[General] AITriggerFailureWeightDelta=` (`Rules+0xC8`, ReadDouble at
+    /// `0x00671913`, constructor -1.0; retail -50).
+    pub ai_trigger_failure_weight_delta: NativeF64Bits,
+    /// `[General] AITriggerTrackRecordCoefficient=` (`Rules+0xD0`, ReadDouble
+    /// at `0x0067193A`, constructor 1.0; retail 1).
+    pub ai_trigger_track_record_coefficient: NativeF64Bits,
+    /// `[General] HarvestersPerRefinery=` (`Rules+0x1358`, items `+0x135C`,
+    /// read at `0x006705D3`): the harvesters a computer house wants for each
+    /// refinery. Retail: 2,2,1.
+    pub harvesters_per_refinery: Vec<i32>,
+    /// `[General] AIMinorSuperReadyPercent=` (`Rules+0xD70`, a float read
+    /// through ReadDouble at `0x0066FFC4`, constructor 0.8f): how charged an
+    /// Iron Curtain or Chronosphere must be for an AI trigger to count it.
+    pub ai_minor_super_ready_percent: NativeF32Bits,
     /// `[General] BaseDefenseDelay=` in minutes. A strict responder-budget
     /// overshoot arms the attacker cooldown for `ftol(value * 900)` frames.
     pub base_defense_delay_minutes: f64,
@@ -344,17 +453,24 @@ pub struct GeneralRules {
     /// Underground travel speed for Tunnel locomotor units (TunnelSpeed=).
     /// Default 6.0 cells/second matching RA2 default.
     pub tunnel_speed: SimFixed,
-    /// `MissileROTVar=` from [General]. Amplitude of the sidewinder cosine
-    /// modulation in homing missile flight; the per-tick ROT scales by
-    /// `(1 + var) + cos(2π * frame / 15) * var`. Stock RA2/YR rules set
-    /// `.25`, yielding roughly 1.0 to 1.5 times the projectile's base ROT.
-    /// The parser fallback for a missing key remains 1.0.
-    pub missile_rot_var: SimFixed,
+    /// Rules+598: ReadDouble at 66EC37, constructor .25 at 665DBD.
+    /// Bullet guidance uses sin((signed native ID + frame) % 15 * 2pi/15).
+    pub missile_rot_var: f64,
+    /// Rules+5A0: ReadInt at 66EC57, constructor 500 at 665DC9.
+    /// Targetless guided flight detonates when old Object height reaches it.
+    pub safety_altitude: i32,
+    /// Rules+1863, AudioVisual66B77D ReadColorRGB. Any nonzero channel
+    /// replaces ObjectType ART LineTrailColor on trail construction.
+    pub line_trail_color_override: [u8; 3],
     /// Default cruise altitude for Fly-locomotor aircraft (FlightLevel= in [General]).
     /// Fallback 500 leptons matches the engine constructor default; retail
     /// rulesmd.ini always supplies its own (1500), so the fallback only fires
-    /// for a non-retail INI missing the key. Per-type override not yet implemented.
+    /// for a non-retail INI missing the key. A type's own `FlightLevel=`
+    /// overrides it through `ObjectType::flight_level`.
     pub flight_level: i32,
+    /// Rules+420, [JumpjetControls] CruiseHeight. Object5F4260 uses this
+    /// global threshold; linked Jumpjets instead use their own +2C height.
+    pub display_cruise_height: i32,
     /// Hover locomotor cruise altitude in leptons (`[General] HoverHeight=`, default 120).
     /// The damped-spring vertical controller holds hover units at this height.
     pub hover_height: i32,
@@ -383,16 +499,10 @@ pub struct GeneralRules {
     /// Default 1024 (~4 cells). Distance to target at which the carrier aircraft
     /// reveals fog + transitions to the overfly mission.
     pub paradrop_radius: i32,
-    /// Carrier aircraft type for paradrop missions. Default `PDPLANE`.
-    pub paradrop_aircraft_type: String,
-    /// Parsed `[General] Parachute=` value (uppercased SHP name, e.g. "PARACH").
-    /// `None` if unset or empty. Used by `resolve_art_rates` to resolve
-    /// `parachute_render`.
+    /// Parsed `[General] Parachute=` value (uppercased AnimType name, e.g.
+    /// "PARACH"), `None` if unset or empty: the canopy the simulation attaches
+    /// to a dropped object. Its timing is the AnimType's own art.
     pub parachute_shp: Option<String>,
-    /// Parsed render config for the parachute SHP (from `[General] Parachute=`).
-    /// `None` if the key is unset OR if the referenced art.ini section is
-    /// missing. Render path is a no-op when this is `None`.
-    pub parachute_render: Option<ParachuteRenderConfig>,
     /// American paradrop list: parallel `(infantry_type, count)` pairs.
     /// From `[General] AmerParaDropInf=` zipped with `AmerParaDropNum=`.
     /// Default `[("E1", 8)]`.
@@ -423,19 +533,27 @@ pub struct GeneralRules {
     /// `SeparateAircraft=`. False means the first pad building's value includes
     /// the average cost of the first two `PadAircraft` entries.
     pub separate_aircraft: bool,
-    /// BuildingType identity handled by the Prism support/cascade mission path.
-    /// The generic art-delayed fire path must not consume this type.
+    /// `[General] PrismType=` (Rules `+0x498`): the BuildingType whose
+    /// Mission_Attack forwards its charge instead of firing
+    /// (`sim::world::techno_ai::building_missions`).
     pub prism_type: Option<String>,
+    /// `PrismSupportModifier=`, `PrismSupportMax=` and `PrismSupportDelay=`.
+    pub prism_support: PrismSupportRules,
+    /// `GDIGateOne=`, `GDIGateTwo=`, `NodGateOne=`, `NodGateTwo=`,
+    /// `WallTower=` (Rules `+0x86C..+0x87C`) and the four power plants
+    /// (`+0x89C..+0x8A8`).
+    pub building_types: GeneralBuildingTypes,
     /// Whether ore cells grow denser over time (TiberiumGrows= in [General]).
     /// Default true. Can be overridden per-map in [SpecialFlags].
     pub tiberium_grows: bool,
     /// Whether rich ore spreads to adjacent empty cells (TiberiumSpreads= in [General]).
     /// Default true. Can be overridden per-map in [SpecialFlags].
     pub tiberium_spreads: bool,
-    /// Minutes per full map growth scan cycle (GrowthRate= in [General]).
-    /// Fallback 2.0 minutes matches the engine constructor default; retail
-    /// rulesmd.ini always supplies its own (5), so the fallback only fires for
-    /// a non-retail INI missing the key. Controls how fast ore regenerates.
+    /// `GrowthRate=` in [General], in minutes. Fallback 2.0 matches the engine
+    /// constructor default; retail rulesmd.ini always supplies its own (5), so
+    /// the fallback only fires for a non-retail INI missing the key. Parsed for
+    /// rules fidelity only: VERA's growth runs on the per-Tiberium `Growth=`
+    /// timers and nothing reads this value.
     pub growth_rate_minutes: f32,
     /// Animation played when a unit warps in (WarpIn= in [General]).
     pub warp_in: AnimRef,
@@ -464,17 +582,17 @@ pub struct GeneralRules {
     /// (`TreeTargeting=` in `[CombatDamage]`).
     /// Default false in vanilla RA2.
     pub tree_targeting: bool,
+    /// Signed Terrain Strength fallback. Rules ctor666DF8 stores25;
+    /// General671DD2..671DF1 reads TreeStrength (retail200). Native reader
+    /// evidence: tools/rules_oracle/bridge_landing_inputs.
+    pub tree_strength: i32,
     /// Health ratio threshold below which the bar turns yellow (ConditionYellow= in [AudioVisual]).
     /// Default 0.5 (50%).
-    pub condition_yellow: f32,
-    /// `condition_yellow` pre-scaled to integer x1000 for deterministic sim comparisons.
-    pub condition_yellow_x1000: i64,
+    pub condition_yellow: f64,
     /// Health ratio threshold below which the bar turns red (ConditionRed= in [AudioVisual]).
-    /// Default 0.25 (25%).
-    pub condition_red: f32,
-    /// `condition_red` pre-scaled to integer ×1000 for deterministic sim comparisons.
-    /// Computed once at parse time: `(condition_red * 1000.0) as i64`.
-    pub condition_red_x1000: i64,
+    /// Constructor default0.5 at667568..66756E; retail authors0.25.
+    /// Native reader evidence: tools/rules_oracle/bridge_landing_inputs.
+    pub condition_red: f64,
     /// `[General] CloakingStages=` — native signed progress divisor. The
     /// constructor and stock rules both use 9.
     pub cloaking_stages: i32,
@@ -496,27 +614,21 @@ pub struct GeneralRules {
     /// (`0x00669D3E..0x00669D27`), played on an elite promotion
     /// (`0x006FA0B6..0x006FA0BC`).
     pub upgrade_elite_sound: Option<String>,
+    /// `[AudioVisual] SlavesFreeSound=` — `RulesClass::ReadAudioVisual @
+    /// 0x006691E0` resolves it to a Voc index at `RulesClass+0x234`
+    /// (constructor -1); the slave release plays it at the first freed slave
+    /// (`0x006B0C2C..0x006B0C60`). Absent or empty is silence.
+    pub slaves_free_sound: Option<String>,
     /// `[AudioVisual] EliteFlashTimer=` — `RulesClass+0xBE8`. Seeded into
     /// `TechnoClass+0xF0` on an elite promotion (`0x006FA0D6..0x006FA0DC`),
     /// whatever house owns the object. Constructor default UNCHECKED.
     pub elite_flash_timer: i32,
-    /// `IdleActionFrequency=` from `[AudioVisual]`, pre-scaled to integer ×1000.
-    ///
-    /// Scales how long an idle infantryman waits between fidgets: the wait is
-    /// drawn from `frequency * 450` to `frequency * 1800` frames, so stock
-    /// `.15` gives 67 to 270 frames. Stored ×1000 because the sim may only do
-    /// integer arithmetic with it. gamemd's own constructor default (what it
-    /// would use if the key were missing) is UNCHECKED; stock `rulesmd.ini`
-    /// always supplies the key, so the fallback below only ever serves fixtures.
-    pub idle_action_frequency_x1000: i64,
-    /// Exact integer cutoff used by ordinary-building damage fire after the
-    /// startup validator certifies stock `ConditionYellow=50%`.
-    pub damage_fire_ordinary_ratio: DamageFireHealthRatio,
-    /// Exact integer cutoff used by occupiable-building damage fire after the
-    /// startup validator certifies stock `ConditionRed=25%`.
-    pub damage_fire_occupied_ratio: DamageFireHealthRatio,
-    condition_yellow_native: f64,
-    condition_red_native: f64,
+    /// Exact `[AudioVisual] IdleActionFrequency=` double, `Rules+0x1710`.
+    /// Original constructor667574/66757E stores0x3FB53F7CED916873;
+    /// AudioVisual66B3EA reads over its current value. Infantry51CDB0 uses
+    /// this value to arm its idle timer before subsequent idle/RNG decisions.
+    /// Preserve the native double; milliunit quantization changes its timer.
+    pub idle_action_frequency: f64,
     /// `ConditionRedSparkingProbability=` ([General]) — per-tick probability that
     /// the `AI_Update` damage-Spark particle system spawns while health is below
     /// ConditionRed. Default **0.02** (verified `RulesClass__Constructor`; stock INI
@@ -562,18 +674,33 @@ pub struct GeneralRules {
     pub target_strength_coefficient_default: f64,
     /// `TargetDistanceCoefficientDefault=` (`RulesClass+0x1060`).
     pub target_distance_coefficient_default: f64,
+    /// `EnemyHouseThreatBonus=` (`RulesClass+0x1090`, ReadDouble at
+    /// `0x00671C7C`; constructor 0.0 at `0x00666CB7`, stock rulesmd 400):
+    /// added to the threat score of a candidate the scorer house's current
+    /// enemy owns (`TechnoClass::Calculate_Threat_Score @ 0x0070CF13`).
+    pub enemy_house_threat_bonus: f64,
     /// `ThreatPerOccupant=` (`RulesClass+0x0DF4`, `RulesClass::ReadGeneral @
     /// 0x00670128`; constructor default 5 at `0x006668DE`, stock rulesmd 10).
     /// A garrisoned building's `ThreatPosed` is `occupants * this` instead of
     /// its own type value (`TechnoClass::Get_ThreatPosed @ 0x00708B40`).
     pub threat_per_occupant: i32,
-    /// `NormalTargetingDelay=` ([General], stock 27) — frames between passive
-    /// target scans for every mission except Area Guard. The per-object scan
-    /// timer is re-armed to this value plus a 0..=2 scenario-RNG jitter.
-    pub normal_targeting_delay: u32,
-    /// `GuardAreaTargetingDelay=` ([General], stock 36) — the same cadence for
-    /// an Area Guard object, which scans twice as far and so scans less often.
-    pub guard_area_targeting_delay: u32,
+    /// `NormalTargetingDelay=` ([General], stock 27; `Rules+0xE08`, ReadInt
+    /// `0x006701BA..0x006701D3`, constructor 27 at `0x00666911`, no clamp) —
+    /// frames between passive target scans for every mission except Area
+    /// Guard. The per-object scan timer is re-armed to this value plus a
+    /// 0..=2 scenario-RNG jitter.
+    pub normal_targeting_delay: i32,
+    /// `[General] DeadBodies=` (`Rules+0x124`): the corpse anims an
+    /// infantryman's Die1..Die5 completion picks from when its type names none
+    /// (`0x00520C42..0x00520C91`). Retail: `DEATH_A`..`DEATH_F`.
+    pub dead_bodies: Vec<String>,
+    /// `GuardAreaTargetingDelay=` ([General], stock 36; `Rules+0xE04`, ReadInt
+    /// at `0x0067019A..0x006701B4`, constructor 36 at `0x00666906`, no clamp)
+    /// — the same cadence for an Area Guard object, which scans twice as far
+    /// and so scans less often (`0x0070985E`). It is also the dwell after a
+    /// shot before a unit's idle turret returns (`0x00736B45`) and before a
+    /// Gattling building's idle decay starts (`0x0043FEE9`), each plus 5.
+    pub guard_area_targeting_delay: i32,
     /// SFX played when the first occupant enters a CanBeOccupied building.
     /// Parsed from [AudioVisual] BuildingGarrisonedSound (typically "BuildingGarrisoned").
     /// None = no sound configured. Resolved at app layer to a sound.ini entry.
@@ -723,8 +850,20 @@ pub struct GeneralRules {
     /// GUIMoveInSound (stock `MenuSlideIn`). Played once at the start of each
     /// allow-listed shell dialog's slide. None = no sound configured.
     pub gui_move_in_sound: Option<String>,
-    /// Generic shell click sound from [AudioVisual] GenericClick.
+    /// Shell teardown slide-out cue from [AudioVisual] GUIMoveOutSound (stock
+    /// `MenuSlideOut`, `RulesClass+0x19C` read at `0x006694C7`), played by
+    /// `0x00608070` before a shown shell dialog's buttons slide out.
+    pub gui_move_out_sound: Option<String>,
+    /// Generic shell click sound from [AudioVisual] GenericClick
+    /// (`Rules+0x70C`, read at `0x0066AD30` through `VocClass::FindByName`;
+    /// retail `MenuClick`). A human player's sale order plays it too
+    /// (`Sell_Back @ 0x00447110`), and so does switching a repair off, or on
+    /// below Strength (`BuildingClass::ToggleRepair @ 0x00446FF0`).
     pub generic_click_sound: Option<String>,
+    /// `[AudioVisual] ScoldSound=` (`Rules+0x700`, read at `0x0066ABE8`
+    /// through `VocClass::FindByName`; retail `MenuScold`): ToggleRepair's
+    /// sound when a repair is switched on at full Strength (`0x00447068`).
+    pub scold_sound: Option<String>,
     /// Launcher Options Sound/Voice preview cue from [AudioVisual] GenericBeep.
     pub generic_beep_sound: Option<String>,
     /// Sound event for shell checkboxes from [AudioVisual] GUICheckboxSound.
@@ -744,6 +883,14 @@ pub struct GeneralRules {
     /// (`0x0083A1CC`) through `INIClass::ReadInt @ 0x005276D0` into
     /// `Rules+0x186C`; the constructor default is 0x32.
     pub ore_twinkle_chance: i32,
+    /// `[AudioVisual] GUIBuildSound=` (`Rules+0x18C`, read at `0x006693C1`
+    /// through `VocClass::FindByName`; retail `MenuClick`): the sidebar cameo
+    /// click sound, played by `SelectClass::Action @ 0x006AAD00` for every
+    /// click that acts (e.g. `0x006AAE2A`, `0x006AB713`). Residual: gamemd
+    /// resolves the name as it reads it and keeps the previous layer's sound
+    /// when the name does not resolve; VERA stores the name and resolves it at
+    /// play time. Retail's `MenuClick` resolves.
+    pub gui_build_sound: Option<String>,
     /// Sidebar tab click sound from [AudioVisual] GUITabSound (retail
     /// `MenuTab`). The key→tab-click mapping is name-inferred — flagged for a
     /// Ghidra spot-check of the tab-ID consumer before parity sign-off.
@@ -793,6 +940,23 @@ pub struct GeneralRules {
     /// ChronoOutSound=` (stock ships `ChronoMinerTeleport`). A genuinely-absent
     /// key yields `None` = no sound, not a fabricated fallback.
     pub chrono_out_sound: Option<String>,
+    /// `[AudioVisual] ImpactWaterSound=` / `ImpactLandSound=`
+    /// (`RulesClass+0x200` / `+0x204`, `RulesClass::ReadAudioVisual`
+    /// `0x00669924` / `0x00669965`): a crash impact's fallback cue when the
+    /// type names none (`FlyLocomotionClass::Process 0x004CD83E`/`0x004CD85C`).
+    /// Stock: `ExplosionWaterLarge` and empty (silence).
+    pub impact_water_sound: Option<String>,
+    pub impact_land_sound: Option<String>,
+    /// AudioVisual/SinkingSound -> Rules+208 (6699C8); constructor665940
+    /// stores -1. Used only when the sinking type has no resolved sound.
+    pub sinking_sound: Option<String>,
+    /// `[AudioVisual] BombTickingSound=` (`RulesClass+0x20C`): the looping
+    /// tick at a bombed object (`BombListClass::UpdateAll @ 0x00438BF0`).
+    pub bomb_ticking_sound: Option<String>,
+    /// `[AudioVisual] BombAttachSound=` (`RulesClass+0x210`): played at the
+    /// bombed object for the planter's own player (`BombListClass::Attach @
+    /// 0x00438FD7`).
+    pub bomb_attach_sound: Option<String>,
     /// Interval in minutes between low-power degradation damage ticks on Powered=yes buildings.
     /// Parsed from DamageDelay= in [General]. Default 1.0 minute.
     pub damage_delay_minutes: f32,
@@ -810,21 +974,36 @@ pub struct GeneralRules {
     pub barrel_particle: Option<String>,
 
     // -- Harvester scan radii and economy --
-    /// Short-range ore scan radius in cells (TiberiumShortScan= in [General]).
-    /// Used when harvesting a single patch — scan nearby for the next cell.
-    /// Default 6 cells. YR only (RA2 hardcodes the same value).
+    /// `Rules+0x1778`, `[General] TiberiumShortScan=` in leptons: the ring
+    /// bound of Mission_Harvest state 1's next-cell scan and its full-cargo
+    /// archive scan (`0x0073E9F1`, `0x0073EAA6`, `>> 8` to cells). Read by
+    /// `RulesClass::ReadGeneral` at `0x0067028C..0x006702A6` through
+    /// `CCINIClass::ReadRange 0x00474620` (cells x 256, chopped) over the
+    /// current value; the constructor writes `0x600` (`0x00667638`). Retail
+    /// `6` is 1536.
     pub tiberium_short_scan: i32,
-    /// Long-range ore scan radius in cells (TiberiumLongScan= in [General]).
-    /// Used when short scan fails — look further for a new ore patch.
-    /// Default 48 cells.
+    /// `Rules+0x177C`, `[General] TiberiumLongScan=` in leptons: the ring
+    /// bound of Mission_Harvest state 0's ore search (`0x0073E851`). Read
+    /// like TiberiumShortScan (`0x006702AC..0x006702C5`); the constructor
+    /// writes `0x2000` (`0x00667642`). Retail `48` is 12288.
     pub tiberium_long_scan: i32,
-    /// Slave Miner short scan distance in cells (SlaveMinerShortScan= in [General]).
-    /// Deployed Slave Miner checks this range to decide if it should reposition.
-    /// Default 8.
+    /// `Rules+0x1518`, `[General] BuildupTime=` in minutes: how long a
+    /// building's build-up (and pack-up) animation runs, spread over its
+    /// Buildup SHP's frames (`rules::buildup_asset_catalog`).
+    /// `RulesClass::ReadGeneral` reads it through `CCINIClass::ReadDouble
+    /// 0x005283D0` at `0x00670CB5`; the constructor writes `.05`
+    /// (`0x3FA999999999999A`, `0x006673B3..0x006673BD`). Retail `.06`.
+    pub buildup_time: f64,
+    /// `Rules+0x1780`, `[General] SlaveMinerShortScan=` in leptons: a deployed
+    /// slave refinery with ore this close keeps working where it stands.
+    /// `RulesClass::ReadGeneral` reads it through `CCINIClass::ReadRange
+    /// 0x00474620` at `0x006702E0`; the constructor writes `0x500`
+    /// (`0x0066764C`). Retail `8` is 2048.
     pub slave_miner_short_scan: i32,
-    /// Slave unit scan distance in cells (SlaveMinerSlaveScan= in [General]).
-    /// Slaves scan further than their master since they trust it would reposition if needed.
-    /// Default 14.
+    /// `Rules+0x1784`, `[General] SlaveMinerSlaveScan=` in leptons: how far a
+    /// slave looks for ore (SlaveManagerClass AI_Update state 1,
+    /// `0x006AF748`). ReadRange at `0x00670300`; constructor `0x1000`
+    /// (`0x00667656`). Retail `14` is 3584.
     pub slave_miner_slave_scan: i32,
     /// `[General] DrainMoneyFrameDelay=` (`Rules+0x314`, stock 30). The drained
     /// object's `TechnoClass::AI_Update @ 0x006FA167..0x006FA17B` transfers
@@ -836,26 +1015,48 @@ pub struct GeneralRules {
     /// (`Spend_Money @ 0x004F9790`) to the drainer's (`Add_Credits @
     /// 0x004F9950`) at `0x006FA183..0x006FA1C0`. Constructor default UNCHECKED.
     pub drain_money_amount: i32,
-    /// Slave Miner long scan distance in cells (SlaveMinerLongScan= in [General]).
-    /// Used when searching for a new ore field to deploy near. Default 48.
+    /// `Rules+0x1788`, `[General] SlaveMinerLongScan=` in leptons: how far a
+    /// slave miner looks for a field. ReadRange at `0x0067031F`; constructor
+    /// `0x5000` (`0x00667660`). Retail `48` is 12288.
     pub slave_miner_long_scan: i32,
-    /// Cell improvement threshold for Slave Miner repositioning (SlaveMinerScanCorrection=).
-    /// The new spot must be this many cells closer to ore to justify moving. Default 3.
+    /// `Rules+0x178C`, `[General] SlaveMinerScanCorrection=` in leptons: how
+    /// much closer to ore a new spot must be before a deployed slave miner
+    /// moves. ReadRange at `0x0067033F`; constructor `0x300` (`0x0066766A`).
     pub slave_miner_scan_correction: i32,
-    /// Guard duration before deployed Slave Miner re-scans for ore (SlaveMinerKickFrameDelay=).
-    /// In game frames (15 fps). Default 150 (~10 seconds).
-    pub slave_miner_kick_frame_delay: u32,
-    /// Standard harvester "too far" threshold in cells (HarvesterTooFarDistance=).
-    /// If the nearest refinery is farther than this, the harvester drives next to it
-    /// before reserving a dock. Default 5.
+    /// `Rules+0x1790`, `[General] SlaveMinerKickFrameDelay=`: frames an idle
+    /// slave miner waits before it looks for a field again. ReadInt at
+    /// `0x0067035F`; constructor `0x7FFFFFFF` (`0x00667674`). Retail 150.
+    pub slave_miner_kick_frame_delay: i32,
+    /// `Rules+0xF0`, `[General] MaximumQueuedObjects=`: how many builds a
+    /// factory's queue holds behind its active one; `FactoryClass::
+    /// StartProduction` refuses an append at this count (`0x004C9CDE`).
+    /// `RulesClass::ReadGeneral` reads it through `CCINIClass::ReadInt
+    /// 0x005276D0` at `0x00671DA7`; the constructor writes 5 (`0x006656EE` →
+    /// `0x006657CD`).
+    pub maximum_queued_objects: i32,
+    /// `Rules+0xD78`, `[General] HarvesterTooFarDistance=` in cells: a
+    /// refinery farther than this is approached before the dock is reserved.
+    /// `RulesClass::ReadGeneral` reads it through `CCINIClass::ReadInt
+    /// 0x005276D0` at `0x0066FFEB`; the constructor writes 5 (`0x00666835`).
     pub harvester_too_far_distance: i32,
-    /// Chrono harvester "too far" threshold in cells (ChronoHarvTooFarDistance=).
-    /// Larger than standard because chrono miners teleport back. Default 50.
+    /// `Rules+0xDF8`, `[General] ApproachTargetResetMultiplier=`: read through
+    /// `INIClass::ReadInt 0x005276D0` at `0x00670150` (retail `1.5` is 1);
+    /// constructor 1. A returning slave re-paths when its NavCom has drifted
+    /// more than this many cells from the drop cell (SlaveManagerClass
+    /// AI_Update state 4, `0x006AFB13`).
+    pub approach_target_reset_multiplier: i32,
+    /// `Rules+0xD7C`, `[General] ChronoHarvTooFarDistance=` in cells, the
+    /// Chrono Miner's threshold. Read through `ReadInt` at `0x0067000B`; the
+    /// constructor writes 50 (`0x00666846`).
     pub chrono_harv_too_far_distance: i32,
 
     // -- Harvester timing --
-    /// Frames per StepTimer increment during ore gathering (HarvesterLoadRate=).
-    /// One bale requires 9 steps, so harvest_interval = rate * 9. Default 2.
+    /// `Rules+0x1520`, `[General] HarvesterLoadRate=`: the StageClass rate
+    /// Mission_Harvest state 1 and Harvest_Ore_Tick arm (`0x0073E951`,
+    /// `0x0073D5D1`); state 1 cuts when the stage reaches 9. Read by
+    /// `RulesClass::ReadGeneral` at `0x00670CE7..0x00670D01` through
+    /// `CCINIClass::ReadInt 0x005276D0`; the constructor writes 2
+    /// (`0x006671CD`, `0x006673C7`). Retail leaves it unset.
     pub harvester_load_rate: i32,
     /// Whole-frame dump gate for refinery unloading (HarvesterDumpRate=).
     /// The unload accumulator advances one whole frame per unloading tick and a
@@ -864,7 +1065,10 @@ pub struct GeneralRules {
     /// is integer-stepped, the first crossing is exactly `ceil(rate × 900)`, so
     /// storing the ceiling (not a tenths-quantized value) reproduces gamemd's
     /// crossing bit-for-bit with no float in the sim gate.
-    /// Default 15 (from ceil(0.016 × 900) = ceil(14.4) = 15 frames per gate).
+    /// Default 15 (from ceil(0.016 × 900) = ceil(14.4) = 15 frames per gate):
+    /// the RulesClass constructor stores the double 0.016 at Rules+0x1528
+    /// (`0x006673CD..0x006673DC`) and ReadDouble at `0x00670CD4` keeps it when
+    /// the key is absent, as it is in retail RULESMD.INI.
     pub harvester_dump_frames: u16,
 
     // -- Chrono warp delay constants --
@@ -909,15 +1113,41 @@ pub struct GeneralRules {
     /// Divisor to compute survivor count for Third-side (Yuri) buildings (ThirdSurvivorDivisor= in [General]).
     /// YR addition. Default 750.
     pub third_survivor_divisor: i32,
+    /// `AlliedCrew=`/`SovietCrew=`/`ThirdCrew=` (Rules `+0xF78/+0xF7C/+0xF80`),
+    /// `Technician=` (`+0xF6C`) and `Engineer=` (`+0xF70`): the InfantryTypes
+    /// `TechnoClass::GetCrew @ 0x00707D20` and the building crew pick
+    /// `0x0044EB10` return. Stock E1, E2, INIT, CTECH and ENGINEER.
+    pub allied_crew: Option<String>,
+    pub soviet_crew: Option<String>,
+    pub third_crew: Option<String>,
+    pub technician: Option<String>,
+    pub engineer_infantry: Option<String>,
+    /// `CrewEscape=` (Rules `+0x5C0`, `ReadDouble`), the chance a crewed
+    /// vehicle's crew escapes. Constructor default 0.5 (`0x00665E11..0x00665E17`).
+    pub crew_escape: crate::util::native_x87::NativeF64Bits,
+    /// `RefundPercent=` (Rules `+0x1738`, `ReadDouble`), the human-owner refund
+    /// share `TechnoTypeClass::GetRefund @ 0x00711F60` applies. Constructor
+    /// default 0.5 (`0x006675CE..0x006675D4`, ECX set at `0x00667190`).
+    pub refund_percent: crate::util::native_x87::NativeF64Bits,
+    /// `ShipSinkingWeight=` (Rules `+0x630`, `ReadDouble` at `0x0066F174`;
+    /// constructor default 3.0 at `0x00665EE8`). A surface naval unit at
+    /// least this `Weight=` sinks on water instead of exploding
+    /// (`0x00737E00..0x00737E16`). Parsed like `Weight=` so the two compare
+    /// as native doubles do on stock values (3.0 against 1..5).
+    pub ship_sinking_weight: SimFixed,
 
     // -- Cliff/slope movement coefficients ([General]) --
-    /// Tracked vehicle uphill coefficient (`TrackedUphill=`; vanilla 1.0 = no change).
+    // Rules +0x768/+0x770/+0x778/+0x780, each `ReadDouble` over its current
+    // value (0x66F213..0x66F2A9); the constructor stores 1.0 in all four
+    // (0x6660BE..0x6660ED). Read by the Drive/Ship fresh speed publish
+    // (0x4B3D4C..0x4B3DA6) and the per-cell speed chain.
+    /// Tracked vehicle uphill coefficient (`TrackedUphill=`).
     pub tracked_uphill: SimFixed,
-    /// Tracked vehicle downhill coefficient (`TrackedDownhill=`; vanilla 1.2 = faster).
+    /// Tracked vehicle downhill coefficient (`TrackedDownhill=`).
     pub tracked_downhill: SimFixed,
-    /// Non-tracked (wheeled and other) vehicle uphill coefficient (`WheeledUphill=`; vanilla 1.0).
+    /// Non-tracked (wheeled and other) vehicle uphill coefficient (`WheeledUphill=`).
     pub wheeled_uphill: SimFixed,
-    /// Non-tracked vehicle downhill coefficient (`WheeledDownhill=`; vanilla 1.2).
+    /// Non-tracked vehicle downhill coefficient (`WheeledDownhill=`).
     pub wheeled_downhill: SimFixed,
 
     // -- Per-object draw-light offsets --
@@ -929,21 +1159,46 @@ pub struct GeneralRules {
     pub extra_aircraft_light: i32,
 
     // -- Movement arrival --
-    /// Distance in leptons below which a blocked unit stops instead of repathing.
-    /// CloseEnough=2.25 in vanilla rulesmd.ini (2.25 cells × 256 lep/cell ≈ 576 leptons).
-    pub close_enough: SimFixed,
+    /// `Rules+0x1718`, `[General] CloseEnough=` in leptons: a blocked mover
+    /// within this distance of its destination stops instead of repathing.
+    /// Read by `RulesClass::ReadGeneral` at `0x00670EDD..0x00670EF7` through
+    /// `CCINIClass::ReadRange 0x00474620` (cells x 256, chopped) over the
+    /// current value; the constructor writes `0x280` (`0x00667588`). Retail
+    /// `CloseEnough=2.25` is 576.
+    pub close_enough: i32,
+    /// `Rules+0x171C`, `[General] Stray=` in leptons: how far a team member
+    /// may be from its team's centre or goal (`TeamClass::Regroup @
+    /// 0x006EB870`, `Coordinate_Move @ 0x006EBAD0`). `ReadRange 0x00474620`
+    /// at `0x00670E93` over the constructor's `0x200` (`0x00667592`). Retail
+    /// `Stray=2.0` is 512.
+    pub stray: i32,
+    /// `Rules+0x1720`, `[General] RelaxedStray=` in leptons: `Stray=` for a
+    /// team on script action 53 or 54. `ReadRange` at `0x00670EB2` over the
+    /// constructor's `0x200` (`0x0066759C`). Retail `RelaxedStray=3.0` is 768.
+    pub relaxed_stray: i32,
+    /// `Rules+0x1724`, exact `[General] GuardModeStray=` in leptons.
+    /// `ReadGeneral 0x00670EBD..0x00670EDD` uses `ReadRange 0x00474620`
+    /// over the current value. Native construction does not write this field;
+    /// Rust initializes the otherwise unspecified storage deterministically to0.
+    /// Active retail's base General layer supplies2.0 (512 leptons).
+    /// AreaGuard uses it only when its archived post is a Foot object
+    /// (`0x004D6E74..0x004D6E89`), replacing the ordinary range-based leash.
+    pub guard_mode_stray: i32,
 
     // -- Service depot / unit repair --
     /// Ticks between applying RepairStep HP when a unit is on a repair depot.
     /// Derived from URepairRate= in [General] (minutes). Default 0.016 min ≈ 14 ticks at 15 Hz.
     pub unit_repair_rate_ticks: u32,
-    /// HP healed per repair step on a service depot (RepairStep= in [General]).
-    /// Fallback 5 matches the engine constructor default; retail rulesmd sets 8.
-    pub repair_step: u16,
-    /// Percent of build cost charged for a full unit repair (RepairPercent= in [General]).
-    /// Fallback 25 (25%) matches the engine constructor default; retail rulesmd
-    /// sets 15%. Total cost = cost * repair_percent / 100.
-    pub repair_percent: u16,
+    /// `[General] RepairStep=` — `RulesClass+0x16CC`, ReadInt over the
+    /// constructor's 5 with no clamp (retail 8). TechnoTypeClass vt+0xB4
+    /// (`0x00712120`) returns it: the health a repair tick adds, and the
+    /// divisor of Strength in the repair step cost (`0x007120EC`).
+    pub repair_step: i32,
+    /// `[General] RepairPercent=` — `RulesClass+0x16D0`, ReadDouble
+    /// (`0x00670DB7`) over the constructor's .25 (retail `15%`, stored as
+    /// 0x3FC3333333333333). The repair step cost multiplies the per-step
+    /// share of the cost by it (`0x00712101`).
+    pub repair_percent: f64,
 
     // -- Aircraft ammo reload --
     /// Ticks to reload one ammo point at an airfield (from ReloadRate= minutes in [General]).
@@ -951,14 +1206,31 @@ pub struct GeneralRules {
     pub reload_rate_ticks: u32,
 
     // -- Movement delay timers --
-    /// Ticks between pathfinding retry attempts (PathDelay= in [General]).
-    /// INI value is in minutes; converted to ticks: minutes × 60 × 15.
-    /// Default: 0.01 min = 9 ticks. While counting down, pathfinding is not called.
-    pub path_delay_ticks: u16,
+    /// Retained [AI] PathDelay double, in minutes (Rules+1760).
+    /// Convert at the timer producer with the native PC53 multiply/ftol.
+    pub path_delay: f64,
     /// Ticks to wait when blocked by a friendly unit before aggressive repath
-    /// (BlockagePathDelay= in [General]). INI value is in frames (directly).
+    /// ([AI] BlockagePathDelay). Native signed dword, in frames directly.
     /// When this timer expires, the unit re-pathfinds with urgency=2 (scatter).
-    pub blockage_path_delay_ticks: u16,
+    pub blockage_path_delay_ticks: i32,
+    /// [General] AIAutoDeployFrameDelay, native signed DynamicVector at
+    /// Rules+E2C (data+E30), indexed Hard/Normal/Easy by Infantry52155C.
+    /// Constructor666932..666961 leaves it empty; stock15,25,100 is authored.
+    pub ai_auto_deploy_frame_delay: Vec<i32>,
+    /// `[AI] AIForcePredictionFudge=`, the signed DynamicVector at `Rules+0x9A8`
+    /// (items `+0x9AC`) indexed Hard/Normal/Easy by the House difficulty:
+    /// the percent by which the computer's estimate of its enemy's forces
+    /// may err (`sim::ai_base_defense`). ReadAI `0x006732D9..0x00673314`
+    /// copies the vector before the `0x00475D70` reader; the constructor
+    /// (`0x00666373..0x00666388`) leaves it empty. Retail: 5,25,80.
+    pub ai_force_prediction_fudge: Vec<i32>,
+    /// `[General] AIPickWallDefensePercent=`, the signed DynamicVector at
+    /// `Rules+0xDD4` (items `+0xDD8`) indexed Hard/Normal/Easy by the House
+    /// difficulty: the chance that a defense node walls a building instead
+    /// (`sim::ai_base_building`). ReadGeneral `0x006700C6..0x006700F7` copies
+    /// the vector before the `0x00475D70` reader; the constructor
+    /// (`0x0066689C..0x006668CA`) leaves it empty. Retail: 50,25,10.
+    pub ai_pick_wall_defense_percent: Vec<i32>,
 
     // -- Cell scatter eligibility (CellClass::Scatter_Objects) --
     /// `PlayerScatter=` from `[CombatDamage]` — when set, an *unforced* cell
@@ -967,6 +1239,13 @@ pub struct GeneralRules {
     /// the byte, so ordinarily only elite occupants and AI-owned occupants
     /// respond to an unforced scatter.
     pub player_scatter: bool,
+    /// `PlayerReturnFire=` from `[CombatDamage]` (`Rules+0x17EC`, read at
+    /// `0x0066CEBD`). When set, a human's objects retaliate on every mission;
+    /// unset (the constructor's value and stock `rulesmd.ini:899`), they do so
+    /// only on Guard, Area Guard or Patrol (`ShouldRetaliate 0x007089F7`),
+    /// and a human's building hit by a non-Aircraft source turns its `+0x388`
+    /// at random instead of taking the source (`0x00442A1B`).
+    pub player_return_fire: bool,
     /// `Scatter=` from `[IQ]` — the house IQ level at or above which an
     /// occupant answers an *unforced* cell scatter. Stock `rulesmd.ini:3164`
     /// says `2`; the RulesClass constructor default is `3`.
@@ -977,6 +1256,10 @@ pub struct GeneralRules {
     /// transaction. Native accepts the constructor default `5` or the parsed
     /// dword verbatim, without clamping it to `MaxIQLevels`.
     pub iq_production: i32,
+    /// `[IQ] Harvester=` (`Rules+0x1458`, ReadInt at `0x00674394`, constructor
+    /// 3 at `0x006671F8`; retail 2): the house IQ from which a computer house
+    /// replaces its harvesters (`sim::ai_unit_choice`).
+    pub iq_harvester: i32,
     /// `[IQ] RepairSell` outer gate for BuildingClass repair/sell AI.
     pub iq_repair_sell: i32,
     /// `[IQ] SellBack` gate for the red-health low-credit sell decision.
@@ -984,12 +1267,6 @@ pub struct GeneralRules {
     /// `[AI] CreditReserve` threshold. A latched AI building is considered
     /// for sale only while its owner's credits are strictly below this value.
     pub credit_reserve: i32,
-
-    /// Overlay type names that are opaque concrete walls (ConcreteWalls= in [General]).
-    /// Concrete walls do NOT render a ghost sprite during placement -- only the
-    /// valid/invalid cell grid is shown. Fence walls (not in this list) still
-    /// render their connectivity ghost. Stored uppercase for case-insensitive matching.
-    pub concrete_walls: Vec<String>,
 
     // -- Lightning Storm superweapon constants --
     /// Duration of active storm in game frames (LightningStormDuration= in [General]).
@@ -1009,8 +1286,15 @@ pub struct GeneralRules {
     /// Minimum manhattan distance between consecutive bolts (LightningSeparation= in [General]).
     /// Default 3.
     pub lightning_separation: i32,
-    /// Warhead ID for lightning bolt damage (LightningWarhead= in [General]). Default "IonWH".
+    /// [General] LightningWarhead (+17B4), constructor null.
+    /// Retained factory binding from General671053; empty string means null.
     pub lightning_warhead: String,
+    /// [General] WeatherConBoltExplosion (+2F4), constructor null;
+    /// selected by SelectAnim48A59A for LightningWarhead.
+    pub weather_con_bolt_explosion: String,
+    /// [General] WeaponNullifyAnim (+350), constructor null; retained reader
+    /// 66E2AF. Bullet46A2A1 uses it after AreaDamage returns IronCurtain (2).
+    pub weapon_nullify_anim: String,
     /// Whether `[General] AmbientChangeRate=` is nonzero before its native
     /// frame conversion. Kept separately because a nonzero mod value can chop
     /// to a zero-frame interval while still passing ScenarioClass's outer gate.
@@ -1022,15 +1306,19 @@ pub struct GeneralRules {
     pub ambient_change_step: i32,
     // --- IronCurtain ([CombatDamage]) ---
     /// IronCurtain invulnerability duration in frames (IronCurtainDuration= in [CombatDamage]).
-    pub iron_curtain_duration: u32,
+    pub iron_curtain_duration: i32,
     // --- IronCurtain ([General]) ---
     /// Animation played on IC target (IronCurtainInvokeAnim= in [General]). Default IRONBLST.
     pub iron_curtain_invoke_anim: String,
+    /// `[General] IonBlast=` (`RulesClass+0x298`), the animation the Genetic
+    /// Mutator launch constructs (`SuperClass::Launch 0x006CD8A5`). Retail
+    /// `RING1`. The constructor default is a null type: no key, no animation.
+    pub ion_blast_anim: String,
     // --- ForceShield ([General]) ---
     /// Cell radius of ForceShield AoE (ForceShieldRadius= in [General]).
     pub force_shield_radius: u32,
     /// ForceShield invulnerability duration in frames (ForceShieldDuration= in [General]).
-    pub force_shield_duration: u32,
+    pub force_shield_duration: i32,
     /// Power blackout duration triggered by ForceShield (ForceShieldBlackoutDuration= in [General]).
     pub force_shield_blackout_duration: u32,
     /// Frames before fade sound plays (ForceShieldPlayFadeSoundTime= in [General]).
@@ -1049,9 +1337,9 @@ pub struct GeneralRules {
     pub mutate_explosion_warhead: String,
     /// Whether MutateExplosion is enabled (MutateExplosion= in [General]). Default true.
     pub mutate_explosion: bool,
-    /// `[General] MetallicDebris=` — list of animation names to spawn (50%-RNG
-    /// gated, count-checked) on bridge-cell collapse. Default 20 entries.
-    /// Mirrors gamemd `Rules+0x140` (data ptr) / `+0x14C` (count).
+    /// Ordered `[General] MetallicDebris=` AnimType references from the native
+    /// ReadGeneral128/factory pass. Constructor default is empty, not retail's
+    /// authored list. Mirrors Rules+0x140 (data) / +0x14C (count).
     pub metallic_debris: Vec<String>,
 }
 
@@ -1110,15 +1398,25 @@ pub(crate) fn damage_spark_spawn_threshold(band: f64) -> u32 {
 /// Matches gamemd constructor default: 1 game frame at 60fps ≈ 17ms.
 const DEFAULT_ANIM_FRAME_DELAY: u16 = 1;
 
-/// Stand-in for `[AudioVisual] IdleActionFrequency=` when the key is absent.
-///
-/// Stock `rulesmd.ini` sets `.15`, so this only serves fixtures that build a
-/// RuleSet without an `[AudioVisual]` section. gamemd's own constructor default
-/// is UNCHECKED.
-const STOCK_IDLE_ACTION_FREQUENCY_X1000: i64 = 150;
+/// `[General] URepairRate=` and `ReloadRate=` defaults, in minutes.
+const U_REPAIR_RATE_MINUTES: f64 = 0.016;
+const RELOAD_RATE_MINUTES: f64 = 0.3;
+
+/// A `[General]` minutes value as whole logic ticks (at least one), rounded
+/// from `f32` minutes.
+fn minutes_to_ticks(minutes: f64) -> u32 {
+    ((minutes as f32) * 60.0 * (crate::util::fixed_math::RA2_LOGIC_FRAMES_PER_SECOND as f32))
+        .round()
+        .max(1.0) as u32
+}
 
 /// Zip a parallel pair of paradrop INI keys (`Inf` + `Num`) into `(type, count)` pairs.
-/// `skip_count_assert` mirrors gamemd's Soviet branch which lacks the equality check.
+///
+/// `RulesClass::ReadGeneral` reads each `*ParaDropInf=` through the
+/// InfantryType list reader (`0x0067BB10`, `char[128]`) and each
+/// `*ParaDropNum=` through the IntVector reader (`0x00475D70`); an absent key
+/// keeps that vector's current value. `skip_count_assert` mirrors gamemd's
+/// Soviet branch which lacks the equality check.
 fn parse_paradrop_list(
     general: &crate::rules::ini_parser::IniSection,
     inf_key: &str,
@@ -1126,21 +1424,15 @@ fn parse_paradrop_list(
     skip_count_assert: bool,
     default: Vec<(String, u32)>,
 ) -> Vec<(String, u32)> {
-    let inf: Vec<String> = match general.get_list(inf_key) {
-        Some(list) => list
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_uppercase())
-            .collect(),
-        None => return default,
-    };
-    let nums: Vec<u32> = match general.get_list(num_key) {
-        Some(list) => list
-            .into_iter()
-            .filter_map(|s| s.parse::<u32>().ok())
-            .collect(),
-        None => return default,
-    };
+    let (default_inf, default_nums): (Vec<String>, Vec<u32>) = default.iter().cloned().unzip();
+    let inf: Vec<String> = general
+        .read_list(inf_key, 0x80)
+        .map(|tokens| tokens.into_iter().map(str::to_uppercase).collect())
+        .unwrap_or(default_inf);
+    let nums: Vec<u32> = general
+        .read_int_list(num_key)
+        .map(|values| values.into_iter().map(|num| num.max(0) as u32).collect())
+        .unwrap_or(default_nums);
     if !skip_count_assert && inf.len() != nums.len() {
         log::warn!(
             "Paradrop list mismatch: {}={} entries but {}={} entries — using defaults",
@@ -1151,7 +1443,130 @@ fn parse_paradrop_list(
         );
         return default;
     }
-    inf.into_iter().zip(nums.into_iter()).collect()
+    inf.into_iter().zip(nums).collect()
+}
+
+/// `RulesClass::ReadDifficulty @ 0x0066D270`'s `RepairDelay=` default, the
+/// double nearest .02 (`0x3F947AE147AE147B`, pushed at `0x0066D317`).
+const DIFFICULTY_REPAIR_DELAY_DEFAULT: f64 = 0.02;
+
+/// The single BuildingTypes `RulesClass::ReadGeneral` names in `[General]`,
+/// as stored IDs (`read_building_identity`; the layered reader in
+/// `native_processing` replaces the projection).
+///
+/// The gates and WallTower (`Rules+0x86C..+0x87C`, read at
+/// `0x0066F450..0x0066F583`) are the types `CellClass::Is_Clear_To_Build` lets
+/// stand on their own house's wall overlay (`sim::build_site`): WallTower and
+/// the two GDI gates over GASAND/GAWALL (`0x0047C8DD..0x0047C8F7`), the two
+/// Nod gates over NAWALL (`0x0047C92F..0x0047C943`). Retail names GADUMY for
+/// all five. The four power plants (`Rules+0x89C..+0x8A8`, read at
+/// `0x0066F692..0x0066F781`) are the plant the computer's building choice
+/// splices into its BasePlan (`sim::ai_base_building`); retail GAPOWR, NAPOWR,
+/// NANRCT and YAPOWR.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GeneralBuildingTypes {
+    pub gdi_gate_one: Option<String>,
+    pub gdi_gate_two: Option<String>,
+    pub nod_gate_one: Option<String>,
+    pub nod_gate_two: Option<String>,
+    pub wall_tower: Option<String>,
+    /// `GDIPowerPlant=` (`Rules+0x89C`).
+    pub gdi_power_plant: Option<String>,
+    /// `NodRegularPower=` (`Rules+0x8A0`).
+    pub nod_regular_power: Option<String>,
+    /// `NodAdvancedPower=` (`Rules+0x8A4`).
+    pub nod_advanced_power: Option<String>,
+    /// `ThirdPowerPlant=` (`Rules+0x8A8`).
+    pub third_power_plant: Option<String>,
+}
+
+impl GeneralBuildingTypes {
+    /// `type == Rules+0x87C || +0x86C || +0x870`.
+    pub fn stands_on_gdi_wall(&self, type_id: &str) -> bool {
+        [&self.wall_tower, &self.gdi_gate_one, &self.gdi_gate_two]
+            .into_iter()
+            .any(|name| {
+                name.as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(type_id))
+            })
+    }
+
+    /// `type == Rules+0x874 || +0x878`.
+    pub fn stands_on_nod_wall(&self, type_id: &str) -> bool {
+        [&self.nod_gate_one, &self.nod_gate_two]
+            .into_iter()
+            .any(|name| {
+                name.as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(type_id))
+            })
+    }
+}
+
+/// ReadGeneral's BuildingType identity reads (PrismType `0x0067BCE0`, the
+/// gates and WallTower `0x0066F450..0x0066F583`): ReadString128 into a local
+/// buffer; an empty value keeps the current pointer, anything else goes
+/// through BuildingType FindOrAllocate (`0x004653C0`), whose `<none>` and
+/// `none` answer null.
+fn read_building_identity(
+    general: &IniSection,
+    key: &str,
+    current: Option<String>,
+) -> Option<String> {
+    match general.read_name(key, 0x80) {
+        None => current,
+        Some(name) if is_native_none_type_name(name) => None,
+        Some(name) => Some(name.to_ascii_uppercase()),
+    }
+}
+
+/// The `[General]` Prism support keys, read by `RulesClass::ReadGeneral`
+/// (`0x0066D530`) on every rules pass that has a `[General]` section, each
+/// with its current value as the default (`0x0067114F..0x006711B8`). The
+/// beam's `PrismSupportDuration=` (`Rules+0x4A8`) feeds only the support
+/// laser VERA does not draw, and `PrismSupportHeight=` (`Rules+0x4AC`) has no
+/// reader outside the constructor and ReadGeneral.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PrismSupportRules {
+    /// `PrismSupportModifier=` (`Rules+0x49C`), the percent each supporter
+    /// adds to the shot: `ftol(ReadDouble(key, current) x 100)`, so a pass
+    /// with a `[General]` section and no key multiplies it by 100 again.
+    pub modifier: i32,
+    /// `PrismSupportMax=` (`Rules+0x4A0`), the supporters one shot recruits.
+    pub max: i32,
+    /// `PrismSupportDelay=` (`Rules+0x4A4`), a supporter's downtime in frames.
+    pub delay: i32,
+}
+
+impl Default for PrismSupportRules {
+    /// The RulesClass constructor's values (`0x00665CF3`, `0x00665CF9`,
+    /// `0x00665D03`).
+    fn default() -> Self {
+        Self {
+            modifier: 100,
+            max: 8,
+            delay: 100,
+        }
+    }
+}
+
+impl PrismSupportRules {
+    /// One ReadGeneral pass over a `[General]` section. The modifier is
+    /// `fmul qword 100.0` (`0x0067116E`) on the value ReadDouble returns, then
+    /// ftol (`0x007C5F00`), under the game's masked chop control word, which
+    /// also chops ReadDouble's own percent product: a modded `35%` reads 34.
+    pub(crate) fn read_pass(self, general: &crate::rules::ini_parser::IniSection) -> Self {
+        use crate::util::native_x87::{MaskedX87Chop53 as X87, NativeF64Bits};
+        let percent = general.read_double("PrismSupportModifier", f64::from(self.modifier));
+        let modifier = X87::ftol_i32_low_masked(X87::mul(
+            X87::load_f64(NativeF64Bits::from_bits(percent.to_bits())),
+            X87::load_f64(NativeF64Bits::from_bits(100.0_f64.to_bits())),
+        ));
+        Self {
+            modifier,
+            max: general.read_int("PrismSupportMax", self.max),
+            delay: general.read_int("PrismSupportDelay", self.delay),
+        }
+    }
 }
 
 impl Default for GeneralRules {
@@ -1166,14 +1581,32 @@ impl Default for GeneralRules {
             veteran_combat: 1.0,
             veteran_speed: 1.0,
             veteran_rof: 1.0,
+            difficulty_rof: [1.0; 3],
+            difficulty_repair_delay: [DIFFICULTY_REPAIR_DELAY_DEFAULT; 3],
             veteran_armor: 1.0,
+            curley_shuffle: false,
             repair_rate_minutes: 0.016,
             veteran_ratio: VETERAN_RATIO_DEFAULT,
             veteran_cap: VETERAN_CAP_DEFAULT,
-            difficulty_armor: [1.0; 3],
             computer_base_defense_response: 3,
             // Native Rules+0xE48 constructor default; active retail overrides to 3.
             maximum_building_placement_failures: 5,
+            placement_delay: 0.05,
+            ai_alternate_production_credit_cutoff: 1000,
+            ai_restrict_replace_time: 500,
+            team_delays: Vec::new(),
+            total_ai_team_cap: Vec::new(),
+            minimum_ai_defensive_teams: Vec::new(),
+            maximum_ai_defensive_teams: Vec::new(),
+            use_min_defense_rule: true,
+            fill_earliest_team_probability: Vec::new(),
+            dissolve_unfilled_team_delay: 5000,
+            ai_safe_distance: 8,
+            ai_trigger_success_weight_delta: NativeF64Bits::ONE,
+            ai_trigger_failure_weight_delta: NativeF64Bits::from_bits((-1.0_f64).to_bits()),
+            ai_trigger_track_record_coefficient: NativeF64Bits::ONE,
+            harvesters_per_refinery: Vec::new(),
+            ai_minor_super_ready_percent: NativeF32Bits::from_bits(0x3f4c_cccd),
             base_defense_delay_minutes: 0.25,
             suspend_priority: 20,
             suspend_delay_minutes: 2.0,
@@ -1181,8 +1614,11 @@ impl Default for GeneralRules {
             gap_radius: 10,
             reveal_by_height: true,
             tunnel_speed: sim_from_f32(6.0),
-            missile_rot_var: sim_from_f32(1.0),
+            missile_rot_var: 0.25,
+            safety_altitude: 500,
+            line_trail_color_override: [0; 3],
             flight_level: 500,
+            display_cruise_height: 400, // Rules constructor665C3A
             hover_height: 120,
             hover_bob: sim_from_f32(0.04),
             hover_boost: sim_from_f32(1.5),
@@ -1191,9 +1627,7 @@ impl Default for GeneralRules {
             hover_dampen: sim_from_f32(0.4),
             parachute_max_fall_rate: -3,
             paradrop_radius: 1024,
-            paradrop_aircraft_type: "PDPLANE".to_string(),
             parachute_shp: None,
-            parachute_render: None,
             amer_paradrop_list: vec![("E1".to_string(), 8)],
             ally_paradrop_list: vec![("E1".to_string(), 6)],
             sov_paradrop_list: vec![("E2".to_string(), 9)],
@@ -1203,6 +1637,8 @@ impl Default for GeneralRules {
             pad_aircraft_types: Vec::new(),
             separate_aircraft: false,
             prism_type: None,
+            prism_support: PrismSupportRules::default(),
+            building_types: GeneralBuildingTypes::default(),
             tiberium_grows: true,
             tiberium_spreads: true,
             growth_rate_minutes: 2.0,
@@ -1247,27 +1683,17 @@ impl Default for GeneralRules {
             default_mirage_disguises: Vec::new(),
             infantry_blink_disguise_time: 0,
             tree_targeting: false,
+            tree_strength: 25,
             condition_yellow: 0.5,
-            condition_yellow_x1000: 500,
-            condition_red: 0.25,
-            condition_red_x1000: 250,
+            condition_red: 0.5,
             cloaking_stages: 9,
             cloak_delay_frames: 18,
             cloak_sound: None,
             upgrade_veteran_sound: None,
             upgrade_elite_sound: None,
+            slaves_free_sound: None,
             elite_flash_timer: 0,
-            idle_action_frequency_x1000: STOCK_IDLE_ACTION_FREQUENCY_X1000,
-            damage_fire_ordinary_ratio: DamageFireHealthRatio {
-                numerator: 1,
-                denominator: 2,
-            },
-            damage_fire_occupied_ratio: DamageFireHealthRatio {
-                numerator: 1,
-                denominator: 4,
-            },
-            condition_yellow_native: 0.5,
-            condition_red_native: 0.25,
+            idle_action_frequency: f64::from_bits(0x3fb5_3f7c_ed91_6873),
             condition_red_sparking_probability: 0.02,
             condition_yellow_sparking_probability: 0.01,
             condition_red_spark_threshold: damage_spark_spawn_threshold(0.02),
@@ -1282,8 +1708,10 @@ impl Default for GeneralRules {
             target_special_threat_coefficient_default: 200.0,
             target_strength_coefficient_default: -200.0,
             target_distance_coefficient_default: -10.0,
+            enemy_house_threat_bonus: 0.0,
             threat_per_occupant: 5,
             normal_targeting_delay: 27,
+            dead_bodies: Vec::new(),
             guard_area_targeting_delay: 36,
             building_garrisoned_sound: None,
             sell_sound: None,
@@ -1303,11 +1731,14 @@ impl Default for GeneralRules {
             chute_sound: None,
             gui_main_button_sound: None,
             gui_move_in_sound: None,
+            gui_move_out_sound: None,
             generic_click_sound: None,
+            scold_sound: None,
             generic_beep_sound: None,
             gui_checkbox_sound: None,
             ore_twinkle: None,
             ore_twinkle_chance: 50,
+            gui_build_sound: None,
             gui_tab_sound: None,
             incoming_message_sound: None,
             message_delay_minutes: 0.6,
@@ -1320,20 +1751,28 @@ impl Default for GeneralRules {
             fallback_coefficient: SimFixed::lit("0.1"),
             chrono_in_sound: Some("ChronoMinerTeleport".to_string()),
             chrono_out_sound: Some("ChronoMinerTeleport".to_string()),
+            impact_water_sound: None,
+            impact_land_sound: None,
+            sinking_sound: None,
+            bomb_ticking_sound: None,
+            bomb_attach_sound: None,
             damage_delay_minutes: 1.0,
             spy_power_blackout_frames: 1000,
             damage_fire_types: vec![],
             barrel_particle: None,
-            tiberium_short_scan: 6,
-            tiberium_long_scan: 48,
-            slave_miner_short_scan: 8,
-            slave_miner_slave_scan: 14,
+            tiberium_short_scan: 0x600,
+            tiberium_long_scan: 0x2000,
+            buildup_time: f64::from_bits(0x3FA9_9999_9999_999A),
+            slave_miner_short_scan: 0x500,
+            slave_miner_slave_scan: 0x1000,
             drain_money_frame_delay: 30,
             drain_money_amount: 30,
-            slave_miner_long_scan: 48,
-            slave_miner_scan_correction: 3,
-            slave_miner_kick_frame_delay: 150,
+            slave_miner_long_scan: 0x5000,
+            slave_miner_scan_correction: 0x300,
+            slave_miner_kick_frame_delay: 0x7FFF_FFFF,
+            maximum_queued_objects: 5,
             harvester_too_far_distance: 5,
+            approach_target_reset_multiplier: 1,
             chrono_harv_too_far_distance: 50,
             harvester_load_rate: 2,
             harvester_dump_frames: 15,
@@ -1348,37 +1787,53 @@ impl Default for GeneralRules {
             allied_survivor_divisor: 500,
             soviet_survivor_divisor: 250,
             third_survivor_divisor: 750,
-            // Vanilla rulesmd.ini [General]: 1.0 uphill (no change) / 1.2 downhill (faster),
-            // same for tracked and wheeled. Mods can override via [General].
-            tracked_uphill: SimFixed::lit("1.0"),
-            tracked_downhill: SimFixed::lit("1.2"),
-            wheeled_uphill: SimFixed::lit("1.0"),
-            wheeled_downhill: SimFixed::lit("1.2"),
+            allied_crew: None,
+            soviet_crew: None,
+            third_crew: None,
+            technician: None,
+            engineer_infantry: None,
+            crew_escape: crate::util::native_x87::NativeF64Bits::from_bits(0x3fe0_0000_0000_0000),
+            refund_percent: crate::util::native_x87::NativeF64Bits::from_bits(
+                0x3fe0_0000_0000_0000,
+            ),
+            ship_sinking_weight: SimFixed::lit("3.0"),
+            // RulesClass constructor 0x6660BE..0x6660ED.
+            tracked_uphill: SIM_ONE,
+            tracked_downhill: SIM_ONE,
+            wheeled_uphill: SIM_ONE,
+            wheeled_downhill: SIM_ONE,
             extra_unit_light: 0,
             extra_infantry_light: 0,
             extra_aircraft_light: 0,
-            // CloseEnough=2.25 cells in vanilla rulesmd.ini → 576 leptons.
-            close_enough: SimFixed::from_num(576),
+            // RulesClass constructor 0x00667588.
+            close_enough: 0x280,
+            stray: 0x200,
+            relaxed_stray: 0x200,
+            guard_mode_stray: 0,
             // URepairRate=.016 min = 0.96 sec ≈ 14 ticks at 15 Hz.
-            unit_repair_rate_ticks: 14,
+            unit_repair_rate_ticks: minutes_to_ticks(U_REPAIR_RATE_MINUTES),
             repair_step: 5,
-            repair_percent: 25,
+            repair_percent: 0.25,
             // ReloadRate=.3 min = 18 sec = 270 ticks at 15 Hz.
-            reload_rate_ticks: 270,
+            reload_rate_ticks: minutes_to_ticks(RELOAD_RATE_MINUTES),
             // PathDelay=.01 min = 0.6 sec = 9 ticks at 15 Hz.
-            path_delay_ticks: 9,
+            path_delay: 0.016,
             // BlockagePathDelay=60 frames (directly in frames, not minutes).
             blockage_path_delay_ticks: 60,
+            ai_auto_deploy_frame_delay: Vec::new(),
+            ai_force_prediction_fudge: Vec::new(),
+            ai_pick_wall_defense_percent: Vec::new(),
             // RulesClass constructor clears PlayerScatter and stores 3 into
             // [IQ] Scatter; stock rulesmd overrides the latter with 2.
             player_scatter: false,
+            player_return_fire: false,
             iq_scatter: 3,
             max_iq_levels: 5,
             iq_production: 5,
+            iq_harvester: 3,
             iq_repair_sell: 3,
             iq_sell_back: 2,
             credit_reserve: 1000,
-            concrete_walls: Vec::new(),
             cliff_back_impassability: 2,
             lightning_storm_duration: 180,
             lightning_damage: 250,
@@ -1387,12 +1842,15 @@ impl Default for GeneralRules {
             lightning_scatter_delay: 5,
             lightning_cell_spread: 10,
             lightning_separation: 3,
-            lightning_warhead: "IonWH".to_string(),
+            lightning_warhead: String::new(),
+            weather_con_bolt_explosion: String::new(),
+            weapon_nullify_anim: String::new(),
             ambient_change_rate_nonzero: true,
             ambient_change_interval_frames: 180,
             ambient_change_step: 20,
             iron_curtain_duration: 750,
             iron_curtain_invoke_anim: "IRONBLST".to_string(),
+            ion_blast_anim: String::new(),
             force_shield_radius: 4,
             force_shield_duration: 500,
             force_shield_blackout_duration: 1000,
@@ -1402,14 +1860,7 @@ impl Default for GeneralRules {
             mutate_warhead: "Mutate".to_string(),
             mutate_explosion_warhead: "MutateExplosion".to_string(),
             mutate_explosion: true,
-            metallic_debris: vec![
-                "DBRIS1LG", "DBRIS2LG", "DBRIS3LG", "DBRIS4LG", "DBRIS5LG", "DBRIS6LG", "DBRIS7LG",
-                "DBRIS8LG", "DBRIS9LG", "DBRS10LG", "DBRIS1SM", "DBRIS2SM", "DBRIS3SM", "DBRIS4SM",
-                "DBRIS5SM", "DBRIS6SM", "DBRIS7SM", "DBRIS8SM", "DBRIS9SM", "DBRS10SM",
-            ]
-            .into_iter()
-            .map(|s| s.to_string())
-            .collect(),
+            metallic_debris: Vec::new(),
         }
     }
 }
@@ -1418,57 +1869,76 @@ impl Default for GeneralRules {
 /// These global multipliers govern how garrisoned infantry fire from buildings.
 #[derive(Debug, Clone)]
 pub struct GarrisonRules {
-    /// Damage multiplier applied to garrison fire.
-    pub occupy_damage_multiplier: SimFixed,
-    /// ROF divisor for garrison fire -- higher = faster.
-    pub occupy_rof_multiplier: SimFixed,
+    /// Damage multiplier applied to garrison fire: the f32 at `Rules+0xF40`
+    /// that FireAt multiplies on the x87 (`0x006FE3F1`).
+    pub occupy_damage_multiplier: f32,
+    /// `[CombatDamage] OccupyROFMultiplier=`, the single at `Rules+0xF44`
+    /// (ReadDouble stored with `FSTP dword`, `0x0066C6A9..0x0066C6B4`;
+    /// constructor 1.0f, `0x00666AB6`). GetROF divides a garrison's reload by
+    /// it on the x87 when it is greater than zero (`0x006FD19C`).
+    pub occupy_rof_multiplier: f32,
     /// Fixed weapon range in cells for garrisoned fire, replaces weapon's own range.
     pub occupy_weapon_range: i32,
     /// Damage multiplier for bunker passengers.
     pub bunker_damage_multiplier: f32,
-    /// ROF divisor for bunker passengers.
+    /// `[CombatDamage] BunkerROFMultiplier=`, the single at `Rules+0xF50`
+    /// (`0x0066C712..0x0066C71D`; constructor 1.0f, `0x00666ACD`). GetROF
+    /// divides a bunkered unit's reload by it when it is non-zero
+    /// (`0x006FD1B1..0x006FD1EF`).
     pub bunker_rof_multiplier: f32,
     /// Range bonus in cells for bunker passengers.
     pub bunker_weapon_range_bonus: i32,
-    /// Damage multiplier for open-topped passengers.
+    /// `[CombatDamage] OpenToppedDamageMultiplier=`, the single at
+    /// `Rules+0xF58` (constructor 1.0f `0x00666AD9`; ReadDouble stored with
+    /// `FSTP dword` at `0x0066C743..`). FireAt multiplies an open-topped
+    /// passenger's damage by it (`0x006FE43B`).
     pub open_topped_damage_multiplier: f32,
-    /// Range bonus in cells for open-topped passengers.
+    /// `[CombatDamage] OpenToppedRangeBonus=` in cells, `Rules+0xF5C`
+    /// (constructor 2, `0x00666AD9..`; ReadInt at `0x0066C743..0x0066C7AC`).
+    /// InRange adds it, shifted to leptons, for an open-topped passenger
+    /// (`0x006F72C8`).
     pub open_topped_range_bonus: i32,
 }
 
 impl Default for GarrisonRules {
     fn default() -> Self {
         Self {
-            occupy_damage_multiplier: SimFixed::ONE,
-            occupy_rof_multiplier: SimFixed::ONE,
+            occupy_damage_multiplier: 1.0,
+            occupy_rof_multiplier: 1.0,
             occupy_weapon_range: 5,
             bunker_damage_multiplier: 1.0,
             bunker_rof_multiplier: 1.0,
             bunker_weapon_range_bonus: 0,
             open_topped_damage_multiplier: 1.0,
-            open_topped_range_bonus: 0,
+            open_topped_range_bonus: 2,
         }
     }
 }
 
 impl GarrisonRules {
     fn from_ini(ini: &IniFile) -> Self {
-        let section = ini.section("CombatDamage");
-        let get_f32 = |key: &str, default: f32| -> f32 {
-            section.and_then(|s| s.get_f32(key)).unwrap_or(default)
-        };
-        let get_i32 = |key: &str, default: i32| -> i32 {
-            section.and_then(|s| s.get_i32(key)).unwrap_or(default)
-        };
+        // The multipliers are float fields (`FSTP dword` after each ReadDouble,
+        // `0x0066C68A..0x0066C75C`).
+        let section = ini.section_or_empty("CombatDamage");
+        let d = Self::default();
         Self {
-            occupy_damage_multiplier: sim_from_f32(get_f32("OccupyDamageMultiplier", 1.0)),
-            occupy_rof_multiplier: sim_from_f32(get_f32("OccupyROFMultiplier", 1.0)),
-            occupy_weapon_range: get_i32("OccupyWeaponRange", 5),
-            bunker_damage_multiplier: get_f32("BunkerDamageMultiplier", 1.0),
-            bunker_rof_multiplier: get_f32("BunkerROFMultiplier", 1.0),
-            bunker_weapon_range_bonus: get_i32("BunkerWeaponRangeBonus", 0),
-            open_topped_damage_multiplier: get_f32("OpenToppedDamageMultiplier", 1.0),
-            open_topped_range_bonus: get_i32("OpenToppedRangeBonus", 0),
+            occupy_damage_multiplier: section
+                .read_float("OccupyDamageMultiplier", d.occupy_damage_multiplier),
+            occupy_rof_multiplier: section
+                .read_float("OccupyROFMultiplier", d.occupy_rof_multiplier),
+            occupy_weapon_range: section.read_int("OccupyWeaponRange", d.occupy_weapon_range),
+            bunker_damage_multiplier: section
+                .read_float("BunkerDamageMultiplier", d.bunker_damage_multiplier),
+            bunker_rof_multiplier: section
+                .read_float("BunkerROFMultiplier", d.bunker_rof_multiplier),
+            bunker_weapon_range_bonus: section
+                .read_int("BunkerWeaponRangeBonus", d.bunker_weapon_range_bonus),
+            open_topped_damage_multiplier: section.read_float(
+                "OpenToppedDamageMultiplier",
+                d.open_topped_damage_multiplier,
+            ),
+            open_topped_range_bonus: section
+                .read_int("OpenToppedRangeBonus", d.open_topped_range_bonus),
         }
     }
 }
@@ -1476,8 +1946,8 @@ impl GarrisonRules {
 /// Bridge damage/destruction rules parsed from `rules(md).ini`.
 #[derive(Debug, Clone)]
 pub struct BridgeRules {
-    /// Hit points shared by a destroyable bridge span.
-    pub strength: u16,
+    /// Signed upper bound of the per-hit bridge damage admission draw.
+    pub strength: i32,
     /// Reset/default value for `SpecialFlags::DestroyableBridges`.
     ///
     /// `[CombatDamage] DestroyableBridges=` exists in retail INI text but is
@@ -1501,7 +1971,7 @@ pub struct BridgeRules {
 impl Default for BridgeRules {
     fn default() -> Self {
         Self {
-            strength: 1500,
+            strength: 1000,
             destroyable_by_default: true,
             explosions: Vec::new(),
             voxel_max: 3,
@@ -1512,27 +1982,22 @@ impl Default for BridgeRules {
 
 impl BridgeRules {
     fn from_ini(ini: &IniFile) -> Self {
+        // Rules ctor6675DA sets1000; ReadCombatDamage66CD66..66CD86 retains
+        // the current signed dword as ReadInteger's default, with no clamp.
         let strength = ini
             .section("CombatDamage")
-            .and_then(|section| section.get_i32("BridgeStrength"))
-            .unwrap_or(1500)
-            .max(1) as u16;
+            .map_or(1000, |section| section.read_int("BridgeStrength", 1000));
         let destroyable_by_default = true;
-        let explosions = ini
-            .section("General")
-            .and_then(|section| section.get_list("BridgeExplosions"))
-            .map(|list| list.into_iter().map(|s| s.to_uppercase()).collect())
-            .unwrap_or_default();
+        // Published from the ordered RulesClass reader by from_processed_rules.
+        let explosions = Vec::new();
         let voxel_max = ini
-            .section("General")
-            .and_then(|section| section.get_i32("BridgeVoxelMax"))
-            .unwrap_or(3)
+            .section_or_empty("General")
+            .read_int("BridgeVoxelMax", 3)
             .clamp(0, 255) as u8;
         let repair_sound = ini
-            .section("AudioVisual")
-            .and_then(|section| section.get("RepairBridgeSound"))
-            .map(|s| s.trim().to_uppercase())
-            .filter(|s| !s.is_empty());
+            .section_or_empty("AudioVisual")
+            .read_name("RepairBridgeSound", 0x80)
+            .map(str::to_uppercase);
         Self {
             strength,
             destroyable_by_default,
@@ -1599,41 +2064,30 @@ impl RadiationRules {
         let Some(section) = ini.section("Radiation") else {
             return d;
         };
-        let get_i32 = |key: &str, default: i32| -> i32 { section.get_i32(key).unwrap_or(default) };
+        let [red, green, blue] =
+            section.read_color_rgb("RadColor", [d.color.0, d.color.1, d.color.2]);
         Self {
-            duration_multiple: get_i32("RadDurationMultiple", d.duration_multiple),
+            duration_multiple: section.read_int("RadDurationMultiple", d.duration_multiple),
             // Delays are used as divisors/modulo periods — clamp to >= 1 so a
             // degenerate INI value cannot divide by zero.
-            application_delay: get_i32("RadApplicationDelay", d.application_delay).max(1),
-            level_max: get_i32("RadLevelMax", d.level_max),
-            level_delay: get_i32("RadLevelDelay", d.level_delay).max(1),
-            light_delay: get_i32("RadLightDelay", d.light_delay).max(1),
-            level_factor: section
-                .get("RadLevelFactor")
-                .and_then(|s| s.trim().parse::<f64>().ok())
-                .unwrap_or(d.level_factor),
-            light_factor: section
-                .get_f32("RadLightFactor")
-                .map(sim_from_f32)
-                .unwrap_or(d.light_factor),
-            tint_factor: section
-                .get_f32("RadTintFactor")
-                .map(sim_from_f32)
-                .unwrap_or(d.tint_factor),
-            color: section
-                .get("RadColor")
-                .and_then(|s| {
-                    let mut it = s.split(',').map(|p| p.trim().parse::<u8>());
-                    match (it.next(), it.next(), it.next()) {
-                        (Some(Ok(r)), Some(Ok(g)), Some(Ok(b))) => Some((r, g, b)),
-                        _ => None,
-                    }
-                })
-                .unwrap_or(d.color),
+            application_delay: section
+                .read_int("RadApplicationDelay", d.application_delay)
+                .max(1),
+            level_max: section.read_int("RadLevelMax", d.level_max),
+            level_delay: section.read_int("RadLevelDelay", d.level_delay).max(1),
+            light_delay: section.read_int("RadLightDelay", d.light_delay).max(1),
+            // Double fields (`0x0066D057..0x0066D0A5`).
+            level_factor: section.read_double("RadLevelFactor", d.level_factor),
+            light_factor: sim_from_f32(
+                section.read_double("RadLightFactor", d.light_factor.to_num()) as f32,
+            ),
+            tint_factor: sim_from_f32(
+                section.read_double("RadTintFactor", d.tint_factor.to_num()) as f32
+            ),
+            color: (red, green, blue),
             site_warhead: section
-                .get("RadSiteWarhead")
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
+                .read_name("RadSiteWarhead", 0x80)
+                .map(str::to_owned)
                 .unwrap_or(d.site_warhead),
         }
     }
@@ -1649,6 +2103,21 @@ const VETERAN_RATIO_DEFAULT: f64 = 3.0;
 const VETERAN_CAP_DEFAULT: f64 = 2.0;
 
 impl GeneralRules {
+    /// Drive4B3A65, Ship6A30B4 and Foot/Walk's timer producers retain the
+    /// configured double until FLD/FMUL900/ftol7C5F00. In particular, authored
+    /// decimal .01 is parsed through float by ReadDouble5283D0 and converts to
+    /// 8, while 1% converts to9. No clamp, round-to-nearest or u16 narrowing.
+    pub fn path_delay_ticks(&self) -> i32 {
+        native_minutes_to_frames(self.path_delay)
+    }
+
+    /// `ftol(PlacementDelay * 900.0)`, the computer Construction Yard's retry
+    /// wait (`BuildingClass::Factory_AI @ 0x004501DB..0x004501F3`). Retail .05
+    /// gives 45.
+    pub fn placement_delay_frames(&self) -> i32 {
+        native_minutes_to_frames(self.placement_delay)
+    }
+
     pub fn infantry_death_anim(&self, inf_death: u8) -> Option<&str> {
         self.infantry_death_anims
             .get(usize::from(inf_death))
@@ -1657,41 +2126,66 @@ impl GeneralRules {
 
     fn from_ini(ini: &IniFile) -> Self {
         let defaults = Self::default();
+        // Separate ReadJumpjetControls674467..67447E, no General gate.
+        let display_cruise_height = ini
+            .section("JumpjetControls")
+            .map_or(defaults.display_cruise_height, |s| {
+                s.read_int("CruiseHeight", defaults.display_cruise_height)
+            });
+        // AI IQ thresholds live in their own [IQ] read.
+        let iq = ini.section_or_empty("IQ");
         // gamemd-derived: `RulesClass__ReadIQ @ 0x00674240` reads signed
         // `[IQ] Production` into `Rules+0x143C` at `0x006742C1`, independently
         // of the `[General]` pass and without clamping the parsed dword.
-        let iq_production = ini
-            .section("IQ")
-            .and_then(|section| section.get_i32("Production"))
-            .unwrap_or(defaults.iq_production);
+        let iq_production = iq.read_int("Production", defaults.iq_production);
+        // `0x00674379..0x00674399`, the same section gate and reader.
+        let iq_harvester = iq.read_int("Harvester", defaults.iq_harvester);
+        // RulesProcess668F56 reaches ReadAudioVisual6691E0 independently of
+        // ReadGeneral.66B34B/66B372 pass AudioVisual to5283D0 and store raw
+        // doubles in Rules+1708/+1700; a missing General section cannot skip them.
+        let audio_visual = ini.section_or_empty("AudioVisual");
+        let condition_yellow_native = audio_visual.read_double("ConditionYellow", 0.5);
+        let condition_red_native = audio_visual.read_double("ConditionRed", defaults.condition_red);
+        // The bomb sounds (Rules+0x20C/+0x210) come from the same pass.
+        let audio_visual_sound = |key: &str| {
+            audio_visual
+                .read_name(key, 0x80)
+                .filter(|name| !name.eq_ignore_ascii_case("none"))
+                .map(str::to_owned)
+        };
+        let bomb_ticking_sound = audio_visual_sound("BombTickingSound");
+        let bomb_attach_sound = audio_visual_sound("BombAttachSound");
+        // Rules ReadAI6739E5..673A31 is independent of ReadGeneral.
+        // Constructor66760E..66761E supplies PathDelay0.016 and blockage60.
+        let ai = ini.section_or_empty("AI");
+        let path_delay = ai.read_double("PathDelay", defaults.path_delay);
+        let blockage_path_delay_ticks =
+            ai.read_int("BlockagePathDelay", defaults.blockage_path_delay_ticks);
         let Some(general) = ini.section("General") else {
             return Self {
                 iq_production,
+                iq_harvester,
+                display_cruise_height,
+                condition_yellow: condition_yellow_native,
+                condition_red: condition_red_native,
+                path_delay,
+                blockage_path_delay_ticks,
+                bomb_ticking_sound,
+                bomb_attach_sound,
                 ..defaults
             };
         };
-        // ConditionYellow/ConditionRed live in [AudioVisual], not [General].
-        let audio_visual = ini.section("AudioVisual");
         // Combat-only globals are read in the late [CombatDamage] pass.
-        let combat_damage = ini.section("CombatDamage");
-        // AI IQ thresholds live in their own [IQ] read.
-        let iq = ini.section("IQ");
+        let combat_damage = ini.section_or_empty("CombatDamage");
         // Base-planning/credit controls live in the independent [AI] read.
-        let ai = ini.section("AI");
         // Genetic Mutator warhead references are read by [SpecialWeapons].
-        let special_weapons = ini.section("SpecialWeapons");
+        let special_weapons = ini.section_or_empty("SpecialWeapons");
         // INI parser already strips everything after `;` (Westwood comment
         // marker), so values like `WarpOut=WARPOUT;WAKE2` are read as
         // `WARPOUT` — matching gamemd's behaviour. Rate is filled in later
         // from art.ini in `resolve_art_rates`.
-        let parse_anim_name = |key: &str, default: &str| -> String {
-            general
-                .get(key)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or(default)
-                .to_string()
-        };
+        let parse_anim_name =
+            |key: &str, default: &str| -> String { general.read_string(key, default, 0x80) };
         let mut infantry_death_anims = defaults.infantry_death_anims.clone();
         for (index, key, fallback) in [
             (3, "InfantryExplode", "S_BANG34"),
@@ -1706,187 +2200,195 @@ impl GeneralRules {
         }
         infantry_death_anims[5] = Some(
             ini.section("Animations")
-                .and_then(|section| section.get_values().get(1).copied())
-                .map(str::trim)
+                .and_then(|section| section.registry_ids().get(1).copied())
                 .filter(|name| !name.is_empty())
                 .unwrap_or("ELECTRO")
                 .to_string(),
         );
-        let condition_yellow_native = audio_visual
-            .map(|s| s.read_double("ConditionYellow", 0.5))
-            .unwrap_or(0.5);
-        let condition_red_native = audio_visual
-            .map(|s| s.read_double("ConditionRed", 0.25))
-            .unwrap_or(0.25);
-        let condition_yellow_f32 = condition_yellow_native as f32;
-        let condition_red_f32 = condition_red_native as f32;
         // [General] damage-Spark spawn probabilities (verified ctor defaults
         // 0.02/0.01; stock INI omits them). Raw doubles, not percentages. Bound
         // before `Self` so each band feeds both its stored value and its derived
         // integer roll threshold (a struct literal can't reference sibling fields).
-        let condition_red_spark_prob: f64 = general
-            .get_f64("ConditionRedSparkingProbability")
-            .unwrap_or(0.02);
-        let condition_yellow_spark_prob: f64 = general
-            .get_f64("ConditionYellowSparkingProbability")
-            .unwrap_or(0.01);
-        let difficulty_armor = ["Difficult", "Normal", "Easy"].map(|section_name| {
-            ini.section(section_name)
-                .and_then(|section| section.get_f64("Armor"))
-                .unwrap_or(1.0)
-        });
+        let condition_red_spark_prob: f64 =
+            general.read_double("ConditionRedSparkingProbability", 0.02);
+        let condition_yellow_spark_prob: f64 =
+            general.read_double("ConditionYellowSparkingProbability", 0.01);
         // These are ReadDouble values (single-precision parse widened to f64)
         // and the consumer's ftol boundary chops toward zero.
         let ambient_change_rate = general.read_double("AmbientChangeRate", 0.2);
         let ambient_change_step = general.read_double("AmbientChangeStep", 0.2);
         Self {
             scroll_multiplier: audio_visual
-                .and_then(|s| s.get_f64("ScrollMultiplier"))
-                .unwrap_or(defaults.scroll_multiplier),
+                .read_double("ScrollMultiplier", defaults.scroll_multiplier),
             savour_delay_minutes: audio_visual
-                .map(|s| s.read_double("SavourDelay", defaults.savour_delay_minutes))
-                .unwrap_or(defaults.savour_delay_minutes),
+                .read_double("SavourDelay", defaults.savour_delay_minutes),
             condition_red_sparking_probability: condition_red_spark_prob,
             condition_yellow_sparking_probability: condition_yellow_spark_prob,
             condition_red_spark_threshold: damage_spark_spawn_threshold(condition_red_spark_prob),
             condition_yellow_spark_threshold: damage_spark_spawn_threshold(
                 condition_yellow_spark_prob,
             ),
-            dumb_my_effectiveness_coefficient: general
-                .get_f64("DumbMyEffectivenessCoefficient")
-                .unwrap_or(defaults.dumb_my_effectiveness_coefficient),
-            dumb_target_effectiveness_coefficient: general
-                .get_f64("DumbTargetEffectivenessCoefficient")
-                .unwrap_or(defaults.dumb_target_effectiveness_coefficient),
-            dumb_target_special_threat_coefficient: general
-                .get_f64("DumbTargetSpecialThreatCoefficient")
-                .unwrap_or(defaults.dumb_target_special_threat_coefficient),
-            dumb_target_strength_coefficient: general
-                .get_f64("DumbTargetStrengthCoefficient")
-                .unwrap_or(defaults.dumb_target_strength_coefficient),
-            dumb_target_distance_coefficient: general
-                .get_f64("DumbTargetDistanceCoefficient")
-                .unwrap_or(defaults.dumb_target_distance_coefficient),
-            my_effectiveness_coefficient_default: general
-                .get_f64("MyEffectivenessCoefficientDefault")
-                .unwrap_or(defaults.my_effectiveness_coefficient_default),
-            target_effectiveness_coefficient_default: general
-                .get_f64("TargetEffectivenessCoefficientDefault")
-                .unwrap_or(defaults.target_effectiveness_coefficient_default),
-            target_special_threat_coefficient_default: general
-                .get_f64("TargetSpecialThreatCoefficientDefault")
-                .unwrap_or(defaults.target_special_threat_coefficient_default),
-            target_strength_coefficient_default: general
-                .get_f64("TargetStrengthCoefficientDefault")
-                .unwrap_or(defaults.target_strength_coefficient_default),
-            target_distance_coefficient_default: general
-                .get_f64("TargetDistanceCoefficientDefault")
-                .unwrap_or(defaults.target_distance_coefficient_default),
+            dumb_my_effectiveness_coefficient: general.read_double(
+                "DumbMyEffectivenessCoefficient",
+                defaults.dumb_my_effectiveness_coefficient,
+            ),
+            dumb_target_effectiveness_coefficient: general.read_double(
+                "DumbTargetEffectivenessCoefficient",
+                defaults.dumb_target_effectiveness_coefficient,
+            ),
+            dumb_target_special_threat_coefficient: general.read_double(
+                "DumbTargetSpecialThreatCoefficient",
+                defaults.dumb_target_special_threat_coefficient,
+            ),
+            dumb_target_strength_coefficient: general.read_double(
+                "DumbTargetStrengthCoefficient",
+                defaults.dumb_target_strength_coefficient,
+            ),
+            dumb_target_distance_coefficient: general.read_double(
+                "DumbTargetDistanceCoefficient",
+                defaults.dumb_target_distance_coefficient,
+            ),
+            my_effectiveness_coefficient_default: general.read_double(
+                "MyEffectivenessCoefficientDefault",
+                defaults.my_effectiveness_coefficient_default,
+            ),
+            target_effectiveness_coefficient_default: general.read_double(
+                "TargetEffectivenessCoefficientDefault",
+                defaults.target_effectiveness_coefficient_default,
+            ),
+            target_special_threat_coefficient_default: general.read_double(
+                "TargetSpecialThreatCoefficientDefault",
+                defaults.target_special_threat_coefficient_default,
+            ),
+            target_strength_coefficient_default: general.read_double(
+                "TargetStrengthCoefficientDefault",
+                defaults.target_strength_coefficient_default,
+            ),
+            target_distance_coefficient_default: general.read_double(
+                "TargetDistanceCoefficientDefault",
+                defaults.target_distance_coefficient_default,
+            ),
+            enemy_house_threat_bonus: general
+                .read_double("EnemyHouseThreatBonus", defaults.enemy_house_threat_bonus),
             threat_per_occupant: general
-                .get_i32("ThreatPerOccupant")
-                .unwrap_or(defaults.threat_per_occupant),
+                .read_int("ThreatPerOccupant", defaults.threat_per_occupant),
             // Passive-scan cadence, in frames. Both keys are present in stock
             // rulesmd.ini with exactly the constructor defaults (27 / 36); read
             // them rather than hardcoding so a mod's values take effect.
+            dead_bodies: general
+                .read_list("DeadBodies", 0x80)
+                .map(|tokens| tokens.into_iter().map(str::to_owned).collect())
+                .unwrap_or_default(),
             normal_targeting_delay: general
-                .get_i32("NormalTargetingDelay")
-                .map(|v| v.max(0) as u32)
-                .unwrap_or(defaults.normal_targeting_delay),
-            guard_area_targeting_delay: general
-                .get_i32("GuardAreaTargetingDelay")
-                .map(|v| v.max(0) as u32)
-                .unwrap_or(defaults.guard_area_targeting_delay),
+                .read_int("NormalTargetingDelay", defaults.normal_targeting_delay),
+            guard_area_targeting_delay: general.read_int(
+                "GuardAreaTargetingDelay",
+                defaults.guard_area_targeting_delay,
+            ),
             // Gravity lives in [AudioVisual] (stock value 6). Reading it from
             // [General] silently fell back to the code default 3 — half stock
             // gravity for spark ballistics and the hover bob amplitude.
-            gravity: audio_visual
-                .and_then(|s| s.get_i32("Gravity"))
-                .unwrap_or(defaults.gravity),
-            veteran_sight: general
-                .get_f64("VeteranSight")
-                .unwrap_or(defaults.veteran_sight),
-            veteran_combat: general
-                .get_f64("VeteranCombat")
-                .unwrap_or(defaults.veteran_combat),
-            veteran_speed: general
-                .get_f64("VeteranSpeed")
-                .unwrap_or(defaults.veteran_speed),
-            veteran_rof: general
-                .get_f64("VeteranROF")
-                .unwrap_or(defaults.veteran_rof),
-            veteran_armor: general.get_f64("VeteranArmor").unwrap_or(1.0),
-            repair_rate_minutes: general
-                .get_f64("RepairRate")
-                .unwrap_or(defaults.repair_rate_minutes),
-            veteran_ratio: general
-                .get_f64("VeteranRatio")
-                .unwrap_or(VETERAN_RATIO_DEFAULT),
-            veteran_cap: general.get_f64("VeteranCap").unwrap_or(VETERAN_CAP_DEFAULT),
-            difficulty_armor,
-            computer_base_defense_response: general
-                .get_i32("ComputerBaseDefenseResponse")
-                .unwrap_or(defaults.computer_base_defense_response),
+            gravity: audio_visual.read_int("Gravity", defaults.gravity),
+            veteran_sight: general.read_double("VeteranSight", defaults.veteran_sight),
+            veteran_combat: general.read_double("VeteranCombat", defaults.veteran_combat),
+            veteran_speed: general.read_double("VeteranSpeed", defaults.veteran_speed),
+            veteran_rof: general.read_double("VeteranROF", defaults.veteran_rof),
+            difficulty_rof: ["Easy", "Normal", "Difficult"].map(|name| {
+                ini.section(name)
+                    .map_or(1.0, |section| section.read_double("ROF", 1.0))
+            }),
+            difficulty_repair_delay: ["Easy", "Normal", "Difficult"].map(|name| {
+                ini.section(name)
+                    .map_or(DIFFICULTY_REPAIR_DELAY_DEFAULT, |section| {
+                        section.read_double("RepairDelay", DIFFICULTY_REPAIR_DELAY_DEFAULT)
+                    })
+            }),
+            veteran_armor: general.read_double("VeteranArmor", 1.0),
+            curley_shuffle: general.read_bool("CurleyShuffle", defaults.curley_shuffle),
+            repair_rate_minutes: general.read_double("RepairRate", defaults.repair_rate_minutes),
+            veteran_ratio: general.read_double("VeteranRatio", VETERAN_RATIO_DEFAULT),
+            veteran_cap: general.read_double("VeteranCap", VETERAN_CAP_DEFAULT),
+            computer_base_defense_response: ai.read_int(
+                "ComputerBaseDefenseResponse",
+                defaults.computer_base_defense_response,
+            ),
             // Signed [General] binding for native Rules+0xE48. The verified
             // report establishes default 5 and active-retail override 3.
-            maximum_building_placement_failures: general
-                .get_i32("MaximumBuildingPlacementFailures")
-                .unwrap_or(defaults.maximum_building_placement_failures),
+            maximum_building_placement_failures: general.read_int(
+                "MaximumBuildingPlacementFailures",
+                defaults.maximum_building_placement_failures,
+            ),
+            placement_delay: general.read_double("PlacementDelay", defaults.placement_delay),
+            ai_alternate_production_credit_cutoff: general.read_int(
+                "AIAlternateProductionCreditCutoff",
+                defaults.ai_alternate_production_credit_cutoff,
+            ),
+            ai_restrict_replace_time: general
+                .read_int("AIRestrictReplaceTime", defaults.ai_restrict_replace_time),
+            team_delays: general.read_int_list("TeamDelays").unwrap_or_default(),
+            total_ai_team_cap: general.read_int_list("TotalAITeamCap").unwrap_or_default(),
+            minimum_ai_defensive_teams: general
+                .read_int_list("MinimumAIDefensiveTeams")
+                .unwrap_or_default(),
+            maximum_ai_defensive_teams: general
+                .read_int_list("MaximumAIDefensiveTeams")
+                .unwrap_or_default(),
+            use_min_defense_rule: general
+                .read_bool("UseMinDefenseRule", defaults.use_min_defense_rule),
+            fill_earliest_team_probability: general
+                .read_int_list("FillEarliestTeamProbability")
+                .unwrap_or_default(),
+            dissolve_unfilled_team_delay: general.read_int(
+                "DissolveUnfilledTeamDelay",
+                defaults.dissolve_unfilled_team_delay,
+            ),
+            ai_safe_distance: general.read_int("AISafeDistance", defaults.ai_safe_distance),
+            ai_trigger_success_weight_delta: general.read_double_bits(
+                "AITriggerSuccessWeightDelta",
+                defaults.ai_trigger_success_weight_delta,
+            ),
+            ai_trigger_failure_weight_delta: general.read_double_bits(
+                "AITriggerFailureWeightDelta",
+                defaults.ai_trigger_failure_weight_delta,
+            ),
+            ai_trigger_track_record_coefficient: general.read_double_bits(
+                "AITriggerTrackRecordCoefficient",
+                defaults.ai_trigger_track_record_coefficient,
+            ),
+            harvesters_per_refinery: general
+                .read_int_list("HarvestersPerRefinery")
+                .unwrap_or_default(),
+            ai_minor_super_ready_percent: general.read_double_to_float(
+                "AIMinorSuperReadyPercent",
+                defaults.ai_minor_super_ready_percent,
+            ),
             base_defense_delay_minutes: general
                 .read_double("BaseDefenseDelay", defaults.base_defense_delay_minutes),
-            suspend_priority: general
-                .get_i32("SuspendPriority")
-                .unwrap_or(defaults.suspend_priority),
+            suspend_priority: general.read_int("SuspendPriority", defaults.suspend_priority),
             suspend_delay_minutes: general
                 .read_double("SuspendDelay", defaults.suspend_delay_minutes),
-            leptons_per_sight_increase: general.get_i32("LeptonsPerSightIncrease").unwrap_or(0),
-            gap_radius: general.get_i32("GapRadius").unwrap_or(10),
-            reveal_by_height: general.get_bool("RevealByHeight").unwrap_or(true),
-            tunnel_speed: general
-                .get_f32("TunnelSpeed")
-                .map(sim_from_f32)
-                .unwrap_or(sim_from_f32(6.0)),
-            missile_rot_var: general
-                .get_f32("MissileROTVar")
-                .map(sim_from_f32)
-                .unwrap_or(sim_from_f32(1.0)),
-            flight_level: general.get_i32("FlightLevel").unwrap_or(500),
-            // Hover keys. gamemd reads these with the %-aware Get_Double (150% → 1.5),
-            // which `get_percent` matches (it also passes bare floats like `.02` through).
+            leptons_per_sight_increase: general.read_int("LeptonsPerSightIncrease", 0),
+            gap_radius: general.read_int("GapRadius", 10),
+            reveal_by_height: general.read_bool("RevealByHeight", true),
+            tunnel_speed: sim_from_f32(general.read_double("TunnelSpeed", 6.0) as f32),
+            missile_rot_var: general.read_double("MissileROTVar", defaults.missile_rot_var),
+            safety_altitude: general.read_int("MissileSafetyAltitude", defaults.safety_altitude),
+            line_trail_color_override: audio_visual
+                .read_color_rgb("LineTrailColorOverride", defaults.line_trail_color_override),
+            flight_level: general.read_int("FlightLevel", 500),
+            display_cruise_height,
+            // Hover keys: %-aware ReadDouble (150% → 1.5) into double fields.
             // The three time keys (bob/accel/brake) are in MINUTES; ×900 = ticks.
-            hover_height: general.get_i32("HoverHeight").unwrap_or(120),
-            hover_bob: general
-                .get_percent("HoverBob")
-                .map(sim_from_f32)
-                .unwrap_or(sim_from_f32(0.04)),
-            hover_boost: general
-                .get_percent("HoverBoost")
-                .map(sim_from_f32)
-                .unwrap_or(sim_from_f32(1.5)),
-            hover_acceleration: general
-                .get_percent("HoverAcceleration")
-                .map(sim_from_f32)
-                .unwrap_or(sim_from_f32(0.02)),
-            hover_brake: general
-                .get_percent("HoverBrake")
-                .map(sim_from_f32)
-                .unwrap_or(sim_from_f32(0.03)),
-            hover_dampen: general
-                .get_percent("HoverDampen")
-                .map(sim_from_f32)
-                .unwrap_or(sim_from_f32(0.4)),
-            parachute_max_fall_rate: general.get_i32("ParachuteMaxFallRate").unwrap_or(-3),
-            paradrop_radius: general.get_i32("ParadropRadius").unwrap_or(1024),
-            paradrop_aircraft_type: general
-                .get("ParaDropPlane")
-                .map(|s| s.trim().to_uppercase())
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "PDPLANE".to_string()),
-            parachute_shp: general
-                .get("Parachute")
-                .map(|s| s.trim().to_uppercase())
-                .filter(|s| !s.is_empty()),
+            hover_height: general.read_int("HoverHeight", 120),
+            hover_bob: sim_from_f32(general.read_double("HoverBob", 0.04) as f32),
+            hover_boost: sim_from_f32(general.read_double("HoverBoost", 1.5) as f32),
+            hover_acceleration: sim_from_f32(general.read_double("HoverAcceleration", 0.02) as f32),
+            hover_brake: sim_from_f32(general.read_double("HoverBrake", 0.03) as f32),
+            hover_dampen: sim_from_f32(general.read_double("HoverDampen", 0.4) as f32),
+            parachute_max_fall_rate: general.read_int("ParachuteMaxFallRate", -3),
+            paradrop_radius: general.read_int("ParadropRadius", 1024),
+            parachute_shp: general.read_name("Parachute", 0x80).map(str::to_uppercase),
             // Resolved later in `resolve_art_rates` once art.ini is available.
-            parachute_render: None,
             amer_paradrop_list: parse_paradrop_list(
                 general,
                 "AmerParaDropInf",
@@ -1916,66 +2418,47 @@ impl GeneralRules {
                 vec![("INIT".to_string(), 6)],
             ),
             base_unit_types: general
-                .get_list("BaseUnit")
-                .map(|items| {
-                    items
-                        .into_iter()
-                        .map(|s| s.trim().to_ascii_uppercase())
-                        .filter(|s| !s.is_empty())
-                        .collect()
-                })
+                .read_list("BaseUnit", 0x80)
+                .map(|tokens| tokens.into_iter().map(str::to_ascii_uppercase).collect())
                 .unwrap_or_else(|| defaults.base_unit_types),
             multiplayer_ai_cm: general
-                .get_list("MultiplayerAICM")
-                .map(|items| {
-                    items
-                        .into_iter()
-                        .filter_map(crate::rules::ini_value::parse_read_int_value)
-                        .collect()
-                })
+                .read_int_list("MultiplayerAICM")
                 .unwrap_or_else(|| defaults.multiplayer_ai_cm),
             pad_aircraft_types: general
-                .get_list("PadAircraft")
-                .map(|items| {
-                    items
-                        .into_iter()
-                        .map(|item| item.trim().to_ascii_uppercase())
-                        .filter(|item| !item.is_empty())
-                        .collect()
-                })
+                .read_list("PadAircraft", 0x80)
+                .map(|tokens| tokens.into_iter().map(str::to_ascii_uppercase).collect())
                 .unwrap_or_else(|| defaults.pad_aircraft_types),
-            separate_aircraft: general
-                .get_bool("SeparateAircraft")
-                .unwrap_or(defaults.separate_aircraft),
-            // RulesClass reads this BuildingType identity from [General].
-            // BuildingClass::Mission_Attack @ 0x0044ACF0 dispatches it to the
-            // Prism-specific path before considering generic delayed fire.
-            prism_type: general
-                .get("PrismType")
-                .map(|value| value.trim().to_ascii_uppercase())
-                .filter(|value| !value.is_empty()),
-            tiberium_grows: general.get_bool("TiberiumGrows").unwrap_or(true),
-            tiberium_spreads: general.get_bool("TiberiumSpreads").unwrap_or(true),
-            growth_rate_minutes: general.get_f32("GrowthRate").unwrap_or(2.0),
-            attack_cursor_on_disguise: general.get_bool("AttackCursorOnDisguise").unwrap_or(false),
+            separate_aircraft: general.read_bool("SeparateAircraft", defaults.separate_aircraft),
+            // `0x00671144` -> `0x0067BCE0`. The layered reader
+            // (`native_processing`) replaces this projection.
+            prism_type: read_building_identity(general, "PrismType", defaults.prism_type),
+            prism_support: defaults.prism_support.read_pass(general),
+            building_types: GeneralBuildingTypes {
+                gdi_gate_one: read_building_identity(general, "GDIGateOne", None),
+                gdi_gate_two: read_building_identity(general, "GDIGateTwo", None),
+                nod_gate_one: read_building_identity(general, "NodGateOne", None),
+                nod_gate_two: read_building_identity(general, "NodGateTwo", None),
+                wall_tower: read_building_identity(general, "WallTower", None),
+                gdi_power_plant: read_building_identity(general, "GDIPowerPlant", None),
+                nod_regular_power: read_building_identity(general, "NodRegularPower", None),
+                nod_advanced_power: read_building_identity(general, "NodAdvancedPower", None),
+                third_power_plant: read_building_identity(general, "ThirdPowerPlant", None),
+            },
+            tiberium_grows: general.read_bool("TiberiumGrows", true),
+            tiberium_spreads: general.read_bool("TiberiumSpreads", true),
+            growth_rate_minutes: general.read_double("GrowthRate", 2.0) as f32,
+            attack_cursor_on_disguise: general.read_bool("AttackCursorOnDisguise", false),
             default_mirage_disguises: general
-                .get_list("DefaultMirageDisguises")
-                .unwrap_or_default()
-                .into_iter()
-                .map(|value| value.to_ascii_uppercase())
-                .collect(),
-            infantry_blink_disguise_time: general
-                .get_i32("InfantryBlinkDisguiseTime")
-                .unwrap_or(0)
-                .max(0) as u32,
-            tree_targeting: combat_damage
-                .and_then(|section| section.get_bool("TreeTargeting"))
-                .unwrap_or(false),
-            condition_yellow: condition_yellow_f32,
-            condition_yellow_x1000: (condition_yellow_f32 as f64 * 1000.0) as i64,
-            condition_red: condition_red_f32,
-            condition_red_x1000: (condition_red_f32 as f64 * 1000.0) as i64,
-            cloaking_stages: general.get_i32("CloakingStages").unwrap_or(9),
+                .read_list("DefaultMirageDisguises", 0x80)
+                .map(|tokens| tokens.into_iter().map(str::to_ascii_uppercase).collect())
+                .unwrap_or_default(),
+            infantry_blink_disguise_time: general.read_int("InfantryBlinkDisguiseTime", 0).max(0)
+                as u32,
+            tree_targeting: combat_damage.read_bool("TreeTargeting", false),
+            tree_strength: general.read_int("TreeStrength", defaults.tree_strength),
+            condition_yellow: condition_yellow_native,
+            condition_red: condition_red_native,
+            cloaking_stages: general.read_int("CloakingStages", 9),
             cloak_delay_frames: (general.read_double("CloakDelay", 0.02) * 900.0)
                 .trunc()
                 .clamp(i32::MIN as f64, i32::MAX as f64) as i32,
@@ -1983,67 +2466,33 @@ impl GeneralRules {
             // RulesClass+0x6A0. Retain the name at the data boundary; an absent
             // or empty key leaves the native invalid-index/no-play behavior.
             cloak_sound: audio_visual
-                .and_then(|s| s.get("CloakSound"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+                .read_name("CloakSound", 0x80)
+                .map(str::to_owned),
             upgrade_veteran_sound: audio_visual
-                .and_then(|s| s.get("UpgradeVeteranSound"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+                .read_name("UpgradeVeteranSound", 0x80)
+                .map(str::to_owned),
             upgrade_elite_sound: audio_visual
-                .and_then(|s| s.get("UpgradeEliteSound"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
-            elite_flash_timer: audio_visual
-                .and_then(|s| s.get_i32("EliteFlashTimer"))
-                .unwrap_or(defaults.elite_flash_timer),
-            idle_action_frequency_x1000: (audio_visual
-                .map(|s| {
-                    s.read_double(
-                        "IdleActionFrequency",
-                        STOCK_IDLE_ACTION_FREQUENCY_X1000 as f64 / 1000.0,
-                    )
-                })
-                .unwrap_or(STOCK_IDLE_ACTION_FREQUENCY_X1000 as f64 / 1000.0)
-                * 1000.0) as i64,
-            damage_fire_ordinary_ratio: DamageFireHealthRatio {
-                numerator: 1,
-                denominator: 2,
-            },
-            damage_fire_occupied_ratio: DamageFireHealthRatio {
-                numerator: 1,
-                denominator: 4,
-            },
-            condition_yellow_native,
-            condition_red_native,
+                .read_name("UpgradeEliteSound", 0x80)
+                .map(str::to_owned),
+            slaves_free_sound: audio_visual
+                .read_name("SlavesFreeSound", 0x80)
+                .map(str::to_owned),
+            elite_flash_timer: audio_visual.read_int("EliteFlashTimer", defaults.elite_flash_timer),
+            idle_action_frequency: audio_visual
+                .read_double("IdleActionFrequency", defaults.idle_action_frequency),
             building_garrisoned_sound: audio_visual
-                .and_then(|s| s.get("BuildingGarrisonedSound"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
-            sell_sound: audio_visual
-                .and_then(|s| s.get("SellSound"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+                .read_name("BuildingGarrisonedSound", 0x80)
+                .map(str::to_owned),
+            sell_sound: audio_visual.read_name("SellSound", 0x80).map(str::to_owned),
             base_under_attack_sound: audio_visual
-                .and_then(|s| s.get("BaseUnderAttackSound"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+                .read_name("BaseUnderAttackSound", 0x80)
+                .map(str::to_owned),
             building_die_sound: audio_visual
-                .and_then(|s| s.get("BuildingDieSound"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+                .read_name("BuildingDieSound", 0x80)
+                .map(str::to_owned),
             building_damage_sound: audio_visual
-                .and_then(|s| s.get("BuildingDamageSound"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+                .read_name("BuildingDamageSound", 0x80)
+                .map(str::to_owned),
             // `CCINIClass::ReadSoundList @ 0x00525430`: `ReadString(..., "",
             // buf, 0x80)` first (so the whole value is byte-cut and trimmed
             // once), then `strtok` on `","` (`0x00817F70`) with the tokens
@@ -2051,147 +2500,105 @@ impl GeneralRules {
             // (`VocClass::FindPtrByName`, which drops unresolvable names) is
             // deferred to the app layer, where the registry lives.
             lightning_sounds: audio_visual
-                .map(|section| section.read_string("LightningSounds", "", 0x80))
-                .map(|value| {
-                    value
-                        .split(',')
-                        .filter(|token| !token.is_empty())
-                        .map(str::to_string)
-                        .collect()
-                })
+                .read_list("LightningSounds", 0x80)
+                .map(|tokens| tokens.into_iter().map(str::to_owned).collect())
                 .unwrap_or_default(),
             credit_ticks: audio_visual
-                .map(|section| section.read_string("CreditTicks", "", 0x80))
-                .map(|value| {
-                    value
-                        .split(',')
-                        .filter(|token| !token.is_empty())
-                        .map(str::to_string)
-                        .collect()
-                })
+                .read_list("CreditTicks", 0x80)
+                .map(|tokens| tokens.into_iter().map(str::to_owned).collect())
                 .unwrap_or_default(),
             storm_sound: audio_visual
-                .and_then(|s| s.get("StormSound"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+                .read_name("StormSound", 0x80)
+                .map(str::to_owned),
             // `RulesClass::ReadGeneral @ 0x0067107F` passes the field's own
             // current value as the default, so an absent key keeps the
             // constructor's `true` (see the field doc).
-            lightning_print_text: general.get_bool("LightningPrintText").unwrap_or(true),
-            dig_sound: audio_visual
-                .and_then(|s| s.get("DigSound"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+            lightning_print_text: general.read_bool("LightningPrintText", true),
+            dig_sound: audio_visual.read_name("DigSound", 0x80).map(str::to_owned),
             psychic_dominator_activate_sound: audio_visual
-                .and_then(|s| s.get("PsychicDominatorActivateSound"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+                .read_name("PsychicDominatorActivateSound", 0x80)
+                .map(str::to_owned),
             genetic_mutator_activate_sound: audio_visual
-                .and_then(|s| s.get("GeneticMutatorActivateSound"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+                .read_name("GeneticMutatorActivateSound", 0x80)
+                .map(str::to_owned),
             psychic_reveal_activate_sound: audio_visual
-                .and_then(|s| s.get("PsychicRevealActivateSound"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+                .read_name("PsychicRevealActivateSound", 0x80)
+                .map(str::to_owned),
             chute_sound: audio_visual
-                .and_then(|s| s.get("ChuteSound"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+                .read_name("ChuteSound", 0x80)
+                .map(str::to_owned),
             bunker_walls_down_sound: audio_visual
-                .and_then(|s| s.get("BunkerWallsDownSound"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+                .read_name("BunkerWallsDownSound", 0x80)
+                .map(str::to_owned),
             bunker_walls_up_sound: audio_visual
-                .and_then(|s| s.get("BunkerWallsUpSound"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+                .read_name("BunkerWallsUpSound", 0x80)
+                .map(str::to_owned),
             gui_main_button_sound: audio_visual
-                .and_then(|s| s.get("GUIMainButtonSound"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+                .read_name("GUIMainButtonSound", 0x80)
+                .map(str::to_owned),
             gui_move_in_sound: audio_visual
-                .and_then(|s| s.get("GUIMoveInSound"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+                .read_name("GUIMoveInSound", 0x80)
+                .map(str::to_owned),
+            gui_move_out_sound: audio_visual
+                .read_name("GUIMoveOutSound", 0x80)
+                .map(str::to_owned),
             generic_click_sound: audio_visual
-                .and_then(|s| s.get("GenericClick"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+                .read_name("GenericClick", 0x80)
+                .map(str::to_owned),
+            scold_sound: audio_visual
+                .read_name("ScoldSound", 0x80)
+                .map(str::to_owned),
             generic_beep_sound: audio_visual
-                .and_then(|s| s.get("GenericBeep"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+                .read_name("GenericBeep", 0x80)
+                .map(str::to_owned),
             gui_checkbox_sound: audio_visual
-                .and_then(|s| s.get("GUICheckboxSound"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
-            ore_twinkle: {
-                let value = general.read_string("OreTwinkle", "", 0x80);
-                (!value.is_empty()).then_some(value)
-            },
+                .read_name("GUICheckboxSound", 0x80)
+                .map(str::to_owned),
+            ore_twinkle: general.read_name("OreTwinkle", 0x80).map(str::to_owned),
             ore_twinkle_chance: audio_visual
-                .and_then(|s| s.get_i32("OreTwinkleChance"))
-                .unwrap_or(defaults.ore_twinkle_chance),
+                .read_int("OreTwinkleChance", defaults.ore_twinkle_chance),
+            gui_build_sound: audio_visual
+                .read_name("GUIBuildSound", 0x80)
+                .map(str::to_owned),
             gui_tab_sound: audio_visual
-                .and_then(|s| s.get("GUITabSound"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+                .read_name("GUITabSound", 0x80)
+                .map(str::to_owned),
             incoming_message_sound: audio_visual
-                .and_then(|s| s.get("IncomingMessage"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
-            message_delay_minutes: audio_visual
-                .and_then(|s| s.get_f32("MessageDelay"))
-                .unwrap_or(0.6),
-            speak_delay_minutes: audio_visual
-                .and_then(|s| s.get_f64("SpeakDelay"))
-                .unwrap_or(0.0),
+                .read_name("IncomingMessage", 0x80)
+                .map(str::to_owned),
+            message_delay_minutes: audio_visual.read_double("MessageDelay", 0.6) as f32,
+            speak_delay_minutes: audio_visual.read_double("SpeakDelay", 0.0),
             gui_combo_open_sound: audio_visual
-                .and_then(|s| s.get("GUIComboOpenSound"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+                .read_name("GUIComboOpenSound", 0x80)
+                .map(str::to_owned),
             gui_combo_close_sound: audio_visual
-                .and_then(|s| s.get("GUIComboCloseSound"))
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
-            direct_rocking_coefficient: audio_visual
-                .and_then(|s| s.get_f32("DirectRockingCoefficient"))
-                .map(sim_from_f32)
-                .unwrap_or(SimFixed::lit("1.5")),
-            fallback_coefficient: audio_visual
-                .and_then(|s| s.get_f32("FallBackCoefficient"))
-                .map(sim_from_f32)
-                .unwrap_or(SimFixed::lit("0.1")),
+                .read_name("GUIComboCloseSound", 0x80)
+                .map(str::to_owned),
+            // Float fields (`FSTP dword` at `0x0066B8B1`/`0x0066B8DB`).
+            direct_rocking_coefficient: sim_from_f32(
+                audio_visual.read_float("DirectRockingCoefficient", 1.5),
+            ),
+            fallback_coefficient: sim_from_f32(audio_visual.read_float("FallBackCoefficient", 0.1)),
             // ChronoInSound/ChronoOutSound live in [AudioVisual], not [General].
             // No hardcoded fallback: a genuinely-absent key means no fallback
             // sound (silence), matching gamemd. Stock ships these keys present
             // (= ChronoMinerTeleport), so stock audio is unchanged.
             chrono_in_sound: audio_visual
-                .and_then(|s| s.get("ChronoInSound"))
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty()),
+                .read_name("ChronoInSound", 0x80)
+                .map(str::to_owned),
             chrono_out_sound: audio_visual
-                .and_then(|s| s.get("ChronoOutSound"))
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty()),
+                .read_name("ChronoOutSound", 0x80)
+                .map(str::to_owned),
+            impact_water_sound: audio_visual
+                .read_name("ImpactWaterSound", 0x80)
+                .map(str::to_owned),
+            impact_land_sound: audio_visual
+                .read_name("ImpactLandSound", 0x80)
+                .map(str::to_owned),
+            // Constructor -1 until the fixed SOUNDMD catalog resolves it.
+            sinking_sound: None,
+            bomb_ticking_sound,
+            bomb_attach_sound,
             warp_in: AnimRef {
                 name: parse_anim_name("WarpIn", "WARPIN"),
                 frame_delay: defaults.warp_in.frame_delay,
@@ -2217,253 +2624,193 @@ impl GeneralRules {
                 frame_delay: defaults.move_flash.frame_delay,
             },
             infantry_death_anims,
-            damage_delay_minutes: general.get_f32("DamageDelay").unwrap_or(1.0),
-            spy_power_blackout_frames: general.get_i32("SpyPowerBlackout").unwrap_or(1000).max(0)
-                as u32,
+            damage_delay_minutes: general.read_double("DamageDelay", 1.0) as f32,
+            spy_power_blackout_frames: general.read_int("SpyPowerBlackout", 1000).max(0) as u32,
             damage_fire_types: general
-                .get_list("DamageFireTypes")
-                .map(|list| {
-                    list.into_iter()
-                        .filter(|s| !s.is_empty())
-                        .map(|s| AnimRef {
-                            name: s.to_uppercase(),
+                .read_list("DamageFireTypes", 0x80)
+                .map(|tokens| {
+                    tokens
+                        .into_iter()
+                        .map(|name| AnimRef {
+                            name: name.to_uppercase(),
                             frame_delay: DEFAULT_ANIM_FRAME_DELAY,
                         })
                         .collect()
                 })
                 .unwrap_or_default(),
-            barrel_particle: general
-                .get("BarrelParticle")
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty()),
-            tiberium_short_scan: general.get_i32("TiberiumShortScan").unwrap_or(6),
-            tiberium_long_scan: general.get_i32("TiberiumLongScan").unwrap_or(48),
-            slave_miner_short_scan: general.get_i32("SlaveMinerShortScan").unwrap_or(8),
-            slave_miner_slave_scan: general.get_i32("SlaveMinerSlaveScan").unwrap_or(14),
-            drain_money_frame_delay: general.get_i32("DrainMoneyFrameDelay").unwrap_or(30),
-            drain_money_amount: general.get_i32("DrainMoneyAmount").unwrap_or(30),
-            slave_miner_long_scan: general.get_i32("SlaveMinerLongScan").unwrap_or(48),
-            slave_miner_scan_correction: general.get_i32("SlaveMinerScanCorrection").unwrap_or(3),
-            slave_miner_kick_frame_delay: general
-                .get_i32("SlaveMinerKickFrameDelay")
-                .unwrap_or(150)
-                .max(0) as u32,
-            harvester_too_far_distance: general.get_i32("HarvesterTooFarDistance").unwrap_or(5),
-            chrono_harv_too_far_distance: general.get_i32("ChronoHarvTooFarDistance").unwrap_or(50),
-            harvester_load_rate: general.get_i32("HarvesterLoadRate").unwrap_or(2),
+            barrel_particle: general.read_name("BarrelParticle", 0x80).map(str::to_owned),
+            tiberium_short_scan: general.read_range("TiberiumShortScan", 0x600),
+            tiberium_long_scan: general.read_range("TiberiumLongScan", 0x2000),
+            buildup_time: general.read_double("BuildupTime", f64::from_bits(0x3FA9_9999_9999_999A)),
+            slave_miner_short_scan: general.read_range("SlaveMinerShortScan", 0x500),
+            slave_miner_slave_scan: general.read_range("SlaveMinerSlaveScan", 0x1000),
+            drain_money_frame_delay: general.read_int("DrainMoneyFrameDelay", 30),
+            drain_money_amount: general.read_int("DrainMoneyAmount", 30),
+            slave_miner_long_scan: general.read_range("SlaveMinerLongScan", 0x5000),
+            slave_miner_scan_correction: general.read_range("SlaveMinerScanCorrection", 0x300),
+            slave_miner_kick_frame_delay: general.read_int("SlaveMinerKickFrameDelay", 0x7FFF_FFFF),
+            maximum_queued_objects: general.read_int("MaximumQueuedObjects", 5),
+            harvester_too_far_distance: general.read_int("HarvesterTooFarDistance", 5),
+            approach_target_reset_multiplier: general.read_int("ApproachTargetResetMultiplier", 1),
+            chrono_harv_too_far_distance: general.read_int("ChronoHarvTooFarDistance", 50),
+            harvester_load_rate: general.read_int("HarvesterLoadRate", 2),
             harvester_dump_frames: {
                 // gamemd reads HarvesterDumpRate with ReadDouble and gates on
                 // `rate × 900 <= accumulator`; the accumulator is integer-stepped,
                 // so the first crossing is ceil(rate × 900). Take the ceiling at
                 // full double precision to match that crossing exactly (no tenths
                 // rounding). Clamp to u16::MAX to keep the frame threshold in range.
-                let rate = general.get_f64("HarvesterDumpRate").unwrap_or(0.016);
+                let rate = general.read_double("HarvesterDumpRate", 0.016);
                 (rate * 900.0).clamp(0.0, u16::MAX as f64).ceil() as u16
             },
-            chrono_delay: general.get_i32("ChronoDelay").unwrap_or(60),
-            chrono_reinf_delay: general.get_i32("ChronoReinfDelay").unwrap_or(180),
-            chrono_distance_factor: general.get_i32("ChronoDistanceFactor").unwrap_or(48),
-            chrono_trigger: general.get_bool("ChronoTrigger").unwrap_or(true),
-            chrono_minimum_delay: general.get_i32("ChronoMinimumDelay").unwrap_or(16),
-            chrono_range_minimum: general.get_i32("ChronoRangeMinimum").unwrap_or(0),
+            chrono_delay: general.read_int("ChronoDelay", 60),
+            chrono_reinf_delay: general.read_int("ChronoReinfDelay", 180),
+            chrono_distance_factor: general.read_int("ChronoDistanceFactor", 48),
+            chrono_trigger: general.read_bool("ChronoTrigger", true),
+            chrono_minimum_delay: general.read_int("ChronoMinimumDelay", 16),
+            chrono_range_minimum: general.read_int("ChronoRangeMinimum", 0),
             // Parse-time float -> fixed-point ppm (mirrors the IncomeMult parse); the runtime
             // bonus math is all integer. Full precision — no whole-percent quantize.
-            purifier_bonus_ppm: (general.get_percent("PurifierBonus").unwrap_or(0.25) as f64
+            // A float field (`FSTP dword` at `0x0066FC70`).
+            purifier_bonus_ppm: (f64::from(general.read_float("PurifierBonus", 0.25))
                 * INCOME_PPM_SCALE as f64)
                 .round() as i64,
-            ai_virtual_purifiers: {
-                let defaults = [4, 2, 0];
+            // An IntVector (`0x00475D70`) indexed by difficulty.
+            ai_virtual_purifiers: general
+                .read_int_list("AIVirtualPurifiers")
+                .and_then(|values| values.get(..3)?.try_into().ok())
+                .unwrap_or([4, 2, 0]),
+            allied_survivor_divisor: general.read_int("AlliedSurvivorDivisor", 500),
+            soviet_survivor_divisor: general.read_int("SovietSurvivorDivisor", 250),
+            third_survivor_divisor: general.read_int("ThirdSurvivorDivisor", 750),
+            allied_crew: general.read_name("AlliedCrew", 0x80).map(str::to_owned),
+            soviet_crew: general.read_name("SovietCrew", 0x80).map(str::to_owned),
+            third_crew: general.read_name("ThirdCrew", 0x80).map(str::to_owned),
+            technician: general.read_name("Technician", 0x80).map(str::to_owned),
+            engineer_infantry: general.read_name("Engineer", 0x80).map(str::to_owned),
+            crew_escape: crate::util::native_x87::NativeF64Bits::from_bits(
                 general
-                    .get("AIVirtualPurifiers")
-                    .and_then(|raw| {
-                        let parsed: Vec<i32> = raw
-                            .split(',')
-                            .map(|s| s.trim())
-                            .filter(|s| !s.is_empty())
-                            .filter_map(|s| s.parse::<i32>().ok())
-                            .collect();
-                        if parsed.len() == 3 {
-                            Some([parsed[0], parsed[1], parsed[2]])
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or(defaults)
-            },
-            allied_survivor_divisor: general.get_i32("AlliedSurvivorDivisor").unwrap_or(500),
-            soviet_survivor_divisor: general.get_i32("SovietSurvivorDivisor").unwrap_or(250),
-            third_survivor_divisor: general.get_i32("ThirdSurvivorDivisor").unwrap_or(750),
-            tracked_uphill: general
-                .get_f32("TrackedUphill")
-                .map(sim_from_f32)
-                .unwrap_or(defaults.tracked_uphill),
-            tracked_downhill: general
-                .get_f32("TrackedDownhill")
-                .map(sim_from_f32)
-                .unwrap_or(defaults.tracked_downhill),
-            wheeled_uphill: general
-                .get_f32("WheeledUphill")
-                .map(sim_from_f32)
-                .unwrap_or(defaults.wheeled_uphill),
-            wheeled_downhill: general
-                .get_f32("WheeledDownhill")
-                .map(sim_from_f32)
-                .unwrap_or(defaults.wheeled_downhill),
+                    .read_double("CrewEscape", f64::from_bits(defaults.crew_escape.bits()))
+                    .to_bits(),
+            ),
+            refund_percent: crate::util::native_x87::NativeF64Bits::from_bits(
+                general
+                    .read_double(
+                        "RefundPercent",
+                        f64::from_bits(defaults.refund_percent.bits()),
+                    )
+                    .to_bits(),
+            ),
+            ship_sinking_weight: sim_from_f32(
+                general.read_double("ShipSinkingWeight", defaults.ship_sinking_weight.to_num())
+                    as f32,
+            ),
+            tracked_uphill: SimFixed::from_num(
+                general.read_double("TrackedUphill", defaults.tracked_uphill.to_num::<f64>()),
+            ),
+            tracked_downhill: SimFixed::from_num(
+                general.read_double("TrackedDownhill", defaults.tracked_downhill.to_num::<f64>()),
+            ),
+            wheeled_uphill: SimFixed::from_num(
+                general.read_double("WheeledUphill", defaults.wheeled_uphill.to_num::<f64>()),
+            ),
+            wheeled_downhill: SimFixed::from_num(
+                general.read_double("WheeledDownhill", defaults.wheeled_downhill.to_num::<f64>()),
+            ),
             // RulesClass's AudioVisual pass stores these ReadDouble values as
             // signed milliunits after the active x87 chop-toward-zero conversion.
             extra_unit_light: (audio_visual
-                .map(|section| {
-                    section.read_double("ExtraUnitLight", defaults.extra_unit_light as f64 / 1000.0)
-                })
-                .unwrap_or(defaults.extra_unit_light as f64 / 1000.0)
+                .read_double("ExtraUnitLight", defaults.extra_unit_light as f64 / 1000.0)
                 * 1000.0) as i32,
-            extra_infantry_light: (audio_visual
-                .map(|section| {
-                    section.read_double(
-                        "ExtraInfantryLight",
-                        defaults.extra_infantry_light as f64 / 1000.0,
-                    )
-                })
-                .unwrap_or(defaults.extra_infantry_light as f64 / 1000.0)
-                * 1000.0) as i32,
-            extra_aircraft_light: (audio_visual
-                .map(|section| {
-                    section.read_double(
-                        "ExtraAircraftLight",
-                        defaults.extra_aircraft_light as f64 / 1000.0,
-                    )
-                })
-                .unwrap_or(defaults.extra_aircraft_light as f64 / 1000.0)
-                * 1000.0) as i32,
-            close_enough: general
-                .get_f32("CloseEnough")
-                .map(|cells| sim_from_f32(cells * 256.0))
-                .unwrap_or(defaults.close_enough),
+            extra_infantry_light: (audio_visual.read_double(
+                "ExtraInfantryLight",
+                defaults.extra_infantry_light as f64 / 1000.0,
+            ) * 1000.0) as i32,
+            extra_aircraft_light: (audio_visual.read_double(
+                "ExtraAircraftLight",
+                defaults.extra_aircraft_light as f64 / 1000.0,
+            ) * 1000.0) as i32,
+            close_enough: general.read_range("CloseEnough", defaults.close_enough),
+            stray: general.read_range("Stray", defaults.stray),
+            relaxed_stray: general.read_range("RelaxedStray", defaults.relaxed_stray),
+            guard_mode_stray: general.read_range("GuardModeStray", defaults.guard_mode_stray),
             // URepairRate= is in minutes. Convert to ticks: minutes * 60 * 15 ticks/sec.
-            unit_repair_rate_ticks: general
-                .get_f32("URepairRate")
-                .map(|minutes| {
-                    (minutes * 60.0 * (crate::util::fixed_math::RA2_LOGIC_FRAMES_PER_SECOND as f32))
-                        .round()
-                        .max(1.0) as u32
-                })
-                .unwrap_or(defaults.unit_repair_rate_ticks),
-            repair_step: general
-                .get_i32("RepairStep")
-                .unwrap_or(defaults.repair_step as i32)
-                .max(1) as u16,
-            repair_percent: general
-                .get_percent("RepairPercent")
-                .map(|frac| (frac * 100.0).round() as u16)
-                .unwrap_or(defaults.repair_percent),
-            reload_rate_ticks: general
-                .get_f32("ReloadRate")
-                .map(|minutes| {
-                    (minutes * 60.0 * (crate::util::fixed_math::RA2_LOGIC_FRAMES_PER_SECOND as f32))
-                        .round()
-                        .max(1.0) as u32
-                })
-                .unwrap_or(defaults.reload_rate_ticks),
-            // PathDelay= is in minutes. Convert to ticks: minutes * 60 * 15.
-            path_delay_ticks: general
-                .get_f32("PathDelay")
-                .map(|minutes| {
-                    (minutes * 60.0 * (crate::util::fixed_math::RA2_LOGIC_FRAMES_PER_SECOND as f32))
-                        .round()
-                        .max(1.0) as u16
-                })
-                .unwrap_or(defaults.path_delay_ticks),
-            // BlockagePathDelay= is directly in frames (ticks).
-            blockage_path_delay_ticks: general
-                .get_i32("BlockagePathDelay")
-                .map(|frames| frames.max(1) as u16)
-                .unwrap_or(defaults.blockage_path_delay_ticks),
+            unit_repair_rate_ticks: minutes_to_ticks(
+                general.read_double("URepairRate", U_REPAIR_RATE_MINUTES),
+            ),
+            repair_step: general.read_int("RepairStep", defaults.repair_step),
+            repair_percent: general.read_double("RepairPercent", defaults.repair_percent),
+            reload_rate_ticks: minutes_to_ticks(
+                general.read_double("ReloadRate", RELOAD_RATE_MINUTES),
+            ),
+            path_delay,
+            blockage_path_delay_ticks,
+            // ReadGeneral670235..670267 uses the same475D70 signed vector
+            // reader as the existing Recalc difficulty tables below.
+            ai_auto_deploy_frame_delay: general
+                .read_int_list("AIAutoDeployFrameDelay")
+                .unwrap_or_default(),
+            ai_force_prediction_fudge: ai
+                .read_int_list("AIForcePredictionFudge")
+                .unwrap_or_default(),
+            ai_pick_wall_defense_percent: general
+                .read_int_list("AIPickWallDefensePercent")
+                .unwrap_or_default(),
             // PlayerScatter belongs to the [CombatDamage] read, IQ Scatter to
             // the [IQ] read; neither is a [General] key.
-            player_scatter: combat_damage
-                .and_then(|s| s.get_bool("PlayerScatter"))
-                .unwrap_or(defaults.player_scatter),
-            iq_scatter: iq
-                .and_then(|s| s.get_i32("Scatter"))
-                .unwrap_or(defaults.iq_scatter),
-            max_iq_levels: iq
-                .and_then(|s| s.get_i32("MaxIQLevels"))
-                .unwrap_or(defaults.max_iq_levels),
+            player_scatter: combat_damage.read_bool("PlayerScatter", defaults.player_scatter),
+            player_return_fire: combat_damage
+                .read_bool("PlayerReturnFire", defaults.player_return_fire),
+            iq_scatter: iq.read_int("Scatter", defaults.iq_scatter),
+            max_iq_levels: iq.read_int("MaxIQLevels", defaults.max_iq_levels),
             iq_production,
-            iq_repair_sell: iq
-                .and_then(|s| s.get_i32("RepairSell"))
-                .unwrap_or(defaults.iq_repair_sell),
-            iq_sell_back: iq
-                .and_then(|s| s.get_i32("SellBack"))
-                .unwrap_or(defaults.iq_sell_back),
-            credit_reserve: ai
-                .and_then(|s| s.get_i32("CreditReserve"))
-                .unwrap_or(defaults.credit_reserve),
-            concrete_walls: general
-                .get_list("ConcreteWalls")
-                .map(|list| {
-                    list.into_iter()
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_ascii_uppercase())
-                        .collect()
-                })
-                .unwrap_or_default(),
-            cliff_back_impassability: general.get_i32("CliffBackImpassability").unwrap_or(2) as u8,
-            lightning_storm_duration: general.get_i32("LightningStormDuration").unwrap_or(180),
-            lightning_damage: general.get_i32("LightningDamage").unwrap_or(250),
-            lightning_deferment: general.get_i32("LightningDeferment").unwrap_or(250),
-            lightning_hit_delay: general.get_i32("LightningHitDelay").unwrap_or(10).max(1),
-            lightning_scatter_delay: general.get_i32("LightningScatterDelay").unwrap_or(5).max(1),
-            lightning_cell_spread: general.get_i32("LightningCellSpread").unwrap_or(10),
-            lightning_separation: general.get_i32("LightningSeparation").unwrap_or(3),
-            lightning_warhead: general
-                .get("LightningWarhead")
-                .unwrap_or("IonWH")
-                .to_string(),
+            iq_harvester,
+            iq_repair_sell: iq.read_int("RepairSell", defaults.iq_repair_sell),
+            iq_sell_back: iq.read_int("SellBack", defaults.iq_sell_back),
+            credit_reserve: ai.read_int("CreditReserve", defaults.credit_reserve),
+            cliff_back_impassability: general.read_int("CliffBackImpassability", 2) as u8,
+            lightning_storm_duration: general.read_int("LightningStormDuration", 180),
+            lightning_damage: general.read_int("LightningDamage", 250),
+            lightning_deferment: general.read_int("LightningDeferment", 250),
+            lightning_hit_delay: general.read_int("LightningHitDelay", 10).max(1),
+            lightning_scatter_delay: general.read_int("LightningScatterDelay", 5).max(1),
+            lightning_cell_spread: general.read_int("LightningCellSpread", 10),
+            lightning_separation: general.read_int("LightningSeparation", 3),
+            lightning_warhead: general.read_string("LightningWarhead", "", 128),
+            weather_con_bolt_explosion: general.read_string("WeatherConBoltExplosion", "", 128),
+            weapon_nullify_anim: general.read_string("WeaponNullifyAnim", "", 128),
             ambient_change_rate_nonzero: ambient_change_rate != 0.0,
             ambient_change_interval_frames: (ambient_change_rate * 900.0) as i32,
             ambient_change_step: (ambient_change_step * 100.0) as i32,
-            iron_curtain_duration: combat_damage
-                .and_then(|s| s.get_i32("IronCurtainDuration"))
-                .unwrap_or(750) as u32,
-            iron_curtain_invoke_anim: general
-                .get("IronCurtainInvokeAnim")
-                .unwrap_or("IRONBLST")
-                .to_string(),
-            force_shield_radius: general.get_i32("ForceShieldRadius").unwrap_or(4) as u32,
-            force_shield_duration: general.get_i32("ForceShieldDuration").unwrap_or(500) as u32,
-            force_shield_blackout_duration: general
-                .get_i32("ForceShieldBlackoutDuration")
-                .unwrap_or(1000) as u32,
-            force_shield_fade_sound_time: general
-                .get_i32("ForceShieldPlayFadeSoundTime")
-                .unwrap_or(75) as u32,
-            force_shield_invoke_anim: general
-                .get("ForceShieldInvokeAnim")
-                .unwrap_or("FORCSHLD")
-                .to_string(),
-            psychic_reveal_radius: combat_damage
-                .and_then(|section| section.get_i32("PsychicRevealRadius"))
-                .unwrap_or(15) as u32,
-            mutate_warhead: special_weapons
-                .and_then(|section| section.get("MutateWarhead"))
-                .unwrap_or("Mutate")
-                .to_string(),
-            mutate_explosion_warhead: special_weapons
-                .and_then(|section| section.get("MutateExplosionWarhead"))
-                .unwrap_or("MutateExplosion")
-                .to_string(),
-            mutate_explosion: general.get_bool("MutateExplosion").unwrap_or(true),
-            metallic_debris: general
-                .get("MetallicDebris")
-                .map(|v| {
-                    v.split(',')
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                        .collect::<Vec<_>>()
-                })
-                .filter(|v| !v.is_empty())
-                .unwrap_or_else(|| Self::default().metallic_debris),
+            iron_curtain_duration: combat_damage.read_int("IronCurtainDuration", 750),
+            iron_curtain_invoke_anim: general.read_string(
+                "IronCurtainInvokeAnim",
+                "IRONBLST",
+                0x80,
+            ),
+            ion_blast_anim: general.read_string("IonBlast", "", 0x80),
+            force_shield_radius: general.read_int("ForceShieldRadius", 4) as u32,
+            force_shield_duration: general.read_int("ForceShieldDuration", 500),
+            force_shield_blackout_duration: general.read_int("ForceShieldBlackoutDuration", 1000)
+                as u32,
+            force_shield_fade_sound_time: general.read_int("ForceShieldPlayFadeSoundTime", 75)
+                as u32,
+            force_shield_invoke_anim: general.read_string(
+                "ForceShieldInvokeAnim",
+                "FORCSHLD",
+                0x80,
+            ),
+            psychic_reveal_radius: combat_damage.read_int("PsychicRevealRadius", 15) as u32,
+            mutate_warhead: special_weapons.read_string("MutateWarhead", "Mutate", 0x80),
+            mutate_explosion_warhead: special_weapons.read_string(
+                "MutateExplosionWarhead",
+                "MutateExplosion",
+                0x80,
+            ),
+            mutate_explosion: general.read_bool("MutateExplosion", true),
+            // The processed RulesClass vector is authoritative; a merged INI
+            // cannot reproduce successful-read replacement or factory identity.
+            metallic_debris: Vec::new(),
         }
     }
 
@@ -2473,10 +2820,8 @@ impl GeneralRules {
     /// anim's own `[ANIM_NAME]` section for its native `Rate=` frame delay.
     pub fn resolve_art_rates(&mut self, art_ini: &IniFile) {
         fn rate_from_section(ini: &IniFile, name: &str, fallback: u16) -> u16 {
-            ini.section(name)
-                .and_then(|s| s.get_i32("Rate"))
-                .map(crate::rules::art_data::art_rate_to_logic_frames)
-                .unwrap_or(fallback)
+            crate::rules::art_data::read_anim_rate(ini.section_or_empty(name))
+                .map_or(fallback, crate::rules::art_data::art_rate_to_logic_frames)
         }
         self.warp_in.frame_delay =
             rate_from_section(art_ini, &self.warp_in.name, DEFAULT_ANIM_FRAME_DELAY);
@@ -2518,80 +2863,37 @@ impl GeneralRules {
                     .join(", "),
             );
         }
-
-        // Parachute render config: [General] Parachute= names the section in
-        // artmd.ini that holds the chute SHP's animation metadata.
-        self.parachute_render = self.parachute_shp.as_deref().and_then(|shp_name| {
-            let section = art_ini.section(shp_name)?;
-            let rate = section.get_i32("Rate").unwrap_or(1);
-            let frame_delay = crate::rules::art_data::art_rate_to_logic_frames(rate);
-            let loop_start = section.get_i32("LoopStart").unwrap_or(0).max(0) as u16;
-            let loop_end = section.get_i32("LoopEnd").unwrap_or(0).max(0) as u16;
-            let end_frame = loop_end.saturating_add(1);
-            let z_adjust = section.get_i32("ZAdjust").unwrap_or(0) as i16;
-            let alt_palette = section.get_bool("AltPalette").unwrap_or(false);
-            Some(ParachuteRenderConfig {
-                shp_name: shp_name.to_string(),
-                frame_delay,
-                loop_start,
-                end_frame,
-                z_adjust,
-                alt_palette,
-            })
-        });
-        if let Some(ref pc) = self.parachute_render {
-            log::info!(
-                "Parachute render config loaded: shp={} frame_delay={} loop_start={} end_frame={} z_adjust={} alt_palette={}",
-                pc.shp_name,
-                pc.frame_delay,
-                pc.loop_start,
-                pc.end_frame,
-                pc.z_adjust,
-                pc.alt_palette,
-            );
-        } else {
-            log::warn!(
-                "Parachute render config NOT loaded (missing [General] Parachute= or referenced art.ini section)"
-            );
-        }
     }
 }
 
 impl ProductionRules {
+    /// The RulesClass `[General]` reads, in native order: the four floats
+    /// (`0x0066EB5B..0x0066EBC9`), then `BuildSpeed=` (`0x00670D23`) and
+    /// `WallBuildSpeedCoefficient=` (`0x0067187F`). An absent section skips
+    /// them all (the section test `0x00526810` jumps to `0x00671E8E`).
     fn from_ini(ini: &IniFile) -> Self {
+        let mut rules = Self::default();
         let Some(general) = ini.section("General") else {
-            return Self::default();
+            return rules;
         };
-
-        // Fallback for an absent key matches the engine's constructor default
-        // (BuildSpeed 1.0). Retail rulesmd.ini always supplies its own value
-        // (.7), so this fallback fires only for a non-retail INI missing the key.
-        let bs = general.get_f32("BuildSpeed").unwrap_or(1.0);
-        let mf = general.get_f32("MultipleFactory").unwrap_or(0.8);
-        let lpp = general.get_f32("LowPowerPenaltyModifier").unwrap_or(1.0);
-        let min_lp = general.get_f32("MinLowPowerProductionSpeed").unwrap_or(0.5);
-        let max_lp = general.get_f32("MaxLowPowerProductionSpeed").unwrap_or(0.9);
-        let wall_coeff = general.get_f32("WallBuildSpeedCoefficient").unwrap_or(1.0);
-        let result = Self {
-            build_speed: bs,
-            multiple_factory: mf,
-            low_power_penalty_modifier: lpp,
-            min_low_power_production_speed: min_lp,
-            max_low_power_production_speed: max_lp,
-            multiple_factory_ppm: f32_to_ppm(mf, 0.01),
-            low_power_penalty_modifier_ppm: f32_to_ppm(lpp, 0.0),
-            min_low_power_production_speed_ppm: f32_to_ppm(min_lp, 0.0),
-            max_low_power_production_speed_ppm: f32_to_ppm(max_lp.max(min_lp), 0.0),
-            build_speed_x1000: (bs.max(0.01) as f64 * 1000.0).round() as u64,
-            wall_build_speed_coefficient: wall_coeff,
-        };
-        log::info!(
-            "ProductionRules: BuildSpeed={}, MultipleFactory={}, LowPowerPenalty={}",
-            result.build_speed,
-            result.multiple_factory,
-            result.low_power_penalty_modifier,
+        rules.min_low_power_production_speed = general.read_double_to_float(
+            "MinLowPowerProductionSpeed",
+            rules.min_low_power_production_speed,
         );
-        result
+        rules.max_low_power_production_speed = general.read_double_to_float(
+            "MaxLowPowerProductionSpeed",
+            rules.max_low_power_production_speed,
+        );
+        rules.low_power_penalty_modifier = general
+            .read_double_to_float("LowPowerPenaltyModifier", rules.low_power_penalty_modifier);
+        rules.multiple_factory =
+            general.read_double_to_float("MultipleFactory", rules.multiple_factory);
+        rules.build_speed = general.read_double_bits("BuildSpeed", rules.build_speed);
+        rules.wall_build_speed_coefficient = general.read_double_bits(
+            "WallBuildSpeedCoefficient",
+            rules.wall_build_speed_coefficient,
+        );
+        rules
     }
 }
 
@@ -2617,8 +2919,9 @@ pub struct RuleSet {
     /// this retains distinct types when malformed/custom rules list the same
     /// ID in more than one category.
     object_category_index: HashMap<(ObjectCategory, String), TypeHandle>,
-    /// Case-insensitive native BuildingType registry identity to its ordered index.
-    building_type_indices: HashMap<String, i32>,
+    /// Case-insensitive identity of each type in the four native TechnoType
+    /// registries to its ordered array index (`+0xDF8`).
+    type_array_indices: HashMap<(ObjectCategory, String), i32>,
     /// All weapons indexed by ID (e.g., "105mm" → WeaponType).
     weapons: HashMap<String, WeaponType>,
     /// All warheads indexed by ID (e.g., "AP" → WarheadType).
@@ -2672,6 +2975,20 @@ pub struct RuleSet {
     pub build_weapons_types: Vec<String>,
     /// Source-ordered resolved `[AI] BuildRadar=` BuildingType identities.
     pub build_radar_types: Vec<String>,
+    /// Source-ordered resolved `[AI] AlliedBaseDefenses=`,
+    /// `SovietBaseDefenses=` and `ThirdBaseDefenses=` BuildingType identities
+    /// (`Rules+0x954`, `+0x970`, `+0x98C`, read like the other BasePlan lists
+    /// at `0x00673058..0x006732D0`): the computer's base defense candidates by
+    /// side ([`Self::base_defense_types`]).
+    pub allied_base_defense_types: Vec<String>,
+    pub soviet_base_defense_types: Vec<String>,
+    pub third_base_defense_types: Vec<String>,
+    /// Source-ordered resolved `[AI] ConcreteWalls=` BuildingType identities
+    /// (the TypeList at `Rules+0xA50`, items `+0xA54`, count `+0xA60`, read
+    /// like the lists above at `0x0067375B..0x00673824`; the constructor
+    /// leaves it empty, `0x0066641B..0x00666430`): the computer's wall types
+    /// (`sim::ai_base_building`).
+    pub concrete_wall_types: Vec<String>,
     /// Source-ordered resolved `[General] HarvesterUnit=` UnitType identities.
     pub harvester_unit_types: Vec<String>,
     /// Signed Hard/Normal/Easy vectors consumed directly by BasePlan Recalc.
@@ -2752,6 +3069,9 @@ pub struct RuleSet {
     /// IonCannonWarhead=`, `C4Warhead=`, `CrushWarhead=`). Resolution to interned IDs happens
     /// at world init.
     pub bridge_warheads: crate::rules::bridge_warheads::BridgeWarheads,
+    /// Mind-control globals: ring anim, Mastermind overload, sounds and the
+    /// AI capture-decision tables.
+    pub mind_control: crate::rules::mind_control_rules::MindControlRules,
     /// The three hardcoded missile-spawn families (`[General] V3RocketType=`,
     /// `DMislType=`, `CMislType=`) with their launch frames, impact damage and
     /// warheads. Read by the spawn manager to classify a spawn child and by the
@@ -2763,8 +3083,6 @@ pub struct RuleSet {
     pub c4_delay_ticks: u32,
     /// Particle types in registry order. Index = `ParticleTypeId.0`.
     particle_types: Vec<ParticleType>,
-    /// Uppercase name → `ParticleTypeId` for case-insensitive lookup.
-    particle_types_by_name: HashMap<String, ParticleTypeId>,
     /// Particle system types in registry order. Index = `ParticleSystemTypeId.0`.
     particle_system_types: Vec<ParticleSystemType>,
     /// Uppercase name → `ParticleSystemTypeId` for case-insensitive lookup.
@@ -2776,12 +3094,21 @@ pub struct RuleSet {
     /// Smudge type registry parsed from `[SmudgeTypes]` and per-name sections.
     /// Populated by `RuleSet::from_ini` from rulesmd.ini.
     pub smudge_types: SmudgeTypeRegistry,
-    /// Retained art.ini registry. Populated by the app loading path (`app::loading::init`) after `merge_art_data`
-    /// so dispatchers (e.g. smudge spawning) can read per-anim spawn flags.
-    pub art_registry: crate::rules::art_data::ArtRegistry,
-    /// GPU-independent SHP frame counts used by authoritative world-effect
-    /// and particle timing. Bound once from the active assets and ART data.
+    /// Scenario-owned ART metadata and bound animation closure. Loaders transfer
+    /// it once; every later binding and consumer uses this same registry.
+    art_registry: crate::rules::art_data::ArtRegistry,
+    /// Existing AnimTypes for Building451890's lookup-only427CB0 gate.
+    /// Membership is independent of a same-named art section or loaded SHP.
+    pub anim_type_names: BTreeSet<String>,
+    /// Ordered native registry receipt: whether this type actually reached a
+    /// successful fixed-ART ReadINI before the final rules pass completed.
+    pub anim_type_art_read_states: Vec<(String, bool)>,
+    /// GPU-independent SHP frame counts used by particle timing. Bound once
+    /// from the active assets and ART data.
     effect_assets: crate::rules::effect_asset_catalog::EffectAssetCatalog,
+    /// Every building type's construction control from its Buildup SHP,
+    /// bound once from the active assets (`bind_building_buildup_assets`).
+    buildup_assets: crate::rules::buildup_asset_catalog::BuildupAssetCatalog,
     /// Raw terrain SHP counts used by authoritative TIBTRE animation timing.
     /// Presentation keeps its separate body-frame projection.
     terrain_spawner_assets: crate::rules::terrain_asset_catalog::TerrainSpawnerAssetCatalog,
@@ -2801,132 +3128,10 @@ pub struct RuleSet {
     source_ini_hash: u64,
 }
 
-/// Project one native AI planning type list through its `char[128]` reader.
-///
-/// gamemd-derived: `RulesClass__ReadAI @ 0x00672AE0`, seven list blocks
-/// `0x00672B14..0x00673058` and `0x0067368C..0x0067375B`, plus
-/// `RulesClass__ReadGeneral @ 0x0066D530` HarvesterUnit block
-/// `0x0066F8C8..0x0066F9CB`. Each calls `CCINIClass__ReadString @ 0x00528A10`
-/// with length `0x80`, trims the complete copied buffer, then tokenizes with
-/// comma as the sole `strtok` delimiter. `IniFile::from_bytes` stores each
-/// source byte as one zero-extended scalar, so narrowing before truncation
-/// preserves the native payload-byte boundary even when Rust UTF-8 would not.
-fn parse_native_type_list_source_tokens(value: &str) -> Vec<String> {
-    const NATIVE_PAYLOAD_BYTES: usize = 127;
-
-    let Some(mut copied) = value
-        .chars()
-        .map(|character| u8::try_from(u32::from(character)).ok())
-        .collect::<Option<Vec<_>>>()
-    else {
-        // Production INI values come through `IniFile::from_bytes` and are
-        // always in the reversible byte domain. A direct Unicode-only test
-        // value has no native narrow-byte identity and must not alias a
-        // registered BuildingType.
-        return Vec::new();
-    };
-    copied.truncate(NATIVE_PAYLOAD_BYTES);
-
-    let first = copied.iter().position(|byte| *byte > b' ');
-    let Some(first) = first else {
-        return Vec::new();
-    };
-    let last = copied
-        .iter()
-        .rposition(|byte| *byte > b' ')
-        .expect("the first non-control byte also supplies the last");
-
-    copied[first..=last]
-        .split(|byte| *byte == b',')
-        // CRT `strtok` coalesces repeated delimiters and emits no empty token
-        // for leading, repeated, or trailing commas.
-        .filter(|token| !token.is_empty())
-        .filter(|token| {
-            !token.eq_ignore_ascii_case(b"none") && !token.eq_ignore_ascii_case(b"<none>")
-        })
-        .map(crate::util::native_string::widen_bytes)
-        .collect()
-}
-
-/// Parse the signed DynamicVector payload used by Recalc difficulty tables.
-///
-/// gamemd-derived: `DifficultyClass__ReadINI_IntVector @ 0x00475D70`, reached
-/// by `RulesClass__ReadGeneral @ 0x0066D530` for AISlaveMinerNumber
-/// `0x00670585..0x006705B7`, AIExtraRefineries `0x006705F9..0x0067062A`, and
-/// the three BaseDefenseCounts vectors `0x00670013..0x006700BE`. The reader has
-/// a native `char[512]` buffer, whole-buffer trim, comma `strtok`, and CRT atoi.
-fn parse_native_difficulty_int_vector(value: &str) -> Vec<i32> {
-    const NATIVE_PAYLOAD_BYTES: usize = 511;
-
-    let Some(mut copied) = value
-        .chars()
-        .map(|character| u8::try_from(u32::from(character)).ok())
-        .collect::<Option<Vec<_>>>()
-    else {
-        return Vec::new();
-    };
-    copied.truncate(NATIVE_PAYLOAD_BYTES);
-
-    let Some(first) = copied.iter().position(|byte| *byte > b' ') else {
-        return Vec::new();
-    };
-    let last = copied
-        .iter()
-        .rposition(|byte| *byte > b' ')
-        .expect("the first non-control byte also supplies the last");
-
-    copied[first..=last]
-        .split(|byte| *byte == b',')
-        .filter(|token| !token.is_empty())
-        .map(native_atoi_bytes)
-        .collect()
-}
-
-/// CRT `atoi` byte-domain projection: skip exactly ASCII whitespace, accept an
-/// optional sign, consume the decimal prefix, and retain 32-bit wrapping.
-fn native_atoi_bytes(value: &[u8]) -> i32 {
-    let mut index = value
-        .iter()
-        .take_while(|&&byte| matches!(byte, b'\t'..=b'\r' | b' '))
-        .count();
-    let negative = value.get(index) == Some(&b'-');
-    if value
-        .get(index)
-        .is_some_and(|byte| matches!(*byte, b'-' | b'+'))
-    {
-        index += 1;
-    }
-    let mut result = 0u32;
-    let mut any = false;
-    while let Some(byte) = value.get(index).filter(|byte| byte.is_ascii_digit()) {
-        any = true;
-        result = result
-            .wrapping_mul(10)
-            .wrapping_add(u32::from(*byte - b'0'));
-        index += 1;
-    }
-    if !any {
-        0
-    } else if negative {
-        result.wrapping_neg() as i32
-    } else {
-        result as i32
-    }
-}
-
 impl RuleSet {
     /// Build from the active ordered rules sources.
     pub fn from_rules_layers(layers: &RulesLayerStack) -> Result<Self, RulesError> {
-        let processed = layers.process()?;
-        let content_hash = processed.content_hash();
-        let crate_rules = processed.crate_rules().clone();
-        let powerups = processed.powerups().clone();
-        let ini = processed.into_projection_discarding_native_receipt();
-        let mut rules = Self::from_projected_ini(&ini)?;
-        rules.crate_rules = crate_rules;
-        rules.powerups = powerups;
-        rules.source_ini_hash = content_hash;
-        Ok(rules)
+        Self::from_processed_rules(&layers.process()?)
     }
 
     pub(crate) fn from_processed_rules(
@@ -2935,8 +3140,89 @@ impl RuleSet {
         let mut rules = Self::from_projected_ini(processed.ini())?;
         rules.crate_rules = processed.crate_rules().clone();
         rules.powerups = processed.powerups().clone();
+        rules.general.metallic_debris = processed.metallic_debris().to_vec();
+        rules.bridge_rules.explosions = processed.bridge_explosions().to_vec();
+        rules.general.gravity = processed.gravity();
+        rules.general.prism_support = processed.prism_support();
+        rules.general.prism_type = processed.prism_type().map(str::to_owned);
+        rules.general.building_types = processed.building_types().clone();
+        let (lightning, weather_anim, nullify_anim, splash) = processed.select_anim_rules();
+        rules.general.lightning_warhead = lightning.to_owned();
+        rules.general.weather_con_bolt_explosion = weather_anim.to_owned();
+        rules.general.weapon_nullify_anim = nullify_anim.to_owned();
+        rules.combat_damage.splash_list = splash.to_vec();
+        for (name, conventional, em_effect, anim_list) in processed.warhead_anim_states() {
+            if let Some(warhead) = rules
+                .warheads
+                .values_mut()
+                .find(|wh| wh.id.eq_ignore_ascii_case(name))
+            {
+                warhead.conventional = conventional;
+                warhead.em_effect = em_effect;
+                warhead.anim_list = anim_list.to_vec();
+            }
+        }
+        (
+            rules.general.missile_rot_var,
+            rules.general.safety_altitude,
+            rules.general.line_trail_color_override,
+        ) = processed.projectile_rule_controls();
+        for (name, speed, projectile) in processed.weapon_speeds_and_projectiles() {
+            if let Some(weapon) = rules
+                .weapons
+                .values_mut()
+                .find(|weapon| weapon.id.eq_ignore_ascii_case(name))
+            {
+                weapon.speed = speed;
+                weapon.projectile = projectile.map(str::to_owned);
+            }
+        }
+        rules.anim_type_art_read_states = processed
+            .anim_type_art_read_states()
+            .map(|(name, read)| (name.to_owned(), read))
+            .collect();
+        // The registry processor owns native read timing and retained values;
+        // the runtime definition receives that result, not another ART read.
+        for (name, art) in processed.projectile_art_states() {
+            if let Some(projectile) = rules
+                .projectiles
+                .values_mut()
+                .find(|projectile| projectile.id.eq_ignore_ascii_case(name))
+            {
+                art.apply_to(projectile);
+            }
+        }
         rules.source_ini_hash = processed.content_hash();
         Ok(rules)
+    }
+
+    /// Resolve type sound readers against the startup-selected
+    /// SOUNDMD registry. The processed projection retains only passes where
+    /// each type existed, including the native current-ID retention order.
+    /// Type defaults and Rules+208 start at -1; [AudioVisual] owns the latter.
+    pub(crate) fn bind_type_sound_references(
+        &mut self,
+        ini: &IniFile,
+        sounds: &crate::rules::sound_ini::SoundRegistry,
+    ) {
+        self.general.sinking_sound = ini
+            .section("AudioVisual")
+            .and_then(|section| sounds.read_rules_reference(section, "SinkingSound"));
+        for object in &mut self.object_list {
+            let section = ini.section(&object.id);
+            object.sinking_sound =
+                section.and_then(|section| sounds.read_rules_reference(section, "SinkingSound"));
+            object.voice_sinking =
+                section.and_then(|section| sounds.read_rules_reference(section, "VoiceSinking"));
+            if object.category == crate::rules::object_type::ObjectCategory::Infantry {
+                // Infantry52440B then524447: missing/empty/unregistered names
+                // keep the prior signed ID across the existing processed passes.
+                object.enter_water_sound = section
+                    .and_then(|section| sounds.read_rules_reference(section, "EnterWaterSound"));
+                object.leave_water_sound = section
+                    .and_then(|section| sounds.read_rules_reference(section, "LeaveWaterSound"));
+            }
+        }
     }
 
     /// Parse a complete RuleSet from a rules.ini IniFile.
@@ -2949,43 +3235,46 @@ impl RuleSet {
         Self::from_rules_layers(&RulesLayerStack::new(ini.clone()))
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_ini_with_fixed_art_for_test(
+        ini: &IniFile,
+        art: &IniFile,
+    ) -> Result<Self, RulesError> {
+        Self::from_processed_rules(&RulesLayerStack::new(ini.clone()).process_with_fixed_art(art)?)
+    }
+
     fn from_projected_ini(ini: &IniFile) -> Result<Self, RulesError> {
         let mut object_list: Vec<ObjectType> = Vec::new();
         let mut object_index: HashMap<String, TypeHandle> = HashMap::new();
         let mut object_category_index: HashMap<(ObjectCategory, String), TypeHandle> =
             HashMap::new();
-        let mut building_type_indices: HashMap<String, i32> = HashMap::new();
+        let mut type_array_indices: HashMap<(ObjectCategory, String), i32> = HashMap::new();
         let mut infantry_ids: Vec<String> = Vec::new();
         let mut vehicle_ids: Vec<String> = Vec::new();
         let mut aircraft_ids: Vec<String> = Vec::new();
         let mut building_ids: Vec<String> = Vec::new();
         let production: ProductionRules = ProductionRules::from_ini(ini);
         let general: GeneralRules = GeneralRules::from_ini(ini);
-        let ai_base_spacing = ini
-            .section("AI")
-            .and_then(|section| section.get_i32("AIBaseSpacing"))
-            .unwrap_or(1);
-        let parse_named_list = |section: &str, key: &str| -> Vec<String> {
-            ini.section(section)
-                .and_then(|section| section.get_list(key))
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|entry| !entry.is_empty())
-                .map(str::to_string)
-                .collect()
-        };
-        let shipyard_types = parse_named_list("General", "Shipyard");
+        let ai_base_spacing = ini.section_or_empty("AI").read_int("AIBaseSpacing", 1);
+        let shipyard_types: Vec<String> = ini
+            .section_or_empty("General")
+            .read_list("Shipyard", 0x80)
+            .map(|tokens| tokens.into_iter().map(str::to_owned).collect())
+            .unwrap_or_default();
         // gamemd-derived: `RulesClass__Process` reads type registries first
         // (`ReadBuildingTypes` 0x00668E78), then `RulesClass__ReadAI @
         // 0x00672AE0` (0x00668EC8). All seven BasePlan lists use the exact
         // char[128]/whole-buffer-trim/comma-only path owned by their blocks at
         // 0x00672B14..0x00673058 and 0x0067368C..0x0067375B. None falls back
         // to `[General]`, and individual tokens are not trimmed.
-        let parse_planning_list = |section_name: &str, key: &str| {
-            ini.section(section_name)
-                .and_then(|section| section.get(key))
-                .map(parse_native_type_list_source_tokens)
+        let parse_planning_list = |section_name: &str, key: &str| -> Vec<String> {
+            ini.section_or_empty(section_name)
+                .read_list(key, 0x80)
                 .unwrap_or_default()
+                .into_iter()
+                .filter(|token| !is_native_none_type_name(token))
+                .map(str::to_owned)
+                .collect()
         };
         let build_const_source_tokens = parse_planning_list("AI", "BuildConst");
         let build_power_source_tokens = parse_planning_list("AI", "BuildPower");
@@ -2994,11 +3283,18 @@ impl RuleSet {
         let build_tech_source_tokens = parse_planning_list("AI", "BuildTech");
         let build_weapons_source_tokens = parse_planning_list("AI", "BuildWeapons");
         let build_radar_source_tokens = parse_planning_list("AI", "BuildRadar");
+        let allied_base_defense_source_tokens = parse_planning_list("AI", "AlliedBaseDefenses");
+        let soviet_base_defense_source_tokens = parse_planning_list("AI", "SovietBaseDefenses");
+        let third_base_defense_source_tokens = parse_planning_list("AI", "ThirdBaseDefenses");
+        let concrete_wall_source_tokens = parse_planning_list("AI", "ConcreteWalls");
         let harvester_unit_source_tokens = parse_planning_list("General", "HarvesterUnit");
+        // `DifficultyClass::ReadINI_IntVector @ 0x00475D70`, reached by
+        // `RulesClass::ReadGeneral` for AISlaveMinerNumber
+        // `0x00670585..0x006705B7`, AIExtraRefineries `0x006705F9..0x0067062A`
+        // and the three BaseDefenseCounts vectors `0x00670013..0x006700BE`.
         let parse_difficulty_vector = |key: &str| {
-            ini.section("General")
-                .and_then(|section| section.get(key))
-                .map(parse_native_difficulty_int_vector)
+            ini.section_or_empty("General")
+                .read_int_list(key)
                 .unwrap_or_default()
         };
         let ai_slave_miner_number = parse_difficulty_vector("AISlaveMinerNumber");
@@ -3010,29 +3306,11 @@ impl RuleSet {
         // +0xE0C; `RulesClass::ReadGeneral @ 0x006701D9..0x006701FE` reads the
         // signed `AINavalYardAdjacency=` override.
         let ai_naval_yard_adjacency = ini
-            .section("General")
-            .and_then(|section| section.get_i32("AINavalYardAdjacency"))
-            .unwrap_or(20);
+            .section_or_empty("General")
+            .read_int("AINavalYardAdjacency", 20);
         let initial_veteran = ini
-            .section("SpecialFlags")
-            .and_then(|section| section.get_bool("InitialVeteran"))
-            .unwrap_or(false);
-        if general.condition_yellow_native != 0.5 {
-            return Err(RulesError::InvalidValue {
-                section: "AudioVisual".to_string(),
-                key: "ConditionYellow".to_string(),
-                expected: "50% (the currently certified damage-fire ratio)".to_string(),
-                value: general.condition_yellow_native.to_string(),
-            });
-        }
-        if general.condition_red_native != 0.25 {
-            return Err(RulesError::InvalidValue {
-                section: "AudioVisual".to_string(),
-                key: "ConditionRed".to_string(),
-                expected: "25% (the currently certified damage-fire ratio)".to_string(),
-                value: general.condition_red_native.to_string(),
-            });
-        }
+            .section_or_empty("SpecialFlags")
+            .read_bool("InitialVeteran", false);
         let terrain_rules: TerrainRules = TerrainRules::from_ini(ini);
         let tiberium_types = TiberiumTypeRegistry::from_ini(ini);
         let bridge_rules: BridgeRules = BridgeRules::from_ini(ini);
@@ -3046,9 +3324,8 @@ impl RuleSet {
         // `[WallModel]` is absent: 0x0066D20E passes the current
         // `[ESI+0x1850]` as the default and 0x0066D22E stores the answer back.
         let allied_wall_transparency: bool = ini
-            .section("WallModel")
-            .and_then(|s| s.get_bool("AlliedWallTransparency"))
-            .unwrap_or(false);
+            .section_or_empty("WallModel")
+            .read_bool("AlliedWallTransparency", false);
         let radiation: RadiationRules = RadiationRules::from_ini(ini);
         let radar_event_config: RadarEventConfig = RadarEventConfig::from_ini(ini);
         let country_side_registry = parse_country_side_registry(ini);
@@ -3064,16 +3341,14 @@ impl RuleSet {
             log::info!("Registry [{}]: {} entries", registry_name, ids.len());
 
             for (registry_index, id) in ids.iter().enumerate() {
-                if category == ObjectCategory::Building {
-                    building_type_indices
-                        .entry(id.to_ascii_uppercase())
-                        .or_insert(registry_index as i32);
-                }
+                type_array_indices
+                    .entry((category, id.to_ascii_uppercase()))
+                    .or_insert(registry_index as i32);
                 if let Some(section) = ini.section(id) {
                     let mut obj: ObjectType = ObjectType::from_ini_section(id, section, category);
                     if category == ObjectCategory::Building {
-                        obj.base_plan_type_index = building_type_indices
-                            .get(&id.to_ascii_uppercase())
+                        obj.base_plan_type_index = type_array_indices
+                            .get(&(category, id.to_ascii_uppercase()))
                             .copied()
                             .expect("BuildingType index was registered above");
                     }
@@ -3158,6 +3433,14 @@ impl RuleSet {
             resolve_registered(build_weapons_source_tokens, ObjectCategory::Building);
         let build_radar_types =
             resolve_registered(build_radar_source_tokens, ObjectCategory::Building);
+        let allied_base_defense_types =
+            resolve_registered(allied_base_defense_source_tokens, ObjectCategory::Building);
+        let soviet_base_defense_types =
+            resolve_registered(soviet_base_defense_source_tokens, ObjectCategory::Building);
+        let third_base_defense_types =
+            resolve_registered(third_base_defense_source_tokens, ObjectCategory::Building);
+        let concrete_wall_types =
+            resolve_registered(concrete_wall_source_tokens, ObjectCategory::Building);
         let harvester_unit_types =
             resolve_registered(harvester_unit_source_tokens, ObjectCategory::Vehicle);
         for type_id in &build_const_types {
@@ -3171,9 +3454,8 @@ impl RuleSet {
         // Step 2: Collect all weapon and warhead IDs referenced by objects.
         let (mut weapon_ids, warhead_refs) = collect_weapon_refs(&object_list);
         if let Some(default_death_weapon) = ini
-            .section("CombatDamage")
-            .and_then(|section| section.get("DeathWeapon"))
-            .filter(|value| !value.trim().is_empty())
+            .section_or_empty("CombatDamage")
+            .read_name("DeathWeapon", 0x80)
         {
             weapon_ids.insert(default_death_weapon.to_string());
         }
@@ -3374,21 +3656,23 @@ impl RuleSet {
             .map(crate::rules::bridge_warheads::BridgeWarheads::from_ini_section)
             .unwrap_or_default();
 
+        let mind_control = crate::rules::mind_control_rules::MindControlRules::from_ini(ini);
+
         // [General] rocket type/frame slots + [CombatDamage] missile warheads.
         let missile_spawn = crate::rules::missile_spawn::MissileSpawnRules::from_ini_sections(
-            ini.section("General"),
-            ini.section("CombatDamage"),
+            ini.section_or_empty("General"),
+            ini.section_or_empty("CombatDamage"),
         );
 
         // [CombatDamage] C4Delay = minutes (double). Default 0.03 = 27 ticks @ 15 fps.
         // Stored as integer ticks for lockstep-safe per-tick comparison.
         const SIM_TICKS_PER_SECOND: u32 = crate::util::fixed_math::RA2_LOGIC_FRAMES_PER_SECOND;
-        let c4_delay_ticks: u32 = ini
-            .section("CombatDamage")
-            .and_then(|s| s.get("C4Delay"))
-            .and_then(|v| v.trim().parse::<f64>().ok())
-            .map(|minutes| (minutes * 60.0 * SIM_TICKS_PER_SECOND as f64).round() as u32)
-            .unwrap_or(27); // 0.03 × 60 × 15 = 27
+        let c4_delay_ticks: u32 = (ini
+            .section_or_empty("CombatDamage")
+            .read_double("C4Delay", 0.03)
+            * 60.0
+            * SIM_TICKS_PER_SECOND as f64)
+            .round() as u32; // 0.03 × 60 × 15 = 27
 
         // Per-mission behaviour table from the [<MissionName>] sections.
         let mission_control = MissionControl::from_ini(ini);
@@ -3396,10 +3680,6 @@ impl RuleSet {
         // Parse [TerrainTypes] registry → per-type sections (TIBTRE01, TREE01, etc.).
         let mut terrain_object_types: HashMap<String, TerrainObjectType> = HashMap::new();
         let terrain_names: Vec<String> = parse_registry(ini, "TerrainTypes");
-        let tree_strength = ini
-            .section("General")
-            .and_then(|section| section.get_i32("TreeStrength"))
-            .unwrap_or(200);
         for name in &terrain_names {
             if let Some(section) = ini.section(name) {
                 terrain_object_types.insert(
@@ -3407,7 +3687,7 @@ impl RuleSet {
                     TerrainObjectType::from_ini_section_with_tree_strength(
                         name,
                         section,
-                        tree_strength,
+                        general.tree_strength,
                     ),
                 );
             }
@@ -3477,7 +3757,7 @@ impl RuleSet {
             object_list,
             object_index,
             object_category_index,
-            building_type_indices,
+            type_array_indices,
             weapons,
             warheads,
             projectiles,
@@ -3501,6 +3781,10 @@ impl RuleSet {
             build_tech_types,
             build_weapons_types,
             build_radar_types,
+            allied_base_defense_types,
+            soviet_base_defense_types,
+            third_base_defense_types,
+            concrete_wall_types,
             harvester_unit_types,
             ai_slave_miner_number,
             ai_extra_refineries,
@@ -3529,17 +3813,26 @@ impl RuleSet {
             super_weapon_order,
             combat_damage,
             bridge_warheads,
+            mind_control,
             missile_spawn,
             c4_delay_ticks,
             particle_types,
-            particle_types_by_name,
             particle_system_types,
             particle_system_types_by_name,
             voxel_anim_types,
             voxel_anim_types_by_name,
             smudge_types: SmudgeTypeRegistry::from_rules_ini(ini),
             art_registry: crate::rules::art_data::ArtRegistry::empty(),
+            anim_type_art_read_states: Vec::new(),
+            anim_type_names: ini
+                .section("Animations")
+                .into_iter()
+                .flat_map(|section| section.registry_ids())
+                .map(|name| name.to_ascii_uppercase())
+                .filter(|name| !name.is_empty())
+                .collect(),
             effect_assets: crate::rules::effect_asset_catalog::EffectAssetCatalog::default(),
+            buildup_assets: crate::rules::buildup_asset_catalog::BuildupAssetCatalog::default(),
             terrain_spawner_assets:
                 crate::rules::terrain_asset_catalog::TerrainSpawnerAssetCatalog::default(),
             animation_sequences: BTreeMap::new(),
@@ -3600,13 +3893,64 @@ impl RuleSet {
             .map(|handle| self.object_by_handle(*handle))
     }
 
+    /// The computer's base defense candidates of a House's side
+    /// (`HouseTypeClass+0xBC`): Allied for side 0, Soviet for 1, Third for any
+    /// other (`0x00507BCA..0x00507BFA`).
+    pub(crate) fn base_defense_types(&self, side_index: u8) -> &[String] {
+        match side_index {
+            0 => &self.allied_base_defense_types,
+            1 => &self.soviet_base_defense_types,
+            _ => &self.third_base_defense_types,
+        }
+    }
+
+    /// The BuildingType at native array index `index` (`BuildingTypes[index]`,
+    /// the index `ObjectType::base_plan_type_index` and BasePlan nodes hold).
+    /// `None` for a negative index, one past the array, or a registered name
+    /// without a section.
+    pub(crate) fn building_type_at(&self, index: i32) -> Option<&ObjectType> {
+        self.type_array_at(ObjectCategory::Building, index)
+    }
+
     /// Resolve one scenario BasePlan token through the native BuildingType
     /// registry only, matching
     /// `BuildingTypeClass__FindIndexByName @ 0x0045E7B0` used by
     /// `FUN_0042EBE0`, and return its ordered index.
     pub(crate) fn building_type_index(&self, id: &str) -> Option<i32> {
-        self.building_type_indices
-            .get(&id.to_ascii_uppercase())
+        self.type_array_index(ObjectCategory::Building, id)
+    }
+
+    /// The ids of one native TechnoType array (`InfantryTypeClass::Array`
+    /// `0xA8E34C`, `UnitTypeClass::Array` `0xA83CE4`, `AircraftTypeClass::
+    /// Array` `0xA8B21C`, `BuildingTypeClass::Array` `0xA83C6C`), in index
+    /// order: the registry's first spelling of each identity.
+    pub(crate) fn type_array_ids(&self, category: ObjectCategory) -> &[String] {
+        match category {
+            ObjectCategory::Infantry => &self.infantry_ids,
+            ObjectCategory::Vehicle => &self.vehicle_ids,
+            ObjectCategory::Aircraft => &self.aircraft_ids,
+            ObjectCategory::Building => &self.building_ids,
+        }
+    }
+
+    /// The type at native array index `index` of `category`'s array; `None`
+    /// for a negative index, one past the array, or a registered name
+    /// without a section.
+    pub(crate) fn type_array_at(
+        &self,
+        category: ObjectCategory,
+        index: i32,
+    ) -> Option<&ObjectType> {
+        let id = self
+            .type_array_ids(category)
+            .get(usize::try_from(index).ok()?)?;
+        self.object_in_category(category, id)
+    }
+
+    /// The native array index (`+0xDF8`) of `id` in `category`'s array.
+    pub(crate) fn type_array_index(&self, category: ObjectCategory, id: &str) -> Option<i32> {
+        self.type_array_indices
+            .get(&(category, id.to_ascii_uppercase()))
             .copied()
     }
 
@@ -3657,29 +4001,84 @@ impl RuleSet {
         })
     }
 
+    /// TechnoType virtual `+0x84`, the cost a House pays for `object`.
+    ///
+    /// `TechnoTypeClass::Cost_Of @ 0x00711F00` (Infantry, Unit and Aircraft
+    /// types) returns the type's virtual `+0xAC` cost ([`Self::type_cost`])
+    /// for a null House; otherwise it stores the country factor
+    /// (`0x0050BDF0`) and the FactoryPlant factor (`0x0050BEB0`) as floats
+    /// and returns `ftol(cost * plant * country)` (`0x00711F35..0x00711F41`).
+    /// The BuildingType override `0x0045EDD0` adjusts its actual cost
+    /// (virtual `+0xAC` = `0x0045ED50`) the same way, adds the halved sum of
+    /// both PadAircraft costs when it bundles them, and adds its FreeUnit's
+    /// cost, clamping only that arm at zero (`0x0045EE47..0x0045EE50`).
+    /// Native comparison: `tools/spatial_oracle/cost_of`.
+    pub fn cost_of(&self, object: &ObjectType, house: Option<&HouseCostFactors>) -> i32 {
+        let cost = self.adjusted_cost(object, house);
+        if object.category != ObjectCategory::Building {
+            return cost;
+        }
+        let mut cost = cost;
+        if let Some((first, second)) = self.bundled_pad_aircraft(object) {
+            let pads = self
+                .adjusted_cost(second, house)
+                .wrapping_add(self.adjusted_cost(first, house));
+            cost = cost.wrapping_add(pads / 2);
+        }
+        match object
+            .free_unit
+            .as_deref()
+            .and_then(|name| self.object(name))
+        {
+            Some(free) => cost.wrapping_add(self.adjusted_cost(free, house)).max(0),
+            None => cost,
+        }
+    }
+
+    /// `0x00711F00` over the type's virtual `+0xAC` cost ([`Self::type_cost`]).
+    fn adjusted_cost(&self, object: &ObjectType, house: Option<&HouseCostFactors>) -> i32 {
+        let cost = self.type_cost(object);
+        house.map_or(cost, |house| house.adjust(cost, object.factor_slot()))
+    }
+
+    /// The two PadAircraft a BuildingType bundles into its price: with
+    /// `SeparateAircraft=no`, when it is the first `Dock=` of the first
+    /// PadAircraft (`0x0045ED63..0x0045ED7D`).
+    fn bundled_pad_aircraft(&self, object: &ObjectType) -> Option<(&ObjectType, &ObjectType)> {
+        if self.general.separate_aircraft {
+            return None;
+        }
+        let [first_id, second_id, ..] = self.general.pad_aircraft_types.as_slice() else {
+            return None;
+        };
+        let (first, second) = (self.object(first_id)?, self.object(second_id)?);
+        first
+            .dock
+            .first()
+            .is_some_and(|dock| dock.eq_ignore_ascii_case(&object.id))
+            .then_some((first, second))
+    }
+
+    /// TechnoType virtual `+0xAC` (GetCost): `Cost=` (`0x00711EB0`), or a
+    /// BuildingType's [`Self::building_actual_cost`] (`0x0045ED50`).
+    pub fn type_cost(&self, object: &ObjectType) -> i32 {
+        if object.category == ObjectCategory::Building {
+            self.building_actual_cost(object)
+        } else {
+            object.cost
+        }
+    }
+
     /// BuildingType virtual `+0xAC` value. Wall sale invokes and discards it;
     /// receiver anger uses the same authority.
     pub(crate) fn building_actual_cost(&self, object: &ObjectType) -> i32 {
         let mut value = object.cost;
-        if !self.general.separate_aircraft
-            && let [first_id, second_id, ..] = self.general.pad_aircraft_types.as_slice()
-            && let (Some(first), Some(second)) = (
-                self.object_case_insensitive(first_id),
-                self.object_case_insensitive(second_id),
-            )
-            && first
-                .dock
-                .first()
-                .is_some_and(|dock| dock.eq_ignore_ascii_case(&object.id))
-        {
+        if let Some((first, second)) = self.bundled_pad_aircraft(object) {
             value = value.wrapping_sub(first.cost.wrapping_add(second.cost) / 2);
         }
         if let Some(free_unit) = object.free_unit.as_deref() {
             value = value
-                .wrapping_sub(
-                    self.object_case_insensitive(free_unit)
-                        .map_or(0, |free| free.cost),
-                )
+                .wrapping_sub(self.object(free_unit).map_or(0, |free| free.cost))
                 .max(0);
         }
         value
@@ -3727,12 +4126,43 @@ impl RuleSet {
     /// slices and are not claimed by this hash yet.
     pub fn simulation_config_hash(&self) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        b"rules-simulation-config-v5".hash(&mut hasher);
+        b"rules-simulation-config-v10".hash(&mut hasher);
         self.source_ini_hash.hash(&mut hasher);
+        // Process-resident Gravity and Weapon postpass results can differ for
+        // identical current source stacks because earlier passes retained them.
+        self.general.gravity.hash(&mut hasher);
+        self.general.prism_support.hash(&mut hasher);
+        self.general.missile_rot_var.to_bits().hash(&mut hasher);
+        self.general.safety_altitude.hash(&mut hasher);
+        self.general.line_trail_color_override.hash(&mut hasher);
+        self.general.lightning_warhead.hash(&mut hasher);
+        self.general.weather_con_bolt_explosion.hash(&mut hasher);
+        self.general.weapon_nullify_anim.hash(&mut hasher);
+        self.combat_damage.splash_list.hash(&mut hasher);
+        self.warheads
+            .iter()
+            .map(|(name, wh)| {
+                (
+                    name.to_ascii_uppercase(),
+                    (wh.conventional, wh.em_effect, &wh.anim_list),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+            .hash(&mut hasher);
+        self.weapons
+            .iter()
+            .map(|(id, weapon)| (id.to_ascii_uppercase(), (weapon.speed, &weapon.projectile)))
+            .collect::<BTreeMap<_, _>>()
+            .hash(&mut hasher);
+        // Selection order and duplicate references affect the scenario RNG's
+        // consumers, including the truncated retail pool's unread AnimType D.
+        self.general.metallic_debris.hash(&mut hasher);
+        self.bridge_rules.explosions.hash(&mut hasher);
         self.animation_sequences.hash(&mut hasher);
         self.effect_assets.hash(&mut hasher);
+        self.buildup_assets.hash(&mut hasher);
         self.terrain_spawner_assets.hash(&mut hasher);
-        b"art-smudge-config-v1".hash(&mut hasher);
+        b"art-smudge-config-v2".hash(&mut hasher);
         let smudge_anim_inputs = self
             .art_registry
             .iter_entries()
@@ -3754,10 +4184,37 @@ impl RuleSet {
         // These effective ART values feed ordinary FireAt after load. Hash
         // consumed values in canonical type order, not ART insertion order,
         // authored-key presence, or unrelated presentation metadata.
-        b"art-projectile-launch-config-v1".hash(&mut hasher);
+        b"art-projectile-config-v3".hash(&mut hasher);
         self.projectiles
             .iter()
-            .map(|(id, projectile)| (id.to_ascii_uppercase(), projectile.voxel))
+            .map(|(id, p)| {
+                (
+                    id.to_ascii_uppercase(),
+                    (
+                        (
+                            &p.image,
+                            &p.image_load,
+                            p.voxel,
+                            p.theater,
+                            p.new_theater,
+                            p.inviso,
+                        ),
+                        (p.rotates, p.flat, p.anim_palette),
+                        (
+                            p.use_line_trail,
+                            p.line_trail_color,
+                            p.line_trail_color_decrement,
+                        ),
+                        (
+                            p.anim_low,
+                            p.anim_high,
+                            p.anim_rate,
+                            p.spawn_delay,
+                            &p.trailer,
+                        ),
+                    ),
+                )
+            })
             .collect::<BTreeMap<_, _>>()
             .hash(&mut hasher);
         self.object_list
@@ -3771,7 +4228,115 @@ impl RuleSet {
             })
             .collect::<BTreeMap<_, _>>()
             .hash(&mut hasher);
+        // Actual selected FLH records and turret pivot, in canonical type order.
+        b"art-weapon-flh-v1".hash(&mut hasher);
+        self.object_list
+            .iter()
+            .map(|object| {
+                let art = self
+                    .art_registry
+                    .get(&object.image)
+                    .or_else(|| self.art_registry.get(&object.id));
+                // FireAt uses zero FLH/pivot when metadata is absent. Hash
+                // that same effective value, not the presence of an ART section.
+                let slots = (0..crate::rules::object_type::WEAPON_SLOT_COUNT)
+                    .map(|index| {
+                        let elite = object
+                            .elite_weapon_list
+                            .get(index)
+                            .is_some_and(Option::is_some);
+                        art.map_or_else(Default::default, |art| {
+                            (
+                                art.weapon_flh(
+                                    object.turret_count,
+                                    object.weapon_count,
+                                    index as i32,
+                                    false,
+                                ),
+                                art.weapon_flh(
+                                    object.turret_count,
+                                    object.weapon_count,
+                                    index as i32,
+                                    elite,
+                                ),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let consumed = (art.map_or(0, |art| art.turret_offset), slots);
+                (object.id.to_ascii_uppercase(), consumed)
+            })
+            .collect::<BTreeMap<_, _>>()
+            .hash(&mut hasher);
+        self.hash_building_body_config(&mut hasher);
+        self.hash_building_slot_config(&mut hasher);
         hasher.finish()
+    }
+
+    /// Slot constructors consume selected names, offsets and the common runtime
+    /// metadata. Canonical ordering makes ART section insertion order irrelevant.
+    fn hash_building_slot_config(&self, hasher: &mut impl Hasher) {
+        b"building-slot-config-v1".hash(hasher);
+        self.anim_type_names.hash(hasher);
+        self.anim_type_art_read_states.hash(hasher);
+        self.art_registry.scheduler_anim_types().hash(hasher);
+        let mut types = self.anim_type_names.clone();
+        types.extend(self.art_registry.scheduler_anim_types().iter().cloned());
+        for name in types {
+            name.hash(hasher);
+            self.art_registry.anim_runtime_config(&name).hash(hasher);
+        }
+        let buildings = self
+            .object_list
+            .iter()
+            .filter(|object| object.category == ObjectCategory::Building)
+            .map(|object| (object.id.to_ascii_uppercase(), object))
+            .collect::<BTreeMap<_, _>>();
+        for (name, object) in buildings {
+            name.hash(hasher);
+            object.powered.hash(hasher);
+            object.powered_special.hash(hasher);
+            let entry = self
+                .art_registry
+                .resolve_metadata_entry(&object.id, &object.image);
+            entry
+                .map(|e| e.building_anim_power)
+                .unwrap_or([Default::default(); 21])
+                .hash(hasher);
+            entry.is_some_and(|e| e.is_anim_delayed_fire).hash(hasher);
+            entry.is_some_and(|e| e.silo_damage).hash(hasher);
+            let mut slots = self
+                .art_registry
+                .resolve_metadata_entry(&object.id, &object.image)
+                .map(|entry| entry.building_anims.iter().collect::<Vec<_>>())
+                .unwrap_or_default();
+            slots.sort_by_key(|config| config.native_slot);
+            slots.hash(hasher);
+        }
+    }
+
+    /// Effective body inputs used by the receiver's native43EF90 frame guard.
+    /// Parser provenance: tools/spatial_oracle/building_body_rules.json.
+    fn hash_building_body_config(&self, hasher: &mut impl Hasher) {
+        b"building-body-config-v1".hash(hasher);
+        self.object_list
+            .iter()
+            .filter(|object| object.category == ObjectCategory::Building)
+            .map(|object| {
+                let art = self
+                    .art_registry
+                    .resolve_metadata_entry(&object.id, &object.image);
+                (
+                    object.id.to_ascii_uppercase(),
+                    (
+                        object.firestorm_wall,
+                        art.map_or(9, |entry| entry.building_gate_stages),
+                        art.map_or([[0, 1, 0]; 4], |entry| entry.building_body_ranges),
+                    ),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+            .hash(hasher);
     }
 
     /// FireAt's Building Height input: native BuildingRead4610D8..461101
@@ -3791,6 +4356,11 @@ impl RuleSet {
             .is_some_and(|country| country.multiplay_passive)
     }
 
+    /// The country's `ROF=` (HouseType `+0xE8`); 1.0 for an unknown country.
+    pub fn country_rof(&self, id: &str) -> f64 {
+        self.country_rules(id).map_or(1.0, |country| country.rof)
+    }
+
     /// Whether a country/house type may claim nearby map walls. Native default is true.
     pub fn country_wall_owner(&self, id: &str) -> bool {
         self.country_rules(id)
@@ -3804,15 +4374,21 @@ impl RuleSet {
             .map_or(INCOME_PPM_SCALE, |country| country.income_ppm)
     }
 
-    /// Source factors for native `HouseClass::GetArmorMultForType`. They stay
-    /// separate so the caller can first store the house-level
-    /// `difficulty * country Armor` result, then multiply the selected live
-    /// category float in the receiver's native grouping.
-    pub(crate) fn country_armor_factors(&self, id: &str, object: &ObjectType) -> (f64, f64) {
+    /// A country's `Cost*Mult=` floats (`HouseType+0x114..+0x124`), the
+    /// constructor's 1.0 for an unknown country.
+    pub(crate) fn country_cost_mults(&self, id: &str) -> [NativeF32Bits; 5] {
+        self.country_rules(id)
+            .map_or([NativeF32Bits::ONE; 5], |country| country.cost_mults)
+    }
+
+    /// `HouseClass::GetArmorMultForType @ 0x0050BD30` for a house of country
+    /// `id`: its per-category float for `object` (a `BuildCat=Combat`
+    /// building takes `ArmorDefensesMult=`), 1.0 for an unknown country.
+    pub(crate) fn country_armor_mult_for_type(&self, id: &str, object: &ObjectType) -> f32 {
         let Some(country) = self.country_rules(id) else {
-            return (1.0, 1.0);
+            return 1.0;
         };
-        let category = match object.category {
+        match object.category {
             ObjectCategory::Infantry => country.armor_infantry_mult,
             ObjectCategory::Vehicle => country.armor_units_mult,
             ObjectCategory::Aircraft => country.armor_aircraft_mult,
@@ -3820,8 +4396,21 @@ impl RuleSet {
                 country.armor_defenses_mult
             }
             ObjectCategory::Building => country.armor_buildings_mult,
+        }
+    }
+
+    /// `HouseClass @ 0x0050C0A0` for a house of country `id`: its
+    /// `BuildTime*Mult=` for `object`'s class (a `BuildCat=Combat` building
+    /// takes the defenses one), 1.0 for an unknown country.
+    pub(crate) fn country_build_time_mult_for_type(
+        &self,
+        id: &str,
+        object: &ObjectType,
+    ) -> NativeF32Bits {
+        let Some(country) = self.country_rules(id) else {
+            return NativeF32Bits::ONE;
         };
-        (country.armor, f64::from(category))
+        country.build_time_mults[object.factor_slot()]
     }
 
     /// Resolve a country name to its stable `[Countries]` registration index.
@@ -3913,10 +4502,12 @@ impl RuleSet {
     }
 
     /// Resolve a particle type name to its ID (case-insensitive).
+    #[cfg(test)]
     pub fn p_type_id_by_name(&self, name: &str) -> Option<ParticleTypeId> {
-        self.particle_types_by_name
-            .get(&name.to_ascii_uppercase())
-            .copied()
+        self.particle_types
+            .iter()
+            .position(|particle| particle.name.eq_ignore_ascii_case(name))
+            .map(|index| ParticleTypeId(index as u32))
     }
 
     /// Resolve a particle system type name to its ID (case-insensitive).
@@ -3939,16 +4530,19 @@ impl RuleSet {
     }
 
     /// Number of `[VoxelAnims]` types loaded.
+    #[cfg(test)]
     pub fn voxel_anim_type_count(&self) -> usize {
         self.voxel_anim_types.len()
     }
 
     /// Number of particle types loaded from `[Particles]`.
+    #[cfg(test)]
     pub fn particle_type_count(&self) -> usize {
         self.particle_types.len()
     }
 
     /// Number of particle system types loaded from `[ParticleSystems]`.
+    #[cfg(test)]
     pub fn particle_system_type_count(&self) -> usize {
         self.particle_system_types.len()
     }
@@ -3973,12 +4567,6 @@ impl RuleSet {
     pub fn is_refinery_type(&self, structure_id: &str) -> bool {
         self.object_case_insensitive(structure_id)
             .is_some_and(|obj| obj.refinery)
-    }
-
-    /// Whether a structure type is a repair depot (UnitRepair=yes in rules.ini).
-    pub fn is_repair_depot(&self, structure_id: &str) -> bool {
-        self.object_case_insensitive(structure_id)
-            .is_some_and(|obj| obj.unit_repair)
     }
 
     /// Resolve a refinery's free starter unit if both the refinery and the unit exist.
@@ -4012,18 +4600,17 @@ impl RuleSet {
     /// NOT exist in rules.ini. ObjectType defaults to "1x1" and this method overwrites
     /// it with the authoritative value from art.ini, resolved via the `Image=` key.
     /// Without this, all buildings would be 1x1 which breaks placement and rendering.
-    pub fn merge_art_data(&mut self, art: &crate::rules::art_data::ArtRegistry) {
-        self.art_registry = art.clone();
-        // ObjectRead 5F933B/5F962E precedes BulletRead 46C1E8. On a fresh
-        // type the Object image defaults to its ID, even though Bullet's later
-        // missing-Image read clears its separate rendering name. An explicit
-        // Image never falls back to the type ID or follows ART Image redirects.
-        for projectile in self.projectiles.values_mut() {
-            let image = projectile.image.as_deref().unwrap_or(&projectile.id);
-            if let Some(voxel) = art.get(image).and_then(|entry| entry.authored_voxel) {
-                projectile.voxel = voxel;
-            }
-        }
+    pub fn install_art_data(&mut self, art: crate::rules::art_data::ArtRegistry) {
+        self.art_registry = art;
+        self.art_registry
+            .apply_anim_type_read_states(&self.anim_type_art_read_states);
+        self.project_art_data();
+    }
+
+    fn project_art_data(&mut self) {
+        let art = &self.art_registry;
+        // Projectile ART is already projected from the per-pass registry owner.
+        // A final-image reread here would lose omission/cache/default semantics.
         let ai_base_spacing = self.ai_base_spacing;
         let mut patched: u32 = 0;
         let mut dock_patched: u32 = 0;
@@ -4039,6 +4626,8 @@ impl RuleSet {
                 infantry_checked += 1;
                 if let Some(entry) = entry {
                     obj.crawls = entry.crawls;
+                    // Original ART5246BE..52473A owns four independent signed
+                    // fields; project them without narrowing or fallback.
                     obj.fire_up_frame = entry.fire_up;
                     obj.fire_prone_frame = entry.fire_prone;
                     obj.secondary_fire_frame = entry.secondary_fire;
@@ -4080,7 +4669,7 @@ impl RuleSet {
                         crate::rules::foundation::foundation_name(&obj.foundation).to_string();
                 }
                 // Merge QueueingCell from art.ini (TibSun legacy dock system).
-                if entry.queueing_cell.is_some() {
+                if entry.queueing_cell != [0, 0] {
                     obj.queueing_cell = entry.queueing_cell;
                     dock_patched += 1;
                 }
@@ -4096,7 +4685,7 @@ impl RuleSet {
                 // anchor) keep firing. Otherwise zero-padding would silently
                 // shift refinery dock positions, which is out of scope here.
                 if !entry.pads.is_empty() {
-                    let n = obj.number_of_docks as usize;
+                    let n = obj.number_of_docks.max(0) as usize;
                     obj.pads = entry.pads.iter().take(n).copied().collect();
                     while obj.pads.len() < n {
                         obj.pads.push(crate::rules::object_type::DockPad {
@@ -4139,6 +4728,101 @@ impl RuleSet {
         self.rebuild_animation_sequences(None);
     }
 
+    /// Read the same bound ART owner used during construction and gameplay.
+    pub fn art(&self) -> &crate::rules::art_data::ArtRegistry {
+        &self.art_registry
+    }
+
+    pub(crate) fn bind_scheduler_anim_assets(
+        &mut self,
+        roots: &[String],
+        assets: &crate::assets::asset_manager::AssetManager,
+        theater_ext: &str,
+        theater_name: &str,
+    ) -> Result<(), crate::rules::art_data::AnimAssetBindError> {
+        self.art_registry
+            .bind_scheduler_anim_assets(roots, assets, theater_ext, theater_name)
+    }
+
+    pub(crate) fn bind_anim_class_assets(
+        &mut self,
+        roots: &[String],
+        assets: &crate::assets::asset_manager::AssetManager,
+        theater_ext: &str,
+        theater_name: &str,
+    ) -> usize {
+        self.art_registry
+            .bind_anim_class_assets(roots, assets, theater_ext, theater_name)
+    }
+
+    pub(crate) fn populate_anim_frame_dims(
+        &mut self,
+        assets: &crate::assets::asset_manager::AssetManager,
+        theater_ext: &str,
+        theater_name: &str,
+    ) -> (u32, u32) {
+        self.art_registry
+            .populate_anim_frame_dims(assets, theater_ext, theater_name)
+    }
+
+    /// Extend the bound closure before an authored-load constructor spends its
+    /// native ID. The constructor then borrows this same owner for Reveal/Start
+    /// (AnimClass421EA0, Unlimbo5F4EC0, Start424CE0).
+    pub(crate) fn bind_authored_load_anim(
+        &mut self,
+        name: &str,
+        assets: &crate::assets::asset_manager::AssetManager,
+        theater_ext: &str,
+        theater_name: &str,
+    ) -> Result<(), crate::rules::art_data::AnimAssetBindError> {
+        let mut roots: Vec<String> = self
+            .art_registry
+            .scheduler_anim_types()
+            .iter()
+            .cloned()
+            .collect();
+        roots.push(name.to_ascii_uppercase());
+        roots.sort();
+        roots.dedup();
+        // Preserve the existing strict load failure boundary. RESIDUAL: a
+        // previously tolerant root with a missing chained SHP can fail here.
+        // This affects modded art; none of retail's nine chain keys starts
+        // from a tolerant root. No new asset admission policy is introduced.
+        self.bind_scheduler_anim_assets(&roots, assets, theater_ext, theater_name)
+    }
+
+    /// Synthetic fixtures that previously projected ART then restored the raw
+    /// registry deliberately bypass native read admission. Move that fixture
+    /// once while sharing the production projection, without clone publication.
+    #[cfg(test)]
+    pub(crate) fn install_art_fixture(&mut self, art: crate::rules::art_data::ArtRegistry) {
+        self.art_registry = art;
+        self.project_art_data();
+    }
+
+    /// Raw synthetic fixture replacement: no native admission or field projection.
+    #[cfg(test)]
+    pub(crate) fn replace_art_registry_for_test(
+        &mut self,
+        art: crate::rules::art_data::ArtRegistry,
+    ) {
+        self.art_registry = art;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bind_anim_frame_count_for_test(&mut self, name: &str, raw_count: i32) {
+        self.art_registry
+            .bind_anim_frame_count_for_test(name, raw_count);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn art_entry_mut_for_test(
+        &mut self,
+        name: &str,
+    ) -> Option<&mut crate::rules::art_data::ArtEntry> {
+        self.art_registry.get_mut(name)
+    }
+
     /// Resolve every registered object type's authoritative animation timing
     /// after ART's `[*Sequence]` sections have been parsed.
     pub fn bind_animation_sequences(
@@ -4148,8 +4832,8 @@ impl RuleSet {
         self.rebuild_animation_sequences(Some(infantry_sequences));
     }
 
-    /// Resolve authoritative world-effect and particle SHP frame counts from
-    /// the active theater assets without constructing a renderer atlas.
+    /// Resolve particle image SHP frame counts from the active theater assets
+    /// without constructing a renderer atlas.
     pub fn bind_effect_assets(
         &mut self,
         asset_manager: &crate::assets::asset_manager::AssetManager,
@@ -4183,16 +4867,44 @@ impl RuleSet {
             );
     }
 
-    /// Authoritative consumer-visible SHP frame count for a world effect or
-    /// particle image. Lookup is case-insensitive and does not intern names.
-    pub fn effect_frame_count(&self, name: &str) -> Option<u16> {
-        self.effect_assets.effect_frame_count(name)
+    /// Resolve every building type's Buildup SHP from the active theater's
+    /// assets into its construction control, without a renderer atlas.
+    pub fn bind_building_buildup_assets(
+        &mut self,
+        asset_manager: &crate::assets::asset_manager::AssetManager,
+        theater_name: &str,
+    ) {
+        self.buildup_assets = crate::rules::buildup_asset_catalog::BuildupAssetCatalog::bind(
+            self,
+            asset_manager,
+            theater_name,
+        );
     }
 
-    /// Literal SHP header frame count retained for parity investigation where
-    /// the native particle body/shadow policy is still UNCHECKED.
-    pub fn raw_effect_frame_count(&self, name: &str) -> Option<u16> {
-        self.effect_assets.raw_frame_count(name)
+    /// A building type's construction control (`Type+0xF04`: first frame,
+    /// frame count, rate); the constructor's `{0, 1, 0}` when its Buildup SHP
+    /// is unbound.
+    pub fn buildup_control(&self, type_id: &str) -> [i32; 3] {
+        self.buildup_assets.control(type_id)
+    }
+
+    /// Whether a building type's Buildup SHP is bound (`+0x6E9`,
+    /// [`crate::rules::buildup_asset_catalog::BuildupAssetCatalog::has_buildup`]).
+    pub fn has_buildup(&self, type_id: &str) -> bool {
+        self.buildup_assets.has_buildup(type_id)
+    }
+
+    /// Install one building type's construction control (fixtures without
+    /// assets).
+    #[cfg(test)]
+    pub(crate) fn set_buildup_control_for_test(&mut self, type_id: &str, control: [i32; 3]) {
+        self.buildup_assets.insert_for_test(type_id, control);
+    }
+
+    /// Consumer-visible SHP frame count for a particle image. Lookup is
+    /// case-insensitive and does not intern names.
+    pub fn effect_frame_count(&self, name: &str) -> Option<u16> {
+        self.effect_assets.effect_frame_count(name)
     }
 
     /// Raw SHP header count used by `TerrainClass::AI` midpoint timing.
@@ -4273,6 +4985,7 @@ impl RuleSet {
     }
 
     /// Total number of projectiles.
+    #[cfg(test)]
     pub fn projectile_count(&self) -> usize {
         self.projectiles.len()
     }
@@ -4347,7 +5060,8 @@ fn parse_country_side_registry(ini: &IniFile) -> ParsedCountrySideRegistry {
     if let Some(sides) = ini.section("Sides") {
         for side_name in sides.keys() {
             let side = find_or_allocate_side(side_name, &mut side_ids, &mut side_indices);
-            if let Some(members) = sides.get_list(side_name) {
+            // `0x004767C0`: ReadString into `char[128]`, then `strtok(",")`.
+            if let Some(members) = sides.read_list(side_name, 0x80) {
                 for member in members {
                     let country = find_or_allocate_country(
                         member,
@@ -4489,12 +5203,9 @@ fn parse_prerequisite_groups(ini: &IniFile) -> HashMap<String, Vec<String>> {
     ];
 
     for &(ini_key, alias) in PREREQ_KEYS {
-        if let Some(list) = general.get_list(ini_key) {
-            let ids: Vec<String> = list
-                .into_iter()
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_ascii_uppercase())
-                .collect();
+        // `0x004770E0`: ReadString into `char[128]`, then `strtok(",")`.
+        if let Some(list) = general.read_list(ini_key, 0x80) {
+            let ids: Vec<String> = list.into_iter().map(str::to_ascii_uppercase).collect();
             if !ids.is_empty() {
                 groups.insert(alias.to_string(), ids);
             }
@@ -4697,6 +5408,32 @@ SpawnCount=3
     use crate::rules::native_processing::RulesLayerKind;
 
     #[test]
+    fn retail_shell_slide_cues_come_from_audio_visual() {
+        // RulesClass+0x19C GUIMoveOutSound (0x006694C7) and +0x1A0
+        // GUIMoveInSound (0x00669509), read from [AudioVisual].
+        let Some(ini) = crate::rules::retail_ini_fixture::retail_ini("rulesmd.ini") else {
+            return;
+        };
+        let general = GeneralRules::from_ini(&ini);
+        assert_eq!(general.gui_move_out_sound.as_deref(), Some("MenuSlideOut"));
+        assert_eq!(general.gui_move_in_sound.as_deref(), Some("MenuSlideIn"));
+    }
+
+    #[test]
+    fn retail_production_click_keys_come_from_rulesmd() {
+        // Rules+0xF0 MaximumQueuedObjects ([General], 0x00671DA7), +0x18C
+        // GUIBuildSound and +0x700 ScoldSound ([AudioVisual], 0x006693C1 and
+        // 0x0066ABE8).
+        let Some(ini) = crate::rules::retail_ini_fixture::retail_ini("rulesmd.ini") else {
+            return;
+        };
+        let general = GeneralRules::from_ini(&ini);
+        assert_eq!(general.maximum_queued_objects, 29);
+        assert_eq!(general.gui_build_sound.as_deref(), Some("MenuClick"));
+        assert_eq!(general.scold_sound.as_deref(), Some("MenuScold"));
+    }
+
+    #[test]
     fn cloak_global_defaults_and_native_minute_conversion_parse() {
         let defaults = GeneralRules::default();
         assert_eq!(defaults.cloaking_stages, 9);
@@ -4824,6 +5561,91 @@ CellSpread=0
 
     /// P7: per-country IncomeMult parses to PPM, defaults to the neutral 1.0×, and looks
     /// up case-insensitively. The hand-written Default must NOT be a derived zero.
+    #[test]
+    fn cost_of_matches_the_original_cost_virtuals() {
+        let rows: serde_json::Value =
+            serde_json::from_str(include_str!("../../tools/spatial_oracle/cost_of.json")).unwrap();
+        let bits = |value: &serde_json::Value| -> [NativeF32Bits; 5] {
+            let bits: Vec<u32> = value
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|bits| bits.as_u64().unwrap() as u32)
+                .collect();
+            std::array::from_fn(|slot| NativeF32Bits::from_bits(bits[slot]))
+        };
+        let rows = rows.as_array().unwrap();
+        for row in rows {
+            let input = &row["input"];
+            let cost = input["cost"].as_i64().unwrap();
+            let techno = input["techno"].as_str();
+            let own_cost = |kind: &str, other: i64| if techno == Some(kind) { cost } else { other };
+            let free = input["free"].as_i64();
+            let pads = &input["pads"];
+            let key = |set: bool, line: &'static str| if set { line } else { "" };
+            let separate = if input["separate_aircraft"] == 1 {
+                "yes"
+            } else {
+                "no"
+            };
+            let ini = format!(
+                "[General]\nSeparateAircraft={}\nPadAircraft=PAD1,PAD2\n\
+                 [BuildingTypes]\n0=BUILDING\n[VehicleTypes]\n0=FREE\n\
+                 [InfantryTypes]\n0=INF\n[AircraftTypes]\n0=PAD1\n1=PAD2\n\
+                 [BUILDING]\nCost={cost}\n{}{}\n[FREE]\nCost={}\n[INF]\nCost={cost}\n\
+                 [PAD1]\nCost={}\n{}\n[PAD2]\nCost={}\n",
+                separate,
+                key(free.is_some(), "FreeUnit=FREE\n"),
+                key(input["build_cat"] == 5, "BuildCat=Combat"),
+                own_cost("unit", free.unwrap_or(0)),
+                own_cost("aircraft", pads[0].as_i64().unwrap()),
+                key(input["docks"] == true, "Dock=BUILDING"),
+                pads[1].as_i64().unwrap(),
+            );
+            let rules = RuleSet::from_ini(&IniFile::from_str(&ini)).unwrap();
+            let object = match techno {
+                None => "BUILDING",
+                Some("unit") => "FREE",
+                Some("infantry") => "INF",
+                Some(_) => "PAD1",
+            };
+            let factors = HouseCostFactors {
+                country: bits(&input["country"]),
+                factory_plant: bits(&input["plant"]),
+            };
+            let house = (input["house"] == true).then_some(&factors);
+            assert_eq!(
+                rules.cost_of(rules.object(object).unwrap(), house),
+                row["cost"].as_i64().unwrap() as i32,
+                "native Cost_Of row {input}"
+            );
+        }
+        assert_eq!(rows.len(), 90);
+    }
+
+    #[test]
+    fn country_cost_mults_read_doubles_into_floats() {
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[Countries]\n0=Americans\n1=Russians\n\
+             [Americans]\nCostInfantryMult=.8\nCostUnitsMult=85%\n",
+        ))
+        .unwrap();
+        let one = NativeF32Bits::ONE;
+        assert_eq!(
+            rules.country_cost_mults("americans"),
+            [
+                NativeF32Bits::from_bits(0.8_f32.to_bits()),
+                // 0.85000000000000009 stored under the chop control word.
+                NativeF32Bits::from_bits(0x3F59_9999),
+                one,
+                one,
+                one,
+            ]
+        );
+        assert_eq!(rules.country_cost_mults("Russians"), [one; 5]);
+        assert_eq!(rules.country_cost_mults("Nowhere"), [one; 5]);
+    }
+
     #[test]
     fn country_income_mult_parses_and_defaults() {
         assert_eq!(
@@ -4971,13 +5793,55 @@ CellSpread=0
         assert_eq!(rules.aircraft_ids.len(), 0);
         assert_eq!(rules.building_ids.len(), 1);
         assert_eq!(rules.object_count(), 4); // E1, E2, MTNK, GAPOWR
-        assert!((rules.production.build_speed - 0.75).abs() < 0.0001);
-        assert!((rules.production.multiple_factory - 0.7).abs() < 0.0001);
-        assert!((rules.production.low_power_penalty_modifier - 1.25).abs() < 0.0001);
-        assert!((rules.production.min_low_power_production_speed - 0.4).abs() < 0.0001);
-        assert!((rules.production.max_low_power_production_speed - 0.85).abs() < 0.0001);
-        assert_eq!(rules.bridge_rules.strength, 1500);
+        // ReadDouble scans a float and widens it; float fields store it back.
+        let float = |value: f32| NativeF32Bits::from_bits(value.to_bits());
+        assert_eq!(
+            rules.production.build_speed,
+            NativeF64Bits::from_bits(f64::from(0.75_f32).to_bits())
+        );
+        assert_eq!(rules.production.multiple_factory, float(0.7));
+        assert_eq!(rules.production.low_power_penalty_modifier, float(1.25));
+        assert_eq!(rules.production.min_low_power_production_speed, float(0.4));
+        assert_eq!(rules.production.max_low_power_production_speed, float(0.85));
+        assert_eq!(rules.bridge_rules.strength, 1000);
         assert!(rules.bridge_rules.destroyable_by_default);
+    }
+
+    /// `HouseClass @ 0x0050C0A0` takes the country's build-time multiplier by
+    /// WhatAmI: infantry `+0x134`, units `+0x138`, aircraft `+0x13C`, and a
+    /// building's `+0x140`, or `+0x144` when its BuildCat is 5, Combat
+    /// (`0x0050C0F0`). An absent key or an unknown country gives 1.0.
+    #[test]
+    fn country_build_time_mults_follow_the_native_slots() {
+        let ini = IniFile::from_str(
+            "[Countries]\n0=T\n1=U\n\
+             [T]\nBuildTimeInfantryMult=0.5\nBuildTimeUnitsMult=0.75\n\
+             BuildTimeAircraftMult=1.25\nBuildTimeBuildingsMult=1.5\n\
+             BuildTimeDefensesMult=2.0\n\
+             [U]\nBuildTimeUnitsMult=0.8\n\
+             [InfantryTypes]\n0=I\n[VehicleTypes]\n0=V\n[AircraftTypes]\n0=A\n\
+             [BuildingTypes]\n0=B\n1=D\n2=P\n\
+             [I]\nStrength=1\n[V]\nStrength=1\n[A]\nStrength=1\n[B]\nStrength=1\n\
+             [D]\nStrength=1\nBuildCat=Combat\n[P]\nStrength=1\nBuildCat=Power\n",
+        );
+        let rules = RuleSet::from_ini(&ini).expect("country fixture parses");
+        let float = |value: f32| NativeF32Bits::from_bits(value.to_bits());
+        let mult = |country: &str, object: &str| {
+            rules.country_build_time_mult_for_type(country, rules.object(object).unwrap())
+        };
+        for (object, expected) in [
+            ("I", 0.5),
+            ("V", 0.75),
+            ("A", 1.25),
+            ("B", 1.5),
+            ("D", 2.0),
+            ("P", 1.5),
+        ] {
+            assert_eq!(mult("T", object), float(expected), "{object}");
+        }
+        assert_eq!(mult("U", "V"), float(0.8));
+        assert_eq!(mult("U", "I"), NativeF32Bits::ONE);
+        assert_eq!(mult("Nowhere", "V"), NativeF32Bits::ONE);
     }
 
     #[test]
@@ -5031,15 +5895,54 @@ CellSpread=0
 
         let parsed = GeneralRules::from_ini(&IniFile::from_str(
             "[General]\n\
-             ComputerBaseDefenseResponse=-4\n\
              BaseDefenseDelay=.125\n\
              SuspendPriority=-2\n\
-             SuspendDelay=1.5\n",
+             SuspendDelay=1.5\n\
+             [AI]\nComputerBaseDefenseResponse=-4\n",
         ));
         assert_eq!(parsed.computer_base_defense_response, -4);
         assert_eq!(parsed.base_defense_delay_minutes, 0.125_f32 as f64);
         assert_eq!(parsed.suspend_priority, -2);
         assert_eq!(parsed.suspend_delay_minutes, 1.5_f32 as f64);
+    }
+
+    /// Original Rules ReadAI673E41..673E61 uses the AI section pointer;
+    /// a later General-only pass cannot overwrite the retained AI value.
+    /// Executable controls are saved by foot_navigation_coordinate --base-response.
+    #[test]
+    fn native_base_response_reads_ai_section_across_rules_passes() {
+        let mut layers = RulesLayerStack::new(IniFile::from_str(
+            "[General]\nComputerBaseDefenseResponse=17\n\
+             [AI]\nComputerBaseDefenseResponse=5\n",
+        ));
+        layers.push(
+            crate::rules::native_processing::RulesLayerKind::Scenario,
+            IniFile::from_str("[General]\nComputerBaseDefenseResponse=19\n"),
+        );
+        let rules = RuleSet::from_rules_layers(&layers).unwrap();
+        assert_eq!(rules.general.computer_base_defense_response, 5);
+    }
+
+    /// Original TechnoType ReadINI71464A..71469F retains the current speed
+    /// when a later rules pass reads -1. The constructor starts it at zero.
+    /// Executed reader history: spatial_oracle/base_defense_response.json.
+    #[test]
+    fn native_base_response_type_speed_retains_minus_one_across_rules_passes() {
+        let mut layers = RulesLayerStack::new(IniFile::from_str(
+            "[VehicleTypes]\n0=V\n[V]\nStrength=100\nSpeed=7\n",
+        ));
+        layers.push(
+            crate::rules::native_processing::RulesLayerKind::Scenario,
+            IniFile::from_str("[V]\nSpeed=-1\n"),
+        );
+        let rules = RuleSet::from_rules_layers(&layers).unwrap();
+        assert_eq!(rules.object("V").unwrap().speed, 7);
+        assert_eq!(
+            crate::util::fixed_math::ra2_speed_to_leptons_per_frame(
+                rules.object("V").unwrap().speed,
+            ),
+            17,
+        );
     }
 
     #[test]
@@ -5241,7 +6144,10 @@ MutateWarhead=MyMutate\n\
         assert_eq!(e1.strength, 125);
         assert_eq!(e1.category, ObjectCategory::Infantry);
         assert_eq!(e1.primary, Some("M60".to_string()));
-        assert!((e1.build_time_multiplier - 1.15).abs() < 0.0001);
+        assert_eq!(
+            e1.build_time_multiplier,
+            NativeF32Bits::from_bits(1.15_f32.to_bits())
+        );
 
         let mtnk: &ObjectType = rules.object("MTNK").expect("MTNK exists");
         assert_eq!(mtnk.cost, 700);
@@ -5282,12 +6188,11 @@ MutateWarhead=MyMutate\n\
 
         // Warheads referenced by weapons should be loaded.
         let sa: &WarheadType = rules.warhead("SA").expect("SA exists");
-        assert_eq!(sa.verses.len(), 11);
-        assert_eq!(sa.verses[0], 100); // none: 100%
-        assert_eq!(sa.verses[5], 25); // heavy: 25%
+        assert!((sa.verses_f64[0] - 1.0).abs() < 1e-9); // none: 100%
+        assert!((sa.verses_f64[5] - 0.25).abs() < 1e-9); // heavy: 25%
 
         let ap: &WarheadType = rules.warhead("AP").expect("AP exists");
-        assert_eq!(ap.verses[6], 60); // wood: 60%
+        assert!((ap.verses_f64[6] - 0.6).abs() < 1e-9); // wood: 60%
     }
 
     #[test]
@@ -5322,10 +6227,10 @@ MutateWarhead=MyMutate\n\
         assert!(std::ptr::eq(lower, mixed));
         assert_eq!(lower.id, "RegistryOnlyWH");
         assert_eq!(lower.percent_at_max, 50);
-        assert_eq!(
-            lower.verses,
-            vec![100, 90, 80, 70, 60, 50, 40, 30, 20, 10, 0]
-        );
+        let expected = [1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0];
+        for (actual, expected) in lower.verses_f64.iter().zip(expected) {
+            assert!((actual - expected).abs() < 1e-9);
+        }
     }
 
     #[test]
@@ -5342,7 +6247,7 @@ MutateWarhead=MyMutate\n\
              Harvester=yes\n\
              Dock=modproc\n\
              [MODPROC]\n\
-             Refinery=yes\n\
+             Refinery=yes\nDockUnload=yes\n\
              FreeUnit=modharv\n\
              [FAKEREF]\n\
              Name=Fake Refinery\n",
@@ -5369,7 +6274,7 @@ MutateWarhead=MyMutate\n\
              [BuildingTypes]\n\
              0=MODPROC\n\
              [MODPROC]\n\
-             Refinery=yes\n\
+             Refinery=yes\nDockUnload=yes\n\
              FreeUnit=UNKNOWN\n",
         );
         let rules = RuleSet::from_ini(&ini).expect("Should parse");
@@ -5391,25 +6296,36 @@ MutateWarhead=MyMutate\n\
              [BuildingTypes]\n\
              [General]\n\
              TiberiumShortScan=10\n\
-             TiberiumLongScan=60\n\
+             TiberiumLongScan=6.5\n\
+             HarvesterLoadRate=3\n\
              SlaveMinerShortScan=12\n\
              SlaveMinerSlaveScan=20\n\
              SlaveMinerLongScan=55\n\
              SlaveMinerScanCorrection=5\n\
              SlaveMinerKickFrameDelay=200\n\
              HarvesterTooFarDistance=8\n\
+             MaximumQueuedObjects=$1D\n\
              ChronoHarvTooFarDistance=40\n\
+             ApproachTargetResetMultiplier=1.5\n\
              PurifierBonus=.30\n",
         );
         let rules = RuleSet::from_ini(&ini).expect("Should parse");
-        assert_eq!(rules.general.tiberium_short_scan, 10);
-        assert_eq!(rules.general.tiberium_long_scan, 60);
-        assert_eq!(rules.general.slave_miner_short_scan, 12);
-        assert_eq!(rules.general.slave_miner_slave_scan, 20);
-        assert_eq!(rules.general.slave_miner_long_scan, 55);
-        assert_eq!(rules.general.slave_miner_scan_correction, 5);
+        // ReadRange: cells x 256, chopped.
+        assert_eq!(rules.general.tiberium_short_scan, 10 * 256);
+        assert_eq!(rules.general.tiberium_long_scan, 1664);
+        assert_eq!(rules.general.harvester_load_rate, 3);
+        assert_eq!(rules.general.slave_miner_short_scan, 12 * 256);
+        assert_eq!(rules.general.slave_miner_slave_scan, 20 * 256);
+        assert_eq!(rules.general.slave_miner_long_scan, 55 * 256);
+        assert_eq!(rules.general.slave_miner_scan_correction, 5 * 256);
         assert_eq!(rules.general.slave_miner_kick_frame_delay, 200);
+        // ReadInt stops at the decimal point.
+        assert_eq!(rules.general.approach_target_reset_multiplier, 1);
         assert_eq!(rules.general.harvester_too_far_distance, 8);
+        assert_eq!(
+            rules.general.maximum_queued_objects, 29,
+            "ReadInt takes `$` hex"
+        );
         assert_eq!(rules.general.chrono_harv_too_far_distance, 40);
         assert_eq!(rules.general.purifier_bonus_ppm, 300_000);
     }
@@ -5425,14 +6341,18 @@ MutateWarhead=MyMutate\n\
              FixtureOnly=1\n",
         );
         let rules = RuleSet::from_ini(&ini).expect("Should parse");
-        assert_eq!(rules.general.tiberium_short_scan, 6);
-        assert_eq!(rules.general.tiberium_long_scan, 48);
-        assert_eq!(rules.general.slave_miner_short_scan, 8);
-        assert_eq!(rules.general.slave_miner_slave_scan, 14);
-        assert_eq!(rules.general.slave_miner_long_scan, 48);
-        assert_eq!(rules.general.slave_miner_scan_correction, 3);
-        assert_eq!(rules.general.slave_miner_kick_frame_delay, 150);
+        // The RulesClass constructor's leptons (`0x00667638`, `0x00667642`).
+        assert_eq!(rules.general.tiberium_short_scan, 0x600);
+        assert_eq!(rules.general.tiberium_long_scan, 0x2000);
+        assert_eq!(rules.general.harvester_load_rate, 2);
+        assert_eq!(rules.general.slave_miner_short_scan, 0x500);
+        assert_eq!(rules.general.slave_miner_slave_scan, 0x1000);
+        assert_eq!(rules.general.slave_miner_long_scan, 0x5000);
+        assert_eq!(rules.general.slave_miner_scan_correction, 0x300);
+        assert_eq!(rules.general.slave_miner_kick_frame_delay, 0x7FFF_FFFF);
+        assert_eq!(rules.general.approach_target_reset_multiplier, 1);
         assert_eq!(rules.general.harvester_too_far_distance, 5);
+        assert_eq!(rules.general.maximum_queued_objects, 5);
         assert_eq!(rules.general.chrono_harv_too_far_distance, 50);
         assert_eq!(rules.general.purifier_bonus_ppm, 250_000);
     }
@@ -5483,18 +6403,40 @@ MutateWarhead=MyMutate\n\
     }
 
     #[test]
-    fn metallic_debris_default_matches_retail() {
-        let g = GeneralRules::default();
-        assert_eq!(g.metallic_debris.len(), 20);
-        assert_eq!(g.metallic_debris[0], "DBRIS1LG");
-        assert_eq!(g.metallic_debris[19], "DBRS10SM");
+    fn bridge_animation_vectors_have_empty_constructor_defaults() {
+        assert!(GeneralRules::default().metallic_debris.is_empty());
+        assert!(BridgeRules::default().explosions.is_empty());
+        let rules = RuleSet::from_ini(&IniFile::empty()).unwrap();
+        assert!(rules.general.metallic_debris.is_empty());
+        assert!(rules.bridge_rules.explosions.is_empty());
     }
 
     #[test]
     fn metallic_debris_parses_from_ini() {
         let ini = IniFile::from_str("[General]\nMetallicDebris=ANIM1,ANIM2,ANIM3\n");
-        let g = GeneralRules::from_ini(&ini);
-        assert_eq!(g.metallic_debris, vec!["ANIM1", "ANIM2", "ANIM3"]);
+        let rules = RuleSet::from_ini(&ini).unwrap();
+        assert_eq!(
+            rules.general.metallic_debris,
+            vec!["ANIM1", "ANIM2", "ANIM3"]
+        );
+    }
+
+    #[test]
+    fn resolved_bridge_animation_order_and_duplicates_affect_simulation_hash() {
+        let mut rules = RuleSet::from_ini(&IniFile::from_str(
+            "[General]\nMetallicDebris=A,B,A\nBridgeExplosions=X,Y\n",
+        ))
+        .unwrap();
+        let original = rules.simulation_config_hash();
+        rules.general.metallic_debris.swap(0, 1);
+        assert_ne!(original, rules.simulation_config_hash());
+        rules.general.metallic_debris.swap(0, 1);
+        rules.general.metallic_debris.pop();
+        assert_ne!(original, rules.simulation_config_hash());
+        rules.general.metallic_debris.push("A".to_owned());
+        assert_eq!(original, rules.simulation_config_hash());
+        rules.bridge_rules.explosions.reverse();
+        assert_ne!(original, rules.simulation_config_hash());
     }
 
     #[test]
@@ -6194,34 +7136,26 @@ ParachuteMaxFallRate=-1
     }
 
     #[test]
-    fn test_missile_rot_var_missing_key_falls_back_to_one() {
+    fn test_missile_rot_var_missing_key_keeps_native_constructor() {
         let ini = IniFile::from_str("[General]\nFixtureOnly=1\n");
         let general = GeneralRules::from_ini(&ini);
-        assert_eq!(general.missile_rot_var, sim_from_f32(1.0));
+        assert_eq!(general.missile_rot_var, 0.25);
     }
 
     #[test]
     fn test_missile_rot_var_stock_rules_value_parsed() {
         let ini = IniFile::from_str("[General]\nMissileROTVar=.25\n");
         let general = GeneralRules::from_ini(&ini);
-        let diff = (general.missile_rot_var - SimFixed::lit("0.25")).abs();
-        assert!(
-            diff < SimFixed::lit("0.001"),
-            "got {:?}",
-            general.missile_rot_var
-        );
+        let diff = (general.missile_rot_var - 0.25).abs();
+        assert!(diff < 0.001, "got {:?}", general.missile_rot_var);
     }
 
     #[test]
     fn test_missile_rot_var_parsed() {
         let ini = IniFile::from_str("[General]\nMissileROTVar=2.5\n");
         let general = GeneralRules::from_ini(&ini);
-        let diff = (general.missile_rot_var - sim_from_f32(2.5)).abs();
-        assert!(
-            diff < SimFixed::lit("0.001"),
-            "got {:?}",
-            general.missile_rot_var
-        );
+        let diff = (general.missile_rot_var - 2.5).abs();
+        assert!(diff < 0.001, "got {:?}", general.missile_rot_var);
     }
 
     #[test]
@@ -6379,30 +7313,20 @@ DefaultSparkSystem=SparkSys
     }
 
     #[test]
-    fn damage_fire_thresholds_accept_only_the_certified_stock_ratios() {
-        let stock = IniFile::from_str(
-            "[General]\nDamageFireTypes=FIRE01\n\n[AudioVisual]\nConditionYellow=50%\nConditionRed=25%\n",
+    fn damage_fire_thresholds_use_the_same_authored_double_as_other_health_readers() {
+        let ini = IniFile::from_str(
+            "[General]\nDamageFireTypes=FIRE01\n[AudioVisual]\nConditionYellow=49%\nConditionRed=13%\n",
         );
-        let rules = RuleSet::from_ini(&stock).expect("stock thresholds");
+        let rules = RuleSet::from_ini(&ini).expect("native thresholds are not stock-only");
+        let section = ini.section("AudioVisual").unwrap();
         assert_eq!(
-            rules.general.damage_fire_ordinary_ratio,
-            DamageFireHealthRatio {
-                numerator: 1,
-                denominator: 2,
-            }
+            rules.general.condition_yellow,
+            section.read_double("ConditionYellow", 0.5)
         );
         assert_eq!(
-            rules.general.damage_fire_occupied_ratio,
-            DamageFireHealthRatio {
-                numerator: 1,
-                denominator: 4,
-            }
+            rules.general.condition_red,
+            section.read_double("ConditionRed", GeneralRules::default().condition_red)
         );
-
-        let unsupported = IniFile::from_str(
-            "[General]\nDamageFireTypes=FIRE01\n\n[AudioVisual]\nConditionYellow=49%\nConditionRed=25%\n",
-        );
-        assert!(RuleSet::from_ini(&unsupported).is_err());
     }
 
     #[test]
@@ -6441,6 +7365,27 @@ DefaultSparkSystem=SparkSys
     }
 
     #[test]
+    fn health_conditions_retain_the_native_double_without_scaled_copies() {
+        let ini = IniFile::from_str("[AudioVisual]\nConditionYellow=37%\nConditionRed=13%\n");
+        let general = GeneralRules::from_ini(&ini);
+        let section = ini.section("AudioVisual").unwrap();
+        assert_eq!(
+            general.condition_yellow.to_bits(),
+            section.read_double("ConditionYellow", 0.5).to_bits()
+        );
+        assert_eq!(
+            general.condition_red.to_bits(),
+            section
+                .read_double("ConditionRed", GeneralRules::default().condition_red)
+                .to_bits()
+        );
+        assert_ne!(
+            general.condition_yellow.to_bits(),
+            f64::from(general.condition_yellow as f32).to_bits()
+        );
+    }
+
+    #[test]
     fn targeting_delay_defaults_and_override() {
         // Stock rulesmd.ini carries both keys with exactly the constructor
         // defaults; a missing section must still yield them.
@@ -6456,6 +7401,13 @@ DefaultSparkSystem=SparkSys
         ));
         assert_eq!(g.normal_targeting_delay, 9);
         assert_eq!(g.guard_area_targeting_delay, 13);
+        // ReadInt keeps a negative delay (no clamp at `0x006701B4` or
+        // `0x006701D3`).
+        let g = GeneralRules::from_ini(&ini_with_general(
+            "NormalTargetingDelay=-3\nGuardAreaTargetingDelay=-10",
+        ));
+        assert_eq!(g.normal_targeting_delay, -3);
+        assert_eq!(g.guard_area_targeting_delay, -10);
     }
 
     #[test]
@@ -6498,7 +7450,6 @@ DefaultSparkSystem=SparkSys
         let ini = IniFile::from_str("[Foo]\nBar=1\n");
         let g = GeneralRules::from_ini(&ini);
         assert_eq!(g.paradrop_radius, 1024);
-        assert_eq!(g.paradrop_aircraft_type, "PDPLANE");
         assert_eq!(g.amer_paradrop_list, vec![("E1".to_string(), 8)]);
         assert_eq!(g.ally_paradrop_list, vec![("E1".to_string(), 6)]);
         assert_eq!(g.sov_paradrop_list, vec![("E2".to_string(), 9)]);
@@ -6578,62 +7529,20 @@ Projectile=Invisible
     }
 
     #[test]
-    fn parses_parachute_render_config_from_artmd() {
-        let rules_text = "\
-[General]
-Parachute=PARACH
-";
-        let art_text = "\
-[PARACH]
-Rate=400
-LoopStart=20
-LoopEnd=39
-LoopCount=30
-AltPalette=yes
-ZAdjust=-10
-";
-        let rules_ini = IniFile::from_str(rules_text);
-        let art_ini = IniFile::from_str(art_text);
-        let mut general = GeneralRules::from_ini(&rules_ini);
-        assert_eq!(general.parachute_shp.as_deref(), Some("PARACH"));
-        general.resolve_art_rates(&art_ini);
-        let pc = general
-            .parachute_render
-            .as_ref()
-            .expect("parachute_render must be loaded");
-        assert_eq!(pc.shp_name, "PARACH");
-        // Rate=400 → floor(900/400) = 2 native frames.
-        assert_eq!(pc.frame_delay, 2);
-        assert_eq!(pc.loop_start, 20);
-        assert_eq!(pc.end_frame, 40); // LoopEnd + 1
-        assert_eq!(pc.z_adjust, -10);
-        assert!(pc.alt_palette);
-    }
-
-    #[test]
-    fn parachute_render_none_when_general_parachute_unset() {
-        let rules_text = "[General]\nFlightLevel=1500\n";
-        let art_text = "[PARACH]\nRate=400\n";
-        let rules_ini = IniFile::from_str(rules_text);
-        let art_ini = IniFile::from_str(art_text);
-        let mut general = GeneralRules::from_ini(&rules_ini);
-        assert!(general.parachute_shp.is_none());
-        general.resolve_art_rates(&art_ini);
-        assert!(general.parachute_render.is_none());
-    }
-
-    #[test]
     fn merge_art_propagates_add_remove_occupy() {
         let mut layers = RulesLayerStack::new(IniFile::from_str(&make_test_rules()));
-        layers.push(crate::rules::native_processing::RulesLayerKind::Scenario, IniFile::from_str(
-            "[BuildingTypes]\n0=GAREFN\n\
+        layers.push(
+            crate::rules::native_processing::RulesLayerKind::Scenario,
+            IniFile::from_str(
+                "[BuildingTypes]\n0=GAREFN\n\
              [GAREFN]\nName=Refinery\nCost=2000\nFoundation=4x3\n",
-        ));
+            ),
+        );
         let art_text = "[GAREFN]\nFoundation=4x3\nCanHideThings=no\nOccupyHeight=4\nAddOccupy1=-1,0\nAddOccupy2=-1,-1\nRemoveOccupy1=3,1\n";
         let mut rules: RuleSet = RuleSet::from_rules_layers(&layers).expect("rules parse");
         let art_ini: IniFile = IniFile::from_str(art_text);
         let art = crate::rules::art_data::ArtRegistry::from_ini(&art_ini);
-        rules.merge_art_data(&art);
+        rules.install_art_data(art);
         let obj = rules.object("GAREFN").expect("GAREFN");
         assert_eq!(obj.hidden_occupancy.add_occupy[0], Some((-1, 0)));
         assert_eq!(obj.hidden_occupancy.add_occupy[1], Some((-1, -1)));
@@ -6645,18 +7554,94 @@ ZAdjust=-10
     }
 
     #[test]
+    fn native_discharge_retail_gi_binding_retains_independent_zero_defaults() {
+        let corpus: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tools/spatial_oracle/infantry_discharge_rules.json"
+        ))
+        .unwrap();
+        let physical = corpus["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["case"] == "physical_GI")
+            .unwrap();
+        let expected: [i32; 4] = serde_json::from_value(physical["after"].clone()).unwrap();
+        let Some((retail_rules, retail_art)) =
+            crate::rules::retail_ini_fixture::retail_rules_and_art()
+        else {
+            return;
+        };
+        let mut rules = RuleSet::from_ini(&retail_rules).expect("retail rules parse");
+        rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&retail_art));
+        let infantry = rules.object("E1").expect("retail E1");
+        assert_eq!(infantry.image, "GI");
+        assert_eq!(
+            [
+                infantry.fire_up_frame,
+                infantry.fire_prone_frame,
+                infantry.secondary_fire_frame,
+                infantry.secondary_prone_frame,
+            ],
+            expected,
+            "original5246BE..52473A on physical ARTMD.INI[GI]"
+        );
+    }
+
+    #[test]
+    fn native_discharge_signed_art_fields_reach_infantry_type() {
+        let corpus: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tools/spatial_oracle/infantry_discharge_rules.json"
+        ))
+        .unwrap();
+        let row = corpus["cases"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["case"] == "all_independent")
+            .unwrap();
+        let expected: [i32; 4] = serde_json::from_value(row["after"].clone()).unwrap();
+        let mut layers = RulesLayerStack::new(IniFile::from_str(&make_test_rules()));
+        layers.push(
+            crate::rules::native_processing::RulesLayerKind::Scenario,
+            IniFile::from_str("[E1]\nImage=GI\n"),
+        );
+        let mut rules = RuleSet::from_rules_layers(&layers).expect("rules parse");
+        let mut art_text = "[GI]\nFixtureOnly=1\n".to_owned();
+        for (key, raw) in row["layers"][0].as_object().unwrap() {
+            art_text.push_str(&format!("{key}={}\n", raw.as_str().unwrap()));
+        }
+        rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(
+            &IniFile::from_str(&art_text),
+        ));
+        let infantry = rules.object("E1").expect("E1");
+        assert_eq!(
+            [
+                infantry.fire_up_frame,
+                infantry.fire_prone_frame,
+                infantry.secondary_fire_frame,
+                infantry.secondary_prone_frame,
+            ],
+            expected,
+            "original independent signed DWORDs survive ART projection"
+        );
+    }
+
+    #[test]
     fn merge_art_propagates_infantry_crawls_without_building_side_effects() {
         let mut layers = RulesLayerStack::new(IniFile::from_str(&make_test_rules()));
-        layers.push(crate::rules::native_processing::RulesLayerKind::Scenario, IniFile::from_str(
-            "[E1]\nName=GI\nImage=GI\nStrength=125\nArmor=flak\nSpeed=4\n\
+        layers.push(
+            crate::rules::native_processing::RulesLayerKind::Scenario,
+            IniFile::from_str(
+                "[E1]\nName=GI\nImage=GI\nStrength=125\nArmor=flak\nSpeed=4\n\
              [GAPOWR]\nName=Power\nStrength=750\nArmor=wood\nFoundation=2x2\n",
-        ));
+            ),
+        );
         let mut rules = RuleSet::from_rules_layers(&layers).expect("rules parse");
         let art_ini = IniFile::from_str(
             "[GI]\nCrawls=yes\nFireUp=2\nFireProne=3\nSecondaryFire=4\nSecondaryProne=5\n\n[GAPOWR]\nCrawls=yes\nFireUp=9\n",
         );
         let art = crate::rules::art_data::ArtRegistry::from_ini(&art_ini);
-        rules.merge_art_data(&art);
+        rules.install_art_data(art);
 
         let infantry = rules.object("E1").expect("E1");
         assert!(infantry.crawls);
@@ -6999,7 +7984,11 @@ ZAdjust=-10
               [GACNST]\nFoundation=1x1\n[LATE]\nFoundation=1x1\n",
         );
         let ini = IniFile::from_bytes(&bytes).expect("byte-domain BuildConst rules");
-        let stored = ini.section("AI").unwrap().get("BuildConst").unwrap();
+        let stored = ini
+            .section("AI")
+            .unwrap()
+            .get_for_test("BuildConst")
+            .unwrap();
         assert_eq!(stored.chars().nth(126), Some(char::from(0xE9)));
         assert_eq!(stored.chars().nth(127), Some(','));
         let rules = RuleSet::from_ini(&ini).expect("byte-domain BuildConst RuleSet");
@@ -7073,24 +8062,6 @@ ZAdjust=-10
         assert_eq!(rules.build_const_types, ["CON"]);
         assert_eq!(rules.build_power_types, ["NEWPOW"]);
         assert_eq!(rules.build_tech_types, ["TECH"]);
-    }
-
-    #[test]
-    fn recalc_difficulty_vectors_match_native_projection_and_atoi() {
-        assert_eq!(
-            parse_native_difficulty_int_vector(" \t1,,  -2junk,,+3,abc,4294967297,-2147483649  \n"),
-            [1, -2, 3, 0, 1, i32::MAX]
-        );
-        assert_eq!(parse_native_difficulty_int_vector("7"), [7]);
-        assert!(parse_native_difficulty_int_vector(" \t\r\n").is_empty());
-
-        let oversized = format!("1,{},7", "0".repeat(509));
-        assert_eq!(oversized.as_bytes()[511], b',');
-        assert_eq!(
-            parse_native_difficulty_int_vector(&oversized),
-            [1, 0],
-            "bytes beyond the char[512] payload cannot add another entry"
-        );
     }
 
     #[test]
@@ -7190,7 +8161,7 @@ ZAdjust=-10
         let mut rules = RuleSet::from_ini(&rules_ini).expect("rules parse");
         let art_ini_parsed = IniFile::from_str(art_ini);
         let art = crate::rules::art_data::ArtRegistry::from_ini(&art_ini_parsed);
-        rules.merge_art_data(&art);
+        rules.install_art_data(art);
         rules
     }
 
@@ -7327,6 +8298,91 @@ ZAdjust=-10
     }
 
     #[test]
+    fn simulation_config_hash_covers_registered_slot_names_offsets_and_runtime() {
+        let ini =
+            IniFile::from_str("[BuildingTypes]\n0=B\n[B]\nImage=BODY\n[Animations]\n0=N\n1=D\n");
+        let make = |slot: &str, runtime: &str| {
+            let art_ini = IniFile::from_str(&format!(
+                "[BODY]\nActiveAnim=N\n{slot}\n[N]\n{runtime}\n[D]\n"
+            ));
+            let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art_ini).unwrap();
+            let art = crate::rules::art_data::ArtRegistry::from_ini(&art_ini);
+            rules.install_art_data(art);
+            rules
+        };
+        let original = make("", "Rate=900");
+        for (slot, runtime) in [
+            ("ActiveAnimDamaged=D", "Rate=900"),
+            ("ActiveAnimX=1", "Rate=900"),
+            ("ActiveAnimY=-1", "Rate=900"),
+            ("ActiveAnimZAdjust=7", "Rate=900"),
+            ("ActiveAnimYSort=2", "Rate=900"),
+            ("", "Rate=450"),
+            ("", "RandomRate=900,300"),
+            ("", "Next=D"),
+        ] {
+            let changed = make(slot, runtime);
+            assert_eq!(original.source_ini_hash(), changed.source_ini_hash());
+            assert_ne!(
+                original.simulation_config_hash(),
+                changed.simulation_config_hash(),
+                "{slot}, {runtime}"
+            );
+        }
+        let mut changed = make("", "Rate=900");
+        changed.anim_type_names.insert("ADDED".into());
+        assert_ne!(
+            original.simulation_config_hash(),
+            changed.simulation_config_hash()
+        );
+    }
+
+    #[test]
+    fn simulation_config_hash_covers_effective_building_body_art() {
+        use crate::rules::art_data::ArtRegistry;
+        let ini = IniFile::from_str("[BuildingTypes]\n0=BUILD\n[BUILD]\nImage=BODY\nGate=yes\n");
+        let make = |art: &str| {
+            let mut rules = RuleSet::from_ini(&ini).unwrap();
+            rules.install_art_data(ArtRegistry::from_ini(&IniFile::from_str(art)));
+            rules
+        };
+        let defaults =
+            "GateStages=9\nAnimIdle=0,1,0\nAnimActive=0,1,0\nAnimAux1=0,1,0\nAnimAux2=0,1,0\n";
+        let original = make(&format!("[BODY]\n{defaults}"));
+        let reordered = make(&format!("[UNUSED]\nGateStages=-1\n[BODY]\n{defaults}"));
+        assert_eq!(
+            original.simulation_config_hash(),
+            reordered.simulation_config_hash(),
+            "unused art and section insertion order do not alter resolved body inputs"
+        );
+        assert_eq!(
+            make("[UNUSED]\nGateStages=99\n").simulation_config_hash(),
+            original.simulation_config_hash(),
+            "missing metadata and explicit constructor defaults are equivalent"
+        );
+        for changed in [
+            "GateStages=-1\n",
+            "AnimIdle=-1,1,0\n",
+            "AnimActive=0,2147483647,0\n",
+            "AnimAux1=0,1,-2\n",
+            "AnimAux2=65536,1,0\n",
+        ] {
+            let changed = make(&format!("[BODY]\n{changed}"));
+            assert_eq!(original.source_ini_hash(), changed.source_ini_hash());
+            assert_ne!(
+                original.simulation_config_hash(),
+                changed.simulation_config_hash()
+            );
+        }
+        let mut firestorm = make(&format!("[BODY]\n{defaults}"));
+        firestorm.object_list[0].firestorm_wall = true;
+        assert_ne!(
+            original.simulation_config_hash(),
+            firestorm.simulation_config_hash()
+        );
+    }
+
+    #[test]
     fn simulation_config_hash_changes_with_resolved_effect_frame_count() {
         let ini = IniFile::from_str("[General]\nWarpOut=WARPOUT\n");
         let mut first = RuleSet::from_ini(&ini).expect("first rules");
@@ -7369,16 +8425,21 @@ ZAdjust=-10
             "[VehicleTypes]\n0=UNIT\n[UNIT]\nPrimary=GUN\n[GUN]\nProjectile=SHOT\n[SHOT]\nImage=SHOTART\n[BuildingTypes]\n0=BUILD\n[BUILD]\nImage=BUILDART\n",
         );
         let make = |art: &str| {
-            let mut rules = RuleSet::from_ini(&ini).unwrap();
-            rules.merge_art_data(&ArtRegistry::from_ini(&IniFile::from_str(art)));
+            let mut rules =
+                RuleSet::from_ini_with_fixed_art_for_test(&ini, &IniFile::from_str(art)).unwrap();
+            rules.install_art_data(ArtRegistry::from_ini(&IniFile::from_str(art)));
             rules
         };
-        let first = make("[SHOTART]\nVoxel=yes\n[BUILDART]\nHeight=4\n[UNUSED]\nHeight=9\n");
-        let reordered =
-            make("[UNUSED]\nHeight=200\nVoxel=yes\n[BUILDART]\nHeight=4\n[SHOTART]\nVoxel=yes\n");
-        let voxel_changed = make("[SHOTART]\nVoxel=no\n[BUILDART]\nHeight=4\n");
-        let height_changed = make("[SHOTART]\nVoxel=yes\n[BUILDART]\nHeight=5\n");
+        let first =
+            make("[SHOTART]\nVoxel=yes\nFlat=yes\n[BUILDART]\nHeight=4\n[UNUSED]\nHeight=9\n");
+        let reordered = make(
+            "[UNUSED]\nHeight=200\nVoxel=yes\nFlat=no\n[BUILDART]\nHeight=4\n[SHOTART]\nVoxel=yes\nFlat=yes\n",
+        );
+        let voxel_changed = make("[SHOTART]\nVoxel=no\nFlat=yes\n[BUILDART]\nHeight=4\n");
+        let height_changed = make("[SHOTART]\nVoxel=yes\nFlat=yes\n[BUILDART]\nHeight=5\n");
+        let flat_changed = make("[SHOTART]\nVoxel=yes\nFlat=no\n[BUILDART]\nHeight=4\n");
         assert!(first.projectile("SHOT").unwrap().voxel);
+        assert!(first.projectile("SHOT").unwrap().flat);
         assert_eq!(
             first.building_launch_height(first.object("BUILD").unwrap()),
             4
@@ -7388,7 +8449,7 @@ ZAdjust=-10
             reordered.simulation_config_hash(),
             "canonical consumed inputs ignore ART section order and unused metadata"
         );
-        for changed in [&voxel_changed, &height_changed] {
+        for changed in [&voxel_changed, &height_changed, &flat_changed] {
             assert_eq!(first.source_ini_hash(), changed.source_ini_hash());
             assert_ne!(
                 first.simulation_config_hash(),
@@ -7396,14 +8457,14 @@ ZAdjust=-10
             );
         }
         let absent = make("[UNUSED]\nHeight=999\n");
-        let explicit_default = make("[SHOTART]\nVoxel=no\n[BUILDART]\nHeight=2\n");
+        let explicit_default = make("[SHOTART]\nVoxel=no\nFlat=no\n[BUILDART]\nHeight=2\n");
         assert_eq!(
             absent.simulation_config_hash(),
             explicit_default.simulation_config_hash(),
             "authored presence alone is not a consumed launch input"
         );
-        let mut retained = make("[SHOTART]\nVoxel=yes\n[BUILDART]\nHeight=4\n");
-        retained.merge_art_data(&ArtRegistry::from_ini(&IniFile::from_str(
+        let mut retained = make("[SHOTART]\nVoxel=yes\nFlat=yes\n[BUILDART]\nHeight=4\n");
+        retained.install_art_data(ArtRegistry::from_ini(&IniFile::from_str(
             "[BUILDART]\nHeight=4\n",
         )));
         assert_eq!(
@@ -7423,7 +8484,7 @@ ZAdjust=-10
             )
             .is_ok()
         );
-        for changed in [&voxel_changed, &height_changed] {
+        for changed in [&voxel_changed, &height_changed, &flat_changed] {
             assert!(matches!(
                 GameSnapshot::load_validated(
                     &bytes,
@@ -7461,9 +8522,9 @@ ZAdjust=-10
         changed_big.frame_width = 60;
         changed_big.frame_height = 50;
 
-        first.merge_art_data(&first_art);
-        reordered.merge_art_data(&reordered_art);
-        changed.merge_art_data(&changed_art);
+        first.install_art_data(first_art);
+        reordered.install_art_data(reordered_art);
+        changed.install_art_data(changed_art);
 
         assert_eq!(first.source_ini_hash(), reordered.source_ini_hash());
         assert_eq!(
@@ -7475,5 +8536,73 @@ ZAdjust=-10
             first.simulation_config_hash(),
             changed.simulation_config_hash()
         );
+    }
+
+    /// Retail difficulty rows and country ROF through the production reader:
+    /// `[Easy] ROF=.8`, `[Normal] ROF=1.0`, `[Difficult] ROF=1.2` (ReadDouble
+    /// widens the `%f` single), and no retail country sets `ROF=`, so every
+    /// country keeps the constructor's 1.0.
+    #[test]
+    fn retail_difficulty_and_country_rof() {
+        let Some(ini) = crate::rules::retail_ini_fixture::retail_ini("rulesmd.ini") else {
+            return;
+        };
+        let rules = RuleSet::from_ini(&ini).expect("retail rules parse");
+        assert_eq!(
+            rules.general.difficulty_rof,
+            [f64::from(0.8f32), 1.0, f64::from(1.2f32)]
+        );
+        for country in ["Americans", "Russians", "YuriCountry"] {
+            assert_eq!(rules.country_rof(country), 1.0, "{country}");
+        }
+    }
+
+    /// Retail corpse anims through the production reader: `[General]
+    /// DeadBodies=` lists six, and the GI and Conscript name none of their own
+    /// and are not `NotHuman=`, so their deaths pick from the six.
+    #[test]
+    fn retail_dead_bodies() {
+        let Some(ini) = crate::rules::retail_ini_fixture::retail_ini("rulesmd.ini") else {
+            return;
+        };
+        let rules = RuleSet::from_ini(&ini).expect("retail rules parse");
+        assert_eq!(
+            rules.general.dead_bodies,
+            [
+                "DEATH_A", "DEATH_B", "DEATH_C", "DEATH_D", "DEATH_E", "DEATH_F"
+            ]
+        );
+        for infantry in ["E1", "E2"] {
+            let object = rules.object(infantry).unwrap();
+            assert!(
+                object.dead_bodies.is_empty() && !object.not_human,
+                "{infantry}"
+            );
+        }
+    }
+
+    /// Retail `FireAngle=` through the production reader: ships, submarines,
+    /// missiles and the tech outpost set it (`CAOUTP` behind a trailing
+    /// comment); the Grizzly and Rhino keep the constructor's 8.
+    #[test]
+    fn retail_fire_angle() {
+        let Some(ini) = crate::rules::retail_ini_fixture::retail_ini("rulesmd.ini") else {
+            return;
+        };
+        let rules = RuleSet::from_ini(&ini).expect("retail rules parse");
+        for (object, fire_angle) in [
+            ("DEST", 32),
+            ("BSUB", 64),
+            ("V3ROCKET", 1),
+            ("CAOUTP", 0),
+            ("MTNK", 8),
+            ("HTNK", 8),
+        ] {
+            assert_eq!(
+                rules.object(object).unwrap().fire_angle,
+                fire_angle,
+                "{object}"
+            );
+        }
     }
 }

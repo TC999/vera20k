@@ -1,13 +1,40 @@
-//! Committed Drive/Ship head coordinates and their curve anchor.
+//! Committed Drive/Ship head coordinates.
 //!
 //! Fresh Drive4B32AF/4B40B0 and Ship6A28FF/6A36E0 add path directions to
 //! current Foot XYZ. Chain4B1BC4/6A120A instead adds to the previous head.
 //! Original executable cases: tools/spatial_oracle/locomotor_head_coordinates.json.
 
-use super::drive_track::{self, DriveTrackPlan, DriveTrackState};
+use super::drive_track::{self, DriveTrackPlan};
+use super::track_process::TrackFamily;
 use crate::rules::locomotor_type::LocomotorKind;
 use crate::sim::components::{DriveCoord, DriveLocomotionRuntime, Position, ShipLocomotionRuntime};
+use crate::sim::game_entity::GameEntity;
 use crate::util::direction_tables::lepton::LEPTON_DELTAS;
+
+/// Drive4AFB80 / Ship69F290 IsMoving and their readiness head-presence input.
+/// A destination is sufficient; without one, a non-null head must differ from
+/// physical owner X/Y (Z is ignored). Read the selected instance even when a
+/// caller is testing a suspended Drive. Orders, power and track cursors are
+/// not inputs. Original comparisons: locomotor_moving.{py,json,meta.json}.
+pub(crate) fn motion_state(entity: &GameEntity, family: TrackFamily) -> (bool, bool) {
+    let (destination, head) = match family {
+        TrackFamily::Drive => entity
+            .drive_locomotion
+            .as_ref()
+            .map_or((None, None), |s| (s.destination, s.head_to)),
+        TrackFamily::Ship => entity
+            .ship_locomotion
+            .as_ref()
+            .map_or((None, None), |s| (s.destination, s.head_to)),
+    };
+    let nonnull = |c: &DriveCoord| c.x != 0 || c.y != 0 || c.z != 0;
+    let head = head.filter(nonnull);
+    let current = super::ground_pose::position_world_xy(&entity.position);
+    (
+        destination.is_some_and(|c| nonnull(&c)) || head.is_some_and(|c| [c.x, c.y] != current),
+        head.is_some(),
+    )
+}
 
 /// One original direction-table addition; no terrain or cell-center sampling.
 pub(super) fn offset_head(base: DriveCoord, direction: u8) -> DriveCoord {
@@ -20,58 +47,99 @@ pub(super) fn offset_head(base: DriveCoord, direction: u8) -> DriveCoord {
 }
 
 /// Publish the selected descriptor and cursor on the active locomotor,
-/// preserving its residual. Geometry is only the coordinate projection.
+/// preserving its residual. The immutable tables project its coordinates.
 pub(super) fn accept_fresh_progress(
     kind: LocomotorKind,
     drive: &mut Option<DriveLocomotionRuntime>,
     ship: &mut Option<ShipLocomotionRuntime>,
     turn_index: usize,
 ) {
-    use super::track_process::TrackFamily;
-    let (progress, family) = match kind {
-        LocomotorKind::Drive => {
-            let state = drive.get_or_insert_with(Default::default);
-            state.pending_track_occupation = true;
-            (&mut state.track, TrackFamily::Drive)
-        }
-        LocomotorKind::Ship => {
-            let state = ship.get_or_insert_with(Default::default);
-            state.pending_track_occupation = true;
-            (&mut state.track, TrackFamily::Ship)
-        }
-        _ => return,
+    let Some(progress) = select_fresh_progress(kind, drive, ship, turn_index) else {
+        return;
     };
-    assert!(progress.select_fresh(family, (turn_index / 8) as u8, (turn_index % 8) as u8));
     progress.accept_fresh();
     // Drive ProcessMovement4B46C5 publishes +63 before the accepted head
     // and Apply1, even when this invocation cannot pay a point.
-    if kind == LocomotorKind::Drive {
-        drive.as_mut().unwrap().track_valid = true;
+    match kind {
+        LocomotorKind::Drive => drive.as_mut().unwrap().track_valid = true,
+        LocomotorKind::Ship => ship.as_mut().unwrap().track_valid = true,
+        _ => unreachable!(),
     }
 }
 
-/// Build the stored coordinate and executable curve together, before either is
-/// published. Both use the same exact origin, including noncentered subcells.
-pub(super) fn begin_fresh(
-    plan: &DriveTrackPlan,
-    position: &Position,
-) -> Option<(DriveCoord, DriveTrackState)> {
+/// Drive ProcessMovement4B4016..4B4034 / Ship twin: the turn table selector
+/// (+58) and the reversed byte (+60 = 0), written before the crate question
+/// and the second candidate, so every later arm of the same call sees them.
+pub(super) fn select_fresh_progress<'a>(
+    kind: LocomotorKind,
+    drive: &'a mut Option<DriveLocomotionRuntime>,
+    ship: &'a mut Option<ShipLocomotionRuntime>,
+    turn_index: usize,
+) -> Option<&'a mut crate::sim::components::TrackProgress> {
+    let progress = match kind {
+        LocomotorKind::Drive => &mut drive.get_or_insert_with(Default::default).track,
+        LocomotorKind::Ship => &mut ship.get_or_insert_with(Default::default).track,
+        _ => return None,
+    };
+    assert!(progress.select_fresh((turn_index / 8) as u8, (turn_index % 8) as u8));
+    Some(progress)
+}
+
+/// Outer Process admission (Drive4B055A..576, mirrored Ship): the class
+/// valid byte and selector are authoritative, independent of head coordinates.
+/// This is distinct from querying a non-null committed coordinate below.
+pub(super) fn active_track_family(
+    entity: &GameEntity,
+) -> Option<super::track_process::TrackFamily> {
+    use super::track_process::TrackFamily;
+    let (family, valid, selector) = match entity.locomotor.as_ref()?.kind {
+        LocomotorKind::Drive => {
+            let state = entity.drive_locomotion.as_ref()?;
+            (
+                TrackFamily::Drive,
+                state.track_valid,
+                state.track.turn_index,
+            )
+        }
+        LocomotorKind::Ship => {
+            let state = entity.ship_locomotion.as_ref()?;
+            (TrackFamily::Ship, state.track_valid, state.track.turn_index)
+        }
+        _ => return None,
+    };
+    (valid && selector != -1).then_some(family)
+}
+
+/// The active Drive/Ship selector and retained head identify a committed segment.
+/// Native callbacks may clear the head while leaving a selector installed.
+pub(crate) fn committed_track_head(entity: &GameEntity) -> Option<DriveCoord> {
+    let (head, track) = match entity.locomotor.as_ref()?.kind {
+        LocomotorKind::Drive => {
+            let state = entity.drive_locomotion.as_ref()?;
+            (state.head_to?, state.track)
+        }
+        LocomotorKind::Ship => {
+            let state = entity.ship_locomotion.as_ref()?;
+            (state.head_to?, state.track)
+        }
+        _ => return None,
+    };
+    (track.turn_index >= 0).then_some(head)
+}
+
+/// Validate the immutable raw table and form the accepted head from exact Foot
+/// XYZ, including noncentered subcells. Fresh progress is published separately.
+pub(super) fn begin_fresh(plan: &DriveTrackPlan, position: &Position) -> Option<DriveCoord> {
+    if drive_track::raw_track_points(plan.selection.raw_track_index).is_empty() {
+        return None;
+    }
     let current = super::ground_pose::position_world_coord(position);
     let from = (plan.selection.turn_track_index / 8) as u8;
     let mut head = offset_head(current, from);
     if plan.nodes == 2 {
         head = offset_head(head, (plan.selection.turn_track_index % 8) as u8);
     }
-    let mut curve = drive_track::begin_drive_track_with_head_offset(
-        plan.selection.raw_track_index,
-        plan.selection.flags,
-        head.x.wrapping_sub(i32::from(position.rx) * 256),
-        head.y.wrapping_sub(i32::from(position.ry) * 256),
-        plan.selection.target_facing,
-    )?;
-    // Fresh acceptance stores zero; RawTrack.entry is for chained adoption.
-    curve.point_index = 0;
-    Some((head, curve))
+    Some(head)
 }
 
 #[cfg(test)]

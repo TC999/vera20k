@@ -6,25 +6,39 @@
 //! it also consumes one additional Scenario RNG sample for the native diagnostic
 //! snapshot path.
 
+#[cfg(test)]
 use crate::map::entities::EntityCategory;
+#[cfg(test)]
 use crate::sim::game_entity::GameEntity;
 use crate::sim::world::Simulation;
+#[cfg(test)]
 use crate::util::native_x87::{NativeF32Bits, X87Chop53};
 
 pub const DISPLAY_LAYER_COUNT: usize = 5;
 
+#[cfg(test)]
 const RTTI_UNIT: i32 = 1;
+#[cfg(test)]
 const RTTI_AIRCRAFT: i32 = 2;
 const RTTI_ANIM: i32 = 4;
+#[cfg(test)]
 const RTTI_BUILDING: i32 = 6;
+#[cfg(test)]
 const RTTI_BULLET: i32 = 8;
+#[cfg(test)]
 const RTTI_INFANTRY: i32 = 0x0f;
+#[cfg(test)]
 const RTTI_PARTICLE_SYSTEM: i32 = 0x18;
+#[cfg(test)]
 const RTTI_TERRAIN: i32 = 0x24;
+#[cfg(test)]
 const RTTI_WAVE: i32 = 0x240;
 const SYNC_EXEMPT_ANIM_ID: i32 = -2;
+#[cfg(test)]
 const LEPTONS_PER_CELL: i32 = crate::util::lepton::LEPTONS_PER_CELL_I32;
+#[cfg(test)]
 const CELL_CENTER_LEPTON: i32 = crate::util::lepton::CELL_CENTER_LEPTON_I32;
+#[cfg(test)]
 const WAVE_EXTENDED_ENDPOINT_SCALE: NativeF32Bits = NativeF32Bits::from_bits(0x3f86_6666);
 
 /// One ObjectClass entry as seen by a display-layer checksum pass.
@@ -161,6 +175,7 @@ fn coordinate_term(world_x: i32, world_y: i32) -> u32 {
     (x as u32).wrapping_add((y as u32).wrapping_mul(0x1_0000))
 }
 
+#[cfg(test)]
 #[inline]
 fn entity_world_xy(entity: &GameEntity) -> (i32, i32) {
     (
@@ -173,6 +188,7 @@ fn entity_world_xy(entity: &GameEntity) -> (i32, i32) {
     )
 }
 
+#[cfg(test)]
 #[inline]
 fn terrain_world_xy(rx: u16, ry: u16) -> (i32, i32) {
     // gamemd-derived: `TerrainClass__Constructor @ 0x0071BB90` converts the
@@ -183,6 +199,7 @@ fn terrain_world_xy(rx: u16, ry: u16) -> (i32, i32) {
     )
 }
 
+#[cfg(test)]
 #[inline]
 fn wave_object_axis(source: i32, target: i32, wave_type: u8) -> Option<i32> {
     let scale = match wave_type {
@@ -196,6 +213,7 @@ fn wave_object_axis(source: i32, target: i32, wave_type: u8) -> Option<i32> {
     i32::try_from(X87Chop53::ftol_i64(X87Chop53::add(source_term, target_term)).ok()?).ok()
 }
 
+#[cfg(test)]
 #[inline]
 fn wave_world_xy(wave: &crate::sim::wave::Wave) -> Option<(i32, i32)> {
     // gamemd-derived: `WaveClass__Constructor @ 0x0075E950` Reveals at the
@@ -207,16 +225,7 @@ fn wave_world_xy(wave: &crate::sim::wave::Wave) -> Option<(i32, i32)> {
     ))
 }
 
-#[inline]
-fn primary_facing(entity: &GameEntity, frame: u32) -> u16 {
-    entity
-        .body_facing
-        .as_ref()
-        .map_or(u16::from(entity.facing) << 8, |facing| {
-            facing.current(frame)
-        })
-}
-
+#[cfg(test)]
 #[inline]
 fn secondary_facing(entity: &GameEntity, frame: u32) -> u16 {
     entity
@@ -225,6 +234,7 @@ fn secondary_facing(entity: &GameEntity, frame: u32) -> u16 {
         .map_or(0, |facing| facing.current(frame))
 }
 
+#[cfg(test)]
 #[inline]
 fn entity_rtti(category: EntityCategory) -> i32 {
     match category {
@@ -244,6 +254,7 @@ impl Simulation {
     /// This method must be called only by the admitted multiplayer-frame path:
     /// it consumes exactly two Scenario RNG samples and therefore must never run
     /// for an offline frame or a diagnostic-only `state_hash()` request.
+    #[cfg(test)]
     pub fn compute_retail_multiplayer_checksum(
         &mut self,
         display_layers: [&[ChecksumObject]; DISPLAY_LAYER_COUNT],
@@ -257,7 +268,7 @@ impl Simulation {
         for entity in self.substrate.entities.values_sorted() {
             if entity.category == EntityCategory::Infantry {
                 let (x, y) = entity_world_xy(entity);
-                checksum.fold_infantry(x, y, primary_facing(entity, frame));
+                checksum.fold_infantry(x, y, entity.body_facing_current(frame));
             }
         }
         for entity in self.substrate.entities.values_sorted() {
@@ -266,7 +277,7 @@ impl Simulation {
                 checksum.fold_unit(
                     x,
                     y,
-                    primary_facing(entity, frame),
+                    entity.body_facing_current(frame),
                     secondary_facing(entity, frame),
                 );
             }
@@ -274,7 +285,7 @@ impl Simulation {
         for entity in self.substrate.entities.values_sorted() {
             if entity.category == EntityCategory::Structure {
                 let (x, y) = entity_world_xy(entity);
-                checksum.fold_building(x, y, primary_facing(entity, frame));
+                checksum.fold_building(x, y, entity.body_facing_current(frame));
             }
         }
 
@@ -363,7 +374,7 @@ mod tests {
         ProjectileTarget, ProjectileTrajectory, ProjectileVelocity, ProjectileVisualState,
         TargetExpiryPolicy,
     };
-    use crate::sim::terrain_object::{TerrainObjectLifecycle, TerrainObjectState};
+    use crate::sim::terrain_object::TerrainObjectState;
     use crate::sim::timer::CdTimer;
     use crate::sim::wave::Wave;
     use crate::sim::world::Simulation;
@@ -393,29 +404,36 @@ mod tests {
                 first_ai_guard: false,
                 constructor_reverse: false,
                 inactive: false,
+                paused: false,
             },
             draw_runtime: AnimDrawRuntime::default(),
             use_cell_drawer: false,
             terrain_attached: false,
             in_logic_vector: false,
             owner_entity: None,
+            building_slot: None,
+            damage_fire_slot: None,
             start_sound_active: false,
             stop_sound_id: None,
+            display: Default::default(),
+            bounce: None,
         }
     }
 
     fn test_projectile(origin: ProjectileCoord) -> ProjectileSpawn {
         ProjectileSpawn {
+            native_unique_id: 0,
+            line_trail: None,
+            flat: false,
             source_id: 0,
             origin,
             target: ProjectileTarget::Cell { rx: 0, ry: 0 },
             initial_target_position: ProjectileCoord::new(128, 128, 0),
-            payload: ProjectilePayload {
-                base_damage: 0,
-                warhead: InternedId::from_index(0),
-                weapon: InternedId::from_index(0),
-                owner: InternedId::from_index(0),
-            },
+            payload: ProjectilePayload::new(
+                0,
+                InternedId::from_index(0),
+                InternedId::from_index(0),
+            ),
             speed_leptons_per_frame: 1,
             velocity: ProjectileVelocity::new(0, 0, 0),
             trajectory: ProjectileTrajectory::Straight,
@@ -455,7 +473,6 @@ mod tests {
             lifetime: -1,
             spark_spawn_frames: 0,
             facing: 0,
-            directionless: true,
             attached_entity: None,
             owner_entity: None,
             target_coords: IVec3::ZERO,
@@ -464,21 +481,13 @@ mod tests {
         });
 
         let terrain_id = sim.allocate_stable_id();
-        sim.production.terrain_objects.insert(
-            terrain_id,
-            TerrainObjectState {
-                stable_id: terrain_id,
-                native_unique_id: None,
-                in_logic_vector: false,
-                type_ref: InternedId::from_index(0),
-                rx: 7,
-                ry: 9,
-                health: 10,
-                max_health: 10,
-                occupation_bits: 0,
-                lifecycle: TerrainObjectLifecycle::Live,
-            },
-        );
+        sim.production.terrain_objects.insert(terrain_id, {
+            let mut terrain =
+                TerrainObjectState::for_test(terrain_id, InternedId::from_index(0), 7, 9);
+            terrain.health = 10;
+            terrain.max_health = 10;
+            terrain
+        });
 
         let bullet_id = sim.allocate_stable_id();
         sim.projectiles.spawn(

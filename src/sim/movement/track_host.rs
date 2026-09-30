@@ -1,4 +1,4 @@
-//! Ordinary Drive4B0F20/Ship6A0980 world execution. The retained cursor belongs
+//! Drive4B0F20/Ship6A0980 world execution for every retained track. The retained cursor belongs
 //! to the locomotor; TrackProcess owns just this call's paid budget and raw
 //! descriptor. Every world receiver ends the entity borrow before continuing.
 //!
@@ -7,7 +7,7 @@
 //! playfield receivers. Discovery/tag4, crates and the refinery radio branch
 //! remain explicit receiver gaps; this host does not replay object AI for them.
 
-use super::ground_pose::{commit_ground_height, position_world_coord};
+use super::ground_pose::{position_world_coord, set_height};
 use super::locomotor::MovementLayer;
 use super::track_process::{TrackFamily, TrackInvocation, TrackPayment, TrackProcess};
 #[cfg(test)]
@@ -16,11 +16,7 @@ use crate::map::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::components::{DriveCoord, DriveOccupationFootprint, TrackProgress};
 use crate::sim::game_entity::GameEntity;
-use crate::sim::lifecycle_request::{LifecycleRequest, UninitReason};
 use crate::sim::mission::{MissionId, MissionType};
-use crate::sim::occupancy::CellListInsertion;
-use crate::sim::pathfinding::PathGrid;
-use crate::sim::pathfinding::cell_entry::CellEntryResult;
 use crate::sim::world::Simulation;
 use crate::util::fixed_math::SimFixed;
 
@@ -31,6 +27,33 @@ pub(super) enum TrackWorldEvent {
     MarkPut,
     PerCell,
     Arrival,
+}
+
+/// One Process_Track call: its paid placements and the native AL. AL is
+/// true only from the terminal tail (Drive 0x4B2283 / 0x4B22A1): after the
+/// terminal PerCell a null, dead, limbo or falling owner (0x4B2218), a true
+/// Enter_Idle_Mode (0x4B2273) or a true vt+504 (0x4B2291). The outer Process
+/// then returns at once (0x4B057D / 0x69FC8D).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct TrackPass {
+    pub moved: u32,
+    pub aborted: bool,
+}
+
+impl TrackPass {
+    fn paid(moved: u32) -> Self {
+        Self {
+            moved,
+            aborted: false,
+        }
+    }
+
+    fn aborted(moved: u32) -> Self {
+        Self {
+            moved,
+            aborted: true,
+        }
+    }
 }
 
 fn progress(entity: &GameEntity, family: TrackFamily) -> Option<&TrackProgress> {
@@ -67,22 +90,37 @@ fn head(entity: &GameEntity, family: TrackFamily) -> DriveCoord {
     .unwrap_or(DriveCoord { x: 0, y: 0, z: 0 })
 }
 
+fn head_or_null(entity: Option<&GameEntity>, family: TrackFamily) -> DriveCoord {
+    entity
+        .map(|entity| head(entity, family))
+        .unwrap_or(DriveCoord { x: 0, y: 0, z: 0 })
+}
+
 fn set_head(entity: &mut GameEntity, family: TrackFamily, value: Option<DriveCoord>) {
     match family {
         TrackFamily::Drive => {
             if let Some(state) = entity.drive_locomotion.as_mut() {
                 state.head_to = value;
-                if value.is_none() {
-                    state.pending_track_occupation = false;
-                }
             }
         }
         TrackFamily::Ship => {
             if let Some(state) = entity.ship_locomotion.as_mut() {
                 state.head_to = value;
-                if value.is_none() {
-                    state.pending_track_occupation = false;
-                }
+            }
+        }
+    }
+}
+
+fn set_track_valid(entity: &mut GameEntity, family: TrackFamily, value: bool) {
+    match family {
+        TrackFamily::Drive => {
+            if let Some(state) = entity.drive_locomotion.as_mut() {
+                state.track_valid = value;
+            }
+        }
+        TrackFamily::Ship => {
+            if let Some(state) = entity.ship_locomotion.as_mut() {
+                state.track_valid = value;
             }
         }
     }
@@ -102,27 +140,130 @@ fn put_coords(entity: &mut GameEntity, coord: DriveCoord) {
 }
 
 impl Simulation {
-    pub(crate) fn run_ordinary_track_process(
+    /// Drive Force_Track4B0C40, on the ILoco interface (+4 receiver).
+    /// Selector/cursor publication precedes the null-coordinate return. Head,
+    /// destination, residual and owner speed have independent lifetimes.
+    pub(crate) fn force_drive_track(
+        &mut self,
+        id: u64,
+        selector: i32,
+        supplied: DriveCoord,
+    ) -> bool {
+        self.force_drive_track_observed(id, selector, supplied, &mut |_, _, _| true)
+    }
+
+    fn force_drive_track_observed(
+        &mut self,
+        id: u64,
+        selector: i32,
+        supplied: DriveCoord,
+        receive: &mut impl FnMut(&mut Simulation, u64, DriveCoord) -> bool,
+    ) -> bool {
+        let Some(entity) = self.substrate.entities.get_mut(id) else {
+            return false;
+        };
+        if !entity
+            .locomotor
+            .as_ref()
+            .is_some_and(|loco| loco.kind == crate::rules::locomotor_type::LocomotorKind::Drive)
+        {
+            return false;
+        }
+        let drive = entity.drive_locomotion.get_or_insert_with(Default::default);
+        drive.track.select_forced(selector);
+        if supplied == (DriveCoord { x: 0, y: 0, z: 0 }) {
+            return false;
+        }
+        drive.head_to = Some(supplied);
+        drive.track_valid = true;
+        //4B0D14/4B0D1B: address the supplied cell, then synchronous crate
+        // pickup. The shared track host's crate receiver is still incomplete;
+        // the observer preserves its callback/reload boundary for witnesses.
+        let received = receive(self, id, supplied);
+        let survives = self
+            .substrate
+            .entities
+            .get(id)
+            .is_some_and(|entity| received && !entity.lifecycle.in_limbo);
+        if !survives {
+            if let Some(entity) = self.substrate.entities.get_mut(id)
+                && entity.lifecycle.object_alive
+                && let Some(drive) = entity.drive_locomotion.as_mut()
+            {
+                drive.head_to = None;
+                drive.track_valid = false;
+            }
+            return false;
+        }
+        self.track_apply_occupation_at(id, TrackFamily::Drive, supplied, true);
+        let Some(drive) = self
+            .substrate
+            .entities
+            .get_mut(id)
+            .and_then(|entity| entity.drive_locomotion.as_mut())
+        else {
+            return false;
+        };
+        drive.destination = Some(supplied);
+        drive.target_speed_fraction = crate::util::fixed_math::SIM_ONE;
+        true
+    }
+
+    pub(crate) fn run_track_process(
         &mut self,
         invocation: TrackInvocation,
         rules: Option<&RuleSet>,
-        fallback_grid: Option<&PathGrid>,
         registry: Option<&OverlayTypeRegistry>,
-    ) -> u32 {
-        self.run_ordinary_track_process_observed(
+    ) -> Result<TrackPass, String> {
+        if invocation.apply_fresh_occupation {
+            self.track_apply_occupation(invocation.entity_id, invocation.family, true);
+        }
+        let object = self
+            .substrate
+            .entities
+            .get(invocation.entity_id)
+            .and_then(|e| rules?.object(self.interner.resolve(e.type_ref())));
+        let Some(entity) = self.substrate.entities.get_mut(invocation.entity_id) else {
+            return Ok(TrackPass::default());
+        };
+        if !super::track_turn::admit_track_entry(entity, object.is_some_and(|o| o.has_turret)) {
+            return Ok(TrackPass::default());
+        }
+        // One native entry owns admission, scalar prefix and paid loop, in that
+        // order. No scalar speed update crosses the world receiver handoff.
+        // The prefix also runs for `retry`, whose budget masks its speed.
+        let current_grid = self.path_grid.as_deref();
+        let fresh_budget = super::track_speed::advance(entity, object, rules, current_grid);
+        self.try_run_track_points_observed(
             invocation,
+            fresh_budget,
             rules,
-            fallback_grid,
             registry,
             &mut |_, _, _| {},
         )
     }
 
-    fn track_survives(&self, id: u64) -> bool {
+    /// Geometry/receiver fixtures explicitly supply the paid budget; they do
+    /// not certify the native entry or scalar prefix. Production enters above.
+    #[cfg(test)]
+    pub(super) fn run_track_points(
+        &mut self,
+        invocation: TrackInvocation,
+        fresh_budget: i32,
+        rules: Option<&RuleSet>,
+        registry: Option<&OverlayTypeRegistry>,
+    ) -> u32 {
+        if invocation.apply_fresh_occupation {
+            self.track_apply_occupation(invocation.entity_id, invocation.family, true);
+        }
+        self.run_track_points_observed(invocation, fresh_budget, rules, registry, &mut |_, _, _| {})
+    }
+
+    pub(super) fn track_survives(&self, id: u64) -> bool {
         self.substrate.entities.get(id).is_some_and(|entity| {
             entity.lifecycle.object_alive
                 && !entity.lifecycle.in_limbo
-                && entity.object_is_falling_down == 0
+                && !entity.is_falling_down()
         })
     }
 
@@ -139,41 +280,40 @@ impl Simulation {
         ))
     }
 
-    /// The observer is used by integration fixtures to exercise mutations at
-    /// the actual production boundary; it is a no-op in normal execution.
-    pub(super) fn run_ordinary_track_process_observed(
+    /// Shared paid-loop body. The observer tests synchronous receiver effects;
+    /// the caller has already completed admission and the scalar prefix.
+    #[cfg(test)]
+    pub(super) fn run_track_points_observed(
         &mut self,
         invocation: TrackInvocation,
+        fresh_budget: i32,
         rules: Option<&RuleSet>,
-        fallback_grid: Option<&PathGrid>,
         registry: Option<&OverlayTypeRegistry>,
         observe: &mut impl FnMut(&mut Simulation, u64, TrackWorldEvent),
     ) -> u32 {
+        self.try_run_track_points_observed(invocation, fresh_budget, rules, registry, observe)
+            .expect("track fixture must provide every coordinate receiver")
+            .moved
+    }
+
+    fn try_run_track_points_observed(
+        &mut self,
+        invocation: TrackInvocation,
+        fresh_budget: i32,
+        rules: Option<&RuleSet>,
+        registry: Option<&OverlayTypeRegistry>,
+        observe: &mut impl FnMut(&mut Simulation, u64, TrackWorldEvent),
+    ) -> Result<TrackPass, String> {
         let TrackInvocation {
             entity_id: id,
             family,
-            fresh_budget,
+            retry,
+            ..
         } = invocation;
-        let pending = self.substrate.entities.get_mut(id).is_some_and(|entity| {
-            let pending = match family {
-                TrackFamily::Drive => entity
-                    .drive_locomotion
-                    .as_mut()
-                    .map(|state| &mut state.pending_track_occupation),
-                TrackFamily::Ship => entity
-                    .ship_locomotion
-                    .as_mut()
-                    .map(|state| &mut state.pending_track_occupation),
-            };
-            pending.is_some_and(std::mem::take)
-        });
-        if pending {
-            self.track_apply_occupation(id, family, true, fallback_grid);
-        }
         let Some((state, _, _)) = self.track_state(id, family) else {
-            return 0;
+            return Ok(TrackPass::default());
         };
-        let mut call = TrackProcess::begin(family, &state, fresh_budget);
+        let mut call = TrackProcess::begin(family, &state, fresh_budget, retry);
         let mut moved = 0u32;
         let candidate_direction = self.substrate.entities.get(id).and_then(|entity| {
             entity
@@ -190,10 +330,10 @@ impl Simulation {
             });
         loop {
             let Some((state, stored_head, current)) = self.track_state(id, family) else {
-                return moved;
+                return Ok(TrackPass::paid(moved));
             };
             let Some(payment) = call.pay_current(&state) else {
-                return moved;
+                return Ok(TrackPass::paid(moved));
             };
             let TrackPayment::Sample(sample) = payment else {
                 break;
@@ -212,20 +352,19 @@ impl Simulation {
                     cell(current),
                     true,
                     rules,
-                    fallback_grid,
                     registry,
                     observe,
                 );
                 moved = moved.saturating_add(1);
-                let reached = self.track_reached_destination(id, family);
                 if let Some(entity) = self.substrate.entities.get_mut(id) {
                     set_head(entity, family, None);
+                    // Drive4B2104 / Ship6A1747 clear the active class's +63
+                    // before selector retirement and the terminal PerCell.
+                    set_track_valid(entity, family, false);
                     if let Some(state) = progress_mut(entity, family) {
                         state.clear_selector();
                     }
-                    entity.drive_track = None;
                     if let Some(drive) = entity.drive_locomotion.as_mut() {
-                        drive.track_valid = false;
                         drive.occupation_head_to = None;
                         drive.occupation_handoff = None;
                     }
@@ -233,6 +372,11 @@ impl Simulation {
                         ship.occupation_head_to = None;
                         ship.occupation_handoff = None;
                     }
+                }
+                // Native clears Head_To and selector before target+4C, then
+                // queries the owner's physical cell and fresh +4C height.
+                let reached = self.track_reached_destination(id, family, rules)?;
+                if let Some(entity) = self.substrate.entities.get_mut(id) {
                     if reached {
                         match family {
                             TrackFamily::Drive => {
@@ -253,21 +397,25 @@ impl Simulation {
                 // a callback may install a new path that must survive this tail.
                 self.track_consume_reached_node(id);
                 if let Some(entity) = self.substrate.entities.get_mut(id) {
-                    if reached
-                        || entity
-                            .movement_target
-                            .as_ref()
-                            .is_some_and(|target| target.next_index >= target.path.len())
-                    {
+                    if reached {
                         entity.movement_target = None;
-                        entity.navigation.pending_arrival_clear =
-                            !reached && entity.navigation.nav_com.is_some();
+                    } else if entity
+                        .movement_target
+                        .as_ref()
+                        .is_some_and(|target| target.next_index >= target.path.len())
+                    {
+                        super::movement_commands::spend_track_route(entity);
                     }
                 }
-                self.track_per_cell(id, rules, fallback_grid);
+                self.unit_per_cell_process(
+                    id,
+                    super::per_cell::PerCellReason::Arrival,
+                    rules,
+                    registry,
+                );
                 observe(self, id, TrackWorldEvent::PerCell);
                 if !self.track_survives(id) {
-                    return moved;
+                    return Ok(TrackPass::aborted(moved));
                 }
                 if reached {
                     let entity = self.substrate.entities.get_mut(id).unwrap();
@@ -278,7 +426,7 @@ impl Simulation {
                         let returns = self.track_enter_idle_mode(id, rules);
                         observe(self, id, TrackWorldEvent::Arrival);
                         if returns {
-                            return moved;
+                            return Ok(TrackPass::aborted(moved));
                         }
                     }
                 }
@@ -291,7 +439,7 @@ impl Simulation {
                     }
                 }
                 if self.track_navigation_gate(id, rules) {
-                    return moved;
+                    return Ok(TrackPass::aborted(moved));
                 }
                 if !self
                     .substrate
@@ -299,7 +447,7 @@ impl Simulation {
                     .get(id)
                     .is_some_and(|e| e.lifecycle.object_alive)
                 {
-                    return moved;
+                    return Ok(TrackPass::paid(moved));
                 }
                 // +504 false/alive admits the residual tail directly. It must
                 // never restart the paid loop with a newly selected curve.
@@ -307,14 +455,14 @@ impl Simulation {
             }
 
             if self.track_occupation_enabled(id) {
-                self.track_raw_mark(id, false, fallback_grid);
+                self.track_raw_mark(id, false);
                 self.set_track_occupation_enabled(id, false);
                 if let Some(entity) = self.substrate.entities.get_mut(id) {
                     entity.navigation.path_runtime.path_blocked = false;
                 }
             }
             let Some((live, live_head, actual)) = self.track_state(id, family) else {
-                return moved;
+                return Ok(TrackPass::paid(moved));
             };
             let previous = if live.cursor == 0 {
                 cell(actual)
@@ -333,7 +481,7 @@ impl Simulation {
             // The point XY was paid earlier; facing independently reloads the
             // live cursor BEFORE placement, then survives Mark callbacks.
             let Some((xy, _)) = sample.transform(family, &live, live_head) else {
-                return moved;
+                return Ok(TrackPass::paid(moved));
             };
             let paid_facing = call
                 .live_facing_sample(live.cursor)
@@ -354,7 +502,6 @@ impl Simulation {
                 previous,
                 false,
                 rules,
-                fallback_grid,
                 registry,
                 observe,
             );
@@ -365,36 +512,35 @@ impl Simulation {
                 .get(id)
                 .is_some_and(|entity| entity.lifecycle.object_alive)
             {
-                return moved;
+                return Ok(TrackPass::paid(moved));
             }
             if let Some(entity) = self.substrate.entities.get_mut(id) {
                 let marked = entity.lifecycle.cell_marked;
                 entity.lifecycle.cell_marked = false;
-                commit_ground_height(
+                set_height(
                     &mut entity.position,
                     entity.on_bridge,
+                    0,
                     self.resolved_terrain.as_ref(),
-                    self.path_grid.as_deref().or(fallback_grid),
+                    self.path_grid.as_deref(),
                 );
                 entity.lifecycle.cell_marked = marked;
             }
-            if let Some(facing) = paid_facing {
-                if let Some(entity) = self.substrate.entities.get_mut(id) {
-                    entity.facing = facing;
-                    entity.facing_target = None;
-                    if let Some(body) = entity.body_facing.as_mut() {
-                        body.snap(u16::from(facing) << 8, self.session.binary_frame);
-                    }
-                }
+            if let Some(facing) = paid_facing
+                && let Some(entity) = self.substrate.entities.get_mut(id)
+            {
+                entity
+                    .body_facing
+                    .snap(u16::from(facing) << 8, self.session.binary_frame);
             }
             let Some((live, _, _)) = self.track_state(id, family) else {
-                return moved;
+                return Ok(TrackPass::paid(moved));
             };
             if call.is_at_occupation_handoff(&live) {
-                self.track_raw_mark(id, false, fallback_grid);
+                self.track_raw_mark(id, false);
             }
             let Some((live, _, _)) = self.track_state(id, family) else {
-                return moved;
+                return Ok(TrackPass::paid(moved));
             };
             if chain_allowed && call.is_at_chain_cursor(&live) {
                 if self.track_try_chain(
@@ -403,33 +549,33 @@ impl Simulation {
                     &mut call,
                     candidate_direction.unwrap(),
                     rules,
-                    fallback_grid,
+                    registry,
                     observe,
-                ) {
+                )? {
                     chain_allowed = false;
                     if !self.track_survives(id) {
-                        return moved;
+                        return Ok(TrackPass::paid(moved));
                     }
                 }
             }
             let Some(entity) = self.substrate.entities.get_mut(id) else {
-                return moved;
+                return Ok(TrackPass::paid(moved));
             };
             let Some(state) = progress_mut(entity, family) else {
-                return moved;
+                return Ok(TrackPass::paid(moved));
             };
             call.finish_surviving_point(state);
             self.track_consume_reached_node(id);
         }
         let Some(entity) = self.substrate.entities.get_mut(id) else {
-            return moved;
+            return Ok(TrackPass::paid(moved));
         };
         let Some(state) = progress_mut(entity, family) else {
-            return moved;
+            return Ok(TrackPass::paid(moved));
         };
         call.store_residual(state);
         let Some((live, stored_head, current)) = self.track_state(id, family) else {
-            return moved;
+            return Ok(TrackPass::paid(moved));
         };
         if let Some(step) = live.residual_step(family, current, stored_head) {
             let identity = |coord: DriveCoord| {
@@ -449,18 +595,9 @@ impl Simulation {
                 matches(step.interpolated, step.full),
                 live.residual,
             );
-            self.track_place(
-                id,
-                chosen,
-                cell(current),
-                false,
-                rules,
-                fallback_grid,
-                registry,
-                observe,
-            );
+            self.track_place(id, chosen, cell(current), false, rules, registry, observe);
         }
-        moved
+        Ok(TrackPass::paid(moved))
     }
 
     fn track_consume_reached_node(&mut self, id: u64) {
@@ -509,35 +646,28 @@ impl Simulation {
 
     /// Unit7441B0/744210 select the raw plane from exact live XYZ; REMOVE
     /// deliberately does not require a surviving structural bridge flag.
-    fn track_raw_mark(&mut self, id: u64, put: bool, fallback_grid: Option<&PathGrid>) {
+    pub(super) fn track_raw_mark(&mut self, id: u64, put: bool) {
         let Some(entity) = self.substrate.entities.get(id) else {
             return;
         };
         let coord = position_world_coord(&entity.position);
-        self.track_raw_mark_at(id, coord, put, fallback_grid);
+        self.track_raw_mark_at(id, coord, put);
     }
 
-    fn track_raw_mark_at(
-        &mut self,
-        id: u64,
-        coord: DriveCoord,
-        put: bool,
-        fallback_grid: Option<&PathGrid>,
-    ) -> MovementLayer {
+    fn track_raw_mark_at(&mut self, id: u64, coord: DriveCoord, put: bool) -> MovementLayer {
         let at = cell(coord);
         let terrain = self.resolved_terrain.as_ref();
         let ground = super::ground_pose::ground_surface_z_at(
             [coord.x, coord.y],
             false,
             terrain,
-            self.path_grid.as_deref().or(fallback_grid),
+            self.path_grid.as_deref(),
         )
         .unwrap_or(coord.z);
         let structural = terrain
             .and_then(|terrain| terrain.cell(at.0, at.1))
             .is_some_and(|cell| cell.bridge_facts.has_structural_bridge());
-        let deck = coord.z
-            >= ground.wrapping_add(crate::util::lepton::BRIDGE_HEIGHT_DELTA_LEPTONS as i32)
+        let deck = coord.z >= ground.wrapping_add(crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS)
             && (!put || structural);
         let layer = if deck {
             MovementLayer::Bridge
@@ -595,19 +725,16 @@ impl Simulation {
         if position_world_coord(&entity.position) == coord {
             return;
         }
-        let cargo = rules
-            .and_then(|rules| rules.object(self.interner.resolve(entity.type_ref())))
-            .filter(|object| object.open_topped)
-            .and_then(|_| entity.passenger_role.cargo())
-            .map(|cargo| cargo.passengers.clone())
-            .unwrap_or_default();
         put_coords(self.substrate.entities.get_mut(id).unwrap(), coord);
         // Foot4DB810 -> Techno7104F0 propagates changed XYZ to OpenTopped
         // cargo in cargo-list order, before the caller resumes Mark(PUT).
-        for passenger in cargo {
-            if let Some(entity) = self.substrate.entities.get_mut(passenger) {
-                put_coords(entity, coord);
-            }
+        if let Some(rules) = rules {
+            crate::sim::passenger::open_topped_riders_follow(
+                &mut self.substrate.entities,
+                id,
+                rules,
+                &self.interner,
+            );
         }
     }
 
@@ -619,7 +746,6 @@ impl Simulation {
         previous_track_cell: (u16, u16),
         terminal: bool,
         rules: Option<&RuleSet>,
-        fallback_grid: Option<&PathGrid>,
         registry: Option<&OverlayTypeRegistry>,
         observe: &mut impl FnMut(&mut Simulation, u64, TrackWorldEvent),
     ) {
@@ -630,28 +756,7 @@ impl Simulation {
         let selected_cell = cell(coord);
         let crossing = old != selected_cell;
         if crossing {
-            let removed_layer = self.substrate.entities.get_mut(id).and_then(|entity| {
-                if entity.lifecycle.in_limbo || !entity.lifecycle.cell_marked {
-                    return None;
-                }
-                entity.lifecycle.cell_marked = false;
-                Some(if entity.on_bridge {
-                    MovementLayer::Bridge
-                } else {
-                    MovementLayer::Ground
-                })
-            });
-            if let Some(layer) = removed_layer {
-                self.substrate
-                    .occupancy
-                    .remove_on_layer(old.0, old.1, id, layer);
-                // RemoveContent's raw clear/Recalc still run if list search
-                // found no link. The Foot enable is re-read after unlink.
-                if self.track_occupation_enabled(id) {
-                    self.track_raw_mark(id, false, fallback_grid);
-                }
-                self.recalculate_track_cell(old, rules, registry);
-            }
+            self.foot_mark_remove(id, rules, registry);
             observe(self, id, TrackWorldEvent::MarkRemove);
         }
         let saved_marked = if !crossing {
@@ -668,21 +773,18 @@ impl Simulation {
         if crossing && !terminal {
             // Crossing uses actual current cell; this predicate instead uses
             // the previous transformed cached point (or current at cursor0).
-            let grid = self.path_grid.as_deref().or(fallback_grid);
+            let grid = self.path_grid.as_deref();
             if let Some(entity) = self.substrate.entities.get_mut(id) {
                 if let Some((source, destination)) = grid.and_then(|grid| {
                     grid.cell(previous_track_cell.0, previous_track_cell.1)
                         .zip(grid.cell(selected_cell.0, selected_cell.1))
                 }) {
                     match super::movement_bridge::compute_bridge_transition(source, destination) {
-                        super::movement_bridge::BridgeTransition::Enter { deck_level } => {
+                        super::movement_bridge::BridgeTransition::Enter => {
                             entity.on_bridge = true;
-                            entity.bridge_occupancy =
-                                Some(crate::sim::components::BridgeOccupancy { deck_level });
                         }
                         super::movement_bridge::BridgeTransition::Exit => {
                             entity.on_bridge = false;
-                            entity.bridge_occupancy = None;
                         }
                         super::movement_bridge::BridgeTransition::NoChange => {}
                     }
@@ -691,11 +793,12 @@ impl Simulation {
         }
         if terminal {
             if let Some(entity) = self.substrate.entities.get_mut(id) {
-                commit_ground_height(
+                set_height(
                     &mut entity.position,
                     entity.on_bridge,
+                    0,
                     self.resolved_terrain.as_ref(),
-                    self.path_grid.as_deref().or(fallback_grid),
+                    self.path_grid.as_deref(),
                 );
             }
         }
@@ -705,54 +808,27 @@ impl Simulation {
             }
         }
         if crossing {
-            let entered_cell = self.substrate.entities.get_mut(id).and_then(|entity| {
-                if entity.lifecycle.in_limbo || entity.lifecycle.cell_marked {
-                    return None;
-                }
-                // Object5F58F7 publishes marked=true BEFORE Foot Enter.
-                entity.lifecycle.cell_marked = true;
-                let at = (entity.position.rx, entity.position.ry);
-                let layer = if entity.on_bridge {
-                    MovementLayer::Bridge
-                } else {
-                    MovementLayer::Ground
-                };
-                entity.occupancy_enter_order = self.substrate.next_occupancy_enter_order.next();
-                self.substrate.occupancy.add(
-                    at.0,
-                    at.1,
-                    id,
-                    layer,
-                    entity.sub_cell,
-                    CellListInsertion::from_category(entity.category),
-                );
-                Some(at)
+            self.foot_mark_put_observed(id, rules, registry, &mut |sim, id| {
+                observe(sim, id, TrackWorldEvent::MarkPut)
             });
-            if let Some(entered_cell) = entered_cell {
-                // AddContent47E8A0 discovery/tag4 belongs here. Map object
-                // tags are not represented; no periodic trigger substitute.
-                observe(self, id, TrackWorldEvent::MarkPut);
-                if self.track_occupation_enabled(id) {
-                    self.track_raw_mark(id, true, fallback_grid);
-                }
-                // Enter retains the addressed cell for its post-discovery
-                // slot relookup; a callback's new owner XYZ is only raw-mark's
-                // input, not the Recalc receiver coordinate.
-                self.recalculate_track_cell(entered_cell, rules, registry);
-            }
         }
     }
 
     /// Apply_Track_Occupation_Mode(0/1), Drive4B0AD0 / Ship6A01A0:
     /// direct raw handoff then full supplied head, with no Foot+6B6 gate.
-    fn track_apply_occupation(
+    pub(super) fn track_apply_occupation(&mut self, id: u64, family: TrackFamily, put: bool) {
+        let supplied = head_or_null(self.substrate.entities.get(id), family);
+        self.track_apply_occupation_at(id, family, supplied, put);
+    }
+
+    fn track_apply_occupation_at(
         &mut self,
         id: u64,
         family: TrackFamily,
+        supplied: DriveCoord,
         put: bool,
-        fallback_grid: Option<&PathGrid>,
     ) {
-        let Some((state, supplied, current)) = self.track_state(id, family) else {
+        let Some((state, retained_head, current)) = self.track_state(id, family) else {
             return;
         };
         if supplied == (DriveCoord { x: 0, y: 0, z: 0 }) {
@@ -783,21 +859,23 @@ impl Simulation {
                     turn.flags,
                 );
                 Some(DriveCoord {
-                    x: supplied.x.wrapping_add(i32::from(x)),
-                    y: supplied.y.wrapping_add(i32::from(y)),
+                    // Transform4B47E2/E5 reloads class head after the crate
+                    // receiver; Apply's final mark still uses supplied XYZ.
+                    x: retained_head.x.wrapping_add(i32::from(x)),
+                    y: retained_head.y.wrapping_add(i32::from(y)),
                     z: current.z,
                 })
             })
             .flatten();
         let handoff_mark = handoff.map(|coord| {
-            let layer = self.track_raw_mark_at(id, coord, put, fallback_grid);
+            let layer = self.track_raw_mark_at(id, coord, put);
             DriveOccupationFootprint {
                 rx: cell(coord).0,
                 ry: cell(coord).1,
                 layer,
             }
         });
-        let layer = self.track_raw_mark_at(id, supplied, put, fallback_grid);
+        let layer = self.track_raw_mark_at(id, supplied, put);
         if put {
             if let Some(entity) = self.substrate.entities.get_mut(id) {
                 let marks = match family {
@@ -837,21 +915,7 @@ impl Simulation {
             }
         });
         if let Some(family) = family {
-            self.track_apply_occupation(id, family, false, None);
-            if let Some(entity) = self.substrate.entities.get_mut(id) {
-                match family {
-                    TrackFamily::Drive => {
-                        if let Some(state) = entity.drive_locomotion.as_mut() {
-                            state.pending_track_occupation = false;
-                        }
-                    }
-                    TrackFamily::Ship => {
-                        if let Some(state) = entity.ship_locomotion.as_mut() {
-                            state.pending_track_occupation = false;
-                        }
-                    }
-                }
-            }
+            self.track_apply_occupation(id, family, false);
         }
     }
 
@@ -862,127 +926,89 @@ impl Simulation {
         call: &mut TrackProcess,
         direction: u8,
         rules: Option<&RuleSet>,
-        fallback_grid: Option<&PathGrid>,
+        registry: Option<&OverlayTypeRegistry>,
         observe: &mut impl FnMut(&mut Simulation, u64, TrackWorldEvent),
-    ) -> bool {
+    ) -> Result<bool, String> {
         let Some(entity) = self.substrate.entities.get(id) else {
-            return false;
+            return Ok(false);
         };
         let Some(from) = call.chain_target_facing() else {
-            return false;
+            return Ok(false);
         };
         if direction >= 8 || crate::util::direction::direction_from_facing(from) == direction {
-            return false;
+            return Ok(false);
         }
         let Some(selection) = super::drive_track::select_drive_track(from, direction * 32, false)
         else {
-            return false;
+            return Ok(false);
         };
         if selection.entry_index == 0 {
-            return false;
+            return Ok(false);
         }
+        // A component fixture without rules or map cells cannot ask the
+        // native predicate; production always has both. It takes no chain.
+        let (Some(rules), Some(terrain)) = (rules, self.resolved_terrain.as_ref()) else {
+            return Ok(false);
+        };
         let candidate = super::track_head::offset_head(head(entity, family), direction);
-        let saved_speed = entity.foot_speed.applied_fraction;
-        let grid = self.path_grid.as_deref().or(fallback_grid);
-        let Some(snapshot) = super::movement_tick::snapshot_mover(
-            &self.substrate.entities,
+        let saved_speed = entity.foot_speed.applied_fraction();
+        //4B1BA1..4B1C3E: Unit+1AC(cell(head + delta), dir, Object 0x5F5F00,
+        //0, 1), with no Mark bracket.
+        let target = super::foot_path::coord_cell(candidate);
+        let (height, native) = {
+            let cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
+            let height = super::ground_pose::query_object_cell_height(
+                &cells,
+                position_world_coord(&entity.position),
+                entity.on_bridge,
+            );
+            (height, cells.lookup(target))
+        };
+        let code = self.foot_can_enter(
             id,
-            self.playfield_bounds,
-        ) else {
-            return false;
-        };
-        let entity = self.substrate.entities.get_mut(id).unwrap();
-        let layer = if entity.on_bridge {
-            MovementLayer::Bridge
-        } else {
-            MovementLayer::Ground
-        };
-        let entry = super::movement_occupancy::evaluate_runtime_can_enter_cell_with_transition(
-            grid,
-            layer,
-            &mut entity.runtime_bridge_transition,
-            entity.on_bridge,
-            super::movement_occupancy::RuntimeCanEnterCellArgs::runtime(
-                cell(candidate),
-                direction as i8,
-                super::movement_occupancy::runtime_current_effective_height(
-                    grid,
-                    (entity.position.rx, entity.position.ry),
-                    entity.on_bridge,
-                    entity.position.z,
-                ),
-            ),
-        );
-        let chain = super::movement_tick::DeferredDriveTrackChain {
-            target_cell: cell(candidate),
-            head: candidate,
-            layers: entry.layers,
-            bridge_traversal_allowed: entry.bridge_traversal_allowed,
-            cur_face: from,
-            next_face: direction * 32,
-        };
-        let skips = super::movement_occupancy::build_live_building_entry_skip_map(
-            &self.substrate.entities,
-            id,
-            &self.interner,
+            native,
+            super::infantry_entry::InfantryEntryArgs {
+                direction: i32::from(direction),
+                height,
+                previous_cell: None,
+            },
             rules,
-        );
-        let result = super::movement_tick::classify_drive_track_chain_entry(
-            chain,
-            id,
-            &snapshot,
-            grid,
-            self.resolved_terrain.as_ref(),
-            snapshot
-                .speed_type
-                .and_then(|speed| self.terrain_costs.get(&speed)),
-            &self.substrate.occupancy,
-            &self.substrate.cell_occupation,
-            &skips,
-            &self.substrate.entities,
-            &self.house_alliances,
-            &self.interner,
-        );
-        match result {
-            // Original jump table4B2608 admits codes0 and2 here. Code1
-            // goes to redraw4B1E52 and common advancement, without a chain.
-            CellEntryResult::Clear
-            | CellEntryResult::TemporaryBlock { .. }
-            | CellEntryResult::TemporaryOccupation => {}
-            CellEntryResult::ScatterRequired { .. } => {
-                super::movement_tick::drive_track_chain_check_crushable_obstacle(
+            registry,
+        )?;
+        //4B1C44..4B1C4D: the jump table 0x4B2608 over codes 0..6.
+        match code {
+            0 | 2 => {}
+            //4B1E52..4B1E68: ground-list+FC contact callbacks, no chain.
+            1 => {
+                self.uncloak_contacts_at_cell(target, rules)?;
+                return Ok(false);
+            }
+            //4B1E6D..4B1EBB: the gate question, answer discarded.
+            3 => {
+                let owner = self
+                    .substrate
+                    .entities
+                    .get(id)
+                    .map(|actor| self.interner.resolve(actor.owner()).to_owned())
+                    .unwrap_or_default();
+                let _ = crate::sim::gate_runtime::request_gate_open_for_cell(
                     &mut self.substrate.entities,
                     &self.substrate.occupancy,
-                    chain,
+                    (target.0 as u16, target.1 as u16),
                     id,
-                    &snapshot,
+                    &owner,
                     rules,
                     &self.house_alliances,
                     &self.interner,
                 );
-                return false;
+                return Ok(false);
             }
-            CellEntryResult::FriendlyStationary { blocker_id } => {
-                super::bump_crush::scatter_blocker(
-                    &mut self.substrate.entities,
-                    blocker_id,
-                    grid,
-                    self.resolved_terrain.as_ref(),
-                    &self.substrate.occupancy,
-                    chain.layers.object_list_layer,
-                    &mut self.scenario_rng,
-                    rules,
-                    &self.interner,
-                    crate::sim::movement::DestinationTiming::new(
-                        self.session.binary_frame,
-                        rules.map_or(self.blockage_path_delay_ticks, |r| {
-                            r.general.blockage_path_delay_ticks
-                        }),
-                    ),
-                );
-                return false;
+            //4B1EC0..4B1F43: the forced deck-aware Scatter_Objects on the cell.
+            6 => {
+                self.scatter_blocked_track_cell(id, target, rules, registry)?;
+                return Ok(false);
             }
-            _ => return false,
+            _ => return Ok(false),
         }
         // Actual Unit+2C dispatch746E20 returns1; the next test reads
         // UnitType Passive+E0C. Stock absent Passive defaults false.
@@ -990,74 +1016,71 @@ impl Simulation {
             .substrate
             .entities
             .get(id)
-            .and_then(|entity| rules?.object(self.interner.resolve(entity.type_ref())))
+            .and_then(|entity| rules.object(self.interner.resolve(entity.type_ref())))
             .is_some_and(|object| object.passive)
         {
-            return false;
+            return Ok(false);
         }
         let entity = self.substrate.entities.get_mut(id).unwrap();
         if !call.accept_chain(
             progress_mut(entity, family).unwrap(),
             selection.turn_track_index as i32,
         ) {
-            return false;
+            return Ok(false);
         }
         set_head(entity, family, None);
-        if let Some(drive) = entity.drive_locomotion.as_mut() {
-            drive.track_valid = true;
-        }
-        self.track_per_cell(id, rules, fallback_grid);
+        // Drive4B1CF5 / Ship6A1338 publish +63 for the PerCell receiver.
+        set_track_valid(entity, family, true);
+        self.unit_per_cell_process(
+            id,
+            super::per_cell::PerCellReason::Arrival,
+            Some(rules),
+            registry,
+        );
         observe(self, id, TrackWorldEvent::PerCell);
         if let Some(entity) = self.substrate.entities.get_mut(id) {
-            if let Some(drive) = entity.drive_locomotion.as_mut() {
-                drive.track_valid = false;
-            }
+            // Drive4B1D06 / Ship6A1349 clear it before the survival ladder.
+            set_track_valid(entity, family, false);
         }
         if !self.track_survives(id) {
-            return true;
+            return Ok(true);
         }
         let entity = self.substrate.entities.get_mut(id).unwrap();
         // Callback writes to the head are cleared before candidate install.
         set_head(entity, family, None);
-        // Accepted Drive chain4B1DA5 restores +63 before candidate head
-        // stores4B1DA9..4B1DB4, after the transient PerCell corridor.
-        if family == TrackFamily::Drive
-            && let Some(drive) = entity.drive_locomotion.as_mut()
-        {
-            drive.track_valid = true;
-        }
+        // Drive4B1DA5 / Ship6A13E8 restore +63 before candidate head stores,
+        // after the transient PerCell corridor.
+        set_track_valid(entity, family, true);
         set_head(entity, family, Some(candidate));
         // Crate pickup is an explicit receiver gap. A surviving pickup
         // precedes Apply1, then the saved owner fraction and live queue shift.
-        self.track_apply_occupation(id, family, true, fallback_grid);
+        self.track_apply_occupation(id, family, true);
         if let Some(entity) = self.substrate.entities.get_mut(id) {
-            entity.foot_speed.applied_fraction = saved_speed;
+            entity.foot_speed.set_speed_fraction(saved_speed);
             super::path_markers::consume_path_replay(&mut entity.navigation.path_replay, 1);
         }
-        true
+        Ok(true)
     }
 
-    fn track_reached_destination(&self, id: u64, family: TrackFamily) -> bool {
+    fn track_reached_destination(
+        &self,
+        id: u64,
+        family: TrackFamily,
+        rules: Option<&RuleSet>,
+    ) -> Result<bool, String> {
         let Some(entity) = self.substrate.entities.get(id) else {
-            return false;
+            return Ok(false);
         };
         let Some(target) = entity.navigation.nav_com else {
-            return false;
+            return Ok(false);
         };
-        let coord = match target {
-            crate::sim::components::NavTargetRef::Cell { rx, ry } => {
-                super::navcom::target_cell_coord(rx, ry, self.resolved_terrain.as_ref())
-            }
-            _ => {
-                let Some(coord) = super::navcom::resolve_entity_nav_target_drive_coord(
-                    target,
-                    &self.substrate.entities,
-                ) else {
-                    return false;
-                };
-                coord
-            }
-        };
+        let coord = super::navcom::nav_target_coordinate(
+            target,
+            Some(id),
+            &self.substrate.entities,
+            self.resolved_terrain.as_ref(),
+            rules.map(|rules| (rules, &self.interner)),
+        )?;
         let destination = match family {
             TrackFamily::Drive => entity
                 .drive_locomotion
@@ -1069,20 +1092,31 @@ impl Simulation {
                 .and_then(|state| state.destination),
         };
         let Some(destination) = destination else {
-            return false;
+            return Ok(false);
         };
         // Drive4B2180..2194 / Ship6A17C3..17D7 query OWNER +4C for Z.
         // The cleared head makes ordinary +4C resolve to the placed owner;
         // NavCom contributes only the horizontal cell test.
-        let owner = position_world_coord(&entity.position);
-        cell(coord) == cell(owner)
-            && owner.z.wrapping_sub(destination.z).wrapping_abs()
-                < 2 * crate::util::lepton::GROUND_LEVEL_HEIGHT_LEPTONS
+        if cell(coord) != cell(position_world_coord(&entity.position)) {
+            return Ok(false);
+        }
+        let owner = self.foot_navigation_coordinate(id)?;
+        Ok(owner.z.wrapping_sub(destination.z).wrapping_abs()
+            < 2 * crate::util::lepton::GROUND_LEVEL_HEIGHT_LEPTONS)
+    }
+
+    /// `UnitClass::Enter_Idle_Mode(0, 1)` (vt+0x484) from a class caller:
+    /// the refinery dock's Mission_Enter refusal (`0x004D92E2`) and
+    /// Mission_Unload's lost contact (`0x0073DEF2`).
+    pub(crate) fn unit_enter_idle_mode(&mut self, id: u64, rules: Option<&RuleSet>) -> bool {
+        self.track_enter_idle_mode(id, rules)
     }
 
     /// Bounded Unit738970 receiver. Existing idle selectors cover ordinary
     /// human vehicles/miners; deploy/radio/AI arms remain receiver residuals.
-    fn track_enter_idle_mode(&mut self, id: u64, rules: Option<&RuleSet>) -> bool {
+    pub(super) fn track_enter_idle_mode(&mut self, id: u64, rules: Option<&RuleSet>) -> bool {
+        // Foot4D82D9 -> Techno709A54 lets a held Temporal target go first.
+        self.temporal_release_if_warping(id);
         let Some(entity) = self.substrate.entities.get_mut(id) else {
             return false;
         };
@@ -1117,11 +1151,9 @@ impl Simulation {
         // Normal Foot4D8538 invokes +544(0.0); Unit dispatch4D3710
         // writes Foot+578. The true-return NavQueue arm skips this setter.
         if !ended_drive && entity.navigation.nav_queue.is_empty() && queued_cell.is_none() {
-            entity.foot_speed.applied_fraction = crate::util::fixed_math::SIM_ZERO;
-            entity.foot_speed.cached_current_speed = 0;
-            if let Some(target) = entity.movement_target.as_mut() {
-                target.current_speed = crate::util::fixed_math::SIM_ZERO;
-            }
+            entity
+                .foot_speed
+                .set_speed_fraction(crate::util::fixed_math::SIM_ZERO);
         }
         let saved_base_return = ended_drive || queued_cell.is_some();
         let has_destination = entity.navigation.nav_com.is_some();
@@ -1145,7 +1177,10 @@ impl Simulation {
         };
         if selection.is_some() && !has_destination {
             if let Some(entity) = self.substrate.entities.get_mut(id) {
-                entity.attack_target = None;
+                // Unit738AF5/738C75 calls the virtual target setter before
+                // the Guard/Harvest queue; clearing only Target loses its
+                // retained burst reset (Techno6FCF5B).
+                crate::sim::mission::concrete_effects::represented_assign_target(entity, None);
             }
         }
         // Unit738CFA..D12 suppresses assignment only after preceding writes.
@@ -1181,134 +1216,12 @@ impl Simulation {
         }
         self.track_enter_idle_mode(id, rules)
     }
-
-    fn track_per_cell(
-        &mut self,
-        id: u64,
-        rules: Option<&RuleSet>,
-        _fallback_grid: Option<&PathGrid>,
-    ) {
-        // Unit739EC0 invokes the MCV receiver before normal crush/Foot tail.
-        if let Some(rules) = rules {
-            crate::sim::mcv_deploy::per_cell_process(self, id, rules);
-        }
-        if !self.track_survives(id) {
-            return;
-        }
-        // Unit PerCell2 739EC0: after MCV retry, +6D1==0 admits
-        // Ready(+200)73ACC2 -> Commence(+1EC)73ACD1, BEFORE full-cell
-        // crush73B089 and Foot sensor/playfield tail73B0A0. The existing
-        // miner.unload_active owns +6D1 (ctor7353FE, unload73DFDA).
-        // This promotes only: it does not dispatch a mission handler or
-        // repeat the object AI prefix. mission_host_promote retains its
-        // documented unavailable locomotor/height fallback for other inputs.
-        let promote = self.substrate.entities.get(id).is_some_and(|entity| {
-            !entity
-                .miner
-                .as_ref()
-                .is_some_and(|miner| miner.unload_active)
-        });
-        if let Some(rules) = rules.filter(|_| promote) {
-            self.mission_host_promote(id, self.session.binary_frame, rules);
-        }
-        let Some(entity) = self.substrate.entities.get(id) else {
-            return;
-        };
-        let at = (entity.position.rx, entity.position.ry);
-        let layer = if entity.on_bridge {
-            MovementLayer::Bridge
-        } else {
-            MovementLayer::Ground
-        };
-        let mut cursor = self
-            .substrate
-            .occupancy
-            .get(at.0, at.1)
-            .and_then(|list| list.first_on_layer(layer));
-        while let Some(victim) = cursor {
-            // Save successor BEFORE lifecycle can remove the current object.
-            cursor = self
-                .substrate
-                .occupancy
-                .get(at.0, at.1)
-                .and_then(|list| list.next_on_layer(layer, victim));
-            if victim == id {
-                continue;
-            }
-            let Some(crusher) = self.substrate.entities.get(id) else {
-                return;
-            };
-            let coord = position_world_coord(&crusher.position);
-            let capability = super::bump_crush::CrushCapability::new(
-                crusher.regular_crusher,
-                crusher.omni_crusher,
-            );
-            let kills = super::bump_crush::classify_drive_crush_phase(
-                super::bump_crush::DriveCrushPhase::FullyInCell,
-                &[victim],
-                &self.substrate.entities,
-                id,
-                &self.house_alliances,
-                &self.interner,
-                (coord.x, coord.y),
-                capability,
-                super::bump_crush::ScatterEligibility::from_rules(rules),
-                self.session.tick as u32,
-            );
-            if !matches!(kills, super::bump_crush::DriveCrushOutcome::Kill { ref victims } if victims.contains(&victim))
-            {
-                continue;
-            }
-            if let Some(rules) = rules {
-                if let Some(entity) = self.substrate.entities.get(victim) {
-                    super::bump_crush::emit_crush_kill_sounds_at(
-                        entity,
-                        (i32::from(at.0), i32::from(at.1)),
-                        rules,
-                        &mut self.interner,
-                        &mut self.sound_events,
-                    );
-                }
-                let owner = self.substrate.entities.get(id).map(|entity| entity.owner());
-                if let Some(entity) = self.substrate.entities.get_mut(victim) {
-                    entity.health.current = 0;
-                    crate::sim::combat::capture_kill_credit(entity, owner, rules, &self.interner);
-                }
-                crate::sim::combat::award_kill_experience(
-                    &mut self.substrate.entities,
-                    rules,
-                    &self.interner,
-                    &self.house_alliances,
-                    id,
-                    victim,
-                );
-                self.apply_lifecycle_request_with_rules(
-                    LifecycleRequest::Uninit {
-                        stable_id: victim,
-                        reason: UninitReason::Crush,
-                    },
-                    rules,
-                );
-            } else {
-                self.apply_lifecycle_request(LifecycleRequest::Uninit {
-                    stable_id: victim,
-                    reason: UninitReason::Crush,
-                });
-            }
-        }
-        if !self.track_survives(id) {
-            return;
-        }
-        if let Some(rules) = rules {
-            self.refresh_unit_sensor_at_per_cell(id, rules);
-            crate::sim::world::techno_ai_cloak::uncloak_on_sensor_neighbour_after_cell_entry(
-                self, id, rules,
-            );
-        }
-        self.promote_entity_playfield_membership_after_move(id);
-    }
 }
 
 #[cfg(test)]
 #[path = "track_host_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "track_force_tests.rs"]
+mod force_tests;

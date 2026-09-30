@@ -4,6 +4,7 @@
 //! pair is the sole emptiness discriminator; accepted ghosts retain the same
 //! coordinate/timer state as visible crates.
 
+use crate::sim::timer::CdTimer;
 use crate::util::native_x87::{NativeF64Bits, X87Chop53};
 
 pub(crate) const CRATE_SLOT_CAPACITY: usize = 256;
@@ -32,6 +33,12 @@ impl Default for CrateSlot {
 impl CrateSlot {
     pub fn is_empty(self) -> bool {
         self.cell_x == 0 && self.cell_y == 0
+    }
+
+    /// The slot's timer: its start and duration words. The `aux` word between
+    /// them sits where a native timer keeps its unused pointer dword.
+    pub(crate) const fn timer(self) -> CdTimer {
+        CdTimer::from_raw(self.start_frame, self.duration)
     }
 }
 
@@ -64,6 +71,7 @@ impl CrateAuthority {
 
     /// Accepted coordinates in native ascending slot order. Negative packed
     /// values are malformed snapshot state and cannot name a Rust grid cell.
+    #[cfg(test)]
     pub(crate) fn occupied_cells(&self) -> impl Iterator<Item = (u16, u16)> + '_ {
         self.slots.iter().filter_map(|slot| {
             if slot.is_empty() {
@@ -101,7 +109,7 @@ pub(crate) fn crate_timer_words(
     // `Math__ftol @ 0x007C5F00` executes masked `FISTP qword`; an
     // out-of-range conversion stores integer-indefinite i64::MIN. The crate
     // writer at 0x004A18C5 keeps only EAX, so either-sign overflow becomes 0.
-    let duration = X87Chop53::ftol_i64(value).unwrap_or(i64::MIN) as i32;
+    let duration = X87Chop53::ftol_i32_low_masked(value);
     (current_frame, (stored_upper.bits() >> 32) as u32, duration)
 }
 
@@ -218,11 +226,8 @@ mod tests {
     #[test]
     fn crate_timer_out_of_range_fistp_stores_integer_indefinite_low_dword() {
         for regen in [1.0e20_f64, -1.0e20_f64] {
-            let (_, _, duration) = crate_timer_words(
-                NativeF64Bits::from_bits(regen.to_bits()),
-                0x3fff_ffff,
-                91,
-            );
+            let (_, _, duration) =
+                crate_timer_words(NativeF64Bits::from_bits(regen.to_bits()), 0x3fff_ffff, 91);
             assert_eq!(
                 duration, 0,
                 "masked FISTP qword writes i64::MIN and the native slot keeps low EAX"
@@ -246,12 +251,10 @@ mod tests {
     }
 
     #[test]
-    fn crate_authority_every_raw_word_changes_v114_hash_only() {
+    fn crate_authority_every_raw_word_changes_the_hash() {
         use crate::sim::world::Simulation;
 
-        let baseline = Simulation::new();
-        let baseline_current = baseline.state_hash();
-        let baseline_v113 = baseline.state_hash_without_crate_authority_v114();
+        let baseline_current = Simulation::new().state_hash();
         for slot in [
             CrateSlot {
                 start_frame: 8,
@@ -277,10 +280,6 @@ mod tests {
             let mut changed = Simulation::new();
             *changed.crate_authority.slot_mut(73) = slot;
             assert_ne!(baseline_current, changed.state_hash());
-            assert_eq!(
-                baseline_v113,
-                changed.state_hash_without_crate_authority_v114()
-            );
         }
     }
 

@@ -5,7 +5,7 @@
 use super::button::ShellButtonInteraction;
 use super::geom::{self, RectPx};
 use super::in_game_shell::InGameShellLayout;
-use crate::ui::main_menu_dialogs::options::{thumb_left, trackbar_position_from_x};
+use crate::ui::shell::trackbar::{thumb_left, trackbar_position_from_x};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
@@ -111,10 +111,11 @@ impl SoundState {
         self.scroll.cancel();
     }
     pub fn thumb_left(&self, id: SoundSlider, rect: RectPx) -> i32 {
-        thumb_left(self.positions[id as usize], rect.w, 50, 10)
+        thumb_left(i32::from(self.positions[id as usize]), rect.w, 50, 10)
     }
     pub fn set_from_pointer(&mut self, id: SoundSlider, rect: RectPx, x: i32) -> Option<f32> {
-        let pos = trackbar_position_from_x(x - rect.x, rect.w, 50, 10);
+        // The range is 10, so the position fits a byte.
+        let pos = trackbar_position_from_x(x - rect.x, rect.w, 50, 10) as u8;
         let stored = &mut self.positions[id as usize];
         if *stored == pos {
             return None;

@@ -1,16 +1,14 @@
 //! Weapon selection — the native `TechnoClass::What_Weapon_Should_I_Use`
-//! ladder, its Infantry/Unit class overrides, the `NavalTargeting=` selector,
-//! `TechnoClass::GetWeapon` (elite tier), and the target-legality subset of
-//! `TechnoClass::GetFireError` that turns a selected slot into "can engage /
-//! cannot engage".
+//! ladder, its Infantry/Unit class overrides, the `NavalTargeting=` selector
+//! and `TechnoClass::GetWeapon` (elite tier), with a garrison's occupant
+//! weapon.
 //!
 //! Shape: `what_weapon_should_i_use` reproduces the native predicate ladder in
 //! native order as one function with the same early returns and returns a
-//! weapon-slot INDEX (never "no weapon"). `select_weapon_for_target` then
-//! resolves that index through `GetWeapon` and applies the GetFireError
-//! targeting verdicts (AA vs high-flying, naval `-1`, `LandTargeting=1`,
-//! `Verses == 0`) so callers keep the existing `Option<SelectedWeapon>`
-//! contract: `None` means the shot is ILLEGAL, not that no slot was chosen.
+//! weapon-slot INDEX (never "no weapon"). `resolve_selected_weapon` resolves
+//! that index through `GetWeapon`; its `None` means the slot names no weapon.
+//! Neither asks whether the shot is legal: that is GetFireError
+//! ([`super::fire_error`]), which each caller asks where native asks it.
 //!
 //! gamemd-derived (all read live this session):
 //! - `TechnoClass::What_Weapon_Should_I_Use @ 0x006F3330` (vtable `+0x2E4` in
@@ -18,8 +16,8 @@
 //! - `InfantryClass` override `@ 0x005218E0` (`0x007EB33C`), `UnitClass`
 //!   override `@ 0x00746CD0` (`0x007F5F54`).
 //! - `TechnoClass::SelectNavalTargetingWeapon @ 0x006F3820` (vtable `+0x2E8`).
-//! - `TechnoClass::GetWeapon @ 0x0070E140` (elite tier).
-//! - `TechnoClass::GetFireError @ 0x006FC0B0` (targeting subset only).
+//! - `TechnoClass::GetWeapon @ 0x0070E140` (elite tier) and the occupied arm
+//!   of `BuildingClass::GetWeapon @ 0x004526F0`.
 //!
 //! ## Dependency rules
 //! - Part of sim/ — depends on rules/, map/ terrain facts, and sim entity state.
@@ -37,13 +35,11 @@ use crate::rules::ruleset::RuleSet;
 use crate::rules::terrain_rules::LandType;
 use crate::rules::warhead_type::WarheadType;
 use crate::rules::weapon_type::WeaponType;
-use crate::sim::animation::SequenceKind;
 use crate::sim::deploy::DeployPhase;
 use crate::sim::entity_store::EntityStore;
 use crate::sim::game_entity::GameEntity;
 use crate::sim::intern::{InternedId, StringInterner};
 use crate::sim::mission::MissionType;
-use crate::util::lepton::HIGH_FLIGHT_THRESHOLD_LEPTONS;
 
 /// Which weapon slot the unit is using for this engagement.
 ///
@@ -55,72 +51,34 @@ pub enum WeaponSlot {
     Secondary,
 }
 
-/// Weapon-selection override carried by a transport firing on a passenger's
-/// behalf. Both variants feed native inputs of the selection ladder:
+/// Weapon-selection override carried by a transport on a passenger's behalf.
 ///
 /// - **`IfvSlot(idx)`** — `Gunner=yes` transports (IFV). The passenger's
 ///   `IFVMode` becomes the transport's `CurrentWeaponNumber`
 ///   (`TechnoClass+0x138`, written by `TechnoClass::SetGunnerWeapon @
 ///   0x0070DC70` from the receive-gunner path at `0x007464CE`).
-/// - **`OpenTransport(slot)`** — VERA-internal bridge for open-topped
-///   passenger fire: the transport entity stands in for the passenger whose
-///   `InOpenToppedTransport` (`TechnoClass+0x82`) and `OpenTransportWeapon`
-///   would natively be read on the passenger itself (ladder arm G @
-///   `0x006F33D9`). The slot value is the passenger's `OpenTransportWeapon`.
+///
+/// An open-topped passenger's `OpenTransportWeapon` is read on the passenger
+/// itself (its `+0x82`, [`PassengerRole::in_open_transport`]).
+///
+/// [`PassengerRole::in_open_transport`]: crate::sim::passenger::PassengerRole::in_open_transport
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum WeaponOverride {
     /// Transport's `CurrentWeaponNumber`, used when transport is `Gunner=yes`.
     IfvSlot(u32),
-    /// Passenger's `OpenTransportWeapon` slot (0 primary / 1 secondary).
-    OpenTransport(u32),
 }
 
-/// Result of weapon selection: the chosen weapon, its warhead, and the
-/// effective Verses percentage against the target's armor.
+/// Result of weapon selection: the chosen weapon and its warhead.
 pub(crate) struct SelectedWeapon<'a> {
     /// Section id of the selected weapon.
     pub weapon_id: &'a str,
     pub weapon: &'a WeaponType,
     pub warhead: &'a WarheadType,
-    /// Damage percentage for target armor (0–200). Already looked up from Verses.
-    /// 100 = full damage, 0 = immune. Cell targets report 100 (native reads
-    /// no Verses for a non-Techno target).
-    pub verses_pct: u8,
     /// FLH slot: index 1 is `Secondary`, every other index is `Primary`.
     pub slot: WeaponSlot,
     /// Native weapon-array index returned by the selection ladder.
     pub index: i32,
 }
-
-/// Behavioral gate derived from the Verses damage percentage.
-/// Controls whether a weapon can passively acquire or retaliate against a target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum VersesGate {
-    /// 0% — weapon cannot target this armor type at all, even force-fire.
-    Blocked,
-    /// 1% — no passive acquire, no retaliation. Force-fire works at 1% damage.
-    Suppressed,
-    /// >1% — normal engagement allowed.
-    Normal,
-}
-
-/// Classify a Verses percentage into its behavioral gate.
-///
-/// RA2 uses these thresholds to control targeting:
-/// - 0 blocks the weapon entirely (falls back to Secondary).
-/// - 1 (1%) suppresses auto-targeting but allows force-fire.
-/// - >1 is normal combat.
-pub(crate) fn verses_gate(verses_pct: u8) -> VersesGate {
-    match verses_pct {
-        0 => VersesGate::Blocked,
-        1 => VersesGate::Suppressed,
-        _ => VersesGate::Normal,
-    }
-}
-
-/// `DeployFireWeapon=` constructor default (`TechnoTypeClass` ctor @
-/// `0x0071113A`): slot 1.
-const DEFAULT_DEPLOY_FIRE_WEAPON_INDEX: i32 = 1;
 
 /// Elite veterancy threshold used by `VeterancyClass::IsElite` inside
 /// `GetWeapon`.
@@ -180,7 +138,40 @@ pub(crate) struct AttackerFacts {
     pub aircraft_spawn_collision: bool,
 }
 
-/// Target-side facts read by the ladder and the GetFireError subset.
+/// Flight virtuals are queried only where the selection ladder asks them.
+/// Gathering target facts must not eagerly move the canonical fallback cell.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TargetFlight<'a> {
+    Live {
+        entity: &'a GameEntity,
+        terrain: Option<&'a ResolvedTerrainGrid>,
+        rules: &'a RuleSet,
+        interner: &'a StringInterner,
+    },
+    #[cfg(test)]
+    Supplied { high: bool },
+}
+
+impl TargetFlight<'_> {
+    fn high(self) -> bool {
+        match self {
+            Self::Live {
+                entity,
+                terrain,
+                rules,
+                interner,
+            } => crate::sim::movement::air_movement::is_high_flying(
+                entity,
+                terrain,
+                Some((rules, interner)),
+            ),
+            #[cfg(test)]
+            Self::Supplied { high } => high,
+        }
+    }
+}
+
+/// Target-side facts read by the ladder.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum TargetFacts<'a> {
     /// Real TerrainClass Object target: neither CellClass nor TechnoClass.
@@ -203,7 +194,7 @@ pub(crate) enum TargetFacts<'a> {
         kind: TechnoKind,
         /// `ObjectClass::IsHighFlying @ 0x005F6B90` (vtable `+0x54`):
         /// marked on the map and `GetHeight() >= 2 * LeptonsPerLevel`.
-        is_high_flying: bool,
+        flight: TargetFlight<'a>,
         /// `FootClass+0x8C OnBridge`.
         on_bridge: bool,
         /// `LandType` of the target's occupied cell (`vt+0x1BC` → `+0xEC`).
@@ -216,6 +207,46 @@ pub(crate) enum TargetFacts<'a> {
     },
 }
 
+/// ParasiteClass CanInfect `0x0062A8E0`, the one implementation both callers
+/// use (AttachTo and GetFireError): a live, unlimboed, uninfected,
+/// Parasiteable Foot outside a tank bunker, plus the water-set cell a Naval
+/// owner requires. GetFireError returns ILLEGAL (5) otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ParasiteVictimFacts {
+    pub(crate) infectable: bool,
+    pub(crate) on_water_set: bool,
+}
+
+impl ParasiteVictimFacts {
+    /// A NULL victim cell passes the water gate (`0x00485060` is not reached).
+    pub(crate) fn of(
+        target: &GameEntity,
+        target_obj: &ObjectType,
+        terrain: Option<&ResolvedTerrainGrid>,
+    ) -> Self {
+        let on_water_set = terrain
+            .and_then(|grid| grid.cell(target.position.rx, target.position.ry))
+            .is_none_or(|cell| cell.is_water);
+        Self {
+            infectable: matches!(
+                target.category,
+                EntityCategory::Unit | EntityCategory::Infantry | EntityCategory::Aircraft
+            ) && !target.lifecycle.in_limbo
+                && target.lifecycle.object_alive
+                && target.health.current != 0
+                && target.parasite_eating_me.is_none()
+                && target_obj.parasiteable
+                && target.bunker_link.installed_in().is_none(),
+            on_water_set,
+        }
+    }
+
+    /// The owner half: a Naval owner also needs the water-set victim cell.
+    pub(crate) fn admits(self, naval_owner: bool) -> bool {
+        self.infectable && (!naval_owner || self.on_water_set)
+    }
+}
+
 impl TargetFacts<'_> {
     fn techno(&self) -> Option<&Self> {
         match self {
@@ -226,7 +257,7 @@ impl TargetFacts<'_> {
 
     fn is_high_flying(&self) -> bool {
         match self {
-            TargetFacts::Techno { is_high_flying, .. } => *is_high_flying,
+            TargetFacts::Techno { flight, .. } => flight.high(),
             // `CellClass` vtable `+0x54` @ `0x00410530` returns 0.
             TargetFacts::Cell { .. } | TargetFacts::Terrain => false,
         }
@@ -259,6 +290,24 @@ fn elite_weapon_at(obj: &ObjectType, index: usize) -> Option<&str> {
         .and_then(|slot| slot.as_deref())
 }
 
+/// [`fire_error::weapon_damage_value`](super::fire_error::weapon_damage_value)
+/// (`0x006F3970(-1)`) over the object's own weapon slots at its rank. Not for
+/// a garrisoned building, whose GetWeapon answers the occupant's weapon; that
+/// goes through `FireSubject::weapon_damage_value`. Read by the bridge-repair
+/// infantry entry probe.
+pub(crate) fn weapon_damage_value(entity: &GameEntity, obj: &ObjectType, rules: &RuleSet) -> i32 {
+    super::fire_error::weapon_damage_value(
+        obj.turret_count,
+        obj.is_gattling,
+        attacker_facts(entity, obj).current_weapon_number,
+        |slot| {
+            weapon_for_index(obj, entity.veterancy(), slot)
+                .and_then(|(name, _)| rules.weapon(name))
+                .map(|weapon| weapon.damage.wrapping_add(weapon.ambient_damage))
+        },
+    )
+}
+
 /// `TechnoClass::GetWeapon @ 0x0070E140`: `-1` → no weapon; elite objects use
 /// `EliteWeapon[idx]` when that slot names a weapon, else `Weapon[idx]`.
 /// Veteran tier does not swap. Indices outside the 18-slot array are treated
@@ -287,16 +336,6 @@ pub(crate) fn weapon_for_index(
         WeaponSlot::Primary
     };
     Some((weapon_id, slot))
-}
-
-/// Alias kept for the fatal-receiver Suicide gate, which stores the last
-/// selected index as a `u8`.
-pub(crate) fn weapon_for_slot_index(
-    obj: &ObjectType,
-    veterancy: u16,
-    index: i32,
-) -> Option<(&str, WeaponSlot)> {
-    weapon_for_index(obj, veterancy, index)
 }
 
 /// `GetWeapon(0)` weapon id at the given veterancy.
@@ -355,31 +394,132 @@ pub(crate) fn is_armed(entity: &GameEntity, obj: &ObjectType) -> bool {
     is_armed_from_facts(obj, attacker_facts(entity, obj))
 }
 
-fn is_armed_from_facts(obj: &ObjectType, facts: AttackerFacts) -> bool {
+/// The `Wall=` and `Wood=` flags of the mover's **slot 0** warhead.
+///
+/// gamemd-derived: the weapon route of the wall arm in
+/// `UnitClass::Can_Enter_Cell @ 0x0073F0A0` resolves its warhead by pushing a
+/// literal `0` into vtable `+0x3F8` (`TechnoClass::GetWeapon @ 0x0070E140`) at
+/// `0x0073F497`, then reads `+0xAC` for the warhead and tests `+0x144` (`Wall=`)
+/// at `0x0073F4A9` and `+0x147` (`Wood=`) at `0x0073F4B3`.
+///
+/// Slot 0 is **unconditional** there. [`is_armed`] resolves the turret-aware
+/// current weapon instead (`GetCurrentWeapon @ 0x0070E1A0`: the gunner slot iff
+/// `HasTurrets`), so the two gates of the same arm deliberately read different
+/// slots and this cannot reuse that choice.
+///
+/// `Wood=` additionally requires the overlay's own `Armor` to be wood
+/// (`0x0073F4BD` compares 6) and is Unit-only - the infantry arm's
+/// `FUN_00772AC0` tests `+0x144` alone. Both of those gates live in the wall arm
+/// itself; this returns the raw warhead flags.
+pub(crate) fn primary_warhead_wall_flags(
+    entity: &GameEntity,
+    obj: &ObjectType,
+    rules: &crate::rules::ruleset::RuleSet,
+) -> (bool, bool) {
+    let facts = attacker_facts(entity, obj);
+    let Some((weapon_id, _)) = weapon_for_index(obj, facts.veterancy, 0) else {
+        return (false, false);
+    };
+    let Some(warhead_id) = rules.weapon(weapon_id).and_then(|w| w.warhead.as_deref()) else {
+        return (false, false);
+    };
+    rules
+        .warhead(warhead_id)
+        .map_or((false, false), |wh| (wh.wall, wh.wood))
+}
+
+/// Aircraft auxiliary+18/41B7F0: the primary projectile selects the attack
+/// approach and release branches. All callers use the live weapon tier.
+pub(crate) fn aircraft_strafes(rules: &RuleSet, obj: &ObjectType, veterancy: u16) -> bool {
+    primary_for_tier(obj, veterancy)
+        .and_then(|name| rules.weapon(name))
+        .and_then(|weapon| weapon.projectile.as_deref())
+        .and_then(|name| rules.projectile(name))
+        .is_some_and(|projectile| projectile.rot <= 1 && !projectile.inviso)
+}
+
+/// `TechnoClass::GetWeaponRange @ 0x007012C0` (vt+0x168, no class
+/// override): the raw signed range of `GetWeapon(index)`, 0 without one,
+/// capped by [`open_topped_cargo_range`]. It deliberately excludes InRange's
+/// bonuses and range overrides. Read by the flak scatter, the aircraft fire
+/// location, the scan radius (`Threat_Range`, `Greatest_Threat`), the
+/// base-defence threat score and an open-topped mover's per-cell stop.
+pub(crate) fn weapon_range(
+    entity: &GameEntity,
+    obj: &ObjectType,
+    index: i32,
+    entities: &crate::sim::entity_store::EntityStore,
+    rules: &RuleSet,
+    interner: &StringInterner,
+) -> i32 {
+    let Some(weapon) =
+        weapon_for_index(obj, entity.veterancy(), index).and_then(|(name, _)| rules.weapon(name))
+    else {
+        return 0;
+    };
+    let range = weapon.range_leptons;
+    open_topped_cargo_range(entity, obj, entities, rules, interner)
+        .map_or(range, |cargo| range.min(cargo))
+}
+
+/// GetWeaponRange's `OpenTopped=` arm (`0x007012ED..`, the same walk as
+/// `0x00710590`): the shortest range among the passengers' current weapons
+/// (`GetCurrentWeapon`, vt+0x3F4), walked from the cargo head. `None` when
+/// `obj` is not open-topped or no passenger is armed: native starts from
+/// `INT_MAX`, which caps nothing.
+pub(crate) fn open_topped_cargo_range(
+    entity: &GameEntity,
+    obj: &ObjectType,
+    entities: &crate::sim::entity_store::EntityStore,
+    rules: &RuleSet,
+    interner: &StringInterner,
+) -> Option<i32> {
+    if !obj.open_topped {
+        return None;
+    }
+    let mut shortest = None;
+    // Cargo owns the native head/+30 sequence. Neither limbo nor death
+    // filters belong to this reader; boarded passengers are in limbo.
+    for &id in &entity.passenger_role.cargo()?.passengers {
+        let Some(passenger) = entities.get(id) else {
+            break;
+        };
+        let Some(kind) = rules.object(interner.resolve(passenger.type_ref())) else {
+            continue;
+        };
+        if let Some(weapon) = current_weapon(passenger, kind).and_then(|name| rules.weapon(name)) {
+            shortest = Some(shortest.map_or(weapon.range_leptons, |range: i32| {
+                range.min(weapon.range_leptons)
+            }));
+        }
+    }
+    shortest
+}
+
+fn current_weapon_index(obj: &ObjectType, facts: AttackerFacts) -> i32 {
+    // GetCurrentWeapon70E1A0 reads CurrentWeaponNumber only with HasTurrets.
+    if obj.turret_count > 0 {
+        facts.current_weapon_number
+    } else {
+        0
+    }
+}
+
+/// `TechnoClass::GetCurrentWeapon @ 0x0070E1A0` (vt+0x3F4): the weapon in the
+/// gunner slot of a `TurretCount>0` type, slot 0 otherwise, at the live tier.
+pub(crate) fn current_weapon<'o>(entity: &GameEntity, obj: &'o ObjectType) -> Option<&'o str> {
+    let facts = attacker_facts(entity, obj);
+    weapon_for_index(obj, facts.veterancy, current_weapon_index(obj, facts)).map(|(id, _)| id)
+}
+
+pub(crate) fn is_armed_from_facts(obj: &ObjectType, facts: AttackerFacts) -> bool {
     // `BuildingClass::Is_Armed 0x00458DB0`: `IsOccupied() → 1`.
     if facts.is_occupied_building {
         return true;
     }
     // `GetCurrentWeapon 0x0070E1A0`: gunner slot iff `HasTurrets`, else slot 0.
-    let index = if obj.turret_count > 0 {
-        facts.current_weapon_number
-    } else {
-        0
-    };
+    let index = current_weapon_index(obj, facts);
     weapon_for_index(obj, facts.veterancy, index).is_some()
-}
-
-fn deploy_fire_weapon_index(obj: &ObjectType) -> i32 {
-    obj.deploy_fire_weapon
-        .unwrap_or(DEFAULT_DEPLOY_FIRE_WEAPON_INDEX)
-}
-
-/// Weapon ID the unit will fire while deployed (`DeployFireWeapon=` slot,
-/// default Secondary), without target-compatibility checks. Used by the
-/// deployed self-irradiator gate, which needs the weapon's RadLevel before
-/// any target exists.
-pub(crate) fn deploy_fire_weapon_id(obj: &ObjectType, veterancy: u16) -> Option<&str> {
-    weapon_for_index(obj, veterancy, deploy_fire_weapon_index(obj)).map(|(weapon_id, _)| weapon_id)
 }
 
 /// `TechnoClass::SelectNavalTargetingWeapon @ 0x006F3820` (vtable `+0x2E8`,
@@ -438,70 +578,78 @@ fn projectile_aa(rules: &RuleSet, weapon: &WeaponType) -> bool {
         .is_some_and(|projectile| projectile.aa)
 }
 
-/// Ordinary passive-scan class-mask bit4: Weapon772A90 projectile AA.
-/// Unit7431C9..24D uses only CurrentWeaponNumber when TurretCount>0 and
-/// !IsGattling, otherwise slots0/1; Building445F00 and Infantry51E2C7..319
-/// also union slots0/1. GetWeapon70E140 supplies elite fallback. This does
-/// not port the Infantry wrapper's separate special mission/type masks.
+/// `0x00772A90`: a weapon's class bits in a threat mask, from its
+/// projectile (`Weapon+0xA0`): `AA=` (`+0x2A4`) gives `4`, `AG=` (`+0x2A5`)
+/// ORs `0xB8`. A weapon naming no projectile section reads the reader's
+/// defaults (AA=no, AG=yes), as weapon selection does; retail weapons always
+/// name one.
+fn weapon_class_bits(rules: &RuleSet, weapon: &WeaponType) -> u32 {
+    let (aa, ag) = weapon
+        .projectile
+        .as_ref()
+        .and_then(|id| rules.projectile(id))
+        .map_or((false, true), |projectile| (projectile.aa, projectile.ag));
+    let mut bits = 0;
+    if aa {
+        bits = 4;
+    }
+    if ag {
+        bits |= 0xB8;
+    }
+    bits
+}
+
+/// The weapon class bits a scanner's `Greatest_Threat` override ORs into its
+/// mask ([`super::threat_mask`]). `UnitClass @ 0x007431C9..0x0074324D` takes
+/// only the CurrentWeaponNumber weapon when `TurretCount>0` and not
+/// `IsGattling`, otherwise slots 0 and 1; `InfantryClass @
+/// 0x0051E2C7..0x0051E319` and `BuildingClass @ 0x00445F00` take slots 0
+/// and 1. GetWeapon (`0x0070E140`) supplies the elite fallback, and
+/// `BuildingClass::GetWeapon @ 0x004526F0` answers an occupied building's
+/// occupant weapon for either index.
+///
 /// Building4526F0's installed-upgrade substitution remains unrepresented:
-/// the audited184 stock maps have no authored upgrade selectors, and the
+/// the audited 184 stock maps have no authored upgrade selectors, and the
 /// existing installer is authored-only. This is not generic upgrade parity.
-pub(crate) fn passive_scan_has_aa(
+pub(crate) fn passive_scan_class_bits(
     rules: &RuleSet,
     obj: &ObjectType,
     attacker: AttackerFacts,
     garrison: Option<(&str, u16)>,
-) -> bool {
+) -> u32 {
     if attacker.kind == TechnoKind::Building
         && let Some((occupant_type, veterancy)) = garrison
     {
-        // Building4526F0's occupied override returns this same identity for
-        // either index. It does not test target legality or fall back after
-        // refusing a target. Use the actual firing-occupant snapshot.
-        return rules
+        let bits = rules
             .object(occupant_type)
-            .and_then(|occupant| {
-                let occupy = if veterancy >= ELITE_VETERANCY {
-                    occupant.elite_occupy_weapon.as_deref()
-                } else {
-                    occupant.occupy_weapon.as_deref()
-                };
-                occupy.or_else(|| primary_for_tier(occupant, veterancy))
-            })
-            .and_then(|id| rules.weapon(id))
-            .is_some_and(|weapon| projectile_aa(rules, weapon));
+            .and_then(|occupant| occupant_weapon(rules, occupant, veterancy))
+            .map_or(0, |weapon| weapon_class_bits(rules, weapon));
+        return bits;
     }
-    let slot_has_aa = |index| {
+    let slot_bits = |index| {
         weapon_for_index(obj, attacker.veterancy, index)
             .and_then(|(id, _)| rules.weapon(id))
-            .is_some_and(|weapon| projectile_aa(rules, weapon))
+            .map_or(0, |weapon| weapon_class_bits(rules, weapon))
     };
-    let has_aa = if attacker.kind == TechnoKind::Unit && obj.turret_count > 0 && !obj.is_gattling {
-        slot_has_aa(attacker.current_weapon_number)
+    if attacker.kind == TechnoKind::Unit && obj.turret_count > 0 && !obj.is_gattling {
+        slot_bits(attacker.current_weapon_number)
     } else {
-        slot_has_aa(0) || slot_has_aa(1)
-    };
-    // Infantry51E31B..347: IsArmed first, then primary GetWeapon(0)'s
-    // Warhead+149 removes AA4. ReadINI75DE5A..9A derives that byte from
-    // exact double Verses[4] and[6] ==0 (finite retail values). DOG's AA
-    // VirtualScanner secondary therefore does not grant an air prepass.
-    if has_aa && attacker.kind == TechnoKind::Infantry && is_armed_from_facts(obj, attacker) {
-        let primary_warhead = primary_for_tier(obj, attacker.veterancy)
-            .and_then(|id| rules.weapon(id))
-            .and_then(|weapon| warhead_of(rules, weapon));
-        if verses_is_zero(primary_warhead, 4) && verses_is_zero(primary_warhead, 6) {
-            return false;
-        }
+        slot_bits(0) | slot_bits(1)
     }
-    has_aa
 }
 
-fn projectile_ag(rules: &RuleSet, weapon: &WeaponType) -> bool {
-    weapon
-        .projectile
-        .as_ref()
-        .and_then(|id| rules.projectile(id))
-        .is_none_or(|projectile| projectile.ag)
+/// Warhead `+0x149`, which the Verses parse sets (`0x0075DE5A..0x0075DE9A`)
+/// when the exact doubles `Verses[4]` and `Verses[6]` are both `0.0`, read
+/// through slot 0's weapon at the live tier (`0x0051E329..0x0051E343`).
+pub(crate) fn primary_warhead_spares_medium_and_wood(
+    rules: &RuleSet,
+    obj: &ObjectType,
+    veterancy: u16,
+) -> bool {
+    let warhead = primary_for_tier(obj, veterancy)
+        .and_then(|id| rules.weapon(id))
+        .and_then(|weapon| warhead_of(rules, weapon));
+    verses_is_zero(warhead, 4) && verses_is_zero(warhead, 6)
 }
 
 pub(crate) fn warhead_of<'a>(rules: &'a RuleSet, weapon: &WeaponType) -> Option<&'a WarheadType> {
@@ -521,7 +669,7 @@ fn verses_is_zero(warhead: Option<&WarheadType>, armor: usize) -> bool {
 
 /// Weapon-slot selection with the class overrides that run BEFORE the base
 /// ladder. Returns the weapon-array index native returns; it never returns
-/// "no weapon" — legality is `GetFireError`'s job (`select_weapon_for_target`).
+/// "no weapon" — legality is `GetFireError`'s job ([`super::fire_error`]).
 ///
 /// - `InfantryClass @ 0x005218E0`: a `DeployFire=yes` infantry never enters
 ///   the ladder — deployed sequences fire `DeployFireWeapon`, otherwise
@@ -537,12 +685,12 @@ pub(crate) fn what_weapon_should_i_use(
     match attacker.kind {
         TechnoKind::Infantry if obj.deploy_fire => {
             if attacker.deploy_fire_active {
-                return deploy_fire_weapon_index(obj);
+                return obj.deploy_fire_weapon;
             }
             return attacker.open_transport_weapon.unwrap_or(0);
         }
         TechnoKind::Unit if attacker.deploy_fire_active && obj.deploy_fire => {
-            return deploy_fire_weapon_index(obj);
+            return obj.deploy_fire_weapon;
         }
         _ => {}
     }
@@ -600,11 +748,12 @@ fn techno_what_weapon_should_i_use(
     // H @ 0x006F3422: gattling stage pair. Note the AA test reads
     // `GetWeapon(1)`'s projectile regardless of the current stage.
     if obj.is_gattling {
+        // `LEA` at `0x006F345C`/`0x006F346A`: no clamp, and `2s` wraps.
         let stage = attacker.gattling_stage;
         if secondary_aa && techno.is_some_and(TargetFacts::is_high_flying) {
-            return stage * 2 + 1;
+            return stage.wrapping_mul(2).wrapping_add(1);
         }
-        return stage * 2;
+        return stage.wrapping_mul(2);
     }
     // I @ 0x006F3477: Airstrike secondary — only against a C4-able building
     // that is not BOTH a resource gatherer and a resource destination.
@@ -691,7 +840,7 @@ fn techno_what_weapon_should_i_use(
     // Q @ 0x006F36DB.
     let Some(TargetFacts::Techno {
         obj: target_obj,
-        is_high_flying,
+        flight,
         on_bridge,
         cell_land_type,
         ..
@@ -712,7 +861,7 @@ fn techno_what_weapon_should_i_use(
     // and only GetFireError turns it into ILLEGAL.
     let mut on_water = *cell_land_type == LandType::Water.as_index()
         || *cell_land_type == LandType::Beach.as_index();
-    if *is_high_flying {
+    if flight.high() {
         on_water = false;
     }
     if !*on_bridge && on_water {
@@ -723,196 +872,62 @@ fn techno_what_weapon_should_i_use(
         return 0;
     }
     // U @ 0x006F37B9.
-    if !*is_high_flying && obj.land_targeting == 2 {
+    if !flight.high() && obj.land_targeting == 2 {
         return 1;
     }
     // V @ 0x006F37E7: unconditional AA-secondary against a high-flying target.
-    if secondary_aa && *is_high_flying {
+    if secondary_aa && flight.high() {
         return 1;
     }
     0
 }
 
-/// The target-legality subset of `TechnoClass::GetFireError @ 0x006FC0B0`
-/// that depends only on the selected weapon and the target. Returns true when
-/// the shot is ILLEGAL (native 5) or CANNOT (native 6). Ammo, ROF, cloak,
-/// busy-effect and range verdicts live elsewhere.
-fn targeting_fire_error_blocks(
-    rules: &RuleSet,
-    obj: &ObjectType,
-    weapon: &WeaponType,
-    warhead: &WarheadType,
-    target: &TargetFacts,
-) -> bool {
-    let aa = projectile_aa(rules, weapon);
-    match *target {
-        // Terrain is admitted only to the index-selection owner above. No
-        // Terrain firing caller is delivered by the repair query; retain an
-        // explicit unsupported legality result instead of treating it as Cell.
-        TargetFacts::Terrain => true,
-        TargetFacts::Cell { land_type, .. } => {
-            // 0x006FC7EB..0x006FC812: a non-Techno target that is not
-            // high-flying needs an AG projectile. `CellClass` vtable `+0x54`
-            // (`0x00410530`) always returns 0, so for a cell this is exactly
-            // "no AG projectile → ILLEGAL"; the AA-only Flak Cannon and Aegis
-            // cannot force-fire terrain at all.
-            if !projectile_ag(rules, weapon) {
-                return true;
-            }
-            // 0x006FC815..0x006FC868: a cell whose LandType is neither
-            // Water(2) nor Beach(6), fired at by a `LandTargeting=1` type.
-            if land_type != LandType::Water.as_index()
-                && land_type != LandType::Beach.as_index()
-                && obj.land_targeting == 1
-            {
-                return true;
-            }
-            false
-        }
-        TargetFacts::Techno {
-            obj: target_obj,
-            is_high_flying,
-            on_bridge,
-            cell_land_type,
-            ..
-        } => {
-            // 0x006FC705..0x006FC739: `IsHighFlying && !AA` → 5 (3 when the
-            // target is this object's `DeployedFrom`; both block the shot).
-            //
-            // RESIDUAL (UNCHECKED) — 0x006FC73C..0x006FC75C is a second gate:
-            // a Foot target whose `InWhichLayer (vt+0x78) != 2` also needs an
-            // AA projectile. For a Foot target that slot is NOT
-            // `ObjectClass::InWhichLayer @ 0x005F4260` (which would make the
-            // gate identical to `IsHighFlying`) — `FootClass 0x004DB7E0` and
-            // `AircraftClass 0x0041ADC0` both forward it to the attached
-            // locomotor's own vtable `+0x74`, which VERA does not model.
-            // Trigger: a ground weapon shooting an airborne unit whose
-            // locomotor reports a non-ground layer while its altitude is still
-            // under two levels — a Rocketeer or Kirov just after lift-off, an
-            // aircraft mid-landing. Player effect: VERA lets the shot through
-            // where gamemd may answer ILLEGAL. Frequency: brief windows at the
-            // start and end of every flight. Downstream: none — the verdict is
-            // recomputed every tick.
-            if is_high_flying && !aa {
-                return true;
-            }
-            // 0x006FC76A..0x006FC7CA: the naval `-1` verdict, under the same
-            // water/not-high-flying/not-on-bridge gate ladder step T used.
-            let mut on_water = (cell_land_type == LandType::Water.as_index()
-                || cell_land_type == LandType::Beach.as_index())
-                && !is_high_flying;
-            if !on_bridge {
-                if on_water && select_naval_targeting_weapon(obj, Some(target)) == -1 {
-                    return true;
-                }
-            } else {
-                on_water = false;
-            }
-            // 0x006FC7D0..0x006FC868: `target->IsLowFlying (vt+0x50)` and not
-            // on water, fired at by a `LandTargeting=1` type.
-            //
-            // RESIDUAL (UNCHECKED) — `ObjectClass::IsLowFlying @ 0x005F6B60`
-            // is `marked-on-map (+0x74) && height < 2 * LeptonsPerLevel`, so
-            // an unmarked object is neither low- nor high-flying and native
-            // skips this gate; VERA reads `!is_high_flying`, which is true for
-            // an unmarked object. Trigger: only a target that is not marked on
-            // the map, i.e. in limbo inside a transport — never a fire target
-            // in ordinary play. Frequency: unreachable as written.
-            if !is_high_flying && !on_water && obj.land_targeting == 1 {
-                return true;
-            }
-            // 0x006FCB6A: `FLD Warhead.Verses[armor]`, `FCOMP 0.0` → 5.
-            if verses_is_zero(Some(warhead), armor_index(&target_obj.armor)) {
-                return true;
-            }
-            false
-        }
-    }
+/// Native SelectWeapon/GetWeapon resolution. It asks no legality: Evaluate owns
+/// the subsequent full fire-error query; Mission_Attack 418432..418476 selects
+/// on each burst iteration after one admission only.
+pub(crate) fn resolve_selected_weapon<'a>(
+    rules: &'a RuleSet,
+    obj: &'a ObjectType,
+    attacker: &AttackerFacts,
+    target: Option<&TargetFacts>,
+) -> Option<SelectedWeapon<'a>> {
+    let index = what_weapon_should_i_use(rules, obj, attacker, target);
+    resolve_weapon_index(rules, obj, attacker.veterancy, index)
 }
 
-/// Turn a ladder index into the weapon it names and apply the GetFireError
-/// targeting verdicts.
+/// GetWeapon of an index SelectWeapon already answered (a delayed building
+/// shot resolves its saved slot here without re-running the ladder).
 ///
 /// RESIDUAL (UNCHECKED) — `BuildingClass::GetWeapon @ 0x004526F0` (vtable
 /// `+0x3F8`) is a real override: when `IsOccupied (vt+0x400)` is set and a
-/// firing occupant is selected, it returns the occupant type's `OccupyWeapon`
-/// (`+0xE04`, elite `+0xE20`), falling back to that occupant's `GetWeapon(0)`,
-/// instead of the building's own slot. Ladder arm B therefore resolves to the
-/// occupant's weapon natively, not to the building's `Primary=`. VERA performs
-/// the substitution only on the fire path (`select_garrison_weapon`) and in the
-/// dedicated garrison auto-acquire scan (`combat::tick_combat`, the
-/// `can_be_occupied && can_occupy_fire` block); `resolve_index` here reads the
-/// building's own slot 0. *Trigger:* a garrisoned building reached through
-/// `can_retaliate` or `calculate_ai_threat_score`. *Player effect:* a garrisoned
+/// firing occupant is selected, it returns that occupant's weapon
+/// ([`occupant_weapon`]) instead of the building's own slot. Ladder arm B
+/// therefore resolves to the occupant's weapon natively, not to the
+/// building's `Primary=`. VERA performs the substitution through
+/// `fire_error_world::garrison_weapon` (GetFireError, InRange and the damage
+/// value), on the fire path and in the dedicated garrison auto-acquire scan
+/// (`combat::tick_combat`, the `can_be_occupied && can_occupy_fire` block);
+/// this reads the building's own slot. *Trigger:* a garrisoned building
+/// reached through `calculate_ai_threat_score`. *Player effect:* a garrisoned
 /// civilian building (no `Primary=` of its own) resolves to no weapon, so it
-/// does not retaliate in the same tick it is shot and scores no AI threat; the
-/// auto-acquire scan still picks the shooter up on a later tick, so the shot
-/// itself is not lost. *Frequency:* every garrisoned building on a city map that
-/// takes fire. *Downstream:* AI threat ranking only; no deterministic state.
-fn resolve_index<'a>(
+/// scores no AI threat. *Frequency:* every garrisoned building on a city map
+/// that an AI weighs. *Downstream:* AI threat ranking only.
+pub(crate) fn resolve_weapon_index<'a>(
     rules: &'a RuleSet,
     obj: &'a ObjectType,
     veterancy: u16,
     index: i32,
-    target: &TargetFacts,
 ) -> Option<SelectedWeapon<'a>> {
     let (weapon_id, slot) = weapon_for_index(obj, veterancy, index)?;
-    // GetFireError: a null `GetWeapon(idx)` is CANNOT (6).
     let weapon = rules.weapon(weapon_id)?;
     let warhead = warhead_of(rules, weapon)?;
-    if targeting_fire_error_blocks(rules, obj, weapon, warhead, target) {
-        return None;
-    }
-    let verses_pct = match target {
-        TargetFacts::Techno {
-            obj: target_obj, ..
-        } => warhead
-            .verses
-            .get(armor_index(&target_obj.armor))
-            .copied()
-            .unwrap_or(100),
-        TargetFacts::Cell { .. } | TargetFacts::Terrain => 100,
-    };
     Some(SelectedWeapon {
         weapon_id,
         weapon,
         warhead,
-        verses_pct,
         slot,
         index,
     })
-}
-
-/// Run the selection ladder against a resolved target and apply the
-/// GetFireError targeting verdicts. `None` = the selected weapon cannot
-/// legally fire at this target.
-pub(crate) fn select_weapon_for_target<'a>(
-    rules: &'a RuleSet,
-    obj: &'a ObjectType,
-    attacker: &AttackerFacts,
-    target: &TargetFacts,
-) -> Option<SelectedWeapon<'a>> {
-    let index = what_weapon_should_i_use(rules, obj, attacker, Some(target));
-    resolve_index(rules, obj, attacker.veterancy, index, target)
-}
-
-/// Resolve exactly one saved static weapon slot against the current target.
-///
-/// Unlike normal selection, this never re-runs the ladder. The delayed
-/// Building fire path stores `CurrentWeaponNumber` while arming and asks that
-/// same slot for its live tier/legality when the delay expires.
-pub(crate) fn select_weapon_slot<'a>(
-    rules: &'a RuleSet,
-    obj: &'a ObjectType,
-    veterancy: u16,
-    slot: WeaponSlot,
-    target: &TargetFacts,
-) -> Option<SelectedWeapon<'a>> {
-    let index = match slot {
-        WeaponSlot::Primary => 0,
-        WeaponSlot::Secondary => 1,
-    };
-    resolve_index(rules, obj, veterancy, index, target)
 }
 
 /// `HouseClass::Is_Ally_ByObject @ 0x004F9A90` reduced to house identity:
@@ -930,23 +945,10 @@ pub(crate) fn is_ally_by_object(
         })
 }
 
-/// `ObjectClass::IsHighFlying` for a represented entity: locomotor altitude
-/// at or above two levels. Category is irrelevant — a landed aircraft is a
-/// ground target and an airborne jumpjet infantry is an air target.
-pub(crate) fn target_is_high_flying(entity: &GameEntity) -> bool {
-    entity
-        .locomotor
-        .as_ref()
-        .map(|locomotor| locomotor.altitude.to_num::<i64>())
-        .unwrap_or(0)
-        >= HIGH_FLIGHT_THRESHOLD_LEPTONS
-}
-
-fn open_transport_weapon_from_override(weapon_override: Option<WeaponOverride>) -> Option<i32> {
-    match weapon_override {
-        Some(WeaponOverride::OpenTransport(slot)) => i32::try_from(slot).ok(),
-        _ => None,
-    }
+/// Arm G's pair (`0x006F33D9`) and the DeployFire infantry arm's
+/// (`0x005218E0`): `+0x82` and the type's `OpenTransportWeapon (+0xD50) != -1`.
+fn open_transport_weapon(in_open_transport: bool, obj: &ObjectType) -> Option<i32> {
+    (in_open_transport && obj.open_transport_weapon != -1).then_some(obj.open_transport_weapon)
 }
 
 fn current_weapon_number_from_override(weapon_override: Option<WeaponOverride>) -> i32 {
@@ -960,12 +962,6 @@ fn current_weapon_number_from_override(weapon_override: Option<WeaponOverride>) 
 ///
 /// RESIDUAL (GSI-08.02, row 122) — inputs whose native state VERA does not
 /// yet represent are pinned at their constructor value:
-/// - `gattling_stage` = 0 (`TechnoClass+0x140`, stepped by
-///   `TechnoClass::UpdateGattlingStage @ 0x0070E000` — row 123). Trigger:
-///   every Gattling Cannon/Tank shot after spin-up; player effect: the
-///   stage-0 weapon pair (AGGattling/AAGattCann) is always used, so the
-///   later-stage damage/ROF never arrives; frequency: continuous in any Yuri
-///   match; downstream: none beyond row 123.
 /// - `drain_target_active` = false (`TechnoClass+0x1CC`, written by the
 ///   drain link @ `0x0070FD70`). Trigger: a Floating Disc already draining
 ///   one building being ordered onto a second Drainable one; effect: the
@@ -977,22 +973,17 @@ fn current_weapon_number_from_override(weapon_override: Option<WeaponOverride>) 
 ///   model. Trigger: a player deliberately parking three Tesla Troopers on an
 ///   `Overpowerable=true` building (stock: TESLA, CAEAST01/02, CAPARS01), or
 ///   one while the house is at full power ratio; effect: the coil never fires
-///   `OPCoilBolt`; frequency: only that micro, which is far rarer than the
-///   gattling residual above.
+///   `OPCoilBolt`; frequency: only that micro.
 /// - `aircraft_spawn_collision` = false (`AircraftClass+0x6CA`, writer
 ///   `SpawnRetreat__Push 0x0054E47D`). Trigger: Hornet/ASW pushed to
 ///   retreat; effect: the collision secondary is never chosen; frequency:
 ///   every carrier/destroyer spawn cycle end.
-/// - `open_transport_weapon` is read from the transport-side override, not
-///   from a passenger's `+0x82` flag, because VERA's open-topped fire is
-///   emitted by the transport (passengers never reach the fire path).
 pub(crate) fn attacker_facts(entity: &GameEntity, obj: &ObjectType) -> AttackerFacts {
     let kind = TechnoKind::from_category(entity.category);
     let deploy_fire_active = match kind {
-        TechnoKind::Infantry => matches!(
-            entity.deploy_state,
-            Some(DeployPhase::Deploying { .. } | DeployPhase::Deployed)
-        ),
+        // Infantry5218F3..52190B reads Doing27..30, as predicate522510. The
+        // separate Unit deployment controller has no Infantry writer.
+        TechnoKind::Infantry => entity.infantry_deploy_doing(),
         TechnoKind::Unit => matches!(entity.deploy_state, Some(DeployPhase::Deployed)),
         TechnoKind::Aircraft | TechnoKind::Building => false,
     };
@@ -1005,10 +996,13 @@ pub(crate) fn attacker_facts(entity: &GameEntity, obj: &ObjectType) -> AttackerF
             .is_some_and(|cargo| !cargo.is_empty());
     AttackerFacts {
         kind,
-        veterancy: entity.veterancy,
+        veterancy: entity.veterancy(),
         current_weapon_number: current_weapon_number_from_override(entity.weapon_override),
-        open_transport_weapon: open_transport_weapon_from_override(entity.weapon_override),
-        gattling_stage: 0,
+        open_transport_weapon: open_transport_weapon(
+            entity.passenger_role.in_open_transport(),
+            obj,
+        ),
+        gattling_stage: entity.gattling.stage(),
         deploy_fire_active,
         is_occupied_building,
         // `TechnoClass+0x1CC DrainTarget`, the live drain link (GSI-09.01).
@@ -1021,18 +1015,16 @@ pub(crate) fn attacker_facts(entity: &GameEntity, obj: &ObjectType) -> AttackerF
 }
 
 /// Attacker facts from a combat snapshot, for scan paths that hold no entity
-/// borrow. The snapshot carries no mission, so the AreaFire/Unload arm reads
-/// false here; every production caller prefers `attacker_facts` when the
-/// entity is resolvable.
+/// borrow. The snapshot carries no mission and no gattling stage, so the
+/// AreaFire/Unload arm reads false and the stage 0 here; every production
+/// caller prefers `attacker_facts` when the entity is resolvable.
 pub(crate) fn attacker_facts_from_snapshot(
     snap: &AttackerSnapshot,
     obj: &ObjectType,
 ) -> AttackerFacts {
     let kind = TechnoKind::from_category(snap.category);
     let deploy_fire_active = match kind {
-        TechnoKind::Infantry => {
-            snap.is_fully_deployed || snap.animation_sequence == Some(SequenceKind::Deploy)
-        }
+        TechnoKind::Infantry => snap.is_fully_deployed || snap.infantry_doing == Some(27),
         TechnoKind::Unit => snap.is_fully_deployed,
         TechnoKind::Aircraft | TechnoKind::Building => false,
     };
@@ -1040,7 +1032,7 @@ pub(crate) fn attacker_facts_from_snapshot(
         kind,
         veterancy: snap.veterancy,
         current_weapon_number: current_weapon_number_from_override(snap.weapon_override),
-        open_transport_weapon: open_transport_weapon_from_override(snap.weapon_override),
+        open_transport_weapon: open_transport_weapon(snap.in_open_transport, obj),
         gattling_stage: 0,
         deploy_fire_active,
         is_occupied_building: kind == TechnoKind::Building
@@ -1057,19 +1049,26 @@ pub(crate) fn attacker_facts_from_snapshot(
 /// Target facts for a Techno target. `terrain == None` (headless fixtures)
 /// reads the occupied cell as clear land.
 pub(crate) fn techno_target_facts<'a>(
-    target: &GameEntity,
+    target: &'a GameEntity,
     target_obj: &'a ObjectType,
-    terrain: Option<&ResolvedTerrainGrid>,
+    terrain: Option<&'a ResolvedTerrainGrid>,
     is_ally: bool,
+    rules: &'a RuleSet,
+    interner: &'a StringInterner,
 ) -> TargetFacts<'a> {
-    let cell_land_type = terrain
-        .and_then(|grid| grid.cell(target.position.rx, target.position.ry))
+    let cell = terrain.and_then(|grid| grid.cell(target.position.rx, target.position.ry));
+    let cell_land_type = cell
         .map(|cell| cell.yr_cell_land_type)
         .unwrap_or(LandType::Clear.as_index());
     TargetFacts::Techno {
         obj: target_obj,
         kind: TechnoKind::from_category(target.category),
-        is_high_flying: target_is_high_flying(target),
+        flight: TargetFlight::Live {
+            entity: target,
+            terrain,
+            rules,
+            interner,
+        },
         on_bridge: target.on_bridge,
         cell_land_type,
         submerged: target.cloak.as_ref().is_some_and(|cloak| cloak.state != 0),
@@ -1103,112 +1102,73 @@ pub(crate) fn cell_target_facts(
     }
 }
 
-/// Production entry: resolve the target, build both fact sets, run the
-/// ladder and the GetFireError targeting subset.
+/// SelectWeapon (vt+0x2E4) against a `TargetKind`, then GetWeapon of its
+/// index: resolve the target, build both fact sets and run the ladder. No
+/// legality is asked. The index is retained even when GetWeapon has no
+/// weapon, so the caller can still ask GetFireError. `None` means a supplied
+/// target is gone. A null target still enters the native selection ladder.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn select_weapon_against<'a>(
     rules: &'a RuleSet,
     attacker_obj: &'a ObjectType,
     attacker: &AttackerFacts,
     attacker_owner: InternedId,
-    target: &TargetKind,
+    target: Option<&TargetKind>,
     entities: &EntityStore,
     interner: &StringInterner,
     terrain: Option<&ResolvedTerrainGrid>,
     alliances: Option<&HouseAllianceMap>,
-) -> Option<SelectedWeapon<'a>> {
-    let target_facts = match *target {
-        TargetKind::Entity(target_id) => {
+) -> Option<(i32, Option<SelectedWeapon<'a>>)> {
+    let target_facts = match target.copied() {
+        Some(TargetKind::Entity(target_id)) => {
             let target_entity = entities.get(target_id)?;
             let target_obj = rules.object(interner.resolve(target_entity.type_ref()))?;
             let is_ally =
                 is_ally_by_object(alliances, interner, attacker_owner, target_entity.owner());
-            techno_target_facts(target_entity, target_obj, terrain, is_ally)
+            Some(techno_target_facts(
+                target_entity,
+                target_obj,
+                terrain,
+                is_ally,
+                rules,
+                interner,
+            ))
         }
-        TargetKind::Cell(rx, ry) => cell_target_facts(rx, ry, terrain),
+        Some(TargetKind::Cell(rx, ry)) => Some(cell_target_facts(rx, ry, terrain)),
+        None => None,
     };
-    select_weapon_for_target(rules, attacker_obj, attacker, &target_facts)
+    let index = what_weapon_should_i_use(rules, attacker_obj, attacker, target_facts.as_ref());
+    Some((
+        index,
+        resolve_weapon_index(rules, attacker_obj, attacker.veterancy, index),
+    ))
 }
 
-/// Select the weapon used by a garrisoned occupant firing from a building.
-///
-/// Priority chain (matching gamemd `BuildingClass::GetWeapon` 0x004526F0):
-/// 1. Elite occupant → `EliteOccupyWeapon`
-/// 2. Normal occupant → `OccupyWeapon`
-/// 3. Fallback → occupant's Primary weapon
-///
-/// Returns None if no weapon can engage the target type.
-pub(crate) fn select_garrison_weapon<'a>(
+/// The occupied arm of `BuildingClass::GetWeapon @ 0x004526F0`, which answers
+/// every index: the firing occupant's `EliteOccupyWeapon` (`+0xE20`) when it
+/// is elite, else its `OccupyWeapon` (`+0xE04`); when that names no weapon,
+/// the occupant's own GetWeapon(0) (vt+0x3F8, `0x0070E140`) at its rank. An
+/// elite occupant without `EliteOccupyWeapon=` therefore fires its elite
+/// primary, never the normal `OccupyWeapon`. No target is read; whether the
+/// weapon may fire is GetFireError's.
+pub(crate) fn occupant_weapon<'a>(
     rules: &'a RuleSet,
-    occupant_type_ref: &str,
-    occupant_veterancy: u16,
-    target_category: EntityCategory,
-    target_armor: &str,
-) -> Option<SelectedWeapon<'a>> {
-    let occupant_obj = rules.object(occupant_type_ref)?;
-    let is_elite = occupant_veterancy >= ELITE_VETERANCY;
-
-    // Elite missing EliteOccupyWeapon falls directly to Primary; it does not
-    // reuse the normal OccupyWeapon path.
-    let occupy_weapon_id = if is_elite {
-        occupant_obj.elite_occupy_weapon.as_deref()
+    occupant: &ObjectType,
+    veterancy: u16,
+) -> Option<&'a WeaponType> {
+    let occupy = if veterancy >= ELITE_VETERANCY {
+        occupant.elite_occupy_weapon.as_deref()
     } else {
-        occupant_obj.occupy_weapon.as_deref()
+        occupant.occupy_weapon.as_deref()
     };
-
-    if let Some(wid) = occupy_weapon_id {
-        if let Some(sw) = try_garrison_weapon(rules, wid, target_category, target_armor) {
-            return Some(sw);
-        }
-    }
-
-    // Fallback: occupant's primary weapon.
-    if let Some(ref primary) = occupant_obj.primary {
-        return try_garrison_weapon(rules, primary, target_category, target_armor);
-    }
-    None
-}
-
-/// Garrison-only legality: projectile AA/AG against the target category and
-/// a non-zero Verses entry. VERA-internal shape retained for the occupant
-/// path; the building's own `GetFireError` verdicts for occupant fire are
-/// UNCHECKED here.
-fn try_garrison_weapon<'a>(
-    rules: &'a RuleSet,
-    weapon_id: &'a str,
-    target_category: EntityCategory,
-    target_armor: &str,
-) -> Option<SelectedWeapon<'a>> {
-    let weapon: &WeaponType = rules.weapon(weapon_id)?;
-    let legal = match target_category {
-        EntityCategory::Aircraft => projectile_aa(rules, weapon),
-        EntityCategory::Unit | EntityCategory::Infantry | EntityCategory::Structure => {
-            projectile_ag(rules, weapon)
-        }
-    };
-    if !legal {
-        return None;
-    }
-    let warhead: &WarheadType = warhead_of(rules, weapon)?;
-    let idx: usize = armor_index(target_armor);
-    let verses_pct: u8 = warhead.verses.get(idx).copied().unwrap_or(100);
-    if verses_gate(verses_pct) == VersesGate::Blocked {
-        return None;
-    }
-    Some(SelectedWeapon {
-        weapon_id,
-        weapon,
-        warhead,
-        verses_pct,
-        slot: WeaponSlot::Primary,
-        index: 0,
-    })
+    rules.weapon(occupy.or_else(|| primary_for_tier(occupant, veterancy))?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::rules::ini_parser::IniFile;
+    use crate::sim::passenger::PassengerRole;
 
     #[test]
     fn passive_scan_occupied_building_uses_weapon_identity_without_target_fallback() {
@@ -1225,7 +1185,7 @@ mod tests {
         let mut building = GameEntity::test_default(1, "HOUSE", "Americans", 5, 5);
         building.category = EntityCategory::Structure;
         let facts = attacker_facts(&building, obj);
-        assert!(passive_scan_has_aa(&rules, obj, facts, None));
+        assert_eq!(passive_scan_class_bits(&rules, obj, facts, None), 0xBC);
         // Normal OccupyWeapon=GROUND overrides AA primary even though an AA
         // target would be refused. Elite missing EliteOccupyWeapon uses its
         // resolved elite primary, not the normal OccupyWeapon.
@@ -1236,14 +1196,14 @@ mod tests {
             ("ELITEGI", 200, true),
         ] {
             assert_eq!(
-                passive_scan_has_aa(&rules, obj, facts, Some((occupant, veterancy))),
+                passive_scan_class_bits(&rules, obj, facts, Some((occupant, veterancy))) & 4 != 0,
                 expected
             );
         }
     }
 
     #[test]
-    fn passive_scan_infantry_primary_warhead_clears_aa_after_resolved_slot_union() {
+    fn slot_zero_warhead_flag_reads_the_exact_medium_and_wood_verses_at_the_live_tier() {
         for medium in ["0%", "0.1%", "0.001"] {
             let rules = RuleSet::from_ini(&IniFile::from_str(&format!(
                 "[InfantryTypes]\n0=DOG\n[DOG]\nPrimary=BITE\nSecondary=SCANNER\nElitePrimary=ELITEBITE\n\
@@ -1257,39 +1217,19 @@ mod tests {
             let mut dog = GameEntity::test_default(1, "DOG", "Americans", 5, 5);
             dog.category = EntityCategory::Infantry;
             assert_eq!(
-                passive_scan_has_aa(&rules, obj, attacker_facts(&dog, obj), None),
-                medium == "0.001"
+                passive_scan_class_bits(&rules, obj, attacker_facts(&dog, obj), None),
+                0xBC,
+                "slot 0 AG and slot 1 AA+AG"
             );
-            dog.veterancy = 200;
+            assert_eq!(
+                primary_warhead_spares_medium_and_wood(&rules, obj, 0),
+                medium != "0.001"
+            );
             assert!(
-                passive_scan_has_aa(&rules, obj, attacker_facts(&dog, obj), None),
+                !primary_warhead_spares_medium_and_wood(&rules, obj, 200),
                 "elite primary is resolved first"
             );
-            dog.veterancy = 0;
-            dog.category = EntityCategory::Unit;
-            assert!(
-                passive_scan_has_aa(&rules, obj, attacker_facts(&dog, obj), None),
-                "the clear belongs to Infantry"
-            );
         }
-    }
-
-    #[test]
-    fn test_weapon_override_variants() {
-        let ifv = WeaponOverride::IfvSlot(16);
-        let open = WeaponOverride::OpenTransport(1);
-        assert_ne!(ifv, open);
-        assert_eq!(ifv, WeaponOverride::IfvSlot(16));
-        assert_eq!(open, WeaponOverride::OpenTransport(1));
-    }
-
-    #[test]
-    fn test_verses_gate_thresholds() {
-        assert_eq!(verses_gate(0), VersesGate::Blocked);
-        assert_eq!(verses_gate(1), VersesGate::Suppressed);
-        assert_eq!(verses_gate(2), VersesGate::Normal);
-        assert_eq!(verses_gate(100), VersesGate::Normal);
-        assert_eq!(verses_gate(200), VersesGate::Normal);
     }
 
     /// Stock-shaped fixture: every type/weapon/projectile/warhead value below
@@ -1854,7 +1794,7 @@ IsLocomotor=yes
         TargetFacts::Techno {
             obj,
             kind,
-            is_high_flying: false,
+            flight: TargetFlight::Supplied { high: false },
             on_bridge: false,
             cell_land_type: LandType::Clear.as_index(),
             submerged: false,
@@ -1867,7 +1807,7 @@ IsLocomotor=yes
             TargetFacts::Techno {
                 obj,
                 kind,
-                is_high_flying,
+                flight,
                 on_bridge,
                 submerged,
                 is_ally,
@@ -1875,7 +1815,7 @@ IsLocomotor=yes
             } => TargetFacts::Techno {
                 obj,
                 kind,
-                is_high_flying,
+                flight,
                 on_bridge,
                 cell_land_type: LandType::Water.as_index(),
                 submerged,
@@ -1898,7 +1838,7 @@ IsLocomotor=yes
             } => TargetFacts::Techno {
                 obj,
                 kind,
-                is_high_flying: true,
+                flight: TargetFlight::Supplied { high: true },
                 on_bridge,
                 cell_land_type,
                 submerged,
@@ -1913,7 +1853,7 @@ IsLocomotor=yes
             TargetFacts::Techno {
                 obj,
                 kind,
-                is_high_flying,
+                flight,
                 on_bridge,
                 cell_land_type,
                 submerged,
@@ -1921,7 +1861,7 @@ IsLocomotor=yes
             } => TargetFacts::Techno {
                 obj,
                 kind,
-                is_high_flying,
+                flight,
                 on_bridge,
                 cell_land_type,
                 submerged,
@@ -1940,13 +1880,15 @@ IsLocomotor=yes
         what_weapon_should_i_use(rules, rules.object(attacker).unwrap(), facts, target)
     }
 
+    /// The weapon GetWeapon answers for the ladder's slot. Whether it may
+    /// fire is GetFireError's (`fire_error`, pinned by its native rows).
     fn selected<'a>(
         rules: &'a RuleSet,
         attacker: &str,
         facts: &AttackerFacts,
         target: &TargetFacts,
     ) -> Option<&'a str> {
-        select_weapon_for_target(rules, rules.object(attacker).unwrap(), facts, target)
+        resolve_selected_weapon(rules, rules.object(attacker).unwrap(), facts, Some(target))
             .map(|selected| selected.weapon_id)
     }
 
@@ -2068,7 +2010,7 @@ IsLocomotor=yes
         let submerged_sub = TargetFacts::Techno {
             obj: sub,
             kind: TechnoKind::Unit,
-            is_high_flying: false,
+            flight: TargetFlight::Supplied { high: false },
             on_bridge: false,
             cell_land_type: LandType::Water.as_index(),
             submerged: true,
@@ -2157,8 +2099,7 @@ IsLocomotor=yes
         let mut fv = facts(TechnoKind::Unit);
         fv.current_weapon_number = 1;
         assert_eq!(slot(&rules, "FV", &fv, Some(&building)), 1);
-        assert_eq!(selected(&rules, "FV", &fv, &building), None);
-        // Against a vehicle with repairable armor the repair slot fires.
+        assert_eq!(selected(&rules, "FV", &fv, &building), Some("RepairBullet"));
         let fv_obj = rules.object("FV").unwrap();
         let light = techno(fv_obj, TechnoKind::Unit);
         assert_eq!(selected(&rules, "FV", &fv, &light), Some("RepairBullet"));
@@ -2262,6 +2203,193 @@ IsLocomotor=yes
         gat.veterancy = 200;
         assert_eq!(selected(&rules, "YTNK", &gat, &ground), Some("AGGattlingE"));
         assert_eq!(selected(&rules, "YTNK", &gat, &air), Some("AAGattlingE"));
+    }
+
+    /// Every row of the original `What_Weapon_Should_I_Use`
+    /// (`tools/spatial_oracle/gattling_select.py`: `0x006F3330` through the
+    /// Unit `0x00746CD0` and Building vtables), through
+    /// `what_weapon_should_i_use`: the gattling stage pair over stage x slot-1
+    /// AA x high flier x elite x NeverUse, the arms ahead of it, the target
+    /// kinds and the unclamped stages (`2s` wraps).
+    #[test]
+    fn original_weapon_selection_rows() {
+        let payload: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../tools/spatial_oracle/gattling_select.json"
+        ))
+        .unwrap();
+        let defaults = &payload["defaults"];
+        let rows = payload["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 134);
+        for row in rows {
+            let input = &row["input"];
+            let name = input["name"].as_str().unwrap();
+            let group = |key: &str, field: &str| -> serde_json::Value {
+                input
+                    .get(key)
+                    .and_then(|group| group.get(field))
+                    .unwrap_or(&defaults[key][field])
+                    .clone()
+            };
+            let scalar = |key: &str| input.get(key).unwrap_or(&defaults[key]).clone();
+            let flag = |value: serde_json::Value| {
+                value
+                    .as_bool()
+                    .unwrap_or_else(|| value.as_i64().unwrap() != 0)
+            };
+            let int = |value: serde_json::Value| value.as_i64().unwrap();
+            let building = scalar("class").as_str().unwrap() == "building";
+            let turret_count = int(group("type", "turret_count"));
+            // Slot 1's AA sits on its projectile, NeverUse on the weapon;
+            // `present: false` leaves the slot empty.
+            let weapon = |name: &str, key: &str| -> Option<String> {
+                flag(group(key, "present")).then(|| {
+                    format!(
+                        "[{name}]\nDamage=10\nWarhead=WH\nProjectile={}\nNeverUse={}\n",
+                        if key.ends_with('1') && flag(group(key, "aa")) {
+                            "AAP"
+                        } else {
+                            "AGP"
+                        },
+                        if key.ends_with('1') && flag(group(key, "never_use")) {
+                            "yes"
+                        } else {
+                            "no"
+                        },
+                    )
+                })
+            };
+            let slots = [
+                ("W0", "slot0"),
+                ("W1", "slot1"),
+                ("E0", "elite_slot0"),
+                ("E1", "elite_slot1"),
+            ]
+            .map(|(name, key)| weapon(name, key));
+            let mut section = format!(
+                "[GAT]\nStrength=100\nArmor=none\nIsGattling={}\nTurretCount={turret_count}\n\
+                 WeaponCount=2\nDeployFire={}\nDeployFireWeapon={}\nOpenTransportWeapon={}\n\
+                 CanBeOccupied={}\nCanOccupyFire={}\n",
+                if flag(group("type", "is_gattling")) {
+                    "yes"
+                } else {
+                    "no"
+                },
+                if flag(group("type", "deploy_fire")) {
+                    "yes"
+                } else {
+                    "no"
+                },
+                int(group("type", "deploy_fire_weapon")),
+                int(group("type", "open_transport_weapon")),
+                if flag(group("type", "can_be_occupied")) {
+                    "yes"
+                } else {
+                    "no"
+                },
+                if flag(group("type", "can_occupy_fire")) {
+                    "yes"
+                } else {
+                    "no"
+                },
+            );
+            let keys = if turret_count > 0 {
+                ["Weapon1", "Weapon2", "EliteWeapon1", "EliteWeapon2"]
+            } else {
+                ["Primary", "Secondary", "ElitePrimary", "EliteSecondary"]
+            };
+            for (key, (weapon, slot)) in keys
+                .iter()
+                .zip(["W0", "W1", "E0", "E1"].iter().zip(slots.iter()))
+            {
+                if slot.is_some() {
+                    section.push_str(&format!("{key}={weapon}\n"));
+                }
+            }
+            let text = format!(
+                "[{}]\n0=GAT\n1=TGT\n[AircraftTypes]\n0=AIR\n\
+                 [InfantryTypes]\n[{}]\n0=TBLD\n{section}\
+                 [TGT]\nStrength=100\nArmor=none\n[AIR]\nStrength=100\nArmor=none\n\
+                 [TBLD]\nStrength=100\nArmor=none\n\
+                 [AAP]\nAA=yes\nAG=yes\n[AGP]\nAA=no\nAG=yes\n\
+                 [WH]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n{}",
+                if building {
+                    "BuildingTypes"
+                } else {
+                    "VehicleTypes"
+                },
+                if building {
+                    "VehicleTypes"
+                } else {
+                    "BuildingTypes"
+                },
+                slots.iter().flatten().cloned().collect::<String>(),
+            );
+            let rules = RuleSet::from_ini(&IniFile::from_str(&text)).unwrap();
+            let gat = rules.object("GAT").unwrap();
+            let mut attacker = facts(if building {
+                TechnoKind::Building
+            } else {
+                TechnoKind::Unit
+            });
+            let veterancy = scalar("veterancy").as_f64().unwrap();
+            attacker.veterancy = if veterancy >= 2.0 {
+                200
+            } else if veterancy >= 1.0 {
+                100
+            } else {
+                0
+            };
+            attacker.current_weapon_number = int(scalar("current_weapon")) as i32;
+            attacker.gattling_stage = int(scalar("stage")) as i32;
+            attacker.deploy_fire_active = !building && flag(scalar("deployed"));
+            attacker.is_occupied_building = building
+                && int(scalar("occupants")) > 0
+                && gat.can_be_occupied
+                && gat.can_occupy_fire;
+            let open_transport_weapon = int(group("type", "open_transport_weapon"));
+            attacker.open_transport_weapon = (flag(scalar("open_topped"))
+                && open_transport_weapon != -1)
+                .then_some(open_transport_weapon as i32);
+            let high_flying = group("target", "high_flying").as_bool().unwrap_or(false);
+            let (tgt, air, tbld) = (
+                rules.object("TGT").unwrap(),
+                rules.object("AIR").unwrap(),
+                rules.object("TBLD").unwrap(),
+            );
+            let target = match group("target", "kind").as_str().unwrap() {
+                "none" => None,
+                "cell" => Some(TargetFacts::Cell {
+                    land_type: 0,
+                    tile_in_water_set: false,
+                    bridge_flag: false,
+                }),
+                "terrain" => Some(TargetFacts::Terrain),
+                kind => {
+                    let (obj, kind) = match kind {
+                        "aircraft" => (air, TechnoKind::Aircraft),
+                        "unit" => (tgt, TechnoKind::Unit),
+                        "building" => (tbld, TechnoKind::Building),
+                        other => panic!("{name}: target kind {other}"),
+                    };
+                    let target = techno(obj, kind);
+                    Some(if high_flying {
+                        self::high_flying(target)
+                    } else {
+                        target
+                    })
+                }
+            };
+            assert_eq!(
+                i64::from(what_weapon_should_i_use(
+                    &rules,
+                    gat,
+                    &attacker,
+                    target.as_ref()
+                )),
+                row["index"].as_i64().unwrap(),
+                "{name}"
+            );
+        }
     }
 
     #[test]
@@ -2578,7 +2706,7 @@ IsLocomotor=yes
         let TargetFacts::Techno {
             obj,
             kind,
-            is_high_flying,
+            flight,
             cell_land_type,
             submerged,
             is_ally,
@@ -2590,7 +2718,7 @@ IsLocomotor=yes
         let bridged = TargetFacts::Techno {
             obj,
             kind,
-            is_high_flying,
+            flight,
             on_bridge: true,
             cell_land_type,
             submerged,
@@ -2599,42 +2727,42 @@ IsLocomotor=yes
         assert_eq!(slot(&rules, "DEST", &dest, Some(&bridged)), 0);
     }
 
+    /// Arm T turns the selector's `-1` into slot 0. GetFireError's T40 then
+    /// asks the same selector (`FireQuery::naval_selector`) and refuses the
+    /// shot on `-1` (ILLEGAL, pinned by `fire_error`'s native rows).
     #[test]
-    fn arm_t_naval_minus_one_collapses_to_zero_and_fire_error_makes_it_illegal() {
+    fn arm_t_naval_minus_one_collapses_to_zero() {
         let rules = stock_rules();
+        let aegis = rules.object("AEGIS").unwrap();
+        let htnk = rules.object("HTNK").unwrap();
         let dest_obj = rules.object("DEST").unwrap();
         let sub = rules.object("SUB").unwrap();
         let ship = on_water(techno(dest_obj, TechnoKind::Unit));
-        // AEGIS (NavalTargeting=6) vs a ship: selector 0, GetFireError ILLEGAL.
-        assert_eq!(
-            slot(&rules, "AEGIS", &facts(TechnoKind::Unit), Some(&ship)),
-            0
-        );
+        // AEGIS (NavalTargeting=6) vs a ship: selector -1, slot 0.
+        assert_eq!(select_naval_targeting_weapon(aegis, Some(&ship)), -1);
         assert_eq!(
             selected(&rules, "AEGIS", &facts(TechnoKind::Unit), &ship),
-            None
+            Some("Medusa")
         );
-        // Rhino vs a submerged sub: ILLEGAL; vs a surfaced sub: legal.
+        // Rhino vs a submerged sub: selector -1; vs a surfaced sub: 0.
         let submerged = TargetFacts::Techno {
             obj: sub,
             kind: TechnoKind::Unit,
-            is_high_flying: false,
+            flight: TargetFlight::Supplied { high: false },
             on_bridge: false,
             cell_land_type: LandType::Water.as_index(),
             submerged: true,
             is_ally: false,
         };
+        assert_eq!(select_naval_targeting_weapon(htnk, Some(&submerged)), -1);
         assert_eq!(
             selected(&rules, "HTNK", &facts(TechnoKind::Unit), &submerged),
-            None
+            Some("120mm")
         );
+        let surfaced = on_water(techno(sub, TechnoKind::Unit));
+        assert_eq!(select_naval_targeting_weapon(htnk, Some(&surfaced)), 0);
         assert_eq!(
-            selected(
-                &rules,
-                "HTNK",
-                &facts(TechnoKind::Unit),
-                &on_water(techno(sub, TechnoKind::Unit))
-            ),
+            selected(&rules, "HTNK", &facts(TechnoKind::Unit), &surfaced),
             Some("120mm")
         );
         // Beach counts as water for the gate.
@@ -2644,15 +2772,15 @@ IsLocomotor=yes
         let beach = TargetFacts::Techno {
             obj,
             kind,
-            is_high_flying: false,
+            flight: TargetFlight::Supplied { high: false },
             on_bridge: false,
             cell_land_type: LandType::Beach.as_index(),
             submerged: false,
             is_ally: false,
         };
         assert_eq!(
-            selected(&rules, "AEGIS", &facts(TechnoKind::Unit), &beach),
-            None
+            slot(&rules, "AEGIS", &facts(TechnoKind::Unit), Some(&beach)),
+            0
         );
     }
 
@@ -2687,11 +2815,12 @@ IsLocomotor=yes
             ),
             Some("SquidPunch")
         );
-        // Squid vs a tank on land: LandTargeting=1 → ILLEGAL.
+        // Squid vs a tank on land: the ladder answers slot 0, which
+        // GetFireError's T40 refuses (LandTargeting=1).
         let htnk = rules.object("HTNK").unwrap();
         assert_eq!(
             selected(&rules, "SQD", &sqd, &techno(htnk, TechnoKind::Unit)),
-            None
+            Some("SquidGrab")
         );
     }
 
@@ -2765,9 +2894,10 @@ IsLocomotor=yes
         let orca = rules.object("ORCA").unwrap();
         let air = high_flying(techno(orca, TechnoKind::Aircraft));
         let mut ggi = facts(TechnoKind::Infantry);
-        // Undeployed GGI vs aircraft: slot 0 → M60 has no AA → ILLEGAL.
+        // Undeployed GGI vs aircraft: slot 0, the M60 (no AA), which
+        // GetFireError's T38 refuses.
         assert_eq!(slot(&rules, "GGI", &ggi, Some(&air)), 0);
-        assert_eq!(selected(&rules, "GGI", &ggi, &air), None);
+        assert_eq!(selected(&rules, "GGI", &ggi, &air), Some("M60"));
         // Deployed (Deploy..DeployedIdle): DeployFireWeapon (default 1).
         ggi.deploy_fire_active = true;
         assert_eq!(slot(&rules, "GGI", &ggi, None), 1);
@@ -2844,58 +2974,10 @@ IsLocomotor=yes
         assert_eq!(slot(&rules, "SIEGE", &attacker, None), 0);
     }
 
-    // ---- GetFireError subset ----------------------------------------------
+    // ---- GetWeapon of the selected slot ------------------------------------
 
     #[test]
-    fn fire_error_aa_only_matters_for_high_flying_targets() {
-        let rules = stock_rules();
-        let orca = rules.object("ORCA").unwrap();
-        let rhino = facts(TechnoKind::Unit);
-        // Landed aircraft is a ground target: the 120mm fires.
-        assert_eq!(
-            selected(&rules, "HTNK", &rhino, &techno(orca, TechnoKind::Aircraft)),
-            Some("120mm")
-        );
-        assert_eq!(
-            selected(
-                &rules,
-                "HTNK",
-                &rhino,
-                &high_flying(techno(orca, TechnoKind::Aircraft))
-            ),
-            None
-        );
-        // AEGIS vs high-flying aircraft: Medusa (AA=yes, AG=no); vs a landed
-        // aircraft on land: LandTargeting=1 → ILLEGAL.
-        assert_eq!(
-            selected(
-                &rules,
-                "AEGIS",
-                &rhino,
-                &high_flying(techno(orca, TechnoKind::Aircraft))
-            ),
-            Some("Medusa")
-        );
-        assert_eq!(
-            selected(&rules, "AEGIS", &rhino, &techno(orca, TechnoKind::Aircraft)),
-            None
-        );
-        // Destroyer's ASWLauncher (AG=no) is not rejected for a sub: no AG
-        // test exists for object targets.
-        let sub = rules.object("SUB").unwrap();
-        assert_eq!(
-            selected(
-                &rules,
-                "DEST",
-                &rhino,
-                &on_water(techno(sub, TechnoKind::Unit))
-            ),
-            Some("ASWLauncher")
-        );
-    }
-
-    #[test]
-    fn fire_error_cell_rules() {
+    fn cell_targets_resolve_the_ladders_slot() {
         let rules = stock_rules();
         let land = TargetFacts::Cell {
             land_type: LandType::Clear.as_index(),
@@ -2912,22 +2994,8 @@ IsLocomotor=yes
             tile_in_water_set: false,
             bridge_flag: false,
         };
-        // NAFLAK (LandTargeting=1, FlakProj AG=no): every cell is ILLEGAL —
-        // the land cell twice over (no AG projectile, then LandTargeting=1),
-        // the water and beach cells on the AG test alone. The AG gate at
-        // 0x006FC7EB is unconditional for a cell target: a cell is never
-        // high-flying, so an AA-only defense cannot force-fire terrain.
-        let flak = facts(TechnoKind::Building);
-        assert_eq!(selected(&rules, "NAFLAK", &flak, &land), None);
-        assert_eq!(selected(&rules, "NAFLAK", &flak, &water), None);
-        assert_eq!(selected(&rules, "NAFLAK", &flak, &beach), None);
-        // AEGIS: Medusa is AA-only and there is no secondary, so the same
-        // holds even on the water it sits in.
-        let aegis = facts(TechnoKind::Unit);
-        assert_eq!(selected(&rules, "AEGIS", &aegis, &water), None);
-        assert_eq!(selected(&rules, "AEGIS", &aegis, &beach), None);
         // Destroyer force-firing a beach cell: the ladder picks slot 0 (the
-        // AG 155mm), not the AG-less ASWLauncher, so the shot is legal.
+        // 155mm), not the ASWLauncher.
         assert_eq!(
             selected(&rules, "DEST", &facts(TechnoKind::Unit), &beach),
             Some("155mm")
@@ -2941,26 +3009,22 @@ IsLocomotor=yes
             selected(&rules, "HTNK", &facts(TechnoKind::Unit), &water),
             Some("120mm")
         );
-        // Cell targets read no Verses.
-        let sel = select_weapon_for_target(
+        let sel = resolve_selected_weapon(
             &rules,
             rules.object("HTNK").unwrap(),
             &facts(TechnoKind::Unit),
-            &land,
+            Some(&land),
         )
         .unwrap();
-        assert_eq!(sel.verses_pct, 100);
         assert_eq!(sel.index, 0);
         assert_eq!(sel.slot, WeaponSlot::Primary);
     }
 
     #[test]
-    fn select_weapon_slot_reuses_saved_slot_without_the_ladder() {
+    fn a_saved_slot_resolves_without_the_ladder() {
         let rules = stock_rules();
-        let htnk = rules.object("HTNK").unwrap();
-        let tank = techno(htnk, TechnoKind::Unit);
         let tesla = rules.object("TESLA").unwrap();
-        let saved = select_weapon_slot(&rules, tesla, 0, WeaponSlot::Secondary, &tank).unwrap();
+        let saved = resolve_weapon_index(&rules, tesla, 0, 1).unwrap();
         assert_eq!(saved.weapon_id, "OPCoilBolt");
         assert_eq!(saved.slot, WeaponSlot::Secondary);
         assert_eq!(saved.index, 1);
@@ -2969,18 +3033,30 @@ IsLocomotor=yes
     // ---- Facts builders ----------------------------------------------------
 
     #[test]
-    fn attacker_facts_read_deploy_state_per_class_and_override_slots() {
+    fn attacker_facts_read_class_deployment_owners_and_override_slots() {
         let rules = stock_rules();
         let ggi_obj = rules.object("GGI").unwrap();
         let mut ggi = GameEntity::test_default(1, "GGI", "Americans", 1, 1);
         ggi.category = EntityCategory::Infantry;
-        assert!(!attacker_facts(&ggi, ggi_obj).deploy_fire_active);
-        ggi.deploy_state = Some(DeployPhase::Deploying { ticks_remaining: 3 });
-        assert!(attacker_facts(&ggi, ggi_obj).deploy_fire_active);
-        ggi.deploy_state = Some(DeployPhase::Deployed);
-        assert!(attacker_facts(&ggi, ggi_obj).deploy_fire_active);
-        ggi.deploy_state = Some(DeployPhase::Undeploying { ticks_remaining: 3 });
-        assert!(!attacker_facts(&ggi, ggi_obj).deploy_fire_active);
+        ggi.mission_leaf =
+            crate::sim::mission::MissionLeafState::for_entity_category(EntityCategory::Infantry);
+        // Original522510 accepts precisely Doing27..30, including the
+        // Deploy transition. No Unit deploy_state supplies this predicate.
+        for (doing, expected) in [
+            (0, false),
+            (27, true),
+            (28, true),
+            (29, true),
+            (30, true),
+            (31, false),
+        ] {
+            ggi.mission_leaf.set_infantry_doing_verified(doing).unwrap();
+            assert_eq!(
+                attacker_facts(&ggi, ggi_obj).deploy_fire_active,
+                expected,
+                "native Infantry deployment Doing{doing}"
+            );
+        }
         // Vehicles: only the finished Deployed flag.
         let mut siege = GameEntity::test_default(2, "HTNK", "Americans", 1, 1);
         siege.category = EntityCategory::Unit;
@@ -2988,36 +3064,47 @@ IsLocomotor=yes
         assert!(!attacker_facts(&siege, ggi_obj).deploy_fire_active);
         siege.deploy_state = Some(DeployPhase::Deployed);
         assert!(attacker_facts(&siege, ggi_obj).deploy_fire_active);
-        // Overrides.
+        // The gunner slot is the transport's; `+0x82` is the rider's own.
         siege.weapon_override = Some(WeaponOverride::IfvSlot(3));
         let f = attacker_facts(&siege, ggi_obj);
         assert_eq!(f.current_weapon_number, 3);
         assert_eq!(f.open_transport_weapon, None);
-        siege.weapon_override = Some(WeaponOverride::OpenTransport(1));
-        let f = attacker_facts(&siege, ggi_obj);
+        ggi.passenger_role = PassengerRole::Inside {
+            transport_id: 9,
+            open_topped: true,
+        };
+        let f = attacker_facts(&ggi, ggi_obj);
         assert_eq!(f.current_weapon_number, 0);
         assert_eq!(f.open_transport_weapon, Some(1));
+        ggi.passenger_role = PassengerRole::Inside {
+            transport_id: 9,
+            open_topped: false,
+        };
+        assert_eq!(attacker_facts(&ggi, ggi_obj).open_transport_weapon, None);
     }
 
     #[test]
     fn target_facts_high_flying_ignores_category_and_reads_cloak() {
         let rules = stock_rules();
         let rock_obj = rules.object("ROCK").unwrap();
+        let interner = crate::sim::intern::test_interner();
         let mut rock = GameEntity::test_default(3, "ROCK", "Soviet", 2, 2);
         rock.category = EntityCategory::Infantry;
         let TargetFacts::Techno {
-            is_high_flying,
+            flight,
             kind,
             submerged,
             ..
-        } = techno_target_facts(&rock, rock_obj, None, false)
+        } = techno_target_facts(&rock, rock_obj, None, false, &rules, &interner)
         else {
             unreachable!()
         };
-        assert!(!is_high_flying);
+        assert!(!flight.high());
         assert_eq!(kind, TechnoKind::Infantry);
         assert!(!submerged);
-        assert!(!target_is_high_flying(&rock));
+        assert!(!crate::sim::movement::air_movement::is_high_flying(
+            &rock, None, None
+        ));
     }
 
     #[test]
@@ -3039,7 +3126,7 @@ IsLocomotor=yes
 
     // ---- Garrison ----------------------------------------------------------
 
-    fn make_garrison_rules(include_elite_occupy_weapon: bool) -> RuleSet {
+    fn make_garrison_rules(include_elite_occupy_weapon: bool, occupant_keys: &str) -> RuleSet {
         let elite_occupy_weapon = if include_elite_occupy_weapon {
             "EliteOccupyWeapon=EliteGarrisonRifle\n"
         } else {
@@ -3060,7 +3147,7 @@ Strength=125
 Armor=none
 Primary=PrimaryRifle
 OccupyWeapon=GarrisonRifle
-{}
+{}{}
 
 [PrimaryRifle]
 Damage=15
@@ -3090,36 +3177,42 @@ AA=no
 [SA]
 Verses=100%,100%,100%,80%,60%,40%,100%,40%,20%,100%,100%
 ",
-            elite_occupy_weapon
+            elite_occupy_weapon, occupant_keys
         );
         let ini = IniFile::from_str(&ini_str);
         RuleSet::from_ini(&ini).expect("Should parse garrison test rules")
     }
 
+    fn occupant_weapon_id(rules: &RuleSet, veterancy: u16) -> Option<&str> {
+        occupant_weapon(rules, rules.object("E1").unwrap(), veterancy)
+            .map(|weapon| weapon.id.as_str())
+    }
+
     #[test]
     fn normal_garrison_uses_occupy_weapon() {
-        let rules = make_garrison_rules(false);
-        let sel =
-            select_garrison_weapon(&rules, "E1", 0, EntityCategory::Infantry, "none").unwrap();
-        assert_eq!(sel.weapon_id, "GarrisonRifle");
-        assert_eq!(sel.slot, WeaponSlot::Primary);
+        let rules = make_garrison_rules(false, "");
+        assert_eq!(occupant_weapon_id(&rules, 0), Some("GarrisonRifle"));
     }
 
     #[test]
     fn elite_garrison_uses_elite_occupy_weapon_when_present() {
-        let rules = make_garrison_rules(true);
-        let sel =
-            select_garrison_weapon(&rules, "E1", 200, EntityCategory::Infantry, "none").unwrap();
-        assert_eq!(sel.weapon_id, "EliteGarrisonRifle");
-        assert_eq!(sel.slot, WeaponSlot::Primary);
+        let rules = make_garrison_rules(true, "");
+        assert_eq!(occupant_weapon_id(&rules, 200), Some("EliteGarrisonRifle"));
     }
 
     #[test]
     fn elite_garrison_missing_elite_occupy_weapon_falls_back_to_primary() {
-        let rules = make_garrison_rules(false);
-        let sel =
-            select_garrison_weapon(&rules, "E1", 200, EntityCategory::Infantry, "none").unwrap();
-        assert_eq!(sel.weapon_id, "PrimaryRifle");
-        assert_eq!(sel.slot, WeaponSlot::Primary);
+        let rules = make_garrison_rules(false, "");
+        assert_eq!(occupant_weapon_id(&rules, 200), Some("PrimaryRifle"));
+    }
+
+    /// Without `EliteOccupyWeapon=`, the occupied arm answers the occupant's
+    /// own GetWeapon(0) (`0x0070E140`), which reads its rank: an elite
+    /// occupant fires its `ElitePrimary=`, never the normal `OccupyWeapon`.
+    #[test]
+    fn elite_garrison_missing_elite_occupy_weapon_takes_its_elite_primary() {
+        let rules = make_garrison_rules(false, "ElitePrimary=EliteGarrisonRifle\n");
+        assert_eq!(occupant_weapon_id(&rules, 200), Some("EliteGarrisonRifle"));
+        assert_eq!(occupant_weapon_id(&rules, 0), Some("GarrisonRifle"));
     }
 }
