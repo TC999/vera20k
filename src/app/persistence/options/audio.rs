@@ -59,28 +59,26 @@ impl AudioVolumeOperations for AppState {
         self.audio.launcher_audio_available
     }
     fn store_score_volume(&mut self, volume: f32) {
-        self.persistence.options_profile.score_volume = volume;
+        self.persistence
+            .options_profile
+            .set_score_volume(f64::from(volume));
     }
-    fn apply_score_output(&mut self, volume: f32) {
-        if let Some(player) = self.audio.music_player.as_mut() {
-            player.set_volume(f64::from(volume));
-        }
+    fn apply_score_output(&mut self, _volume: f32) {
+        // The preceding store owns the upper-only clamp for both consumers.
+        self.audio
+            .set_score_volume(self.persistence.options_profile.score_volume);
     }
     fn store_sound_volume(&mut self, volume: f32) {
         self.persistence.options_profile.sound_volume = volume;
     }
     fn apply_sound_output(&mut self, volume: f32) {
-        if let Some(player) = self.audio.sfx_player.as_mut() {
-            player.set_sound_volume(f64::from(volume));
-        }
+        self.audio.set_sound_volume(f64::from(volume));
     }
     fn store_voice_volume(&mut self, volume: f32) {
         self.persistence.options_profile.voice_volume = volume;
     }
     fn apply_voice_output(&mut self, volume: f32) {
-        if let Some(player) = self.audio.sfx_player.as_mut() {
-            player.set_voice_volume(f64::from(volume));
-        }
+        self.audio.set_voice_volume(f64::from(volume));
     }
     fn play_generic_beep(&mut self, local_multiplier: f32) {
         let sound = self
@@ -89,21 +87,12 @@ impl AudioVolumeOperations for AppState {
         let Some(sound) = sound else {
             return;
         };
-        let Some(assets) = self.process_assets.manager() else {
-            return;
-        };
         let Some(sfx) = self.audio.sfx_player.as_mut() else {
             return;
         };
         let Some(catalog) = self.process_assets.audio_catalog() else {
             return;
         };
-        sfx.play_sound_with_volume(
-            &sound,
-            local_multiplier,
-            catalog.sounds(),
-            assets,
-            catalog.index(),
-        );
+        sfx.play_sound_with_volume(&sound, local_multiplier, catalog.sounds());
     }
 }

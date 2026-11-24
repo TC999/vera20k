@@ -4,15 +4,114 @@
 //! dispatcher during combat.
 //!
 //! Dependency rules: depends on rules/, map/, and other sim/ modules.
-//! Never depends on render/, ui/, sidebar/, audio/, net/.
+//! Never depends on render/, ui/, audio/, net/.
 
 use crate::map::cell_index::NativeCellIdentity;
 use crate::map::map_file::MapSmudgeEntry;
-use crate::map::resolved_terrain::ResolvedTerrainGrid;
+use crate::map::resolved_terrain::{NativeCellQuery, ResolvedTerrainGrid};
 use crate::rules::smudge_type::SmudgeTypeRegistry;
 use crate::sim::occupancy::OccupancyGrid;
 use crate::sim::overlay_grid::OverlayGrid;
 use crate::sim::rng::SimRng;
+use crate::util::synced::{ChunkedVec, Synced};
+use std::collections::BTreeMap;
+use std::hash::Hash;
+
+/// Runtime SmudgeClass identity, independently retained until the shared
+/// deferred destructor. Smudge marks are CellClass state, not this lifetime.
+/// Full native6B4A50/6B4BE0/6B4FA0 comparison:
+/// tools/spatial_oracle/building_death_anims_joined_stock_smudges.json.
+#[derive(Debug, Clone, Hash, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SmudgeObject {
+    stable_id: u64,
+    native_unique_id: i32,
+    type_id: u16,
+    location: SimCoord,
+    object_alive: bool,
+    in_limbo: bool,
+}
+
+impl SmudgeObject {
+    pub(crate) fn stable_id(&self) -> u64 {
+        self.stable_id
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn native_unique_id(&self) -> i32 {
+        self.native_unique_id
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn type_id(&self) -> u16 {
+        self.type_id
+    }
+    pub(crate) fn location(&self) -> SimCoord {
+        self.location
+    }
+    pub(crate) fn object_alive(&self) -> bool {
+        self.object_alive
+    }
+    pub(crate) fn in_limbo(&self) -> bool {
+        self.in_limbo
+    }
+    // ObjectCtor5F3900's Health255 is unchanged by Smudge Mark/UnInit/dtor.
+    pub(crate) fn health(&self) -> i32 {
+        255
+    }
+}
+
+/// Split borrows of the existing ID owners at one runtime constructor. The
+/// dispatch commits exactly one producer request, which can construct at most
+/// one Smudge, then Simulation immediately runs the common UnInit callbacks.
+pub(crate) struct SmudgeConstruction<'a> {
+    stable_ids: &'a mut crate::sim::world::StableIdCursor,
+    entities: &'a crate::sim::entity_store::EntityStore,
+    native_ids: &'a mut Option<crate::sim::native_identity::NativeUniqueIdCursor>,
+    scenario_init_priority: bool,
+    constructed_id: Option<u64>,
+}
+
+impl<'a> SmudgeConstruction<'a> {
+    pub(crate) fn new(
+        stable_ids: &'a mut crate::sim::world::StableIdCursor,
+        entities: &'a crate::sim::entity_store::EntityStore,
+        native_ids: &'a mut Option<crate::sim::native_identity::NativeUniqueIdCursor>,
+        scenario_init_priority: bool,
+    ) -> Self {
+        Self {
+            stable_ids,
+            entities,
+            native_ids,
+            scenario_init_priority,
+            constructed_id: None,
+        }
+    }
+
+    pub(crate) fn constructed_id(&self) -> Option<u64> {
+        self.constructed_id
+    }
+
+    fn construct(&mut self, grid: &mut SmudgeGrid, type_id: u16, location: SimCoord) {
+        assert!(
+            self.constructed_id.is_none(),
+            "one smudge per producer request"
+        );
+        let stable_id = self.stable_ids.allocate(self.entities);
+        let native_unique_id =
+            crate::sim::native_identity::NativeUniqueIdCursor::assign_runtime(self.native_ids);
+        let previous = grid.objects.insert(
+            stable_id,
+            SmudgeObject {
+                stable_id,
+                native_unique_id,
+                type_id,
+                location,
+                object_alive: true,
+                in_limbo: false,
+            },
+        );
+        assert!(previous.is_none(), "Smudge {stable_id} already exists");
+        self.constructed_id = Some(stable_id);
+    }
+}
 
 /// Smudge category — Burn for scorches, Crater for explosion craters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,19 +123,14 @@ pub enum SmudgeKind {
 /// Per-cell smudge slot.
 ///
 /// `type_id` indexes into SmudgeTypeRegistry. None = no smudge on this cell.
-/// `footprint_origin` is the top-left cell of the W×H footprint that owns this cell.
-/// `frame_offset` distinguishes the footprint origin (== 0) from non-origin
-/// cells of multi-cell smudges. Computed as
-/// `(rx - origin.rx) + (ry - origin.ry) * footprint_width`. The origin cell
-/// of any placed footprint always has `frame_offset == 0`. Non-origin cells
-/// are skipped at render time — multi-cell SmudgeType SHPs have a single
-/// composite frame, drawn once per footprint at the origin cell.
+/// `frame_offset` is native Cell+11F: the low byte of `y * Width + x`.
+/// Removal and drawing decode it with the current signed type Width. It can
+/// wrap to zero inside a large footprint; no separately saved origin owns it.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
 )]
 pub struct SmudgeCell {
     pub type_id: Option<u16>,
-    pub footprint_origin: Option<(u16, u16)>,
     pub frame_offset: u8,
 }
 
@@ -45,7 +139,11 @@ pub struct SmudgeCell {
 pub struct SmudgeGrid {
     width: u16,
     height: u16,
-    cells: Vec<SmudgeCell>,
+    /// Synced in chunks into the presentation copy (docs/sim-thread.md).
+    cells: ChunkedVec<SmudgeCell>,
+    /// Generic Object/SmudgeClass vector membership lasts through UnInit.
+    /// Never joins Logic; scalar destruction removes only the object.
+    objects: Synced<BTreeMap<u64, SmudgeObject>>,
     /// Cells mutated this tick — drained per tick by the render-update path.
     /// Not part of game state; never serialized.
     #[serde(skip, default)]
@@ -58,7 +156,8 @@ impl SmudgeGrid {
         Self {
             width,
             height,
-            cells: vec![SmudgeCell::default(); count],
+            cells: ChunkedVec::filled(SmudgeCell::default(), count),
+            objects: Synced::default(),
             dirty_cells: Vec::new(),
         }
     }
@@ -68,6 +167,38 @@ impl SmudgeGrid {
     }
     pub fn height(&self) -> u16 {
         self.height
+    }
+
+    pub(crate) fn objects(&self) -> impl Iterator<Item = (u64, &SmudgeObject)> {
+        self.objects.iter().map(|(&id, object)| (id, object))
+    }
+
+    pub(crate) fn object(&self, id: u64) -> Option<&SmudgeObject> {
+        self.objects.get(&id)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn object_count(&self) -> usize {
+        self.objects.len()
+    }
+
+    /// ObjectUnInit5F65F0/Conceal5F4D20 writes these only after both expiry
+    /// broadcasts. The already-written cell footprint remains unchanged.
+    pub(crate) fn finish_uninit(&mut self, id: u64) {
+        let object = self.objects.get_mut(&id).expect("Smudge UnInit identity");
+        object.in_limbo = true;
+        object.object_alive = false;
+    }
+
+    pub(crate) fn finalize_remove(&mut self, id: u64) -> Option<SmudgeObject> {
+        self.objects.remove(&id)
+    }
+
+    pub(crate) fn fold_objects(&self, hasher: &mut impl std::hash::Hasher) {
+        if !self.objects.is_empty() {
+            b"runtime-smudge-objects-v1".hash(hasher);
+            self.objects.hash(hasher);
+        }
     }
 
     pub fn cell(&self, rx: u16, ry: u16) -> &SmudgeCell {
@@ -85,41 +216,17 @@ impl SmudgeGrid {
         }
     }
 
+    /// Whether [`Self::drain_dirty`] would return any cell.
+    pub(crate) fn has_dirty(&self) -> bool {
+        !self.dirty_cells.is_empty()
+    }
+
     pub fn drain_dirty(&mut self) -> Vec<(u16, u16)> {
         std::mem::take(&mut self.dirty_cells)
     }
 
-    /// Clear every complete smudge footprint touched by the supplied cells.
-    /// Intersections are visited in caller order; each owning footprint is
-    /// erased immediately in row-major cell order, so a later intersection
-    /// with that same footprint observes an empty cell and emits no duplicate.
-    pub(crate) fn clear_intersecting_footprints(&mut self, intersections: &[(u16, u16)]) -> usize {
-        let mut cleared = 0;
-        for &(rx, ry) in intersections {
-            let Some(origin) = self
-                .index_of(rx, ry)
-                .and_then(|index| self.cells[index].footprint_origin)
-            else {
-                continue;
-            };
-            for index in 0..self.cells.len() {
-                if self.cells[index].type_id.is_none()
-                    || self.cells[index].footprint_origin != Some(origin)
-                {
-                    continue;
-                }
-                self.cells[index] = SmudgeCell::default();
-                let cell_rx = (index % usize::from(self.width)) as u16;
-                let cell_ry = (index / usize::from(self.width)) as u16;
-                self.dirty_cells.push((cell_rx, cell_ry));
-                cleared += 1;
-            }
-        }
-        cleared
-    }
-
     /// Raw CellClass Mark(1) writer: clear only this cell's native smudge slot
-    /// and data byte, without expanding to the owning Rust footprint.
+    /// and data byte, without decoding a surrounding footprint.
     pub(crate) fn clear_cell_slot(&mut self, rx: u16, ry: u16) -> bool {
         let Some(index) = self.index_of(rx, ry) else {
             return false;
@@ -130,6 +237,83 @@ impl SmudgeGrid {
         self.cells[index] = SmudgeCell::default();
         self.dirty_cells.push((rx, ry));
         true
+    }
+
+    /// Map588AC0's per-source footprint removal. The origin is decoded from
+    /// native Cell+11F / Type.Width, not from Rust's cached footprint origin.
+    /// Each target clears only Cell+48; data and SmudgeClass lifetime survive.
+    /// Original Execute1186E2C20 calls this in allocated578350/578290 order.
+    pub(crate) fn clear_footprint_identity_at(
+        &mut self,
+        source: (i16, i16),
+        registry: &SmudgeTypeRegistry,
+        terrain: &ResolvedTerrainGrid,
+        mut visit: impl FnMut(NativeCellIdentity, (i16, i16), bool),
+    ) -> Option<usize> {
+        let query = NativeCellQuery::canonical(terrain);
+        let source = query.lookup(source);
+        let source_coord = query.coord(source);
+        let (type_id, data) = match source {
+            NativeCellIdentity::Real(_) => {
+                let value = self.cell(source_coord.0 as u16, source_coord.1 as u16);
+                (value.type_id, value.frame_offset)
+            }
+            NativeCellIdentity::Dummy => {
+                let (id, data) = query.dummy().smudge_identity_data();
+                (
+                    if id == -1 {
+                        None
+                    } else {
+                        Some(u16::try_from(id).ok()?)
+                    },
+                    data,
+                )
+            }
+        };
+        let Some(type_id) = type_id else {
+            return Some(0);
+        };
+        let definition = registry.get(type_id)?;
+        // Both Map588B3D and Building43F33F/43F846 divide before testing
+        // either loop bound. A zero divisor refuses this source safely.
+        let (dx, dy) = definition.encoded_cell_offset(data)?;
+        if definition.width <= 0 || definition.height <= 0 {
+            return Some(0);
+        }
+        let origin = (
+            source_coord.0.wrapping_sub(dx as i16),
+            source_coord.1.wrapping_sub(dy as i16),
+        );
+        let mut changed = 0;
+        for dy in 0..definition.height {
+            for dx in 0..definition.width {
+                //588B80..BA4: signed-word linear lookup and shared Dummy stamp.
+                let selected = query.lookup((
+                    origin.0.wrapping_add(dx as i16),
+                    origin.1.wrapping_add(dy as i16),
+                ));
+                let at = query.coord(selected);
+                let did_change = match selected {
+                    NativeCellIdentity::Real(_) => {
+                        let value = self
+                            .index_of(at.0 as u16, at.1 as u16)
+                            .is_some_and(|index| self.cells[index].type_id.take().is_some());
+                        changed += usize::from(value);
+                        value
+                    }
+                    NativeCellIdentity::Dummy => {
+                        let dummy = query.dummy();
+                        let (id, data) = dummy.smudge_identity_data();
+                        dummy.write_smudge_identity_data(-1, data);
+                        id != -1
+                    }
+                };
+                // Building43F3DA/43F8DB invalidates every visited target;
+                // the Map caller retains its changed-cell adapter separately.
+                visit(selected, at, did_change);
+            }
+        }
+        Some(changed)
     }
 
     pub fn iter_occupied(&self) -> impl Iterator<Item = (u16, u16, &SmudgeCell)> {
@@ -147,7 +331,7 @@ impl SmudgeGrid {
     /// Test-only direct cell mutation. Bypasses CanPlaceHere — use only in
     /// unit tests that need to seed a known SmudgeGrid state for hashing or
     /// snapshot round-trip verification.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn test_force_set(&mut self, rx: u16, ry: u16, cell: SmudgeCell) {
         if let Some(idx) = self.index_of(rx, ry) {
             self.cells[idx] = cell;
@@ -158,7 +342,6 @@ impl SmudgeGrid {
 
 const DEFAULT_CELL: SmudgeCell = SmudgeCell {
     type_id: None,
-    footprint_origin: None,
     frame_offset: 0,
 };
 
@@ -227,23 +410,27 @@ impl SmudgeGrid {
     /// not traced). Effect: native refuses a non-forced mark touching the
     /// dummy; here it passes. Frequency: such a building plus a mark over one
     /// cell wide or tall on the diamond's right or bottom edge.
-    #[allow(clippy::too_many_arguments)]
     fn passes_placement_gates(
         &self,
         origin: (i16, i16),
-        w: u8,
-        h: u8,
+        w: i32,
+        h: i32,
         terrain: &ResolvedTerrainGrid,
         overlay: &OverlayGrid,
         occupancy: Option<&OccupancyGrid>,
         allow_building: bool,
     ) -> bool {
+        // CanPlace6B5F95/6B5FA9 succeeds without any cell lookup for an
+        // empty signed footprint, even when its origin would be blocked.
+        if w <= 0 || h <= 0 {
+            return true;
+        }
         let in_bounds = origin_in_bounds(terrain, origin);
         for dy in 0..h {
             for dx in 0..w {
                 let cell = terrain.native_cell_identity((
-                    origin.0.wrapping_add(i16::from(dx)),
-                    origin.1.wrapping_add(i16::from(dy)),
+                    origin.0.wrapping_add(dx as i16),
+                    origin.1.wrapping_add(dy as i16),
                 ));
                 if !in_bounds || terrain.native_cell_ground_fields(cell).1 != 0 {
                     return false;
@@ -255,7 +442,15 @@ impl SmudgeGrid {
                         self.cell(x, y).type_id.is_none()
                             && overlay.cell(x, y).overlay_id.is_none()
                             && (allow_building
-                                || occupancy.is_none_or(|occ| !cell_has_building(occ, x, y)))
+                                || occupancy.is_none_or(|occ| {
+                                    // 6B6011: only absence of the first ground Building admits.
+                                    occ.first_building_on_layer(
+                                        x,
+                                        y,
+                                        crate::sim::movement::locomotor::MovementLayer::Ground,
+                                    )
+                                    .is_none()
+                                }))
                     }
                     NativeCellIdentity::Dummy => {
                         let dummy = terrain.shared_cell_dummy();
@@ -280,18 +475,20 @@ impl SmudgeGrid {
         &mut self,
         origin: (i16, i16),
         type_id: u16,
-        w: u8,
-        h: u8,
+        w: i32,
+        h: i32,
         terrain: &ResolvedTerrainGrid,
     ) {
-        // CanPlace admitted the origin, an allocated slot.
-        let footprint_origin = (origin.0 as u16, origin.1 as u16);
+        // Place6B6090/6B60A4 has no writes for either nonpositive bound.
+        if w <= 0 || h <= 0 {
+            return;
+        }
         for dy in 0..h {
             for dx in 0..w {
-                let data = dy.wrapping_mul(w).wrapping_add(dx);
+                let data = (dy as u8).wrapping_mul(w as u8).wrapping_add(dx as u8);
                 let cell = terrain.native_cell_identity((
-                    origin.0.wrapping_add(i16::from(dx)),
-                    origin.1.wrapping_add(i16::from(dy)),
+                    origin.0.wrapping_add(dx as i16),
+                    origin.1.wrapping_add(dy as i16),
                 ));
                 if cell == NativeCellIdentity::Dummy {
                     terrain
@@ -306,7 +503,6 @@ impl SmudgeGrid {
                 };
                 self.cells[index] = SmudgeCell {
                     type_id: Some(type_id),
-                    footprint_origin: Some(footprint_origin),
                     frame_offset: data,
                 };
                 self.dirty_cells.push((x, y));
@@ -321,21 +517,10 @@ impl SmudgeGrid {
 /// slot; an x outside 0..512 is excluded because the 512-wide stride would
 /// alias it onto another row's slot.
 fn origin_in_bounds(terrain: &ResolvedTerrainGrid, origin: (i16, i16)) -> bool {
-    (0..512).contains(&origin.0)
+    (0..terrain.cell_grid().side() as i16).contains(&origin.0)
         && terrain
             .native_fixed_cell_index(origin.0, origin.1)
             .is_some()
-}
-
-/// gamemd's placement check asks the cell for a *building*, not for an
-/// obstruction: its lookup walks the cell's object list and returns only
-/// BuildingClass objects. A vehicle sitting on the cell is never returned, so a
-/// shell landing on a tank that survives still leaves its scorch.
-fn cell_has_building(occupancy: &OccupancyGrid, rx: u16, ry: u16) -> bool {
-    use crate::sim::movement::locomotor::MovementLayer;
-    occupancy
-        .get(rx, ry)
-        .map_or(false, |c| c.has_building_on(MovementLayer::Ground))
 }
 
 impl SmudgeGrid {
@@ -369,8 +554,7 @@ impl SmudgeGrid {
     /// reduces tiberium before its crater attempt, even on placement failure;
     /// direct `BuildingClass::DestructionEffects @ 0x004415F0` and
     /// `BuildingClass::SpawnSurvivors @ 0x00442D90` callers do not.
-    #[allow(clippy::too_many_arguments)]
-    pub fn try_place(
+    pub(crate) fn try_place(
         &mut self,
         kind: SmudgeKind,
         coord: SimCoord,
@@ -382,6 +566,7 @@ impl SmudgeGrid {
         overlay: &OverlayGrid,
         occupancy: &OccupancyGrid,
         rng: &mut SimRng,
+        construction: Option<&mut SmudgeConstruction<'_>>,
     ) -> bool {
         // The placers' cell: the coordinate over 256 toward zero (`cdq; and edx,
         // 0xFF; add; sar 8`) in 16-bit words. Cell (0, 0), the sentinel
@@ -394,7 +579,7 @@ impl SmudgeGrid {
         }
 
         // Pass 1 — flag filter and per-candidate placement check.
-        let mut placeable: Vec<(u16, u8, u8)> = Vec::new();
+        let mut placeable: Vec<(u16, i32, i32)> = Vec::new();
         for (id, def) in registry.iter_with_id() {
             let flagged = match kind {
                 SmudgeKind::Burn => def.burn,
@@ -419,6 +604,30 @@ impl SmudgeGrid {
             return false;
         };
         let chosen = registry.get(chosen_id).unwrap();
+        if let Some(construction) = construction {
+            // Actual constructor assigns/registers ID before Mark6B4BE0.
+            // Its Mark1 repeats CanPlace6B5F80 with allowBuilding1, unless
+            // the shared Scenario-init priority bracket skips that check.
+            construction.construct(self, chosen_id, coord);
+            if !construction.scenario_init_priority
+                && !self.passes_placement_gates(
+                    origin,
+                    chosen.width,
+                    chosen.height,
+                    terrain,
+                    overlay,
+                    Some(occupancy),
+                    true,
+                )
+            {
+                return false;
+            }
+        } else {
+            // Existing primitive oracles hook the full constructor and check
+            // only numeric placement. Production always owns its lifetime.
+            #[cfg(not(any(test, feature = "test-support")))]
+            panic!("runtime Smudge requires the shared ID owners");
+        }
         self.write_footprint(origin, chosen_id, chosen.width, chosen.height, terrain);
         true
     }
@@ -436,7 +645,7 @@ impl SmudgeGrid {
 /// Native execution: `tools/spatial_oracle/anim_middle.py` and
 /// `smudge_can_place.py` (`placer`, `centre_mark`).
 pub(crate) fn pick_smudge_candidate(
-    placeable: &[(u16, u8, u8)],
+    placeable: &[(u16, i32, i32)],
     width: i32,
     height: i32,
     force_big: bool,
@@ -451,7 +660,7 @@ pub(crate) fn pick_smudge_candidate(
             if force_big {
                 w >= 2 && h >= 2
             } else {
-                (w == 1 && h == 1) || (0x3C < width && 0x32 < height)
+                (w == 1 && h == 1) || crate::rules::art_data::smudge_frame_is_large(width, height)
             }
         })
         .map(|&(id, _, _)| id)
@@ -466,7 +675,7 @@ pub(crate) fn pick_smudge_candidate(
 }
 
 /// Lepton-space coord (256 leptons = 1 cell, matches gamemd's CoordStruct).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct SimCoord {
     pub x: i32,
     pub y: i32,
@@ -476,7 +685,7 @@ pub struct SimCoord {
 /// `tools/spatial_oracle/smudge_can_place.json`: native CanPlace, placer and
 /// DestructionEffects step 7 rows over a synthetic MapClass cell table, and
 /// that table rebuilt in the Rust owners.
-#[cfg(test)]
+#[cfg(all(test, any(tests_sim_p_s, tests_sim_combat_d_z)))]
 pub(crate) mod oracle_fixture {
     use super::*;
     use crate::map::playfield::size_diamond_contains;
@@ -493,8 +702,8 @@ pub(crate) mod oracle_fixture {
     pub(crate) fn corpus() -> &'static Value {
         static CORPUS: OnceLock<Value> = OnceLock::new();
         CORPUS.get_or_init(|| {
-            serde_json::from_str(include_str!(
-                "../../tools/spatial_oracle/smudge_can_place.json"
+            serde_json::from_str(crate::test_fixture::text(
+                "tools/spatial_oracle/smudge_can_place.json",
             ))
             .unwrap()
         })
@@ -564,7 +773,7 @@ pub(crate) mod oracle_fixture {
         for cell in cells {
             let (rx, ry) = (int(&cell["x"]) as u16, int(&cell["y"]) as u16);
             if let Some(id) = cell["overlay"].as_i64() {
-                let slot = overlay.cell_mut(rx, ry);
+                let slot = overlay.cell_mut_for_test(rx, ry);
                 slot.overlay_id = Some(id as u8);
                 slot.overlay_data = int(&cell["overlay_data"]) as u8;
             }
@@ -574,7 +783,6 @@ pub(crate) mod oracle_fixture {
                     ry,
                     SmudgeCell {
                         type_id: Some(id as u16),
-                        footprint_origin: Some((rx, ry)),
                         frame_offset: int(&cell["smudge_data"]) as u8,
                     },
                 );
@@ -722,7 +930,26 @@ pub(crate) mod oracle_fixture {
     }
 }
 
-#[cfg(test)]
+impl SmudgeGrid {
+    /// Bring `mirror`, the presentation copy of the world's grid, up to
+    /// this one (docs/sim-thread.md).
+    pub(crate) fn sync_into(&mut self, mirror: &mut Self) {
+        let Self {
+            width,
+            height,
+            cells,
+            objects,
+            dirty_cells,
+        } = self;
+        mirror.width = *width;
+        mirror.height = *height;
+        cells.sync_into(&mut mirror.cells);
+        objects.sync_into(&mut mirror.objects);
+        mirror.dirty_cells.clone_from(dirty_cells);
+    }
+}
+
+#[cfg(all(test, tests_sim_p_s))]
 mod tests {
     use super::*;
     use crate::map::resolved_terrain::ResolvedTerrainCell;
@@ -730,179 +957,9 @@ mod tests {
     fn make_terrain(w: u16, h: u16, accepts: bool) -> ResolvedTerrainGrid {
         crate::map::resolved_terrain::test_grid(w, h, |rx, ry| ResolvedTerrainCell {
             filled_clear: true,
-            terrain_class: Default::default(),
             accepts_smudge: accepts,
             ..crate::map::resolved_terrain::test_flat_cell(rx, ry)
         })
-    }
-
-    fn make_registry_with_one_crater_1x1() -> SmudgeTypeRegistry {
-        let ini = crate::rules::ini_parser::IniFile::from_bytes(
-            b"[SmudgeTypes]\n1=CR1\n[CR1]\nCrater=yes\nWidth=1\nHeight=1\n",
-        )
-        .unwrap();
-        SmudgeTypeRegistry::from_rules_ini(&ini)
-    }
-
-    #[test]
-    fn try_place_writes_one_cell_for_1x1() {
-        let mut grid = SmudgeGrid::new(8, 8);
-        let registry = make_registry_with_one_crater_1x1();
-        let terrain = make_terrain(8, 8, true);
-        let overlay = OverlayGrid::new(8, 8);
-        let occupancy = OccupancyGrid::new();
-        let mut rng = SimRng::new(1);
-        let coord = SimCoord {
-            x: 4 * 256 + 128,
-            y: 4 * 256 + 128,
-            z: 0,
-        };
-        assert!(grid.try_place(
-            SmudgeKind::Crater,
-            coord,
-            30,
-            30,
-            false,
-            &registry,
-            &terrain,
-            &overlay,
-            &occupancy,
-            &mut rng,
-        ));
-        assert!(grid.cell(4, 4).type_id.is_some());
-    }
-
-    #[test]
-    fn rejects_when_accepts_smudge_false() {
-        let mut grid = SmudgeGrid::new(8, 8);
-        let registry = make_registry_with_one_crater_1x1();
-        let terrain = make_terrain(8, 8, false); // Morphable=no
-        let overlay = OverlayGrid::new(8, 8);
-        let occupancy = OccupancyGrid::new();
-        let mut rng = SimRng::new(1);
-        let coord = SimCoord {
-            x: 4 * 256 + 128,
-            y: 4 * 256 + 128,
-            z: 0,
-        };
-        assert!(!grid.try_place(
-            SmudgeKind::Crater,
-            coord,
-            30,
-            30,
-            false,
-            &registry,
-            &terrain,
-            &overlay,
-            &occupancy,
-            &mut rng,
-        ));
-        assert!(grid.cell(4, 4).type_id.is_none());
-    }
-
-    #[test]
-    fn rejects_when_overlay_present() {
-        let mut grid = SmudgeGrid::new(8, 8);
-        let registry = make_registry_with_one_crater_1x1();
-        let terrain = make_terrain(8, 8, true);
-        let mut overlay = OverlayGrid::new(8, 8);
-        overlay.place_overlay(4, 4, 0, 0);
-        let occupancy = OccupancyGrid::new();
-        let mut rng = SimRng::new(1);
-        let coord = SimCoord {
-            x: 4 * 256 + 128,
-            y: 4 * 256 + 128,
-            z: 0,
-        };
-        assert!(!grid.try_place(
-            SmudgeKind::Crater,
-            coord,
-            30,
-            30,
-            false,
-            &registry,
-            &terrain,
-            &overlay,
-            &occupancy,
-            &mut rng,
-        ));
-    }
-
-    #[test]
-    fn threshold_strict_less_than_for_size_filter() {
-        // Registry: one 1x1 crater + one 2x2 crater. With dmg=60, dmg2=50 (strict < fails),
-        // only the 1x1 should be selectable.
-        let ini = crate::rules::ini_parser::IniFile::from_bytes(
-            b"[SmudgeTypes]\n1=CR1\n2=CR2\n\
-              [CR1]\nCrater=yes\nWidth=1\nHeight=1\n\
-              [CR2]\nCrater=yes\nWidth=2\nHeight=2\n",
-        )
-        .unwrap();
-        let registry = SmudgeTypeRegistry::from_rules_ini(&ini);
-        let terrain = make_terrain(8, 8, true);
-        let overlay = OverlayGrid::new(8, 8);
-        let occupancy = OccupancyGrid::new();
-        let mut rng = SimRng::new(1);
-        let coord = SimCoord {
-            x: 4 * 256 + 128,
-            y: 4 * 256 + 128,
-            z: 0,
-        };
-        // Run try_place 50 times; with dmg=60, dmg2=50 only CR1 (1x1) should be picked.
-        // Verify no 2x2 footprints land (CR2 would write 4 cells; CR1 writes 1).
-        for _ in 0..50 {
-            let mut grid = SmudgeGrid::new(8, 8);
-            grid.try_place(
-                SmudgeKind::Crater,
-                coord,
-                60,
-                50,
-                false,
-                &registry,
-                &terrain,
-                &overlay,
-                &occupancy,
-                &mut rng,
-            );
-            // Count occupied cells; must be 0 or 1, never 4.
-            let occupied = grid.iter_occupied().count();
-            assert!(occupied <= 1, "1x1 only; saw {} cells", occupied);
-        }
-    }
-
-    #[test]
-    fn empty_filter_falls_back_to_unfiltered() {
-        // Registry has only a 2x2 crater; with force_big=false and dmg below threshold,
-        // size filter eliminates it but fallback to unfiltered should still pick it.
-        let ini = crate::rules::ini_parser::IniFile::from_bytes(
-            b"[SmudgeTypes]\n1=CR2\n[CR2]\nCrater=yes\nWidth=2\nHeight=2\n",
-        )
-        .unwrap();
-        let registry = SmudgeTypeRegistry::from_rules_ini(&ini);
-        let mut grid = SmudgeGrid::new(8, 8);
-        let terrain = make_terrain(8, 8, true);
-        let overlay = OverlayGrid::new(8, 8);
-        let occupancy = OccupancyGrid::new();
-        let mut rng = SimRng::new(1);
-        let coord = SimCoord {
-            x: 4 * 256 + 128,
-            y: 4 * 256 + 128,
-            z: 0,
-        };
-        assert!(grid.try_place(
-            SmudgeKind::Crater,
-            coord,
-            30,
-            30,
-            false,
-            &registry,
-            &terrain,
-            &overlay,
-            &occupancy,
-            &mut rng,
-        ));
-        // 2x2 footprint placed at (4,4): 4 cells written.
-        assert_eq!(grid.iter_occupied().count(), 4);
     }
 
     fn registry_1x1_and_2x2_craters() -> SmudgeTypeRegistry {
@@ -913,216 +970,6 @@ mod tests {
         )
         .unwrap();
         SmudgeTypeRegistry::from_rules_ini(&ini)
-    }
-
-    const CENTER_COORD: SimCoord = SimCoord {
-        x: 4 * 256 + 128,
-        y: 4 * 256 + 128,
-        z: 0,
-    };
-
-    #[test]
-    fn occupied_neighbour_blocks_2x2_but_1x1_still_lands_without_a_draw() {
-        // gamemd builds the placeable list BEFORE the random pick, so a cell
-        // whose 2x2 footprint is fouled by an earlier crater still receives the
-        // 1x1 that does fit. Picking first and gating afterwards would drop the
-        // mark whenever the 2x2 came up.
-        let registry = registry_1x1_and_2x2_craters();
-        let mut grid = SmudgeGrid::new(8, 8);
-        // Earlier smudge at (5,4): inside CR2's footprint from (4,4), but not
-        // on the impact cell itself.
-        grid.test_force_set(
-            5,
-            4,
-            SmudgeCell {
-                type_id: Some(0),
-                footprint_origin: Some((5, 4)),
-                frame_offset: 0,
-            },
-        );
-        let _ = grid.drain_dirty();
-        let terrain = make_terrain(8, 8, true);
-        let overlay = OverlayGrid::new(8, 8);
-        let occupancy = OccupancyGrid::new();
-        let mut rng = SimRng::new(1);
-
-        // dmg/dmg2 above both thresholds, so the size pass keeps every
-        // placeable type and cannot itself be what eliminates CR2.
-        assert!(grid.try_place(
-            SmudgeKind::Crater,
-            CENTER_COORD,
-            100,
-            100,
-            false,
-            &registry,
-            &terrain,
-            &overlay,
-            &occupancy,
-            &mut rng,
-        ));
-        // CR1 (id 0) is the only type that fits.
-        assert_eq!(grid.cell(4, 4).type_id, Some(0));
-        // A single-entry pool means the ranged draw is a no-op, so the shared
-        // cursor must not have moved. Under a pick-then-gate order the pool
-        // would have held both types and consumed a draw.
-        assert_eq!(rng.state(), SimRng::new(1).state());
-    }
-
-    #[test]
-    fn force_big_centre_mark_places_on_a_building_cell() {
-        // gamemd forwards `forceBig` as CanPlaceHere's `allowBuilding`, so the
-        // building-destruction centre mark lands under the wreck.
-        let registry = registry_1x1_and_2x2_craters();
-        let mut grid = SmudgeGrid::new(8, 8);
-        let terrain = make_terrain(8, 8, true);
-        let overlay = OverlayGrid::new(8, 8);
-        let mut occupancy = OccupancyGrid::new();
-        use crate::sim::movement::locomotor::MovementLayer;
-        use crate::sim::occupancy::CellListInsertion;
-        for (cx, cy) in [(4, 4), (5, 4), (4, 5), (5, 5)] {
-            occupancy.add(
-                cx,
-                cy,
-                7,
-                MovementLayer::Ground,
-                None,
-                CellListInsertion::AppendBuilding,
-            );
-        }
-        let mut rng = SimRng::new(1);
-
-        assert!(grid.try_place(
-            SmudgeKind::Crater,
-            CENTER_COORD,
-            100,
-            100,
-            true, // force_big => allowBuilding
-            &registry,
-            &terrain,
-            &overlay,
-            &occupancy,
-            &mut rng,
-        ));
-        // force_big prefers >=2x2, so CR2 lands across all four cells.
-        assert_eq!(grid.iter_occupied().count(), 4);
-
-        // Same cell, same occupancy, force_big=false: the building gate applies
-        // and nothing is placed.
-        let mut plain_grid = SmudgeGrid::new(8, 8);
-        let mut plain_rng = SimRng::new(1);
-        assert!(!plain_grid.try_place(
-            SmudgeKind::Crater,
-            CENTER_COORD,
-            100,
-            100,
-            false,
-            &registry,
-            &terrain,
-            &overlay,
-            &occupancy,
-            &mut plain_rng,
-        ));
-        assert_eq!(plain_grid.iter_occupied().count(), 0);
-    }
-
-    #[test]
-    fn surviving_vehicle_does_not_block_a_smudge_but_a_structure_does() {
-        // gamemd's building lookup returns BuildingClass objects only, so a
-        // shell landing on a tank that lives still scorches the ground. Testing
-        // "any ground blocker" instead would swallow the mark on every cell
-        // holding a surviving vehicle.
-        use crate::sim::movement::locomotor::MovementLayer;
-        use crate::sim::occupancy::CellListInsertion;
-        let registry = registry_1x1_and_2x2_craters();
-        let terrain = make_terrain(8, 8, true);
-        let overlay = OverlayGrid::new(8, 8);
-
-        // A vehicle on the impact cell: non-force_big smudge still lands.
-        let mut vehicle_occupancy = OccupancyGrid::new();
-        vehicle_occupancy.add(
-            4,
-            4,
-            11,
-            MovementLayer::Ground,
-            None,
-            CellListInsertion::PrependNonBuilding,
-        );
-        let mut grid = SmudgeGrid::new(8, 8);
-        let mut rng = SimRng::new(1);
-        assert!(
-            grid.try_place(
-                SmudgeKind::Crater,
-                CENTER_COORD,
-                100,
-                100,
-                false,
-                &registry,
-                &terrain,
-                &overlay,
-                &vehicle_occupancy,
-                &mut rng,
-            ),
-            "a surviving vehicle is not a building and must not block the mark"
-        );
-        assert!(grid.cell(4, 4).type_id.is_some());
-
-        // A structure on the same cell: the non-force_big gate still applies.
-        let mut building_occupancy = OccupancyGrid::new();
-        building_occupancy.add(
-            4,
-            4,
-            12,
-            MovementLayer::Ground,
-            None,
-            CellListInsertion::AppendBuilding,
-        );
-        let mut blocked = SmudgeGrid::new(8, 8);
-        let mut blocked_rng = SimRng::new(1);
-        assert!(!blocked.try_place(
-            SmudgeKind::Crater,
-            CENTER_COORD,
-            100,
-            100,
-            false,
-            &registry,
-            &terrain,
-            &overlay,
-            &building_occupancy,
-            &mut blocked_rng,
-        ));
-        assert_eq!(blocked.iter_occupied().count(), 0);
-    }
-
-    #[test]
-    fn no_rng_draw_when_nothing_can_be_placed() {
-        // Overlay on the impact cell rejects every candidate; gamemd returns
-        // from pass 1 without reaching RandomRanged.
-        let registry = registry_1x1_and_2x2_craters();
-        let mut grid = SmudgeGrid::new(8, 8);
-        let terrain = make_terrain(8, 8, true);
-        let mut overlay = OverlayGrid::new(8, 8);
-        overlay.place_overlay(4, 4, 0, 0);
-        let occupancy = OccupancyGrid::new();
-        let mut rng = SimRng::new(1);
-
-        assert!(!grid.try_place(
-            SmudgeKind::Crater,
-            CENTER_COORD,
-            100,
-            100,
-            false,
-            &registry,
-            &terrain,
-            &overlay,
-            &occupancy,
-            &mut rng,
-        ));
-        assert_eq!(grid.iter_occupied().count(), 0);
-        assert_eq!(
-            rng.state(),
-            SimRng::new(1).state(),
-            "no candidate fits, so the scenario cursor must not advance"
-        );
     }
 
     #[test]
@@ -1150,6 +997,7 @@ mod tests {
             &overlay,
             &occupancy,
             &mut origin_rng,
+            None,
         ));
         assert_eq!(origin_rng.logical_state(), origin_state);
 
@@ -1171,6 +1019,7 @@ mod tests {
                 &overlay,
                 &occupancy,
                 &mut rng,
+                None,
             ));
             assert_ne!(rng.logical_state(), SimRng::new(9).logical_state());
         }
@@ -1189,28 +1038,6 @@ mod tests {
         );
         assert!(loaded.cell(0, 0).type_id.is_some());
         let _ = loaded.drain_dirty();
-    }
-
-    #[test]
-    fn gsi_04_11_map_load_retains_row_major_footprint_dirties() {
-        let registry = registry_1x1_and_2x2_craters();
-        let terrain = make_terrain(8, 8, true);
-        let overlay = OverlayGrid::new(8, 8);
-        let mut loaded = SmudgeGrid::from_map_entries(
-            &[MapSmudgeEntry {
-                type_name: "CR2".to_string(),
-                rx: 2,
-                ry: 3,
-            }],
-            &registry,
-            &terrain,
-            &overlay,
-            8,
-            8,
-        );
-
-        assert_eq!(loaded.drain_dirty(), vec![(2, 3), (3, 3), (2, 4), (3, 4)]);
-        assert!(loaded.drain_dirty().is_empty());
     }
 
     /// `SmudgeTypeClass::CanPlace @ 0x006B5F80` executed over MapClass's cell
@@ -1232,8 +1059,8 @@ mod tests {
             oracle_fixture::reset_dummy_coord(&map.terrain);
             let actual = map.smudges.passes_placement_gates(
                 (int(&origin[0]) as i16, int(&origin[1]) as i16),
-                int(&row["width"]) as u8,
-                int(&row["height"]) as u8,
+                int(&row["width"]) as i32,
+                int(&row["height"]) as i32,
                 &map.terrain,
                 &map.overlay,
                 Some(&map.occupancy),
@@ -1289,6 +1116,7 @@ mod tests {
                 &map.overlay,
                 &map.occupancy,
                 &mut rng,
+                None,
             );
             oracle_fixture::assert_marks(&before, &map.smudges, &map.terrain, row);
             assert_eq!(placed, !row["marked"].as_array().unwrap().is_empty());

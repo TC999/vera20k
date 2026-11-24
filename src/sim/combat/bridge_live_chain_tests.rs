@@ -11,6 +11,7 @@ use crate::sim::projectile::{ProjectileCoord, ProjectileTarget};
 use crate::sim::runtime::SimRuntime;
 use crate::sim::snapshot::GameSnapshot;
 use crate::sim::world::TickLane;
+use crate::util::save_codec;
 use std::collections::BTreeMap;
 
 /// A flat bank at deck height, with two deck cells between it and the target.
@@ -77,19 +78,19 @@ fn restore_saved_scenario(
     let map_hash = scenario.map.ini.content_hash();
     let rules_hash = resources.rules.simulation_config_hash();
     let mut restored =
-        GameSnapshot::load_validated(bytes, map_hash, rules_hash, &live.session.map_name)
+        GameSnapshot::load_validated(bytes, map_hash, rules_hash, live.session.map_name())
             .expect("saved retail scenario validates")
             .sim;
     assert_eq!(
-        bincode::serialize(&restored.projectiles).unwrap(),
-        bincode::serialize(&live.projectiles).unwrap(),
+        save_codec::serialize(&restored.projectiles).unwrap(),
+        save_codec::serialize(&live.projectiles).unwrap(),
         "serialized Bullet fields survive before native load fixups"
     );
 
     // The simulation-owned portion of the app's PreparedLoad transaction:
     // detached Resize dummy, stable-reference fixups, pristine map caches,
     // then saved overlay/bridge authority and canonical navigation.
-    restored.retain_in_scenario_process_state_from(live);
+    restored.retain_process_state_for_load(crate::sim::world::SnapshotProcessState::Live(live));
     restored.bind_shared_cell_dummy(crate::map::resolved_terrain::SharedCellDummy::fresh());
     restored.reconstruct_cellclass_dummy_for_map_resize();
     restored
@@ -99,16 +100,17 @@ fn restore_saved_scenario(
         .expect("saved production identities restore");
     restored.rebuild_caches_after_load(
         template.clone(),
-        live.terrain_speed_config.clone(),
+        live.terrain_speed_config().clone(),
         &resources.rules,
     );
     restored
-        .restore_map_authority_after_snapshot_load(&resources.rules, &resources.overlay_registry)
+        .restore_map_authority_after_snapshot_load(
+            &resources.rules,
+            resources.rules.overlay_registry(),
+            None,
+        )
         .expect("saved map and bridge authority restore");
     restored.resolve_type_handles(&resources.rules);
-    restored
-        .restore_move_sound_handles_after_load(&resources.rules)
-        .expect("saved movement sound handles restore");
     restored.rebuild_lighting_sources_after_load(&resources.rules);
     restored
 }
@@ -172,6 +174,7 @@ fn assert_collapsed_bridge_restores(
             .get(attacker)
             .unwrap()
             .attack_target
+            .target()
             .is_none(),
         "save/load must not reacquire the released Cell target"
     );
@@ -184,11 +187,12 @@ fn assert_collapsed_bridge_restores(
         let loaded = restored
             .anim(id)
             .expect("every saved live AnimClass restores");
-        assert_eq!(loaded.type_id, original.type_id);
-        assert_eq!(loaded.world_coord, original.world_coord);
-        assert_eq!(loaded.bounce, original.bounce, "BounceClass body {id}");
+        assert_eq!(loaded.type_id(), original.type_id());
+        assert_eq!(loaded.world_coord(), original.world_coord());
+        assert_eq!(loaded.bounce(), original.bounce(), "BounceClass body {id}");
         assert_eq!(
-            loaded.runtime, original.runtime,
+            loaded.runtime(),
+            original.runtime(),
             "AnimClass timer/lifecycle {id}"
         );
     }
@@ -211,13 +215,13 @@ fn assert_live_projectile_restore_continuation(
         .get(projectile_id)
         .expect("save contains the already-moved live Bullet")
         .clone();
-    assert_ne!(saved_shell.position, saved_shell.launch_origin);
-    assert!(saved_shell.in_logic_vector);
+    assert_ne!(saved_shell.position(), saved_shell.launch_origin());
+    assert!(saved_shell.in_logic_vector());
     assert_eq!(
         scenario.sim().display_layers().layer_of(projectile_id),
         Some(DisplayLayer::AIR)
     );
-    let saved_display = bincode::serialize(scenario.sim().display_layers()).unwrap();
+    let saved_display = save_codec::serialize(scenario.sim().display_layers()).unwrap();
     let live_hash = scenario.sim().state_hash();
     let rules_hash = scenario.runtime.resources.rules.simulation_config_hash();
     let bytes = GameSnapshot::save_validated(
@@ -249,13 +253,13 @@ fn assert_live_projectile_restore_continuation(
         // retained field, including binary64 motion, visual bytes and target,
         // must remain identical after the complete production restore.
         assert_eq!(
-            retained.arm_timer,
-            crate::sim::timer::CdTimer::started(restored.session.binary_frame as i32, 0)
+            *retained.arm_timer(),
+            crate::sim::timer::CdTimer::started(restored.session.binary_frame() as i32, 0)
         );
-        retained.arm_timer = saved_shell.arm_timer;
+        retained.set_arm_timer_for_test(*saved_shell.arm_timer());
         assert_eq!(retained, saved_shell);
         assert_eq!(
-            bincode::serialize(restored.display_layers()).unwrap(),
+            save_codec::serialize(restored.display_layers()).unwrap(),
             saved_display,
             "all five retained Display vectors preserve membership and order"
         );
@@ -275,16 +279,26 @@ fn assert_live_projectile_restore_continuation(
     for frame in 1..=300 {
         let first_output = scenario
             .runtime
-            .advance_frame(&[], SIM_TICK_MS, TickLane::Ordinary)
+            .advance_frame(
+                &[],
+                SIM_TICK_MS,
+                TickLane::Ordinary,
+                &mut crate::sim::world::FrameEffects::default(),
+            )
             .expect("first restored Bullet continuation frame");
         assert!(first_output.tick.frame_committed);
         if let Some(shell) = scenario.sim().projectiles.get(projectile_id) {
-            moved |= shell.position != saved_shell.position;
+            moved |= shell.position() != saved_shell.position();
         }
         std::mem::swap(&mut scenario.runtime.simulation, &mut second);
         let second_output = scenario
             .runtime
-            .advance_frame(&[], SIM_TICK_MS, TickLane::Ordinary)
+            .advance_frame(
+                &[],
+                SIM_TICK_MS,
+                TickLane::Ordinary,
+                &mut crate::sim::world::FrameEffects::default(),
+            )
             .expect("second restored Bullet continuation frame");
         assert!(second_output.tick.frame_committed);
         assert_eq!(
@@ -324,7 +338,7 @@ fn assert_live_projectile_restore_continuation(
     let retired_at = retired_at.expect("restored Bullet must retire within 300 frames");
     println!(
         "saved Bullet {projectile_id} at {:?} resumed flight and retired after {retired_at} ordinary frames; both restored state-hash sequences matched, Display membership was removed, original live frame preserved",
-        saved_shell.position
+        saved_shell.position()
     );
 }
 
@@ -342,7 +356,7 @@ fn assert_debris_restore_continuation(
     let mut second = assert_collapsed_bridge_restores(scenario, template, target, attacker);
     let flying = first
         .anims()
-        .filter_map(|(&id, anim)| anim.bounce.is_some().then_some(id))
+        .filter_map(|(&id, anim)| anim.bounce().is_some().then_some(id))
         .collect::<Vec<_>>();
     assert!(!flying.is_empty(), "save must contain live Bouncer flight");
     assert_eq!(
@@ -364,7 +378,12 @@ fn assert_debris_restore_continuation(
             .collect::<Vec<_>>();
         scenario
             .runtime
-            .advance_frame(&[], SIM_TICK_MS, TickLane::Ordinary)
+            .advance_frame(
+                &[],
+                SIM_TICK_MS,
+                TickLane::Ordinary,
+                &mut crate::sim::world::FrameEffects::default(),
+            )
             .expect("first restored continuation frame");
         for (id, coord) in before {
             observed_motion |= scenario
@@ -375,7 +394,12 @@ fn assert_debris_restore_continuation(
         std::mem::swap(&mut scenario.runtime.simulation, &mut second);
         scenario
             .runtime
-            .advance_frame(&[], SIM_TICK_MS, TickLane::Ordinary)
+            .advance_frame(
+                &[],
+                SIM_TICK_MS,
+                TickLane::Ordinary,
+                &mut crate::sim::world::FrameEffects::default(),
+            )
             .expect("second restored continuation frame");
         assert_eq!(
             scenario.sim().state_hash(),
@@ -414,12 +438,7 @@ fn retail_ifv_forcefire_guidance_survives_restore_and_collapses_live_bridge() {
 fn retail_bridge_forcefire_chain(vehicle_name: &str, weapon_name: &str, projectile_name: &str) {
     let retail = std::env::var("RA2_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            crate::util::config::GameConfig::load()
-                .unwrap()
-                .paths
-                .ra2_dir
-        });
+        .unwrap_or_else(|_| crate::test_fixture::game_config().unwrap().paths.ra2_dir);
     let mut scenario = crate::headless_scenario::load(&retail, "Hills.mmx", 0x0B21_D6E5)
         .expect("production retail Hills load");
     // The headless loader omits the app's retained restore template. Capture
@@ -427,8 +446,8 @@ fn retail_bridge_forcefire_chain(vehicle_name: &str, weapon_name: &str, projecti
     let pristine_terrain = scenario.sim().resolved_terrain.as_ref().unwrap().clone();
     let owner = scenario
         .sim()
-        .session
-        .house_order
+        .houses
+        .order()
         .iter()
         .copied()
         .find(|id| {
@@ -436,7 +455,7 @@ fn retail_bridge_forcefire_chain(vehicle_name: &str, weapon_name: &str, projecti
                 .sim()
                 .houses
                 .get(id)
-                .is_some_and(|house| house.is_human)
+                .is_some_and(|house| house.is_human())
         })
         .expect("ordinary human launch house");
     let owner_name = scenario.sim().interner.resolve(owner).to_owned();
@@ -508,12 +527,13 @@ fn retail_bridge_forcefire_chain(vehicle_name: &str, weapon_name: &str, projecti
                 .get(attacker)
                 .unwrap()
                 .attack_target
+                .target()
                 .is_none()
         {
             issued = true;
             vec![CommandEnvelope::new(
                 owner,
-                scenario.sim().session.tick + 1,
+                scenario.sim().session.tick() + 1,
                 Command::ForceAttackCell {
                     attacker_id: attacker,
                     target_rx: target.0,
@@ -525,7 +545,12 @@ fn retail_bridge_forcefire_chain(vehicle_name: &str, weapon_name: &str, projecti
         };
         let output = scenario
             .runtime
-            .advance_frame(&commands, SIM_TICK_MS, TickLane::Ordinary)
+            .advance_frame(
+                &commands,
+                SIM_TICK_MS,
+                TickLane::Ordinary,
+                &mut crate::sim::world::FrameEffects::default(),
+            )
             .expect("ordinary production frame");
         assert!(
             output.tick.frame_committed,
@@ -539,7 +564,7 @@ fn retail_bridge_forcefire_chain(vehicle_name: &str, weapon_name: &str, projecti
                         .sim()
                         .projectiles
                         .get(*stable_id)
-                        .is_some_and(|bullet| bullet.source_id == attacker) =>
+                        .is_some_and(|bullet| bullet.source_id() == attacker) =>
                 {
                     assert!(trails.insert(*stable_id), "one trail per Bullet lifetime");
                 }
@@ -564,15 +589,15 @@ fn retail_bridge_forcefire_chain(vehicle_name: &str, weapon_name: &str, projecti
         }
         for (&id, &(launched_at, previous)) in &live {
             if let Some(shell) = scenario.sim().projectiles.get(id) {
-                flight_observed |= shell.position != previous;
+                flight_observed |= shell.position() != previous;
                 assert!(
                     frame - launched_at < 300,
                     "{projectile_name} remains in flight for 300 frames: id={id}, launch={:?}, aim={:?}, now={:?}, velocity={:?}, trajectory={:?}",
-                    shell.launch_origin,
-                    shell.launch_target,
-                    shell.position,
-                    shell.velocity,
-                    shell.trajectory
+                    shell.launch_origin(),
+                    shell.launch_target(),
+                    shell.position(),
+                    shell.velocity(),
+                    shell.trajectory()
                 );
             } else {
                 disappeared += 1;
@@ -583,31 +608,29 @@ fn retail_bridge_forcefire_chain(vehicle_name: &str, weapon_name: &str, projecti
             .sim()
             .projectiles
             .iter()
-            .filter(|(_, shell)| shell.source_id == attacker)
+            .filter(|(_, shell)| shell.source_id() == attacker)
         {
             first_launch.get_or_insert(frame);
             live.entry(*id).or_insert_with(|| {
                 assert_eq!(
-                    shell.target,
+                    shell.target(),
                     ProjectileTarget::Cell {
                         rx: target.0,
                         ry: target.1
                     }
                 );
-                assert_eq!(shell.launch_target, expected_aim);
-                (frame, shell.position)
+                assert_eq!(shell.launch_target(), expected_aim);
+                (frame, shell.position())
             });
         }
         if !live_flight_restore_checked {
             let moved_projectile = scenario.sim().projectiles.iter().find_map(|(&id, shell)| {
-                (shell.source_id == attacker
-                    && shell.position != shell.launch_origin
-                    && scenario
-                        .runtime
-                        .resources
-                        .rules
-                        .weapon(scenario.sim().interner.resolve(shell.payload.weapon))
-                        .and_then(|weapon| weapon.projectile.as_deref())
+                (shell.source_id() == attacker
+                    && shell.position() != shell.launch_origin()
+                    && shell
+                        .payload()
+                        .projectile_type()
+                        .map(|kind| scenario.sim().interner.resolve(kind))
                         == Some(projectile_name))
                 .then_some(id)
             });
@@ -629,16 +652,22 @@ fn retail_bridge_forcefire_chain(vehicle_name: &str, weapon_name: &str, projecti
             .unwrap();
         let state = (
             cell.bridge_facts.raw_flags,
-            cell.bridge_facts.state_byte,
+            scenario
+                .sim()
+                .overlay_grid
+                .as_ref()
+                .unwrap()
+                .cell(target.0, target.1)
+                .overlay_data,
             cell.final_tile_index,
         );
-        if let Some(previous) = last_state {
-            if previous != state {
-                bridge_change_observed = true;
-                println!(
-                    "frame {frame}, shots {shots}, ended bullets {disappeared}: bridge {previous:?} -> {state:?}"
-                );
-            }
+        if let Some(previous) = last_state
+            && previous != state
+        {
+            bridge_change_observed = true;
+            println!(
+                "frame {frame}, shots {shots}, ended bullets {disappeared}: bridge {previous:?} -> {state:?}"
+            );
         }
         last_state = Some(state);
         if !cell.bridge_facts.has_structural_bridge() {
@@ -673,6 +702,7 @@ fn retail_bridge_forcefire_chain(vehicle_name: &str, weapon_name: &str, projecti
                     .get(attacker)
                     .unwrap()
                     .attack_target
+                    .target()
                     .is_none(),
                 "successful bridge destruction must detach the force-fire Cell target"
             );

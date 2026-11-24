@@ -1,6 +1,6 @@
 # Retail fixture contracts
 
-[Validation evidence](retail_fixture_contracts.validation.json) records the
+Validation evidence (`tools/retail_fixture_contracts.validation.json`, in git at 1b1a8b43e) records the
 strict test runs, native replay, release build and exact production comparison.
 
 Library tests check the narrow tracked INI fixtures against the user's retail
@@ -14,8 +14,8 @@ Run from the checkout root with the normal build owner:
 export RA2_DIR='/path/to/Red Alert 2'
 export VERA20K_REQUIRE_RETAIL_INI=1
 export VERA20K_REQUIRE_RETAIL_ASSETS=1
-python -m tools.cargo_run -- test -p vera20k --lib
-python -m tools.cargo_run -- clippy -p vera20k --lib
+python -m tools.cargo_run -- test --workspace --lib
+python -m tools.cargo_run -- clippy --workspace --lib
 ```
 
 `VERA20K_REQUIRE_RETAIL_INI` continues to require the extracted files in `ini/`.
@@ -54,5 +54,5 @@ the connection from loaded theater data to the random-map tile IDs.
 
 These checks do not replace the [full decoder corpus](retail_corpus.md),
 [headless and production captures](map_observation.md), or native gameplay
-comparisons. Other integration diagnostics and ignored tests still require
-individual evaluation; this does not close issue #752 as a whole.
+comparisons. The ignored retail-backed tests have their own routine run,
+[`python -m tools.retail_tests run`](README.md#retail-backed-ignored-tests).

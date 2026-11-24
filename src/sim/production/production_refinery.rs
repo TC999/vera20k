@@ -4,13 +4,14 @@
 
 use crate::map::entities::EntityCategory;
 use crate::rules::ruleset::RuleSet;
-use crate::sim::find_nearby_cell::{
-    NearbyAnchorGate, NearbyFootprint, NearbyQuery, NearbySearchOptions, PassabilityArgs,
-    RADIUS_HARD_CAP, find_nearby_passable_cell_with_options,
-};
+use crate::sim::find_nearby_cell::NearbySearchOptions;
+use crate::sim::houses::Houses;
+use crate::sim::intern::InternedId;
+use crate::sim::mission::authority::LiveReadyInputProvider;
+use crate::sim::mission::{MissionId, MissionType};
+use crate::sim::scenario_session::ScenarioSession;
+use crate::sim::world::FrameEffects;
 use crate::sim::world::{PlacementEvidence, Simulation};
-
-use super::production_tech::foundation_dimensions;
 
 /// Native primary FreeUnit facing byte. Under the project facing convention,
 /// 0xC0 is west.
@@ -33,78 +34,79 @@ const FREE_UNIT_FALLBACK_ATTEMPTS: [NearbySearchOptions; 2] = [
     },
 ];
 
-/// Spawn configured refinery FreeUnits for buildings whose build-up completed
-/// this tick. The input order is the deterministic completion order.
-pub(crate) fn spawn_completed_refinery_free_units(
+/// Original Grand_Opening446AA9's FreeUnit tail. It runs inline for one
+/// building, so its constructor and Unlimbo are visible to subsequent Logic
+/// visits. ScenarioInit/capture gates belong to the caller.
+///
+/// Grand_Opening446AE3..446B10 (gamemd) suppresses a human-controlled
+/// House's FreeUnit when its retained nonzero start quote is no greater than
+/// BuildingType::GetCost45ED50. Zero is the nonproduction constructor sentinel.
+/// The original spatial FreeUnit corpus bounds placement below.
+pub(crate) fn spawn_building_free_unit(
     sim: &mut Simulation,
-    completed_building_ids: &[u64],
+    stable_id: u64,
     rules: &RuleSet,
-    overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
+    overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    effects: &mut FrameEffects<'_>,
 ) -> bool {
-    let mut any_spawned = false;
-
-    for &stable_id in completed_building_ids {
-        let Some((owner_id, type_ref, rx, ry, width, height)) = ({
-            let entity = sim.substrate.entities.get(stable_id);
-            entity.and_then(|entity| {
-                if entity.category != EntityCategory::Structure || entity.dying {
-                    return None;
-                }
-                let (width, height) = foundation_dimensions(&entity.foundation);
-                Some((
-                    entity.owner(),
-                    entity.type_ref(),
-                    entity.position.rx,
-                    entity.position.ry,
-                    width,
-                    height,
-                ))
-            })
-        }) else {
-            continue;
-        };
-
-        // These allocations occur only for completed buildings, not every tick.
-        // They end immutable interner borrows before spawn_object mutates sim.
-        let owner = sim.interner.resolve(owner_id).to_owned();
-        let building_type_id = sim.interner.resolve(type_ref).to_owned();
-        any_spawned |= try_spawn_refinery_free_unit(
-            sim,
-            rules,
-            stable_id,
-            &owner,
-            &building_type_id,
-            rx,
-            ry,
-            width,
-            height,
-            overlay_registry,
-        );
-    }
-
-    any_spawned
+    let Some((owner_id, type_ref, rx, ry, width, height)) =
+        sim.substrate.entities.get(stable_id).and_then(|entity| {
+            if entity.category() != EntityCategory::Structure || entity.death.is_dying() {
+                return None;
+            }
+            let object = sim.object_type(entity.type_ref(), rules)?;
+            let human = sim
+                .houses
+                .get(&entity.owner())
+                .is_some_and(|house| house.is_controlled_by_human(sim.session.rule_policy()));
+            if human
+                && entity.production_start_price() != 0
+                && entity.production_start_price() <= rules.type_cost(object)
+            {
+                return None;
+            }
+            let (width, height) = entity.seldom.type_facts.foundation().dimensions();
+            Some((
+                entity.owner(),
+                entity.type_ref(),
+                entity.position.rx(),
+                entity.position.ry(),
+                width,
+                height,
+            ))
+        })
+    else {
+        return false;
+    };
+    try_spawn_building_free_unit(
+        sim,
+        rules,
+        owner_id,
+        type_ref,
+        rx,
+        ry,
+        width,
+        height,
+        overlay_registry,
+        effects,
+    )
 }
 
-fn try_spawn_refinery_free_unit(
+fn try_spawn_building_free_unit(
     sim: &mut Simulation,
     rules: &RuleSet,
-    building_id: u64,
-    owner: &str,
-    building_type_id: &str,
+    owner: InternedId,
+    building_type: InternedId,
     building_rx: u16,
     building_ry: u16,
     width: u16,
     height: u16,
-    overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
+    overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    effects: &mut FrameEffects<'_>,
 ) -> bool {
-    if !rules.is_refinery_type(building_type_id) {
-        return false;
-    }
-
-    let Some(free_unit_type) = rules.refinery_free_unit(building_type_id) else {
+    let Some(free_unit_type) = rules.building_free_unit(sim.interner.resolve(building_type)) else {
         return false;
     };
-    let free_unit_type = free_unit_type.to_owned();
 
     let primary = primary_free_unit_cell(building_rx, building_ry, width, height);
     // Both nearby searches are seeded from the building's NORTH-WEST footprint cell —
@@ -113,27 +115,28 @@ fn try_spawn_refinery_free_unit(
     let search_seed = (building_rx, building_ry);
 
     // Native constructs one UnitClass, then retries Unlimbo on that same object.
-    // Keep that one stable ID in limbo until a placement commits. The limbo cell is
-    // the primary target; it is overwritten by whichever attempt commits, and the
+    // Keep that one stable ID at its constructor's zero Location until a
+    // placement commits. Each attempt supplies its own coordinate, and the
     // object is not on the map until one does.
     let (initial_rx, initial_ry) = primary.unwrap_or(search_seed);
     let initial_z = sim.terrain_cell_level(initial_rx, initial_ry).unwrap_or(0);
-    let Some(free_unit_id) = sim.spawn_object_limbo_at_height(
-        &free_unit_type,
+    let Some(free_unit_id) = sim.construct_object_limbo_at_height(
+        free_unit_type,
         owner,
         initial_rx,
         initial_ry,
         FREE_UNIT_FACING_PRIMARY,
         initial_z,
         rules,
+        effects,
     ) else {
-        let refund = refund_free_unit(sim, rules, owner, &free_unit_type);
+        let refund = refund_free_unit(&sim.session, &mut sim.houses, rules, owner, free_unit_type);
         log::warn!(
             "Completed refinery {} could not construct free unit {}; refunded {} to {}",
-            building_type_id,
+            sim.interner.resolve(building_type),
             free_unit_type,
             refund,
-            owner,
+            sim.interner.resolve(owner),
         );
         return false;
     };
@@ -146,17 +149,17 @@ fn try_spawn_refinery_free_unit(
             primary_ry,
             FREE_UNIT_FACING_PRIMARY,
             rules,
-            building_id,
             overlay_registry,
+            effects,
         )
     {
         log::info!(
             "Completed refinery {} spawned free {} at ({},{}) for {}",
-            building_type_id,
+            sim.interner.resolve(building_type),
             free_unit_type,
             primary_rx,
             primary_ry,
-            owner
+            sim.interner.resolve(owner)
         );
         return true;
     }
@@ -167,7 +170,7 @@ fn try_spawn_refinery_free_unit(
     // than being precomputed, so it sees the occupancy the placement will meet.
     for options in FREE_UNIT_FALLBACK_ATTEMPTS {
         let Some((fallback_rx, fallback_ry)) =
-            find_free_unit_nearby_cell(sim, rules, &free_unit_type, search_seed, options)
+            find_free_unit_nearby_cell(sim, rules, free_unit_type, search_seed, options)
         else {
             continue;
         };
@@ -178,30 +181,33 @@ fn try_spawn_refinery_free_unit(
             fallback_ry,
             FREE_UNIT_FACING_FALLBACK,
             rules,
-            building_id,
             overlay_registry,
+            effects,
         ) {
             log::info!(
                 "Completed refinery {} spawned free {} at fallback ({},{}) for {}",
-                building_type_id,
+                sim.interner.resolve(building_type),
                 free_unit_type,
                 fallback_rx,
                 fallback_ry,
-                owner
+                sim.interner.resolve(owner)
             );
             return true;
         }
     }
 
     // gamemd refunds before uninitializing the constructed UnitClass.
-    let refund = refund_free_unit(sim, rules, owner, &free_unit_type);
-    sim.uninit_with_rules(free_unit_id, rules);
+    let refund = refund_free_unit(&sim.session, &mut sim.houses, rules, owner, free_unit_type);
+    sim.uninit_with_context(
+        free_unit_id,
+        crate::sim::world::UninitContext::new(rules).with_effects(effects),
+    );
     log::warn!(
         "Completed refinery {} could not place free unit {}; refunded {} to {}",
-        building_type_id,
+        sim.interner.resolve(building_type),
         free_unit_type,
         refund,
-        owner,
+        sim.interner.resolve(owner),
     );
     false
 }
@@ -213,8 +219,8 @@ fn try_place_free_unit(
     ry: u16,
     facing: u8,
     rules: &RuleSet,
-    producer_id: u64,
-    overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
+    overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    effects: &mut FrameEffects<'_>,
 ) -> bool {
     // BuildingClass::OnConstructionComplete @ 0x00445F80 invokes the newly
     // constructed UnitClass through virtual Unlimbo for every primary/fallback
@@ -225,44 +231,75 @@ fn try_place_free_unit(
     // occupied by their own live building object and therefore enter the native
     // nearby-search sequence; independent occupants are evaluated in that same
     // ordered cell list rather than through the old coarse ground-blocker model.
-    sim.reveal_constructed_object_at_height_with_unit_context(
+    if sim
+        .reveal_constructed_object_at_height_with_overlay_context(
+            free_unit_id,
+            rx,
+            ry,
+            facing,
+            sim.terrain_cell_level(rx, ry).unwrap_or(0),
+            PlacementEvidence::EvaluateMark,
+            rules,
+            overlay_registry,
+            effects,
+        )
+        .is_none()
+    {
+        return false;
+    }
+    // GrandOpening446EA1..446EB1 assigns Harvest even for a non-harvester
+    // FreeUnit. Queue(false), then Commence, after the successful Unlimbo.
+    // Ares 3.0 BuildingClass_Place_FreeUnit_Mission 10014390 (hook
+    // 0x00446E9F) queues Area_Guard for a type without `Harvester=`.
+    let mission = if rules.ares_form() {
+        if sim
+            .substrate
+            .entities
+            .get(free_unit_id)
+            .and_then(|unit| sim.object_type(unit.type_ref(), rules))
+            .is_some_and(|object| object.harvester)
+        {
+            MissionType::Harvest
+        } else {
+            MissionType::AreaGuard
+        }
+    } else {
+        MissionType::Harvest
+    };
+    let now = sim.session.binary_frame();
+    let _ = sim.mission_queue_exact(
         free_unit_id,
-        rx,
-        ry,
-        facing,
-        sim.terrain_cell_level(rx, ry).unwrap_or(0),
-        PlacementEvidence::EvaluateMark,
-        rules,
-        overlay_registry,
-        producer_id,
-    )
-    .is_some()
+        MissionId::from_known(mission),
+        0,
+        now,
+        &LiveReadyInputProvider { rules },
+    );
+    let _ = sim.substrate.mission_commence_exact(free_unit_id, now);
+    true
 }
 
 /// A free unit that cannot be made or placed pays its house its GetRefund with
 /// `full` set ([`super::type_refund`]; `0x00446E71..0x00446E8F`,
 /// `0x00446EB9..0x00446EDD`) through `HouseClass::Add_Credits @ 0x004F9950`.
 /// Returns the amount credited.
-fn refund_free_unit(sim: &mut Simulation, rules: &RuleSet, owner: &str, unit_type: &str) -> i32 {
-    let Some(owner_id) = sim.interner.get(owner) else {
-        return 0;
-    };
+fn refund_free_unit(
+    session: &ScenarioSession,
+    houses: &mut Houses,
+    rules: &RuleSet,
+    owner_id: InternedId,
+    unit_type: &str,
+) -> i32 {
     let refund = match (
         rules.object(unit_type),
-        sim.houses.get(&owner_id),
-        sim.house_cost_factors(owner_id),
+        houses.get(&owner_id),
+        Simulation::house_cost_factors(houses, owner_id),
     ) {
-        (Some(object), Some(house), Some(factors)) => super::type_refund(
-            rules,
-            object,
-            house,
-            &factors,
-            sim.session.game_mode_nonzero,
-            true,
-        ),
+        (Some(object), Some(house), Some(factors)) => {
+            super::type_refund(rules, object, house, &factors, session.rule_policy(), true)
+        }
         _ => return 0,
     };
-    crate::sim::credit_income::add_credits(sim, owner_id, refund);
+    crate::sim::credit_income::add_credits(houses, owner_id, refund);
     refund
 }
 
@@ -281,14 +318,14 @@ fn primary_free_unit_cell(
     ))
 }
 
-/// One of the two ordered nearby-cell searches for a refused FreeUnit placement,
-/// routed through the shared search port.
+/// One of the two ordered nearby-cell searches for a refused FreeUnit placement
+/// (`0x00446BF4..0x00446CCD`, `0x00446D42..0x00446E10`): seeded at the building's
+/// Location cell (`+0x9C`, its north-west footprint cell) for the free unit's
+/// MovementZone, with the overlay rejection `options` carries.
 ///
-/// Mirrors the engine's two calls: 1x1 candidates seeded from the building's NW
-/// footprint cell, the free unit's own movement zone, bridge cells refused, the
-/// terrain-level gate on, no target cell — so selection is the frame-counter modulo
-/// over the candidate pool, consuming no RNG. `options` carries the one argument the
-/// two calls differ in.
+/// The seed is under the building, but Cell Recalc's zone class ignores
+/// buildings, except a FirestormWall one (`0x00483D8E`; none in retail), so
+/// the seed answers the zone of the ground around it.
 fn find_free_unit_nearby_cell(
     sim: &Simulation,
     rules: &RuleSet,
@@ -297,82 +334,12 @@ fn find_free_unit_nearby_cell(
     options: NearbySearchOptions,
 ) -> Option<(u16, u16)> {
     let free_unit = rules.object(free_unit_type)?;
-    let query = NearbyQuery {
-        native_cells: None,
-        raw_occupation: None,
-        passability: PassabilityArgs {
-            // SUBSTITUTION, not a match. The engine hardcodes one fixed speed-type
-            // index (2) at both callsites; VERA passes the free unit's own
-            // `SpeedType=` instead. The index-to-`SpeedType=`-string mapping is
-            // UNCHECKED, and the tree's own evidence points the other way: index 2 is
-            // Wheel under `rules::locomotor_type::SpeedType`'s ordering, while
-            // `[CMIN]` and `[HARV]` declare no `SpeedType=` and therefore default to
-            // Track. The substitution is invisible to THIS search under the stock
-            // terrain tables — Track and Wheel are zero together and non-zero together
-            // in all twelve stock land-type sections, and the search reads only the
-            // resulting accept/reject verdict, never the cost percentage — but it is
-            // not a verified equivalence for a modded table or another caller.
-            speed_type: free_unit.speed_type,
-            // The engine requires each candidate to share the seed cell's movement
-            // zone. The seed is always a building-footprint cell, to which the Rust
-            // zone map assigns no zone, so requiring it here would reject every
-            // candidate. Left unrequired — a stated residual, not a substitute rule.
-            required_zone_id: None,
-            movement_zone: free_unit.movement_zone,
-            bridge_aware_zone: false,
-        },
-        footprint: NearbyFootprint::SINGLE,
-        anchor_gate: NearbyAnchorGate::UnverifiedCompatibilityBypass,
-        // Both callsites reject bridge cells.
-        allow_bridge_cells: false,
-        // Both callsites enable the terrain-level gate.
-        check_height: true,
-        // DROPPED native constraint, recorded. The per-candidate occupancy rejection
-        // itself is not lost — it lives inside the passability check, which reads the
-        // same occupancy grid. What is lost is the rest of that column: the isometric
-        // playfield-diamond bound (the terrain rectangle still rejects off-grid
-        // cells), the terrain-object block, the slope byte and the ground-building
-        // test. Whether the engine sets its separate rect-occupancy argument at these
-        // two callsites was not re-derived — UNCHECKED. It stays off because the
-        // ported check rejects ANY overlay cell unconditionally, which would cancel
-        // the second attempt's overlay-allowed contract above and leave the two calls
-        // indistinguishable.
-        check_occupancy: false,
-        // The engine's cap is `min(map-rect width + height, RADIUS_HARD_CAP)`, which
-        // is the hard cap itself on any playable map.
-        radius_cap: RADIUS_HARD_CAP,
-        target_cell: None,
-        path_grid: sim.path_grid(),
-        resolved_terrain: sim.resolved_terrain.as_ref(),
-        overlay_grid: sim.overlay_grid.as_ref(),
-        occupancy: Some(&sim.substrate.occupancy),
-        entities: Some(&sim.substrate.entities),
-        zone_grid: sim.zone_grid.as_ref(),
-        playfield_bounds: sim.playfield_bounds,
-    };
-    find_nearby_passable_cell_with_options(
-        (i32::from(seed.0), i32::from(seed.1)),
-        &query,
-        options,
-        // The frame counter is committed late, so during this advance it still holds
-        // the current frame — the value the selection modulo must alias.
-        sim.session.binary_frame,
-    )
+    sim.nearby_wheel_cell(seed, free_unit.movement_zone, options)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_production))]
 mod tests {
-    use super::{FREE_UNIT_FALLBACK_ATTEMPTS, primary_free_unit_cell};
-
-    #[test]
-    fn stock_4x3_primary_cell_is_center_plus_south() {
-        assert_eq!(primary_free_unit_cell(20, 20, 4, 3), Some((22, 22)));
-    }
-
-    #[test]
-    fn primary_cell_rejects_u16_overflow() {
-        assert_eq!(primary_free_unit_cell(u16::MAX, u16::MAX, 4, 3), None);
-    }
+    use super::FREE_UNIT_FALLBACK_ATTEMPTS;
 
     #[test]
     fn fallback_attempts_reject_overlays_first_then_allow_them() {

@@ -27,9 +27,12 @@
 //! - `FUN_0056A080` — bridge code with zero xrefs. Whether that is genuine
 //!   dead code or a lost indirect reference is unresolved; either way nothing
 //!   reaches it at runtime, so there is nothing to be faithful to.
-//! - `MapClass::IncrementBridgeCounter` 0x00578AC0 — single caller
-//!   `FUN_004F42F0`, itself untraced, so no trigger is established. No
-//!   counterpart here.
+//! - `MapClass::IncrementBridgeCounter` 0x00578AC0 — **drawing cache epoch,
+//!   not bridge simulation.**4F42F0(1), reached by Execute1186E2C20, increments
+//!   Map+1158; overlay drawing47F77B/47F843 compares/stamps Cell+118 against
+//!   it to suppress cached blits. Current rendering rebuilds/uploads each
+//!   frame and needs no simulation counterpart. Original Steam byte/caller
+//!   evidence: ALL01 action118-redraw-original packet.
 //! - `ShipLocomotionClass::Compute_BridgeZOffset` 0x0069EBB0 — no CALL xrefs.
 //!   Its Drive-side analogue `DriveLocomotionClass::ComputeBridgeZOffset`
 //!   0x004AF4A0 is a one-shot constant initializer and is bound in
@@ -38,18 +41,17 @@
 pub(crate) mod damage_dispatch;
 pub(crate) mod gap_restamp;
 pub(crate) mod occupants;
-pub(crate) mod ordinary;
+pub mod ordinary;
 pub(crate) mod ordinary_damage;
 pub(crate) mod ordinary_repair;
 pub(crate) mod publication;
-pub(crate) mod ramp_repair;
+pub mod ramp_repair;
 mod record_scan;
+pub(crate) mod repair_query;
 pub(crate) mod rim;
 mod zone_activation;
 
-use crate::map::bridge_facts::{
-    BRIDGE_FLAG_DESTROYED_OR_RAMP, BRIDGE_FLAG_STRUCTURAL, BridgeCellFacts,
-};
+use crate::map::bridge_facts::{BRIDGE_FLAG_DESTROYED_OR_RAMP, BRIDGE_FLAG_STRUCTURAL};
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
 
 /// High-bridge theater slots used by the map-load bridge-record walk.
@@ -63,10 +65,11 @@ pub use crate::map::bridge_facts::Axis;
 
 /// Stateless decode of the CellClass+0x11E bridge state byte.
 ///
-/// Body cells transition Healthy → Damaged → Destroyed under repeated
+/// Body cells transition Healthy → Damaged → destroyed under repeated
 /// damage (per axis). Partial-collapse states are reached only via
-/// bridgehead final-step cascade. `Destroyed` is not a byte value: see
-/// [`cell_render_state`].
+/// bridgehead final-step cascade. The byte writers are the ramp transitions
+/// ([`crate::sim::bridge_specs::apply_ramp_transition`]); a destroyed cell is
+/// not a byte value: see [`cell_render_state`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DamageState {
     /// Healthy body — `variant` carries the 6-frame jitter (0..=5 per axis,
@@ -81,41 +84,9 @@ pub enum DamageState {
     /// Partial collapse: ramp A already collapsed; this cell will fire
     /// CollapseB. State byte 8 (NS) / 16 (EW).
     PartialCollapseB,
-    /// Fully destroyed.
-    Destroyed,
 }
 
 impl DamageState {
-    /// Encode to binary state byte (`CellClass+0x11E`).
-    ///
-    /// Per HIGH §3.1 / `apply_ramp_transition` docstring:
-    /// - NS axis: Healthy{variant: 0..=5} → 0..=5; Damaged → 6;
-    ///   PartialCollapseA → 7; PartialCollapseB → 8; Destroyed → 0.
-    /// - EW axis: Healthy{variant: 0..=5} → 9..=14; Damaged → 0xF;
-    ///   PartialCollapseA → 0x11; PartialCollapseB → 0x10; Destroyed → 0.
-    pub fn to_state_byte(self, axis: Axis) -> u8 {
-        let base: u8 = match axis {
-            Axis::NS => 0,
-            Axis::EW => 9,
-        };
-        match self {
-            DamageState::Healthy { variant } => base + variant.min(5),
-            DamageState::Damaged => match axis {
-                Axis::NS => 6,
-                Axis::EW => 0xF,
-            },
-            DamageState::PartialCollapseA => match axis {
-                Axis::NS => 7,
-                Axis::EW => 0x11,
-            },
-            DamageState::PartialCollapseB => match axis {
-                Axis::NS => 8,
-                Axis::EW => 0x10,
-            },
-            DamageState::Destroyed => 0,
-        }
-    }
-
     /// Decode from binary state byte. Returns `None` for bytes outside the
     /// defined ranges (NS: 0..=8; EW: 9..=0x11). Byte 0 always decodes to
     /// `Healthy{variant: 0}`; [`cell_render_state`] adds the flag context.
@@ -135,7 +106,8 @@ impl DamageState {
 }
 
 /// Visible bridge state of one CellClass cell, decoded from its live +44
-/// overlay identity, +11E state byte and +140 flags. `None` means the cell
+/// overlay identity and +11E state byte (`overlay`) and its +140 flags
+/// (`raw_flags`). `None` means the cell
 /// draws no bridge sprite: no overlay, a terminal ordinary overlay, an
 /// undecodable state byte, or a destroyed structural cell.
 ///
@@ -148,9 +120,12 @@ impl DamageState {
 /// Healthy NS. This is not a structural-presence query: native
 /// constructor5FC380 leaves nonanchor structural cells at overlay -1
 /// (constructor corpus cases8..11), and the anchor supplies their sprite.
-pub fn cell_render_state(facts: BridgeCellFacts) -> Option<(DamageState, Axis)> {
-    let state = facts.state_byte;
-    let overlay = facts.overlay_id?;
+pub fn cell_render_state(
+    overlay: &crate::sim::overlay_grid::OverlayCell,
+    raw_flags: u32,
+) -> Option<(DamageState, Axis)> {
+    let state = overlay.overlay_data;
+    let overlay = overlay.overlay_id?;
     // Ordinary overlays carry their axis in the identity (the ordinary
     // selector's classification); every other overlay reads the byte range.
     let axis = [ramp_repair::Family::Low, ramp_repair::Family::High]
@@ -178,7 +153,7 @@ pub fn cell_render_state(facts: BridgeCellFacts) -> Option<(DamageState, Axis)> 
         0xE7 | 0xE8 | 0xFF => return None,
         _ => {
             if state == 0
-                && facts.raw_flags & (BRIDGE_FLAG_STRUCTURAL | BRIDGE_FLAG_DESTROYED_OR_RAMP)
+                && raw_flags & (BRIDGE_FLAG_STRUCTURAL | BRIDGE_FLAG_DESTROYED_OR_RAMP)
                     == BRIDGE_FLAG_DESTROYED_OR_RAMP
             {
                 return None;
@@ -259,16 +234,13 @@ impl DispatchPath {
 /// high bridges write `0`, accepted Tube endpoints write `1`. The historical
 /// `Low` Rust name is retained for compatibility. `MapClass__FindBridgeRecord`
 /// skips non-zero kinds, so callers must choose high-only vs all-record use.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, Default,
+)]
 pub enum BridgeRecordKind {
+    #[default]
     High,
     Low,
-}
-
-impl Default for BridgeRecordKind {
-    fn default() -> Self {
-        Self::High
-    }
 }
 
 /// A bridge's map-load endpoint pair for zone connectivity.
@@ -315,7 +287,7 @@ pub struct BridgeRuntimeState {
 
 impl BridgeRuntimeState {
     /// Production entry with the raw Map Size authority, not backing dimensions.
-    pub(crate) fn from_resolved_terrain_with_map_size(
+    pub fn from_resolved_terrain_with_map_size(
         terrain: &ResolvedTerrainGrid,
         destroyable: bool,
         bridge_strength: i32,
@@ -324,7 +296,7 @@ impl BridgeRuntimeState {
         Self::build_from_terrain(terrain, destroyable, bridge_strength, Some(size))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn from_resolved_terrain(
         terrain: &ResolvedTerrainGrid,
         destroyable: bool,
@@ -359,7 +331,7 @@ impl BridgeRuntimeState {
         self.bridge_destroyable_flag
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn test_set_endpoint_records(&mut self, records: Vec<BridgeEndpointRecord>) {
         self.endpoint_records = records;
     }
@@ -375,5 +347,5 @@ impl BridgeRuntimeState {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 mod tests;

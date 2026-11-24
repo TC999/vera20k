@@ -16,10 +16,11 @@
 //! foreign water fails softly and the whole attempt rolls back.
 
 use crate::map::rmg::rng::RANGE_K_BITS;
-use crate::map::rmg::scratch::RmgScratch;
 use crate::map::rmg::x87::{self, TruncF64};
+use crate::util::native_x87::X87Chop53;
 
-use super::blob::{BlobCtx, MinHeap, seed_draw};
+use super::adjacency::border_cells_of;
+use super::blob::{BlobCtx, CellHeap, by_key, seed_draw};
 use super::shore::{self, ShoreCtx};
 use super::water::WaterArgs;
 
@@ -59,7 +60,7 @@ const MAX_SEED_ATTEMPTS: i32 = 200;
 const BAND_RINGS: i32 = 2;
 const BAND_TAG: i32 = -2;
 
-/// The four cardinal directions, as `DIRECTION_OFFSETS` indices (N, E, S, W).
+/// The four cardinal directions, as `DIRECTION_DELTAS` indices (N, E, S, W).
 const CARDINALS: [usize; 4] = [0, 2, 4, 6];
 
 /// The seeder's cross-attempt accumulators.
@@ -76,7 +77,8 @@ pub struct WaterQuota {
     pub region_id: i32,
 }
 
-/// Seed water for the carved map types.
+/// Seed water for the carved map types
+/// (`RandomMapGenerator::SeedWaterInlandMountain @ 0x0059C580`).
 ///
 /// Only reached when the water amount is non-zero — the original does not enter
 /// this seeder at all otherwise, which is why a zero-water inland map is
@@ -107,13 +109,13 @@ pub fn seed_water_carved(ctx: &mut BlobCtx<'_>, args: &WaterArgs) -> WaterQuota 
 }
 
 /// Total water cells this map is allowed, from the map's generated dimensions
-/// and the water amount.
+/// and the water amount, as `GrowLake @ 0x0059C920` computes it on entry.
 fn water_target(args: &WaterArgs) -> i32 {
     if args.water_percent == 0 {
         return 0;
     }
     // Operand order is the original's: height, then width, then the amount.
-    x87::ftol(
+    X87Chop53::ftol_f64_low_masked(
         TruncF64::from_f64(f64::from(args.playable.h))
             .mul(TruncF64::from_f64(f64::from(args.playable.w)))
             .mul(TruncF64::from_f64(f64::from(args.water_percent)))
@@ -123,39 +125,12 @@ fn water_target(args: &WaterArgs) -> i32 {
     )
 }
 
-/// Cells of `region` that touch a cell of any other region.
-///
-/// The original scans every scratch slot and skips the ones whose stored
-/// coordinate is the invalid `(0, 0)`; walking the diamond covers the same set,
-/// because `(0, 0)` is never inside it.
-fn region_border(scratch: &RmgScratch, grid_cells: &[(i32, i32)], region: i32) -> Vec<(i32, i32)> {
-    let mut border = Vec::new();
-    for &(x, y) in grid_cells {
-        if scratch.get(x, y).region != region {
-            continue;
-        }
-        for dir in 0..8usize {
-            let (nx, ny) = crate::map::rmg::grid::RmgGrid::step(x, y, dir);
-            if scratch.in_diamond(nx, ny) && scratch.get(nx, ny).region != region {
-                border.push((x, y));
-                break;
-            }
-        }
-    }
-    border
-}
-
 /// Peel `rings` border rings off `region`, retagging them and flattening their
 /// tiles. Consumes no randomness and always succeeds.
-fn retag_border_band(
-    ctx: &mut BlobCtx<'_>,
-    cells: &[(i32, i32)],
-    region: i32,
-    rings: i32,
-    new_id: i32,
-) {
+/// `RandomMapGenerator::RetagBorderBand @ 0x005A0410`.
+fn retag_border_band(ctx: &mut BlobCtx<'_>, region: i32, rings: i32, new_id: i32) {
     for _ in 0..rings {
-        let border = region_border(ctx.scratch, cells, region);
+        let border = border_cells_of(ctx.scratch, region);
         for &(x, y) in &border {
             ctx.scratch.get_mut(x, y).region = new_id;
             let cell = ctx.grid.get_mut(x, y).expect("native cell");
@@ -166,7 +141,8 @@ fn retag_border_band(
     }
 }
 
-/// Grow `region` outward by `rings`, claiming clear unowned neighbours.
+/// Grow `region` outward by `rings`, claiming clear unowned neighbours
+/// (`RandomMapGenerator::DilateRegionRings @ 0x005A0160`).
 ///
 /// Returns false as soon as a neighbour belongs to a different region or is not
 /// clear — the caller treats that as the whole lake failing.
@@ -176,26 +152,29 @@ fn retag_border_band(
 /// re-collected the region's whole border every ring; the original chains, and
 /// the difference shows from the second ring on.
 pub(crate) fn dilate_region_rings(ctx: &mut BlobCtx<'_>, region: i32, rings: i32) -> bool {
-    super::meander::dilate_chained(ctx, region, rings, None, [0, 0, 0x200, 0x200])
+    let full = ctx.grid.whole_extent();
+    super::meander::dilate_chained(ctx, region, rings, None, [0, 0, full, full])
 }
 
-/// The growth key, as a single-precision value.
+/// The growth key (`GrowLake` 0x0059D01C..0x0059D053): `(draw*K)*10` plus
+/// `0.5*distance`, less `0.02*placed`, the weights single-precision constants,
+/// stored as the heap's f32 with `FSTP m32` under the chop control word.
 ///
 /// Distance is narrowed to `f32` before it is weighted — that narrowing is the
 /// square-root helper's own store, not a rounding choice made here.
 fn growth_key(distance: f32, draw: u32, placed: i32) -> f32 {
-    let scale = TruncF64::from_f64(f64::from_bits(RANGE_K_BITS));
+    let random_term = TruncF64::from_f64(f64::from(draw))
+        .mul(TruncF64::from_f64(f64::from_bits(RANGE_K_BITS)))
+        .mul(TruncF64::from_f64(f64::from(KEY_RANDOM)));
     let dist_term =
         TruncF64::from_f64(f64::from(distance)).mul(TruncF64::from_f64(f64::from(KEY_DIST)));
-    let random_term = TruncF64::from_f64(f64::from(KEY_RANDOM))
-        .mul(TruncF64::from_f64(f64::from(draw)))
-        .mul(scale);
     let decay_term =
         TruncF64::from_f64(f64::from(placed)).mul(TruncF64::from_f64(f64::from(KEY_DECAY)));
-    dist_term.add(random_term).sub(decay_term).to_f64() as f32
+    x87::store_f32(random_term.add(dist_term).sub(decay_term))
 }
 
-/// Derive the allow mask, then pick a seed cell.
+/// Derive the allow mask, then pick a seed cell (`GrowLake @ 0x0059C920`,
+/// hunted-seed arm).
 ///
 /// The mask is what keeps lakes off the immediate surroundings of water that
 /// already exists: the band peel tags a two-ring margin around foreign water,
@@ -211,7 +190,7 @@ fn prepare_and_seed(
         ctx.scratch.get_mut(x, y).lake_allow = false;
     }
 
-    retag_border_band(ctx, cells, 0, BAND_RINGS, BAND_TAG);
+    retag_border_band(ctx, 0, BAND_RINGS, BAND_TAG);
 
     for &(x, y) in cells {
         let region = ctx.scratch.get(x, y).region;
@@ -247,7 +226,8 @@ fn prepare_and_seed(
     None
 }
 
-/// Draw the target lake size.
+/// Draw the target lake size: `NextGaussian @ 0x005980C0` draws, inline in
+/// `GrowLake @ 0x0059C920`.
 fn size_draw(ctx: &mut BlobCtx<'_>, remaining: i32) -> i32 {
     let upper = if remaining > MIN_CELLS {
         remaining
@@ -275,21 +255,21 @@ fn size_draw(ctx: &mut BlobCtx<'_>, remaining: i32) -> i32 {
             }
         };
         if value <= upper_f {
-            return x87::ftol(value);
+            return X87Chop53::ftol_f64_low_masked(value);
         }
     }
 }
 
-/// Undo every cell this attempt claimed.
-fn rollback(ctx: &mut BlobCtx<'_>, cells: &[(i32, i32)], region: i32) {
-    for &(x, y) in cells {
+/// Undo every cell this attempt claimed: `GrowLake`'s failure tail
+/// (`0x0059C920`).
+fn rollback(ctx: &mut BlobCtx<'_>, region: i32) {
+    for ((x, y), cell) in ctx.grid.cells_in_native_order_mut() {
         if ctx.scratch.get(x, y).region != region {
             continue;
         }
         let scratch = ctx.scratch.get_mut(x, y);
         scratch.region = 0;
         scratch.water_region = false;
-        let cell = ctx.grid.get_mut(x, y).expect("native cell");
         cell.tile = 0;
         cell.sub_tile = 0;
         // The base level, which defaults to 4 — not 0.
@@ -297,7 +277,8 @@ fn rollback(ctx: &mut BlobCtx<'_>, cells: &[(i32, i32)], region: i32) {
     }
 }
 
-/// Grow one lake. Returns whether it was committed.
+/// Grow one lake (`RandomMapGenerator::GrowLake @ 0x0059C920`). Returns
+/// whether it was committed.
 pub(crate) fn grow_lake(
     ctx: &mut BlobCtx<'_>,
     args: &WaterArgs,
@@ -332,13 +313,13 @@ pub(crate) fn grow_lake(
     let size = size_draw(ctx, remaining);
 
     let cap = (remaining * 2 + 2).max(MIN_HEAP_CAP) as usize;
-    let mut heap = MinHeap::new(cap);
+    let mut heap = CellHeap::new(cap);
     ctx.scratch.get_mut(seed.0, seed.1).stamp = region;
-    heap.push(0.0, seed);
+    heap.push((0.0, seed), by_key);
 
     let mut alive = true;
     let mut placed = 0i32;
-    let mut current = heap.pop();
+    let mut current = heap.pop(by_key);
 
     // Growth: pop the cheapest frontier cell, carve it, offer its four cardinal
     // neighbours to the heap.
@@ -366,7 +347,7 @@ pub(crate) fn grow_lake(
                     let distance = x87::approx_sqrt_f32(dx * dx + dy * dy);
                     let draw = ctx.rng.next_u32();
                     ctx.scratch.get_mut(nx, ny).stamp = region;
-                    heap.push(growth_key(distance, draw, placed), (nx, ny));
+                    heap.push((growth_key(distance, draw, placed), (nx, ny)), by_key);
                     continue;
                 }
             }
@@ -378,13 +359,15 @@ pub(crate) fn grow_lake(
         }
 
         placed += 1;
-        current = heap.pop();
+        current = heap.pop(by_key);
     }
 
     // Drain: whatever is still queued must remain carvable, or the attempt dies.
     // These cells still count toward `placed`, so a committed lake is larger
-    // than the drawn size by the length of its final frontier.
-    if let Some(mut entry) = current.or_else(|| heap.pop()) {
+    // than the drawn size by the length of its final frontier. The node the
+    // growth loop last popped is dropped: the drain pops afresh
+    // (`GrowLake` 0x0059D11B, `if nCount != 0`).
+    if let Some(mut entry) = heap.pop(by_key) {
         loop {
             if !alive {
                 break;
@@ -393,7 +376,7 @@ pub(crate) fn grow_lake(
             let scratch = *ctx.scratch.get(x, y);
             let clear = ctx.ids.is_clear(ctx.grid.cell_native(x, y).tile);
             if scratch.region == 0 && clear && scratch.lake_allow {
-                let cell = ctx.grid.get_mut(x, y).expect("native cell");
+                let cell = ctx.grid.cell_native_mut(x, y);
                 cell.tile = ctx.ids.water_base;
                 cell.sub_tile = 0;
                 ctx.scratch.get_mut(x, y).region = region;
@@ -401,7 +384,7 @@ pub(crate) fn grow_lake(
                 alive = false;
             }
             placed += 1;
-            match heap.pop() {
+            match heap.pop(by_key) {
                 Some(next) => entry = next,
                 None => break,
             }
@@ -428,22 +411,17 @@ pub(crate) fn grow_lake(
         && (!is_driver_call || dilate_region_rings(ctx, region, 1));
 
     if !committed {
-        rollback(ctx, &cells, region);
+        rollback(ctx, region);
         return false;
     }
 
     // Anything still bare inside the finished region becomes green — driver
     // lakes only, for the same reason as the passes above.
-    for &(x, y) in &cells {
-        if !is_driver_call {
-            break;
-        }
-        if ctx.scratch.get(x, y).region != region {
-            continue;
-        }
-        let cell = ctx.grid.get_mut(x, y).expect("native cell");
-        if ctx.ids.is_clear(cell.tile) {
-            cell.tile = ctx.ids.green;
+    if is_driver_call {
+        for ((x, y), cell) in ctx.grid.cells_in_native_order_mut() {
+            if ctx.scratch.get(x, y).region == region && ctx.ids.is_clear(cell.tile) {
+                cell.tile = ctx.ids.green;
+            }
         }
     }
 
@@ -451,20 +429,17 @@ pub(crate) fn grow_lake(
     true
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod tests {
     use super::*;
     use crate::map::rmg::grid::RmgGrid;
     use crate::map::rmg::phases::shore::{SubTile, TileBlock, TileBlocks};
     use crate::map::rmg::phases::water::PlayableRect;
     use crate::map::rmg::rng::RmgRng;
-    use crate::map::rmg::tiles::SpecialTerrain;
+    use crate::map::rmg::scratch::RmgScratch;
     use crate::map::rmg::tiles::TileIds;
     use crate::map::rmg::x87::Gaussian;
-
-    /// The river gate: at or below this the original carves no river, so the
-    /// lake path alone is the complete output for the band.
-    const RIVERLESS_WATER: [i32; 3] = [1, 10, 20];
+    use crate::map::theater::TheaterCliffRanges;
 
     struct OneByOne(TileBlock);
 
@@ -491,6 +466,7 @@ mod tests {
             clear: 0,
             ramp_base: -1,
             ramp_smooth: -1,
+            slope_set_pieces: -1,
             rough: -1,
             sand: -1,
             green: 100,
@@ -506,7 +482,7 @@ mod tests {
             paved_roads: -1,
             paved_road_ends: -1,
             medians: -1,
-            special: SpecialTerrain::default(),
+            cliffs: TheaterCliffRanges::default(),
         }
     }
 
@@ -543,7 +519,7 @@ mod tests {
             },
         };
         {
-            let trig = crate::map::rmg::trig::TrigTable::synthetic();
+            let trig = crate::util::retail_trig::TrigTable::embedded();
             let mut ctx = BlobCtx {
                 grid: &mut grid,
                 scratch: &mut scratch,
@@ -551,7 +527,7 @@ mod tests {
                 blocks: &blocks,
                 rng: &mut rng,
                 gauss: &mut gauss,
-                trig: Some(&trig),
+                trig: Some(trig),
                 map_w,
                 map_h,
                 rollback_level: 4,
@@ -565,174 +541,6 @@ mod tests {
         grid.native_cells()
             .filter(|&(x, y)| grid.get(x, y).expect("native cell").tile == identity.water_base)
             .collect()
-    }
-
-    /// The band this slice claims to complete: below the river gate the original
-    /// carves no river, so a lake is the entire water output.
-    #[test]
-    fn riverless_band_produces_a_lake() {
-        for map_type in [3, 4] {
-            for water_percent in RIVERLESS_WATER {
-                let (grid, _, identity, _) = run_carved(map_type, 4242, water_percent);
-                let water = water_cells(&grid, &identity);
-                assert!(
-                    !water.is_empty(),
-                    "map type {map_type} at water {water_percent} produced no lake"
-                );
-            }
-        }
-    }
-
-    /// A lake is one blob, not scattered cells. Walks the water set with a flood
-    /// fill and requires it to be a single 4-connected component.
-    #[test]
-    fn the_lake_is_a_single_connected_body() {
-        let (grid, _, identity, _) = run_carved(4, 4242, 20);
-        let water = water_cells(&grid, &identity);
-        assert!(!water.is_empty(), "no lake to check");
-
-        let mut seen = std::collections::BTreeSet::new();
-        let all: std::collections::BTreeSet<(i32, i32)> = water.iter().copied().collect();
-        let mut stack = vec![water[0]];
-        seen.insert(water[0]);
-        while let Some((x, y)) = stack.pop() {
-            for dir in CARDINALS {
-                let step = RmgGrid::step(x, y, dir);
-                if all.contains(&step) && seen.insert(step) {
-                    stack.push(step);
-                }
-            }
-        }
-        assert_eq!(
-            seen.len(),
-            all.len(),
-            "the lake is {} cells but only {} are reachable from one of them — \
-             it came out as more than one body",
-            all.len(),
-            seen.len()
-        );
-    }
-
-    /// The quota caps how many *lakes* a generation gets, not how many cells one
-    /// lake places.
-    ///
-    /// A committed lake is its drawn size plus its whole final frontier, because
-    /// the drain keeps counting every entry it pops — so a lake routinely ends up
-    /// larger than the quota that authorised it. That overshoot is kept in the
-    /// accumulator, and keeping it is the point: it is what drives the next
-    /// attempt below the minimum and terminates the water phase. Asserting
-    /// `placed <= target` looks obvious and is wrong; this test exists because
-    /// that assertion was written first and failed.
-    #[test]
-    fn a_spent_quota_stops_the_next_lake_before_it_draws() {
-        let args = WaterArgs {
-            map_type: 3,
-            water_percent: 20,
-            num_players: 4,
-            bridge_enabled: false,
-            playable: PlayableRect {
-                x: 2,
-                y: 5,
-                w: 30,
-                h: 30,
-            },
-        };
-        let target = water_target(&args);
-
-        let (map_w, map_h) = (34, 42);
-        let stride = (map_w + map_h + 1) as usize;
-        let (dmin, dmax) = (map_w, map_w + 2 * map_h);
-        let mut grid = RmgGrid::new(stride, dmin, dmax);
-        let mut scratch = RmgScratch::new(stride, dmin, dmax);
-        let identity = ids();
-        let blocks = blocks();
-        let mut rng = RmgRng::new(4242);
-        let mut gauss = Gaussian::default();
-        for (x, y) in grid.native_cells().collect::<Vec<_>>() {
-            grid.get_mut(x, y).expect("native cell").tile = identity.clear;
-        }
-
-        // Exactly at the minimum: `remaining` is the termination threshold, and
-        // the attempt must stop there rather than one cell later.
-        let mut quota = WaterQuota {
-            placed: target - MIN_CELLS,
-            region_id: 1,
-        };
-        let trig = crate::map::rmg::trig::TrigTable::synthetic();
-        let mut ctx = BlobCtx {
-            grid: &mut grid,
-            scratch: &mut scratch,
-            ids: &identity,
-            blocks: &blocks,
-            rng: &mut rng,
-            gauss: &mut gauss,
-            trig: Some(&trig),
-            map_w,
-            map_h,
-            rollback_level: 4,
-        };
-        assert!(
-            !grow_lake(&mut ctx, &args, &mut quota, None),
-            "a quota with only the minimum left must not start a lake"
-        );
-
-        let mut fresh = RmgRng::new(4242);
-        assert_eq!(
-            rng.next_u32(),
-            fresh.next_u32(),
-            "the bail must happen before any draw — the quota check is the first \
-             thing the lake does"
-        );
-    }
-
-    /// A committed lake is larger than its drawn size, and the overshoot is the
-    /// frontier — bounded, not unbounded. Guards against the drain running away.
-    #[test]
-    fn the_lake_overshoots_its_quota_only_by_its_frontier() {
-        for water_percent in RIVERLESS_WATER {
-            let (grid, _, identity, _) = run_carved(3, 4242, water_percent);
-            let placed = water_cells(&grid, &identity).len() as i32;
-            let args = WaterArgs {
-                map_type: 3,
-                water_percent,
-                num_players: 4,
-                bridge_enabled: false,
-                playable: PlayableRect {
-                    x: 2,
-                    y: 5,
-                    w: 30,
-                    h: 30,
-                },
-            };
-            let target = water_target(&args);
-            // The frontier of a blob cannot exceed the blob, so twice the quota
-            // is a generous ceiling that still catches a runaway drain.
-            assert!(
-                placed <= target * 2,
-                "water {water_percent}: placed {placed} against a quota of {target} \
-                 — more than a frontier's worth of overshoot"
-            );
-        }
-    }
-
-    /// A rolled-back attempt must leave nothing behind — no water tiles, no
-    /// region tags, and the level restored to the base rather than zero.
-    #[test]
-    fn a_failed_attempt_leaves_no_trace() {
-        // Below the minimum the seeder bails before drawing or writing anything.
-        let (grid, scratch, identity, mut rng) = run_carved(3, 4242, 0);
-        for (x, y) in grid.native_cells() {
-            let cell = grid.get(x, y).expect("native cell");
-            assert_eq!(cell.tile, identity.clear, "({x},{y}) is not clear");
-            assert_eq!(cell.level, 4, "({x},{y}) lost its base level");
-            assert_eq!(scratch.get(x, y).region, 0, "({x},{y}) kept a region tag");
-        }
-        let mut fresh = RmgRng::new(4242);
-        assert_eq!(
-            rng.next_u32(),
-            fresh.next_u32(),
-            "a bailed seeder must not consume draws"
-        );
     }
 
     /// Same options and seed must give the same lake.
@@ -749,12 +557,160 @@ mod tests {
         }
     }
 
-    /// Different seeds must give different lakes — otherwise the seed pick or the
-    /// growth key is not reading the generator at all.
+    /// Whole original `RandomMapGenerator::GrowLake @ 0x0059C920` calls from
+    /// `tools/rmg_oracle/grow_lake.py`: a declared flat scene (not a full
+    /// Generate prefix), seeded streams, and every carved cell, region tag,
+    /// result, quota and draw the original produced.
     #[test]
-    fn different_seeds_give_different_lakes() {
-        let (a, _, identity, _) = run_carved(4, 1, 20);
-        let (b, _, _, _) = run_carved(4, 30011, 20);
-        assert_ne!(water_cells(&a, &identity), water_cells(&b, &identity));
+    fn native_grow_lake_controls() {
+        let doc = crate::test_fixture::json("tools/rmg_oracle/grow_lake.json");
+        let state = |rng: RmgRng| {
+            let (locked, words, a, b) = rng.into_continuation().into_native_parts();
+            let mut bytes = vec![locked, 0, 0, 0];
+            bytes.extend_from_slice(&(a as u32).to_le_bytes());
+            bytes.extend_from_slice(&(b as u32).to_le_bytes());
+            for word in words {
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let scene = &doc["scene"];
+        // The driver's shore pass needs the fixture's physical shore TMPs.
+        let (mut identity, blocks) = super::super::cliff_native_tests::physical_tiles();
+        identity.water_base = scene["water_base"].as_i64().unwrap() as i32;
+        identity.green = scene["green"].as_i64().unwrap() as i32;
+        let cliff = scene["cliff_base"].as_i64().unwrap() as i32;
+        let rows = doc["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 11);
+        for row in rows {
+            let input = &row["input"];
+            let context = input["id"].as_str().unwrap();
+            let coords = |key: &str| -> Vec<(i32, i32)> {
+                input[key]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|c| (c[0].as_i64().unwrap() as i32, c[1].as_i64().unwrap() as i32))
+                    .collect()
+            };
+            let mut grid = RmgGrid::new(33, 16, 48);
+            let mut scratch = RmgScratch::new(33, 16, 48);
+            for (x, y) in grid.native_cells().collect::<Vec<_>>() {
+                let cell = grid.get_mut(x, y).unwrap();
+                (cell.tile, cell.sub_tile, cell.level) = (0, 0, 0);
+            }
+            for (x, y) in coords("water") {
+                grid.get_mut(x, y).unwrap().tile = identity.water_base;
+                scratch.get_mut(x, y).region = 3;
+            }
+            for (x, y) in coords("rough")
+                .into_iter()
+                .filter(|&(x, y)| scratch.in_diamond(x, y))
+            {
+                grid.get_mut(x, y).unwrap().tile = cliff;
+            }
+            // Every in-diamond cell outside a declared clear pocket is rough.
+            if let Some(pocket) = input["pocket"].as_array() {
+                let [x0, y0, x1, y1]: [i32; 4] =
+                    std::array::from_fn(|i| pocket[i].as_i64().unwrap() as i32);
+                for (x, y) in grid.native_cells().collect::<Vec<_>>() {
+                    let inside = (x0..=x1).contains(&x) && (y0..=y1).contains(&y);
+                    if scratch.in_diamond(x, y) && !inside {
+                        grid.get_mut(x, y).unwrap().tile = cliff;
+                    }
+                }
+            }
+            let fields = |grid: &RmgGrid, scratch: &RmgScratch| {
+                let mut out = Vec::new();
+                for y in 0..33 {
+                    for x in 0..33 {
+                        if scratch.in_diamond(x, y) {
+                            let cell = grid.get(x, y).unwrap();
+                            let (sub, level) = (i32::from(cell.sub_tile), i32::from(cell.level));
+                            out.push([x, y, cell.tile, sub, level, scratch.get(x, y).region]);
+                        }
+                    }
+                }
+                out
+            };
+            let prior = fields(&grid, &scratch);
+            let mut rng = RmgRng::new(input["seed"].as_u64().unwrap() as u16);
+            let mut gauss = Gaussian::default();
+            let size = &input["gen"];
+            let args = WaterArgs {
+                map_type: 3,
+                water_percent: input["water_percent"].as_i64().unwrap() as i32,
+                num_players: 2,
+                bridge_enabled: false,
+                playable: PlayableRect {
+                    x: 0,
+                    y: 0,
+                    w: size[0].as_i64().unwrap() as i32,
+                    h: size[1].as_i64().unwrap() as i32,
+                },
+            };
+            let mut quota = WaterQuota {
+                placed: input["placed"].as_i64().unwrap() as i32,
+                region_id: input["region"].as_i64().unwrap() as i32,
+            };
+            let start = &input["start"];
+            let given = (
+                start[0].as_i64().unwrap() as i32,
+                start[1].as_i64().unwrap() as i32,
+            );
+            let committed = {
+                let mut ctx = BlobCtx {
+                    grid: &mut grid,
+                    scratch: &mut scratch,
+                    ids: &identity,
+                    blocks: &blocks,
+                    rng: &mut rng,
+                    gauss: &mut gauss,
+                    trig: None,
+                    map_w: 16,
+                    map_h: 16,
+                    rollback_level: 0,
+                };
+                grow_lake(
+                    &mut ctx,
+                    &args,
+                    &mut quota,
+                    (given != (0, 0)).then_some(given),
+                )
+            };
+            assert_eq!(
+                committed,
+                row["result"].as_u64().unwrap() != 0,
+                "{context}: result"
+            );
+            assert_eq!(
+                i64::from(quota.placed),
+                row["placed"].as_i64().unwrap(),
+                "{context}: placed"
+            );
+            let after = row["rng_after"].as_u64().unwrap() as usize;
+            assert_eq!(
+                state(rng),
+                doc["rng_states_hex"][after],
+                "{context}: exit RNG"
+            );
+            // Only cells the call changed, as the producer records them.
+            let cells: Vec<[i32; 6]> = fields(&grid, &scratch)
+                .into_iter()
+                .zip(prior)
+                .filter(|(now, before)| now != before)
+                .map(|(now, _)| now)
+                .collect();
+            let native: Vec<[i32; 6]> = row["cells"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| std::array::from_fn(|i| c[i].as_i64().unwrap() as i32))
+                .collect();
+            assert_eq!(cells, native, "{context}: cells");
+        }
     }
 }

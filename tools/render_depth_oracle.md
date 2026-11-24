@@ -34,17 +34,13 @@ initializer `49F2F0` executes before the fixture writes cached FPCW `822D80`;
 its live FPCW, and every later call's live/cached word, retain `0x0E7F` chronology.
 Original virtual methods and instructions remain unpatched.
 
-Native binary SHA-256:
-`1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c`.
-The sidecar records the binary, Unicorn core/binding, entry points, runtime
-assumptions, canonical payload hash, and UTF-8/LF-normalized hashes of the
-producer and shared native owner. The shared publisher captures those hashes
-before generation and rejects source drift through metadata construction before
-comparison or publication. It is a run consistency check, not a source lock or
-an import-time attestation.
+The sidecar records the Unicorn core/binding, entry points, runtime
+assumptions and canonical payload hash. The shared publisher hashes the producer
+and shared native owner before generation and refuses to compare or publish if
+one changed through metadata construction; nothing is recorded.
 
-Schema 2 moves `generator_normalized_lf_sha256` out of the result payload into
-that sidecar. All 85 cases, their list order, inputs, native results, defaults,
+Schema 2 removed `generator_normalized_lf_sha256` from the result payload. All
+85 cases, their list order, inputs, native results, defaults,
 region hashes and coverage restrictions were compared with exact typed equality
 against the pre-migration checked native run. Shared serialization sorts object
 keys; this explains the larger textual JSON diff. No native numeric golden
@@ -78,8 +74,10 @@ python -m tools.render_depth_fixture target/foot-z/cliff-back.map --cliff-back
 ```
 
 Use a [map observation profile](map_observation.md) with its absolute
-`launch.selected_map_file`, then capture before/after preserved builds through
-`tools.map_observation` and compare them with the same tool. The fixture contains
+`launch.selected_map_file` and one AI opponent (the scene's buildings are the
+computer's; a skirmish never creates the local House's authored Structures),
+then capture before/after preserved builds through `tools.map_observation` and
+compare them with the same tool. The fixture contains
 controlled tank/infantry positions and a scenario-only
 `[General] CliffBackImpassability=0` override; it does not retune ordinary maps.
 A matching capture establishes production load/step/render regression evidence,
@@ -89,7 +87,7 @@ and presentation inputs. Every Rust test invocation uses `--lib`.
 
 ## Recorded validation
 
-The [validation receipt](render_depth_oracle.validation.json) records the checked
+The validation receipt (`tools/render_depth_oracle.validation.json`, in git at 1b1a8b43e) records the checked
 85-case migration, normal/optimized native reproduction, 30 focused shared/Foot lifecycle tests in both normal and optimized Python,
 and 298 total Python tests (2 optional skips), 18 Foot Z Rust tests, full strict-retail library
 suite (9,592 passed, 213 ignored), clippy (870 existing warnings) and release build.

@@ -6,12 +6,12 @@ and VERA20K_GAMEMD_EXE; --write records and --check reproduces native results.
 No VERA scalar/parser output initializes native AnimType fields. Both existing
 production-export input fixtures are asserted against the native results.
 """
-import json,struct,hashlib,os
+import json,struct,hashlib,os,uuid
 from pathlib import Path
 from tools.rules_oracle.bridge_anim_lists import Lists,HEAP
 from tools.projectile_oracle.flat_art import crc
 from tools.spatial_oracle.building_body_rules import INI,SP,dwords
-from tools.native_oracle import run_checked,RET_MAGIC,NATIVE_SHA256,finish_vectors,provenance
+from tools.native_oracle import run_checked,RET_MAGIC,finish_vectors,provenance
 from unicorn.x86_const import *
 DEFAULT_ASSETS=Path(os.environ.get('CARGO_TARGET_DIR','target'))/'asset/bridge-anim-inputs/extract'
 ROOT=Path(os.environ.get('VERA20K_BRIDGE_ANIM_ASSETS',str(DEFAULT_ASSETS)))
@@ -40,31 +40,90 @@ def physical_sections(raw):
   if k and v:
    k=k.decode('latin1');assert k not in current,('duplicate-key',k);current[k]=v.decode('latin1')
  return {n:v for n,v in result.items() if v}
+def read_asset_inputs(root,names=None):
+ """Read only selected asset files when a bounded producer supplies names."""
+ if names is None:
+  paths=root.glob('*')
+ else:
+  selected={name.upper() for name in names}
+  paths=(p for p in root.iterdir() if p.name.upper() in selected and p.is_file())
+ return {p.name.upper():p.read_bytes() for p in paths}
+
 class Reader(Lists):
- def __init__(self,root,sections):
-  self.assets={p.name.upper():p.read_bytes() for p in root.glob('*')};self.asset_loaded=[];self.asset_ptr={};self.sound_names=[]
-  super().__init__()
+ def __init__(self,root,sections,*,arena_size=0x400000,asset_names=None):
+  self.assets=read_asset_inputs(root,asset_names);self.asset_loaded=[];self.asset_ptr={};self.sound_names=[]
+  super().__init__(arena_size=arena_size)
   # Retail startup installs the CRT floating scanner before ReadDouble5283D0.
   self.invoke(0x7C8F5E,0)
   self.make_ini(sections)
  def alloc(self,n):
-  out=self.cursor;self.cursor+=(n+15)&~15;assert self.cursor<HEAP+0x400000;return out
+  out=self.cursor;self.cursor+=(n+15)&~15;assert self.cursor<HEAP+self.arena_size;return out
  def cstring(self,s):
   raw=s.encode('latin1')+b'\0';ptr=self.alloc(len(raw));self.u.mem_write(ptr,raw);return ptr
- def invoke(self,addr,obj,args=()):
-  self.u.mem_write(SP,dwords(RET_MAGIC,*args));self.u.reg_write(UC_X86_REG_ESP,SP);self.u.reg_write(UC_X86_REG_ECX,obj);run_checked(self.u,addr,RET_MAGIC,count=2000000);return self.u.reg_read(UC_X86_REG_EAX)
- def make_ini(self,sections):
-  u=self.u;u.mem_write(INI,bytes(0x40));rows=[]
+ def invoke(self,addr,obj,args=(),*,timeout_us=10_000_000,context=None,instruction_limit=2_000_000):
+  self.u.mem_write(SP,dwords(RET_MAGIC,*args));self.u.reg_write(UC_X86_REG_ESP,SP);self.u.reg_write(UC_X86_REG_ECX,obj)
+  run_checked(self.u,addr,RET_MAGIC,count=instruction_limit,timeout_us=timeout_us,context=context)
+  return self.u.reg_read(UC_X86_REG_EAX)
+ def install_waypoint_character_format_transport(self):
+  """Supply only ToLetters763610's two Windows wsprintfA calls.
+
+  Original instructions calculate and push every character. The raw PE IAT
+  7E14B0 is unresolved40FFF0, not an operating-system formatter. Keep code
+  bytes unchanged and supply the two exact %c formats at the import call.
+  wsprintfA is cdecl: leave arguments for the original ADD ESP cleanup.
+  Contract: https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-wsprintfa
+  No native division, letter selection, INI reader or gameplay return is supplied.
+  """
+  from unicorn import UC_HOOK_CODE
+  if hasattr(self,'waypoint_character_formats'):return self.waypoint_character_formats
+  self.waypoint_character_formats=[]
+  def transport(u,pc,_size,_data):
+   if pc not in (0x763635,0x763671):return
+   assert bytes(u.mem_read(pc,6))==bytes.fromhex('ff15b0147e00')
+   sp=u.reg_read(UC_X86_REG_ESP)
+   dest,fmt=struct.unpack('<2I',u.mem_read(sp,8))
+   template=self.string(fmt)
+   assert template in ('%c','%c%c'),(hex(pc),template)
+   count=template.count('%c')
+   args=list(struct.unpack('<'+'I'*count,u.mem_read(sp+8,4*count)))
+   raw=bytes(value&255 for value in args)
+   assert all(0<value<128 for value in raw),(hex(pc),args)
+   u.mem_write(dest,raw+b'\0')
+   u.reg_write(UC_X86_REG_EAX,len(raw))
+   u.reg_write(UC_X86_REG_EIP,pc+6)
+   self.waypoint_character_formats.append(dict(call=f'{pc:08X}',iat='007E14B0',
+       format=template,arguments=args,output=raw.decode('ascii'),returned=len(raw)))
+  self.waypoint_character_format_hook=self.u.hook_add(UC_HOOK_CODE,transport)
+  return self.waypoint_character_formats
+ def guid_transport(self,u,pc,sp,events):
+  """Existing Mission's two Windows GUID-reader transport boundaries.
+
+  Original527920 reads the INI string and supplies its current GUID default.
+  Only ASCII-to-UTF16 and CLSIDFromString OS calls are supplied here; no type
+  field, caller return or gameplay result is invented. Mission and composed
+  type-input fixtures share this exact transport owner.
+  """
+  if pc==0x527AF9:
+   codepage,flags,source,length,dest,capacity=struct.unpack('<6I',u.mem_read(sp,24));assert (codepage,flags,length)==(0,1,0xffffffff)
+   value=self.string(source);assert value.isascii();raw=(value+'\0').encode('utf-16-le');assert len(raw)//2<=capacity
+   u.mem_write(dest,raw);u.reg_write(UC_X86_REG_EAX,len(raw)//2);u.reg_write(UC_X86_REG_ESP,sp+24);u.reg_write(UC_X86_REG_EIP,0x527AFF);events.append(dict(kind='OS_ascii_to_utf16',value=value));return True
+  if pc==0x527B0C:
+   source,dest=struct.unpack('<2I',u.mem_read(sp,8));s=[]
+   while (v:=struct.unpack('<H',u.mem_read(source+len(s)*2,2))[0]):s.append(chr(v))
+   value=''.join(s);raw=uuid.UUID(value).bytes_le;u.mem_write(dest,raw);u.reg_write(UC_X86_REG_EAX,0);u.reg_write(UC_X86_REG_ESP,sp+8);u.reg_write(UC_X86_REG_EIP,0x527B12);events.append(dict(kind='OS_CLSIDFromString',value=value,bytes=raw.hex()));return True
+  return False
+ def make_ini(self,sections,*,ini_address=INI,checksum=crc):
+  u=self.u;u.mem_write(ini_address,bytes(0x40));rows=[]
   for name,keys in sections.items():
    sec=self.alloc(0x44);u.mem_write(sec+0xc,dwords(self.cstring(name)));entries=[]
    for key,value in keys.items():
-    entry=self.alloc(0x28);u.mem_write(entry+0xc,dwords(self.cstring(key),self.cstring(value)));entries.append((crc(key),entry))
+    entry=self.alloc(0x28);u.mem_write(entry+0xc,dwords(self.cstring(key),self.cstring(value)));entries.append((checksum(key),entry))
    items=self.alloc(len(entries)*8)
    for i,(key,pointer) in enumerate(sorted(entries,key=lambda x:struct.unpack('<i',dwords(x[0]))[0])):u.mem_write(items+i*8,dwords(key,pointer))
-   u.mem_write(sec+0x2c,dwords(items,len(entries),len(entries),1,0));rows.append((crc(name),sec))
+   u.mem_write(sec+0x2c,dwords(items,len(entries),len(entries),1,0));rows.append((checksum(name),sec))
   items=self.alloc(len(rows)*8)
   for i,(key,pointer) in enumerate(sorted(rows,key=lambda x:struct.unpack('<i',dwords(x[0]))[0])):u.mem_write(items+i*8,dwords(key,pointer))
-  u.mem_write(INI+0x28,dwords(items,len(rows),len(rows),1,0))
+  u.mem_write(ini_address+0x28,dwords(items,len(rows),len(rows),1,0))
  def hook(self,u,p,n,d):
   if p==0x5B40B0:
    name=self.string(u.reg_read(UC_X86_REG_ECX));raw=self.assets.get(name.upper());pointer=0
@@ -139,7 +198,7 @@ def generate():
  for scorch,crater in [('yes','no'),('no','yes')]:
   controls.extend(read_types(ROOT,{'DBRIS1LG':{'Scorch':scorch,'Crater':crater}},['DBRIS1LG']))
  assert [(r['scorch'],r['crater']) for r in controls]==[(True,False),(False,True)]
- return dict(schema_version=1,native_sha256=NATIVE_SHA256,
+ return dict(schema_version=1,
              art_sha256=hashlib.sha256(raw).hexdigest(),art_bytes=len(raw),
              rows=rows,asymmetric_flag_controls=controls,production_export_checks=checks)
 

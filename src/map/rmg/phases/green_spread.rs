@@ -5,17 +5,17 @@
 //! entries are converted to green, each conversion re-feeding the list with
 //! the converted cell's clear cardinal neighbors.
 
-use crate::map::rmg::grid::RmgGrid;
+use crate::map::rmg::grid::{CellRef, RmgGrid};
 use crate::map::rmg::rng::RmgRng;
 use crate::map::rmg::tiles::TileIds;
-
-use super::CellRef;
 
 /// Conversion cap per map.
 const SPREAD_CAP: i32 = 1000;
 /// The four even directions (N, E, S, W) the spread steps in.
 const EVEN_DIRS: [usize; 4] = [0, 2, 4, 6];
 
+/// `RandomMapGenerator::SpreadGreenTerrain @ 0x0059B740`, called from
+/// `Generate @ 0x00598960`.
 pub fn run(grid: &mut RmgGrid, ids: &TileIds, rng: &mut RmgRng) {
     // Collect: every green cell's clear cardinal neighbors, in native scan
     // order. Duplicates are kept — the original appends without dedup.
@@ -41,33 +41,25 @@ pub fn run(grid: &mut RmgGrid, ids: &TileIds, rng: &mut RmgRng) {
 
         // Paint through the held reference: a border entry writes the shared
         // border cell no matter what coordinate it was appended from.
-        match entry {
-            CellRef::Cell(x, y) => {
-                grid.get_mut(i32::from(x), i32::from(y))
-                    .expect("list entries reference existing cells")
-                    .tile = ids.green;
-            }
-            CellRef::Border => grid.border_cell_mut().tile = ids.green,
-        }
+        grid.ref_cell_mut(entry).tile = ids.green;
 
         // Re-scan the converted cell's cardinal neighbors. The base
         // coordinate is re-read from the cell each step — for the border
         // cell that is its live coordinate slot, which an out-of-band step
         // in this very loop can move.
         for dir in EVEN_DIRS {
-            let (bx, by) = match entry {
-                CellRef::Cell(x, y) => (i32::from(x), i32::from(y)),
-                CellRef::Border => grid.border_coord(),
-            };
+            let (bx, by) = grid.ref_coord(entry);
             let (nx, ny) = RmgGrid::step(bx, by, dir);
-            let clear = ids.is_clear(grid.cell_native(nx, ny).tile);
-            if clear {
-                list.push(CellRef::at(grid, nx, ny));
+            let held = grid.cell_ref(nx, ny);
+            if ids.is_clear(grid.ref_cell(held).tile) {
+                list.push(held);
             }
         }
     }
 }
 
+/// The clear cardinal neighbours `0x0059B740` appends after each conversion,
+/// stepping with `MapCoord_StepByDir_GetCell @ 0x00481810`.
 fn append_clear_neighbors(
     grid: &mut RmgGrid,
     ids: &TileIds,
@@ -77,17 +69,18 @@ fn append_clear_neighbors(
 ) {
     for dir in EVEN_DIRS {
         let (nx, ny) = RmgGrid::step(x, y, dir);
-        if ids.is_clear(grid.cell_native(nx, ny).tile) {
-            list.push(CellRef::at(grid, nx, ny));
+        let held = grid.cell_ref(nx, ny);
+        if ids.is_clear(grid.ref_cell(held).tile) {
+            list.push(held);
         }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod tests {
     use super::*;
 
-    use crate::map::rmg::tiles::SpecialTerrain;
+    use crate::map::theater::TheaterCliffRanges;
 
     /// Minimal identity table: green base 100, green LAT 110, everything else
     /// far away so no accidental range overlaps.
@@ -96,6 +89,7 @@ mod tests {
             clear: 0,
             ramp_base: -1,
             ramp_smooth: -1,
+            slope_set_pieces: -1,
             rough: -1,
             sand: 200,
             green: 100,
@@ -111,7 +105,7 @@ mod tests {
             paved_roads: -1,
             paved_road_ends: -1,
             medians: -1,
-            special: SpecialTerrain::default(),
+            cliffs: TheaterCliffRanges::default(),
         }
     }
 
@@ -128,73 +122,6 @@ mod tests {
         for &(x, y) in cells {
             grid.get_mut(x, y).unwrap().tile = tile;
         }
-    }
-
-    #[test]
-    fn conversion_count_is_a_third_of_the_candidate_list() {
-        let mut grid = grid_with_water();
-        // One green cell surrounded by 4 clear cardinals -> list of 4,
-        // count = 4/3 = 1 conversion.
-        paint(&mut grid, &[(8, 8)], 100);
-        paint(&mut grid, &[(8, 7), (9, 8), (8, 9), (7, 8)], 0);
-
-        let ids = test_ids();
-        let mut rng = RmgRng::new(7);
-        run(&mut grid, &ids, &mut rng);
-
-        let greens = [(8, 7), (9, 8), (8, 9), (7, 8)]
-            .iter()
-            .filter(|&&(x, y)| grid.get(x, y).unwrap().tile == 100)
-            .count();
-        assert_eq!(greens, 1, "list of 4 yields exactly one conversion");
-    }
-
-    #[test]
-    fn short_lists_convert_nothing() {
-        let mut grid = grid_with_water();
-        // Two clear neighbors -> len 2 -> 2/3 = 0 conversions.
-        paint(&mut grid, &[(8, 8)], 100);
-        paint(&mut grid, &[(8, 7), (9, 8)], 0);
-
-        let ids = test_ids();
-        let mut rng = RmgRng::new(7);
-        let before = rng.clone();
-        run(&mut grid, &ids, &mut rng);
-
-        assert_eq!(grid.get(8, 7).unwrap().tile, 0);
-        assert_eq!(grid.get(9, 8).unwrap().tile, 0);
-        assert_eq!(
-            rng.next_u32(),
-            before.clone().next_u32(),
-            "zero conversions must consume zero draws"
-        );
-    }
-
-    #[test]
-    fn converted_cells_refeed_the_list() {
-        let mut grid = grid_with_water();
-        // A clear corridor: enough green sources that the corridor cells all
-        // enter the list, and conversions append their clear neighbors.
-        paint(&mut grid, &[(10, 8), (10, 10), (12, 8)], 100);
-        let corridor: Vec<(i32, i32)> = (8..14).map(|x| (x, 9)).collect();
-        paint(&mut grid, &corridor, 0);
-        paint(&mut grid, &[(10, 9)], 0);
-        // Give each green its cardinal clears.
-        paint(&mut grid, &[(10, 7), (9, 8), (11, 8)], 0);
-        paint(&mut grid, &[(9, 10), (11, 10), (10, 11)], 0);
-        paint(&mut grid, &[(12, 7), (13, 8), (11, 8)], 0);
-
-        let ids = test_ids();
-        let mut rng = RmgRng::new(1234);
-        run(&mut grid, &ids, &mut rng);
-
-        let converted = grid
-            .native_cells()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .filter(|&(x, y)| grid.get(x, y).unwrap().tile == 100)
-            .count();
-        assert!(converted > 3, "spread grew beyond the seed greens");
     }
 
     #[test]
@@ -228,33 +155,79 @@ mod tests {
         assert_eq!(tiles(&first), tiles(&second));
     }
 
+    /// Whole original `SpreadGreenTerrain @ 0x0059B740` calls from
+    /// `tools/rmg_oracle/terrain_paint.py`: a declared scene (not a Generate
+    /// prefix), every converted tile, the shared Dummy's tile and the exit
+    /// RNG state.
     #[test]
-    fn edge_green_can_paint_the_border_cell() {
-        let mut grid = grid_with_water();
-        // A green cell on the first scan row: its north neighbor is out of
-        // band, so the (clear-tiled) border cell joins the list; with a list
-        // of exactly 3 the single conversion may hit any entry, but the
-        // border cell must at least have been considered clear and appended.
-        let (x, y) = (4, 5); // sum 9 > 8, first row region
-        assert!(grid.is_valid(x, y));
-        assert!(!grid.is_valid(x, y - 1), "north neighbor is out of band");
-        paint(&mut grid, &[(x, y)], 100);
-        paint(&mut grid, &[(x + 1, y), (x, y + 1)], 0);
-
-        let ids = test_ids();
-        // List: border (N), (x+1,y) E, (x,y+1) S -> count exactly 1.
-        let mut rng = RmgRng::new(3);
-        run(&mut grid, &ids, &mut rng);
-
-        let converted_real =
-            grid.get(x + 1, y).unwrap().tile == 100 || grid.get(x, y + 1).unwrap().tile == 100;
-        let converted_border = {
-            let mut probe = grid;
-            probe.cell_native(0, 0).tile == 100
+    fn native_spread_green_controls() {
+        let doc = crate::test_fixture::json("tools/rmg_oracle/terrain_paint.json");
+        let int = |v: &serde_json::Value| v.as_i64().unwrap() as i32;
+        let tiles = &doc["scene"]["tiles"];
+        let identity = TileIds {
+            green: int(&tiles["green"]),
+            green_lat: int(&tiles["green_lat"]),
+            sand: -1,
+            sand_lat: -1,
+            water_base: -1,
+            ..test_ids()
         };
-        assert!(
-            converted_real || converted_border,
-            "exactly one of the three entries (incl. the border cell) converted"
-        );
+        let rows = doc["spread"].as_array().unwrap();
+        assert_eq!(rows.len(), 7);
+        for row in rows {
+            let input = &row["input"];
+            let context = input["id"].as_str().unwrap();
+            let mut grid = RmgGrid::new(33, 16, 48);
+            let cells: Vec<(i32, i32)> = grid.native_cells().collect();
+            for &(x, y) in &cells {
+                grid.get_mut(x, y).unwrap().tile = int(&tiles["rough"]);
+            }
+            for c in input["clear"].as_array().unwrap() {
+                grid.get_mut(int(&c[0]), int(&c[1])).unwrap().tile = 0;
+            }
+            for t in input["tiles"].as_array().unwrap() {
+                let family = int(&tiles[t[2].as_str().unwrap()]);
+                grid.get_mut(int(&t[0]), int(&t[1])).unwrap().tile = family + int(&t[3]);
+            }
+            assert_eq!(
+                grid.ref_cell(CellRef::Border).tile,
+                int(&row["dummy_tile_before"]),
+                "{context}: Dummy prior"
+            );
+            let before: Vec<i32> = cells
+                .iter()
+                .map(|&(x, y)| grid.get(x, y).unwrap().tile)
+                .collect();
+            let mut rng = RmgRng::new(input["seed"].as_u64().unwrap() as u16);
+            run(&mut grid, &identity, &mut rng);
+            let mut changed: Vec<[i32; 3]> = cells
+                .iter()
+                .zip(before)
+                .filter_map(|(&(x, y), was)| {
+                    let tile = grid.get(x, y).unwrap().tile;
+                    (tile != was).then_some([x, y, tile])
+                })
+                .collect();
+            // The corpus lists changes row-major.
+            changed.sort_by_key(|&[x, y, _]| (y, x));
+            let native: Vec<[i32; 3]> = row["changed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| std::array::from_fn(|i| int(&c[i])))
+                .collect();
+            assert_eq!(changed, native, "{context}: converted tiles");
+            assert_eq!(
+                grid.ref_cell(CellRef::Border).tile,
+                int(&row["dummy_tile"]),
+                "{context}: Dummy tile"
+            );
+            assert_eq!(
+                rng.into_continuation().into_native_parts(),
+                super::super::cliff_native_tests::native_state(&doc, &row["rng_after"])
+                    .into_native_parts(),
+                "{context}: exit RNG"
+            );
+        }
     }
 }

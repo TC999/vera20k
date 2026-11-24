@@ -7,9 +7,20 @@ use crate::skirmish_launch::{
     SkirmishLaunchMode, SkirmishLaunchOptions, SkirmishLocalSlot,
 };
 
+#[test]
+fn browser_peer_wait_starts_after_the_terminal_ack_drain() {
+    let mut wait = NetworkLoadWait::new(100, 0.5);
+    wait.start_pending = true;
+    assert_eq!(wait.poll(340, 0.75), NetworkLoadPoll::Pending);
+    assert_eq!(wait.poll(639, 0.75), NetworkLoadPoll::Pending);
+    assert_eq!(wait.poll(640, 0.75), NetworkLoadPoll::ReportProgress);
+    assert_eq!(wait.poll(3940, 0.75), NetworkLoadPoll::TimedOut);
+}
+
 pub(super) fn test_launch_session(country: LaunchCountry) -> SkirmishLaunchSession {
-    SkirmishLaunchSession {
-        mode: SkirmishLaunchMode {
+    SkirmishLaunchSession::from_rows(
+        SkirmishLaunchMode {
+            class: crate::skirmish_modes::MpModeClass::Battle,
             id: 1,
             ui_name_key: "GUI:Battle".to_string(),
             tooltip_key: "STT:ModeBattle".to_string(),
@@ -19,17 +30,23 @@ pub(super) fn test_launch_session(country: LaunchCountry) -> SkirmishLaunchSessi
             allies_allowed: true,
             must_ally: false,
         },
-        selected_map_file: Some("mp01t4.map".to_string()),
-        player_name: "Player".to_string(),
-        local: SkirmishLocalSlot {
-            country,
-            country_random: false,
-            color_index: 0,
-            color_random: false,
-            start_position: LaunchStartPosition::Position(0),
-            team: LaunchTeam::None,
-        },
-        opponents: vec![SkirmishAiSlot {
+        Some("mp01t4.map".to_string()),
+        vec![crate::skirmish_launch::SkirmishHumanSlot {
+            raw_slot_index: Some(0),
+            name: "Player".to_string(),
+            slot: SkirmishLocalSlot {
+                country,
+                country_random: false,
+                color_index: 0,
+                color_random: false,
+                start_position: LaunchStartPosition::Position(0),
+                team: LaunchTeam::None,
+            },
+            role: crate::skirmish_launch::LaunchHumanRole::from_observer(false),
+        }],
+        0,
+        vec![SkirmishAiSlot {
+            raw_slot_index: 1,
             country: LaunchCountry::Russia,
             country_random: false,
             color_index: 1,
@@ -38,20 +55,392 @@ pub(super) fn test_launch_session(country: LaunchCountry) -> SkirmishLaunchSessi
             team: LaunchTeam::None,
             difficulty: AiDifficulty::Easy,
         }],
-        pre_fill_house_roster: crate::skirmish_launch::PreFillHouseRoster::from_compact_skirmish(1),
-        options: SkirmishLaunchOptions::default(),
+        SkirmishLaunchOptions::default(),
+    )
+}
+
+#[test]
+fn recorded_network_mode_stays_in_shell_until_the_world_is_installed() {
+    use crate::app::match_runtime::session::{MatchSession, SessionMode};
+    use crate::sim::scenario_bootstrap::MatchLaunchDescriptor;
+    let startup = LoadingStartup::Replay {
+        launch: Box::new(
+            MatchLaunchDescriptor::from_resolved(test_launch_session(LaunchCountry::America))
+                .unwrap(),
+        ),
+        seed: crate::app::match_bootstrap::MatchSeed {
+            value: 73,
+            source: crate::app::match_bootstrap::MatchSeedSource::SavedScenario,
+            seed_authority_certifying: false,
+        },
+        game_mode: SessionMode::Wol,
+        native_id_prefix: 0,
+    };
+    assert!(!crate::app::loading::init::should_read_tmcj4f(
+        startup.session_mode(),
+        true,
+    ));
+    let replay_with_mode = |game_mode| match &startup {
+        LoadingStartup::Replay {
+            launch,
+            seed,
+            native_id_prefix,
+            ..
+        } => LoadingStartup::Replay {
+            launch: launch.clone(),
+            seed: *seed,
+            game_mode,
+            native_id_prefix: *native_id_prefix,
+        },
+        _ => unreachable!("test startup is a Replay"),
+    };
+    let lan_replay = replay_with_mode(SessionMode::Lan);
+    assert!(!crate::app::loading::init::should_read_tmcj4f(
+        lan_replay.session_mode(),
+        true,
+    ));
+    let skirmish_replay = replay_with_mode(SessionMode::Skirmish);
+    assert!(crate::app::loading::init::should_read_tmcj4f(
+        skirmish_replay.session_mode(),
+        true,
+    ));
+    assert!(!crate::app::loading::init::should_read_tmcj4f(
+        skirmish_replay.session_mode(),
+        false,
+    ));
+    let mut session = MatchSession::default();
+    prepare_session_for_loading(&mut session, &startup);
+    assert_eq!(session.shell_mode(), Some(SessionMode::Wol));
+    assert_eq!(session.local_player_name(), Some("Player"));
+    assert!(session.network_return_context().is_none());
+    assert!(session.network_setup().is_none());
+    session.hand_mode_to_world(SessionMode::Wol);
+    assert_eq!(session.shell_mode(), None);
+}
+
+#[test]
+fn replay_install_uses_recorded_rules_and_keeps_skirmish_map_construction() {
+    use crate::rules::rule_policy::{BootstrapRuleProfile, RulePolicy};
+    use crate::sim::scenario_bootstrap::MatchLaunchDescriptor;
+    use crate::sim::scenario_session::{ExecutionTopology, ScenarioDescriptor, ScenarioGameMode};
+    use crate::sim::world::Simulation;
+    use crate::skirmish_modes::MpModeClass;
+
+    let session = test_launch_session(LaunchCountry::America);
+    let skirmish_rules = RulePolicy::stock_multiplayer();
+    let install = |raw_mode, recorded_policy: Option<RulePolicy>, expected_construction| {
+        let game_mode = ScenarioGameMode::from_game_mode(raw_mode);
+        let mut launch = MatchLaunchDescriptor::from_resolved(session.clone()).unwrap();
+        if let Some(policy) = recorded_policy {
+            launch = launch.with_rule_policy(policy);
+        }
+        let startup = LoadingStartup::Replay {
+            launch: Box::new(launch),
+            seed: crate::app::match_bootstrap::MatchSeed {
+                value: 73,
+                source: crate::app::match_bootstrap::MatchSeedSource::SavedScenario,
+                seed_authority_certifying: false,
+            },
+            game_mode,
+            native_id_prefix: 0,
+        };
+        let construction_rules = startup
+            .match_spec_for_construction(BootstrapRuleProfile::Multiplayer)
+            .rules();
+        assert_eq!(construction_rules, expected_construction);
+        let mut sim = Simulation::from_descriptor(&ScenarioDescriptor {
+            rule_policy: construction_rules,
+            ..Default::default()
+        });
+        crate::app::loading::init::install_startup_session_mode(&mut sim, &startup);
+        assert_eq!(sim.session().game_mode(), game_mode);
+        assert_eq!(
+            sim.session().execution_topology(),
+            ExecutionTopology::LocalOffline
+        );
+        assert_eq!(
+            sim.session().multiplayer_mode_class(),
+            Some(MpModeClass::Battle)
+        );
+        sim.session().rule_policy()
+    };
+    assert_eq!(
+        install(0, None, skirmish_rules),
+        RulePolicy::stock_campaign()
+    );
+    assert_eq!(install(5, None, skirmish_rules), skirmish_rules);
+    let custom_construction = skirmish_rules.with_uses_room_options(false);
+    let custom_live = custom_construction.with_bootstrap(BootstrapRuleProfile::Campaign);
+    assert_eq!(
+        install(5, Some(custom_live), custom_construction),
+        custom_live
+    );
+}
+
+#[test]
+fn authored_campaign_replay_uses_campaign_prefix_and_no_stock_seats() {
+    use crate::app::loading::fresh_scenario::{FreshScenarioFamily, FreshStartupProvenance};
+    use crate::app::match_bootstrap::{MatchSeed, MatchSeedSource};
+    use crate::map::campaign_manifest::CampaignManifest;
+    use crate::sim::scenario_bootstrap::AuthoredCampaignStart;
+    use crate::sim::scenario_session::ScenarioGameMode;
+
+    let dir =
+        crate::map::source::test_support::TestDirectory::new("authored-campaign-replay-summary");
+    let manifest_path = dir.path().join("campaign.ini");
+    std::fs::write(
+        &manifest_path,
+        b"[Stage Opening]\nMap=open.map\n[Roles Opening]\nLead=Americans\nWing=Americans\n[Grants Opening]\nWing.Russians=UnitsOnly",
+    ).unwrap();
+    let manifest = CampaignManifest::load(&manifest_path).unwrap();
+    let start =
+        AuthoredCampaignStart::from_stage(&manifest.stages[0], 0, 2, Default::default()).unwrap();
+    let policy = start.rule_policy();
+    let logical_map = "campaigns/test/open.map";
+    let local_map = dir
+        .path()
+        .join("relocated.map")
+        .to_string_lossy()
+        .into_owned();
+    let startup = LoadingStartup::AuthoredCampaignReplay {
+        start: Box::new(start),
+        logical_map: logical_map.into(),
+        local_map: local_map.clone(),
+        map_sha256: crate::util::sha256::sha256_hex(b"campaign scenario fixture"),
+        seed: MatchSeed {
+            value: 31,
+            source: MatchSeedSource::SavedScenario,
+            seed_authority_certifying: false,
+        },
+        native_id_prefix: 15,
+        game_mode: ScenarioGameMode::Wol,
+        game_speed: 4,
+    };
+    let source = crate::map::source::LoadedMapSource::Loose {
+        cache_lease: Default::default(),
+        path: local_map.clone().into(),
+        payload_len: 32,
+        source_sha256: crate::util::sha256::sha256_hex(b"campaign scenario fixture"),
+    };
+    let initial = MapLoadInitial::from_test_map_source(prefix_test_map(&[]), source);
+    let context = FreshScenarioLoadContextDescriptor::admit(
+        &startup,
+        initial.map_data(),
+        initial.map_source(),
+        &mut None,
+    )
+    .unwrap();
+    assert_eq!(context.family(), FreshScenarioFamily::Campaign);
+    assert_eq!(context.startup_provenance(), FreshStartupProvenance::Replay);
+    assert_eq!(context.match_seed(), 31);
+    assert!(startup.launch_session().is_none());
+    assert_eq!(startup.match_spec().rules(), policy);
+    assert_eq!(startup.authored_campaign_speed(), Some(4));
+    assert_eq!(startup.selected_map_file(), logical_map);
+    assert_eq!(startup.physical_map_file(), local_map);
+}
+
+#[test]
+#[ignore = "slow; retail warm/cold ordered online startup"]
+fn sequenced_wol_cold_and_warm_rules_share_world_and_agreement_identity() {
+    cold_and_warm_rules_share_world_and_agreement_identity(
+        crate::app::match_runtime::session::NetworkReturnContext::Wol,
+    );
+}
+
+/// The host's Create Random Map dialog or an earlier match warms its Rules
+/// owner; a just-opened guest's is cold. Both must still build one world.
+#[test]
+#[ignore = "slow; retail warm/cold LAN startup"]
+fn lan_cold_and_warm_rules_share_world_and_agreement_identity() {
+    cold_and_warm_rules_share_world_and_agreement_identity(
+        crate::app::match_runtime::session::NetworkReturnContext::LanLobby,
+    );
+}
+
+fn cold_and_warm_rules_share_world_and_agreement_identity(
+    context: crate::app::match_runtime::session::NetworkReturnContext,
+) {
+    use crate::app::match_runtime::session::{MatchSession, NetworkReturnContext};
+    use crate::sim::native_identity::network_native_id_prefix;
+    let wol = context == NetworkReturnContext::Wol;
+    let mode = context.session_mode();
+    let root = PathBuf::from(std::env::var_os("RA2_DIR").expect("retail RA2_DIR"));
+    let mut launch = test_launch_session(LaunchCountry::America);
+    launch.selected_map_file = Some("XMP03T4.MAP".into());
+    launch.opponents.clear();
+    launch.ai_player_count = 0;
+    let mut remote = launch.humans[0].clone();
+    remote.name = "Remote".into();
+    remote.raw_slot_index = Some(1);
+    remote.slot.country = LaunchCountry::Russia;
+    remote.slot.color_index = 1;
+    remote.slot.start_position = LaunchStartPosition::Position(1);
+    launch.humans.push(remote);
+    let mut session = MatchSession::default();
+    session.enter_network(context);
+    session
+        .accept_network_setup(launch, true, Some(7), false)
+        .unwrap();
+    if wol {
+        session.prepare_wol_timing([0], true).unwrap();
+    } else {
+        session.set_network_start_seed(73).unwrap();
+        session.prepare_network_timing(2, || 0).unwrap();
     }
+    let startup = session.freeze_network_start(73, None).unwrap();
+    let LoadingStartup::Network(admitted) = &startup else {
+        unreachable!()
+    };
+    let checkpoint = startup.native_id_prefix();
+    assert_eq!(network_native_id_prefix(mode, 1), None);
+
+    let assets = AssetManager::new(
+        &root,
+        crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+    )
+    .unwrap();
+    let audio = crate::rules::audio_sources::AudioDefinitions::select(&assets);
+    let (_, _, mut process_rules) = crate::rules::retail_sources::load_startup_rules(
+        &assets,
+        std::sync::Arc::clone(audio.sounds()),
+        std::sync::Arc::clone(audio.eva()),
+    )
+    .unwrap()
+    .into_parts();
+    let load = |rules: Option<&mut crate::rules::process_owner::NativeRulesProcessOwner>,
+                prefix| {
+        crate::headless_scenario::load_with_launch_and_ini(
+            &root,
+            "XMP03T4.MAP",
+            73,
+            crate::sim::scenario_bootstrap::MatchLaunchDescriptor::from_resolved(
+                admitted.launch_session().clone(),
+            )
+            .unwrap(),
+            &Default::default(),
+            mode,
+            prefix,
+            rules,
+        )
+        .unwrap()
+    };
+    // A real completed prior map load warms this independent process owner.
+    drop(load(Some(&mut process_rules), None));
+    let mut warm = load(Some(&mut process_rules), checkpoint);
+    let mut cold = load(None, checkpoint);
+    let mut agreements = Vec::new();
+    for scene in [&mut warm, &mut cold] {
+        let bindings = admitted
+            .launch_session()
+            .humans
+            .iter()
+            .enumerate()
+            .map(|(source, human)| {
+                (
+                    human.raw_slot_index.unwrap(),
+                    i8::try_from(
+                        crate::app::match_runtime::network_match::source_house(
+                            &session,
+                            scene.sim(),
+                            source,
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let sim = &mut scene.runtime.simulation;
+        crate::app::loading::init::install_startup_session_mode(sim, &startup);
+        sim.batch_path_searches();
+        // lan_service's start: a relay-ordered match sends every frame;
+        // LAN keeps native FrameSendRate 5 and no sequenced clock.
+        let send_rate = if wol { 1 } else { 5 };
+        sim.network_command_queues().install_timing(
+            bindings[0].1,
+            std::num::NonZeroU8::new(send_rate).unwrap(),
+            bindings.iter().map(|&(_, house)| house),
+        );
+        if wol {
+            sim.network_command_queues().configure_sequenced_clock(45);
+        }
+        agreements.push(
+            crate::net::live_commands::StartupAgreement::new(
+                bindings.iter().copied(),
+                bindings.iter().map(|&(row, _)| row),
+                73,
+                admitted.max_ahead_frames(),
+                45,
+                std::num::NonZeroU32::new(u32::from(send_rate)).unwrap(),
+                sim.state_hash(),
+                0,
+                "",
+                "",
+            )
+            .unwrap(),
+        );
+    }
+    assert_eq!(warm.sim().state_hash(), cold.sim().state_hash());
+    // And one reading of the picture and model files, which each start
+    // certifies with its world (`RuleSet::file_inputs_hash`).
+    assert_eq!(
+        warm.runtime.resources.rules.file_inputs_hash(),
+        cold.runtime.resources.rules.file_inputs_hash()
+    );
+    // And the retail install changes none of it: a refused start would name
+    // no file of its folder.
+    let folder_files = cold.runtime.resources.rules.file_input_folder_files();
+    assert!(folder_files.is_empty(), "{folder_files:?}");
+    assert_eq!(checkpoint, Some(0));
+    assert_eq!(warm.sim().native_identity_prefix_checkpoint(), Some(0));
+    assert_eq!(
+        warm.sim().native_identity_cursor(),
+        cold.sim().native_identity_cursor()
+    );
+    // The full value object includes every world-derived sequencing-identity
+    // input; the build and rules are process-level and left out here.
+    assert_eq!(agreements[0], agreements[1]);
+}
+
+#[test]
+fn failed_network_load_retries_its_shell_without_installing_an_offline_fallback() {
+    use crate::app::match_runtime::session::{MatchSession, NetworkReturnContext, SessionMode};
+    let mut session = MatchSession::default();
+    session.enter_network(NetworkReturnContext::LanLobby);
+    session
+        .accept_network_setup(
+            test_launch_session(LaunchCountry::America),
+            true,
+            Some(7),
+            false,
+        )
+        .unwrap();
+    session.set_network_start_seed(77).unwrap();
+    session.prepare_network_timing(2, || 0).unwrap();
+    let startup = session.freeze_network_start(77, None).unwrap();
+    let loading = LoadingSession::from_request(LoadingRequest::network(startup));
+    assert_eq!(
+        loading.failure_policy(),
+        LoadingFailurePolicy::RetryNetworkShell
+    );
+    assert_eq!(
+        session.return_to_network_lobby(),
+        Some(NetworkReturnContext::LanLobby)
+    );
+    assert_eq!(session.shell_mode(), Some(SessionMode::Lan));
+    assert!(session.network_setup().is_none());
 }
 
 struct TestClock(u32);
 
-impl crate::match_bootstrap::MatchSeedClock for TestClock {
+impl crate::app::match_bootstrap::MatchSeedClock for TestClock {
     fn low_u32(&mut self) -> u32 {
         self.0
     }
 
-    fn source(&self) -> crate::match_bootstrap::MatchSeedSource {
-        crate::match_bootstrap::MatchSeedSource::Controlled
+    fn source(&self) -> crate::app::match_bootstrap::MatchSeedSource {
+        crate::app::match_bootstrap::MatchSeedSource::Controlled
     }
 
     fn seed_authority_certifying(&self) -> bool {
@@ -59,22 +448,199 @@ impl crate::match_bootstrap::MatchSeedClock for TestClock {
     }
 }
 
-fn prepared_startup(next: &mut u64, seed: u32) -> crate::match_bootstrap::PreparedMatchStartup {
+fn prepared_startup(
+    next: &mut u64,
+    seed: u32,
+) -> crate::app::match_bootstrap::PreparedMatchStartup {
     let launch = test_launch_session(LaunchCountry::America);
-    let accepted = match crate::match_bootstrap::classify_startup_session(&launch) {
-        crate::match_bootstrap::StartupSessionClassification::AcceptedExplicitFixedBattle(
+    let accepted = match crate::app::match_bootstrap::classify_startup_session(&launch) {
+        crate::app::match_bootstrap::StartupSessionClassification::AcceptedExplicitFixedBattle(
             accepted,
-        ) => accepted,
+        ) => *accepted,
         other => panic!("fixture was not accepted: {other:?}"),
     };
-    let correlation = crate::match_bootstrap::allocate_match_correlation(next).unwrap();
-    crate::match_bootstrap::prepare_match_startup(correlation, accepted, &mut TestClock(seed))
+    let correlation = crate::app::match_bootstrap::allocate_match_correlation(next).unwrap();
+    crate::app::match_bootstrap::prepare_match_startup(correlation, accepted, &mut TestClock(seed))
 }
 
-pub(super) fn unverified_seed(value: u32) -> crate::match_bootstrap::MatchSeed {
-    crate::match_bootstrap::MatchSeed {
+pub(super) fn prepared_campaign() -> crate::app::match_bootstrap::PreparedCampaignStartup {
+    let ini = crate::rules::ini_parser::IniFile::from_str(
+        "[Battles]\n0=ALL1\n[ALL1]\nCD=2\nScenario=ALL01UMD.MAP\n",
+    );
+    let mut campaigns = crate::rules::campaigns::CampaignRegistry::default();
+    campaigns.apply_ini(&ini, &crate::rules::movies::MovieRegistry::default());
+    crate::app::match_bootstrap::prepare_campaign_startup(
+        &campaigns,
+        "ALL1",
+        1,
+        None,
+        None,
+        &mut TestClock(31),
+    )
+    .expect("synthetic campaign catalog admits a selected campaign")
+}
+
+/// VERA: a network match that seats no computer loads the original AI INI,
+/// and one that seats a computer the game folder's; its room's rules
+/// agreement asks the same of the same launch.
+#[test]
+fn a_network_load_reads_the_original_ai_ini_only_without_computers() {
+    use crate::app::match_runtime::session::{MatchSession, NetworkReturnContext};
+    use crate::rules::retail_sources::AiFile;
+    let dir = crate::map::source::test_support::TestDirectory::new("load-ai-file");
+    let assets = AssetManager::from_loose_root_for_test(dir.path());
+    let started = |computers: bool| {
+        let mut launch = test_launch_session(LaunchCountry::America);
+        if !computers {
+            launch.opponents.clear();
+            launch.ai_player_count = 0;
+        }
+        let mut guest = launch.humans[0].clone();
+        guest.name = "Guest".into();
+        guest.raw_slot_index = Some(2);
+        guest.slot.color_index = 2;
+        guest.slot.start_position = LaunchStartPosition::Position(2);
+        launch.humans.push(guest);
+        let mut session = MatchSession::default();
+        session.enter_network(NetworkReturnContext::LanLobby);
+        session
+            .accept_network_setup(launch, false, Some(7), false)
+            .unwrap();
+        let room = session.network_seats_computers();
+        session.prepare_network_timing(2, || 0).unwrap();
+        let startup = session.freeze_network_start(0xabc123, None).unwrap();
+        assert_eq!(session.network_seats_computers(), room);
+        (room, startup.ai_file(&assets))
+    };
+    assert_eq!(started(false), (false, AiFile::Original));
+    assert_eq!(started(true), (true, AiFile::GameFolder));
+}
+
+#[test]
+fn admitted_network_start_preserves_canonical_humans_and_host_seed_in_fresh_loading() {
+    use crate::app::match_runtime::session::{MatchSession, NetworkReturnContext, SessionMode};
+    let mut launch = test_launch_session(LaunchCountry::America);
+    launch.opponents.clear();
+    launch.humans[0].slot.color_index = 6;
+    let mut guest = launch.humans[0].clone();
+    guest.name = "Guest".into();
+    guest.raw_slot_index = Some(1);
+    guest.slot.color_index = 1;
+    guest.slot.start_position = LaunchStartPosition::Position(1);
+    launch.humans.push(guest);
+    launch.local_player_index = 1;
+    let mut session = MatchSession::default();
+    session.enter_network(NetworkReturnContext::LanLobby);
+    session
+        .accept_network_setup(launch, false, Some(7), false)
+        .unwrap();
+    session.prepare_network_timing(2, || 0).unwrap();
+    let startup = session.freeze_network_start(0xabc123, None).unwrap();
+    let request = LoadingRequest::network(startup);
+    let initial = crate::app::loading::init::MapLoadInitial::from_test_map_source(
+        prefix_test_map(&[(0, 20, 24), (1, 42, 46)]),
+        crate::map::source::LoadedMapSource::Loose {
+            cache_lease: Default::default(),
+            path: std::path::PathBuf::from("mp01t4.map"),
+            payload_len: 23,
+            source_sha256: crate::util::sha256::sha256_hex(b"synthetic network map"),
+        },
+    );
+    let prepared = request.prepare_initial(initial).unwrap();
+    assert_eq!(prepared.context.match_seed(), 0xabc123);
+    assert_eq!(
+        prepared.context.startup_provenance(),
+        crate::app::loading::fresh_scenario::FreshStartupProvenance::NetworkAccepted
+    );
+    let launch = prepared.context.stock_offline_launch().session();
+    assert_eq!(launch.humans.len(), 2);
+    assert_eq!(launch.local_player_index, 1);
+    assert_eq!(launch.local_player().name, "Guest");
+    let markers =
+        selected_map_start_assignments(launch, Some(prepared.context.stock_offline_projection()));
+    assert_eq!(
+        markers
+            .iter()
+            .map(|marker| marker.participant)
+            .collect::<Vec<_>>(),
+        vec![LoadingParticipantId::Human(0), LoadingParticipantId::Local]
+    );
+    assert_eq!(session.shell_mode(), Some(SessionMode::Lan));
+    assert!(!session.host());
+}
+
+#[test]
+fn campaign_preparation_failure_retires_the_lease_with_shell_retry_policy() {
+    let mut assets = crate::app::process_assets::ProcessAssets::new(
+        crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+        false,
+    );
+    assets.return_from_loading(AssetManager::from_loose_root_for_test(&std::env::temp_dir()));
+    let mut audio = test_audio();
+    let mut slot = None;
+    let mut startup = crate::app::match_runtime::startup::MatchStartup::default();
+    for consume_during_preparation in [false, true] {
+        replace_loading_attempt(
+            &mut slot,
+            &mut startup,
+            &mut assets,
+            &mut audio,
+            LoadingSession::from_request(LoadingRequest::campaign(prepared_campaign())),
+            10,
+        );
+        // Capture disposition while the immutable campaign request is still
+        // present: preparation can consume the slot before reporting failure.
+        let policy = slot.as_ref().unwrap().failure_policy();
+        assert_eq!(policy, LoadingFailurePolicy::RetryCampaignShell);
+        if consume_during_preparation {
+            let err = prepare_loading_session(
+                &mut assets,
+                &mut test_audio(),
+                &mut Default::default(),
+                None,
+                slot.take().unwrap(),
+                true,
+                None,
+                None,
+            )
+            .err()
+            .expect("missing config fails before a scenario can install");
+            assert!(err.to_string().contains("missing game config"));
+        }
+        assert_eq!(
+            retire_failed_loading_attempt(&mut slot, &mut startup, &mut assets, policy),
+            LoadingFailurePolicy::RetryCampaignShell,
+        );
+        assert!(slot.is_none() && assets.is_available() && !assets.is_leased());
+        assert!(startup.accepted().is_none());
+    }
+}
+
+#[test]
+fn a_failed_campaign_or_network_load_tells_the_player_why() {
+    let err = anyhow::anyhow!("unknown theater").context("map MYMAP.MAP");
+    for policy in [
+        LoadingFailurePolicy::RetryCampaignShell,
+        LoadingFailurePolicy::RetryNetworkShell,
+    ] {
+        let text = failed_load_notice(policy, &err).expect("the shell shows a box");
+        assert!(text.contains("map MYMAP.MAP: unknown theater"), "{text}");
+    }
+    // Skirmish keeps its result card and the generic fallback installs a map.
+    assert!(failed_load_notice(LoadingFailurePolicy::ReportNativeFailure, &err).is_none());
+    assert!(failed_load_notice(LoadingFailurePolicy::InstallGenericFallback, &err).is_none());
+    let long = anyhow::anyhow!("x".repeat(5000));
+    let text = failed_load_notice(LoadingFailurePolicy::RetryNetworkShell, &long).unwrap();
+    assert!(
+        text.chars().count() < 500,
+        "a debug dump is cut to fit the box"
+    );
+}
+
+pub(super) fn unverified_seed(value: u32) -> crate::app::match_bootstrap::MatchSeed {
+    crate::app::match_bootstrap::MatchSeed {
         value,
-        source: crate::match_bootstrap::MatchSeedSource::Controlled,
+        source: crate::app::match_bootstrap::MatchSeedSource::Controlled,
         seed_authority_certifying: false,
     }
 }
@@ -95,30 +661,20 @@ fn prefix_test_map(starts: &[(u8, u16, u16)]) -> crate::map::map_file::MapFile {
     map
 }
 
-fn generated_preview_with_starts(
-    seed: u16,
-    starts: &[(u8, u16, u16)],
-) -> crate::map::rmg::GeneratedMap {
-    crate::map::rmg::GeneratedMap {
-        map_file: prefix_test_map(starts),
-        mapgen_continuation: crate::map::rmg::RmgRng::new(seed).into_continuation(),
-        construction_trace: crate::map::rmg::RmgConstructionTrace::default(),
-        start_waypoints: starts.to_vec(),
-        stages_run: Vec::new(),
-        unfilled_start_slots: 0,
-    }
-}
-
 fn accepted_random_map_with_starts(
     selected_map_file: &str,
-    seed: u16,
     preview_waypoints: &[(u8, u16, u16)],
     staged_starts: &[(u8, u16, u16)],
 ) -> crate::app::shell_random_map::AcceptedRandomMapLaunch {
     let mut retention = crate::app::shell_random_map::RandomMapGenerationRetention::default();
-    let mut generated = generated_preview_with_starts(seed, staged_starts);
-    generated.map_file = prefix_test_map(preview_waypoints);
-    retention.finish_generation(generated);
+    retention.finish_generation(crate::map::rmg::GeneratedMap {
+        map_file: prefix_test_map(preview_waypoints),
+        construction_trace: crate::map::rmg::RmgConstructionTrace::default(),
+        start_waypoints: staged_starts.to_vec(),
+        stages_run: Vec::new(),
+        unfilled_start_slots: 0,
+        fairness: None,
+    });
     retention.accept_setup(selected_map_file);
     retention
         .take_acceptance_for_loading(Some(selected_map_file))
@@ -126,10 +682,10 @@ fn accepted_random_map_with_starts(
 }
 
 fn receipt_for(
-    startup: &crate::match_bootstrap::PreparedMatchStartup,
-) -> crate::match_bootstrap::RustL0Receipt {
+    startup: &crate::app::match_bootstrap::PreparedMatchStartup,
+) -> crate::app::match_bootstrap::RustL0Receipt {
     let simulation = crate::sim::world::Simulation::with_seed(u64::from(startup.seed.value));
-    crate::match_bootstrap::RustL0Observation {
+    crate::app::match_bootstrap::RustL0Observation {
         startup,
         simulation: &simulation,
         active_correlation: startup.correlation,
@@ -140,14 +696,16 @@ fn receipt_for(
     .expect("valid test startup must acknowledge")
 }
 
-fn test_audio() -> crate::app::audio_runtime::AppAudioRuntime {
+pub(super) fn test_audio() -> crate::app::audio_runtime::AppAudioRuntime {
     crate::app::audio_runtime::AppAudioRuntime {
         theme: crate::audio::theme::ThemeRuntime::default(),
-        last_theme_poll_ms: None,
+        service_clock: crate::audio::arbiter::AudioServiceClock::default(),
         music_player: None,
         sfx_player: None,
         launcher_audio_available: true,
         theme_startup_suppressed: false,
+        master_groups: Default::default(),
+        restore_muted: false,
     }
 }
 
@@ -213,8 +771,32 @@ fn begin_loading_plays_loading_theme_and_polls_theme_through_the_lease() {
     );
     let assets = audio_service_asset_manager(&process_assets, Some(session))
         .expect("leased manager serves the Theme poll");
-    audio.update_theme(assets, 600);
-    assert_eq!(audio.last_theme_poll_ms, Some(600));
+    let frontend = crate::sim::rng::MainRng::new(1);
+    let mut main = crate::app::state::process_main_draws(&frontend);
+    audio.service_audio(600, false, Some(assets), None, &mut main);
+    assert!(
+        !audio.service_clock.admit(600),
+        "the shared audio pass was admitted through the lease"
+    );
+}
+
+#[test]
+fn presentation_wait_retirement_returns_the_process_asset_lease() {
+    let mut assets = crate::app::process_assets::ProcessAssets::new(
+        crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+        false,
+    );
+    assets.return_from_loading(AssetManager::from_loose_root_for_test(&std::env::temp_dir()));
+    let mut session = LoadingSession::from_request(LoadingRequest::generic_map_load("pending"));
+    let mut result = super::super::transitions::fallback_map_load_result();
+    result.asset_manager = assets.lease_for_loading();
+    session.stage = LoadingStage::PreparingPresentation {
+        result: Box::new(result),
+    };
+    assert!(assets.is_leased() && !assets.is_available());
+    assert!(loading_asset_manager(&session).is_some());
+    session.retire(&mut assets);
+    assert!(assets.is_available() && !assets.is_leased());
 }
 
 #[test]
@@ -262,6 +844,36 @@ fn loading_replacement_and_terminal_retirement_preserve_cache_and_admission_orde
             )
             .is_err()
     );
+    // A fully loaded network wait retains the same leased cache; retiring it
+    // before peer completion must return that manager too.
+    let pending = slot.as_mut().unwrap();
+    let mut result = super::super::transitions::fallback_map_load_result();
+    result.scenario.startup = LoadingStartup::Accepted(replacement.clone());
+    result.asset_manager = pending.job.asset_manager.take();
+    pending.stage = LoadingStage::AwaitingPeers {
+        result: Box::new(result),
+        wait: NetworkLoadWait::new(0, 0.5),
+    };
+    let cached = audio_service_asset_manager(&assets, slot.as_ref())
+        .unwrap()
+        .load_file_from_mix("sentinel.bin")
+        .unwrap();
+    assert!(std::sync::Arc::ptr_eq(&original.bytes, &cached.bytes));
+    // A completed observer handoff retains that same result and cache after
+    // the real wait has finished. Cancel/replacement must return its lease too.
+    let pending = slot.as_mut().unwrap();
+    let LoadingStage::AwaitingPeers { result, .. } = std::mem::replace(
+        &mut pending.stage,
+        LoadingStage::Selected(LoadingRequest::generic_map_load("auto")),
+    ) else {
+        unreachable!()
+    };
+    pending.stage = LoadingStage::ReadyToInstall { result };
+    let cached = audio_service_asset_manager(&assets, slot.as_ref())
+        .unwrap()
+        .load_file_from_mix("sentinel.bin")
+        .unwrap();
+    assert!(std::sync::Arc::ptr_eq(&original.bytes, &cached.bytes));
     // The installer's resource-only cleanup must preserve the replacement
     // admission until its actual L0 observation commits.
     retire_loading_attempt(&mut slot, &mut assets);
@@ -288,9 +900,18 @@ fn loading_replacement_and_terminal_retirement_preserve_cache_and_admission_orde
         if consumed_during_preparation {
             // Exact production preparation failure before initial selection;
             // no config exists, while the prior lease is already owned.
-            let err = prepare_loading_session(&mut assets, slot.take().unwrap(), true, None)
-                .err()
-                .unwrap();
+            let err = prepare_loading_session(
+                &mut assets,
+                &mut test_audio(),
+                &mut Default::default(),
+                None,
+                slot.take().unwrap(),
+                true,
+                None,
+                None,
+            )
+            .err()
+            .unwrap();
             assert!(err.to_string().contains("missing game config"));
             assert!(assets.is_available());
         }
@@ -352,143 +973,212 @@ fn loading_replacement_and_terminal_retirement_preserve_cache_and_admission_orde
     ));
 }
 
-/// Uses the production initial-map reader and real retail trig tables;
-/// assertions distinguish initial read failure from context admission.
+/// Uses the production initial-map reader; assertions distinguish initial read
+/// failure from context admission.
 #[test]
-#[ignore = "requires RA2_DIR with verified retail gamemd.exe"]
+#[ignore = "requires RA2_DIR with the retail game files"]
 fn loading_preparation_consumes_real_source_and_returns_lease_on_initial_and_admission_failures() {
-    let ra2_dir = PathBuf::from(std::env::var_os("RA2_DIR").expect("RA2_DIR"));
-    crate::map::retail_trig::install_from_dir(&ra2_dir);
-    assert!(crate::map::retail_trig::wave_tables_available());
-    let dir = std::env::temp_dir().join(format!(
-        "vera20k-loading-preparation-{}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).unwrap();
-    let map_path = dir.join("mp01t4.map");
-    let retail_assets = AssetManager::new(
-        &ra2_dir,
-        crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
-    )
-    .unwrap();
-    for name in ["rulesmd.ini", "artmd.ini", "soundmd.ini", "evamd.ini"] {
-        std::fs::write(
-            dir.join(name),
-            retail_assets.get_ref(name).expect("retail INI"),
+    for ares_way in [false, true] {
+        let _ares = crate::rules::ares_switch::read_ares_way(ares_way);
+        let ra2_dir = PathBuf::from(std::env::var_os("RA2_DIR").expect("RA2_DIR"));
+        let dir = std::env::temp_dir().join(format!(
+            "vera20k-loading-preparation-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let map_path = dir.join("mp01t4.map");
+        let mut retail_assets = AssetManager::new(
+            &ra2_dir,
+            crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
         )
         .unwrap();
-    }
-    let map_bytes = retail_assets
-        .get("Fight.MAP")
-        .expect("retail Fight.MAP fixture");
-    std::fs::write(&map_path, map_bytes).unwrap();
-    std::fs::write(dir.join("sentinel.bin"), b"keep this cache").unwrap();
-    let mut assets = crate::app::process_assets::ProcessAssets::new(
-        crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
-        false,
-    );
-    assets.return_from_loading(AssetManager::from_loose_root_for_test(&dir));
-    let original = assets
-        .manager()
-        .unwrap()
-        .load_file_from_mix("sentinel.bin")
-        .unwrap();
-    let mut launch = test_launch_session(LaunchCountry::America);
-    launch.selected_map_file = Some(map_path.to_string_lossy().into_owned());
-    let request = LoadingRequest::unverified_legacy_skirmish(launch, unverified_seed(7));
-    let mut session = LoadingSession::from_request(request);
-    session.job.asset_manager = assets.lease_for_loading();
-    let session =
-        prepare_loading_session(&mut assets, session, true, Some(ra2_dir.clone())).unwrap();
-    assert_eq!(session.next_frame, NextLoadingFrame::Blank);
-    assert_eq!(
-        session.native.as_ref().unwrap().progress.current_value(),
-        0.0
-    );
-    let LoadingStage::Prepared(prepared) = &session.stage else {
-        panic!("prepared payload");
-    };
-    assert_eq!(
-        prepared.context.physical_source(),
-        prepared.initial.map_source()
-    );
-    assert_eq!(prepared.context.signed_new_ini_format(), 4);
-    assert!(!prepared.initial.map_data().waypoints.is_empty());
-    session.job.retire(&mut assets);
-
-    for (selected, expected_error) in [
-        (map_path.to_string_lossy().into_owned(), "Generic startup"),
-        (
-            dir.join("absent.map").to_string_lossy().into_owned(),
-            "absent.map",
-        ),
-    ] {
-        let mut session = LoadingSession::from_request(LoadingRequest::generic_map_load(selected));
+        for name in ["rulesmd.ini", "artmd.ini", "soundmd.ini", "evamd.ini"] {
+            std::fs::write(
+                dir.join(name),
+                retail_assets.get_ref(name).expect("retail INI"),
+            )
+            .unwrap();
+        }
+        // Preparing a game read the Ares way also reads the Country's loading
+        // palette (`MPLSU.PAL` for America, `rules::country_loading`) from
+        // this root.
+        if ares_way {
+            retail_assets.register_loading_archives().unwrap();
+            std::fs::write(
+                dir.join("mplsu.pal"),
+                retail_assets.get_ref("mplsu.pal").unwrap(),
+            )
+            .unwrap();
+        }
+        let map_bytes = retail_assets
+            .get("Fight.MAP")
+            .expect("retail Fight.MAP fixture");
+        std::fs::write(&map_path, map_bytes).unwrap();
+        std::fs::write(dir.join("sentinel.bin"), b"keep this cache").unwrap();
+        let mut assets = crate::app::process_assets::ProcessAssets::new(
+            crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+            false,
+        );
+        assets.return_from_loading(if ares_way {
+            AssetManager::from_loose_root_with_ares_for_test(&dir)
+        } else {
+            AssetManager::from_loose_root_for_test(&dir)
+        });
+        let original = assets
+            .manager()
+            .unwrap()
+            .load_file_from_mix("sentinel.bin")
+            .unwrap();
+        let mut launch = test_launch_session(LaunchCountry::America);
+        launch.selected_map_file = Some(map_path.to_string_lossy().into_owned());
+        let request = LoadingRequest::unverified_legacy_skirmish(launch, unverified_seed(7));
+        let mut session = LoadingSession::from_request(request);
         session.job.asset_manager = assets.lease_for_loading();
-        let err = prepare_loading_session(&mut assets, session, false, Some(ra2_dir.clone()))
+        let mut retention = crate::app::shell_random_map::RandomMapGenerationRetention::default();
+        if ares_way {
+            ensure_session_job_asset_manager(&mut assets, &mut session, Some(ra2_dir.clone()))
+                .unwrap();
+            assets.read_multiplayer_country(&crate::rules::ini_parser::IniFile::empty(), 0);
+            assets.refresh_multiplayer_country_bodies();
+        }
+        let session = prepare_loading_session(
+            &mut assets,
+            &mut test_audio(),
+            &mut retention,
+            None,
+            session,
+            true,
+            Some(ra2_dir.clone()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(session.next_frame, NextLoadingFrame::Blank);
+        assert_eq!(
+            session.native.as_ref().unwrap().progress.current_value(),
+            0.0
+        );
+        let LoadingStage::Prepared(prepared) = &session.stage else {
+            panic!("prepared payload");
+        };
+        assert_eq!(
+            prepared.context.physical_source(),
+            prepared.initial.map_source()
+        );
+        assert_eq!(prepared.context.signed_new_ini_format(), 4);
+        assert!(!prepared.initial.map_data().waypoints.is_empty());
+        session.retire(&mut assets);
+
+        for (selected, expected_error) in [
+            (map_path.to_string_lossy().into_owned(), "Generic startup"),
+            (
+                dir.join("absent.map").to_string_lossy().into_owned(),
+                "absent.map",
+            ),
+        ] {
+            let mut session =
+                LoadingSession::from_request(LoadingRequest::generic_map_load(selected));
+            session.job.asset_manager = assets.lease_for_loading();
+            let err = prepare_loading_session(
+                &mut assets,
+                &mut test_audio(),
+                &mut retention,
+                None,
+                session,
+                false,
+                Some(ra2_dir.clone()),
+                None,
+            )
             .err()
             .unwrap();
-        assert!(format!("{err:#}").contains(expected_error), "{err:#}");
-        assert!(assets.is_available() && !assets.is_leased());
-        assert!(std::sync::Arc::ptr_eq(
-            &original.bytes,
-            &assets
-                .manager()
-                .unwrap()
-                .load_file_from_mix("sentinel.bin")
-                .unwrap()
-                .bytes
-        ));
+            assert!(format!("{err:#}").contains(expected_error), "{err:#}");
+            assert!(assets.is_available() && !assets.is_leased());
+            assert!(std::sync::Arc::ptr_eq(
+                &original.bytes,
+                &assets
+                    .manager()
+                    .unwrap()
+                    .load_file_from_mix("sentinel.bin")
+                    .unwrap()
+                    .bytes
+            ));
+        }
     }
 }
 
 #[test]
-fn loading_side_comes_from_first_launch_node_country() {
-    let session = LoadingSession::from_request(LoadingRequest::unverified_legacy_skirmish(
-        test_launch_session(LaunchCountry::Korea),
-        unverified_seed(1),
-    ));
-
+fn loading_rows_draw_their_own_country_insignia_file() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let rules =
+        crate::rules::ruleset::RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(
+            "[Countries]\n0=Americans\n1=Custom\n[Custom]\nFile.Flag=MyFlag.PCX\n",
+        ))
+        .expect("insignia country rules parse");
     assert_eq!(
-        session.native.as_ref().map(|native| native.variant),
-        Some(LoadingArtVariant::Alliance)
+        super::loading_row_insignia(Some(&rules), None, 1).as_deref(),
+        Some("myflag.pcx")
+    );
+    assert_eq!(
+        super::loading_row_insignia(Some(&rules), Some(LoadingArtVariant::Americans), 0).as_deref(),
+        Some("usai.pcx")
+    );
+    // An observer row carries no Country selection, so the stock `-3` chain
+    // (obsi.pcx) still decides.
+    assert_eq!(
+        super::loading_row_insignia(Some(&rules), Some(LoadingArtVariant::Observer), 0),
+        None
     );
 }
 
 #[test]
-fn loading_progress_row_snapshots_the_launch_player_name() {
-    let mut launch = test_launch_session(LaunchCountry::America);
-    launch.player_name = "Commander".to_owned();
-    let session = LoadingSession::from_request(LoadingRequest::unverified_legacy_skirmish(
-        launch,
-        unverified_seed(22),
-    ));
-
-    assert_eq!(
-        session
-            .native
-            .as_ref()
-            .map(|native| native.progress_row.label.as_str()),
-        Some("Commander"),
-    );
+fn extended_country_identity_survives_without_stock_loading_art() {
+    // Human/AI creation indexes the full HouseType registry, while native
+    // stock loading art/insignia stop at9 (5534CE/4E3671).
+    for index in [10, 13, 14] {
+        let country = LaunchCountry::from_country_index(index);
+        let request = LoadingRequest::unverified_legacy_skirmish(
+            test_launch_session(country),
+            unverified_seed(1),
+        );
+        let session = LoadingSession::from_request(request);
+        assert_eq!(
+            session
+                .stage
+                .startup()
+                .launch_session()
+                .unwrap()
+                .local_slot()
+                .country,
+            country
+        );
+        let native = session.native.as_ref().unwrap();
+        assert_eq!(native.variant, NativeLoadingArt::StockOffline(None));
+        assert!(native.progress_row.participants[0].variant.is_none());
+        assert_eq!(native.local_side_index, -1);
+    }
 }
 
 #[test]
-fn loading_session_preserves_selected_map_filename() {
-    let session = LoadingSession::from_request(LoadingRequest::unverified_legacy_skirmish(
-        test_launch_session(LaunchCountry::Yuri),
-        unverified_seed(2),
-    ));
-
-    assert_eq!(session.stage.request().selected_map_file(), "mp01t4.map");
-    assert_eq!(
-        session
-            .stage
-            .request()
-            .skirmish_launch_session()
-            .and_then(|launch| launch.selected_map_file.as_deref()),
-        Some("mp01t4.map")
+fn ctor_only_country_side_uses_nonzero_loading_text_scheme() {
+    let schemes = [
+        ColorSchemeEntry {
+            name: "AlliedLoad".into(),
+            hsv: [1, 255, 255],
+        },
+        ColorSchemeEntry {
+            name: "SovietLoad".into(),
+            hsv: [127, 255, 255],
+        },
+    ];
+    let ramps = HouseColorRamps::from_schemes(&schemes);
+    let mut native = NativeLoadingScreenState::standard_skirmish(
+        None,
+        -1,
+        HouseColorIndex(0),
+        LoadingProgressRowSnapshot::default(),
+        NativeLoadingProgressCadence::SelectedMap,
     );
+    native.resolve_player_colors(&schemes, &ramps);
+    assert_eq!(native.text_rgb, normalize_rgb(hsv_to_rgb(schemes[1].hsv)));
 }
 
 #[test]
@@ -527,7 +1217,7 @@ fn gsi_04_12_generated_prefix_uses_accepted_staging_once() {
     let regenerated = [(0, 70, 90), (1, 90, 90)];
     let mut launch = test_launch_session(LaunchCountry::America);
     launch.selected_map_file = Some(selected.to_string());
-    let accepted = accepted_random_map_with_starts(selected, 0x1212, &preview_waypoints, &staged);
+    let accepted = accepted_random_map_with_starts(selected, &preview_waypoints, &staged);
     let mut regenerated_map =
         crate::map::rmg::emit::empty_map_file(&crate::map::rmg::RmgOptions::default(), 100, 100);
     regenerated_map
@@ -545,6 +1235,7 @@ fn gsi_04_12_generated_prefix_uses_accepted_staging_once() {
     regenerated_map.cells = [(60, 60), (60, 140), (140, 60), (140, 140)]
         .into_iter()
         .map(|(rx, ry)| MapCell {
+            legacy_ice_byte: 0,
             rx,
             ry,
             tile_index: 0,
@@ -556,6 +1247,7 @@ fn gsi_04_12_generated_prefix_uses_accepted_staging_once() {
         regenerated_map,
         crate::map::source::LoadedMapSource::Generated {
             seed_name: selected.to_ascii_lowercase(),
+            seed_source: None,
         },
     );
     let request =
@@ -595,6 +1287,7 @@ fn gsi_04_12_generated_prefix_uses_accepted_staging_once() {
         &launch,
         None,
         [800, 600],
+        crate::ui::shell::geom::RETAIL_SCALE,
         Some(DecodedPreview {
             width: 300,
             height: 100,
@@ -671,8 +1364,8 @@ fn gsi_04_12_generated_prefix_uses_accepted_staging_once() {
     );
     assert_eq!(
         staged_sim
-            .session
-            .mp_start_waypoints
+            .session()
+            .mp_start_waypoints()
             .iter()
             .map(|(&index, &(rx, ry))| (index as u8, rx, ry))
             .collect::<Vec<_>>(),
@@ -706,6 +1399,7 @@ fn load_descriptor_source_family_format_matrix() {
     ];
     for source in [
         crate::map::source::LoadedMapSource::Loose {
+            cache_lease: Default::default(),
             path: std::path::PathBuf::from("mp01t4.map"),
             payload_len: 17,
             source_sha256: crate::util::sha256::sha256_hex(b"synthetic map fixture"),
@@ -760,6 +1454,7 @@ fn load_descriptor_source_family_format_matrix() {
         launch.selected_map_file = Some(selected.clone());
         if mode_id == 2 {
             launch.mode = SkirmishLaunchMode {
+                class: crate::skirmish_modes::MpModeClass::FreeForAll,
                 id: 2,
                 ui_name_key: "GUI:FreeForAll".to_string(),
                 tooltip_key: "STT:ModeFreeForAll".to_string(),
@@ -770,11 +1465,12 @@ fn load_descriptor_source_family_format_matrix() {
                 must_ally: false,
             };
         }
-        let accepted = accepted_random_map_with_starts(&selected, 0x2345, &starts, &starts);
+        let accepted = accepted_random_map_with_starts(&selected, &starts, &starts);
         let mut map = prefix_test_map(&starts);
         map.basic.new_ini_format = Some(4);
         let source = crate::map::source::LoadedMapSource::Generated {
             seed_name: selected.to_ascii_lowercase(),
+            seed_source: None,
         };
         let initial =
             crate::app::loading::init::MapLoadInitial::from_test_map_source(map, source.clone());
@@ -807,6 +1503,7 @@ fn accepted_and_resolved_legacy_share_one_stock_cursor_shape() {
 
     let starts = [(0, 20, 24), (1, 42, 46)];
     let source = crate::map::source::LoadedMapSource::Loose {
+        cache_lease: Default::default(),
         path: std::path::PathBuf::from("mp01t4.map"),
         payload_len: 23,
         source_sha256: crate::util::sha256::sha256_hex(b"synthetic map fixture"),
@@ -877,22 +1574,23 @@ fn generic_manual_and_unresolved_legacy_reject_before_receipt_or_staging() {
     let starts = [(0, 20, 24), (1, 42, 46)];
     let source = crate::map::source::LoadedMapSource::Generated {
         seed_name: selected.to_string(),
+        seed_source: None,
     };
     let initial = crate::app::loading::init::MapLoadInitial::from_test_map_source(
         prefix_test_map(&starts),
         source,
     );
-    let accepted = accepted_random_map_with_starts(selected, 0x4567, &starts, &starts);
+    let accepted = accepted_random_map_with_starts(selected, &starts, &starts);
     let mut generic =
         LoadingRequest::generic_map_load(selected).with_accepted_random_map(Some(accepted));
     let generic_err = generic.admit_context(&initial).unwrap_err();
     assert!(format!("{generic_err:#}").contains("Generic startup"));
     assert!(generic.accepted_rmg_start_staging.is_some());
 
-    let accepted = accepted_random_map_with_starts(selected, 0x4567, &starts, &starts);
+    let accepted = accepted_random_map_with_starts(selected, &starts, &starts);
     let mut unresolved_session = test_launch_session(LaunchCountry::America);
     unresolved_session.selected_map_file = Some(selected.to_string());
-    unresolved_session.local.country_random = true;
+    unresolved_session.local_slot_mut().country_random = true;
     let mut unresolved =
         LoadingRequest::unverified_legacy_skirmish(unresolved_session, unverified_seed(0x4567))
             .with_accepted_random_map(Some(accepted));
@@ -903,6 +1601,7 @@ fn generic_manual_and_unresolved_legacy_reject_before_receipt_or_staging() {
     let authored = crate::app::loading::init::MapLoadInitial::from_test_map_source(
         prefix_test_map(&starts),
         crate::map::source::LoadedMapSource::Loose {
+            cache_lease: Default::default(),
             path: std::path::PathBuf::from("manual.map"),
             payload_len: 1,
             source_sha256: crate::util::sha256::sha256_hex(b"synthetic map fixture"),
@@ -925,11 +1624,11 @@ fn loading_assignments_keep_gather_table_slots_separate_from_sparse_waypoint_ind
 
     let mut launch = test_launch_session(LaunchCountry::America);
     let mut second_opponent = launch.opponents[0].clone();
+    second_opponent.raw_slot_index = 2;
     second_opponent.color_index = 2;
     second_opponent.start_position = LaunchStartPosition::Position(2);
     launch.opponents.push(second_opponent);
-    launch.pre_fill_house_roster =
-        crate::skirmish_launch::PreFillHouseRoster::from_compact_skirmish(2);
+    launch.ai_player_count = 2;
 
     // Gather target 3 retains raw slots 0 and 2, then appends a fallback
     // at vector position 2. The retained slot and fallback consequently
@@ -971,7 +1670,7 @@ fn loading_assignments_keep_gather_table_slots_separate_from_sparse_waypoint_ind
     // The compositor still reads original Scenario geometry. Native's odd
     // sparse-prefix rule visits raw waypoint 2 and colors it from table[2],
     // not from the retained Gather vector entry at position 1.
-    let raw_prefix = native_loading_waypoint_prefix(&map.waypoints);
+    let raw_prefix = native_loading_waypoint_prefix(&map.waypoints, 8);
     let markers = build_mmpb_marker_records(
         &raw_prefix,
         &assignments,
@@ -1001,51 +1700,6 @@ fn loading_assignments_keep_gather_table_slots_separate_from_sparse_waypoint_ind
 }
 
 #[test]
-fn gsi_04_12_generated_prefix_rejects_presentation_only_preview() {
-    let selected = "RandMap.Sed";
-    let starts = [(0, 20, 24), (1, 42, 46)];
-    let mut launch = test_launch_session(LaunchCountry::America);
-    launch.selected_map_file = Some(selected.to_string());
-    let initial = crate::app::loading::init::MapLoadInitial::from_test_map_source(
-        prefix_test_map(&starts),
-        crate::map::source::LoadedMapSource::Generated {
-            seed_name: selected.to_string(),
-        },
-    );
-    let mut request = LoadingRequest::unverified_legacy_skirmish(launch, unverified_seed(0x1313))
-        .with_random_map_preview(Some(generated_preview_with_starts(0x1313, &starts)));
-
-    let err = request.admit_context(&initial).unwrap_err();
-    assert!(
-        format!("{err:#}").contains("no accepted setup start staging"),
-        "unexpected error: {err:#}"
-    );
-}
-
-#[test]
-fn generated_prefix_rejects_mismatched_source_name() {
-    let selected = "RandMap.Sed";
-    let starts = [(0, 20, 24), (1, 42, 46)];
-    let mut launch = test_launch_session(LaunchCountry::America);
-    launch.selected_map_file = Some(selected.to_string());
-    let accepted = accepted_random_map_with_starts(selected, 0x1414, &starts, &starts);
-    let initial = crate::app::loading::init::MapLoadInitial::from_test_map_source(
-        prefix_test_map(&starts),
-        crate::map::source::LoadedMapSource::Generated {
-            seed_name: "Other.Sed".to_string(),
-        },
-    );
-    let mut request = LoadingRequest::unverified_legacy_skirmish(launch, unverified_seed(0x1414))
-        .with_accepted_random_map(Some(accepted));
-
-    let err = request.admit_context(&initial).unwrap_err();
-    assert!(
-        format!("{err:#}").contains("does not match selected record"),
-        "unexpected error: {err:#}"
-    );
-}
-
-#[test]
 fn generated_prefix_rejects_cooperative_mode() {
     let selected = "RandMap.Sed";
     let starts = [(0, 20, 24), (1, 42, 46)];
@@ -1056,11 +1710,12 @@ fn generated_prefix_rejects_cooperative_mode() {
         .find(|mode| mode.id == 3)
         .expect("retail Cooperative row");
     launch.mode = SkirmishLaunchMode::from_game_mode(&cooperative);
-    let accepted = accepted_random_map_with_starts(selected, 0x1515, &starts, &starts);
+    let accepted = accepted_random_map_with_starts(selected, &starts, &starts);
     let initial = crate::app::loading::init::MapLoadInitial::from_test_map_source(
         prefix_test_map(&starts),
         crate::map::source::LoadedMapSource::Generated {
             seed_name: selected.to_string(),
+            seed_source: None,
         },
     );
     let mut request = LoadingRequest::unverified_legacy_skirmish(launch, unverified_seed(0x1515))
@@ -1078,33 +1733,12 @@ fn generated_prefix_rejects_cooperative_mode() {
 }
 
 #[test]
-fn generated_prefix_rejects_a_spoofed_stock_row_before_consuming_staging() {
-    let selected = "RandMap.SED";
-    let starts = [(0, 20, 24), (1, 42, 46)];
-    let mut launch = test_launch_session(LaunchCountry::America);
-    launch.selected_map_file = Some(selected.to_string());
-    launch.mode.tooltip_key = "STT:SpoofedBattle".to_string();
-    let accepted = accepted_random_map_with_starts(selected, 0x1516, &starts, &starts);
-    let initial = crate::app::loading::init::MapLoadInitial::from_test_map_source(
-        prefix_test_map(&starts),
-        crate::map::source::LoadedMapSource::Generated {
-            seed_name: selected.to_string(),
-        },
-    );
-    let mut request = LoadingRequest::unverified_legacy_skirmish(launch, unverified_seed(0x1516))
-        .with_accepted_random_map(Some(accepted));
-
-    let err = request.admit_context(&initial).unwrap_err();
-    assert!(format!("{err:#}").contains("not the validated active-retail stock row"));
-    assert!(request.accepted_rmg_start_staging.is_some());
-}
-
-#[test]
 fn authored_prefix_rejects_random_map_staging_for_loose_and_mix_sources() {
     let selected = "mp01t4.map";
     let starts = [(0, 20, 24), (1, 42, 46)];
     let sources = [
         crate::map::source::LoadedMapSource::Loose {
+            cache_lease: Default::default(),
             path: std::path::PathBuf::from(selected),
             payload_len: 1,
             source_sha256: crate::util::sha256::sha256_hex(b"synthetic map fixture"),
@@ -1120,7 +1754,7 @@ fn authored_prefix_rejects_random_map_staging_for_loose_and_mix_sources() {
     for source in sources {
         let mut launch = test_launch_session(LaunchCountry::America);
         launch.selected_map_file = Some(selected.to_string());
-        let accepted = accepted_random_map_with_starts(selected, 0x1616, &starts, &starts);
+        let accepted = accepted_random_map_with_starts(selected, &starts, &starts);
         let initial = crate::app::loading::init::MapLoadInitial::from_test_map_source(
             prefix_test_map(&starts),
             source,
@@ -1172,6 +1806,7 @@ fn gsi_04_12_stock_ffa_preview_can_only_supply_loading_fallback_pixels() {
 
     let mut launch = test_launch_session(LaunchCountry::America);
     launch.mode = SkirmishLaunchMode {
+        class: crate::skirmish_modes::MpModeClass::FreeForAll,
         id: 2,
         ui_name_key: "GUI:FreeForAll".to_string(),
         tooltip_key: "STT:ModeFreeForAll".to_string(),
@@ -1187,6 +1822,7 @@ fn gsi_04_12_stock_ffa_preview_can_only_supply_loading_fallback_pixels() {
         crate::map::rmg::emit::empty_map_file(&crate::map::rmg::RmgOptions::default(), 100, 100);
     map.cells = vec![
         MapCell {
+            legacy_ice_byte: 0,
             rx: 60,
             ry: 60,
             tile_index: 0,
@@ -1194,6 +1830,7 @@ fn gsi_04_12_stock_ffa_preview_can_only_supply_loading_fallback_pixels() {
             z: 0,
         },
         MapCell {
+            legacy_ice_byte: 0,
             rx: 60,
             ry: 140,
             tile_index: 0,
@@ -1201,6 +1838,7 @@ fn gsi_04_12_stock_ffa_preview_can_only_supply_loading_fallback_pixels() {
             z: 0,
         },
         MapCell {
+            legacy_ice_byte: 0,
             rx: 140,
             ry: 60,
             tile_index: 0,
@@ -1238,11 +1876,11 @@ fn gsi_04_12_stock_ffa_preview_can_only_supply_loading_fallback_pixels() {
     let active_scenario_waypoints = map.waypoints.clone();
     let generated = crate::map::rmg::GeneratedMap {
         map_file: map,
-        mapgen_continuation: crate::map::rmg::RmgRng::new(0x4567).into_continuation(),
         construction_trace: crate::map::rmg::RmgConstructionTrace::default(),
         start_waypoints: vec![(0, 70, 70), (1, 90, 70), (2, 70, 90)],
         stages_run: Vec::new(),
         unfilled_start_slots: 0,
+        fairness: None,
     };
     let _request =
         LoadingRequest::unverified_legacy_skirmish(launch.clone(), unverified_seed(0x4567))
@@ -1261,6 +1899,7 @@ fn gsi_04_12_stock_ffa_preview_can_only_supply_loading_fallback_pixels() {
         &launch,
         None,
         [800, 600],
+        crate::ui::shell::geom::RETAIL_SCALE,
         Some(preview),
         &launch_map,
         &active_scenario_waypoints,
@@ -1271,8 +1910,10 @@ fn gsi_04_12_stock_ffa_preview_can_only_supply_loading_fallback_pixels() {
         prepared
             .image
             .rgba
-            .chunks_exact(4)
-            .filter(|pixel| *pixel == [0, 0, 0, 255])
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|pixel| **pixel == [0, 0, 0, 255])
             .count(),
         3 * 4 * 4,
         "all three valid FFA starts are burned black"
@@ -1301,34 +1942,15 @@ fn random_map_progress_uses_native_integer_halving_and_raw_200_terminal() {
 }
 
 #[test]
-fn loading_session_falls_back_without_native_session_only_outside_parity_path() {
-    let session = LoadingSession::from_request(LoadingRequest::generic_map_load("auto"));
-
-    assert!(session.native.is_none());
-    assert!(session.stage.request().skirmish_launch_session().is_none());
-    assert_eq!(session.stage.request().selected_map_file(), "auto");
-}
-
-#[test]
-fn loading_session_starts_at_initial_map_selection_phase() {
-    let session = LoadingSession::from_request(LoadingRequest::unverified_legacy_skirmish(
-        test_launch_session(LaunchCountry::America),
-        unverified_seed(3),
-    ));
-
-    assert!(matches!(session.stage, LoadingStage::Selected(_)));
-}
-
-#[test]
 fn loading_request_moves_exact_startup_authority_once() {
     struct Clock;
-    impl crate::match_bootstrap::MatchSeedClock for Clock {
+    impl crate::app::match_bootstrap::MatchSeedClock for Clock {
         fn low_u32(&mut self) -> u32 {
             0x1234_5678
         }
 
-        fn source(&self) -> crate::match_bootstrap::MatchSeedSource {
-            crate::match_bootstrap::MatchSeedSource::Controlled
+        fn source(&self) -> crate::app::match_bootstrap::MatchSeedSource {
+            crate::app::match_bootstrap::MatchSeedSource::Controlled
         }
 
         fn seed_authority_certifying(&self) -> bool {
@@ -1337,22 +1959,24 @@ fn loading_request_moves_exact_startup_authority_once() {
     }
 
     let session = test_launch_session(LaunchCountry::America);
-    let accepted = match crate::match_bootstrap::classify_startup_session(&session) {
-        crate::match_bootstrap::StartupSessionClassification::AcceptedExplicitFixedBattle(
+    let accepted = match crate::app::match_bootstrap::classify_startup_session(&session) {
+        crate::app::match_bootstrap::StartupSessionClassification::AcceptedExplicitFixedBattle(
             accepted,
-        ) => accepted,
+        ) => *accepted,
         other => panic!("fixture was not accepted: {other:?}"),
     };
     let mut next = 1;
-    let correlation = crate::match_bootstrap::allocate_match_correlation(&mut next).unwrap();
+    let correlation = crate::app::match_bootstrap::allocate_match_correlation(&mut next).unwrap();
     let mut clock = Clock;
-    let prepared = crate::match_bootstrap::prepare_match_startup(correlation, accepted, &mut clock);
+    let prepared =
+        crate::app::match_bootstrap::prepare_match_startup(correlation, accepted, &mut clock);
     let request = LoadingRequest::accepted_skirmish(prepared.clone());
 
     assert_eq!(request.startup().accepted(), Some(&prepared));
     let initial = MapLoadInitial::from_test_map_source(
         prefix_test_map(&[(0, 20, 24), (1, 42, 46)]),
         crate::map::source::LoadedMapSource::Loose {
+            cache_lease: Default::default(),
             path: PathBuf::from("mp01t4.map"),
             payload_len: 1,
             source_sha256: crate::util::sha256::sha256_hex(b"synthetic map fixture"),
@@ -1416,6 +2040,47 @@ fn replacing_loading_startup_retires_prior_admission() {
 }
 
 #[test]
+fn saved_load_retires_fresh_receipt_and_admits_restored_exact_steps() {
+    use crate::app::match_runtime::startup::MatchStartup;
+    let mut next = 1;
+    let prior = prepared_startup(&mut next, 0x1111_2222);
+    let mut warm = MatchStartup::default();
+    warm.begin(Some(prior.correlation));
+    let simulation = crate::sim::world::Simulation::with_seed(u64::from(prior.seed.value));
+    warm.acknowledge(prior.clone(), Some(&simulation), true)
+        .unwrap();
+
+    // A cold menu and an outgoing accepted match reach the same successful
+    // saved-world commit. Neither may expose the prior map's L0 afterward.
+    for mut authority in [MatchStartup::default(), warm] {
+        authority.acknowledge_saved_load(None);
+        assert!(authority.startup().is_none());
+        assert!(authority.receipt().is_none());
+        assert!(authority.admits_ordinary_tick());
+        assert!(authority.admits_exact_step());
+
+        let restored = authority.clone();
+        assert!(
+            authority
+                .acknowledge(prior.clone(), Some(&simulation), true)
+                .is_err()
+        );
+        assert_eq!(
+            authority, restored,
+            "stale fresh-load completion cannot replace saved admission"
+        );
+        authority.clear();
+        assert!(!authority.admits_exact_step());
+        authority.acknowledge_saved_load(None);
+        authority.begin(Some(prior.correlation));
+        assert!(
+            !authority.admits_exact_step(),
+            "a new loading attempt retires saved admission"
+        );
+    }
+}
+
+#[test]
 fn rejected_startup_observation_does_not_publish_partial_admission() {
     use crate::app::match_runtime::startup::MatchStartup;
     let mut next = 1;
@@ -1438,42 +2103,6 @@ fn rejected_startup_observation_does_not_publish_partial_admission() {
     authority.begin(None);
     assert!(authority.admits_ordinary_tick());
     assert!(!authority.admits_exact_step());
-}
-
-#[test]
-fn loading_progress_standard_skirmish_initializes_one_lane_max_100() {
-    let progress = LoadingProgressState::standard_skirmish();
-
-    assert_eq!(progress.max_value(), 100.0);
-    assert_eq!(progress.current_value(), 0.0);
-    assert_eq!(progress.current_percent(), 0.0);
-}
-
-#[test]
-fn loading_progress_duplicate_milestones_do_not_redraw() {
-    let mut progress = LoadingProgressState::standard_skirmish();
-
-    assert!(progress.advance_progress(3));
-    assert!(!progress.advance_progress(3));
-    assert_eq!(progress.current_value(), 3.0);
-}
-
-#[test]
-fn loading_progress_lower_milestone_does_not_redraw() {
-    let mut progress = LoadingProgressState::standard_skirmish();
-
-    assert!(progress.advance_progress(8));
-    assert!(!progress.advance_progress(6));
-    assert_eq!(progress.current_value(), 8.0);
-}
-
-#[test]
-fn loading_progress_advancing_milestone_requests_redraw() {
-    let mut progress = LoadingProgressState::standard_skirmish();
-
-    assert!(progress.advance_progress(3));
-    assert!(progress.advance_progress(8));
-    assert_eq!(progress.current_value(), 8.0);
 }
 
 #[test]
@@ -1506,23 +2135,9 @@ fn loading_progress_theater_ramp_stock_rulesmd_count_emits_13_through_25() {
 }
 
 #[test]
-fn loading_progress_theater_ramp_nonmultiple_base_count_uses_native_quotient() {
-    let emitted = theater_ramp_changed_values(38);
-
-    assert_eq!(emitted, (13..=25).collect::<Vec<_>>());
-}
-
-#[test]
 fn loading_progress_theater_ramp_zero_or_invalid_small_count_has_no_dynamic_values() {
     assert!(theater_ramp_changed_values(0).is_empty());
     assert!(theater_ramp_changed_values(12).is_empty());
-}
-
-#[test]
-fn loading_theater_cache_mismatch_covers_first_same_and_changed_cases() {
-    assert!(theater_cache_mismatch(false, "TEMPERATE", "TEMPERATE"));
-    assert!(!theater_cache_mismatch(true, "TEMPERATE", "temperate"));
-    assert!(theater_cache_mismatch(true, "TEMPERATE", "SNOW"));
 }
 
 #[test]
@@ -1532,33 +2147,39 @@ fn selected_native_gate_preserves_metadata_and_raw_progress_cadence() {
         (NativeLoadingProgressCadence::RandomMapHalved, 6.0),
     ] {
         let mut native = NativeLoadingScreenState::standard_skirmish(
-            LoadingArtVariant::Americans,
+            Some(LoadingArtVariant::Americans),
             0,
             HouseColorIndex(0),
-            LoadingProgressRowSnapshot {
-                label: "Player".into(),
-            },
+            LoadingProgressRowSnapshot::from_launch_session(
+                &test_launch_session(LaunchCountry::America),
+                crate::rules::skirmish_colors::SkirmishColorMode::VANILLA,
+            ),
             cadence,
         );
         native.runtime_color_scheme_count = 16;
         {
-            let mut phase = LoadingPhaseProgress::select(Some(&mut native), true, |_| {
-                panic!("no atlas must select the real gated sink")
-            });
+            let mut phase =
+                LoadingPhaseProgress::select(Some(&mut native), true, true, None, |_, _| {
+                    panic!("no atlas must select the real gated sink")
+                });
             assert!(matches!(&phase.sink, SelectedProgressSink::Gated(_)));
             assert!(phase.native_theater_cache_mismatch);
             assert_eq!(phase.runtime_color_scheme_count, 16);
             for raw in [8, 6, 8, 12, 12] {
-                phase.sink.milestone(raw);
+                phase.sink.milestone(raw).unwrap();
             }
         }
         assert_eq!(native.progress.current_percent(), expected);
         {
-            let mut phase = LoadingPhaseProgress::select(Some(&mut native), false, |_| {
-                panic!("no atlas must select the real gated sink")
-            });
+            let mut phase =
+                LoadingPhaseProgress::select(Some(&mut native), false, true, None, |_, _| {
+                    panic!("no atlas must select the real gated sink")
+                });
             assert!(!phase.native_theater_cache_mismatch);
-            phase.sink.milestone(cadence.terminal_raw_percent());
+            phase
+                .sink
+                .milestone(cadence.terminal_raw_percent())
+                .unwrap();
         }
         assert_eq!(native.progress.current_percent(), 100.0);
     }
@@ -1575,12 +2196,13 @@ fn native_loading_state_keeps_the_full_player_progress_ramp() {
         mk("DarkBlue", [153, 214, 212]),
     ]);
     let mut native = NativeLoadingScreenState::standard_skirmish(
-        LoadingArtVariant::Americans,
+        Some(LoadingArtVariant::Americans),
         0,
         HouseColorIndex(1),
-        LoadingProgressRowSnapshot {
-            label: "Player".to_owned(),
-        },
+        LoadingProgressRowSnapshot::from_launch_session(
+            &test_launch_session(LaunchCountry::America),
+            crate::rules::skirmish_colors::SkirmishColorMode::VANILLA,
+        ),
         NativeLoadingProgressCadence::SelectedMap,
     );
     native.resolve_player_colors(
@@ -1592,25 +2214,6 @@ fn native_loading_state_keeps_the_full_player_progress_ramp() {
     assert_eq!(native.progress_ramp, *ramps.ramp(HouseColorIndex(1)));
     assert_ne!(native.progress_ramp[0], native.progress_ramp[15]);
     assert!(native.progress_ramp[0].b > native.progress_ramp[0].r);
-}
-
-#[test]
-fn both_native_loading_cadences_prepare_scenario_before_first_frame() {
-    assert!(NativeLoadingProgressCadence::SelectedMap.prepares_scenario_before_first_frame());
-    assert!(NativeLoadingProgressCadence::RandomMapHalved.prepares_scenario_before_first_frame());
-}
-
-#[test]
-fn selected_generic_progress_uses_no_native_loader_metadata() {
-    let mut phase = LoadingPhaseProgress::select(None, true, |_| {
-        panic!("generic loading must never construct rendering progress")
-    });
-    assert!(matches!(&phase.sink, SelectedProgressSink::Generic(_)));
-    assert!(!phase.native_theater_cache_mismatch);
-    assert_eq!(phase.runtime_color_scheme_count, 0);
-    for raw in [8, 6, 8, 12, 100, 200] {
-        phase.sink.milestone(raw);
-    }
 }
 
 /// Startup absence and a lost loading lease both rebuild from the retained
@@ -1720,4 +2323,420 @@ fn absent_and_lost_loading_managers_preserve_media_policy() {
         session.job.retire(&mut owner);
         assert!(owner.is_available());
     }
+}
+
+#[test]
+fn native_loading_percentage_controls_and_completion_match_original() {
+    let corpus: serde_json::Value =
+        crate::test_fixture::json("tools/storage_oracle/lan_lobby.json").clone();
+    for row in corpus["loading_wait_progress"].as_array().unwrap() {
+        let mut launch = test_launch_session(LaunchCountry::America);
+        let template = launch.humans[0].clone();
+        launch.humans = (0..row["count"].as_u64().unwrap() as usize)
+            .map(|index| {
+                let mut human = template.clone();
+                human.name = format!("Player{index}");
+                human.raw_slot_index = Some(index as u8);
+                human
+            })
+            .collect();
+        let mut rows = LoadingProgressRowSnapshot::from_launch_session(
+            &launch,
+            crate::rules::skirmish_colors::SkirmishColorMode::VANILLA,
+        );
+        let mut local = LoadingProgressState::standard_skirmish();
+        for update in row["updates"].as_array().unwrap() {
+            let index = update[0].as_u64().unwrap() as usize;
+            let percent = update[1].as_i64().unwrap() as i32;
+            if index == 0 {
+                local.advance_progress(percent as u32);
+            } else {
+                // This corpus exercises native SetPercent643C94..643CC9 and
+                // the original average/wait controls, including signed values
+                // after100. The network row's VERA terminal latch is a separate
+                // transport policy, covered by the real-UDP loading test.
+                rows.participants[index]
+                    .remote_progress
+                    .as_mut()
+                    .unwrap()
+                    .set_percent(f64::from(percent));
+            }
+        }
+        for (index, expected) in row["values"].as_array().unwrap().iter().enumerate() {
+            let actual = rows.participants[index]
+                .remote_progress
+                .as_ref()
+                .unwrap_or(&local)
+                .current_value();
+            assert_eq!(actual, expected.as_f64().unwrap());
+        }
+        let fraction = rows.total_fraction(&local);
+        let expected = row["fraction"].as_f64().unwrap();
+        // Native x87 averages retain intermediate precision; integer packet
+        // values cannot reach that sub-ULP gap at the0.9995 admission boundary.
+        assert!((fraction - expected).abs() <= expected.abs().max(1.0) * f64::EPSILON * 2.0);
+        let mut wait = NetworkLoadWait::new(10, fraction);
+        assert_eq!(
+            wait.poll(10, fraction) == NetworkLoadPoll::Complete,
+            row["complete"].as_bool().unwrap()
+        );
+    }
+}
+
+#[test]
+fn network_loading_wait_resends_rearms_on_regression_and_expires_before_completion() {
+    let mut wait = NetworkLoadWait::new(0, 0.5);
+    assert_eq!(wait.poll(299, 0.5), NetworkLoadPoll::Pending);
+    assert_eq!(wait.poll(300, 0.5), NetworkLoadPoll::ReportProgress);
+    assert_eq!(wait.poll(359, 0.5), NetworkLoadPoll::Pending);
+    assert_eq!(wait.poll(360, 0.5), NetworkLoadPoll::ReportProgress);
+    assert_eq!(wait.poll(1000, 0.75), NetworkLoadPoll::ReportProgress);
+    assert_eq!(wait.poll(1001, 0.5), NetworkLoadPoll::Pending);
+    assert_eq!(wait.poll(8200, 0.5), NetworkLoadPoll::ReportProgress);
+    assert_eq!(wait.poll(8201, 1.0), NetworkLoadPoll::TimedOut);
+    let mut unchanged = NetworkLoadWait::new(0, 0.5);
+    assert_eq!(unchanged.poll(3600, 0.5), NetworkLoadPoll::TimedOut);
+}
+
+/// A two-human network start whose remote player is still loading; returns the
+/// local and remote House ids.
+fn network_load_with_remote_peer(
+    context: crate::app::match_runtime::session::NetworkReturnContext,
+) -> (
+    crate::app::match_runtime::session::MatchSession,
+    MapLoadResult,
+    crate::sim::intern::InternedId,
+    crate::sim::intern::InternedId,
+) {
+    let mut launch = test_launch_session(LaunchCountry::America);
+    launch.opponents.clear();
+    launch.ai_player_count = 0;
+    let mut remote = launch.humans[0].clone();
+    remote.name = "Remote".into();
+    remote.raw_slot_index = Some(1);
+    remote.slot.color_index = 1;
+    remote.slot.start_position = LaunchStartPosition::Position(1);
+    launch.humans.push(remote);
+    let rules = crate::rules::ruleset::RuleSet::from_ini(
+        &crate::rules::ini_parser::IniFile::from_str("[Countries]\n0=Americans\n"),
+    )
+    .unwrap();
+    let descriptor =
+        crate::sim::scenario_bootstrap::MatchLaunchDescriptor::from_resolved(launch.clone())
+            .unwrap();
+    let mut sim = crate::sim::world::Simulation::new();
+    crate::sim::scenario_bootstrap::initialize_skirmish_launch_houses(
+        &mut sim,
+        &Default::default(),
+        &rules,
+        &descriptor,
+    );
+    let local = sim.interner().get("Player").unwrap();
+    let peer = sim.interner().get("Remote").unwrap();
+    let mut session = crate::app::match_runtime::session::MatchSession::default();
+    session.enter_network(context);
+    session
+        .accept_network_setup(launch, true, Some(7), false)
+        .unwrap();
+    session.prepare_network_timing(2, || 0).unwrap();
+    let mut result = super::super::transitions::fallback_map_load_result();
+    result.scenario.startup = session.freeze_network_start(1, None).unwrap();
+    result.scenario.simulation = Some(sim);
+    (session, result, local, peer)
+}
+
+#[test]
+fn loading_timeout_retires_only_live_peer_and_flags_existing_house_before_install() {
+    let (mut session, mut result, local, peer) = network_load_with_remote_peer(
+        crate::app::match_runtime::session::NetworkReturnContext::LanLobby,
+    );
+    assert!(!session.retire_cooperative_start_on_timeout(&[1]));
+    let notices = apply_network_loading_disconnects(&mut session, &mut result, &[1]);
+    assert_eq!(
+        notices,
+        vec![
+            crate::app::match_runtime::network_match::ConnectionDestroyed {
+                owner: peer,
+                key: "TXT_CONNECTION_LOST",
+                player: None,
+            }
+        ]
+    );
+    assert_eq!(session.network_connected_source_indices(), &[0]);
+    assert_eq!(
+        result
+            .scenario
+            .startup
+            .launch_session()
+            .unwrap()
+            .humans
+            .len(),
+        2
+    );
+    let sim = result.scenario.simulation.as_ref().unwrap();
+    assert!(sim.houses()[&peer].is_to_die());
+    // DestroyConnection's line names the House by its own +0x1602A.
+    assert_eq!(
+        sim.houses()[&peer].ui_name(),
+        &crate::sim::house_state::HouseUiName::Handle("Remote".into())
+    );
+    assert!(!sim.houses()[&local].is_to_die());
+    assert_eq!(sim.session().current_house(), Some(local));
+    assert!(apply_network_loading_disconnects(&mut session, &mut result, &[1]).is_empty());
+}
+
+/// Online play orders commands through the relay, which departs a player who
+/// never becomes ready in the first frame. Retiring it locally as well would
+/// leave this client's roster short of the relay certificate.
+#[test]
+fn online_loading_timeout_leaves_the_departure_to_the_relay() {
+    let (mut session, mut result, _, peer) = network_load_with_remote_peer(
+        crate::app::match_runtime::session::NetworkReturnContext::Wol,
+    );
+    assert!(apply_network_loading_disconnects(&mut session, &mut result, &[1]).is_empty());
+    assert_eq!(session.network_connected_source_indices(), &[0, 1]);
+    let sim = result.scenario.simulation.as_ref().unwrap();
+    assert!(!sim.houses()[&peer].is_to_die());
+}
+
+#[cfg(target_os = "linux")]
+#[path = "campaign_miner_tests.rs"]
+mod campaign_miner;
+
+#[test]
+fn a_network_start_installs_its_mode_and_timing_into_the_scenario() {
+    use crate::app::match_runtime::session::{MatchSession, NetworkReturnContext, SessionMode};
+    let mut session = MatchSession::default();
+    session.enter_network(NetworkReturnContext::LanLobby);
+    session
+        .accept_network_setup(
+            test_launch_session(LaunchCountry::America),
+            true,
+            Some(7),
+            false,
+        )
+        .unwrap();
+    session.set_network_start_seed(77).unwrap();
+    session.prepare_network_timing(2, || 0).unwrap();
+    let startup = session.freeze_network_start(77, None).unwrap();
+    let crate::app::match_bootstrap::LoadingStartup::Network(accepted) = &startup else {
+        panic!("a frozen network start");
+    };
+    let mut sim = crate::sim::world::Simulation::new();
+    crate::app::loading::init::install_startup_session_mode(&mut sim, &startup);
+    assert_eq!(sim.session().game_mode(), SessionMode::Lan);
+    assert_eq!(
+        sim.session().network_max_ahead_frames(),
+        Some(accepted.max_ahead_frames())
+    );
+    assert_eq!(
+        sim.session().execution_topology().command_queue_route(),
+        crate::sim::world::CommandQueueRoute::Multiplayer
+    );
+}
+
+#[test]
+fn held_network_sink_sends_rmg_display_progress_and_services_the_same_source_rows() {
+    let (mut host, mut host_session, _, mut guest, mut guest_session, _) =
+        crate::app::lan_service::loading_test_pair();
+    let native = |session: &crate::app::match_runtime::session::MatchSession| {
+        NativeLoadingScreenState::standard_skirmish(
+            Some(LoadingArtVariant::Americans),
+            0,
+            HouseColorIndex(0),
+            LoadingProgressRowSnapshot::from_launch_session(
+                session.network_setup().unwrap(),
+                crate::rules::skirmish_colors::SkirmishColorMode::VANILLA,
+            ),
+            NativeLoadingProgressCadence::RandomMapHalved,
+        )
+    };
+    let mut host_native = native(&host_session);
+    let mut guest_native = native(&guest_session);
+    let mut wait = NetworkLoadWait::new(
+        0,
+        host_native
+            .progress_row
+            .total_fraction(&host_native.progress),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        for (service, session, native, raw) in [
+            (&mut host, &mut host_session, &mut host_native, 60),
+            (&mut guest, &mut guest_session, &mut guest_native, 12),
+        ] {
+            let network = crate::app::lan_service::LoadingNetworkService::borrow(
+                session,
+                Some(service),
+                false,
+            )
+            .unwrap();
+            let mut phase =
+                LoadingPhaseProgress::select(Some(native), false, true, network, |_, _| {
+                    panic!("fixture deliberately uses the real gated network sink without GPU art")
+                });
+            phase.sink.milestone(raw).unwrap();
+        }
+        if host_native.progress_row.participants[1]
+            .remote_progress
+            .as_ref()
+            .unwrap()
+            .current_percent()
+            == 6.0
+            && guest_native.progress_row.participants[0]
+                .remote_progress
+                .as_ref()
+                .unwrap()
+                .current_percent()
+                == 30.0
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "held loader did not service real UDP progress"
+        );
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        host_native.progress.current_percent(),
+        30.0,
+        "raw60 is halved only once"
+    );
+    assert_eq!(guest_native.progress.current_percent(), 6.0);
+    assert!(
+        host_native.progress_row.participants[0]
+            .remote_progress
+            .is_none()
+    );
+    let fraction = host_native
+        .progress_row
+        .total_fraction(&host_native.progress);
+    assert_eq!(wait.poll(3500, fraction), NetworkLoadPoll::ReportProgress);
+    assert_eq!(
+        wait.timeout.remaining(3500),
+        7200,
+        "actual peer progress refreshes the native wait"
+    );
+    assert_ne!(wait.poll(3601, fraction), NetworkLoadPoll::TimedOut);
+}
+
+#[test]
+fn cancelled_admission_cannot_release_a_ready_result_and_returns_the_same_asset_lease() {
+    let (_, mut session, accepted, _, _, _) = crate::app::lan_service::loading_test_pair();
+    let dir = crate::map::source::test_support::TestDirectory::new("loading-cancel-lease");
+    dir.write("sentinel.bin", b"same process cache");
+    let mut assets = crate::app::process_assets::ProcessAssets::new(
+        crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
+        false,
+    );
+    assets.return_from_loading(AssetManager::from_loose_root_for_test(dir.path()));
+    let original = assets
+        .manager()
+        .unwrap()
+        .load_file_from_mix("sentinel.bin")
+        .unwrap();
+    let mut loading = LoadingSession::from_request(LoadingRequest::network(accepted.clone()));
+    let mut result = super::super::transitions::fallback_map_load_result();
+    result.scenario.startup = accepted;
+    result.asset_manager = assets.lease_for_loading();
+    loading.stage = LoadingStage::ReadyToInstall {
+        result: Box::new(result),
+    };
+    let mut slot = Some(loading);
+    let mut startup = crate::app::match_runtime::startup::MatchStartup::default();
+    let still_admitted = take_after_network_service(&mut slot, &session)
+        .unwrap()
+        .unwrap();
+    assert!(assets.is_leased() && !assets.is_available());
+    slot = Some(still_admitted);
+    //This is the SAME MatchSession retirement used by ordinary shell/HTTPS
+    //abort reducers. Local completion cannot authorize an obsolete result.
+    session.return_to_network_lobby();
+    assert!(take_after_network_service(&mut slot, &session).is_err());
+    assert!(
+        slot.is_some() && assets.is_leased(),
+        "the guard cannot consume the invalid result"
+    );
+    //fail_loading's exact retirement seam, without a window/GPU fixture.
+    assert_eq!(
+        retire_failed_loading_attempt(
+            &mut slot,
+            &mut startup,
+            &mut assets,
+            LoadingFailurePolicy::RetryNetworkShell
+        ),
+        LoadingFailurePolicy::RetryNetworkShell
+    );
+    assert!(slot.is_none() && assets.is_available() && !assets.is_leased());
+    let restored = assets
+        .manager()
+        .unwrap()
+        .load_file_from_mix("SENTINEL.BIN")
+        .unwrap();
+    assert!(std::sync::Arc::ptr_eq(&original.bytes, &restored.bytes));
+    assert!(
+        take_after_network_service(&mut slot, &session)
+            .unwrap()
+            .is_none()
+    );
+    let same = assets
+        .manager()
+        .unwrap()
+        .load_file_from_mix("sentinel.bin")
+        .unwrap();
+    assert!(
+        std::sync::Arc::ptr_eq(&restored.bytes, &same.bytes),
+        "no second lease return"
+    );
+}
+
+#[test]
+fn a_loaded_network_screen_holds_until_its_install_time() {
+    let mut session = LoadingSession::from_request(LoadingRequest::generic_map_load("hold"));
+    assert!(
+        !session.holds_loaded_screen(0),
+        "no hold before every player loads"
+    );
+    session.install_after_ms = Some(1_000 + NETWORK_LOADED_HOLD_MS);
+    assert!(session.holds_loaded_screen(1_000 + NETWORK_LOADED_HOLD_MS - 1));
+    assert!(!session.holds_loaded_screen(1_000 + NETWORK_LOADED_HOLD_MS));
+}
+
+/// VERA: a mod's map additions reach Skirmish and online matches on an
+/// authored map, and neither campaign missions, cooperative ones too, nor
+/// random maps, which read their rules while they are made.
+#[test]
+fn map_additions_reach_matches_but_not_missions_or_random_maps() {
+    use crate::app::match_runtime::session::SessionMode;
+    use crate::rules::rule_policy::RulePolicy;
+    use crate::sim::scenario_bootstrap::MatchLaunchDescriptor;
+    use crate::skirmish_modes::MpModeClass::{Battle, Cooperative};
+    let reach = |class, map: &str, game_mode, rule_override: Option<RulePolicy>| {
+        let mut session = test_launch_session(LaunchCountry::America);
+        session.mode.class = class;
+        session.selected_map_file = Some(map.to_owned());
+        let mut launch = MatchLaunchDescriptor::from_resolved(session).unwrap();
+        if let Some(policy) = rule_override {
+            launch = launch.with_rule_policy(policy);
+        }
+        crate::app::mod_additions::reach(&LoadingStartup::Replay {
+            launch: Box::new(launch),
+            seed: crate::app::match_bootstrap::MatchSeed {
+                value: 73,
+                source: crate::app::match_bootstrap::MatchSeedSource::SavedScenario,
+                seed_authority_certifying: false,
+            },
+            game_mode,
+            native_id_prefix: 0,
+        })
+    };
+    assert!(reach(Battle, "mp01t4.map", SessionMode::Lan, None));
+    assert!(!reach(Cooperative, "mp01t4.map", SessionMode::Lan, None));
+    assert!(!reach(Battle, "RandMap.Sed", SessionMode::Lan, None));
+    assert!(!reach(Battle, "mp01t4.map", SessionMode::Campaign, None));
+    let rules = SessionMode::Lan
+        .stock_rule_policy(Some(Battle))
+        .with_mod_map_additions(false);
+    assert!(!reach(Battle, "mp01t4.map", SessionMode::Lan, Some(rules)));
 }

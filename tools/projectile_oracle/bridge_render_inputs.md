@@ -65,8 +65,7 @@ to the connected corpora rather than copying VERA-interpreted fields.
 ## Physical asset identity
 
 `bridge_render_inputs.json` pins file lengths, SHA-256 hashes, source lines,
-the complete48-byte120MM input and its palette indices. Native binary identity
-is1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c.
+the complete48-byte120MM input and its palette indices.
 
 - RULESMD is the743215-byte expandmd01.mix entry8218F9F4; fixed ARTMD is336535
   bytes. MPBattleMD is295 bytes. Hills is the144458-byte inner INI of loose
@@ -102,7 +101,7 @@ frame/stencil retention and absence of frame fallback. Its ignored
 loads the actual scenario and archives. The canonical focused atlas group passes6 with this archive test ignored;
 retained ART tests pass3 and the full40-shape comparison passes both GPU formats.
 The physical Hills archive test subsequently passes when invoked separately.
-See [the chain receipt](../../docs/research/bridge-projectile-render.md) for the
+See the chain receipt for the
 binary hash and logs. The renderer remedy now passes the reproduced Metal stress case. Final CPU/Clippy
 also pass (9544/0/157, Clippy exit0) on unchanged renderer source. Same-source
 release/visible validation now passes within the recorded load/continuation/UI

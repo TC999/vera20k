@@ -1,16 +1,81 @@
-//! Native LightConvert color resolution for ordinary clear-A draws.
+//! Native LightConvert color resolution for ordinary indexed draws.
 //!
 //! `0x00556090 -> 0x007DE200` constructs RGB565 rows; `0x00420140`
 //! selects them from brightness and A-buffer. The captured retail process uses
-//! MMX, RGB565 and x87 CW 0x0e7f. See
-//! `docs/research/LIGHTCONVERT_ROW_RGB565_ORACLE_2026_09_09.md`.
+//! MMX, RGB565 and x87 CW 0x0e7f. Executed tables: `tools/palette_oracle`.
 //! Palette ownership (cell versus ColorScheme), scalar brightness and the
 //! per-index mask remain separate. Zero/default means precomposed RGBA/UI.
 
 use crate::map::lighting::CellLightGrid;
 
-/// RGB scale uses bits 0..17; red's high byte stores N, green bit 31 the
-/// ColorScheme mask. The fourth word retains the signed brightness argument.
+/// House50B840/500DF7 initializes +56F9 from ColorScheme+330 (index16),
+/// Convert+174 (the middle N53 row), then unpacks the RGB565 word. Raw house
+/// ramps remain palette inputs; this is the shared resolved house RGB reader.
+/// The separate normalized laser color at +56FC is not this value.
+/// Native execution: tools/procedural_drawing_oracle/house_color.
+pub(crate) fn house_color_rgb(
+    ramps: &crate::rules::house_colors::HouseColorRamps,
+    index: crate::rules::house_colors::HouseColorIndex,
+) -> [u8; 3] {
+    let color = ramps.ramp(index)[0];
+    let word =
+        PaletteLight::color_scheme([1000; 3], 1000).rgb565([color.r, color.g, color.b], 16, 127);
+    crate::render::native_surface_format::RGB565.unpack_rgb8(word)
+}
+
+/// Player/AI House +56FC..56FE, produced by ComputeRemap50BA00 after
+/// InitColor50B840 in Create_Houses687F10. Campaign500ECC..501086 produces
+/// the same bytes. This is separate from palette remapping and radar RGB.
+/// Native execution covers all 65,536 resolved RGB565 inputs and all 21
+/// physical Colors entries: tools/procedural_drawing_oracle/house_color.
+pub(crate) fn house_laser_rgb(
+    ramps: &crate::rules::house_colors::HouseColorRamps,
+    index: crate::rules::house_colors::HouseColorIndex,
+) -> [u8; 3] {
+    normalized_house_laser_rgb(house_color_rgb(ramps, index))
+}
+
+fn normalized_house_laser_rgb(rgb: [u8; 3]) -> [u8; 3] {
+    use crate::util::native_x87::{NativeF64Bits, X87Chop53, sqrt_approx_f32};
+
+    // Presentation-only binary64 arithmetic; the shared native Sqrt_Approx
+    // owner supplies its chopped f32 input and mantissa table. Ordinary f64
+    // operations match the resulting bytes for the complete RGB565 domain,
+    // without introducing another x87 arithmetic implementation.
+    let normalize = |[r, g, b]: [f64; 3]| {
+        let squared = b * b + g * g + r * r;
+        let squared = X87Chop53::load_f64(NativeF64Bits::from_bits(squared.to_bits()))
+            .expect("house color squares are finite");
+        let root = f64::from(f32::from_bits(
+            sqrt_approx_f32(squared)
+                .expect("house color magnitude is finite")
+                .bits(),
+        ));
+        if root == 0.0 {
+            ([255.0; 3], false)
+        } else {
+            (
+                [r, g, b].map(|channel| (channel * 240.0 / root).min(255.0)),
+                true,
+            )
+        }
+    };
+    let (mut channels, nonzero) = normalize(rgb.map(f64::from));
+    if nonzero {
+        channels = channels.map(|channel| if channel < 96.0 { 0.0 } else { channel });
+    }
+    // RESIDUAL (invisible): a campaign map's laser colour takes this second
+    // pass through Normalize_Color_To_240 @ 0x0050B920 (0x00501058), which
+    // sums (r²+b²)+g². The house_color oracle matches every retail colour; a
+    // mod colour could land one step off in one channel.
+    normalize(channels).0.map(|channel| channel as u8)
+}
+
+/// RGB scale uses bits 0..17; red's high byte stores N, green bit 30 the
+/// plain-Convert flag and bit 31 the ColorScheme mask. Bits 18.. of each
+/// channel word carry that channel's part of the colour word
+/// ([`Self::with_colour_word`]). The fourth word retains the signed brightness
+/// argument.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PaletteLight(pub [u32; 4]);
@@ -29,26 +94,20 @@ impl PaletteLight {
 
     /// CellClass owns its normalized hue-profile and row count (0x00544E70).
     pub fn cell(grid: &CellLightGrid, cell: (u16, u16), top: bool) -> Self {
-        let (rgb, brightness) = grid.cell_light_at(cell).map_or(([1000; 3], 1000), |light| {
-            (
-                light.rgb_key,
-                if top {
-                    light.top_scalar
-                } else {
-                    light.common_scalar
-                },
-            )
-        });
-        Self::new(
-            grid.palette_rgb(rgb),
-            if rgb.iter().sum::<i32>() < 2000 {
-                27
-            } else {
-                53
-            },
-            brightness,
-            false,
-        )
+        let (rgb, rows, brightness) =
+            grid.cell_light_at(cell)
+                .map_or(([1000; 3], 53, 1000), |light| {
+                    (
+                        grid.palette_rgb(light.profile_id),
+                        grid.palette_rows(light.profile_id),
+                        if top {
+                            light.top_scalar
+                        } else {
+                            light.common_scalar
+                        },
+                    )
+                });
+        Self::new(rgb, rows, brightness, false)
     }
 
     /// The selected house Convert uses 53 rows even on a cell with 27 rows
@@ -72,6 +131,23 @@ impl PaletteLight {
     pub fn with_brightness(mut self, brightness: i32) -> Self {
         self.0[3] = brightness as u32;
         self
+    }
+
+    /// The colour word the blit ORs into each pixel it draws, after the
+    /// conversion (`0x00494CD9`, `0x00498293`, `0x004993C2`): red's five
+    /// bits ride bits 18..23 of the red word, green's six bits 18..24 of the
+    /// green word and blue's five bits 18..23 of the blue word.
+    pub fn with_colour_word(mut self, word: u16) -> Self {
+        let word = u32::from(word);
+        self.0[0] = self.0[0] & !(0x1F << 18) | (word >> 11 & 0x1F) << 18;
+        self.0[1] = self.0[1] & !(0x3F << 18) | (word >> 5 & 0x3F) << 18;
+        self.0[2] = self.0[2] & !(0x1F << 18) | (word & 0x1F) << 18;
+        self
+    }
+
+    pub fn colour_word(self) -> u16 {
+        ((self.0[0] >> 18 & 0x1F) << 11 | (self.0[1] >> 18 & 0x3F) << 5 | (self.0[2] >> 18 & 0x1F))
+            as u16
     }
 
     pub fn rows(self) -> u32 {
@@ -113,7 +189,13 @@ impl PaletteLight {
                 ((u32::from(rgb[i]) * (scale[i] >> 4)) >> 12).min(255)
             }
         });
-        (((lit[0] >> 3) << 11) | ((lit[1] >> 2) << 5) | (lit[2] >> 3)) as u16
+        let word = (((lit[0] >> 3) << 11) | ((lit[1] >> 2) << 5) | (lit[2] >> 3)) as u16;
+        // A blitter never draws index 0, so no word reaches it.
+        if source_index == 0 {
+            word
+        } else {
+            word | self.colour_word()
+        }
     }
 }
 
@@ -136,17 +218,24 @@ pub fn native_row(brightness: i32, a: u8, rows: u32) -> u32 {
 /// https://docs.rs/wgpu/27.0.1/wgpu/enum.TextureFormat.html
 pub(crate) fn shader_source(body: &str) -> String {
     let profile = super::native_surface_format::ACTIVE_RETAIL_RGB565_PRESENTATION;
-    let words = |bytes: &[u8]| {
+    // Decoded here, once, so no pixel pays for the conversion.
+    let linear = |bytes: &[u8]| {
         bytes
             .iter()
-            .map(|b| b.to_string())
+            .map(|&byte| {
+                format!(
+                    "{:?}",
+                    super::area_scale::srgb_to_linear(f32::from(byte) / 255.0)
+                )
+            })
             .collect::<Vec<_>>()
             .join(",")
     };
     format!(
-        "const RETAIL_FIVE = array<u32,32>({});\nconst RETAIL_SIX = array<u32,64>({});\n{}\n{}",
-        words(&profile.five_bit),
-        words(&profile.six_bit),
+        "const RETAIL_FIVE_LINEAR = array<f32,32>({});\n\
+         const RETAIL_SIX_LINEAR = array<f32,64>({});\n{}\n{}",
+        linear(&profile.five_bit),
+        linear(&profile.six_bit),
         include_str!("palette_light.wgsl"),
         body
     )
@@ -170,7 +259,7 @@ pub(crate) fn native_fixtures() -> [NativePaletteFixture; 9] {
                 rgb: $rgb,
                 house: $house,
                 plain: false,
-                bytes: include_bytes!(concat!("../../tools/palette_oracle/fixtures/", $file)),
+                bytes: crate::test_fixture::bytes(concat!("tools/palette_oracle/fixtures/", $file)),
             }
         };
     }
@@ -197,29 +286,120 @@ pub(crate) fn native_fixtures() -> [NativePaletteFixture; 9] {
             rgb: [1000; 3],
             house: false,
             plain: true,
-            bytes: include_bytes!("../../tools/palette_oracle/fixtures/palette-1-plain.bin"),
+            bytes: crate::test_fixture::bytes("tools/palette_oracle/fixtures/palette-1-plain.bin"),
         },
         NativePaletteFixture {
             rows: 53,
             rgb: [1000; 3],
             house: false,
             plain: true,
-            bytes: include_bytes!("../../tools/palette_oracle/fixtures/palette-53-plain.bin"),
+            bytes: crate::test_fixture::bytes("tools/palette_oracle/fixtures/palette-53-plain.bin"),
         },
     ]
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_render_a_r))]
 mod tests {
     use super::*;
 
     #[test]
+    fn retail_house_colors_match_original_normal_and_campaign_initialization() {
+        use crate::rules::house_colors::{HouseColorIndex, NO_REMAP};
+        let Some(rules) = crate::rules::retail_ini_fixture::retail_rulesmd_rules() else {
+            return;
+        };
+        let native: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/procedural_drawing_oracle/house_color.json",
+        ))
+        .unwrap();
+        assert_eq!(native["constructor_palette_index"], 16);
+        let colors = native["colors"].as_array().unwrap();
+        assert_eq!(colors.len(), 21);
+        // VERA's built-in extra lobby colours follow the rules' own entries.
+        assert_eq!(
+            rules.color_schemes.len(),
+            colors.len() + crate::rules::skirmish_colors::MAX_EXTRA_COLORS
+        );
+        for (index, row) in colors.iter().enumerate() {
+            let scheme = &rules.color_schemes[index];
+            assert_eq!(scheme.name, row["name"].as_str().unwrap());
+            assert_eq!(serde_json::json!(scheme.hsv), row["hsv"], "{}", scheme.name);
+            let index = HouseColorIndex(index as u8);
+            let ramp: Vec<_> = rules
+                .house_color_ramps
+                .ramp(index)
+                .iter()
+                .map(|color| [color.r, color.g, color.b])
+                .collect();
+            assert_eq!(serde_json::json!(ramp), row["ramp_rgb"], "{}", scheme.name);
+            let rgb = serde_json::json!(house_color_rgb(&rules.house_color_ramps, index));
+            let laser_rgb = serde_json::json!(house_laser_rgb(&rules.house_color_ramps, index));
+            for mode in ["scalar", "cmov", "mmx"] {
+                assert_eq!(rgb, row["modes"][mode]["rgb"], "{} {mode}", scheme.name);
+                assert_eq!(
+                    rgb, row["modes"][mode]["campaign_rgb"],
+                    "{} {mode}",
+                    scheme.name
+                );
+                assert_eq!(
+                    laser_rgb, row["modes"][mode]["laser_rgb"],
+                    "{} {mode}",
+                    scheme.name
+                );
+                assert_eq!(
+                    laser_rgb, row["modes"][mode]["campaign_laser_rgb"],
+                    "{} {mode}",
+                    scheme.name
+                );
+            }
+        }
+        assert_eq!(
+            serde_json::json!(house_color_rgb(&rules.house_color_ramps, NO_REMAP)),
+            colors[crate::rules::house_colors::DEFAULT_SCHEME_ENTRY]["modes"]["scalar"]["rgb"]
+        );
+        // The negative-index control supplies a synthetic lookup table. It
+        // establishes registry index5 (N53 variant of physical entry2), not
+        // the RGB of the stock LightGrey table checked above.
+        assert_eq!(native["negative_scheme"]["normal"]["scheme_index"], 5);
+        assert_eq!(native["negative_scheme"]["campaign"]["scheme_index"], 5);
+    }
+
+    #[test]
+    fn house_laser_normalization_matches_every_original_rgb565_input() {
+        let native: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/procedural_drawing_oracle/house_color.json",
+        ))
+        .unwrap();
+        let domain = &native["laser_rgb565_domain"];
+        assert_eq!(domain["count"], 65536);
+        assert_eq!(domain["bytes_per_result"], 3);
+        let hex = domain["rgb_hex"].as_str().unwrap();
+        assert_eq!(hex.len(), 65536 * 6);
+        for (word, bytes) in hex.as_bytes().as_chunks::<6>().0.iter().enumerate() {
+            let expected: [u8; 3] = std::array::from_fn(|channel| {
+                u8::from_str_radix(
+                    std::str::from_utf8(&bytes[channel * 2..channel * 2 + 2]).unwrap(),
+                    16,
+                )
+                .unwrap()
+            });
+            let rgb = crate::render::native_surface_format::RGB565.unpack_rgb8(word as u16);
+            assert_eq!(
+                normalized_house_laser_rgb(rgb),
+                expected,
+                "RGB565 {word:04X}"
+            );
+        }
+    }
+
+    #[test]
     fn all_clamped_base_scales_match_original_x87_bytes() {
-        let golden = include_bytes!("../../tools/palette_oracle/fixtures/base-scales-0-2000.bin");
-        for (light, value) in golden.chunks_exact(4).enumerate() {
+        let golden =
+            crate::test_fixture::bytes("tools/palette_oracle/fixtures/base-scales-0-2000.bin");
+        for (light, value) in golden.as_chunks::<4>().0.iter().enumerate() {
             assert_eq!(
                 native_scale16(light as i32),
-                u32::from_le_bytes(value.try_into().unwrap()),
+                u32::from_le_bytes(*value),
                 "light={light}"
             );
         }
@@ -230,11 +410,11 @@ mod tests {
         for (n, bytes) in [
             (
                 27,
-                include_bytes!("../../tools/palette_oracle/fixtures/intensity-27.bin"),
+                crate::test_fixture::bytes("tools/palette_oracle/fixtures/intensity-27.bin"),
             ),
             (
                 53,
-                include_bytes!("../../tools/palette_oracle/fixtures/intensity-53.bin"),
+                crate::test_fixture::bytes("tools/palette_oracle/fixtures/intensity-53.bin"),
             ),
         ] {
             for b in -1i32..=2000 {

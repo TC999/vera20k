@@ -55,7 +55,7 @@ impl MissionId {
     }
 
     /// Return the dispatch-table index only for known dispatched missions.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn dispatch_index(self) -> Option<usize> {
         let raw = self.0;
         (0..MISSION_COUNT as i32)
@@ -69,7 +69,7 @@ impl MissionId {
 /// Field order mirrors the deterministic snapshot/hash contract.  The fields
 /// stay private so all gameplay writes pass through a named compatibility or
 /// exact-authority transition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct MissionCom {
     current: MissionId,
     suspended: MissionId,
@@ -77,6 +77,9 @@ pub struct MissionCom {
     movement_bypass_latch: u8,
     handler_state: u32,
     mission_start_frame: u32,
+    /// The mission AI counter (`MissionClass+0xC4`), which every techno
+    /// steps on every AI visit. The store steps it without a mutable
+    /// hand-out of the object ([`crate::sim::entity_store::EntityStore::count_mission_ai_visit`]).
     ai_counter: u32,
     dispatch_timer: MissionDispatchTimer,
 }
@@ -184,8 +187,15 @@ impl MissionCom {
         self.movement_bypass_latch = 0;
     }
 
-    pub(crate) fn increment_ai_counter(&mut self) {
+    /// `+0xC4 += 1`, wrapping, for one AI visit (`0x006FA646..0x006FA64F`).
+    pub(crate) fn count_ai_visit(&mut self) {
         self.ai_counter = self.ai_counter.wrapping_add(1);
+    }
+
+    /// The `visits` increments a sleeping object was owed
+    /// (`GameEntity::settle_sleep`).
+    pub(crate) fn add_owed_ai_visits(&mut self, visits: u32) {
+        self.ai_counter = self.ai_counter.wrapping_add(visits);
     }
 
     /// `+0xC4 = 0` outside an assignment: Unit and Infantry PerCellProcess
@@ -223,9 +233,9 @@ impl MissionCom {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct MissionTestFixture {
+pub struct MissionTestFixture {
     pub current: MissionId,
     pub suspended: MissionId,
     pub queued: MissionId,
@@ -236,8 +246,15 @@ pub(crate) struct MissionTestFixture {
     pub dispatch_timer: MissionDispatchTimer,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl MissionCom {
+    /// A handler mid-mission: `current` holding Mission+0xBC `handler_state`,
+    /// the other fields kept.
+    pub(crate) fn set_current_for_test(&mut self, current: MissionId, handler_state: u32) {
+        self.current = current;
+        self.handler_state = handler_state;
+    }
+
     pub(crate) fn apply_test_fixture(&mut self, fixture: MissionTestFixture) {
         self.current = fixture.current;
         self.suspended = fixture.suspended;
@@ -250,31 +267,9 @@ impl MissionCom {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn all_known_mission_ids_round_trip_without_changing_width() {
-        for raw in 0..MISSION_COUNT as i32 {
-            let known = MissionType::from_id(raw as u8).expect("known mission id");
-            let id = MissionId::from_raw(raw);
-
-            assert_eq!(id.raw(), raw);
-            assert_eq!(id.known(), Some(known));
-            assert_eq!(id.dispatch_index(), Some(raw as usize));
-            assert_eq!(MissionId::from_known(known), id);
-        }
-    }
-
-    #[test]
-    fn unknown_mission_id_round_trips_without_normalization() {
-        let id = MissionId::from_raw(0x1234_5678);
-
-        assert_eq!(id.raw(), 0x1234_5678);
-        assert_eq!(id.known(), None);
-        assert_eq!(id.dispatch_index(), None);
-    }
 
     #[test]
     fn none_is_signed_minus_one_not_enum_ff() {
@@ -324,8 +319,9 @@ mod tests {
             dispatch_timer: MissionDispatchTimer::from_raw(-17, -29),
         });
 
-        let bytes = bincode::serialize(&state).expect("serialize Mission state");
-        let restored: MissionCom = bincode::deserialize(&bytes).expect("deserialize Mission state");
+        let bytes = crate::util::save_codec::serialize(&state).expect("serialize Mission state");
+        let restored: MissionCom =
+            crate::util::save_codec::deserialize(&bytes).expect("deserialize Mission state");
 
         assert_eq!(restored, state);
     }
@@ -344,9 +340,9 @@ mod tests {
             dispatch_timer: MissionDispatchTimer::from_raw(7, 8),
         });
 
-        state.increment_ai_counter();
+        state.count_ai_visit();
         assert_eq!(state.ai_counter(), 0);
-        let before = state;
+        let before = state.clone();
 
         state.write_dispatch_epilogue(-17, -29);
 

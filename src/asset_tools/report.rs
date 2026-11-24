@@ -271,9 +271,6 @@ pub struct PaletteChoice {
     pub name: String,
     /// Why this palette won — see `asset_tools::palette::PaletteReason`.
     pub reason: String,
-    /// `standard` bakes index-0 alpha into the palette; `gamemd_ui` does not.
-    /// Pairing the wrong one with a frame converter yields opaque sprites.
-    pub alpha_policy: String,
     /// `production` when a real engine code path binds this palette to this
     /// asset class, `declared` when art.ini named it, `heuristic` otherwise.
     pub confidence: String,
@@ -443,6 +440,9 @@ pub struct SoundEntry {
 pub struct SoundReport {
     /// Independent consumed IDX/BAG identities, absent when no pair opened.
     pub sources: Option<crate::assets::asset_manager::AudioIndexSources>,
+    /// Further admitted Ares BAG pairs in append order. Stock JSON is unchanged.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub additional_sources: Vec<crate::assets::asset_manager::AudioIndexSources>,
     pub bag: String,
     pub entry_count: usize,
     pub matched: usize,
@@ -479,10 +479,12 @@ pub struct AnimSlot {
     /// Draw offset relative to the building origin.
     pub offset: [i32; 2],
     pub rate: u16,
-    /// Slot played instead of this one while the building is damaged.
+    /// Slot played while the building is damaged; this slot itself when the
+    /// art declares no damaged variant.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub damaged_variant: Option<String>,
-    /// Slot played instead of this one while the building is garrisoned.
+    /// Slot played while the building is garrisoned; this slot itself when the
+    /// art declares no garrisoned variant.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub garrisoned_variant: Option<String>,
     pub candidates: Vec<ArtCandidate>,

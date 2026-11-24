@@ -4,17 +4,25 @@
 //! lookup order. Only after OverlayData, the shared drain, and the first live
 //! Recalc sweep does it move a linear payload into the simulation OverlayGrid.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::map::bridge_facts::{BridgeFlagStamp, BridgeStampSlot, high_bridge_stamp_for_overlay};
+use crate::map::bridge_facts::{
+    BridgeFlagStamp, BridgeStampFamily, BridgeStampSlot, high_bridge_stamp_for_overlay,
+};
 use crate::map::map_file::AuthoredOverlayPackReceipt;
-use crate::map::overlay_types::OverlayTypeRegistry;
+use crate::map::overlay::OverlayIdentityPack;
+use crate::map::overlay_mark::{
+    MarkCrateImages, OverlayCellAnim, OverlayMarkHost, OverlayMarkOutcome, OverlayMarkRequest,
+    mark_overlay,
+};
 use crate::map::resolved_terrain::{
     AutomaticTubeAllocation, AutomaticTubeRequest, LoadCellRecalcEffects, LoadCellRecalcError,
     LoadCellRecalcOutcome, LoadCellRecalcState, ResolvedTerrainGrid, SharedCellDummy,
     TerrainTileAnimation,
 };
-use crate::rules::terrain_rules::LandType;
+use crate::rules::locomotor_type::SpeedType;
+use crate::rules::overlay_types::OverlayTypeRegistry;
+use crate::rules::rule_policy::AuthoredCratePolicy;
 use crate::rules::tiberium_type::TiberiumTypeRegistry;
 
 pub(crate) const NO_OVERLAY_IDENTITY: i32 = -1;
@@ -44,7 +52,7 @@ impl FinalizedOverlayCell {
     }
 
     pub(crate) const fn overlay_id(self) -> Option<u8> {
-        if self.identity >= 0 && self.identity <= u8::MAX as i32 - 1 {
+        if self.identity >= 0 && self.identity < u8::MAX as i32 {
             Some(self.identity as u8)
         } else {
             None
@@ -76,7 +84,7 @@ impl FinalizedOverlayPayload {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn from_cells_for_test(
         width: u16,
         height: u16,
@@ -106,23 +114,13 @@ pub(crate) struct AuthoredOverlayCellRef {
     pub(crate) coord: (i16, i16),
 }
 
-/// Synchronous wall-local effects in native execution order. Callers must
-/// apply each effect before this transaction advances to the next one.
+/// The synchronous effects of the load-time wall cleanup in native execution
+/// order. Callers must apply each effect before the cleanup advances.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthoredWallEffect {
     TacticalDirty(AuthoredOverlayCellRef),
     RadarDirty(AuthoredOverlayCellRef),
     CleanupRecalcAndZone(AuthoredOverlayCellRef),
-    BlockerCountIncrement(AuthoredOverlayCellRef),
-    CommonAnchorRecalc(AuthoredOverlayCellRef),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AuthoredWallMarkResult {
-    Completed,
-    RejectedUnallocatedAnchor,
-    RejectedSteepSlope,
-    RejectedNonWallType,
 }
 
 /// Raw `[Map] Size` dimensions used by the native radar-diamond predicate.
@@ -139,59 +137,32 @@ impl NativeOverlayMapShape {
         Self { width, height }
     }
 
-    /// `Cell_in_bounds_check @ 0x00568300` after the caller has narrowed both
+    /// `MapClass::In_Bounds @ 0x00568300` after the caller has narrowed both
     /// coordinate words to signed 16-bit values.
     pub(crate) const fn admits(self, x: i16, y: i16) -> bool {
-        let x = x as i32;
-        let y = y as i32;
-        let sum = x.wrapping_add(y);
-        self.width < sum
-            && x.wrapping_sub(y) < self.width
-            && y.wrapping_sub(x) < self.width
-            && sum <= self.width.wrapping_add(self.height.wrapping_mul(2))
+        crate::map::playfield::size_diamond_contains(self.width, self.height, (x, y))
     }
 
-    /// Exact real-cell anti-diagonal order used by `Full_Init @ 0x00686B20`
-    /// through `CellIterator_Init @ 0x00578350` / `Next @ 0x00578290`:
-    /// increasing `x`, decreasing `y` for each sum in
-    /// `W+1 ..= W+2H`. Valid fresh maps keep both dimensions in `1..=512`.
+    /// The real cells `Full_Init @ 0x00686B20` visits: the allocated-cell
+    /// walk over the cells [`Self::admits`]
+    /// ([`SizeDiamond::allocated_cells`](crate::map::playfield::SizeDiamond::allocated_cells)),
+    /// which on a Size one cell wide ends after (1, 1). Dimensions must fit
+    /// the selected cell grid.
     pub(crate) fn recalc_cells(self) -> Vec<(i16, i16)> {
-        if !(1..=512).contains(&self.width) || !(1..=512).contains(&self.height) {
+        if !(1..=crate::map::cell_index::MAX_CELL_SIDE as i32).contains(&self.width)
+            || !(1..=crate::map::cell_index::MAX_CELL_SIDE as i32).contains(&self.height)
+        {
             return Vec::new();
         }
         let mut cells =
             Vec::with_capacity(usize::try_from(self.height * (2 * self.width - 1)).unwrap_or(0));
-        for sum in self.width + 1..=self.width + 2 * self.height {
-            let first_x = (sum - self.width) / 2 + 1;
-            let last_x = (sum + self.width - 1) / 2;
-            for x in first_x..=last_x {
-                cells.push((x as i16, (sum - x) as i16));
-            }
-        }
+        cells.extend(
+            crate::map::playfield::SizeDiamond::from_size(self.width, self.height)
+                .allocated_cells()
+                .map(|(x, y)| (x as i16, y as i16)),
+        );
         cells
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AuthoredLowMarkResult {
-    OccupiedFixedRow,
-    FixedEndWithoutOpposite,
-    BodyRows { rows: u32, scenario_draws: u32 },
-}
-
-/// Narrow synchronous seam used only by the fixed-map low-overlay Mark arm.
-/// `recalc` receives the already-mutated live overlay surface and must finish
-/// the complete real-cell effect before the Mark transaction advances.
-pub(crate) trait AuthoredLowMarkHost {
-    type Error;
-
-    fn next_scenario_raw(&mut self) -> u32;
-
-    fn recalc(
-        &mut self,
-        cells: &mut LiveOverlayCells,
-        cell: AuthoredOverlayCellRef,
-    ) -> Result<(), Self::Error>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +179,7 @@ pub(crate) enum MapLoadDirtyKind {
 pub(crate) trait AuthoredOverlayLoadHost {
     type Handle: Copy;
     type Error;
+    type CellAnim;
 
     fn try_construct_overlay(
         &mut self,
@@ -250,13 +222,20 @@ pub(crate) trait AuthoredOverlayLoadHost {
         cell: AuthoredOverlayCellRef,
     ) -> Result<(), Self::Error>;
 
+    /// `OverlayClass::Mark @ 0x005FD112..0x005FD1F4`'s CellAnim; `terrain`
+    /// is the live load-time CellClass array its ground height reads.
     fn spawn_cell_anim(
         &mut self,
         handle: Self::Handle,
-        anim_name: &str,
-        cell: AuthoredOverlayCellRef,
-        world_z: i32,
-    ) -> Result<(), Self::Error>;
+        request: OverlayCellAnim<'_>,
+        terrain: &ResolvedTerrainGrid,
+    ) -> Result<Self::CellAnim, Self::Error>;
+
+    fn tint_cell_anim(
+        &mut self,
+        anim: Self::CellAnim,
+        tiberium: crate::rules::tiberium_type::TiberiumTypeId,
+    );
 
     fn finish_common(&mut self, handle: Self::Handle) -> Result<(), Self::Error>;
 
@@ -266,21 +245,49 @@ pub(crate) trait AuthoredOverlayLoadHost {
 }
 
 #[derive(Debug)]
-pub(crate) enum AuthoredOverlayFinalizeError<E> {
-    InvalidMapShape { width: i32, height: i32 },
-    MalformedOverlayType { overlay_id: u8 },
-    ConstructedUnallocatedAnchor { overlay_id: u8, cell: (u16, u16) },
-    WallInvariant(AuthoredWallMarkResult),
-    RecalcMalformedOverlayIdentity { identity: i32 },
-    RecalcMissingOverlayType { overlay_id: u8 },
-    RecalcCellIndexOutOfBounds { index: usize },
-    RecalcResidentInput { reason: String },
+pub enum AuthoredOverlayFinalizeError<E> {
+    Tiberium(crate::rules::overlay_types::TiberiumImageError),
+    InvalidMapShape {
+        width: i32,
+        height: i32,
+    },
+    MalformedOverlayType {
+        overlay_id: u8,
+    },
+    ConstructedUnallocatedAnchor {
+        overlay_id: u8,
+        cell: (u16, u16),
+    },
+    /// `Is_Clear_To_Build` refused a wall while ScenarioInit was raised.
+    WallRefused {
+        overlay_id: u8,
+        cell: (u16, u16),
+    },
+    /// Mark reached a callback the load host does not provide; each one is
+    /// gated behind a lowered ScenarioInit bracket, which map loading keeps
+    /// raised.
+    UnhostedMarkCallback {
+        callback: &'static str,
+    },
+    RecalcMalformedOverlayIdentity {
+        identity: i32,
+    },
+    RecalcMissingOverlayType {
+        overlay_id: u8,
+    },
+    RecalcCellIndexOutOfBounds {
+        index: usize,
+    },
+    RecalcResidentInput {
+        reason: String,
+    },
     Host(E),
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for AuthoredOverlayFinalizeError<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Tiberium(error) => std::fmt::Display::fmt(error, f),
             Self::InvalidMapShape { width, height } => {
                 write!(f, "invalid authored overlay map shape {width}x{height}")
             }
@@ -292,8 +299,13 @@ impl<E: std::fmt::Display> std::fmt::Display for AuthoredOverlayFinalizeError<E>
                 "authored overlay {overlay_id} constructed at unallocated cell ({},{})",
                 cell.0, cell.1
             ),
-            Self::WallInvariant(result) => {
-                write!(f, "authored wall Mark invariant failed: {result:?}")
+            Self::WallRefused { overlay_id, cell } => write!(
+                f,
+                "authored wall {overlay_id} refused at ({},{}) during ScenarioInit",
+                cell.0, cell.1
+            ),
+            Self::UnhostedMarkCallback { callback } => {
+                write!(f, "authored Mark reached unhosted callback {callback}")
             }
             Self::RecalcMalformedOverlayIdentity { identity } => {
                 write!(
@@ -328,30 +340,9 @@ where
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Host(error) => Some(error),
+            Self::Tiberium(error) => Some(error),
             _ => None,
         }
-    }
-}
-
-struct FinalizerLowHost<'a, 'resources, H> {
-    terrain: &'a mut ResolvedTerrainGrid,
-    recalc: &'a mut LoadCellRecalcState<'resources>,
-    host: &'a mut H,
-}
-
-impl<H: AuthoredOverlayLoadHost> AuthoredLowMarkHost for FinalizerLowHost<'_, '_, H> {
-    type Error = AuthoredOverlayFinalizeError<H::Error>;
-
-    fn next_scenario_raw(&mut self) -> u32 {
-        self.host.next_scenario_raw()
-    }
-
-    fn recalc(
-        &mut self,
-        cells: &mut LiveOverlayCells,
-        cell: AuthoredOverlayCellRef,
-    ) -> Result<(), Self::Error> {
-        recalc_target(self.terrain, self.recalc, cells, self.host, cell).map(|_| ())
     }
 }
 
@@ -444,32 +435,20 @@ fn recalc_target<H: AuthoredOverlayLoadHost>(
     Ok(Some(outcome))
 }
 
-fn mirror_real_overlay_pair(
-    terrain: &mut ResolvedTerrainGrid,
-    cells: &LiveOverlayCells,
-    cell: AuthoredOverlayCellRef,
-) {
-    let NativeOverlayCellTarget::Real(index) = cell.target else {
-        return;
-    };
-    let value = cells.read(cell.target);
-    terrain.mirror_authored_overlay_pair(index, value.overlay_id(), value.state());
-}
-
 /// One consuming authored-reader transaction. It owns the exact packed y/x
 /// traversal, Mark dispatch, independent data pass, reader drain, and first
 /// anti-diagonal Recalc boundary.
 enum LoadRecalcOwner<'load, 'resources> {
     Borrowed(&'load mut LoadCellRecalcState<'resources>),
-    #[cfg(test)]
-    Synthetic(LoadCellRecalcState<'resources>),
+    #[cfg(any(test, feature = "test-support"))]
+    Synthetic(Box<LoadCellRecalcState<'resources>>),
 }
 
 impl<'load, 'resources> LoadRecalcOwner<'load, 'resources> {
     fn as_mut(&mut self) -> &mut LoadCellRecalcState<'resources> {
         match self {
             Self::Borrowed(recalc) => recalc,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             Self::Synthetic(recalc) => recalc,
         }
     }
@@ -484,12 +463,11 @@ pub(crate) struct AuthoredOverlayFinalizer<'load, 'resources, H> {
     tiberium_types: &'resources TiberiumTypeRegistry,
     overlay_shp_ids: &'resources BTreeSet<u8>,
     signed_new_ini_format: i32,
-    game_mode_nonzero: bool,
+    authored_crate_policy: AuthoredCratePolicy,
     host: &'load mut H,
 }
 
 impl<'load, 'resources, H: AuthoredOverlayLoadHost> AuthoredOverlayFinalizer<'load, 'resources, H> {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_recalc(
         terrain: &'load mut ResolvedTerrainGrid,
         recalc: &'load mut LoadCellRecalcState<'resources>,
@@ -498,7 +476,7 @@ impl<'load, 'resources, H: AuthoredOverlayLoadHost> AuthoredOverlayFinalizer<'lo
         tiberium_types: &'resources TiberiumTypeRegistry,
         overlay_shp_ids: &'resources BTreeSet<u8>,
         signed_new_ini_format: i32,
-        game_mode_nonzero: bool,
+        authored_crate_policy: AuthoredCratePolicy,
         host: &'load mut H,
     ) -> Self {
         let cells = LiveOverlayCells::empty_for_terrain(terrain);
@@ -511,13 +489,12 @@ impl<'load, 'resources, H: AuthoredOverlayLoadHost> AuthoredOverlayFinalizer<'lo
             tiberium_types,
             overlay_shp_ids,
             signed_new_ini_format,
-            game_mode_nonzero,
+            authored_crate_policy,
             host,
         }
     }
 
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new(
         terrain: &'load mut ResolvedTerrainGrid,
         shape: NativeOverlayMapShape,
@@ -525,21 +502,21 @@ impl<'load, 'resources, H: AuthoredOverlayLoadHost> AuthoredOverlayFinalizer<'lo
         tiberium_types: &'resources TiberiumTypeRegistry,
         overlay_shp_ids: &'resources BTreeSet<u8>,
         signed_new_ini_format: i32,
-        game_mode_nonzero: bool,
+        authored_crate_policy: AuthoredCratePolicy,
         host: &'load mut H,
     ) -> Self {
         let cells = LiveOverlayCells::empty_for_terrain(terrain);
-        let recalc = LoadCellRecalcState::synthetic(overlay_types, terrain.cells.len());
+        let recalc = LoadCellRecalcState::synthetic(overlay_types, terrain.cells().len());
         Self {
             terrain,
-            recalc: LoadRecalcOwner::Synthetic(recalc),
+            recalc: LoadRecalcOwner::Synthetic(Box::new(recalc)),
             cells,
             shape,
             overlay_types,
             tiberium_types,
             overlay_shp_ids,
             signed_new_ini_format,
-            game_mode_nonzero,
+            authored_crate_policy,
             host,
         }
     }
@@ -550,7 +527,9 @@ impl<'load, 'resources, H: AuthoredOverlayLoadHost> AuthoredOverlayFinalizer<'lo
     ) -> Result<FinalizedOverlayPayload, AuthoredOverlayFinalizeError<H::Error>> {
         // gamemd-derived: ReadMapOverlayPacks @ 0x005FD2E0, followed by the
         // Full_Init first Recalc boundary @ 0x00687A3E..0x00687A6B.
-        if !(1..=512).contains(&self.shape.width) || !(1..=512).contains(&self.shape.height) {
+        if !(1..=crate::map::cell_index::MAX_CELL_SIDE as i32).contains(&self.shape.width)
+            || !(1..=crate::map::cell_index::MAX_CELL_SIDE as i32).contains(&self.shape.height)
+        {
             return Err(AuthoredOverlayFinalizeError::InvalidMapShape {
                 width: self.shape.width,
                 height: self.shape.height,
@@ -558,38 +537,44 @@ impl<'load, 'resources, H: AuthoredOverlayLoadHost> AuthoredOverlayFinalizer<'lo
         }
         let (identity, data) = packs.into_parts();
         if self.signed_new_ini_format > 1 && identity.has_positive_length() {
-            for y in 0..512u16 {
-                for x in 0..512u16 {
+            let side =
+                crate::map::cell_index::CellGrid::for_map_size(self.shape.width, self.shape.height)
+                    .side();
+            let bridge_decks = self.authored_high_bridge_decks(&identity, side);
+            for y in 0..side {
+                for x in 0..side {
                     let Some(overlay_id) = identity.read_byte(x, y) else {
                         continue;
                     };
                     if overlay_id == u8::MAX {
                         continue;
                     }
-                    self.run_identity_row(x, y, overlay_id)?;
+                    self.run_identity_row(x, y, overlay_id, bridge_decks.get(&(x, y)).copied())?;
                 }
             }
         }
 
         if self.signed_new_ini_format > 1 && data.has_positive_length() {
-            for y in 0..512u16 {
-                for x in 0..512u16 {
+            for y in 0..crate::map::cell_index::CellGrid::for_map_size(
+                self.shape.width,
+                self.shape.height,
+            )
+            .side()
+            {
+                for x in 0..crate::map::cell_index::CellGrid::for_map_size(
+                    self.shape.width,
+                    self.shape.height,
+                )
+                .side()
+                {
                     let cell = (x as i16, y as i16);
                     if !self.shape.admits(cell.0, cell.1) {
                         continue;
                     }
                     let value = data.read_byte(x, y).unwrap_or(0);
                     let target = self.cells.target(cell.0, cell.1);
-                    if let NativeOverlayCellTarget::Real(index) = target {
+                    if let NativeOverlayCellTarget::Real(_) = target {
                         self.cells.write_state(target, value);
-                        mirror_real_overlay_pair(
-                            self.terrain,
-                            &self.cells,
-                            AuthoredOverlayCellRef {
-                                target: NativeOverlayCellTarget::Real(index),
-                                coord: cell,
-                            },
-                        );
                     }
                 }
             }
@@ -605,23 +590,45 @@ impl<'load, 'resources, H: AuthoredOverlayLoadHost> AuthoredOverlayFinalizer<'lo
         Ok(self.cells.finish())
     }
 
+    fn authored_high_bridge_decks(
+        &self,
+        identity: &OverlayIdentityPack,
+        side: u16,
+    ) -> BTreeMap<(u16, u16), i16> {
+        let anchors = (0..side)
+            .flat_map(|y| (0..side).map(move |x| (x, y)))
+            .filter_map(|(x, y)| {
+                let id = identity.read_byte(x, y)?;
+                let stamp = high_bridge_stamp_for_overlay(id)?;
+                let flags = self.overlay_types.flags(id)?;
+                (self.overlay_shp_ids.contains(&id) || flags.cell_anim.is_some())
+                    .then_some(((x, y), stamp))
+            });
+        self.terrain
+            .recover_authored_high_bridge_decks(anchors, |(x, y)| {
+                x < side && y < side && self.shape.admits(x as i16, y as i16)
+            })
+    }
+
     fn run_identity_row(
         &mut self,
         x: u16,
         y: u16,
         overlay_id: u8,
+        span_deck: Option<i16>,
     ) -> Result<(), AuthoredOverlayFinalizeError<H::Error>> {
         // gamemd-derived: ReadMapOverlayPacks row corridor @
         // 0x005FD36D..0x005FD55D -> OverlayClass::Mark @ 0x005FC570.
-        let flags = self
-            .overlay_types
+        let overlay_types = self.overlay_types;
+        let flags = overlay_types
             .flags(overlay_id)
-            .cloned()
             .ok_or(AuthoredOverlayFinalizeError::MalformedOverlayType { overlay_id })?;
         if !self.overlay_shp_ids.contains(&overlay_id) && flags.cell_anim.is_none() {
             return Ok(());
         }
-        if self.game_mode_nonzero && flags.crate_type {
+        // ReadMapOverlayPacks 0x005FD469..0x005FD47C skips a crate
+        // before construction in nonzero GameMode.
+        if flags.crate_type && self.authored_crate_policy == AuthoredCratePolicy::Skip {
             return Ok(());
         }
         let packed = (x as i16, y as i16);
@@ -630,8 +637,10 @@ impl<'load, 'resources, H: AuthoredOverlayLoadHost> AuthoredOverlayFinalizer<'lo
         }
 
         let anchor = self.cells.cell_ref(packed.0, packed.1);
-        let high = high_bridge_stamp_for_overlay(overlay_id);
-        let saved_high_state = high.map(|_| self.cells.read(anchor.target).state());
+        // 0x005FD4A4/0x005FD502: the reader saves the anchor's data byte
+        // around a high-bridge Mark and restores it afterwards.
+        let saved_high_state = high_bridge_stamp_for_overlay(overlay_id)
+            .map(|_| self.cells.read(anchor.target).state());
         let Some(handle) = self
             .host
             .try_construct_overlay(overlay_id, (x, y))
@@ -640,7 +649,7 @@ impl<'load, 'resources, H: AuthoredOverlayLoadHost> AuthoredOverlayFinalizer<'lo
             self.restore_high_anchor_state(packed, saved_high_state);
             return Ok(());
         };
-        let NativeOverlayCellTarget::Real(anchor_index) = anchor.target else {
+        let NativeOverlayCellTarget::Real(_) = anchor.target else {
             return Err(AuthoredOverlayFinalizeError::ConstructedUnallocatedAnchor {
                 overlay_id,
                 cell: (x, y),
@@ -653,184 +662,49 @@ impl<'load, 'resources, H: AuthoredOverlayLoadHost> AuthoredOverlayFinalizer<'lo
         self.host
             .publish_dirty(MapLoadDirtyKind::BaseMarkTactical, anchor)
             .map_err(AuthoredOverlayFinalizeError::Host)?;
-        let slope_type = self.terrain.cells()[anchor_index].slope_type;
-        if slope_type > 4 && overlay_id != 0xB2 {
-            self.host
-                .finish_slope_survivor(handle)
-                .map_err(AuthoredOverlayFinalizeError::Host)?;
-            self.restore_high_anchor_state(packed, saved_high_state);
-            return Ok(());
-        }
-
-        if let Some((family, direction)) = high {
-            self.apply_high_stamp(anchor, overlay_id, family, direction);
-            self.finish_ordinary_or_high(handle, anchor, &flags, false)?;
-            self.restore_high_anchor_state(packed, saved_high_state);
-            return Ok(());
-        }
-        if flags.wall {
-            self.finish_wall(handle, anchor, overlay_id, slope_type)?;
-            return Ok(());
-        }
-
-        let low_result = {
-            let (terrain, recalc, host) =
-                (&mut *self.terrain, self.recalc.as_mut(), &mut *self.host);
-            let mut adapter = FinalizerLowHost {
-                terrain,
-                recalc,
-                host,
-            };
-            self.cells.try_mark_authored_low(
-                self.shape,
-                packed.0,
-                packed.1,
-                overlay_id,
-                &mut adapter,
-            )?
-        };
-        if low_result.is_some() {
-            self.recalc_cell(anchor)?;
-            self.host
-                .finish_common(handle)
-                .map_err(AuthoredOverlayFinalizeError::Host)?;
-            return Ok(());
-        }
-
-        self.cells
-            .write_identity(anchor.target, i32::from(overlay_id));
-        self.finish_ordinary_or_high(handle, anchor, &flags, true)
-    }
-
-    fn apply_high_stamp(
-        &mut self,
-        anchor: AuthoredOverlayCellRef,
-        overlay_id: u8,
-        family: crate::map::bridge_facts::BridgeStampFamily,
-        direction: u8,
-    ) {
-        // gamemd-derived: CellClass::SetBridgeDirection_NESW @ 0x0047E040 and
-        // SetBridgeDirection_NWSE @ 0x0047E470.
-        let stamp = BridgeFlagStamp::new(
-            (anchor.coord.0 as u16, anchor.coord.1 as u16),
-            direction,
-            true,
-        );
-        for (slot, requested) in stamp.slots().expect("verified high direction") {
-            let target = self
-                .terrain
-                .apply_authored_bridge_flag_slot(anchor.target, stamp, family, slot, requested)
-                .map_or(
-                    NativeOverlayCellTarget::Dummy,
-                    NativeOverlayCellTarget::Real,
-                );
-            if matches!(
-                slot,
-                BridgeStampSlot::Anchor
-                    | BridgeStampSlot::Forward1
-                    | BridgeStampSlot::Forward2
-                    | BridgeStampSlot::Opposite
-            ) {
-                self.cells
-                    .write_state(target, if direction == 0 { 0 } else { 9 });
-            }
-        }
-        self.cells
-            .write_identity(anchor.target, i32::from(overlay_id));
-        if let NativeOverlayCellTarget::Real(index) = anchor.target {
-            self.terrain
-                .mirror_authored_overlay_identity(index, Some(overlay_id));
-        }
-    }
-
-    fn finish_ordinary_or_high(
-        &mut self,
-        handle: H::Handle,
-        anchor: AuthoredOverlayCellRef,
-        flags: &crate::rules::overlay_types::OverlayTypeFlags,
-        write_ordinary_state: bool,
-    ) -> Result<(), AuthoredOverlayFinalizeError<H::Error>> {
-        // gamemd-derived: OverlayClass::Mark ordinary/high tail @
-        // 0x005FD09F..0x005FD227.
-        if write_ordinary_state {
-            self.cells.write_state(anchor.target, 0);
-            if flags.land == LandType::Tiberium {
-                self.cells.write_state(anchor.target, 1);
-                self.cells.germinate_authored_tiberium(
-                    self.overlay_types,
-                    self.tiberium_types,
-                    anchor,
-                );
-            }
-            if flags.crate_type {
-                self.cells.write_state(anchor.target, u8::MAX);
-            }
-        }
-        if let Some(anim_name) = flags.cell_anim.as_deref() {
-            mirror_real_overlay_pair(self.terrain, &self.cells, anchor);
-            let world_z = match anchor.target {
-                NativeOverlayCellTarget::Real(index) => {
-                    i32::from(self.terrain.cells()[index].level as i8)
-                        .wrapping_mul(crate::util::lepton::GROUND_LEVEL_HEIGHT_LEPTONS)
-                }
-                NativeOverlayCellTarget::Dummy => 0,
-            };
-            self.host
-                .spawn_cell_anim(handle, anim_name, anchor, world_z)
-                .map_err(AuthoredOverlayFinalizeError::Host)?;
-        }
-        self.recalc_cell(anchor)?;
-        self.host
-            .finish_common(handle)
-            .map_err(AuthoredOverlayFinalizeError::Host)
-    }
-
-    fn finish_wall(
-        &mut self,
-        handle: H::Handle,
-        anchor: AuthoredOverlayCellRef,
-        overlay_id: u8,
-        slope_type: u8,
-    ) -> Result<(), AuthoredOverlayFinalizeError<H::Error>> {
-        let (terrain, recalc, host) = (&mut *self.terrain, self.recalc.as_mut(), &mut *self.host);
-        let result = self.cells.try_mark_authored_wall(
-            self.overlay_types,
-            anchor.coord.0,
-            anchor.coord.1,
+        // The constructor (0x005FC380) centres Location on the cell with Z 0.
+        // ScenarioInit admits before the crate-image comparisons.
+        let request = OverlayMarkRequest {
             overlay_id,
-            slope_type,
-            |cells, effect| match effect {
-                AuthoredWallEffect::TacticalDirty(cell) => {
-                    mirror_real_overlay_pair(terrain, cells, cell);
-                    host.publish_dirty(MapLoadDirtyKind::WallTactical, cell)
-                        .map_err(AuthoredOverlayFinalizeError::Host)
-                }
-                AuthoredWallEffect::RadarDirty(cell) => host
-                    .publish_dirty(MapLoadDirtyKind::WallRadar, cell)
-                    .map_err(AuthoredOverlayFinalizeError::Host),
-                AuthoredWallEffect::CleanupRecalcAndZone(cell) => {
-                    let outcome = recalc_target(terrain, recalc, cells, host, cell)?;
-                    if outcome.is_some_and(|outcome| outcome.zone_before != outcome.zone_after) {
-                        host.merge_wall_zone(cell)
-                            .map_err(AuthoredOverlayFinalizeError::Host)?;
-                    }
-                    Ok(())
-                }
-                AuthoredWallEffect::BlockerCountIncrement(cell) => host
-                    .observe_blocker_count_increment(cell)
-                    .map_err(AuthoredOverlayFinalizeError::Host),
-                AuthoredWallEffect::CommonAnchorRecalc(cell) => {
-                    recalc_target(terrain, recalc, cells, host, cell)?;
-                    Ok(())
-                }
-            },
-        )?;
-        if result != AuthoredWallMarkResult::Completed {
-            return Err(AuthoredOverlayFinalizeError::WallInvariant(result));
+            flags,
+            cell: packed,
+            location: [
+                i32::from(x).wrapping_mul(256).wrapping_add(128),
+                i32::from(y).wrapping_mul(256).wrapping_add(128),
+                0,
+            ],
+            registry: overlay_types,
+            tiberium_types: Some(self.tiberium_types),
+            crate_images: MarkCrateImages::default(),
+        };
+        let mut mark = FinalizerMarkHost {
+            terrain: &mut *self.terrain,
+            recalc: self.recalc.as_mut(),
+            cells: &mut self.cells,
+            shape: self.shape,
+            overlay_types,
+            host: &mut *self.host,
+            handle,
+            span_deck,
+        };
+        match mark_overlay(&mut mark, &request)? {
+            OverlayMarkOutcome::SlopeRefused => self
+                .host
+                .finish_slope_survivor(handle)
+                .map_err(AuthoredOverlayFinalizeError::Host)?,
+            OverlayMarkOutcome::WallRefused => {
+                return Err(AuthoredOverlayFinalizeError::WallRefused {
+                    overlay_id,
+                    cell: (x, y),
+                });
+            }
+            OverlayMarkOutcome::Marked => self
+                .host
+                .finish_common(handle)
+                .map_err(AuthoredOverlayFinalizeError::Host)?,
         }
-        self.host
-            .finish_common(handle)
-            .map_err(AuthoredOverlayFinalizeError::Host)
+        self.restore_high_anchor_state(packed, saved_high_state);
+        Ok(())
     }
 
     fn restore_high_anchor_state(&mut self, packed: (i16, i16), state: Option<u8>) {
@@ -839,9 +713,6 @@ impl<'load, 'resources, H: AuthoredOverlayLoadHost> AuthoredOverlayFinalizer<'lo
         };
         let target = self.cells.target(packed.0, packed.1);
         self.cells.write_state(target, state);
-        if let NativeOverlayCellTarget::Real(index) = target {
-            self.terrain.mirror_authored_overlay_state(index, state);
-        }
     }
 
     fn recalc_cell(
@@ -859,55 +730,199 @@ impl<'load, 'resources, H: AuthoredOverlayLoadHost> AuthoredOverlayFinalizer<'lo
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-struct AuthoredLowTriggerSpec {
-    fixed_id: u8,
-    fixed_start: (i16, i16),
-    fixed_step: (i16, i16),
-    join_step: (i16, i16),
-    opposite_id: u8,
-    body_base: u8,
-    body_cross: [(i16, i16); 3],
+/// The load-local CellClass surface as the host of `OverlayClass::Mark`. The
+/// map reader keeps ScenarioInit raised, so the passability, Overrides and
+/// zone-merge branches never run here. Identity and data stores go to the
+/// load's live cells as they happen; Recalc is the load Recalc.
+struct FinalizerMarkHost<'a, 'resources, H: AuthoredOverlayLoadHost> {
+    terrain: &'a mut ResolvedTerrainGrid,
+    recalc: &'a mut LoadCellRecalcState<'resources>,
+    cells: &'a mut LiveOverlayCells,
+    shape: NativeOverlayMapShape,
+    overlay_types: &'resources OverlayTypeRegistry,
+    host: &'a mut H,
+    handle: H::Handle,
+    span_deck: Option<i16>,
 }
 
-fn authored_low_trigger_spec(overlay_id: u8) -> Option<AuthoredLowTriggerSpec> {
-    const EW_CROSS: [(i16, i16); 3] = [(0, -1), (0, 0), (0, 1)];
-    const NS_CROSS: [(i16, i16); 3] = [(-1, 0), (0, 0), (1, 0)];
-    let (family_base, trigger) = match overlay_id {
-        0x7A..=0x7D => (0u8, overlay_id - 0x7A),
-        0xE9..=0xEC => (1u8, overlay_id - 0xE9),
-        _ => return None,
-    };
-    let fixed_ids = if family_base == 0 {
-        [0x5C, 0x5E, 0x60, 0x62]
-    } else {
-        [0xDF, 0xE1, 0xE3, 0xE5]
-    };
-    let opposite_ids = if family_base == 0 {
-        [0x5E, 0x5C, 0x62, 0x60]
-    } else {
-        [0xE1, 0xDF, 0xE5, 0xE3]
-    };
-    let index = usize::from(trigger);
-    Some(AuthoredLowTriggerSpec {
-        fixed_id: fixed_ids[index],
-        fixed_start: if index < 2 { (0, -1) } else { (-1, 0) },
-        fixed_step: if index < 2 { (0, 1) } else { (1, 0) },
-        join_step: [(-1, 0), (1, 0), (0, 1), (0, -1)][index],
-        opposite_id: opposite_ids[index],
-        body_base: if family_base == 0 {
-            if index < 2 { 0x4A } else { 0x53 }
-        } else if index < 2 {
-            0xCD
-        } else {
-            0xD6
-        },
-        body_cross: if index < 2 { EW_CROSS } else { NS_CROSS },
-    })
-}
+impl<H: AuthoredOverlayLoadHost> OverlayMarkHost for FinalizerMarkHost<'_, '_, H> {
+    type Error = AuthoredOverlayFinalizeError<H::Error>;
+    type CellAnim = H::CellAnim;
 
-const fn wrapping_step(cell: (i16, i16), delta: (i16, i16)) -> (i16, i16) {
-    (cell.0.wrapping_add(delta.0), cell.1.wrapping_add(delta.1))
+    fn tiberium_error(error: crate::rules::overlay_types::TiberiumImageError) -> Self::Error {
+        AuthoredOverlayFinalizeError::Tiberium(error)
+    }
+
+    fn cell(&mut self, coord: (i16, i16)) -> NativeOverlayCellTarget {
+        self.cells.target(coord.0, coord.1)
+    }
+
+    fn coord(&self, cell: NativeOverlayCellTarget) -> (i16, i16) {
+        self.cells.coord_of(cell)
+    }
+
+    fn in_bounds(&mut self, coord: (i16, i16)) -> Result<bool, Self::Error> {
+        Ok(self.shape.admits(coord.0, coord.1))
+    }
+
+    fn slope(&self, cell: NativeOverlayCellTarget) -> u8 {
+        self.terrain.native_cell_ground_fields(cell).1
+    }
+
+    fn admits_authored_bridge_grade(&self, _anchor: NativeOverlayCellTarget) -> bool {
+        self.span_deck.is_some()
+    }
+
+    fn identity(&self, cell: NativeOverlayCellTarget) -> i32 {
+        self.cells.read(cell).identity()
+    }
+
+    fn data(&self, cell: NativeOverlayCellTarget) -> u8 {
+        self.cells.read(cell).state()
+    }
+
+    fn write_identity(
+        &mut self,
+        cell: NativeOverlayCellTarget,
+        overlay_id: u8,
+    ) -> Result<(), Self::Error> {
+        self.cells.write_identity(cell, i32::from(overlay_id));
+        Ok(())
+    }
+
+    fn write_data(&mut self, cell: NativeOverlayCellTarget, data: u8) -> Result<(), Self::Error> {
+        self.cells.write_state(cell, data);
+        Ok(())
+    }
+
+    fn scenario_init(&self) -> bool {
+        true
+    }
+
+    fn next_scenario_raw(&mut self) -> u32 {
+        self.host.next_scenario_raw()
+    }
+
+    fn passable(
+        &mut self,
+        _cell: NativeOverlayCellTarget,
+        _speed: SpeedType,
+        _ignore_occupants: bool,
+    ) -> Result<bool, Self::Error> {
+        Err(AuthoredOverlayFinalizeError::UnhostedMarkCallback {
+            callback: "CellClass::CheckCellPassability",
+        })
+    }
+
+    fn set_bridge_direction(
+        &mut self,
+        anchor: NativeOverlayCellTarget,
+        family: BridgeStampFamily,
+        direction: u8,
+    ) -> Result<(), Self::Error> {
+        // gamemd-derived: CellClass::SetBridgeDirection_NESW @ 0x0047E040 and
+        // SetBridgeDirection_NWSE @ 0x0047E470 with (direction, 1).
+        if let Some(deck) = self.span_deck {
+            self.terrain.set_authored_high_bridge_deck(anchor, deck);
+        }
+        let coord = self.cells.coord_of(anchor);
+        let stamp = BridgeFlagStamp::new((coord.0 as u16, coord.1 as u16), direction, true);
+        let Some(slots) = stamp.slots() else {
+            return Ok(());
+        };
+        for (slot, requested) in slots {
+            let target = self
+                .terrain
+                .apply_authored_bridge_flag_slot(anchor, stamp, family, slot, requested)
+                .map_or(
+                    NativeOverlayCellTarget::Dummy,
+                    NativeOverlayCellTarget::Real,
+                );
+            if matches!(
+                slot,
+                BridgeStampSlot::Anchor
+                    | BridgeStampSlot::Forward1
+                    | BridgeStampSlot::Forward2
+                    | BridgeStampSlot::Opposite
+            ) {
+                self.write_data(
+                    target,
+                    crate::map::bridge_facts::bridge_setter_state(direction),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn wall_clear_to_build(
+        &mut self,
+        _anchor: NativeOverlayCellTarget,
+    ) -> Result<bool, Self::Error> {
+        // CellClass::Is_Clear_To_Build @ 0x0047C632 returns true while the
+        // ScenarioInit bracket is raised.
+        Ok(true)
+    }
+
+    fn wall_cleanup(&mut self, anchor: NativeOverlayCellTarget) -> Result<(), Self::Error> {
+        let anchor = self.cells.coord_of(anchor);
+        let (terrain, recalc, host) = (&mut *self.terrain, &mut *self.recalc, &mut *self.host);
+        self.cells
+            .post_wall_cleanup(self.overlay_types, anchor, |cells, effect| match effect {
+                AuthoredWallEffect::TacticalDirty(cell) => host
+                    .publish_dirty(MapLoadDirtyKind::WallTactical, cell)
+                    .map_err(AuthoredOverlayFinalizeError::Host),
+                AuthoredWallEffect::RadarDirty(cell) => host
+                    .publish_dirty(MapLoadDirtyKind::WallRadar, cell)
+                    .map_err(AuthoredOverlayFinalizeError::Host),
+                AuthoredWallEffect::CleanupRecalcAndZone(cell) => {
+                    let outcome = recalc_target(terrain, recalc, cells, host, cell)?;
+                    if outcome.is_some_and(|outcome| outcome.zone_before != outcome.zone_after) {
+                        host.merge_wall_zone(cell)
+                            .map_err(AuthoredOverlayFinalizeError::Host)?;
+                    }
+                    Ok(())
+                }
+            })
+    }
+
+    fn merge_wall_zones(&mut self, _anchor: NativeOverlayCellTarget) -> Result<(), Self::Error> {
+        Err(AuthoredOverlayFinalizeError::UnhostedMarkCallback {
+            callback: "MapClass::MergeAdjacentCellZone",
+        })
+    }
+
+    fn increment_wall_neighbor_count(
+        &mut self,
+        cell: NativeOverlayCellTarget,
+    ) -> Result<(), Self::Error> {
+        self.cells.increment_authored_wall_count(cell);
+        let cell = self.cells.cell_ref_of(cell);
+        self.host
+            .observe_blocker_count_increment(cell)
+            .map_err(AuthoredOverlayFinalizeError::Host)
+    }
+
+    fn spawn_cell_anim(
+        &mut self,
+        request: OverlayCellAnim<'_>,
+    ) -> Result<Self::CellAnim, Self::Error> {
+        self.host
+            .spawn_cell_anim(self.handle, request, self.terrain)
+            .map_err(AuthoredOverlayFinalizeError::Host)
+    }
+
+    fn tint_cell_anim(
+        &mut self,
+        anim: Self::CellAnim,
+        tiberium: crate::rules::tiberium_type::TiberiumTypeId,
+    ) {
+        self.host.tint_cell_anim(anim, tiberium);
+    }
+
+    fn recalc(&mut self, cell: NativeOverlayCellTarget) -> Result<(), Self::Error> {
+        let cell = self.cells.cell_ref_of(cell);
+        recalc_target(self.terrain, self.recalc, self.cells, self.host, cell).map(|_| ())
+    }
 }
 
 /// Mutable, load-local native overlay cell surface. It cannot escape except by
@@ -941,10 +956,11 @@ impl LiveOverlayCells {
     /// `MapClass::Get_CellClass` narrows both operands to signed words before
     /// sign-extending `y * 512 + x`. A true miss stamps only dummy coordinates.
     pub(crate) fn target(&self, x: i16, y: i16) -> NativeOverlayCellTarget {
-        let real = crate::map::cell_index::cell_linear_index(i32::from(x), i32::from(y)).and_then(
-            |linear| {
-                let rx = (linear % crate::map::cell_index::CELL_ROW_STRIDE) as usize;
-                let ry = (linear / crate::map::cell_index::CELL_ROW_STRIDE) as usize;
+        let grid = crate::map::cell_index::CellGrid::for_extent(self.width, self.height);
+        let real = grid
+            .canonical_coord(i32::from(x), i32::from(y))
+            .and_then(|(rx, ry)| {
+                let (rx, ry) = (usize::from(rx), usize::from(ry));
                 if rx >= usize::from(self.width) || ry >= usize::from(self.height) {
                     return None;
                 }
@@ -955,8 +971,7 @@ impl LiveOverlayCells {
                         .as_deref()
                         .is_none_or(|mask| mask.get(index).copied().unwrap_or(false)))
                 .then_some(index)
-            },
-        );
+            });
         if let Some(index) = real {
             return NativeOverlayCellTarget::Real(index);
         }
@@ -1029,7 +1044,31 @@ impl LiveOverlayCells {
         }
     }
 
-    fn wrapping_increment_authored_wall_count(&mut self, target: NativeOverlayCellTarget) {
+    /// `CellClass+0x24` of a CellClass target: a real cell's own coordinate,
+    /// or the shared dummy's latest stamp.
+    fn coord_of(&self, target: NativeOverlayCellTarget) -> (i16, i16) {
+        match target {
+            NativeOverlayCellTarget::Real(index) => (
+                (index % usize::from(self.width)) as i16,
+                (index / usize::from(self.width)) as i16,
+            ),
+            NativeOverlayCellTarget::Dummy => {
+                let coord = self.shared_dummy.snapshot().coord;
+                (coord.0 as i16, coord.1 as i16)
+            }
+        }
+    }
+
+    fn cell_ref_of(&self, target: NativeOverlayCellTarget) -> AuthoredOverlayCellRef {
+        AuthoredOverlayCellRef {
+            target,
+            coord: self.coord_of(target),
+        }
+    }
+
+    /// One wrapping `INC byte [CellClass+0x122]` from the wall arm
+    /// (`0x005FC762..0x005FC773`). True-dummy increments stay on the dummy.
+    fn increment_authored_wall_count(&mut self, target: NativeOverlayCellTarget) {
         if let NativeOverlayCellTarget::Real(index) = target {
             self.authored_wall_neighbor_counts[index] =
                 self.authored_wall_neighbor_counts[index].wrapping_add(1);
@@ -1038,215 +1077,23 @@ impl LiveOverlayCells {
         }
     }
 
-    fn germinate_authored_tiberium(
-        &mut self,
-        overlay_types: &OverlayTypeRegistry,
-        tiberium_types: &TiberiumTypeRegistry,
-        anchor: AuthoredOverlayCellRef,
-    ) {
-        // gamemd-derived: CellClass::SpreadCellGerminate(0) @ 0x004818E0,
-        // called by OverlayClass::Mark @ 0x005FD0EC.
-        const ADJACENT_8: [(i16, i16); 8] = [
-            (0, -1),
-            (1, -1),
-            (1, 0),
-            (1, 1),
-            (0, 1),
-            (-1, 1),
-            (-1, 0),
-            (-1, -1),
-        ];
-        const DENSITY_FOR_MATCHING_NEIGHBORS: [u8; 9] = [0, 1, 3, 4, 6, 7, 8, 10, 11];
-
-        let current = self.read(anchor.target);
-        let Some(overlay_id) = current.overlay_id() else {
-            return;
-        };
-        let Some(tiberium_type) =
-            overlay_types.tiberium_type_for_overlay(tiberium_types, overlay_id)
-        else {
-            return;
-        };
-
-        let mut matching = 0usize;
-        for offset in ADJACENT_8 {
-            let coord = wrapping_step(anchor.coord, offset);
-            let neighbor = self.cell_ref(coord.0, coord.1);
-            let neighbor_type = self
-                .read(neighbor.target)
-                .overlay_id()
-                .and_then(|id| overlay_types.tiberium_type_for_overlay(tiberium_types, id));
-            matching += usize::from(neighbor_type == Some(tiberium_type));
-        }
-        self.write_state(anchor.target, DENSITY_FOR_MATCHING_NEIGHBORS[matching]);
-    }
-
-    /// Execute the active-retail fixed-map low-overlay branch. The caller owns
-    /// base dirty, the universal slope gate, and the one common anchor Recalc;
-    /// this method owns only the fixed/search/body transaction and its inline
-    /// per-write Recalcs.
-    ///
-    /// Native evidence: `OverlayClass::Mark @ 0x005FC570`, wood corridor
-    /// `0x005FC790..0x005FCB70`, concrete corridor
-    /// `0x005FCBB9..0x005FCF9E`, and the settled tables at
-    /// `0x008333C0..0x00833440`.
-    pub(crate) fn try_mark_authored_low<H: AuthoredLowMarkHost>(
-        &mut self,
-        shape: NativeOverlayMapShape,
-        x: i16,
-        y: i16,
-        overlay_id: u8,
-        host: &mut H,
-    ) -> Result<Option<AuthoredLowMarkResult>, H::Error> {
-        let Some(spec) = authored_low_trigger_spec(overlay_id) else {
-            return Ok(None);
-        };
-
-        let origin = (x, y);
-        let first_fixed = wrapping_step(origin, spec.fixed_start);
-        let mut probe = first_fixed;
-        let mut all_clear = true;
-        for _ in 0..3 {
-            let cell = self.cell_ref(probe.0, probe.1);
-            if self.read(cell.target).identity != NO_OVERLAY_IDENTITY {
-                all_clear = false;
-            }
-            probe = wrapping_step(probe, spec.fixed_step);
-        }
-        if !all_clear {
-            return Ok(Some(AuthoredLowMarkResult::OccupiedFixedRow));
-        }
-
-        let mut fixed = first_fixed;
-        for state in 0..3u8 {
-            let cell = self.cell_ref(fixed.0, fixed.1);
-            self.write_identity(cell.target, i32::from(spec.fixed_id));
-            self.write_state(cell.target, state);
-            host.recalc(self, cell)?;
-            fixed = wrapping_step(fixed, spec.fixed_step);
-        }
-
-        let mut search = wrapping_step(origin, spec.join_step);
-        let found = loop {
-            if !shape.admits(search.0, search.1) {
-                break None;
-            }
-            let cell = self.cell_ref(search.0, search.1);
-            let current = self.read(cell.target);
-            if current.identity == i32::from(spec.opposite_id) && current.state == 1 {
-                break Some(search);
-            }
-            search = wrapping_step(search, spec.join_step);
-        };
-        let Some(found) = found else {
-            return Ok(Some(AuthoredLowMarkResult::FixedEndWithoutOpposite));
-        };
-
-        let reverse = (-spec.join_step.0, -spec.join_step.1);
-        let mut work = wrapping_step(found, reverse);
-        let rows = (i32::from(work.0) - i32::from(first_fixed.0))
-            .abs()
-            .max((i32::from(work.1) - i32::from(first_fixed.1)).abs()) as u32;
-        let mut scenario_draws = 0u32;
-        for _ in 0..rows {
-            for (state, offset) in spec.body_cross.into_iter().enumerate() {
-                let coord = wrapping_step(work, offset);
-                let cell = self.cell_ref(coord.0, coord.1);
-                let raw = host.next_scenario_raw();
-                scenario_draws = scenario_draws.wrapping_add(1);
-                self.write_identity(
-                    cell.target,
-                    i32::from(spec.body_base.wrapping_add((raw & 3) as u8)),
-                );
-                self.write_state(cell.target, state as u8);
-                host.recalc(self, cell)?;
-            }
-            work = wrapping_step(work, reverse);
-        }
-
-        Ok(Some(AuthoredLowMarkResult::BodyRows {
-            rows,
-            scenario_draws,
-        }))
-    }
-
-    /// Complete the authored `Wall=yes` Mark arm after reader admission and
-    /// allocation. Successful Full_Init keeps ScenarioInit nonzero, so there is
-    /// intentionally no Rust approximation of the counter-zero build predicate.
-    ///
-    /// Native evidence: `OverlayClass::Mark @ 0x005FC570`, wall success corridor
-    /// `0x005FC6F4..0x005FC775`, and common tail `0x005FD1FA..0x005FD227`.
-    #[cfg(test)]
-    pub(crate) fn mark_authored_wall(
+    /// `CellClass::PostDestructionWallCleanup @ 0x00480630` with argument 1,
+    /// as the wall arm of `OverlayClass::Mark` calls it while the map reader
+    /// keeps ScenarioInit raised: the north, east, south, west and self visits
+    /// publish their dirty cells, and every wall among them recomputes its
+    /// connectivity nibble and recalculates. Every callback completes before
+    /// the cleanup advances to the next effect.
+    pub(crate) fn post_wall_cleanup<E>(
         &mut self,
         registry: &OverlayTypeRegistry,
-        x: i16,
-        y: i16,
-        overlay_id: u8,
-        anchor_slope_type: u8,
-        mut apply_effect: impl FnMut(AuthoredWallEffect),
-    ) -> AuthoredWallMarkResult {
-        match self.try_mark_authored_wall(
-            registry,
-            x,
-            y,
-            overlay_id,
-            anchor_slope_type,
-            |_, effect| {
-                apply_effect(effect);
-                Ok::<(), std::convert::Infallible>(())
-            },
-        ) {
-            Ok(result) => result,
-            Err(never) => match never {},
-        }
-    }
-
-    /// Fallible form used by the production load-effect host. Every callback
-    /// completes before native wall Mark advances to the next effect.
-    pub(crate) fn try_mark_authored_wall<E>(
-        &mut self,
-        registry: &OverlayTypeRegistry,
-        x: i16,
-        y: i16,
-        overlay_id: u8,
-        anchor_slope_type: u8,
+        anchor: (i16, i16),
         mut apply_effect: impl FnMut(&mut LiveOverlayCells, AuthoredWallEffect) -> Result<(), E>,
-    ) -> Result<AuthoredWallMarkResult, E> {
+    ) -> Result<(), E> {
         const CARDINAL: [(i16, i16); 4] = [(0, -1), (1, 0), (0, 1), (-1, 0)];
         const CLEANUP_CROSS: [(i16, i16); 5] = [(0, -1), (1, 0), (0, 1), (-1, 0), (0, 0)];
-        const ADJACENT_8: [(i16, i16); 8] = [
-            (0, -1),
-            (1, -1),
-            (1, 0),
-            (1, 1),
-            (0, 1),
-            (-1, 1),
-            (-1, 0),
-            (-1, -1),
-        ];
-
-        let anchor = self.cell_ref(x, y);
-        let NativeOverlayCellTarget::Real(_) = anchor.target else {
-            return Ok(AuthoredWallMarkResult::RejectedUnallocatedAnchor);
-        };
-        let anchor_coord = self.coord_for_target(anchor.target, anchor.coord);
-        if anchor_slope_type > 4 && overlay_id != 0xB2 {
-            return Ok(AuthoredWallMarkResult::RejectedSteepSlope);
-        }
-        if !registry.flags(overlay_id).is_some_and(|flags| flags.wall) {
-            return Ok(AuthoredWallMarkResult::RejectedNonWallType);
-        }
-
-        // Native writes state before compact identity.
-        self.write_state(anchor.target, 0);
-        self.write_identity(anchor.target, i32::from(overlay_id));
 
         for (dx, dy) in CLEANUP_CROSS {
-            let visit = self.cell_ref(
-                anchor_coord.0.wrapping_add(dx),
-                anchor_coord.1.wrapping_add(dy),
-            );
+            let visit = self.cell_ref(anchor.0.wrapping_add(dx), anchor.1.wrapping_add(dy));
             apply_effect(self, AuthoredWallEffect::TacticalDirty(visit))?;
             apply_effect(self, AuthoredWallEffect::RadarDirty(visit))?;
 
@@ -1281,18 +1128,7 @@ impl LiveOverlayCells {
             };
             apply_effect(self, AuthoredWallEffect::CleanupRecalcAndZone(recalc))?;
         }
-
-        for (dx, dy) in ADJACENT_8 {
-            let neighbor = self.cell_ref(
-                anchor_coord.0.wrapping_add(dx),
-                anchor_coord.1.wrapping_add(dy),
-            );
-            self.wrapping_increment_authored_wall_count(neighbor.target);
-            apply_effect(self, AuthoredWallEffect::BlockerCountIncrement(neighbor))?;
-        }
-
-        apply_effect(self, AuthoredWallEffect::CommonAnchorRecalc(anchor))?;
-        Ok(AuthoredWallMarkResult::Completed)
+        Ok(())
     }
 
     pub(crate) fn finish(self) -> FinalizedOverlayPayload {
@@ -1304,13 +1140,13 @@ impl LiveOverlayCells {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn real_cell(&self, index: usize) -> FinalizedOverlayCell {
         self.cells[index]
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod tests {
     use super::*;
     use crate::map::resolved_terrain::{SharedCellDummy, zone_class};
@@ -1323,6 +1159,93 @@ mod tests {
             height,
             crate::map::resolved_terrain::test_loader_clear_cell,
         )
+    }
+
+    #[test]
+    fn authored_high_bridge_spans_an_interior_steep_depression() {
+        let mut terrain = flat_terrain(24, 24);
+        for (x, level, slope) in [(10, 6, 0), (11, 0, 9), (12, 6, 9), (13, 6, 0)] {
+            let cell = terrain.cell_mut_for_test(x, 10).unwrap();
+            cell.level = level;
+            cell.slope_type = slope;
+        }
+        let registry = registry_with_count(25);
+        let payload = AuthoredOverlayFinalizer::new(
+            &mut terrain,
+            NativeOverlayMapShape::new(10, 10),
+            &registry,
+            &TiberiumTypeRegistry::default(),
+            &BTreeSet::from([0x18]),
+            4,
+            AuthoredCratePolicy::Keep,
+            &mut LoadHost::default(),
+        )
+        .run(raw_packs(
+            &[
+                (10, 10, 0x18),
+                (11, 10, 0x18),
+                (12, 10, 0x18),
+                (13, 10, 0x18),
+            ],
+            &[],
+        ))
+        .unwrap();
+        let (_, _, overlays, _) = payload.into_parts();
+        for x in [11, 12] {
+            let index = terrain.native_fixed_cell_index(x, 10).unwrap();
+            assert_eq!(overlays[index].overlay_id(), Some(0x18));
+            assert_eq!(
+                terrain.corrected_high_bridge_deck_level((x as u16, 10)),
+                Some(10)
+            );
+        }
+    }
+
+    #[test]
+    fn authored_high_bridge_uses_rim_deck_at_depressed_overlay_ends() {
+        let mut terrain = flat_terrain(24, 24);
+        terrain.test_set_high_bridge_rim_tiles(
+            crate::map::bridge_rim_tiles::HighBridgeRimTiles::from_ini(
+                100,
+                b"[General]\nBridgeTopRight1=5\nBridgeBottomLeft1=7\n",
+            ),
+        );
+        for (y, level, slope, tile, sub) in [
+            (9, 10, 0, 104, 8),
+            (10, 0, 9, 104, 12),
+            (11, 0, 9, 0, 0),
+            (12, 0, 9, 0, 0),
+            (13, 10, 0, 106, 2),
+        ] {
+            let cell = terrain.cell_mut_for_test(10, y).unwrap();
+            cell.level = level;
+            cell.slope_type = slope;
+            cell.final_tile_index = tile;
+            cell.final_sub_tile = sub;
+        }
+        let registry = registry_with_count(26);
+        let payload = AuthoredOverlayFinalizer::new(
+            &mut terrain,
+            NativeOverlayMapShape::new(10, 10),
+            &registry,
+            &TiberiumTypeRegistry::default(),
+            &BTreeSet::from([0x19]),
+            4,
+            AuthoredCratePolicy::Keep,
+            &mut LoadHost::default(),
+        )
+        .run(raw_packs(
+            &[(10, 10, 0x19), (10, 11, 0x19), (10, 12, 0x19)],
+            &[],
+        ))
+        .unwrap()
+        .into_parts()
+        .2;
+        for y in [10, 12] {
+            let index = terrain.native_fixed_cell_index(10, y as i16).unwrap();
+            assert_eq!(payload[index].overlay_id(), Some(0x19));
+            assert_eq!(terrain.corrected_high_bridge_deck_level((10, y)), Some(10));
+        }
     }
 
     fn wall_registry() -> OverlayTypeRegistry {
@@ -1366,8 +1289,14 @@ mod tests {
             data[usize::from(y) * 512 + usize::from(x)] = value;
         }
         AuthoredOverlayPackReceipt::from_parts_for_test(
-            crate::map::overlay::OverlayIdentityPack::from_decoded(identity),
-            crate::map::overlay::OverlayDataPack::from_decoded(data),
+            crate::map::overlay::OverlayIdentityPack::from_decoded(
+                identity,
+                crate::map::cell_index::CellGrid::Retail,
+            ),
+            crate::map::overlay::OverlayDataPack::from_decoded(
+                data,
+                crate::map::cell_index::CellGrid::Retail,
+            ),
         )
     }
 
@@ -1380,6 +1309,7 @@ mod tests {
              [Tiberiums]\n0=Riparius\n\
              [Riparius]\nImage=1\nMaxDensity=12\n",
         );
+        let ini = crate::rules::tiberium_type::with_tiberium_image_slots(&ini);
         (
             OverlayTypeRegistry::from_ini(&ini, None),
             TiberiumTypeRegistry::from_ini(&ini),
@@ -1393,39 +1323,55 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct LowHost {
-        raw: Vec<u32>,
-        next_raw: usize,
-        recalcs: Vec<(AuthoredOverlayCellRef, FinalizedOverlayCell)>,
+    /// The one Mark port on load-local cells through the production load
+    /// host, outside a reader row (handle 0, synthetic Recalc inputs).
+    fn mark_live(
+        terrain: &mut ResolvedTerrainGrid,
+        cells: &mut LiveOverlayCells,
+        shape: NativeOverlayMapShape,
+        overlay_types: &OverlayTypeRegistry,
+        tiberium_types: &TiberiumTypeRegistry,
+        host: &mut LoadHost,
+        coord: (i16, i16),
+        overlay_id: u8,
+    ) -> Result<OverlayMarkOutcome, AuthoredOverlayFinalizeError<Infallible>> {
+        let mut recalc = LoadCellRecalcState::synthetic(overlay_types, terrain.cells().len());
+        let request = OverlayMarkRequest {
+            overlay_id,
+            flags: overlay_types.flags(overlay_id).expect("registered type"),
+            cell: coord,
+            location: [
+                i32::from(coord.0) * 256 + 128,
+                i32::from(coord.1) * 256 + 128,
+                0,
+            ],
+            registry: overlay_types,
+            tiberium_types: Some(tiberium_types),
+            crate_images: MarkCrateImages::default(),
+        };
+        mark_overlay(
+            &mut FinalizerMarkHost {
+                terrain,
+                recalc: &mut recalc,
+                cells,
+                shape,
+                overlay_types,
+                host,
+                handle: 0,
+                span_deck: None,
+            },
+            &request,
+        )
     }
 
-    impl LowHost {
-        fn with_raw(raw: impl IntoIterator<Item = u32>) -> Self {
-            Self {
-                raw: raw.into_iter().collect(),
-                ..Self::default()
-            }
-        }
-    }
-
-    impl AuthoredLowMarkHost for LowHost {
-        type Error = Infallible;
-
-        fn next_scenario_raw(&mut self) -> u32 {
-            let raw = self.raw.get(self.next_raw).copied().unwrap_or(0);
-            self.next_raw += 1;
-            raw
-        }
-
-        fn recalc(
-            &mut self,
-            cells: &mut LiveOverlayCells,
-            cell: AuthoredOverlayCellRef,
-        ) -> Result<(), Self::Error> {
-            self.recalcs.push((cell, cells.read(cell.target)));
-            Ok(())
-        }
+    fn recalcs(host: &LoadHost) -> Vec<(AuthoredOverlayCellRef, FinalizedOverlayCell)> {
+        host.events
+            .iter()
+            .filter_map(|event| match event {
+                LoadEvent::Recalc(cell, value) => Some((*cell, *value)),
+                _ => None,
+            })
+            .collect()
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1437,7 +1383,8 @@ mod tests {
         Recalc(AuthoredOverlayCellRef, FinalizedOverlayCell),
         WallZone(AuthoredOverlayCellRef),
         BlockerIncrement(AuthoredOverlayCellRef),
-        CellAnim(u32, String, AuthoredOverlayCellRef),
+        CellAnim(u32, String, NativeOverlayCellTarget, [i32; 2]),
+        CellAnimTint(u32, u8),
         FinishCommon(u32),
         FinishSlope(u32),
         Drain,
@@ -1456,6 +1403,7 @@ mod tests {
     impl AuthoredOverlayLoadHost for LoadHost {
         type Handle = u32;
         type Error = Infallible;
+        type CellAnim = u32;
 
         fn try_construct_overlay(
             &mut self,
@@ -1531,13 +1479,24 @@ mod tests {
         fn spawn_cell_anim(
             &mut self,
             handle: Self::Handle,
-            anim_name: &str,
-            cell: AuthoredOverlayCellRef,
-            _world_z: i32,
-        ) -> Result<(), Self::Error> {
-            self.events
-                .push(LoadEvent::CellAnim(handle, anim_name.to_string(), cell));
-            Ok(())
+            request: OverlayCellAnim<'_>,
+            _terrain: &ResolvedTerrainGrid,
+        ) -> Result<Self::CellAnim, Self::Error> {
+            self.events.push(LoadEvent::CellAnim(
+                handle,
+                request.anim.to_string(),
+                request.cell,
+                request.anim_xy,
+            ));
+            Ok(handle)
+        }
+
+        fn tint_cell_anim(
+            &mut self,
+            anim: Self::CellAnim,
+            tiberium: crate::rules::tiberium_type::TiberiumTypeId,
+        ) {
+            self.events.push(LoadEvent::CellAnimTint(anim, tiberium.0));
         }
 
         fn finish_common(&mut self, handle: Self::Handle) -> Result<(), Self::Error> {
@@ -1574,24 +1533,6 @@ mod tests {
     }
 
     #[test]
-    fn payload_retains_signed_identity_and_independent_state_until_consumed() {
-        let payload = FinalizedOverlayPayload::from_cells_for_test(
-            2,
-            1,
-            vec![(NO_OVERLAY_IDENTITY, 41), (0xee, 9)],
-            vec![7, 11],
-        );
-        let (width, height, cells, counts) = payload.into_parts();
-
-        assert_eq!((width, height), (2, 1));
-        assert_eq!(cells[0].overlay_id(), None);
-        assert_eq!(cells[0].state(), 41);
-        assert_eq!(cells[1].overlay_id(), Some(0xee));
-        assert_eq!(cells[1].state(), 9);
-        assert_eq!(counts, vec![7, 11]);
-    }
-
-    #[test]
     fn native_overlay_shape_keeps_all_four_strict_radar_boundaries() {
         let shape = NativeOverlayMapShape::new(10, 6);
         assert!(!shape.admits(5, 5), "W < x+y is strict");
@@ -1607,6 +1548,16 @@ mod tests {
         assert_eq!(
             shape.recalc_cells(),
             vec![(1, 2), (2, 1), (2, 2), (2, 3), (3, 2), (3, 3)]
+        );
+    }
+
+    #[test]
+    fn a_one_cell_wide_walk_ends_at_its_first_null() {
+        // The walk steps from (1, 1) to (2, 1), outside a one-wide Size, where
+        // Next @ 0x00578290 returns null before the diagonal's (2, 2).
+        assert_eq!(
+            NativeOverlayMapShape::new(1, 3).recalc_cells(),
+            vec![(1, 1)]
         );
     }
 
@@ -1627,7 +1578,7 @@ mod tests {
             &tiberium_types,
             &shp_ids,
             4,
-            false,
+            AuthoredCratePolicy::Keep,
             &mut host,
         )
         .run(packs)
@@ -1706,7 +1657,7 @@ mod tests {
             &tiberium_types,
             &shp_ids,
             1,
-            false,
+            AuthoredCratePolicy::Keep,
             &mut host,
         )
         .run(packs)
@@ -1748,7 +1699,7 @@ mod tests {
             &tiberium_types,
             &malformed_shp,
             4,
-            false,
+            AuthoredCratePolicy::Keep,
             &mut malformed_host,
         )
         .run(raw_packs(&[(0, 0, 1)], &[]));
@@ -1770,7 +1721,7 @@ mod tests {
             &tiberium_types,
             &shp,
             4,
-            false,
+            AuthoredCratePolicy::Keep,
             &mut null_host,
         )
         .run(raw_packs(&[(2, 1, 0)], &[]))
@@ -1782,7 +1733,7 @@ mod tests {
         );
 
         let mut slope_terrain = flat_terrain(6, 6);
-        slope_terrain.cells[8].slope_type = 5;
+        slope_terrain.cells_mut_for_test()[8].slope_type = 5;
         let mut slope_host = LoadHost::default();
         let slope_payload = AuthoredOverlayFinalizer::new(
             &mut slope_terrain,
@@ -1791,7 +1742,7 @@ mod tests {
             &tiberium_types,
             &shp,
             4,
-            false,
+            AuthoredCratePolicy::Keep,
             &mut slope_host,
         )
         .run(raw_packs(&[(2, 1, 0)], &[]))
@@ -1818,7 +1769,7 @@ mod tests {
         let tiberium_types = TiberiumTypeRegistry::default();
 
         let mut b2_terrain = flat_terrain(6, 6);
-        b2_terrain.cells[8].slope_type = 5;
+        b2_terrain.cells_mut_for_test()[8].slope_type = 5;
         let b2_registry = registry_with_count(0xB3);
         let b2_shp = BTreeSet::from([0xB2]);
         let mut b2_host = LoadHost::default();
@@ -1829,7 +1780,7 @@ mod tests {
             &tiberium_types,
             &b2_shp,
             4,
-            false,
+            AuthoredCratePolicy::Keep,
             &mut b2_host,
         )
         .run(raw_packs(&[(2, 1, 0xB2)], &[]))
@@ -1862,7 +1813,7 @@ mod tests {
             &tiberium_types,
             &BTreeSet::new(),
             4,
-            false,
+            AuthoredCratePolicy::Keep,
             &mut cell_anim_host,
         )
         .run(raw_packs(&[(2, 1, 0)], &[]))
@@ -1873,7 +1824,13 @@ mod tests {
                 LoadEvent::Construct(0, (2, 1), 1),
                 LoadEvent::Begin(1, real(8, (2, 1))),
                 LoadEvent::Dirty(MapLoadDirtyKind::BaseMarkTactical, real(8, (2, 1))),
-                LoadEvent::CellAnim(1, "SPARK".to_string(), real(8, (2, 1))),
+                // 0x005FD171..0x005FD177: Location plus 0x180 on X and Y.
+                LoadEvent::CellAnim(
+                    1,
+                    "SPARK".to_string(),
+                    NativeOverlayCellTarget::Real(8),
+                    [2 * 256 + 128 + 0x180, 256 + 128 + 0x180],
+                ),
                 LoadEvent::Recalc(
                     real(8, (2, 1)),
                     FinalizedOverlayCell {
@@ -1898,7 +1855,7 @@ mod tests {
             &tiberium_types,
             &crate_shp,
             4,
-            true,
+            AuthoredCratePolicy::Skip,
             &mut rejected_host,
         )
         .run(raw_packs(&[(2, 1, 0)], &[]))
@@ -1918,7 +1875,7 @@ mod tests {
             &tiberium_types,
             &crate_shp,
             4,
-            false,
+            AuthoredCratePolicy::Keep,
             &mut accepted_host,
         )
         .run(raw_packs(&[(2, 1, 0)], &[]))
@@ -1951,7 +1908,7 @@ mod tests {
             &tiberium_types,
             &BTreeSet::new(),
             4,
-            false,
+            AuthoredCratePolicy::Keep,
             &mut rejected_host,
         )
         .run(raw_packs(&[(2, 1, 0)], &[(2, 1, 7)]))
@@ -1972,7 +1929,7 @@ mod tests {
             &tiberium_types,
             &low_shp,
             4,
-            false,
+            AuthoredCratePolicy::Keep,
             &mut short_host,
         )
         .run(raw_packs(&[(2, 2, 0x7B)], &[(0, 0, 37)]))
@@ -2007,7 +1964,7 @@ mod tests {
             &tiberium_types,
             &shp,
             4,
-            false,
+            AuthoredCratePolicy::Keep,
             &mut no_data_host,
         )
         .run(raw_packs(&identity_rows, &[]))
@@ -2048,7 +2005,7 @@ mod tests {
             &tiberium_types,
             &shp,
             4,
-            false,
+            AuthoredCratePolicy::Keep,
             &mut data_host,
         )
         .run(raw_packs(&identity_rows, &data_rows))
@@ -2062,6 +2019,7 @@ mod tests {
              [Tiberiums]\n0=Riparius\n\
              [Riparius]\nImage=1\n",
         );
+        let crate_ini = crate::rules::tiberium_type::with_tiberium_image_slots(&crate_ini);
         let crate_registry = OverlayTypeRegistry::from_ini(&crate_ini, None);
         let crate_tiberium = TiberiumTypeRegistry::from_ini(&crate_ini);
         let mut crate_terrain = flat_terrain(12, 12);
@@ -2073,7 +2031,7 @@ mod tests {
             &crate_tiberium,
             &shp,
             4,
-            false,
+            AuthoredCratePolicy::Keep,
             &mut crate_host,
         )
         .run(raw_packs(&[(4, 3, 0)], &[]))
@@ -2107,7 +2065,7 @@ mod tests {
             &tiberium_types,
             &shp,
             4,
-            false,
+            AuthoredCratePolicy::Keep,
             &mut host,
         )
         .run(raw_packs(&[(8, 8, 0x7B), (12, 8, 0x7A)], &[]))
@@ -2148,17 +2106,12 @@ mod tests {
                 let index = y * 24 + center_x;
                 assert_eq!(cells[index].overlay_id(), Some(0x4A + (draw as u8 & 3)));
                 assert_eq!(cells[index].state(), state as u8);
-                assert_eq!(
-                    terrain.cells[index].bridge_facts.overlay_id,
-                    cells[index].overlay_id()
-                );
-                assert_eq!(terrain.cells[index].bridge_facts.state_byte, state as u8);
             }
         }
     }
 
     #[test]
-    fn map_owned_recalc_clears_sloped_resource_pair_on_both_live_surfaces() {
+    fn map_owned_recalc_clears_the_sloped_resource_pair() {
         let registry = OverlayTypeRegistry::from_ini(
             &IniFile::from_str(
                 "[OverlayTypes]\n0=SLOPED_RESOURCE\n\
@@ -2172,8 +2125,8 @@ mod tests {
             (5, FinalizedOverlayCell::default()),
         ] {
             let mut terrain = flat_terrain(6, 6);
-            terrain.cells[8].slope_type = slope;
-            let mut recalc = LoadCellRecalcState::synthetic(&registry, terrain.cells.len());
+            terrain.cells_mut_for_test()[8].slope_type = slope;
+            let mut recalc = LoadCellRecalcState::synthetic(&registry, terrain.cells().len());
             let mut cells = LiveOverlayCells::empty_for_terrain(&terrain);
             let target = real(8, (2, 1));
             cells.write(target.target, 0, 7);
@@ -2183,11 +2136,6 @@ mod tests {
                 .expect("map-owned resource Recalc");
 
             assert_eq!(cells.real_cell(8), expected, "slope {slope}");
-            assert_eq!(
-                terrain.cells[8].bridge_facts.overlay_id,
-                expected.overlay_id()
-            );
-            assert_eq!(terrain.cells[8].bridge_facts.state_byte, expected.state());
             assert_eq!(host.events, vec![LoadEvent::Recalc(target, expected)]);
         }
     }
@@ -2195,9 +2143,9 @@ mod tests {
     #[test]
     fn map_owned_recalc_returns_before_reading_or_observing_the_shared_dummy() {
         let mut terrain = flat_terrain(2, 2);
-        let before = format!("{:?}", terrain.cells);
+        let before = format!("{:?}", terrain.cells());
         let registry = registry_with_count(1);
-        let mut recalc = LoadCellRecalcState::synthetic(&registry, terrain.cells.len());
+        let mut recalc = LoadCellRecalcState::synthetic(&registry, terrain.cells().len());
         let mut cells = LiveOverlayCells::empty_for_terrain(&terrain);
         cells.write(NativeOverlayCellTarget::Dummy, 0, 9);
         let dummy = AuthoredOverlayCellRef {
@@ -2213,7 +2161,7 @@ mod tests {
             cells.read(NativeOverlayCellTarget::Dummy),
             FinalizedOverlayCell::from_parts(0, 9)
         );
-        assert_eq!(format!("{:?}", terrain.cells), before);
+        assert_eq!(format!("{:?}", terrain.cells()), before);
         assert!(host.events.is_empty());
     }
 
@@ -2236,7 +2184,7 @@ mod tests {
                 &tiberium_types,
                 &shp_ids,
                 4,
-                false,
+                AuthoredCratePolicy::Keep,
                 &mut host,
             )
             .run(packs)
@@ -2265,7 +2213,6 @@ mod tests {
             let anchor_index = usize::from(y) * 16 + 7;
             assert_eq!(cells[anchor_index].overlay_id(), Some(later_dir0));
             assert_eq!(cells[anchor_index].state(), 9);
-            assert_eq!(terrain.cells[anchor_index].bridge_facts.state_byte, 9);
         }
     }
 
@@ -2286,7 +2233,7 @@ mod tests {
             &tiberium_types,
             &shp_ids,
             4,
-            false,
+            AuthoredCratePolicy::Keep,
             &mut host,
         )
         .run(packs)
@@ -2344,7 +2291,7 @@ mod tests {
     #[test]
     fn authored_wall_cleanup_skips_zone_merge_when_recalc_keeps_zone() {
         let mut terrain = flat_terrain(6, 6);
-        terrain.cells[14].zone_type = zone_class::WALL;
+        terrain.cells_mut_for_test()[14].zone_type = zone_class::WALL;
         let shape = NativeOverlayMapShape::new(2, 2);
         let registry = wall_registry();
         let tiberium_types = TiberiumTypeRegistry::default();
@@ -2359,7 +2306,7 @@ mod tests {
             &tiberium_types,
             &shp_ids,
             4,
-            false,
+            AuthoredCratePolicy::Keep,
             &mut host,
         )
         .run(packs)
@@ -2375,7 +2322,7 @@ mod tests {
 
     #[test]
     fn authored_tiberium_germination_uses_same_class_neighbor_density_table() {
-        let terrain = flat_terrain(12, 12);
+        let shape = NativeOverlayMapShape::new(12, 12);
         let (overlay_types, tiberium_types) = tiberium_registries();
         let neighbors = [
             (5, 4),
@@ -2390,23 +2337,46 @@ mod tests {
         let expected = [0, 1, 3, 4, 6, 7, 8, 10, 11];
 
         for matching in 0..=8 {
+            let mut terrain = flat_terrain(12, 12);
             let mut live = LiveOverlayCells::empty_for_terrain(&terrain);
-            let anchor = live.cell_ref(5, 5);
-            live.write(anchor.target, 0, 1);
             for &coord in &neighbors[..matching] {
                 let target = live.target(coord.0, coord.1);
                 live.write(target, 1, u8::MAX);
             }
-            live.germinate_authored_tiberium(&overlay_types, &tiberium_types, anchor);
-            assert_eq!(live.read(anchor.target).state(), expected[matching]);
+            let mut host = LoadHost::default();
+            assert_eq!(
+                mark_live(
+                    &mut terrain,
+                    &mut live,
+                    shape,
+                    &overlay_types,
+                    &tiberium_types,
+                    &mut host,
+                    (5, 5),
+                    0,
+                )
+                .expect("Mark"),
+                OverlayMarkOutcome::Marked
+            );
+            assert_eq!(live.read(live.target(5, 5)).state(), expected[matching]);
         }
 
+        let mut terrain = flat_terrain(12, 12);
         let mut land_only = LiveOverlayCells::empty_for_terrain(&terrain);
-        let anchor = land_only.cell_ref(5, 5);
-        land_only.write(anchor.target, 2, 1);
-        land_only.germinate_authored_tiberium(&overlay_types, &tiberium_types, anchor);
+        let mut host = LoadHost::default();
+        mark_live(
+            &mut terrain,
+            &mut land_only,
+            shape,
+            &overlay_types,
+            &tiberium_types,
+            &mut host,
+            (5, 5),
+            2,
+        )
+        .expect("Land=Tiberium Mark");
         assert_eq!(
-            land_only.read(anchor.target).state(),
+            land_only.read(land_only.target(5, 5)).state(),
             1,
             "Land=5 without Tiberium=yes returns before neighbor lookup"
         );
@@ -2420,12 +2390,21 @@ mod tests {
         let mut live = LiveOverlayCells::empty_for_terrain(&terrain);
         let dummy = live.target(-1, 0);
         live.write(dummy, 1, 9);
-        let anchor = live.cell_ref(0, 0);
-        live.write(anchor.target, 0, 1);
+        let mut host = LoadHost::default();
 
-        live.germinate_authored_tiberium(&overlay_types, &tiberium_types, anchor);
+        mark_live(
+            &mut terrain,
+            &mut live,
+            NativeOverlayMapShape::new(4, 4),
+            &overlay_types,
+            &tiberium_types,
+            &mut host,
+            (0, 0),
+            0,
+        )
+        .expect("germinating Mark");
 
-        assert_eq!(live.read(anchor.target).state(), 11);
+        assert_eq!(live.read(live.target(0, 0)).state(), 11);
         assert_eq!(terrain.dummy_cell_requested_coord(), (-1, -1));
         assert_eq!(live.read(dummy).overlay_id(), Some(1));
         assert_eq!(live.read(dummy).state(), 9);
@@ -2440,8 +2419,9 @@ mod tests {
 
     #[test]
     fn authored_low_fixed_tables_cover_both_retail_families_without_rng() {
-        let terrain = flat_terrain(20, 20);
         let shape = NativeOverlayMapShape::new(10, 10);
+        let registry = registry_with_count(0xF0);
+        let tiberium_types = TiberiumTypeRegistry::default();
         let fixtures = [
             (0x7A, 0x5C, [(8, 7), (8, 8), (8, 9)]),
             (0x7B, 0x5E, [(8, 7), (8, 8), (8, 9)]),
@@ -2454,14 +2434,29 @@ mod tests {
         ];
 
         for (trigger, fixed_id, coords) in fixtures {
+            let mut terrain = flat_terrain(20, 20);
             let mut live = LiveOverlayCells::empty_for_terrain(&terrain);
-            let mut host = LowHost::default();
+            let mut host = LoadHost::default();
             assert_eq!(
-                live.try_mark_authored_low(shape, 8, 8, trigger, &mut host),
-                Ok(Some(AuthoredLowMarkResult::FixedEndWithoutOpposite))
+                mark_live(
+                    &mut terrain,
+                    &mut live,
+                    shape,
+                    &registry,
+                    &tiberium_types,
+                    &mut host,
+                    (8, 8),
+                    trigger,
+                )
+                .expect("Mark"),
+                OverlayMarkOutcome::Marked
             );
             assert_eq!(host.next_raw, 0, "trigger {trigger:#04X}");
-            assert_eq!(host.recalcs.len(), 3, "trigger {trigger:#04X}");
+            assert_eq!(
+                recalcs(&host).len(),
+                4,
+                "three fixed Recalcs and the common one, trigger {trigger:#04X}"
+            );
             for (state, coord) in coords.into_iter().enumerate() {
                 let cell = live.read(live.target(coord.0, coord.1));
                 assert_eq!(cell.overlay_id(), Some(fixed_id), "at {coord:?}");
@@ -2475,17 +2470,31 @@ mod tests {
         let mut terrain = flat_terrain(12, 12);
         terrain.test_set_native_allocated_cells(&[(8, 7)]);
         let shape = NativeOverlayMapShape::new(10, 10);
+        let registry = registry_with_count(0x7C);
         let mut live = LiveOverlayCells::empty_for_terrain(&terrain);
         let occupied = live.target(8, 7);
         live.write(occupied, 3, 4);
-        let mut host = LowHost::default();
+        let mut host = LoadHost::default();
 
         assert_eq!(
-            live.try_mark_authored_low(shape, 8, 8, 0x7B, &mut host),
-            Ok(Some(AuthoredLowMarkResult::OccupiedFixedRow))
+            mark_live(
+                &mut terrain,
+                &mut live,
+                shape,
+                &registry,
+                &TiberiumTypeRegistry::default(),
+                &mut host,
+                (8, 8),
+                0x7B,
+            )
+            .expect("Mark"),
+            OverlayMarkOutcome::Marked
         );
         assert_eq!(host.next_raw, 0);
-        assert!(host.recalcs.is_empty());
+        assert!(
+            recalcs(&host).is_empty(),
+            "the trigger cell is the dummy, whose common Recalc returns at once"
+        );
         assert_eq!(terrain.dummy_cell_requested_coord(), (8, 9));
         assert_eq!(live.read(occupied).overlay_id(), Some(3));
         assert_eq!(live.read(occupied).state(), 4);
@@ -2493,22 +2502,37 @@ mod tests {
 
     #[test]
     fn authored_low_body_runs_opposite_to_trigger_with_three_raw_draws_per_row() {
-        let terrain = flat_terrain(24, 24);
+        let mut terrain = flat_terrain(24, 24);
         let shape = NativeOverlayMapShape::new(12, 12);
+        let registry = registry_with_count(0x7C);
         let mut live = LiveOverlayCells::empty_for_terrain(&terrain);
         let opposite = live.target(12, 8);
         live.write(opposite, 0x5C, 1);
-        let mut host = LowHost::with_raw(0..9);
+        let mut host = LoadHost {
+            raw: (0..9).collect(),
+            ..LoadHost::default()
+        };
 
         assert_eq!(
-            live.try_mark_authored_low(shape, 8, 8, 0x7B, &mut host),
-            Ok(Some(AuthoredLowMarkResult::BodyRows {
-                rows: 3,
-                scenario_draws: 9,
-            }))
+            mark_live(
+                &mut terrain,
+                &mut live,
+                shape,
+                &registry,
+                &TiberiumTypeRegistry::default(),
+                &mut host,
+                (8, 8),
+                0x7B,
+            )
+            .expect("Mark"),
+            OverlayMarkOutcome::Marked
         );
         assert_eq!(host.next_raw, 9);
-        assert_eq!(host.recalcs.len(), 12, "three fixed plus nine body");
+        assert_eq!(
+            recalcs(&host).len(),
+            13,
+            "three fixed, nine body and the common Recalc"
+        );
         for (row, center_x) in [11i16, 10, 9].into_iter().enumerate() {
             for (state, y) in [7i16, 8, 9].into_iter().enumerate() {
                 let draw = row * 3 + state;
@@ -2521,22 +2545,37 @@ mod tests {
 
     #[test]
     fn authored_low_north_south_body_uses_transverse_west_center_east_order() {
-        let terrain = flat_terrain(24, 24);
+        let mut terrain = flat_terrain(24, 24);
         let shape = NativeOverlayMapShape::new(10, 10);
+        let registry = registry_with_count(0x7E);
         let mut live = LiveOverlayCells::empty_for_terrain(&terrain);
         let opposite = live.target(8, 4);
         live.write(opposite, 0x60, 1);
-        let mut host = LowHost::with_raw(0..9);
+        let mut host = LoadHost {
+            raw: (0..9).collect(),
+            ..LoadHost::default()
+        };
 
         assert_eq!(
-            live.try_mark_authored_low(shape, 8, 8, 0x7D, &mut host),
-            Ok(Some(AuthoredLowMarkResult::BodyRows {
-                rows: 3,
-                scenario_draws: 9,
-            }))
+            mark_live(
+                &mut terrain,
+                &mut live,
+                shape,
+                &registry,
+                &TiberiumTypeRegistry::default(),
+                &mut host,
+                (8, 8),
+                0x7D,
+            )
+            .expect("Mark"),
+            OverlayMarkOutcome::Marked
         );
         assert_eq!(host.next_raw, 9);
-        assert_eq!(host.recalcs.len(), 12, "three fixed plus nine body");
+        assert_eq!(
+            recalcs(&host).len(),
+            13,
+            "three fixed, nine body and the common Recalc"
+        );
         for (row, center_y) in [5i16, 6, 7].into_iter().enumerate() {
             for (state, x) in [7i16, 8, 9].into_iter().enumerate() {
                 let draw = row * 3 + state;
@@ -2549,8 +2588,9 @@ mod tests {
 
     #[test]
     fn authored_low_search_skips_wrong_id_and_state_then_uses_first_exact_match() {
-        let terrain = flat_terrain(24, 24);
+        let mut terrain = flat_terrain(24, 24);
         let shape = NativeOverlayMapShape::new(12, 12);
+        let registry = registry_with_count(0x7C);
         let mut live = LiveOverlayCells::empty_for_terrain(&terrain);
         let wrong_id = live.target(9, 8);
         let wrong_state = live.target(10, 8);
@@ -2560,17 +2600,31 @@ mod tests {
         live.write(wrong_state, 0x5C, 2);
         live.write(first_match, 0x5C, 1);
         live.write(later_match, 0x5C, 1);
-        let mut host = LowHost::with_raw(0..6);
+        let mut host = LoadHost {
+            raw: (0..6).collect(),
+            ..LoadHost::default()
+        };
 
         assert_eq!(
-            live.try_mark_authored_low(shape, 8, 8, 0x7B, &mut host),
-            Ok(Some(AuthoredLowMarkResult::BodyRows {
-                rows: 2,
-                scenario_draws: 6,
-            }))
+            mark_live(
+                &mut terrain,
+                &mut live,
+                shape,
+                &registry,
+                &TiberiumTypeRegistry::default(),
+                &mut host,
+                (8, 8),
+                0x7B,
+            )
+            .expect("Mark"),
+            OverlayMarkOutcome::Marked
         );
         assert_eq!(host.next_raw, 6);
-        assert_eq!(host.recalcs.len(), 9, "three fixed plus six body");
+        assert_eq!(
+            recalcs(&host).len(),
+            10,
+            "three fixed, six body and the common Recalc"
+        );
         assert_eq!(live.read(first_match).overlay_id(), Some(0x5C));
         assert_eq!(live.read(first_match).state(), 1);
         assert_eq!(live.read(later_match).overlay_id(), Some(0x5C));
@@ -2578,71 +2632,33 @@ mod tests {
     }
 
     #[test]
-    fn authored_low_recalc_failure_stops_before_later_writes_or_rng() {
-        #[derive(Default)]
-        struct FailingHost {
-            recalc_calls: usize,
-            raw_calls: usize,
-        }
-
-        impl AuthoredLowMarkHost for FailingHost {
-            type Error = &'static str;
-
-            fn next_scenario_raw(&mut self) -> u32 {
-                self.raw_calls += 1;
-                0
-            }
-
-            fn recalc(
-                &mut self,
-                _cells: &mut LiveOverlayCells,
-                _cell: AuthoredOverlayCellRef,
-            ) -> Result<(), Self::Error> {
-                self.recalc_calls += 1;
-                if self.recalc_calls == 2 {
-                    Err("injected Recalc failure")
-                } else {
-                    Ok(())
-                }
-            }
-        }
-
-        let terrain = flat_terrain(20, 20);
-        let shape = NativeOverlayMapShape::new(10, 10);
-        let mut live = LiveOverlayCells::empty_for_terrain(&terrain);
-        let mut host = FailingHost::default();
-
-        assert_eq!(
-            live.try_mark_authored_low(shape, 8, 8, 0x7B, &mut host),
-            Err("injected Recalc failure")
-        );
-        assert_eq!(host.recalc_calls, 2);
-        assert_eq!(host.raw_calls, 0);
-        assert_eq!(live.read(live.target(8, 7)).overlay_id(), Some(0x5E));
-        assert_eq!(live.read(live.target(8, 8)).overlay_id(), Some(0x5E));
-        assert_eq!(
-            live.read(live.target(8, 9)),
-            FinalizedOverlayCell::default(),
-            "the third fixed write must not run after the synchronous failure"
-        );
-    }
-
-    #[test]
     fn authored_low_adjacent_centers_overwrite_the_new_fixed_row() {
-        let terrain = flat_terrain(20, 20);
+        let mut terrain = flat_terrain(20, 20);
         let shape = NativeOverlayMapShape::new(10, 10);
+        let registry = registry_with_count(0x7C);
         let mut live = LiveOverlayCells::empty_for_terrain(&terrain);
         let opposite = live.target(9, 8);
         live.write(opposite, 0x5C, 1);
-        let mut host = LowHost::with_raw([3, 2, 1]);
+        let mut host = LoadHost {
+            raw: vec![3, 2, 1],
+            ..LoadHost::default()
+        };
 
         assert_eq!(
-            live.try_mark_authored_low(shape, 8, 8, 0x7B, &mut host),
-            Ok(Some(AuthoredLowMarkResult::BodyRows {
-                rows: 1,
-                scenario_draws: 3,
-            }))
+            mark_live(
+                &mut terrain,
+                &mut live,
+                shape,
+                &registry,
+                &TiberiumTypeRegistry::default(),
+                &mut host,
+                (8, 8),
+                0x7B,
+            )
+            .expect("Mark"),
+            OverlayMarkOutcome::Marked
         );
+        assert_eq!(host.next_raw, 3);
         for (state, (y, id)) in [(7i16, 0x4D), (8, 0x4C), (9, 0x4B)].into_iter().enumerate() {
             let cell = live.read(live.target(8, y));
             assert_eq!(cell.overlay_id(), Some(id));
@@ -2652,20 +2668,31 @@ mod tests {
 
     #[test]
     fn authored_low_search_length_uses_requested_coordinate_before_real_alias_canonicalization() {
-        let terrain = flat_terrain(512, 4);
+        let mut terrain = flat_terrain(512, 4);
         let shape = NativeOverlayMapShape::new(512, 2);
+        let registry = registry_with_count(0x7C);
         let mut live = LiveOverlayCells::empty_for_terrain(&terrain);
         let aliased_opposite = live.target(512, 2);
         assert_eq!(aliased_opposite, NativeOverlayCellTarget::Real(1536));
         live.write(aliased_opposite, 0x5C, 1);
-        let mut host = LowHost::with_raw([0, 1, 2]);
+        let mut host = LoadHost {
+            raw: vec![0, 1, 2],
+            ..LoadHost::default()
+        };
 
         assert_eq!(
-            live.try_mark_authored_low(shape, 511, 2, 0x7B, &mut host),
-            Ok(Some(AuthoredLowMarkResult::BodyRows {
-                rows: 1,
-                scenario_draws: 3,
-            }))
+            mark_live(
+                &mut terrain,
+                &mut live,
+                shape,
+                &registry,
+                &TiberiumTypeRegistry::default(),
+                &mut host,
+                (511, 2),
+                0x7B,
+            )
+            .expect("Mark"),
+            OverlayMarkOutcome::Marked
         );
         assert_eq!(host.next_raw, 3);
         for (state, y) in [1i16, 2, 3].into_iter().enumerate() {
@@ -2677,45 +2704,59 @@ mod tests {
 
     #[test]
     fn authored_wall_runs_cleanup_counts_and_common_recalc_in_native_order() {
-        let terrain = flat_terrain(5, 5);
+        let mut terrain = flat_terrain(5, 5);
         let registry = wall_registry();
         let mut live = LiveOverlayCells::empty_for_terrain(&terrain);
         let north = live.target(2, 1);
         let east = live.target(3, 2);
         live.write(north, 0, 0);
         live.write(east, 2, 0);
+        let mut host = LoadHost::default();
 
-        let mut effects = Vec::new();
         assert_eq!(
-            live.mark_authored_wall(&registry, 2, 2, 0, 0, |effect| { effects.push(effect) }),
-            AuthoredWallMarkResult::Completed
+            mark_live(
+                &mut terrain,
+                &mut live,
+                NativeOverlayMapShape::new(5, 5),
+                &registry,
+                &TiberiumTypeRegistry::default(),
+                &mut host,
+                (2, 2),
+                0,
+            )
+            .expect("Mark"),
+            OverlayMarkOutcome::Marked
         );
 
+        let cell = FinalizedOverlayCell::from_parts;
         assert_eq!(
-            effects,
+            host.events,
             vec![
-                AuthoredWallEffect::TacticalDirty(real(7, (2, 1))),
-                AuthoredWallEffect::RadarDirty(real(7, (2, 1))),
-                AuthoredWallEffect::CleanupRecalcAndZone(real(7, (2, 1))),
-                AuthoredWallEffect::TacticalDirty(real(13, (3, 2))),
-                AuthoredWallEffect::RadarDirty(real(13, (3, 2))),
-                AuthoredWallEffect::CleanupRecalcAndZone(real(13, (3, 2))),
-                AuthoredWallEffect::TacticalDirty(real(17, (2, 3))),
-                AuthoredWallEffect::RadarDirty(real(17, (2, 3))),
-                AuthoredWallEffect::TacticalDirty(real(11, (1, 2))),
-                AuthoredWallEffect::RadarDirty(real(11, (1, 2))),
-                AuthoredWallEffect::TacticalDirty(real(12, (2, 2))),
-                AuthoredWallEffect::RadarDirty(real(12, (2, 2))),
-                AuthoredWallEffect::CleanupRecalcAndZone(real(12, (2, 2))),
-                AuthoredWallEffect::BlockerCountIncrement(real(7, (2, 1))),
-                AuthoredWallEffect::BlockerCountIncrement(real(8, (3, 1))),
-                AuthoredWallEffect::BlockerCountIncrement(real(13, (3, 2))),
-                AuthoredWallEffect::BlockerCountIncrement(real(18, (3, 3))),
-                AuthoredWallEffect::BlockerCountIncrement(real(17, (2, 3))),
-                AuthoredWallEffect::BlockerCountIncrement(real(16, (1, 3))),
-                AuthoredWallEffect::BlockerCountIncrement(real(11, (1, 2))),
-                AuthoredWallEffect::BlockerCountIncrement(real(6, (1, 1))),
-                AuthoredWallEffect::CommonAnchorRecalc(real(12, (2, 2))),
+                LoadEvent::Dirty(MapLoadDirtyKind::WallTactical, real(7, (2, 1))),
+                LoadEvent::Dirty(MapLoadDirtyKind::WallRadar, real(7, (2, 1))),
+                LoadEvent::Recalc(real(7, (2, 1)), cell(0, 0x04)),
+                LoadEvent::WallZone(real(7, (2, 1))),
+                LoadEvent::Dirty(MapLoadDirtyKind::WallTactical, real(13, (3, 2))),
+                LoadEvent::Dirty(MapLoadDirtyKind::WallRadar, real(13, (3, 2))),
+                LoadEvent::Recalc(real(13, (3, 2)), cell(2, 0)),
+                LoadEvent::WallZone(real(13, (3, 2))),
+                LoadEvent::Dirty(MapLoadDirtyKind::WallTactical, real(17, (2, 3))),
+                LoadEvent::Dirty(MapLoadDirtyKind::WallRadar, real(17, (2, 3))),
+                LoadEvent::Dirty(MapLoadDirtyKind::WallTactical, real(11, (1, 2))),
+                LoadEvent::Dirty(MapLoadDirtyKind::WallRadar, real(11, (1, 2))),
+                LoadEvent::Dirty(MapLoadDirtyKind::WallTactical, real(12, (2, 2))),
+                LoadEvent::Dirty(MapLoadDirtyKind::WallRadar, real(12, (2, 2))),
+                LoadEvent::Recalc(real(12, (2, 2)), cell(0, 0x01)),
+                LoadEvent::WallZone(real(12, (2, 2))),
+                LoadEvent::BlockerIncrement(real(7, (2, 1))),
+                LoadEvent::BlockerIncrement(real(8, (3, 1))),
+                LoadEvent::BlockerIncrement(real(13, (3, 2))),
+                LoadEvent::BlockerIncrement(real(18, (3, 3))),
+                LoadEvent::BlockerIncrement(real(17, (2, 3))),
+                LoadEvent::BlockerIncrement(real(16, (1, 3))),
+                LoadEvent::BlockerIncrement(real(11, (1, 2))),
+                LoadEvent::BlockerIncrement(real(6, (1, 1))),
+                LoadEvent::Recalc(real(12, (2, 2)), cell(0, 0x01)),
             ]
         );
         assert_eq!(live.read(north).state(), 0x04, "north connects south");
@@ -2735,16 +2776,26 @@ mod tests {
     #[test]
     fn authored_wall_slope_rejects_before_stamp_or_effect() {
         let mut terrain = flat_terrain(3, 3);
-        terrain.cell_mut(1, 1).expect("anchor").slope_type = 5;
+        terrain.cell_mut_for_test(1, 1).expect("anchor").slope_type = 5;
         let registry = wall_registry();
         let mut live = LiveOverlayCells::empty_for_terrain(&terrain);
-        let mut effects = Vec::new();
+        let mut host = LoadHost::default();
 
         assert_eq!(
-            live.mark_authored_wall(&registry, 1, 1, 0, 5, |effect| { effects.push(effect) }),
-            AuthoredWallMarkResult::RejectedSteepSlope
+            mark_live(
+                &mut terrain,
+                &mut live,
+                NativeOverlayMapShape::new(3, 3),
+                &registry,
+                &TiberiumTypeRegistry::default(),
+                &mut host,
+                (1, 1),
+                0,
+            )
+            .expect("Mark"),
+            OverlayMarkOutcome::SlopeRefused
         );
-        assert!(effects.is_empty());
+        assert!(host.events.is_empty());
         assert_eq!(live.real_cell(4), FinalizedOverlayCell::default());
         assert!(
             live.authored_wall_neighbor_counts
@@ -2755,23 +2806,33 @@ mod tests {
 
     #[test]
     fn authored_wall_retains_wrapping_alias_counts_across_data_and_low_body_overwrite() {
-        let terrain = flat_terrain(512, 2);
+        let mut terrain = flat_terrain(512, 2);
         let registry = wall_registry();
         let mut live = LiveOverlayCells::empty_for_terrain(&terrain);
         // West of (0,1) linearizes to fixed slot 511 -> real (511,0).
         live.authored_wall_neighbor_counts[511] = u8::MAX;
-        let mut effects = Vec::new();
+        let mut host = LoadHost::default();
         assert_eq!(
-            live.mark_authored_wall(&registry, 0, 1, 0, 0, |effect| { effects.push(effect) }),
-            AuthoredWallMarkResult::Completed
+            mark_live(
+                &mut terrain,
+                &mut live,
+                NativeOverlayMapShape::new(512, 2),
+                &registry,
+                &TiberiumTypeRegistry::default(),
+                &mut host,
+                (0, 1),
+                0,
+            )
+            .expect("Mark"),
+            OverlayMarkOutcome::Marked
         );
         assert_eq!(live.authored_wall_neighbor_counts[511], 0);
         assert_eq!(
-            effects
+            host.events
                 .iter()
-                .filter(|effect| matches!(
-                    effect,
-                    AuthoredWallEffect::BlockerCountIncrement(AuthoredOverlayCellRef {
+                .filter(|event| matches!(
+                    event,
+                    LoadEvent::BlockerIncrement(AuthoredOverlayCellRef {
                         target: NativeOverlayCellTarget::Dummy,
                         ..
                     })

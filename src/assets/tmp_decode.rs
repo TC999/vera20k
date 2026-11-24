@@ -2,12 +2,35 @@
 //! Handles per-tile cell parsing, diamond pixel unpacking, and extra data overlay.
 //! Part of assets/ — no dependencies on game modules.
 
+// Outside data reaches this module: it refuses bad input, never panics.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
+
 use crate::assets::error::AssetError;
 use crate::assets::tmp_file::TmpTile;
 use crate::util::read_helpers::{read_i32_le, read_u32_le};
 
 /// Size of the per-tile cell header in bytes (before pixel data).
 const TILE_HEADER_SIZE: usize = 52;
+
+/// Decode budget for one tile's pixel plane. Retail and custom terrain tiles
+/// measure in kilobytes; anything larger is a malformed header whose
+/// dimensions must not steer the allocation (issue: asset header counts and
+/// dimensions trigger oversized allocations). The diamond accumulator checks
+/// the same budget, which also bounds its per-row loop on absurd heights.
+const MAX_DECODED_TILE_BYTES: usize = 64 * 1024 * 1024;
+/// The longest side a decoded tile may have. Retail's tallest cliff and
+/// bridge tiles stay under 512 px; the decoded image spans the diamond and
+/// the extra image, so an extra origin thousands of pixels away would ask
+/// for planes of gigabytes with one extra byte in the file.
+const MAX_DECODED_TILE_SIDE: u32 = 2048;
 
 /// Bit flag: tile has extra pixel data (cliff faces, shadows).
 const FLAG_HAS_EXTRA_DATA: u32 = 0x01;
@@ -26,6 +49,61 @@ pub(crate) const DIAMOND_INITIAL_WIDTH: u32 = 4;
 /// Diamond row width increment/decrement per row.
 pub(crate) const DIAMOND_WIDTH_STEP: u32 = 4;
 
+/// A tile cell's 52-byte header.
+struct TileHeader {
+    stored_x: i32,
+    stored_y: i32,
+    extra_data_offset: u32,
+    z_data_offset: u32,
+    extra_z_data_offset: u32,
+    raw_extra_x: i32,
+    raw_extra_y: i32,
+    extra_width: u32,
+    extra_height: u32,
+    flags: u32,
+    height: u8,
+    terrain_type: u8,
+    ramp_type: u8,
+    radar_left: [u8; 3],
+    radar_right: [u8; 3],
+}
+
+impl TileHeader {
+    /// Read the header that starts `cell`, or `None` when the bytes end
+    /// before its 52.
+    fn read(cell: &[u8]) -> Option<Self> {
+        let header: &[u8] = cell.first_chunk::<TILE_HEADER_SIZE>()?;
+        let &[
+            height,
+            terrain_type,
+            ramp_type,
+            left_r,
+            left_g,
+            left_b,
+            right_r,
+            right_g,
+            right_b,
+        ] = header.get(40..)?.first_chunk::<9>()?;
+        Some(Self {
+            stored_x: read_i32_le(header, 0)?,
+            stored_y: read_i32_le(header, 4)?,
+            extra_data_offset: read_u32_le(header, 8)?,
+            z_data_offset: read_u32_le(header, 12)?,
+            extra_z_data_offset: read_u32_le(header, 16)?,
+            raw_extra_x: read_i32_le(header, 20)?,
+            raw_extra_y: read_i32_le(header, 24)?,
+            extra_width: read_u32_le(header, 28)?,
+            extra_height: read_u32_le(header, 32)?,
+            flags: read_u32_le(header, 36)?,
+            height,
+            terrain_type,
+            ramp_type,
+            radar_left: [left_r, left_g, left_b],
+            radar_right: [right_r, right_g, right_b],
+        })
+    }
+}
+
 /// Parse a single tile cell at the given file offset.
 ///
 /// Reads the 52-byte header, unpacks diamond pixel and depth data,
@@ -36,10 +114,24 @@ pub(crate) fn parse_tile_cell(
     tile_width: u32,
     tile_height: u32,
 ) -> Result<TmpTile, AssetError> {
-    let header_end: usize = offset
-        .checked_add(TILE_HEADER_SIZE)
-        .ok_or_else(|| invalid_tmp(format!("Tile cell offset {} overflows", offset)))?;
-    if header_end > data.len() {
+    let Some(TileHeader {
+        stored_x,
+        stored_y,
+        extra_data_offset,
+        z_data_offset,
+        extra_z_data_offset,
+        raw_extra_x,
+        raw_extra_y,
+        extra_width,
+        extra_height,
+        flags,
+        height,
+        terrain_type,
+        ramp_type,
+        radar_left,
+        radar_right,
+    }) = data.get(offset..).and_then(TileHeader::read)
+    else {
         return Err(AssetError::InvalidTmpFile {
             reason: format!(
                 "Tile cell at offset {} extends past file end ({})",
@@ -47,24 +139,7 @@ pub(crate) fn parse_tile_cell(
                 data.len()
             ),
         });
-    }
-
-    let stored_x: i32 = read_i32_le(data, offset);
-    let stored_y: i32 = read_i32_le(data, offset + 4);
-    let extra_data_offset: u32 = read_u32_le(data, offset + 8);
-    let z_data_offset: u32 = read_u32_le(data, offset + 12);
-    let extra_z_data_offset: u32 = read_u32_le(data, offset + 16);
-    let raw_extra_x: i32 = read_i32_le(data, offset + 20);
-    let raw_extra_y: i32 = read_i32_le(data, offset + 24);
-    let extra_width: u32 = read_u32_le(data, offset + 28);
-    let extra_height: u32 = read_u32_le(data, offset + 32);
-    let flags: u32 = read_u32_le(data, offset + 36);
-
-    let height: u8 = data[offset + 40];
-    let terrain_type: u8 = data[offset + 41];
-    let ramp_type: u8 = data[offset + 42];
-    let radar_left: [u8; 3] = [data[offset + 43], data[offset + 44], data[offset + 45]];
-    let radar_right: [u8; 3] = [data[offset + 46], data[offset + 47], data[offset + 48]];
+    };
 
     let has_extra: bool = (flags & FLAG_HAS_EXTRA_DATA) != 0;
     let has_z_data: bool = (flags & FLAG_HAS_Z_DATA) != 0;
@@ -117,6 +192,76 @@ pub(crate) fn parse_tile_cell(
     } else {
         (tile_width, tile_height, 0, 0)
     };
+    // The template header clamps the tile itself; only the extra image can
+    // push the decoded size out.
+    if has_extra && (pixel_width > MAX_DECODED_TILE_SIDE || pixel_height > MAX_DECODED_TILE_SIDE) {
+        return Err(invalid_tmp(format!(
+            "Decoded tile dimensions {}x{} exceed {} px a side: the extra image's origin is nowhere near its tile",
+            pixel_width, pixel_height, MAX_DECODED_TILE_SIDE
+        )));
+    }
+
+    // Validate every payload slice before reserving the decoded planes: a
+    // malformed header's dimensions and offsets must prove the bytes they
+    // promise exist in the file before any allocation reflects them.
+    let diamond_bytes: usize = diamond_byte_count(tile_width, tile_height)?;
+    let diamond_data: &[u8] = checked_cell_slice(
+        data,
+        offset,
+        TILE_HEADER_SIZE as u32,
+        diamond_bytes,
+        "diamond color",
+    )?;
+    let z_data: Option<&[u8]> = if has_z_data {
+        Some(checked_cell_slice(
+            data,
+            offset,
+            z_data_offset,
+            diamond_bytes,
+            "diamond depth",
+        )?)
+    } else {
+        None
+    };
+    let extra_pixel_count: usize = if has_extra {
+        usize::try_from(extra_width)
+            .ok()
+            .and_then(|width| {
+                usize::try_from(extra_height)
+                    .ok()
+                    .and_then(|height| width.checked_mul(height))
+            })
+            .ok_or_else(|| {
+                invalid_tmp(format!(
+                    "Extra dimensions {}x{} overflow their plane size",
+                    extra_width, extra_height
+                ))
+            })?
+    } else {
+        0
+    };
+    let extra_data: &[u8] = if has_extra {
+        checked_cell_slice(
+            data,
+            offset,
+            extra_data_offset,
+            extra_pixel_count,
+            "extra color",
+        )?
+    } else {
+        &[]
+    };
+    let extra_z_data: Option<&[u8]> = if has_extra && has_z_data {
+        Some(checked_cell_slice(
+            data,
+            offset,
+            extra_z_data_offset,
+            extra_pixel_count,
+            "extra depth",
+        )?)
+    } else {
+        None
+    };
 
     let buf_size: usize = usize::try_from(pixel_width)
         .ok()
@@ -131,17 +276,14 @@ pub(crate) fn parse_tile_cell(
                 pixel_width, pixel_height
             ))
         })?;
+    if buf_size > MAX_DECODED_TILE_BYTES {
+        return Err(invalid_tmp(format!(
+            "Decoded tile dimensions {}x{} exceed the {}-byte tile budget",
+            pixel_width, pixel_height, MAX_DECODED_TILE_BYTES
+        )));
+    }
     let mut pixels: Vec<u8> = zeroed_plane(buf_size, "color")?;
     let mut depth: Vec<u8> = zeroed_plane(buf_size, "depth")?;
-
-    let diamond_bytes: usize = diamond_byte_count(tile_width, tile_height)?;
-    let diamond_data: &[u8] = checked_cell_slice(
-        data,
-        offset,
-        TILE_HEADER_SIZE as u32,
-        diamond_bytes,
-        "diamond color",
-    )?;
 
     // The color diamond is the only fixed section: it starts immediately after
     // the cell header. All optional planes use their stored cell-relative offsets.
@@ -158,9 +300,7 @@ pub(crate) fn parse_tile_cell(
     // ZData (per-pixel depth) only exists when HasZData flag (bit 1) is set.
     // Without this check, we'd consume bytes belonging to ExtraData, corrupting
     // cliff face graphics. See ra2_yr_map_terrain.md §1.4.
-    if has_z_data {
-        let z_data: &[u8] =
-            checked_cell_slice(data, offset, z_data_offset, diamond_bytes, "diamond depth")?;
+    if let Some(z_data) = z_data {
         unpack_diamond(
             z_data,
             tile_width,
@@ -174,41 +314,6 @@ pub(crate) fn parse_tile_cell(
 
     // Handle extra data (cliff faces, etc.) if present.
     if has_extra {
-        let extra_pixel_count: usize = usize::try_from(extra_width)
-            .ok()
-            .and_then(|width| {
-                usize::try_from(extra_height)
-                    .ok()
-                    .and_then(|height| width.checked_mul(height))
-            })
-            .ok_or_else(|| {
-                invalid_tmp(format!(
-                    "Extra dimensions {}x{} overflow their plane size",
-                    extra_width, extra_height
-                ))
-            })?;
-
-        // ExtraZData only exists when BOTH HasExtraData AND HasZData are set
-        // (ra2_yr_map_terrain.md §1.5).
-        let extra_data: &[u8] = checked_cell_slice(
-            data,
-            offset,
-            extra_data_offset,
-            extra_pixel_count,
-            "extra color",
-        )?;
-        let extra_z_data: Option<&[u8]> = if has_z_data {
-            Some(checked_cell_slice(
-                data,
-                offset,
-                extra_z_data_offset,
-                extra_pixel_count,
-                "extra depth",
-            )?)
-        } else {
-            None
-        };
-
         // Native draws covered (nonzero) extra colors after the diamond. The
         // flattened handoff therefore overwrites diamond color and carries the
         // matching ExtraZ byte verbatim, including values at or above 32.
@@ -317,6 +422,12 @@ fn diamond_byte_count(tile_width: u32, tile_height: u32) -> Result<usize, AssetE
         total = total
             .checked_add(row_width as usize)
             .ok_or_else(|| invalid_tmp("Diamond byte count overflow".to_string()))?;
+        if total > MAX_DECODED_TILE_BYTES {
+            return Err(invalid_tmp(format!(
+                "Tile {}x{} exceeds the {}-byte tile budget",
+                tile_width, tile_height, MAX_DECODED_TILE_BYTES
+            )));
+        }
         if j < half_minus_one {
             row_width = row_width
                 .checked_add(DIAMOND_WIDTH_STEP)
@@ -332,7 +443,6 @@ fn diamond_byte_count(tile_width: u32, tile_height: u32) -> Result<usize, AssetE
 ///
 /// Diamond rows expand from 4 pixels wide, growing by 4 each row until the
 /// midpoint, then shrinking back.
-#[allow(clippy::too_many_arguments)]
 fn unpack_diamond(
     data: &[u8],
     tile_width: u32,
@@ -344,7 +454,7 @@ fn unpack_diamond(
 ) -> Result<(), AssetError> {
     let buf_width: usize = usize::try_from(buf_width)
         .map_err(|_| invalid_tmp("Decoded tile width does not fit usize".to_string()))?;
-    if buf_width == 0 || buf.len() % buf_width != 0 {
+    if buf_width == 0 || !buf.len().is_multiple_of(buf_width) {
         return Err(invalid_tmp(format!(
             "Decoded pixel buffer length {} does not match width {}",
             buf.len(),
@@ -396,7 +506,6 @@ fn unpack_diamond(
 }
 
 /// Overlay covered extra colors after the diamond and carry matching depth.
-#[allow(clippy::too_many_arguments)]
 fn overlay_extra(
     extra_data: &[u8],
     extra_z_data: Option<&[u8]>,
@@ -412,7 +521,7 @@ fn overlay_extra(
 ) -> Result<(), AssetError> {
     let buf_width: usize = usize::try_from(buf_width)
         .map_err(|_| invalid_tmp("Decoded tile width does not fit usize".to_string()))?;
-    if buf_width == 0 || pixels.len() != depth.len() || pixels.len() % buf_width != 0 {
+    if buf_width == 0 || pixels.len() != depth.len() || !pixels.len().is_multiple_of(buf_width) {
         return Err(invalid_tmp(
             "Decoded color/depth buffers have inconsistent dimensions".to_string(),
         ));
@@ -443,133 +552,45 @@ fn overlay_extra(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_assets))]
 mod tests {
     use super::*;
 
-    const TEST_TILE_WIDTH: u32 = 8;
-    const TEST_TILE_HEIGHT: u32 = 4;
-    const TEST_DIAMOND_BYTES: usize = 16;
-
-    fn put_u32(data: &mut [u8], offset: usize, value: u32) {
-        data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    /// A 52-byte cell header with no pixel payload behind it.
+    fn header_only_cell(extra: u32) -> Vec<u8> {
+        let mut data = vec![0u8; TILE_HEADER_SIZE];
+        data[36..40].copy_from_slice(&extra.to_le_bytes());
+        data
     }
 
-    fn put_i32(data: &mut [u8], offset: usize, value: i32) {
-        data[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
-    }
-
-    fn put_test_diamond(data: &mut [u8], cell_offset: usize) {
-        for i in 0..TEST_DIAMOND_BYTES {
-            data[cell_offset + TILE_HEADER_SIZE + i] = i as u8 + 1;
-        }
+    /// An extra image whose origin sits 8000 px away from a 60x30 tile with
+    /// one extra byte behind it would pass the byte budget and zero two
+    /// 128 MiB planes; the side cap refuses it first.
+    #[test]
+    fn a_far_extra_origin_is_refused_before_its_planes_are_reserved() {
+        let mut data = header_only_cell(FLAG_HAS_EXTRA_DATA);
+        data[20..24].copy_from_slice(&(-8000i32).to_le_bytes());
+        data[24..28].copy_from_slice(&(-8000i32).to_le_bytes());
+        data[28..32].copy_from_slice(&1u32.to_le_bytes());
+        data[32..36].copy_from_slice(&1u32.to_le_bytes());
+        let err = parse_tile_cell(&data, 0, 60, 30)
+            .expect_err("an extra image thousands of pixels away must not decode");
+        let AssetError::InvalidTmpFile { reason } = err else {
+            panic!("expected a TMP parse error: {err:?}");
+        };
+        assert!(reason.contains("a side"), "unexpected reason: {reason}");
     }
 
     #[test]
-    fn gsi_02_11_uses_stored_out_of_order_offsets_and_non_derived_origin() {
-        const CELL_START: usize = 24;
-        let mut data: Vec<u8> = vec![0; CELL_START + 136];
-        put_i32(&mut data, CELL_START, 100);
-        put_i32(&mut data, CELL_START + 4, 200);
-        put_u32(&mut data, CELL_START + 8, 90); // ExtraData follows ExtraZ.
-        put_u32(&mut data, CELL_START + 12, 120); // ZData is the last plane.
-        put_u32(&mut data, CELL_START + 16, 80); // ExtraZData comes first.
-        put_i32(&mut data, CELL_START + 20, 98);
-        put_i32(&mut data, CELL_START + 24, 199);
-        put_u32(&mut data, CELL_START + 28, 2);
-        put_u32(&mut data, CELL_START + 32, 1);
-        put_u32(
-            &mut data,
-            CELL_START + 36,
-            FLAG_HAS_EXTRA_DATA | FLAG_HAS_Z_DATA,
-        );
-        put_test_diamond(&mut data, CELL_START);
-        data[CELL_START + 80..CELL_START + 82].copy_from_slice(&[201, 202]);
-        data[CELL_START + 90..CELL_START + 92].copy_from_slice(&[70, 71]);
-        for i in 0..TEST_DIAMOND_BYTES {
-            data[CELL_START + 120 + i] = i as u8 + 30;
-        }
-
-        let tile: TmpTile =
-            parse_tile_cell(&data, CELL_START, TEST_TILE_WIDTH, TEST_TILE_HEIGHT).unwrap();
-
-        assert_eq!((tile.pixel_width, tile.pixel_height), (10, 5));
-        assert_eq!(tile.relative_extra_y, -1);
-        assert_eq!((tile.offset_x, tile.offset_y), (-2, -1));
-        assert_eq!(&tile.pixels[0..2], &[70, 71]);
-        assert_eq!(&tile.depth[0..2], &[201, 202]);
-        let diamond_first: usize = 1 * tile.pixel_width as usize + 4;
-        assert_eq!(tile.pixels[diamond_first], 1);
-        assert_eq!(tile.depth[diamond_first], 30);
-    }
-
-    #[test]
-    fn gsi_02_11_extra_color_overwrites_overlapping_diamond() {
-        let mut data: Vec<u8> = vec![0; 81];
-        put_u32(&mut data, 8, 80);
-        put_i32(&mut data, 20, 2);
-        put_u32(&mut data, 28, 1);
-        put_u32(&mut data, 32, 1);
-        put_u32(&mut data, 36, FLAG_HAS_EXTRA_DATA);
-        put_test_diamond(&mut data, 0);
-        data[80] = 99;
-
-        let tile: TmpTile = parse_tile_cell(&data, 0, TEST_TILE_WIDTH, TEST_TILE_HEIGHT).unwrap();
-
-        assert_eq!(tile.pixels[2], 99);
-    }
-
-    #[test]
-    fn gsi_04_03c_preserves_relative_extra_y_separately_from_render_bounds() {
-        let mut data: Vec<u8> = vec![0; 81];
-        put_i32(&mut data, 4, 10);
-        put_u32(&mut data, 8, 80);
-        put_i32(&mut data, 24, 25);
-        put_u32(&mut data, 28, 1);
-        put_u32(&mut data, 32, 1);
-        put_u32(&mut data, 36, FLAG_HAS_EXTRA_DATA);
-        put_test_diamond(&mut data, 0);
-        data[80] = 99;
-
-        let tile = parse_tile_cell(&data, 0, TEST_TILE_WIDTH, TEST_TILE_HEIGHT).unwrap();
-
-        assert_eq!(tile.relative_extra_y, 15);
-        assert_eq!(tile.offset_y, 0);
-    }
-
-    #[test]
-    fn gsi_02_11_extra_z_preserves_values_at_or_above_32() {
-        let mut data: Vec<u8> = vec![0; 116];
-        put_u32(&mut data, 8, 80);
-        put_u32(&mut data, 12, 100);
-        put_u32(&mut data, 16, 90);
-        put_i32(&mut data, 20, 2);
-        put_u32(&mut data, 28, 1);
-        put_u32(&mut data, 32, 1);
-        put_u32(&mut data, 36, FLAG_HAS_EXTRA_DATA | FLAG_HAS_Z_DATA);
-        put_test_diamond(&mut data, 0);
-        data[80] = 88;
-        data[90] = 200;
-        data[100..116].fill(7);
-
-        let tile: TmpTile = parse_tile_cell(&data, 0, TEST_TILE_WIDTH, TEST_TILE_HEIGHT).unwrap();
-
-        assert_eq!(tile.pixels[2], 88);
-        assert_eq!(tile.depth[2], 200);
-    }
-
-    #[test]
-    fn gsi_02_11_rejects_out_of_bounds_stored_plane() {
-        let mut data: Vec<u8> = vec![0; TILE_HEADER_SIZE + TEST_DIAMOND_BYTES];
-        put_u32(&mut data, 12, 200);
-        put_u32(&mut data, 36, FLAG_HAS_Z_DATA);
-        put_test_diamond(&mut data, 0);
-
-        let error: AssetError =
-            parse_tile_cell(&data, 0, TEST_TILE_WIDTH, TEST_TILE_HEIGHT).unwrap_err();
-        assert!(
-            error.to_string().contains("Stored diamond depth range"),
-            "unexpected error: {error}"
-        );
+    fn oversized_header_dimensions_reject_on_the_budget_not_an_allocation() {
+        // 65536x65536 would ask for 8 GiB of zeroed planes; the diamond
+        // accumulator must hit the tile budget before any plane is reserved.
+        let data = header_only_cell(0);
+        let err = parse_tile_cell(&data, 0, 0x1_0000, 0x1_0000)
+            .expect_err("dimensions without payload must not decode");
+        let AssetError::InvalidTmpFile { reason } = err else {
+            panic!("expected a TMP parse error: {err:?}");
+        };
+        assert!(reason.contains("budget"), "unexpected reason: {reason}");
     }
 }

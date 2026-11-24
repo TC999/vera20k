@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::rules::ini_parser::IniFile;
-use crate::sim::combat::{AttackTarget, TargetKind};
+use crate::sim::combat::TargetKind;
 use crate::sim::components::NavTargetRef;
 use crate::sim::game_entity::GameEntity;
 use crate::sim::mission::state::MissionTestFixture;
@@ -43,9 +43,9 @@ fn fixture(input: &Value, other_flags: &str) -> (Simulation, RuleSet) {
         (OTHER, "OTHER", "Neutral", EntityCategory::Structure),
     ] {
         let mut entity = GameEntity::test_default(id, name, owner, 10, 10);
-        entity.owner = sim.intern(owner);
-        entity.type_ref = sim.intern(name);
-        entity.category = category;
+        entity.set_owner_for_test(sim.intern(owner));
+        entity.set_type_ref_for_test(sim.intern(name));
+        entity.set_category_for_test(category);
         sim.substrate.entities.insert(entity);
     }
     let infantry = sim.substrate.entities.get_mut(INFANTRY).unwrap();
@@ -59,10 +59,12 @@ fn fixture(input: &Value, other_flags: &str) -> (Simulation, RuleSet) {
         ai_counter: 0,
         dispatch_timer: MissionDispatchTimer::at_frame(0),
     });
-    infantry.navigation.nav_com = identity(&input["nav_com"]).map(NavTargetRef::building);
-    infantry.attack_target = identity(&input["attack_target"]).map(|id| AttackTarget {
-        target: TargetKind::Entity(id),
-    });
+    infantry
+        .navigation
+        .set_nav_com_for_test(identity(&input["nav_com"]).map(NavTargetRef::object));
+    infantry
+        .attack_target
+        .set_for_test(identity(&input["attack_target"]).map(|id| TargetKind::Entity(id)));
     let ground = input["ground_list"]
         .as_array()
         .map(|members| {
@@ -97,8 +99,8 @@ fn fixture(input: &Value, other_flags: &str) -> (Simulation, RuleSet) {
 
 #[test]
 fn ordinary_per_cell_prefix_matches_original_effective_mission_and_ground_target() {
-    let rows: Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/engineer_repair_admission.json"
+    let rows: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/engineer_repair_admission.json",
     ))
     .unwrap();
     assert_eq!(rows.as_array().unwrap().len(), 22);
@@ -117,7 +119,7 @@ fn ordinary_per_cell_prefix_matches_original_effective_mission_and_ground_target
         }
         let (sim, rules) = fixture(input, "");
         let infantry = sim.substrate.entities.get(INFANTRY).unwrap();
-        let mission_before = infantry.mission;
+        let mission_before = infantry.mission.clone();
         let rng_before = (
             sim.scenario_rng.logical_state(),
             sim.main_rng.logical_state(),
@@ -164,7 +166,7 @@ fn one_cell_undeploy_navcom_stays_at_the_separate_conversion_boundary() {
         .get_mut(OTHER)
         .unwrap()
         .lifecycle
-        .cell_marked = false;
+        .set_cell_marked_for_test(false);
     assert_eq!(
         sim.infantry_per_cell_building_admission(
             sim.substrate.entities.get(INFANTRY).unwrap(),
@@ -173,8 +175,14 @@ fn one_cell_undeploy_navcom_stays_at_the_separate_conversion_boundary() {
         InfantryPerCellBuildingAdmission::UndeployBuilding
     );
     assert!(
-        !sim.infantry_per_cell_bridge_repair(INFANTRY, &rules, None)
-            .unwrap()
+        !sim.infantry_per_cell_building_entry(
+            INFANTRY,
+            &rules,
+            None,
+            &mut crate::sim::world::FrameEffects::default()
+        )
+        .unwrap()
+        .bridge_state_changed
     );
     assert!(sim.substrate.entities.contains(INFANTRY));
     assert!(sim.sound_events.is_empty());
@@ -184,7 +192,7 @@ fn one_cell_undeploy_navcom_stays_at_the_separate_conversion_boundary() {
             .get(INFANTRY)
             .unwrap()
             .navigation
-            .nav_com,
-        Some(NavTargetRef::building(OTHER))
+            .nav_com(),
+        Some(NavTargetRef::object(OTHER))
     );
 }

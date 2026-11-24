@@ -30,7 +30,8 @@
 //!   weakest quadrant (`0x00507A0B..0x00507A20`, `sim::ai_base_site`), for the
 //!   node's own type when it has one (the WallTower), else the pick. No site
 //!   fails the choice.
-//! - The writes ([`write_nodes`], `0x00507A4C..0x00507B7B`).
+//! - The writes ([`crate::sim::base_plan::BasePlanState::place_defense`],
+//!   `0x00507A4C..0x00507B7B`).
 //!
 //! The grids, the threat shares (`+0x1609C..+0x160A4`, which only this call
 //! writes before reading) and the grid pointer (`+0x16060`, cleared on every
@@ -42,12 +43,13 @@
 //! choices with the draws and the site search call.
 //!
 //! RESIDUALS:
-//! - The perimeter vector variant (`HouseClass+0x5738`, passed when `+0x5748`
-//!   is positive, `0x004FE61D..0x004FE62F`) is not ported: only the `-3`
-//!   perimeter scan `0x005082C0` fills it, and VERA removes `-3` nodes without
-//!   it (`sim::ai_base_building`). Trigger: a map plan with a `-3` node.
-//!   Effect: its defenses are keyed by the whole perimeter rather than the
-//!   weakest quadrant's cells.
+//! - The separate defense-cell vector (`HouseClass+0x5738`, passed when
+//!   `+0x5748` is positive, `0x004FE61D..0x004FE62F`) is not ported. It is
+//!   distinct from the primary reservation perimeter+5720. ScanBasePerimeter
+//!   5082C0 appends wall/gate plan nodes, not cells to either vector.
+//!   Trigger: loading positive defense cells (BaseLoad42EFFC..42F038);
+//!   a fresh gameplay producer remains unestablished. Effect: VERA searches
+//!   a site instead of consuming a supplied cell from the weakest quadrant.
 //! - Native reads VERA defines, none reachable with retail rules: a quadrant
 //!   total of 999999 or more in all four quadrants leaves the weakest at -1,
 //!   whose sums are read from the stack (VERA reads 0); the fudge vector is
@@ -62,12 +64,12 @@
 use crate::rules::object_type::{ObjectCategory, ObjectType};
 use crate::rules::ruleset::RuleSet;
 use crate::sim::ai_buildable::owner_allows;
-use crate::sim::base_plan::{BasePlanNode, pack_base_plan_cell};
+use crate::sim::base_plan::pack_base_plan_cell;
 use crate::sim::base_plan_generation::prerequisites_satisfied;
 use crate::sim::house_tracking::ForceValues;
 use crate::sim::intern::InternedId;
 use crate::sim::world::Simulation;
-use crate::util::direction_tables::facing16_from_delta;
+use crate::util::direction_tables::{facing16_from_delta, round_facing16_to_8};
 use crate::util::native_x87::{
     MaskedX87Chop53 as X87, MaskedX87Ordering, MaskedX87Value, NativeF32Bits, NativeF64Bits,
     X87Chop53, sqrt_approx_f32,
@@ -127,12 +129,12 @@ impl CoverageGrid {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn cells(&self) -> &[i32] {
         &self.cells
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn cells_mut(&mut self) -> &mut [i32] {
         &mut self.cells
     }
@@ -199,8 +201,7 @@ impl CoverageGrid {
         } else {
             let dx = i32::from(cell.0) - i32::from(center.0);
             let dy = i32::from(cell.1) - i32::from(center.1);
-            let facing = u32::from(facing16_from_delta(dx, dy));
-            let direction = ((((facing >> 7) + 1) >> 1) & 0xFF) as i32;
+            let direction = i32::from(round_facing16_to_8(facing16_from_delta(dx, dy)));
             let turn = argument
                 .wrapping_shl(5)
                 .wrapping_sub(direction)
@@ -299,12 +300,16 @@ pub(crate) struct DefenseChoice<'r> {
     /// `HouseClass+0x6C`: each building's cell (`vt+0x1B8`) and type.
     pub buildings: Vec<((i16, i16), &'r ObjectType)>,
     /// `HouseTypeClass+0xBC`.
-    pub side_index: u8,
+    pub side_index: i32,
     /// `1 << FindIndexOfName(HouseTypeClass+0x98)` (`0x00507B92`); retail
     /// leaves every country's `ParentCountry=` at its own name.
     pub country_bit: u32,
     /// `HouseClass+0x1D4`.
     pub tech_level: i32,
+    /// Per-choice immutable facts, aligned with the side's defense list.
+    /// Gathered from the sole live type owner before this call's RNG draws;
+    /// rebuilt for every choice, so no trigger needs to invalidate a cache.
+    candidate_tech_levels: Vec<Option<i32>>,
     /// The enemy's force values; `None` for `+0x5600 == -1`.
     pub enemy: Option<ForceValues>,
     /// `AIForcePredictionFudge=` at the house's difficulty (`+0x184`).
@@ -328,6 +333,8 @@ pub(crate) struct DefensePick<'r> {
 
 impl<'r> DefenseChoice<'r> {
     /// The inputs of house `owner` for its node at `index`.
+    /// `AI_ChooseNextProduction @ 0x00506EF0` reads each building's cell through
+    /// `vt+0x1B8` in its coverage pass (`0x005070D5..0x0050722F`).
     fn of_house(
         sim: &Simulation,
         rules: &'r RuleSet,
@@ -335,38 +342,44 @@ impl<'r> DefenseChoice<'r> {
         index: usize,
     ) -> Option<Self> {
         let house = sim.houses.get(&owner)?;
-        let node_type = house.base_plan.nodes.get(index)?.type_or_control;
+        let node_type = house.base_plan().nodes().get(index)?.type_or_control;
         let buildings = house
-            .base_projection
+            .base_projection()
             .buildings()
             .iter()
             .filter_map(|&id| {
                 let building = sim.substrate.entities.get(id)?;
                 let ty = sim.object_type(building.type_ref(), rules)?;
                 Some((
-                    (building.position.rx as i16, building.position.ry as i16),
+                    (building.position.rx() as i16, building.position.ry() as i16),
                     ty,
                 ))
             })
             .collect();
-        let country_bit = crate::sim::ai_buildable::house_country_bit(
-            rules,
-            sim.interner.resolve(house.house_type_id()),
-        );
+        let country_bit = rules.country_owner_mask(sim.interner.resolve(house.house_type_id()));
         let enemy = house
-            .enemy_house
+            .enemy_house()
             .and_then(|enemy| sim.houses.get(&enemy))
-            .map(|enemy| enemy.tracking.force_values());
+            .map(|enemy| enemy.tracking().force_values());
         let fudge = house.difficulty_value(&rules.general.ai_force_prediction_fudge);
-        let (x, y) = house.base_plan_center;
+        let (x, y) = house.base_plan_center();
         Some(Self {
             rules,
             center: (x as i16, y as i16),
-            bounds: house.base_reservation.bounds(),
+            bounds: house.base_reservation().bounds(),
             buildings,
-            side_index: house.side_index,
+            side_index: house.side_index(),
             country_bit,
-            tech_level: house.tech_level,
+            tech_level: house.tech_level(),
+            candidate_tech_levels: rules
+                .base_defense_types(house.side_index())
+                .iter()
+                .map(|id| {
+                    rules
+                        .object_in_category(ObjectCategory::Building, id)
+                        .map(|object| sim.object_tech_level(object))
+                })
+                .collect(),
             enemy,
             fudge,
             node_type,
@@ -400,6 +413,10 @@ impl<'r> DefenseChoice<'r> {
         }
         let mut least = 999_999;
         let mut weakest = None;
+        #[expect(
+            clippy::needless_range_loop,
+            reason = "sums three per-category quadrant tables in native order"
+        )]
         for quadrant in 0..4 {
             let total = sums[2][quadrant]
                 .wrapping_add(sums[1][quadrant])
@@ -491,14 +508,22 @@ impl<'r> DefenseChoice<'r> {
         self.rules
             .base_defense_types(self.side_index)
             .iter()
+            .enumerate()
             .rev()
-            .filter_map(|id| self.rules.object_in_category(ObjectCategory::Building, id))
-            .filter(|ty| {
+            .filter_map(|(index, id)| {
+                Some((
+                    self.rules
+                        .object_in_category(ObjectCategory::Building, id)?,
+                    self.candidate_tech_levels[index]?,
+                ))
+            })
+            .filter(|(ty, tech_level)| {
                 owner_allows(ty, self.country_bit, self.rules)
-                    && ty.tech_level <= self.tech_level
+                    && *tech_level <= self.tech_level
                     && category.value(ty) > 0
                     && prerequisites_satisfied(ty, owned, self.rules)
             })
+            .map(|(ty, _)| ty)
             .collect()
     }
 }
@@ -525,33 +550,6 @@ fn weighted_pick<'r>(
     })
 }
 
-/// `0x00507A4C..0x00507B7B`: a `-1` node becomes the defense at `site`; a
-/// WallTower node takes `site`, and hands the defense and `site` to the next
-/// node when that is `-1`.
-pub(crate) fn write_nodes(
-    nodes: &mut [BasePlanNode],
-    index: usize,
-    defense: &ObjectType,
-    site: (i16, i16),
-) {
-    let packed = pack_base_plan_cell(i32::from(site.0), i32::from(site.1));
-    let Some(node) = nodes.get_mut(index) else {
-        return;
-    };
-    if node.type_or_control < 0 {
-        node.type_or_control = defense.base_plan_type_index;
-        node.packed_cell = packed;
-        return;
-    }
-    node.packed_cell = packed;
-    if let Some(next) = nodes.get_mut(index + 1)
-        && next.type_or_control == -1
-    {
-        next.type_or_control = defense.base_plan_type_index;
-        next.packed_cell = packed;
-    }
-}
-
 /// `HouseClass::AI_ChooseNextProduction @ 0x00506EF0` for house `owner`'s
 /// node at `index`, without a perimeter vector: whether the node now holds
 /// a defense (or the WallTower its cell).
@@ -560,7 +558,6 @@ pub(crate) fn choose_next_production(
     rules: &RuleSet,
     owner: InternedId,
     index: usize,
-    registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
 ) -> bool {
     let Some(choice) = DefenseChoice::of_house(sim, rules, owner, index) else {
         return false;
@@ -578,17 +575,20 @@ pub(crate) fn choose_next_production(
             grid: &pick.grid,
             argument: pick.argument,
         },
-        registry,
     );
     if site == (0, 0) {
         return false;
     }
     if let Some(house) = sim.houses.get_mut(&owner) {
-        write_nodes(&mut house.base_plan.nodes, index, pick.defense, site);
+        house.base_plan_mut().place_defense(
+            index,
+            pick.defense.base_plan_type_index,
+            pack_base_plan_cell(i32::from(site.0), i32::from(site.1)),
+        );
     }
     true
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 #[path = "ai_base_defense_tests.rs"]
 mod tests;

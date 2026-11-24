@@ -13,7 +13,7 @@ use crate::sim::timer::CdTimer;
 
 /// Literal Drive/Ship slope interpolation duration installed by both native
 /// `Process` implementations.
-pub(crate) const SLOPE_TRANSITION_FRAMES: u8 = 3;
+pub const SLOPE_TRANSITION_FRAMES: u8 = 3;
 
 /// Defined, persistent state owned by one active or stashed Drive/Ship
 /// locomotor. The native unused timer dword is deliberately not represented.
@@ -26,7 +26,7 @@ pub struct SlopeTransitionState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SlopeRenderPhase {
+pub enum SlopeRenderPhase {
     Stable(u8),
     Transition {
         from_slope: u8,
@@ -48,7 +48,7 @@ impl SlopeTransitionState {
     }
 
     /// `Force_Slope`/successful Foot unlimbo synchronizes immediately.
-    pub(crate) fn snap(&mut self, sampled_slope: u8, binary_frame: u32) {
+    pub fn snap(&mut self, sampled_slope: u8, binary_frame: u32) {
         self.previous_slope = sampled_slope;
         self.current_slope = sampled_slope;
         self.start_frame = binary_frame as i32;
@@ -57,7 +57,7 @@ impl SlopeTransitionState {
 
     /// Drive/Ship `Process` entry starts a literal three-frame timer only when
     /// the current containing-cell slope differs from the cached target.
-    pub(crate) fn sample_process_entry(&mut self, sampled_slope: u8, binary_frame: u32) {
+    pub fn sample_process_entry(&mut self, sampled_slope: u8, binary_frame: u32) {
         if sampled_slope == self.current_slope {
             return;
         }
@@ -75,7 +75,7 @@ impl SlopeTransitionState {
             .remaining(binary_frame as i32)
     }
 
-    pub(crate) fn render_phase(&self, binary_frame: u32) -> SlopeRenderPhase {
+    pub fn render_phase(&self, binary_frame: u32) -> SlopeRenderPhase {
         let remaining = self.remaining(binary_frame);
         if self.transition_total == 0 || remaining == 0 {
             return SlopeRenderPhase::Stable(self.current_slope);
@@ -102,7 +102,7 @@ impl SlopeTransitionState {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn from_fields_for_test(
         previous_slope: u8,
         current_slope: u8,
@@ -125,14 +125,30 @@ fn foot_equivalent(category: EntityCategory) -> bool {
     )
 }
 
-pub(crate) fn state_for_entity(entity: &GameEntity) -> Option<&SlopeTransitionState> {
-    foot_equivalent(entity.category)
+/// The active Drive/Ship locomotor's slope state, as `DriveLocomotionClass::Draw_Matrix`
+/// (`0x004AFF60`) and `ShipLocomotionClass::Draw_Matrix` (`0x0069F670`) read it.
+pub fn state_for_entity(entity: &GameEntity) -> Option<&SlopeTransitionState> {
+    foot_equivalent(entity.category())
         .then_some(())
         .and_then(|()| entity.locomotor.as_ref()?.active_slope_transition())
 }
 
+/// The shared slope phase for the model and its firing coordinates. Bridge
+/// entry can happen after Process sampled the old cell this frame.
+pub fn phase_for_entity(entity: &GameEntity, binary_frame: u32) -> Option<SlopeRenderPhase> {
+    state_for_entity(entity).map(|state| {
+        if entity.on_bridge() {
+            SlopeRenderPhase::Stable(0)
+        } else {
+            state.render_phase(binary_frame)
+        }
+    })
+}
+
+/// The same state for its writers: the Process samples (Drive `0x004B050B`, Ship
+/// `0x0069FC1B`) and `FootClass::Unlimbo`'s force-slope slot (`0x004D71A9`).
 fn state_for_entity_mut(entity: &mut GameEntity) -> Option<&mut SlopeTransitionState> {
-    foot_equivalent(entity.category)
+    foot_equivalent(entity.category())
         .then_some(())
         .and_then(|()| entity.locomotor.as_mut()?.active_slope_transition_mut())
 }
@@ -144,20 +160,41 @@ pub(crate) fn snap_after_successful_unlimbo(
     sampled_slope: u8,
     binary_frame: u32,
 ) {
+    let slope = if entity.on_bridge() { 0 } else { sampled_slope };
     if let Some(state) = state_for_entity_mut(entity) {
-        state.snap(sampled_slope, binary_frame);
+        state.snap(slope, binary_frame);
     }
+}
+
+/// Whether [`sample_process_entry`] will change the locomotor-owned state.
+pub(crate) fn process_entry_changes(entity: &GameEntity, sampled_slope: u8) -> bool {
+    state_for_entity(entity).is_some_and(|state| {
+        if entity.on_bridge() {
+            // Cancel an unfinished approach tilt when reaching the deck.
+            state.current_slope != 0 || state.previous_slope != 0
+        } else {
+            state.current_slope != sampled_slope
+        }
+    })
 }
 
 /// Drive Process `0x004B050B..0x004B0557` and Ship Process
 /// `0x0069FC1B..0x0069FC67` sample before any track/movement branch.
 pub(crate) fn sample_process_entry(entity: &mut GameEntity, sampled_slope: u8, binary_frame: u32) {
+    let on_bridge = entity.on_bridge();
     if let Some(state) = state_for_entity_mut(entity) {
-        state.sample_process_entry(sampled_slope, binary_frame);
+        // Compatibility for an independent high deck: the stock Cell+11C
+        // sample describes the terrain below the Foot. Reset to the level
+        // deck so a subsequent exit transitions from slope zero.
+        if on_bridge {
+            state.snap(0, binary_frame);
+        } else {
+            state.sample_process_entry(sampled_slope, binary_frame);
+        }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 mod tests {
     use super::{SlopeRenderPhase, SlopeTransitionState};
     use crate::map::entities::EntityCategory;
@@ -251,7 +288,7 @@ mod tests {
 
     fn entity_with(category: EntityCategory, kind: LocomotorKind) -> GameEntity {
         let mut entity = GameEntity::test_default(1, "SLOPE", "Americans", 2, 2);
-        entity.category = category;
+        entity.set_category_for_test(category);
         entity.locomotor = Some(LocomotorState::for_test_kind(kind));
         entity
     }
@@ -287,8 +324,11 @@ mod tests {
         }
 
         let mut mismatched = entity_with(EntityCategory::Unit, LocomotorKind::Drive);
-        mismatched.locomotor.as_mut().unwrap().runtime_payload =
-            LocomotorRuntimePayload::Walk(Default::default());
+        mismatched
+            .locomotor
+            .as_mut()
+            .unwrap()
+            .set_runtime_payload_for_test(LocomotorRuntimePayload::Walk(Default::default()));
         assert!(super::state_for_entity(&mismatched).is_none());
     }
 
@@ -307,7 +347,7 @@ mod tests {
                 .locomotor
                 .as_mut()
                 .unwrap()
-                .begin_drive_piggyback_for_teleporter(22)
+                .begin_piggyback(LocomotorKind::Drive, 22)
         );
         assert!(super::state_for_entity(&active_drive).is_some());
         assert_eq!(
@@ -336,12 +376,19 @@ mod tests {
                 .locomotor
                 .as_ref()
                 .unwrap()
-                .piggyback
+                .piggyback()
                 .as_deref()
-                .map(|stashed| &stashed.runtime_payload),
+                .map(|stashed| stashed.runtime_payload()),
             Some(LocomotorRuntimePayload::Drive(_))
         ));
-        assert!(stashed_drive.locomotor.as_mut().unwrap().end_piggyback());
+        assert!(
+            stashed_drive
+                .locomotor
+                .as_mut()
+                .unwrap()
+                .end_piggyback()
+                .is_some()
+        );
         assert_eq!(
             super::state_for_entity(&stashed_drive)
                 .unwrap()

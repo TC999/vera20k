@@ -1,15 +1,19 @@
-//! Stock Techno cloak producer at the Techno AI head.
+//! Stock Techno cloak producer after the Techno AI's managers and healing.
 
 use crate::map::entities::EntityCategory;
+use crate::rules::object_type::Ability;
 use crate::rules::ruleset::RuleSet;
+use crate::sim::cloak_disguise::BuildingFadeEdge;
 use crate::sim::combat::TargetKind;
+use crate::sim::combat::veterancy::{has_weapon_ability, rank_from_u16};
 use crate::sim::intern::InternedId;
-use crate::sim::mission::concrete_effects::{
-    assign_target_commits, represented_assign_target_admitted,
-};
 use crate::sim::movement::locomotor::MovementLayer;
+use crate::util::direction::DIRECTION_DELTAS;
 
-use super::Simulation;
+use super::{FrameEffects, Simulation, UninitContext};
+use crate::sim::world::FrameChannel;
+use crate::sim::world::ObjectSubstrate;
+use crate::sim::world::SimSoundEvent;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct SensorCloakReevaluation {
@@ -17,30 +21,100 @@ pub(crate) struct SensorCloakReevaluation {
     pub(crate) reassigned_targeters: Vec<u64>,
 }
 
+impl Simulation {
+    /// InfantryLoad521A0C and the other Techno class loads call NoInit6F4300
+    /// for every retained object. Invoke this at the player-file boundary;
+    /// internal continuations retain their progress clocks.
+    pub(crate) fn restart_cloak_progress_after_player_load(&mut self) {
+        let frame = self.session.binary_frame() as i32;
+        for entity in self.substrate.entities.values_mut() {
+            if let Some(cloak) = entity.cloak.as_mut() {
+                cloak.restart_progress_after_player_load(frame);
+            }
+        }
+    }
+}
+
+/// `HasStealthAbility`: the live `+0x3D2` byte; Phobos'
+/// `TechnoClass_IsReadyToCloak_Wrapper` / `ShouldNotCloak_Wrapper` OR the
+/// active effects' `Cloakable` into it.
+fn has_stealth_ability(
+    entity: &crate::sim::game_entity::GameEntity,
+    object: &crate::rules::object_type::ObjectType,
+    ares: bool,
+) -> bool {
+    entity.cloak_ability_active(crate::sim::cloak_disguise::type_seeds_stealth(
+        entity.category(),
+        object,
+        ares,
+    ))
+        || entity.phobos_cloakable()
+}
+
+/// `FootClass::IsCloakable @ 0x004DBDA0` (vtable +0x288) while Ares plays:
+/// HasStealthAbility unless a `CloakStop=` type is moving, which
+/// FootClass_IsCloakable_CloakStop (Ares.dll 10048250) asks ILocomotion+10,
+/// not stock +80. `None` for a Foot without a locomotor, an invalid native
+/// state.
+pub(crate) fn ares_foot_is_cloakable(
+    entity: &crate::sim::game_entity::GameEntity,
+    object: &crate::rules::object_type::ObjectType,
+    ares: bool,
+) -> Option<bool> {
+    Some(
+        has_stealth_ability(entity, object, ares)
+            && !(object.cloak_stop && crate::sim::movement::motion_query::is_moving(entity)?),
+    )
+}
+
 fn stock_cloak_tick_facts(
     sim: &Simulation,
     id: u64,
     rules: &RuleSet,
+    registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
 ) -> Option<crate::sim::cloak_disguise::CloakTickFacts> {
     let entity = sim.substrate.entities.get(id)?;
-    if entity.category != EntityCategory::Unit || entity.cloak.is_none() {
+    // Foot vtables (Unit7F5C70, Infantry7EB058, Aircraft7E22A4) all
+    // dispatch +410 to CloakingTick6FB740; the Building's +410 (454DB0) asks
+    // CanAutoCloak and ShouldUncloak through its own +2A0/+2A4 overrides.
+    if !matches!(
+        entity.category(),
+        EntityCategory::Unit
+            | EntityCategory::Infantry
+            | EntityCategory::Aircraft
+            | EntityCategory::Structure
+    ) || entity.cloak.is_none()
+    {
         return None;
     }
-    let object = rules.object(sim.interner.resolve(entity.type_ref()))?;
-    let rank_cloak = entity.veterancy() >= 100 && object.veteran_cloak
-        || entity.veterancy() >= 200 && object.elite_cloak;
-    if !object.cloakable && !rank_cloak {
-        return None;
-    }
-    let moving =
-        crate::sim::movement::drive_locomotor_is_moving(entity) || entity.movement_target.is_some();
-    let holds_target = entity.attack_target.is_some();
+    let is_building = entity.category() == EntityCategory::Structure;
+    let object = sim.interner.object_type(entity.type_ref(), rules)?;
+    let rank_cloak = has_weapon_ability(entity.veterancy.rank_kind(), object, Ability::Cloak);
+    let intrinsic_cloak = has_stealth_ability(entity, object, rules.ares());
     // vt+0x1D4 / vt+0x1D8 (`0x0070C5B0` / `0x0070C5C0`, reading
     // `TechnoClass+0x270`/`+0x271`): a Chrono teleport or a Temporal warp.
     let chrono_active = entity.is_warped_out() || entity.is_warping_in();
     // `FootClass::IsCloakable @ 0x004DBDA0` (vtable +0x288) =
-    // `HasStealthAbility() && !(CloakStop(+0xC93) && locomotor->IsMoving())`.
-    let is_cloakable = object.cloakable && (!object.cloak_stop || !moving);
+    // `HasStealthAbility() && !(CloakStop(+0xC93) && locomotor->Is_Moving_Now())`,
+    // the locomotor's ILocomotion+0x80 at `0x004DBDDD`, asked only under
+    // CloakStop.
+    // The Building's +288 (`0x0070C5A0`) is the raw +3D2 byte alone.
+    let is_cloakable = if rules.ares() {
+        if is_building {
+            intrinsic_cloak
+        } else {
+            ares_foot_is_cloakable(entity, object, rules.ares())?
+        }
+    } else {
+        intrinsic_cloak
+            && !(object.cloak_stop
+                && !is_building
+                && crate::sim::movement::motion_query::is_moving_now(
+                    entity,
+                    crate::sim::movement::SpeedRules::new(rules, &sim.interner, &sim.houses),
+                    sim.session.binary_frame(),
+                ))
+    };
 
     // The gate the state-0 head of `CloakingTick @ 0x006FB757..0x006FB7F7`
     // actually applies, read from the disassembly:
@@ -50,54 +124,58 @@ fn stock_cloak_tick_facts(
     // CORRECTION: VERA used to put "holds an attack target" in this head gate.
     // Native has no such term here — the target test lives in `CanAutoCloak`
     // step 4 below, as `Target(+0x2B4) != 0 && CanFireAtTarget(vt+0x3AC)`.
-    // vt+0x37C is `IsUnderEMP` (Techno `0x0070EFD0` reads `+0x504 > 0`; the
-    // Unit override `0x00746C90` ORs in `i32(+0x6D8) != -1`; that field's
-    // identity still needs evidence), and
+    // vt+0x37C is `IsUnderEMP` (`GameEntity::is_under_emp`: EMP, or a
+    // Unit's running `DeathFrames=` counter), and
     // vt+0x1D4/+0x1D8 are the chrono warp-in/warp-out flags.
     //
-    // RESIDUAL — **EMP decloak is NOT IMPLEMENTED, and this requirement is
-    // therefore UNMET, not closed.** VERA has no EMP mechanism anywhere: there
-    // is no Rust counterpart to `+0x504`, nothing writes an EMP timer, and the
-    // term is hardcoded false at both of its uses in this file. Closing it is
-    // not a cloak change — it lands with an EMP weapon/warhead system, and this
-    // gate is one of that system's consumers.
-    // - Reachability remains unproven. The former stock-source claim was false:
-    //   RULESMD's BoomerTorpedo uses APSplash2 and Robogun uses AP; EMPuls is
-    //   annotated "disabled in code" and EMPulseSpecial is commented out.
-    //   Original EMPulse::Apply4C54E0 writes Techno+504, but its only observed
-    //   caller is constructor4C52B0, which has no incoming Ghidra references.
-    //   That reference search alone does not establish unreachability. Trace
-    //   the actual creation/load path before implementing or closing this arm.
-    // - Player effect/frequency: not established for active-retail gameplay.
-    // - Downstream risk: none structurally; the predicate is one boolean and
-    //   drops into `emp_active` below the day an EMP timer lands.
-    // vt+0x380 is FootClass::IsParalyzed `0x004DE770` (Foot+6A0), armed by
-    // ParasiteClass: a released owner for 3x its ROF, and bitten victims.
-    let emp_active = false;
-    let paralyzed = entity.is_paralyzed(sim.session.binary_frame);
-    let deploy_pending = entity.deploy_state.is_some();
-    let state_zero_head_allows =
-        is_cloakable && !emp_active && !paralyzed && !deploy_pending && !chrono_active
-            || rank_cloak;
+    // Original active-YR producer reachability remains unproven: the
+    // dormant TS EMPulse body alone does not establish an original scenario
+    // caller. Ares's Bullet hook is a separate, established producer.
+    let emp_active = entity.is_under_emp();
+    let paralyzed = entity.parasite.is_paralyzed(sim.session.binary_frame());
+    // Ares ShouldNotCloak10043A40 applies the same blockers to rank cloak
+    // and raw ability, and rejects parachutes and deactivated self-cloakers.
+    let active_cloak = if rules.ares() {
+        // ShouldNotCloak10043A97 falls back to the generator-cell test at
+        //10043B04 when driverless; it does not reject generator cloak.
+        (is_cloakable || rank_cloak)
+            && !entity.deactivated.is_offline()
+            && !entity.driver_killed()
+            && ares_self_cloak_condition_holds(sim, id, object, rules)
+    } else {
+        is_cloakable || intrinsic_cloak || rank_cloak
+    };
+    // CloakDisallowed10043A40 also refuses while the SonarTimer runs.
+    let sonar_active = rules.ares()
+        && entity.seldom.ares.sonar_timer.start_frame() != -1
+        && entity
+            .seldom.ares
+            .sonar_timer
+            .remaining(sim.session.binary_frame() as i32)
+            > 0;
+    let ares_admission = !rules.ares()
+        || (object.cloak_allowed()
+            && entity.parachute_animation().is_none()
+            && !emp_active
+            && !paralyzed
+            && !chrono_active
+            && !sonar_active);
+    let state_zero_head_allows = if rules.ares() {
+        ares_admission && active_cloak
+    } else {
+        is_cloakable && !emp_active && !paralyzed && !chrono_active || rank_cloak
+    };
 
     // CloakingTick's pre-CanAuto destination exclusion is Contact_With_Whom(0)
     // resolving to a WeaponsFactory building (naval-yard repair contact), not
     // an arbitrary movement destination.
-    let destination_is_weapons_factory = entity.radio_contacts.slot(0).is_some_and(|contact_id| {
-        sim.substrate
-            .entities
-            .get(contact_id)
-            .filter(|contact| contact.category == EntityCategory::Structure)
-            .and_then(|contact| rules.object(sim.interner.resolve(contact.type_ref())))
-            .is_some_and(|contact_type| contact_type.weapons_factory)
-    });
-    let current_frame = sim.session.binary_frame as i32;
-    let cloak_state = entity.cloak.as_ref().map_or(0, |cloak| cloak.state);
-    let cloak_progress = entity.cloak.as_ref().map_or(0, |cloak| cloak.depth);
-    let delay_expired = entity
-        .cloak
-        .as_ref()
-        .is_some_and(|cloak| cloak.recloak_delay_expired(current_frame, entity.rearm_timer));
+    let destination_is_weapons_factory = entity
+        .seldom.radio_contacts
+        .slot(0)
+        .is_some_and(|contact| sim.is_weapons_factory(contact, rules));
+    let current_frame = sim.session.binary_frame() as i32;
+    let cloak_state = entity.cloak.as_ref().map_or(0, |cloak| cloak.state());
+    let cloak_progress = entity.cloak.as_ref().map_or(0, |cloak| cloak.depth());
 
     // `CellClass::IsVisibleToHouse @ 0x004870B0` is the CloakedByHouses bit,
     // NOT cell visibility — see `FogState::is_cloaked_by_house`. It is only
@@ -105,81 +183,66 @@ fn stock_cloak_tick_facts(
     // none, so this reads false in every ordinary skirmish. VERA previously
     // substituted `fog.is_cell_visible(owner, ...)` here, which is true for an
     // owner standing on its own cell — inverting both gates below.
-    let cloaked_by_own_house =
-        owner_cloak_field_bit(sim, entity.owner(), entity.position.rx, entity.position.ry);
+    let cloaked_by_own_house = owner_cloak_field_bit(
+        sim,
+        entity.owner(),
+        entity.position.rx(),
+        entity.position.ry(),
+    );
+    // Ares CloakDisallowed10043A40's passive arm: a generator ignores an
+    // object above `[General]CloakHeight` (HoverHeight when unset). This
+    // replaces stock CanAutoCloak's `GetHeight() < 1` gate below.
+    let cloaked_by_own_house = if rules.ares() {
+        cloaked_by_own_house
+            && crate::sim::movement::air_movement::current_fly_height(
+                entity,
+                sim.resolved_terrain.as_ref(),
+            ) <= rules
+                .ares_cloak_power()
+                .cloak_height(rules.general.hover_height)
+    } else {
+        cloaked_by_own_house
+    };
 
-    // `TechnoClass::CanAutoCloak @ 0x006FBDC0`, in native step order.
-    //
-    // Step 1's fall-through is `if (!CloakedByHouses(cell, owner) && +0x3D2 ==
-    // 0) return false`. `+0x3D2` is the raw stealth-ability byte:
-    // `TechnoClass::HasStealthAbility @ 0x0070C5A0` is literally `return
-    // +0x3D2 != 0`, and it is seeded at init from `TechnoTypeClass+0xCD0`
-    // (`Cloakable=`) — `InfantryClass::InitFromType @ 0x00517D80`,
-    // `UnitClass::Constructor @ 0x007355B4`, `TechnoClass::Constructor @
-    // 0x006F2F49`. `object.cloakable` below is that seed, so the term is
-    // modelled. TWO halves of it are not; both are inert in stock YR:
-    //
-    // RESIDUAL 1 — the Cloak CRATE also sets `+0x3D2 = 1` permanently, on every
-    // object within `[CrateRules] CrateRadius` (`Rules+0x172C`, 3.0 cells) of
-    // the picked-up crate: `CrateClass::PickupDispatch @ 0x0048294F`, the arm
-    // whose anim comes from the powerup anim table at `0x0081DAD8` (slot 3 =
-    // `Cloak`, anim `CLOAK`). VERA has no Cloak-crate producer.
-    // - Trigger: a unit picking up a Cloak crate.
-    // - Player effect: in gamemd every unit within three cells is permanently
-    //   cloakable afterwards; in VERA nothing happens.
-    // - Frequency: ZERO in stock, by an AUTHORED zero rather than an absent
-    //   row: `ini/rulesmd.ini` `[Powerups]` spells `Cloak=0,CLOAK,yes`. The
-    //   weights are the selection authority (`CrateClass::PickupDispatch` sums
-    //   the nineteen and draws `RandomRanged(1, total)`), so a 0-weight slot is
-    //   never picked — `src/rules/powerups.rs`
-    //   `stock_section_parses_the_verified_weight_vector` pins that row's 0 in
-    //   the parsed vector (total 110). Only a mod that authors a nonzero
-    //   `Cloak=` weight reaches it.
-    // - Downstream risk: none; it lands as one extra per-entity flag OR-ed into
-    //   `is_cloakable` here and in `should_uncloak` below.
-    //
-    // RESIDUAL 2 — native ORs the RAW `+0x3D2` here, not vt+0x288, so the two
-    // differ exactly when `FootClass::IsCloakable @ 0x004DBDA0` suppresses a
-    // stealth unit for `CloakStop=` while it is moving: native still passes
-    // step 1, VERA refuses. `grep -c '^CloakStop' ini/rulesmd.ini` is 0, so no
-    // stock type can trigger it. Same asymmetry in `should_uncloak` below.
-    // - Frequency: zero in stock; mod-only.
-    let can_auto_cloak = (is_cloakable || rank_cloak || cloaked_by_own_house)
+    // TechnoClass::CanAutoCloak @006FBDC0 reads raw Techno+3D2:
+    // the type seed and permanent crate grant share this capability owner.
+    // Native also ORs raw +0x3D2 independently of vt+0x288: CloakStop can
+    // suppress the moving Foot virtual without removing its retained ability.
+    let can_auto_cloak = ares_admission && (active_cloak || cloaked_by_own_house)
         // 2. already fully cloaked.
         && cloak_state != 2
-        // 3. the ROF rearm countdown at +0x2EC/+0x2F4, and 6. the CloakDelay
-        //    countdown at +0x240/+0x248. `recloak_delay_expired` requires both.
-        && delay_expired
+        // 3. ROF rearm countdown at +0x2EC/+0x2F4. Preserve native lazy order:
+        // it rejects before the retained-target weapon/range query.
+        // Ares CloakAllowed10043990 asks recloak before weapon rearm.
+        && (!rules.ares() || entity.cloak.as_ref().is_some_and(|cloak| cloak.recloak_delay().expired(current_frame)))
+        && entity.seldom.rearm_timer.timer().expired(current_frame)
         // 4. `Target(+0x2B4) != 0 && CanFireAtTarget(vt+0x3AC)`.
-        //    SUBSTITUTED: VERA has no cheap `CanFireAtTarget` here and uses the
-        //    presence of an attack target instead. The two disagree only for a
-        //    unit holding a target no weapon can engage, which VERA's
-        //    acquisition and retaliation paths do not install.
-        && !holds_target
-        // 5. `iVar3 = vt+0x2C(); if (iVar3 != 6 && CloakProgress(+0x224) != 0)
-        //    return false` — a BUILDING is exempt from the progress test, every
-        //    other category is not. This producer is entered only for
-        //    `EntityCategory::Unit` (see the head of this function), so
-        //    `WhatAmI != 6` holds for every object that reaches here and the
-        //    exemption is structurally unreachable rather than dropped. It is
-        //    also unreachable in gamemd data: no stock section pairs
-        //    `Cloakable=yes` with a building. This is why the state-3 silent
-        //    re-cloak branch is unreachable for units: visual state 1 requires
-        //    a nonzero progress.
-        && cloak_progress == 0
-        // 7. `+0x2B0 && Foot && +0x6AD` (`0x006FBF57..0x006FBF7D`): a
-        //    Magnetron-lifted object (`+0x6AD` is written by
-        //    `TechnoClass::ImbueLocomotor @ 0x00710352`). VERA has no
-        //    Magnetron, so the term is always false and is not evaluated.
-        // 8. `GetHeight() < 1`.
-        && crate::sim::movement::air_movement::current_fly_height(
-            entity,
-            sim.resolved_terrain.as_ref(),
-        ) < 1
-        // The pre-CanAutoCloak `Contact_With_Whom(0)` exclusion at
-        // 0x006FB7FD..0x006FB823 (`BuildingType+0x16BD` = `WeaponsFactory=`,
-        // verified from the key string at 0x0081AA4C).
-        && !destination_is_weapons_factory;
+        //    6FBEF4..6FBF01 calls the canonical selected-weapon/InRange owner
+        //    (6F7780), not GetFireError. An ordinary Attack retains a distant
+        //    target and must still permit cloak entry.
+        //    Consumed original controls: tools/spatial_oracle/cloak_target_gate.
+        && !entity.attack_target.target().is_some_and(|target| {
+            sim.techno_can_fire_at_target(id, target, rules, registry)
+        })
+        // CanAutoCloak @006FBDC0 (6FBF0A..6FBF1C) exempts Buildings (WhatAmI
+        // 6) from this progress gate; the three Foot categories use it.
+        && (is_building || cloak_progress == 0)
+        // 6. CloakDelay countdown at +0x240/+0x248, after the range query.
+        && entity
+            .cloak
+            .as_ref()
+            .is_some_and(|cloak| cloak.recloak_delay().expired(current_frame))
+        // 7. `+0x2B0 && Foot && +0x6AD` (`0x006FBF57..0x006FBF7D`): an
+        //    object a Magnetron holds aloft (`sim::locomotor_lift`). This
+        //    producer admits Foot categories only, so the Foot test holds.
+        && !(entity.lift.source().is_some() && entity.lift.swap_active())
+        // 8. `GetHeight() < 1`. Ares CloakAllowed10043990 has no height
+        //    gate; the passive arm above applies CloakHeight instead.
+        && (rules.ares()
+            || crate::sim::movement::air_movement::current_fly_height(entity, sim.resolved_terrain.as_ref()) < 1)
+        // `IsReadyToCloak_Wrapper`: a ready object still refuses while any
+        // active effect forces a decloak.
+        && !entity.phobos_force_decloak();
 
     // `TechnoClass::ShouldUncloak @ 0x006FBC90`:
     //   if ((IsCloakable() || +0x3D2) && !EMP && !vt+0x380 && !WarpIn && !WarpOut)
@@ -187,33 +250,197 @@ fn stock_cloak_tick_facts(
     //   if (rank CLOAK) return 0;
     //   return IsVisibleToHouse(myCell, myOwner) ? 0 : 1;
     // The tail therefore returns 1 in stock YR, so the predicate reduces to
-    // "the object can no longer sustain its cloak" — EMP, chrono warp, a
-    // pending deploy, `CloakStop=` while moving, or a lost stealth ability.
-    // The `|| +0x3D2` disjunct is the raw stealth byte; see the two `+0x3D2`
-    // residuals on `can_auto_cloak` above — `object.cloakable` inside
-    // `is_cloakable` is that byte's stock seed, and the crate-granted and
-    // `CloakStop=`-while-moving halves are both unreachable in stock data.
-    let should_uncloak =
-        if is_cloakable && !emp_active && !paralyzed && !deploy_pending && !chrono_active {
-            false
-        } else if rank_cloak {
+    // "the object can no longer sustain its cloak" — EMP, paralysis, chrono
+    // warp, or a lost stealth ability. Neither this body
+    // nor CloakingTick's head reads the Unit deployment flags.
+    // The `|| +0x3D2` disjunct is the raw stealth byte;
+    // Type seed and crate grant both survive moving with CloakStop.
+    let should_uncloak = if rules.ares() {
+        !ares_admission || !(active_cloak || cloaked_by_own_house)
+    } else {
+        if ((is_cloakable || intrinsic_cloak) && !emp_active && !paralyzed && !chrono_active)
+            || rank_cloak
+        {
             false
         } else {
             !cloaked_by_own_house
-        };
-    Some(crate::sim::cloak_disguise::CloakTickFacts {
+        }
+    };
+    // `ShouldNotBeCloaked_Wrapper`: a passing object still reports
+    // should-uncloak while an active effect forces the decloak.
+    let should_uncloak = should_uncloak || entity.phobos_force_decloak();
+    Some(crate::sim::cloak_disguise::CloakTickFacts::new(
         current_frame,
-        state_zero_head_allows,
+        // CloakingTick6FB7FD..6FB823 applies this contact exclusion before
+        // CanAutoCloak in state zero; the sensor callback has no such gate.
+        state_zero_head_allows && !destination_is_weapons_factory,
         can_auto_cloak,
         should_uncloak,
-        health_above_red: health_strictly_above_condition_red(
+        health_strictly_above_condition_red(
             entity.health,
             object.strength,
             rules.general.condition_red,
         ),
-        cloaking_speed: object.cloaking_speed,
-        cloak_delay_frames: rules.general.cloak_delay_frames,
-    })
+        object.cloaking_speed,
+        rules.general.cloak_delay_frames,
+        object.cloaking_stages(rules.general.cloaking_stages),
+        object.invisible || (is_building && object.invisible_in_game),
+        sim.shared_owned_by_current_house(entity),
+        is_building,
+    ))
+}
+
+/// The cell scan `BuildingClass::CanCloak @ 0x00457770` (vt+0x2A0) and
+/// `BuildingClass::ShouldUncloak @ 0x004578C0` (vt+0x2A4) share: over the
+/// foundation and a one-cell ring around it (X outer, then Y, each from -1
+/// to the width or height past the Location's cell, vt+0x1B8), the cell's
+/// nearest object (`CellClass::Find_Nearest_Object @ 0x0047C3D0` from
+/// (0, 0), ground list) — or, where that is this building, the cell's first
+/// infantry (`CellClass::GetInfantry @ 0x0047EC40`, ground list) — of another
+/// owner whose type has `Sensors=` (`+0xC9D`). The owner test is a raw
+/// inequality, so an ally's sensor counts.
+fn enemy_sensor_by_foundation(sim: &Simulation, id: u64, rules: &RuleSet) -> bool {
+    use crate::map::cell_index::NativeCellIdentity;
+    use crate::map::resolved_terrain::NativeCellQuery;
+    let Some(building) = sim.substrate.entities.get(id) else {
+        return false;
+    };
+    let Some(object) = sim.interner.object_type(building.type_ref(), rules) else {
+        return false;
+    };
+    let Some(terrain) = sim.resolved_terrain.as_ref() else {
+        return false;
+    };
+    let owner = building.owner();
+    let (width, height) = crate::sim::ai_base_site::foundation_size(object);
+    let (rx, ry) = (building.position.rx() as i16, building.position.ry() as i16);
+    let query = NativeCellQuery::canonical(terrain);
+    for dx in -1..=width {
+        for dy in -1..=height {
+            let cell = query.lookup((rx.wrapping_add(dx as i16), ry.wrapping_add(dy as i16)));
+            // The shared fallback Cell has no registered object list.
+            if matches!(cell, NativeCellIdentity::Dummy) {
+                continue;
+            }
+            let (x, y) = query.coord(cell);
+            let (x, y) = (x as u16, y as u16);
+            let found = match sim.nearest_cell_object((x, y), MovementLayer::Ground, None) {
+                Some(nearest) if nearest == id => sim.substrate.occupancy.first_category_on_layer(
+                    x,
+                    y,
+                    MovementLayer::Ground,
+                    EntityCategory::Infantry,
+                    &sim.substrate.entities,
+                ),
+                found => found,
+            };
+            let senses = found
+                .and_then(|other| sim.substrate.entities.get(other))
+                .filter(|other| other.owner() != owner)
+                .and_then(|other| sim.interner.object_type(other.type_ref(), rules))
+                .is_some_and(|other| other.sensors);
+            if senses {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `BuildingClass::UpdateCloak @ 0x00454DB0`, the Building's vt+0x410 that
+/// TechnoClass::AI_Update reaches at `0x006FA946`, for a building with a cloak
+/// ability (a Cloak crate's grant, as no retail building is `Cloakable=`).
+/// One fade stage per visit ([`CloakRuntime::step_building_fade`]); then a
+/// fully cloaked building with [`enemy_sensor_by_foundation`] or Techno
+/// ShouldUncloak starts uncloaking, and an uncloaked one whose CanAutoCloak
+/// passes with no such sensor starts cloaking, each with `CloakSound`.
+/// Unlike CloakingTick there is no ConditionRed draw and no completion
+/// Detach/Scatter. The 1 -> 2 edge deletes the building's
+/// `NaturalParticleSystem=` (`+0x30C`) and the 3 -> 0 edge rebuilds it.
+///
+/// [`CloakRuntime::step_building_fade`]: crate::sim::cloak_disguise::CloakRuntime::step_building_fade
+fn tick_building_cloak(
+    sim: &mut Simulation,
+    id: u64,
+    rules: &RuleSet,
+    registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    effects: &mut FrameEffects<'_>,
+) {
+    let Some((edge, state)) = sim
+        .substrate
+        .entities
+        .get_mut(id)
+        .and_then(|entity| entity.cloak.as_mut())
+        .map(|cloak| (cloak.step_building_fade(), cloak.state()))
+    else {
+        return;
+    };
+    match edge {
+        // 0x00454E7F..0x00454E9E: the system goes through its vt+0x20 with 1.
+        Some(BuildingFadeEdge::Cloaked) => {
+            sim.delete_natural_particle_system(id, UninitContext::new(rules).with_effects(effects))
+        }
+        // 0x00454F29..0x00454F6C: with no system and a NaturalParticleLocation=
+        // other than the zero coordinate (0x0089C848), Unlimbo's constructor
+        // runs again. A type with a system at the zero offset gets it at
+        // Unlimbo, loses it here on cloaking and never gets it back.
+        // Residual: native does not test Type+0x764 here, and its
+        // constructor would dereference a NULL type; VERA builds nothing.
+        Some(BuildingFadeEdge::Uncloaked)
+            if sim.substrate.entities.get(id).is_some_and(|entity| {
+                entity.building.natural_particle_system.system().is_none()
+                    && sim
+                        .interner
+                        .object_type(entity.type_ref(), rules)
+                        .is_some_and(|object| object.natural_particle_location != glam::IVec3::ZERO)
+            }) =>
+        {
+            sim.construct_natural_particle_system(id, rules);
+        }
+        _ => {}
+    }
+    if !matches!(state, 0 | 2) {
+        return;
+    }
+    let Some(facts) = stock_cloak_tick_facts(sim, id, rules, registry) else {
+        return;
+    };
+    let now = facts.current_frame;
+    if state == 2 {
+        // 0x00455012..0x0045502F: vt+0x2A4, then vt+0x45C(0) (7036C0).
+        if !facts.should_uncloak && !enemy_sensor_by_foundation(sim, id, rules) {
+            return;
+        }
+        let start = sim
+            .substrate
+            .entities
+            .get_mut(id)
+            .and_then(|entity| entity.cloak.as_mut())
+            .map(|cloak| {
+                cloak.start_uncloaking(now, facts.cloaking_speed, facts.cloaking_stages(), false)
+            });
+        if start.is_some_and(|start| start.play_sound) {
+            emit_cloak_transition_sound(sim, id, rules, true);
+        }
+        return;
+    }
+    // 0x00455035..0x00455053: vt+0x2A0 (457770 asks CanAutoCloak before its scan),
+    // then vt+0x460(0) (703770).
+    if !facts.can_auto_cloak || enemy_sensor_by_foundation(sim, id, rules) {
+        return;
+    }
+    let start = sim
+        .substrate
+        .entities
+        .get_mut(id)
+        .and_then(|entity| entity.cloak.as_mut())
+        .map(|cloak| cloak.start_cloaking(now, facts.cloaking_speed, false));
+    if start.is_some_and(|start| start.transitioned) {
+        start_cloaking_detach(sim, id, rules, effects);
+    }
+    if start.is_some_and(|start| start.play_sound) {
+        emit_cloak_transition_sound(sim, id, rules, false);
+    }
 }
 
 /// `CellClass::IsVisibleToHouse @ 0x004870B0` for the object's own owner — the
@@ -223,14 +450,15 @@ fn stock_cloak_tick_facts(
 /// (`BuildingClass::UpdateGapGenerator_Tick @ 0x004551B9 / 0x004553B3`), and no
 /// stock YR building carries the key — so this is constantly false in an
 /// ordinary skirmish, exactly as in gamemd.
+///
+/// The bit is the owner's House array index (`HouseClass+0x30`). The AI asks
+/// it of every object, so an owner the House array lacks (a test fixture's)
+/// answers false rather than tripping the base-reservation lookup's assertion.
 fn owner_cloak_field_bit(sim: &Simulation, owner: InternedId, rx: u16, ry: u16) -> bool {
-    let Some(index) = sim.base_reservation_house_index(owner) else {
-        return false;
-    };
-    let Ok(index) = u8::try_from(index) else {
-        return false;
-    };
-    sim.fog.is_cloaked_by_house(index, rx, ry)
+    sim.houses
+        .index_of(owner)
+        .and_then(|index| u8::try_from(index).ok())
+        .is_some_and(|index| sim.fog.is_cloaked_by_house(index, rx, ry))
 }
 
 fn sensor_targeters_in_native_dispatch_order(sim: &Simulation, cloaker_id: u64) -> Vec<u64> {
@@ -238,7 +466,7 @@ fn sensor_targeters_in_native_dispatch_order(sim: &Simulation, cloaker_id: u64) 
         return Vec::new();
     };
     let cloaker_owner = cloaker.owner();
-    let cloaker_cell = (cloaker.position.rx, cloaker.position.ry);
+    let cloaker_cell = (cloaker.position.rx(), cloaker.position.ry());
 
     // TechnoClass+0x420 @ 0x006F4EB0 reverse-scans g_TechnoClass_Array,
     // appends admitted targeters, then reverse-dispatches the saved vector.
@@ -251,8 +479,8 @@ fn sensor_targeters_in_native_dispatch_order(sim: &Simulation, cloaker_id: u64) 
         .filter_map(|(targeter_id, targeter)| {
             let targets_cloaker = targeter
                 .attack_target
-                .as_ref()
-                .is_some_and(|target| target.target == TargetKind::Entity(cloaker_id));
+                .target()
+                .is_some_and(|target| target == TargetKind::Entity(cloaker_id));
             let admitted = targeter.owner() == cloaker_owner
                 || sim
                     .fog
@@ -264,12 +492,19 @@ fn sensor_targeters_in_native_dispatch_order(sim: &Simulation, cloaker_id: u64) 
 
 /// `TechnoClass` vtable `+0x420 @ 0x006F4EB0`, the callback every sensor
 /// deposit runs over the residents of each covered cell (`AddSensorsAt @
-/// 0x004DE7B0` and its three siblings).
+/// 0x004DE7B0` and its three siblings), that the object's cell change runs
+/// (`TechnoClass::PerCellTail @ 0x006F50FA`), and that the Techno AI runs
+/// for an object on the wrong side of its owner's cloak field
+/// ([`cloak_field_ai_step`]).
 ///
-/// The function has two arms, read from the disassembly:
-/// * `0x006F4F05..0x006F4F3A` — if the object is fully cloaked, is not the
-///   local player's, and the local player has no sensor on its cell, call
-///   `ObjectClass::Deselect` (vt+0x150). Local-player UI only; not sim state.
+/// Both arms read the Cell of the object's GetCoords (vt+0x48,
+/// `0x006F4EC0..0x006F4F03`):
+/// * `0x006F4F05..0x006F4F3A` — a fully cloaked object (state 2) whose owner
+///   is not the player's (`PlayerPtr`, `0x00A83D4C`, which must be set) is
+///   deselected (vt+0x150) unless the player holds a sensor count on that
+///   cell (`CellClass::SensorCountForHouse @ 0x004870D0`). So a selected
+///   enemy submarine drops out of the player's selection when it finishes
+///   diving out of the player's sonar, or when that sonar leaves.
 /// * `0x006F4F3A..0x006F5085` — the **cloak-field entry hook**: if
 ///   `CellClass::IsVisibleToHouse(myCell, myOwner)` (the `CloakedByHouses` bit,
 ///   `0x004870B0`) AND `CanAutoCloak()`, snapshot the admitted targeters,
@@ -290,14 +525,35 @@ pub(crate) fn sensor_reevaluate_stock_cloak(
     sim: &mut Simulation,
     id: u64,
     rules: &RuleSet,
+    registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
 ) -> SensorCloakReevaluation {
-    let Some(facts) = stock_cloak_tick_facts(sim, id, rules) else {
+    let Some((owner, cell, fully_cloaked)) = sim.substrate.entities.get(id).and_then(|entity| {
+        Some((
+            entity.owner(),
+            super::lifecycle::object_get_coords_cell(entity)?,
+            entity
+                .cloak
+                .as_ref()
+                .is_some_and(|cloak| cloak.state() == 2),
+        ))
+    }) else {
         return SensorCloakReevaluation::default();
     };
-    let inside_friendly_cloak_field = sim.substrate.entities.get(id).is_some_and(|entity| {
-        owner_cloak_field_bit(sim, entity.owner(), entity.position.rx, entity.position.ry)
-    });
-    if !inside_friendly_cloak_field || !facts.can_auto_cloak {
+    let player = sim.session.current_house();
+    if fully_cloaked
+        && player.is_some_and(|player| player != owner)
+        && !sensor_visible_to_player(sim, id)
+    {
+        sim.object_deselect(id);
+    }
+    // 6F4F46 checks the field before invoking CanAutoCloak and its range query.
+    if !owner_cloak_field_bit(sim, owner, cell.0, cell.1) {
+        return SensorCloakReevaluation::default();
+    }
+    let Some(facts) = stock_cloak_tick_facts(sim, id, rules, registry) else {
+        return SensorCloakReevaluation::default();
+    };
+    if !facts.can_auto_cloak {
         return SensorCloakReevaluation::default();
     }
 
@@ -309,18 +565,22 @@ pub(crate) fn sensor_reevaluate_stock_cloak(
         .entities
         .get_mut(id)
         .and_then(|entity| entity.cloak.as_mut())
-        .map(|cloak| cloak.start_cloaking_from_sensor(facts.current_frame, facts.cloaking_speed));
-    if start.is_some_and(|start| start.play_sound) {
-        emit_configured_cloak_sound(sim, id, rules);
+        // Virtual `StartCloaking +0x460 @ 0x00703770` from the active
+        // sensor-count resident callback `0x006F4EB0`, argument zero.
+        .map(|cloak| cloak.start_cloaking(facts.current_frame, facts.cloaking_speed, false));
+    if start.is_some_and(|start| start.transitioned) {
+        start_cloaking_detach(sim, id, rules, &mut FrameEffects::default());
     }
-    let commits = assign_target_commits(&sim.substrate.entities, Some(TargetKind::Entity(id)));
+    if start.is_some_and(|start| start.play_sound) {
+        emit_cloak_transition_sound(sim, id, rules, false);
+    }
     for &targeter_id in &reassigned_targeters {
-        let targeter = sim
-            .substrate
-            .entities
-            .get_mut(targeter_id)
-            .expect("saved Techno targeter remains registered during sensor callback");
-        represented_assign_target_admitted(targeter, Some(TargetKind::Entity(id)), commits);
+        let _ = sim.assign_target_represented(
+            targeter_id,
+            Some(TargetKind::Entity(id)),
+            rules,
+            &mut FrameEffects::default(),
+        );
     }
     SensorCloakReevaluation {
         cloak_transitioned: start.is_some_and(|start| start.transitioned),
@@ -328,19 +588,70 @@ pub(crate) fn sensor_reevaluate_stock_cloak(
     }
 }
 
-/// `ObjectClass::Detach_All(false)` (vtable `+0xDC`, `0x005F5280`; the
-/// `FootClass` override is `0x004D9720`) → `DispatchPointerExpiredCleanup @
-/// 0x007258D0` with control 0 → `TechnoClass::PointerExpired @ 0x007077C0` on
-/// every registered object, which `StartCloaking @ 0x00703770` runs before its
-/// own state writes.
+/// `TechnoClass::IsSensorVisibleToPlayer @ 0x0070D420` (vt+0x328): the
+/// player's house (`PlayerPtr`, `0x00A83D4C`) holds a sensor count
+/// (`CellClass::SensorCountForHouse @ 0x004870D0`) on the Cell of the
+/// object's GetCoords (vt+0x48). False without a player house.
+pub(crate) fn sensor_visible_to_player(sim: &Simulation, id: u64) -> bool {
+    let Some(player) = sim.session.current_house() else {
+        return false;
+    };
+    sim.substrate
+        .entities
+        .get(id)
+        .and_then(super::lifecycle::object_get_coords_cell)
+        .is_some_and(|(rx, ry)| sim.fog.has_sensor_for_house(player, rx, ry))
+}
+
+/// `TechnoClass::AI_Update @ 0x006FA95B..0x006FA9D2`, after the spawn
+/// manager: an uncloaked object (state 0) inside its owner's cloak field, or
+/// a fully cloaked one (state 2) outside it, runs the sensor callback
+/// ([`sensor_reevaluate_stock_cloak`]). Both read the `CloakedByHouses` bit
+/// (`0x004870B0`) of the Cell of the object's GetCoords for its owner.
 ///
-/// This is the SAME native body the UnInit broadcast runs, only with a
-/// different control value, so it is routed through the one Rust model of it
-/// (`Simulation::detach_all_pointer_expired`) rather than a cloak-local copy.
-/// A miniature copy would have cleared the receiver's Target and nothing else —
-/// no `RandomRanged(4, 8)` re-arm of the `+0x180/+0x188` targeting timer, no
-/// NavCom/cargo/manager slot clears, and none of it for the non-targeters
-/// `Detach_All` also visits.
+/// No retail building raises a cloak field, so in skirmish this is every
+/// fully cloaked object on every AI visit: its sensor callback deselects it
+/// unless the player owns it or senses its cell.
+pub(super) fn cloak_field_ai_step(
+    sim: &mut Simulation,
+    id: u64,
+    rules: &RuleSet,
+    registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+) {
+    // An object with no cloak runtime is in state 0 and cannot pass
+    // CanAutoCloak (`stock_cloak_tick_facts`), so the callback would do
+    // nothing for it; skipping it keeps the field lookup out of the AI loop.
+    let Some((owner, cell, state)) = sim.substrate.entities.get(id).and_then(|entity| {
+        Some((
+            entity.owner(),
+            super::lifecycle::object_get_coords_cell(entity)?,
+            entity.cloak.as_ref()?.state(),
+        ))
+    }) else {
+        return;
+    };
+    let in_field = || owner_cloak_field_bit(sim, owner, cell.0, cell.1);
+    if (state == 0 && in_field()) || (state == 2 && !in_field()) {
+        sensor_reevaluate_stock_cloak(sim, id, rules, registry);
+    }
+}
+
+/// The world half of `TechnoClass::StartCloaking @ 0x00703770`, after
+/// [`CloakRuntime::start_cloaking`](crate::sim::cloak_disguise::CloakRuntime)
+/// accepted the transition:
+/// * `Detach_All(false)` (vtable `+0xDC`, [`Simulation::detach_all`]), which
+///   native runs before its state writes;
+/// * `0x00703819..0x0070383C`: a selected object whose owner is not the
+///   player's (`PlayerPtr`) is deselected (vt+0x150). The player's sensors
+///   do not keep this one, unlike Detach_All's.
+///
+/// Detach_All(false)'s announcement reaches `TechnoClass::PointerExpired @
+/// 0x007077C0` on every registered object with control 0. It is the SAME
+/// native body the UnInit broadcast runs, only with a different control
+/// value. A miniature copy would have cleared the receiver's Target and
+/// nothing else — no `RandomRanged(4, 8)` re-arm of the `+0x180/+0x188`
+/// targeting timer, no NavCom/cargo/manager slot clears, and none of it for
+/// the non-targeters `Detach_All` also visits.
 ///
 /// The clause that matters most for cloak: the receiver's `Target(+0x2B4)` is
 /// cleared through `Assign_Target(NULL)` unless
@@ -359,82 +670,31 @@ pub(crate) fn sensor_reevaluate_stock_cloak(
 /// locked on until the next passive-scan cadence (~28 frames) re-evaluated.
 ///
 /// `RadioClass::PointerExpired @ 0x0065AAC0` is the counter-example: its slot
-/// clear is control-1 only (`0065aaf0 TEST BL,BL / JZ`), so a dive breaks no
-/// radio contact — the diving sub keeps its naval-yard repair and transport
-/// links.
+/// clear is control-1 only (`0065aaf0 TEST BL,BL / JZ`), so the announcement
+/// breaks no radio contact. Only the Foot prelude's OVER_OUT to a contact 0
+/// the owner is not allied with does; the diving sub keeps its naval-yard
+/// repair and transport links.
 ///
-/// Running this after `CloakRuntime::tick` has written the new state instead of
-/// before it is output-equivalent: the admission test reads only the cloaker's
-/// cell, its owner and each receiver's house — never the cloak state.
-fn detach_targeters_on_cloak(sim: &mut Simulation, cloaker_id: u64, rules: &RuleSet) {
-    sim.detach_all_pointer_expired(cloaker_id, rules);
-}
-
-/// Clockwise-from-north neighbour offsets, native `g_DirectionOffsets`
-/// (0x0089F688), indices 0..7 — the exact order `FootClass::PerCellProcess`
-/// walks its eight neighbours.
-const NEIGHBOUR_OFFSETS: [(i32, i32); 8] = [
-    (0, -1),
-    (1, -1),
-    (1, 0),
-    (1, 1),
-    (0, 1),
-    (-1, 1),
-    (-1, 0),
-    (-1, -1),
-];
-
-/// `CellClass::Find_Nearest_Object @ 0x0047C3D0`, read from the disassembly for
-/// the one callsite that matters here (`0x004D87DD`, which passes offset
-/// `{0, 0}`, `alt = 0` and `exclude = NULL`):
-///
-/// ```text
-/// dx7 = offset.X * 7;  dy7 = offset.Y * 7;
-/// for (o = cell->FirstObject(+0xE4); o; o = o->NextObject(+0x30)) {
-///   if (!(o->AbstractFlags(+0x14) & 1)) continue;   // Techno only
-///   if (o == exclude) continue;
-///   c  = o->GetCoords(vt+0x48);
-///   d  = ftol(Sqrt_Approx(sq((c.X & 0xFF) - dx7) + sq((c.Y & 0xFF) - dy7)));
-///   if (best == NULL || d < bestDistance) { best = o; bestDistance = d; }
-/// }
-/// ```
-///
-/// Three things this fixes over the previous "lowest stable id whose
-/// `position` matches" scan:
-///
-/// * **The candidate set is the cell's object list, not every entity parked on
-///   the coordinate.** `techno_limbo` never clears `entity.position`, so a
-///   limboed object keeps a map position for the rest of the match; native
-///   walks `CellClass::FirstObject`, which a limboed object is unlinked from.
-///   `substrate.occupancy` is VERA's model of that list — the same authority
-///   `sensor_lifecycle::sensor_residents_in_native_order` uses — and the
-///   `MovementLayer::Ground` list is the `+0xE4` chain (`+0xE8`, the `alt`
-///   chain, is selected only when `param_3 != 0`, and this callsite passes 0).
-/// * **Selection is nearest-to-the-cell-origin, not lowest id.** With a
-///   `{0, 0}` offset the distance is the object's own sub-cell lepton offset
-///   from the cell's NW corner, through the retail `Sqrt_Approx` LUT and a
-///   truncating `ftol` — so two objects whose distances truncate to the same
-///   integer are decided by list order, and `<` keeps the earlier one.
-/// * **The `+0x14` bit-0 test is the `AbstractFlags` *Techno identity* bit**
-///   (`TechnoClass__Constructor @ 0x006F3228` ORs in 1;
-///   `ObjectClass__Constructor @ 0x005F3B34` ORs in 2), not an on-map flag.
-///   Every `GameEntity` is a Techno, so it needs no counterpart here.
-pub(super) fn find_nearest_object_in_cell(sim: &Simulation, cell: (u16, u16)) -> Option<u64> {
-    let occupancy = sim.substrate.occupancy.get(cell.0, cell.1)?;
-    let mut best: Option<(u64, i32)> = None;
-    for occupant in occupancy.iter_layer(MovementLayer::Ground) {
-        let Some(other) = sim.substrate.entities.get(occupant.entity_id) else {
-            continue;
-        };
-        let distance = crate::sim::cell_kernel::native_xy_distance(
-            other.position.sub_x.to_num::<i32>(),
-            other.position.sub_y.to_num::<i32>(),
-        );
-        if best.is_none_or(|(_, best_distance)| distance < best_distance) {
-            best = Some((occupant.entity_id, distance));
-        }
+/// Running this after `CloakRuntime` has written the new state instead of
+/// before it is output-equivalent: Detach_All reads the cloaker's cell, its
+/// owner, its contacts' owners, the player's sensors and each receiver's
+/// house — never the cloak state.
+fn start_cloaking_detach(
+    sim: &mut Simulation,
+    id: u64,
+    rules: &RuleSet,
+    effects: &mut FrameEffects<'_>,
+) {
+    sim.detach_all(id, false, UninitContext::new(rules).with_effects(effects));
+    let player = sim.session.current_house();
+    if sim
+        .substrate
+        .entities
+        .get(id)
+        .is_some_and(|entity| player != Some(entity.owner()))
+    {
+        sim.object_deselect(id);
     }
-    best.map(|(entity_id, _)| entity_id)
 }
 
 /// `FootClass::PerCellProcess @ 0x004D85D0`, the cell-enter (`param_2 == 2`)
@@ -447,11 +707,13 @@ pub(super) fn find_nearest_object_in_cell(sim: &Simulation, cell: (u16, u16)) ->
 ///     n = myCell + g_DirectionOffsets[dir];
 ///     if (!Is_Cell_In_Playfield(n, 1)) continue;
 ///     o = CellClass::Find_Nearest_Object(n, coord(0,0), 0);
-///     if (o && !Is_Ally_ByObject(this, o)
+///     if (o && !o->Owner->Is_Ally_ByObject(this)
 ///           && (oType->Sensors(+0xC9D) || o->HasWeaponAbility(0xC)))
 ///     { vt+0xFC(); break; }
 ///   }
 /// ```
+///
+/// The neighbour's House asks about the mover (`0x004D87E8..0x004D87EF`).
 ///
 /// This is the "drive a Destroyer next to a moving submarine and it surfaces"
 /// rule. Note what it is NOT: the stationary case is not covered — a Destroyer
@@ -480,11 +742,13 @@ pub(crate) fn uncloak_on_sensor_neighbour_after_cell_entry(
         return false;
     }
     let owner = mover.owner();
-    let owner_str = sim.interner.resolve(owner).to_owned();
-    let (rx, ry) = (i32::from(mover.position.rx), i32::from(mover.position.ry));
+    let (rx, ry) = (
+        i32::from(mover.position.rx()),
+        i32::from(mover.position.ry()),
+    );
 
     let mut triggered = false;
-    for (dx, dy) in NEIGHBOUR_OFFSETS {
+    for (dx, dy) in DIRECTION_DELTAS {
         let (nx, ny) = (rx + dx, ry + dy);
         if nx < 0 || ny < 0 {
             continue;
@@ -499,18 +763,23 @@ pub(crate) fn uncloak_on_sensor_neighbour_after_cell_entry(
         ) {
             continue;
         }
-        let Some(nearest) = find_nearest_object_in_cell(sim, (nx, ny)) else {
+        let Some(nearest) = sim.nearest_cell_object((nx, ny), MovementLayer::Ground, None) else {
             continue;
         };
         let Some(other) = sim.substrate.entities.get(nearest) else {
             continue;
         };
-        let other_owner_str = sim.interner.resolve(other.owner());
-        if sim.fog.is_friendly(&owner_str, other_owner_str) || other.owner() == owner {
+        if crate::sim::combat::combat_weapon::is_ally_by_object(
+            Some(&sim.house_alliances),
+            &sim.interner,
+            other.owner(),
+            owner,
+        ) {
             continue;
         }
-        let detects = rules
-            .object(sim.interner.resolve(other.type_ref()))
+        let detects = sim
+            .interner
+            .object_type(other.type_ref(), rules)
             .is_some_and(|object| object.sensors);
         if !detects {
             continue;
@@ -521,46 +790,82 @@ pub(crate) fn uncloak_on_sensor_neighbour_after_cell_entry(
     if !triggered {
         return false;
     }
-    let cloaking_speed = sim
+    let (cloaking_speed, cloaking_stages) = sim
         .substrate
         .entities
         .get(id)
-        .and_then(|entity| rules.object(sim.interner.resolve(entity.type_ref())))
-        .map_or(1, |object| object.cloaking_speed);
-    let now = sim.session.binary_frame as i32;
+        .and_then(|entity| sim.interner.object_type(entity.type_ref(), rules))
+        .map_or((1, rules.general.cloaking_stages), |object| {
+            (
+                object.cloaking_speed,
+                object.cloaking_stages(rules.general.cloaking_stages),
+            )
+        });
+    let now = sim.session.binary_frame() as i32;
     let surfaced = sim
         .substrate
         .entities
         .get_mut(id)
         .and_then(|entity| entity.cloak.as_mut())
-        .map(|cloak| cloak.start_uncloaking_from_sensor_neighbour(now, cloaking_speed));
+        // `FootClass::PerCellProcess @ 0x004D8829` invokes the `+0xFC`
+        // `StartUncloaking(0)` wrapper (`0x00703850`) when a fully cloaked
+        // mover enters a cell one of whose eight neighbours holds a
+        // non-allied `Sensors=yes` object.
+        .map(|cloak| cloak.start_uncloaking(now, cloaking_speed, cloaking_stages, false));
     if surfaced.is_some_and(|result| result.play_sound) {
-        emit_configured_cloak_sound(sim, id, rules);
+        emit_cloak_transition_sound(sim, id, rules, true);
     }
     surfaced.is_some_and(|result| result.transitioned)
 }
 
-fn emit_configured_cloak_sound(sim: &mut Simulation, id: u64, rules: &RuleSet) {
-    let Some(sound_name) = rules.general.cloak_sound.as_deref() else {
+/// The `CloakSound` of `StartCloaking @ 0x00703770` and `StartUncloaking @
+/// 0x007036C0` when their suppression argument is zero: `[AudioVisual]
+/// CloakSound=` (`Rules+0x6A0`) through `VocClass::PlayAt @ 0x007509E0` at
+/// the object's coordinate. Every cloak transition's sound goes through here.
+///
+/// Ares replaces the Voc ID both transitions load: StartCloaking hook70380A
+/// (10048300) uses the type's CloakSound, else the Rules one; StartUncloaking
+/// hook70375B (10048450) uses the type's DecloakSound, else `[AudioVisual]
+/// DecloakSound`, else the Rules CloakSound. An explicit none is silence.
+pub(crate) fn emit_configured_cloak_sound(
+    substrate: &ObjectSubstrate,
+    sound_events: &mut FrameChannel<SimSoundEvent>,
+    id: u64,
+    rules: &RuleSet,
+    object: Option<&crate::rules::object_type::ObjectType>,
+    decloak: bool,
+) {
+    let general = rules.general.cloak_sound.as_deref();
+    let general = if rules.ares() {
+        let fallback = if decloak {
+            rules
+                .general
+                .ares_decloak_sound
+                .as_ref()
+                .map_or(general, |cue| cue.as_deref())
+        } else {
+            general
+        };
+        object
+            .and_then(|object| object.cloak_sound_override(decloak))
+            .unwrap_or(fallback)
+    } else {
+        general
+    };
+    let Some(sound_name) = general else {
         return;
     };
-    let Some(position) = sim
-        .substrate
-        .entities
-        .get(id)
-        .map(|entity| entity.position.clone())
-    else {
+    let Some(position) = substrate.entities.get(id).map(|entity| entity.position) else {
         return;
     };
-    sim.sound_events
-        .push(crate::sim::world::SimSoundEvent::cloak_sound(
-            sound_name.to_owned(),
-            &position,
-        ));
+    sound_events.emit(crate::sim::world::SimSoundEvent::cloak_sound(
+        rules.sound_name(sound_name),
+        &position,
+    ));
 }
 
 fn health_strictly_above_condition_red(
-    health: crate::sim::components::Health,
+    health: crate::sim::combat::Health,
     strength: i32,
     condition_red: f64,
 ) -> bool {
@@ -568,11 +873,11 @@ fn health_strictly_above_condition_red(
         == crate::util::native_x87::MaskedX87Ordering::Greater
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[test]
 fn original_health_ratio_corpus_populates_cloak_tick_facts() {
     use crate::rules::ini_parser::IniFile;
-    use crate::sim::components::Health;
+    use crate::sim::combat::Health;
     use crate::sim::game_entity::GameEntity;
     for row in crate::sim::health_ratio_fixture::rows() {
         let mut rules = RuleSet::from_ini(&IniFile::from_str(&format!(
@@ -591,18 +896,16 @@ fn original_health_ratio_corpus_populates_cloak_tick_facts() {
             0,
             0,
             owner,
-            Health {
-                current: row.input.current,
-            },
+            Health::new(row.input.current),
             type_ref,
             EntityCategory::Unit,
             0,
             5,
             true,
         );
-        entity.cloak = Some(crate::sim::cloak_disguise::CloakRuntime::new(0, 9));
+        entity.cloak = Some(Box::new(crate::sim::cloak_disguise::CloakRuntime::new(0)));
         sim.substrate.entities.insert(entity);
-        let facts = stock_cloak_tick_facts(&sim, 1, &rules).expect("cloakable unit facts");
+        let facts = stock_cloak_tick_facts(&sim, 1, &rules, None).expect("cloakable unit facts");
         assert_eq!(
             facts.health_above_red, row.output.cloak_above_red,
             "{row:?}"
@@ -610,45 +913,74 @@ fn original_health_ratio_corpus_populates_cloak_tick_facts() {
     }
 }
 
-/// Produce the world-dependent virtual results consumed by
-/// `TechnoClass::CloakingTick @ 0x006FB740`. Stock cloakable objects are Units;
-/// the caller keeps this at the Unit Techno bracket head to preserve Scenario
-/// RNG ordering relative to the rest of that object's AI visit.
-pub(super) fn tick_stock_cloak_producer(sim: &mut Simulation, id: u64, rules: &RuleSet) {
-    let Some((category, type_ref, veterancy)) = sim
-        .substrate
-        .entities
-        .get(id)
-        .map(|entity| (entity.category, entity.type_ref(), entity.veterancy()))
-    else {
+/// Whether [`tick_stock_cloak_producer`] calls the cloak virtual for
+/// `entity`: it can cloak, by its type, a granted ability, its rank or a
+/// Phobos stat, or a transition is still running. Native calls CloakingTick
+/// even after a temporary ability disappears, so the clock keeps going until
+/// its uncloak transition finishes.
+pub(crate) fn cloak_producer_ticks(
+    entity: &crate::sim::game_entity::GameEntity,
+    object: &crate::rules::object_type::ObjectType,
+    ares: bool,
+) -> bool {
+    entity.cloak_ability_active(crate::sim::cloak_disguise::type_seeds_stealth(
+        entity.category(),
+        object,
+        ares,
+    ))
+        || has_weapon_ability(
+            rank_from_u16(entity.veterancy.rank()),
+            object,
+            Ability::Cloak,
+        )
+        || entity
+            .cloak
+            .as_ref()
+            .is_some_and(|cloak| cloak.state() != 0)
+        || entity.phobos_cloakable()
+}
+
+/// The cloak virtual (vt+0x410): `TechnoClass::CloakingTick @ 0x006FB740`
+/// for Foot objects, [`tick_building_cloak`] for a Building;
+/// the shared caller runs this after mission/targeting, Bomb, SlaveManager,
+/// CaptureManager, IsAlive and healing (Techno6FA941..6FA946), before Spawn.
+pub(super) fn tick_stock_cloak_producer(
+    sim: &mut Simulation,
+    id: u64,
+    rules: &RuleSet,
+    registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    effects: &mut FrameEffects<'_>,
+) {
+    let Some(entity) = sim.substrate.entities.get(id) else {
         return;
     };
-    if category != EntityCategory::Unit {
+    let category = entity.category();
+    if !matches!(
+        category,
+        EntityCategory::Unit
+            | EntityCategory::Infantry
+            | EntityCategory::Aircraft
+            | EntityCategory::Structure
+    ) {
         return;
     }
-    let Some(object) = rules.object(sim.interner.resolve(type_ref)) else {
+    let Some(object) = sim.interner.object_type(entity.type_ref(), rules) else {
         return;
     };
-    let rank_cloak =
-        veterancy >= 100 && object.veteran_cloak || veterancy >= 200 && object.elite_cloak;
-    if !object.cloakable && !rank_cloak {
+    if !cloak_producer_ticks(entity, object, rules.ares()) {
         return;
     }
 
-    if sim
-        .substrate
-        .entities
-        .get(id)
-        .is_some_and(|entity| entity.cloak.is_none())
-        && let Some(entity) = sim.substrate.entities.get_mut(id)
-    {
-        entity.cloak = Some(crate::sim::cloak_disguise::CloakRuntime::new(
-            sim.session.binary_frame as i32,
-            rules.general.cloaking_stages,
-        ));
+    let frame = sim.session.binary_frame() as i32;
+    if let Some(entity) = sim.substrate.entities.get_mut(id) {
+        crate::sim::cloak_disguise::CloakRuntime::install_if_absent(&mut entity.cloak, frame);
+    }
+    if category == EntityCategory::Structure {
+        tick_building_cloak(sim, id, rules, registry, effects);
+        return;
     }
 
-    let Some(facts) = stock_cloak_tick_facts(sim, id, rules) else {
+    let Some(facts) = stock_cloak_tick_facts(sim, id, rules, registry) else {
         return;
     };
     let result = sim
@@ -658,8 +990,7 @@ pub(super) fn tick_stock_cloak_producer(sim: &mut Simulation, id: u64, rules: &R
         .and_then(|entity| entity.cloak.as_mut())
         .map(|cloak| cloak.tick(facts, &mut sim.scenario_rng));
     if result.is_some_and(|result| result.began_cloaking) {
-        // `StartCloaking @ 0x00703770` opens with `Detach_All(false)`.
-        detach_targeters_on_cloak(sim, id, rules);
+        start_cloaking_detach(sim, id, rules, effects);
     }
     if result.is_some_and(|result| result.completed_cloak) {
         // The 1 → 2 completion at `0x006FBA98` snapshots the still-admitted
@@ -670,19 +1001,109 @@ pub(super) fn tick_stock_cloak_producer(sim: &mut Simulation, id: u64, rules: &R
         // each receiver's passive-acquire provenance byte `+0x50C` first, which
         // `represented_assign_target_admitted` reproduces.
         let retained = sensor_targeters_in_native_dispatch_order(sim, id);
-        detach_targeters_on_cloak(sim, id, rules);
-        let commits = assign_target_commits(&sim.substrate.entities, Some(TargetKind::Entity(id)));
+        sim.detach_all(id, false, UninitContext::new(rules).with_effects(effects));
         for targeter_id in retained {
-            if let Some(targeter) = sim.substrate.entities.get_mut(targeter_id) {
-                represented_assign_target_admitted(targeter, Some(TargetKind::Entity(id)), commits);
-            }
+            let _ = sim.assign_target_represented(
+                targeter_id,
+                Some(TargetKind::Entity(id)),
+                rules,
+                effects,
+            );
+        }
+        // `0x006FBC0B..0x006FBC32`: both completion paths then make a Unit
+        // (WhatAmI()==1, `0x006FBC0B..0x006FBC15`) whose owner is not
+        // human-controlled (`HouseClass::IsControlledByHuman @ 0x0050B730`)
+        // Scatter(null coordinate, forced, not no-kidding), so a computer's
+        // freshly cloaked sub, dolphin or squid drifts off. Infantry and
+        // Aircraft that a crate or a map's `Cloakable=` cloaks stay where
+        // they are (BuildingClass overrides this slot and never gets here).
+        // DORMANT: a Unit carrying a CTF flag (`+0x6CC != -1`, `0x006FBADF`)
+        // would call StartUncloaking (vt+0xFC, `0x00703850`) instead of the
+        // Detach_All above. Skirmish never attaches a flag; the special-flag
+        // trace is in `foot_speed.rs`.
+        let owner = sim
+            .substrate
+            .entities
+            .get(id)
+            .filter(|entity| entity.category() == EntityCategory::Unit)
+            .map(|entity| entity.owner());
+        if owner.is_some_and(|owner| !sim.owner_is_human(owner)) {
+            sim.scatter(
+                id,
+                None,
+                crate::sim::movement::ScatterFlags::new(true, false),
+                rules,
+                registry,
+                effects,
+            )
+            .unwrap_or_else(|cause| panic!("cloak completion Scatter: {cause}"));
         }
     }
-    if result.is_some_and(|result| result.play_cloak_sound) {
-        emit_configured_cloak_sound(sim, id, rules);
+    if let Some(result) = result.filter(|result| result.play_cloak_sound) {
+        // CloakingTick's only sounding transitions are StartCloaking(0) from
+        // state 0 and StartUncloaking(0) from state 2.
+        emit_cloak_transition_sound(sim, id, rules, !result.began_cloaking);
     }
 }
 
-#[cfg(test)]
+/// [`emit_configured_cloak_sound`] for a represented object's own type.
+fn emit_cloak_transition_sound(sim: &mut Simulation, id: u64, rules: &RuleSet, decloak: bool) {
+    let object = sim
+        .substrate
+        .entities
+        .get(id)
+        .and_then(|entity| sim.interner.object_type(entity.type_ref(), rules));
+    emit_configured_cloak_sound(
+        &sim.substrate,
+        &mut sim.sound_events,
+        id,
+        rules,
+        object,
+        decloak,
+    );
+}
+
+/// Ares CloakDisallowed10043A40's self-cloak conditions after its driver and
+/// Deactivated tests: a `Cloakable.Powered=yes` Building needs IsPowerOnline
+/// (vt+0x350, the shared4555D0 adapter) and a `Cloakable.Deployed=yes`
+/// Infantry needs IsDeployed (vt+0x554, Infantry5228D0: `Deployer=` and a
+/// Doing of 27..30). Otherwise only the generator arm can keep it cloaked.
+fn ares_self_cloak_condition_holds(
+    sim: &Simulation,
+    id: u64,
+    object: &crate::rules::object_type::ObjectType,
+    rules: &RuleSet,
+) -> bool {
+    if rules.ares() {
+        let Some(entity) = sim.substrate.entities.get(id) else {
+            return false;
+        };
+        match entity.category() {
+            EntityCategory::Structure if object.cloak_power().cloak_powered() => {
+                sim.building_operational_state(id, rules) == Some(true)
+            }
+            EntityCategory::Infantry if object.cloak_power().cloak_deployed() => {
+                object.deployer && entity.infantry_deploy_doing()
+            }
+            _ => true,
+        }
+    } else {
+        true
+    }
+}
+
+#[cfg(all(test, tests_sim_world_techno))]
 #[path = "techno_ai_cloak_tests.rs"]
 mod tests;
+
+#[cfg(all(test, tests_sim_world_techno))]
+#[path = "techno_ai_cloak_ares_tests.rs"]
+mod ares_tests;
+
+#[cfg(all(test, tests_sim_world_techno))]
+#[path = "techno_cloak_range_tests.rs"]
+mod range_tests;
+
+#[cfg(all(test, tests_sim_world_techno))]
+#[path = "techno_cloak_range_oracle_tests.rs"]
+mod range_oracle_tests;

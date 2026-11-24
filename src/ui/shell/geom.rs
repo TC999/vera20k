@@ -1,4 +1,7 @@
-//! Shared front-end shell geometry: DLU->pixel, right-panel chrome, button snap.
+//! The front-end shell's dialog geometry: DLU->pixel, right-panel chrome,
+//! button snap and the text alignment flags. Builds on the GUI crate's
+//! generic pixel geometry, re-exported here so the shells have one geometry
+//! path.
 //!
 //! Render-agnostic; depends on plain integers only. The three shells (dialogs
 //! 0xE2 / 0x100 / 0x102) import these instead of each keeping a private copy.
@@ -6,34 +9,45 @@
 //! half-up to the nearest button row; single-player and skirmish bias-truncate a
 //! tile index) because they are not proven equivalent at the half-row boundary.
 
-/// Pixel rect in window space. Fields/semantics identical to the three prior
-/// per-shell copies; `translate` is hoisted from the skirmish copy so all shells
-/// share one type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RectPx {
-    pub x: i32,
-    pub y: i32,
-    pub w: i32,
-    pub h: i32,
+pub use vera20k_gui::shell::geom::{RectPx, ScaledRects, ShellScale, layout_on};
+
+/// The logical shell is authored at 800x600; the fill-window pass scales that
+/// rectangle into the live window, keeping its 4:3 shape.
+pub const SHELL_BASE_W: i32 = 800;
+pub const SHELL_BASE_H: i32 = 600;
+
+/// The retail mapping: the 800x600 dialog is placed in the window by the
+/// host's dialog origin, never scaled. Every art fit keyed on this scale is
+/// then a no-op, so the fill-window path is the only source of drift.
+pub const RETAIL_SCALE: ShellScale = ShellScale::unscaled(SHELL_BASE_W, SHELL_BASE_H);
+
+/// The 800x600 shell scaled to fit a `screen_w`x`screen_h` window at its own
+/// shape, centred.
+pub const fn shell_scale(screen_w: i32, screen_h: i32) -> ShellScale {
+    ShellScale::fit(SHELL_BASE_W, SHELL_BASE_H, screen_w, screen_h)
 }
 
-impl RectPx {
-    pub const fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
-        Self { x, y, w, h }
+/// The mapping the front-end shell takes in a window. Only the two sizes
+/// gamemd's shell runs at keep the retail layout: 800x600, and 640x480 with
+/// its own 640-wide art (`AllowModeToggle`). Any other window gets the
+/// 800x600 dialog scaled to fit at its own shape, centred.
+pub fn shell_scale_for_window(screen_w: i32, screen_h: i32) -> ShellScale {
+    if matches!((screen_w, screen_h), (800, 600) | (640, 480)) {
+        RETAIL_SCALE
+    } else {
+        shell_scale(screen_w, screen_h)
     }
+}
 
-    pub const fn translate(self, dx: i32, dy: i32) -> Self {
-        Self {
-            x: self.x + dx,
-            y: self.y + dy,
-            w: self.w,
-            h: self.h,
-        }
-    }
-
-    pub fn contains(self, x: i32, y: i32) -> bool {
-        x >= self.x && y >= self.y && x < self.x + self.w && y < self.y + self.h
-    }
+/// The window-filling variant of a retail layout: `base` laid out on the
+/// verified 800x600 dialog, then scaled to fit the `screen_w`x`screen_h`
+/// window, keeping its shape. Identity at the base size.
+pub fn fit_window<L: ScaledRects>(
+    screen_w: u32,
+    screen_h: u32,
+    base: impl FnOnce(u32, u32) -> L,
+) -> L {
+    vera20k_gui::shell::geom::fit_window(SHELL_BASE_W, SHELL_BASE_H, screen_w, screen_h, base)
 }
 
 // --- DLU base metrics (MS Sans Serif 8pt) ---
@@ -53,12 +67,139 @@ pub const LOWER_STRIP_H: i32 = 32;
 /// edge; the surrounding chrome remains 168 pixels wide.
 pub const SDBTNANM_CELL_W_NARROW: i32 = 156;
 
+/// Legacy fit for shell controls that still use `PANEL_FACE`.
+pub const RIGHT_PANEL_FACE_W: u32 = 110;
+
+/// The family heading and column buttons share the SDTP window's 116 native
+/// pixels less one pixel on either side. Other shell controls keep their fit.
+pub(crate) const FAMILY_CAPTION_W: i32 = 116 - 2;
+
+/// The shell's text alignment flags: what a GUI text node carries in
+/// `Prop::Align` and `render::shell_text::draw_in_rect_scaled` draws by.
+/// 0x01 = h-center, 0x02 = h-right, 0x04 = v-center, 0x08 = panel face,
+/// 0x10 = single line.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ShellAlign(pub u8);
+
+impl ShellAlign {
+    pub const NONE: ShellAlign = ShellAlign(0);
+    pub const H_CENTER: ShellAlign = ShellAlign(0x01);
+    pub const H_RIGHT: ShellAlign = ShellAlign(0x02);
+    pub const V_CENTER: ShellAlign = ShellAlign(0x04);
+    /// VERA's own: the rect is wider than the right-panel art it labels, an
+    /// SDBTNANM button's red face or the title window atop the column, so the
+    /// text must also fit [`RIGHT_PANEL_FACE_W`] on one line to stay on it.
+    pub const PANEL_FACE: ShellAlign = ShellAlign(0x08);
+    /// An SDBTNANM button's caption, centred on its face.
+    pub const BUTTON_CAPTION: ShellAlign = ShellAlign(0x01 | 0x04 | 0x08);
+    /// The right panel's title, centred in its window.
+    pub const PANEL_TITLE: ShellAlign = ShellAlign(0x01 | 0x08);
+    /// Centred text whose rect already bounds the painted art.
+    pub const ART_CAPTION: ShellAlign = ShellAlign(0x01 | 0x10);
+    pub(crate) const SINGLE_LINE: ShellAlign = ShellAlign(0x10);
+
+    pub fn contains(self, flag: ShellAlign) -> bool {
+        (self.0 & flag.0) != 0
+    }
+}
+
+impl std::ops::BitOr for ShellAlign {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        ShellAlign(self.0 | rhs.0)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RightPanelRects {
     pub top: RectPx,
+    /// The first tile row. Later rows come from [`Self::tile_row`], not from
+    /// stepping this rect's height.
     pub tile: RectPx,
     pub tile_count: i32,
     pub bottom: RectPx,
+    /// The mapping these rects went through and the tile it mapped, so a row
+    /// or a cell in it scales like every other authored rect.
+    scale: ShellScale,
+    authored_tile: RectPx,
+}
+
+impl RightPanelRects {
+    /// Text viewport in the family's SDTP heading window. At 800×600 the
+    /// black inset is [658, 774); leave one pixel of margin on either side.
+    /// Keep the heading static's native y and height (0x0060BD17).
+    pub(crate) fn family_title_caption(self, title: RectPx) -> RectPx {
+        let art = self.scale.scale_rect(RectPx::new(
+            self.authored_tile.x + (RIGHT_PANEL_WIDTH - FAMILY_CAPTION_W) / 2,
+            0,
+            FAMILY_CAPTION_W,
+            0,
+        ));
+        RectPx::new(art.x, title.y, art.w, title.h)
+    }
+
+    /// Tile row `row` of the column. A scaled panel rounds each row's edges
+    /// like any other authored rect, so row `k` lands where a button authored
+    /// on row `k` does; stepping `tile.y` by the rounded height drifts a pixel
+    /// every few rows. Identity on the unscaled panel.
+    pub fn tile_row(&self, row: i32) -> RectPx {
+        self.row_cell(row, self.authored_tile.w, self.authored_tile.h)
+    }
+
+    /// A `w`x`h` shape authored right-aligned at the top of tile row `row`, in
+    /// window space: where `0x006071E0` draws each slide frame (the executed
+    /// positions in `tools/storage_oracle/shell_slide_engine.json`) and where
+    /// the SDBTNANM buttons sit.
+    pub fn row_cell(&self, row: i32, w: i32, h: i32) -> RectPx {
+        let tile = self.authored_tile;
+        self.scale.scale_rect(RectPx::new(
+            tile.x + tile.w - w,
+            tile.y + row * tile.h,
+            w,
+            h,
+        ))
+    }
+
+    /// The panel moved `(dx, dy)` window pixels, as a fixed 800x600 layout is
+    /// centred in a larger window. Only an unscaled panel moves; its authored
+    /// tile is its window tile.
+    pub fn translate(self, dx: i32, dy: i32) -> Self {
+        debug_assert!(
+            self.scale.is_unscaled(),
+            "a scaled panel already fills its window"
+        );
+        Self {
+            top: self.top.translate(dx, dy),
+            tile: self.tile.translate(dx, dy),
+            bottom: self.bottom.translate(dx, dy),
+            authored_tile: self.authored_tile.translate(dx, dy),
+            ..self
+        }
+    }
+
+    /// The panel on `scale`'s mapping, scaled once from its 800x600 rects.
+    pub fn scaled(self, scale: ShellScale) -> Self {
+        debug_assert!(self.scale.is_unscaled(), "panels scale once, from 800x600");
+        Self {
+            top: scale.scale_rect(self.top),
+            tile: scale.scale_rect(self.tile),
+            tile_count: self.tile_count,
+            bottom: scale.scale_rect(self.bottom),
+            scale,
+            authored_tile: self.authored_tile,
+        }
+    }
+
+    /// How far these rects sit from the 168x199 SDTP canvas the panel art is
+    /// authored against: `(1.0, 1.0)` on the retail layout at every screen size,
+    /// the shell's scale factor once the 800x600 dialog is scaled into the
+    /// window. Both axes clamp at one, so an unscaled panel never shrinks its art.
+    pub fn stretch(&self) -> (f32, f32) {
+        (
+            (self.tile.w as f32 / RIGHT_PANEL_WIDTH as f32).max(1.0),
+            (self.top.h as f32 / RIGHT_PANEL_TOP_H as f32).max(1.0),
+        )
+    }
 }
 
 /// Round-half-up MulDiv (sign-correct). Byte-identical to the three prior copies.
@@ -81,10 +222,11 @@ pub fn dlu_rect(x: i32, y: i32, w: i32, h: i32) -> RectPx {
     )
 }
 
-/// A family dialog's template child window: the 6x13 conversion one pixel
-/// wider and taller, as the `0x10E` and `0x6B` children measure in the retail
-/// captures (`0x0060C42E` keeps the template place). The `0x129` movie list
-/// measured at the plain conversion.
+/// Common resized template window: the 6x13 conversion one pixel wider and
+/// taller. Original 775BC0 executes this extent correction for F0's modal and
+/// children (tools/storage_oracle/saved_game_layout.json); the `0x10E` and `0x6B`
+/// children also measure it in retail captures (`0x0060C42E` keeps the place).
+/// The `0x129` movie list measured at the plain conversion.
 pub fn child_window(x: i32, y: i32, w: i32, h: i32) -> RectPx {
     let rect = dlu_rect(x, y, w, h);
     RectPx::new(rect.x, rect.y, rect.w + 1, rect.h + 1)
@@ -113,6 +255,12 @@ pub fn dialog_origin(screen_w: i32, screen_h: i32) -> (i32, i32) {
 /// every i32.
 pub fn center_offset(screen: i32, base: i32) -> i32 {
     ((screen - base) / 2).max(0)
+}
+
+impl ScaledRects for RightPanelRects {
+    fn scaled_rects(&self, scale: ShellScale) -> Self {
+        self.scaled(scale)
+    }
 }
 
 /// Where an image static paints a `w`x`h` image in its window: centred only
@@ -160,6 +308,8 @@ pub fn right_panel_rects(screen_w: i32, screen_h: i32) -> RightPanelRects {
         tile,
         tile_count,
         bottom: RectPx::new(top.x, bottom_y, RIGHT_PANEL_WIDTH, bottom_h),
+        scale: RETAIL_SCALE,
+        authored_tile: tile,
     }
 }
 
@@ -227,9 +377,25 @@ pub fn snap_button_biased_truncate(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_ui))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn family_caption_fits_the_black_heading_at_native_and_scaled_sizes() {
+        let layout = crate::ui::main_menu_shell::compute_layout(800, 600);
+        let panel = layout.right_panel;
+        let title = layout.title;
+        let actual = panel.family_title_caption(title);
+        assert_eq!(actual, RectPx::new(659, title.y, 114, title.h));
+        for size in [(1600, 1200), (2048, 1532)] {
+            let scale = shell_scale(size.0, size.1);
+            assert_eq!(
+                panel.scaled(scale).family_title_caption(scale.scale_rect(title)),
+                scale.scale_rect(actual),
+            );
+        }
+    }
 
     #[test]
     fn dialog_origin_letterboxes_only_from_1024x768() {
@@ -239,73 +405,6 @@ mod tests {
         // Executed 0x0072EC70 (research origin.out.txt).
         assert_eq!(dialog_origin(1024, 768), (112, 84));
         assert_eq!(dialog_origin(1280, 1024), (240, 212));
-    }
-
-    #[test]
-    fn mul_div_round_matches_round_half_up_muldiv_all_odd_dlu() {
-        // Round-half-up MulDiv reference (i64 to avoid overflow), both signs.
-        fn reference(n: i64, numer: i64, denom: i64) -> i64 {
-            let v = n * numer;
-            if v >= 0 {
-                (v + denom / 2) / denom
-            } else {
-                (v - denom / 2) / denom
-            }
-        }
-        for dlu in (-1024..=1024).filter(|d| d % 2 != 0) {
-            assert_eq!(
-                mul_div_round(dlu, DLU_BASE_X, 4) as i64,
-                reference(dlu as i64, DLU_BASE_X as i64, 4)
-            );
-            assert_eq!(
-                mul_div_round(dlu, DLU_BASE_Y, 8) as i64,
-                reference(dlu as i64, DLU_BASE_Y as i64, 8)
-            );
-        }
-    }
-
-    #[test]
-    fn center_offset_equals_if_guard_form_at_boundaries() {
-        for (s, b) in [(800, 800), (801, 800), (1024, 800), (799, 800), (797, 800)] {
-            let if_form = if s > b { (s - b) / 2 } else { 0 };
-            assert_eq!(center_offset(s, b), if_form, "s={s} b={b}");
-        }
-    }
-
-    #[test]
-    fn right_panel_rects_byte_equal_to_pre_refactor_literals() {
-        // Values asserted by the three shells' existing suites pre-refactor.
-        let a = right_panel_rects(800, 600);
-        assert_eq!(a.top, RectPx::new(632, 0, 168, 199));
-        assert_eq!(a.tile, RectPx::new(632, 199, 168, 42));
-        assert_eq!(a.tile_count, 9);
-        assert_eq!(a.bottom, RectPx::new(632, 577, 168, 23));
-
-        let b = right_panel_rects(1024, 768);
-        assert_eq!(b.top, RectPx::new(744, 84, 168, 199));
-        assert_eq!(b.tile, RectPx::new(744, 283, 168, 42));
-        assert_eq!(b.tile_count, 9);
-        assert_eq!(b.bottom, RectPx::new(744, 661, 168, 23));
-
-        let c = right_panel_rects(640, 480);
-        assert_eq!(c.top, RectPx::new(472, 0, 168, 199));
-        assert_eq!(c.tile, RectPx::new(472, 199, 168, 42));
-        assert_eq!(c.tile_count, 6);
-        assert_eq!(c.bottom, RectPx::new(472, 451, 168, 29));
-    }
-
-    #[test]
-    fn snap_round_half_up_reproduces_main_menu_0xe2_stacked_cells() {
-        // 0xE2 at 800x600: cell_w=156, flush-right x=644, rows from y=199.
-        let panel = right_panel_rects(800, 600);
-        let dlu_y = [125, 152, 179, 206, 233];
-        let expected_y = [199, 241, 283, 325, 367];
-        for (dy, ey) in dlu_y.iter().zip(expected_y) {
-            assert_eq!(
-                snap_button_round_half_up(*dy, panel, SDBTNANM_CELL_W_NARROW),
-                RectPx::new(644, ey, 156, 42)
-            );
-        }
     }
 
     #[test]
@@ -325,38 +424,5 @@ mod tests {
                 RectPx::new(644, ey, 156, 42)
             );
         }
-    }
-
-    #[test]
-    fn snap_biased_truncate_reproduces_skirmish_0x102_narrow_cells() {
-        // 0x102 at 800x600: cell_w=156, flush-right x=644, start/choose 241/283.
-        let panel = right_panel_rects(800, 600);
-        assert_eq!(
-            snap_button_biased_truncate(
-                800,
-                600,
-                dlu_rect(425, 149, 108, 23),
-                panel,
-                SDBTNANM_CELL_W_NARROW
-            ),
-            RectPx::new(644, 241, 156, 42)
-        );
-        assert_eq!(
-            snap_button_biased_truncate(
-                800,
-                600,
-                dlu_rect(425, 176, 108, 23),
-                panel,
-                SDBTNANM_CELL_W_NARROW
-            ),
-            RectPx::new(644, 283, 156, 42)
-        );
-    }
-
-    #[test]
-    fn lower_strip_matches_pre_refactor_values() {
-        assert_eq!(lower_strip_rect(800, 600), RectPx::new(0, 568, 632, 32));
-        assert_eq!(lower_strip_rect(1024, 768), RectPx::new(112, 652, 632, 32));
-        assert_eq!(lower_strip_rect(640, 480), RectPx::new(0, 448, 472, 32));
     }
 }

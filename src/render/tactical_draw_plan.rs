@@ -70,6 +70,28 @@ impl BlitPolicy {
         }
     }
 
+    /// Whether the blitter this policy picks ORs a draw's colour word into the
+    /// pixels it draws. The 16-bit Convert (`0x0048E740`) holds one blitter
+    /// per flag set and frame encoding (pickers `0x00490B90`, compressed
+    /// frames `0x00490E50`). The Z-read family's tinted copies OR the word
+    /// (`0x00494C40`, compressed `0x00498150`), as does the Z-writing
+    /// family's compressed-frame one (`0x00499280`); its uncompressed-frame
+    /// one drops it (`0x004959F0` forwards to the plain copy). The voxel cache
+    /// blit always picks a compressed-frame blitter (`0x0070750E`). Executed:
+    /// `tools/superweapon_oracle.py` `blit_pickers`, `blitters`. The
+    /// translucent families' tinted copies forward to their plain ones too
+    /// (read, not executed).
+    pub const fn ors_colour_word(self, compressed: bool) -> bool {
+        let compressed =
+            compressed || matches!(self.encoding, SpriteEncoding::Voxel | SpriteEncoding::Rle);
+        !self.translucent
+            && match self.render_z {
+                RenderZPolicy::ReadOnly => true,
+                RenderZPolicy::ReadWrite => compressed,
+                RenderZPolicy::None | RenderZPolicy::AlphaReadWrite => false,
+            }
+    }
+
     /// Opaque blit that neither reads nor writes render Z (VERA passthrough
     /// for draws whose native Z behaviour is not yet traced).
     pub const fn z_none(encoding: SpriteEncoding) -> Self {
@@ -81,51 +103,13 @@ impl BlitPolicy {
     }
 }
 
-/// Families drawn during the fixed per-cell pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CellDrawKind {
-    Terrain,
-    Smudge,
-    FlatOverlay,
-    WallOverlay,
-    PrimaryCellObject,
-}
-
-/// One already-cell-traversed item. Its order is preserved exactly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CellDraw {
-    pub id: DrawId,
-    pub kind: CellDrawKind,
-    pub policy: BlitPolicy,
-}
-
-/// Fixed cell-pass families from back to front.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CellPass {
-    pub terrain: Vec<CellDraw>,
-    pub smudges: Vec<CellDraw>,
-    /// Flat overlays and walls keep their original cell traversal order.
-    pub overlays: Vec<CellDraw>,
-    pub primary_objects: Vec<CellDraw>,
-}
-
-impl CellPass {
-    fn push(&mut self, draw: CellDraw) {
-        match draw.kind {
-            CellDrawKind::Terrain => self.terrain.push(draw),
-            CellDrawKind::Smudge => self.smudges.push(draw),
-            CellDrawKind::FlatOverlay | CellDrawKind::WallOverlay => self.overlays.push(draw),
-            CellDrawKind::PrimaryCellObject => self.primary_objects.push(draw),
-        }
-    }
-}
-
 /// An object already admitted to an authoritative Display vector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectDraw {
     pub id: DrawId,
     pub layer: TacticalLayer,
-    /// Position in the retained Display vector, including its sort history.
+    /// Position in the layer's draw order (`Simulation::picture_draw_order`,
+    /// which places the presentation anims among the Display members).
     pub display_order: u64,
     pub policy: BlitPolicy,
 }
@@ -135,7 +119,14 @@ pub struct ObjectDraw {
 pub enum BuildingPieceKind {
     BuildupOrSpecial,
     Body,
+    Shadow,
     Bib,
+    /// The bib's own DrawSHP shadow half, drawn right after the bib
+    /// (`TechnoClass_DrawSHP @ 0x00705E00` from `0x0043D8E9`).
+    BibShadow,
+    /// A war factory's `UnderDoorAnim=` and its shadow, drawn after the bib
+    /// (`BuildingClass::DrawIt @ 0x0043D8EE`).
+    UnderDoor,
     PoweredOrActiveOverlay,
     SplitBack,
     SplitFront,
@@ -183,7 +174,6 @@ pub struct ObjectLayerPass {
 /// One pure input to the tactical draw planner.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TacticalDrawInput {
-    Cell(CellDraw),
     Object(ObjectDraw),
     Building(BuildingOwnedPlan),
 }
@@ -191,21 +181,20 @@ pub enum TacticalDrawInput {
 /// Presentation plan lowered from the simulation-owned Display vectors.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TacticalDrawPlan {
-    pub cell_pass: CellPass,
     pub object_layers: Vec<ObjectLayerPass>,
 }
 
 impl TacticalDrawPlan {
-    /// Reassemble class-specific draws in retained Display order. The sim owns
-    /// Submit4A9720 and the single adjacent Ground pass551A30. Tactical6D8F19
-    /// walks each vector forward; a fresh full Y-sort here would erase history.
+    /// Reassemble class-specific draws in Display draw order. The sim owns
+    /// Submit4A9720; the presentation sorts Ground by GetYSort
+    /// (`Simulation::ground_draw_order`). Tactical6D8F19 walks each layer
+    /// forward.
     pub fn build(inputs: impl IntoIterator<Item = TacticalDrawInput>) -> Self {
         let mut plan = Self::default();
         let mut entries = Vec::new();
 
         for input in inputs {
             match input {
-                TacticalDrawInput::Cell(draw) => plan.cell_pass.push(draw),
                 TacticalDrawInput::Object(object) => entries.push(LayerEntry::Object(object)),
                 TacticalDrawInput::Building(building) => {
                     let mut building = building;
@@ -242,11 +231,14 @@ impl TacticalDrawPlan {
 fn building_piece_order(kind: BuildingPieceKind) -> u8 {
     match kind {
         BuildingPieceKind::BuildupOrSpecial => 0,
-        BuildingPieceKind::Bib => 1,
-        BuildingPieceKind::SplitBack => 2,
-        BuildingPieceKind::Body => 3,
-        BuildingPieceKind::PoweredOrActiveOverlay => 4,
-        BuildingPieceKind::SplitFront => 5,
+        BuildingPieceKind::SplitBack => 1,
+        BuildingPieceKind::Body => 2,
+        BuildingPieceKind::Shadow => 3,
+        BuildingPieceKind::Bib => 4,
+        BuildingPieceKind::BibShadow => 5,
+        BuildingPieceKind::UnderDoor => 6,
+        BuildingPieceKind::PoweredOrActiveOverlay => 7,
+        BuildingPieceKind::SplitFront => 8,
     }
 }
 
@@ -258,7 +250,7 @@ fn native_layer_order(left: &LayerEntry, right: &LayerEntry) -> Ordering {
         .then_with(|| left.display_order.cmp(&right.display_order))
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_render_s_z))]
 mod tests {
     use super::*;
 
@@ -271,57 +263,6 @@ mod tests {
             display_order,
             policy: OPAQUE_SHP,
         }
-    }
-
-    #[test]
-    fn cell_pass_keeps_native_family_order_and_cell_traversal_order() {
-        let plan = TacticalDrawPlan::build([
-            TacticalDrawInput::Cell(CellDraw {
-                id: 4,
-                kind: CellDrawKind::WallOverlay,
-                policy: OPAQUE_SHP,
-            }),
-            TacticalDrawInput::Cell(CellDraw {
-                id: 1,
-                kind: CellDrawKind::Terrain,
-                policy: OPAQUE_SHP,
-            }),
-            TacticalDrawInput::Cell(CellDraw {
-                id: 2,
-                kind: CellDrawKind::Smudge,
-                policy: OPAQUE_SHP,
-            }),
-            TacticalDrawInput::Cell(CellDraw {
-                id: 3,
-                kind: CellDrawKind::FlatOverlay,
-                policy: OPAQUE_SHP,
-            }),
-        ]);
-
-        assert_eq!(
-            plan.cell_pass
-                .terrain
-                .iter()
-                .map(|draw| draw.id)
-                .collect::<Vec<_>>(),
-            [1]
-        );
-        assert_eq!(
-            plan.cell_pass
-                .smudges
-                .iter()
-                .map(|draw| draw.id)
-                .collect::<Vec<_>>(),
-            [2]
-        );
-        assert_eq!(
-            plan.cell_pass
-                .overlays
-                .iter()
-                .map(|draw| draw.id)
-                .collect::<Vec<_>>(),
-            [4, 3]
-        );
     }
 
     #[test]
@@ -363,6 +304,12 @@ mod tests {
                     z_bias: 0,
                     policy: OPAQUE_SHP,
                 },
+                BuildingPiece {
+                    id: 23,
+                    kind: BuildingPieceKind::Shadow,
+                    z_bias: 0,
+                    policy: OPAQUE_SHP,
+                },
             ],
         };
         let plan = TacticalDrawPlan::build([
@@ -388,7 +335,11 @@ mod tests {
                 .iter()
                 .map(|piece| piece.kind)
                 .collect::<Vec<_>>(),
-            [BuildingPieceKind::Bib, BuildingPieceKind::Body]
+            [
+                BuildingPieceKind::Body,
+                BuildingPieceKind::Shadow,
+                BuildingPieceKind::Bib
+            ]
         );
         let LayerEntry::Building(building) = &entries[1] else {
             panic!("building parent must retain its owned draw group");
@@ -399,15 +350,7 @@ mod tests {
                 .iter()
                 .map(|piece| piece.id)
                 .collect::<Vec<_>>(),
-            [21, 22]
+            [22, 23, 21]
         );
-    }
-
-    #[test]
-    fn alpha_z_policy_is_explicit_for_future_shared_blitter_lowering() {
-        let policy = BlitPolicy::translucent(SpriteEncoding::Rle, RenderZPolicy::AlphaReadWrite);
-        assert_eq!(policy.encoding, SpriteEncoding::Rle);
-        assert_eq!(policy.render_z, RenderZPolicy::AlphaReadWrite);
-        assert!(policy.translucent);
     }
 }

@@ -5,20 +5,20 @@
 //! and the scanner prerequisite packet. No floating-point arithmetic lives here.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub(crate) struct EstimatedHealth(i32);
+pub struct EstimatedHealth(i32);
 
 impl EstimatedHealth {
     pub(crate) const fn from_raw(value: i32) -> Self {
         Self(value)
     }
 
-    pub(crate) const fn get(self) -> i32 {
+    pub const fn get(self) -> i32 {
         self.0
     }
 
     /// Full-strength repair/reload and constructor/map/conversion initializers
     /// assign this field explicitly; ordinary actual damage does not.
-    pub(crate) fn reset(&mut self, actual_health: i32) {
+    pub fn reset(&mut self, actual_health: i32) {
         self.0 = actual_health;
     }
 
@@ -34,9 +34,18 @@ impl EstimatedHealth {
         self.0 = self.0.wrapping_sub(estimate);
     }
 
+    /// Whether [`Self::recover`] changes the estimate: it is above the actual
+    /// health, or below it on a recovery frame.
+    pub(crate) fn recovers(&self, actual_health: i32, binary_frame: u32) -> bool {
+        self.0 > actual_health || (binary_frame & 4 != 0 && self.0 < actual_health)
+    }
+
     /// Original TechnoAI6F9F6E: signed clamp, then frame-mask recovery. This is
     /// an actor visit, not a once-per-global-tick sweep or a modulo-four pulse.
     pub(crate) fn recover(&mut self, actual_health: i32, binary_frame: u32) {
+        if !self.recovers(actual_health, binary_frame) {
+            return;
+        }
         self.0 = self.0.min(actual_health);
         if binary_frame & 4 != 0 && self.0 < actual_health {
             if self.0.wrapping_add(30) < 0 {
@@ -47,6 +56,6 @@ impl EstimatedHealth {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_c_g))]
 #[path = "estimated_health_tests.rs"]
 mod tests;

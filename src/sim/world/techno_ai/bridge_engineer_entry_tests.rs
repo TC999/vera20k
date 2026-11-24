@@ -23,7 +23,7 @@ impl Simulation {
             return;
         };
         if self.interner.resolve(actor.type_ref()) != "ENGINEER"
-            || ![(66, 76), (67, 75)].contains(&(actor.position.rx, actor.position.ry))
+            || ![(66, 76), (67, 75)].contains(&(actor.position.rx(), actor.position.ry()))
         {
             return;
         }
@@ -33,13 +33,14 @@ impl Simulation {
             .values()
             .filter(|e| {
                 e.stable_id() == id
-                    || ((64..=70).contains(&e.position.rx) && (72..=78).contains(&e.position.ry))
+                    || ((64..=70).contains(&e.position.rx())
+                        && (72..=78).contains(&e.position.ry()))
             })
             .map(|e| {
                 json!({"id":e.stable_id(),"type_name":self.interner.resolve(e.type_ref()),
                     "owner_name":self.interner.resolve(e.owner()),"entity":e,
                     "team_present":self.team_script_vm.team_for_member(e.stable_id()).is_some(),
-                    "type":format!("{:?}",rules.object(self.interner.resolve(e.type_ref()))),
+                    "type":format!("{:?}",self.interner.object_type(e.type_ref(), rules)),
                 })
             })
             .collect();
@@ -54,7 +55,7 @@ impl Simulation {
                         x,
                         y,
                         Ground,
-                        self.production.terrain_object_cells.get(&(x, y)).copied(),
+                        self.terrain_objects.cell_index().get(&(x, y)).copied(),
                     )
                     .map(|o| format!("{o:?}"))
                     .collect();
@@ -65,20 +66,20 @@ impl Simulation {
                     .map(|o| format!("{o:?}"))
                     .collect();
                 cells.push(json!({"coord":[x,y],"level":c.level,"slope":c.slope_type,
-                    "land":c.yr_cell_land_type,"tile":c.final_tile_index,"subtile":c.final_sub_tile,
+                    "land":c.land_type,"tile":c.final_tile_index,"subtile":c.final_sub_tile,
                     "zone_type":c.zone_type,"bridge_facts":c.bridge_facts,
                     "ground_list":ground,"deck_list":deck,
                     "ground_bits":self.substrate.raw_cell_occupation.ground_bits(x,y),
                     "deck_bits":self.substrate.raw_cell_occupation.deck_bits(x,y),
-                    "ground_owner":self.substrate.raw_cell_occupation.infantry_owner(x,y,Ground),
-                    "deck_owner":self.substrate.raw_cell_occupation.infantry_owner(x,y,Bridge),
+                    "ground_owner":self.substrate.raw_cell_occupation.occupant_at(crate::sim::occupancy::RawCellKey::Real(x,y),Ground).1,
+                    "deck_owner":self.substrate.raw_cell_occupation.occupant_at(crate::sim::occupancy::RawCellKey::Real(x,y),Bridge).1,
                     "full_cell_debug":format!("{c:?}"),
                 }));
             }
         }
         let bounds = self.playfield_bounds.unwrap();
         let output = json!({"boundary":boundary, "actor":id,
-            "tick":self.session.tick,"binary_frame":self.session.binary_frame,
+            "tick":self.session.tick(),"binary_frame":self.session.binary_frame(),
             "native_size":[bounds.base,self.playfield_size_height.unwrap()],
             "local_size":[bounds.off_fc,bounds.off_100,bounds.off_104,bounds.off_108],
             "entities":entities,"cells":cells,"dummy":format!("{:?}",terrain.shared_cell_dummy().snapshot()),
@@ -86,7 +87,7 @@ impl Simulation {
         serde_json::to_writer(
             std::fs::File::create(
                 std::path::PathBuf::from(path)
-                    .with_extension(format!("{boundary}-{}.json", self.session.binary_frame)),
+                    .with_extension(format!("{boundary}-{}.json", self.session.binary_frame())),
             )
             .unwrap(),
             &output,
@@ -113,19 +114,21 @@ fn capture_probe(
     let actor = sim.entities().get(engineer).unwrap();
     let owner = sim.interner.resolve(actor.owner()).to_owned();
     assert!(sim.apply_command_with_overlays(
+        None,
         &owner,
         &Command::CaptureBuilding {
             engineer_id: engineer,
             target_building_id: hut
         },
-        Some(&resources.rules),
-        Some(&resources.overlay_registry),
+        &resources.rules,
+        Some(resources.rules.overlay_registry()),
+        &mut crate::sim::world::FrameEffects::default(),
     ));
     let mut snapshot = zone_snapshot(sim, name);
     let actor = sim.entities().get(engineer).unwrap();
-    let object = resources
-        .rules
-        .object(sim.interner.resolve(actor.type_ref()))
+    let object = sim
+        .interner
+        .object_type(actor.type_ref(), &resources.rules)
         .unwrap();
     let destination = actor
         .locomotor
@@ -137,15 +140,14 @@ fn capture_probe(
     let query = json!({
         "actor": engineer, "hut":hut, "type":sim.interner.resolve(actor.type_ref()),
         "movement_zone": object.movement_zone.matrix_row(), "speed_type":format!("{:?}",object.speed_type),
-        "position":actor.position, "on_bridge":actor.on_bridge, "in_playfield":actor.in_playfield,
+        "position":actor.position, "on_bridge":actor.on_bridge(), "in_playfield":actor.in_playfield(),
         "mission_only":actor.is_mission_only(), "lifecycle":actor.lifecycle,
         "tube":actor.low_bridge_tube_state, "locomotor":actor.locomotor,
         "mission":actor.mission, "navigation":actor.navigation,
-        "capture_target":actor.capture_target, "movement_target":actor.movement_target,
         "team_present":sim.team_script_vm.team_for_member(engineer).is_some(),
         "navigation_coord":navigation_coord, "destination_coord":destination,
         "current_coord":crate::sim::movement::ground_pose::position_world_coord(&actor.position),
-        "allow_destination_fringe":sim.foot_allows_outside_playfield(engineer).unwrap(),
+        "allow_destination_fringe":sim.foot_allows_outside_playfield(engineer, object.is_train).unwrap(),
     });
     eprintln!("BRIDGE_ENGINEER_PROBE {name}: {query}");
     let before = sim
@@ -177,16 +179,30 @@ fn retail_hills_engineer_cliff_start_is_rejected() {
         .values()
         .find_map(|e| {
             (runtime.simulation.interner.resolve(e.type_ref()) == "CABHUT"
-                && (e.position.rx, e.position.ry) == (68, 74))
+                && (e.position.rx(), e.position.ry()) == (68, 74))
                 .then_some(e.stable_id())
         })
         .unwrap();
-    let owner = runtime.simulation.session.current_house.unwrap();
+    let owner = runtime.simulation.session.current_house().unwrap();
     let owner_name = runtime.simulation.interner.resolve(owner).to_owned();
-    let engineer = runtime
-        .simulation
-        .spawn_object("ENGINEER", &owner_name, 69, 74, 0, &runtime.resources.rules)
-        .unwrap();
+    // This zone/restore negative control supplies an already-resident actor
+    // on Rock, whose native Foot speed is zero. Object5F4F1B..5F4F4A
+    // bypasses ordinary +1AC admission under the authored A8E7AC scope;
+    // Infantry51E027 also uses it for priority floor placement. End that
+    // context before snapshot/Capture: ordinary cliff Unlimbo is not legal.
+    let engineer = runtime.simulation.with_object_placement_scope(|sim| {
+        sim.spawn_object_with_overlay_registry(
+            "ENGINEER",
+            &owner_name,
+            69,
+            74,
+            0,
+            &runtime.resources.rules,
+            runtime.resources.rules.overlay_registry(),
+        )
+        .unwrap()
+    });
+    assert!(!runtime.simulation.object_placement_scope_active());
     let bytes = GameSnapshot::save_validated(
         &runtime.simulation,
         scenario.map.ini.content_hash(),
@@ -212,8 +228,8 @@ fn retail_hills_engineer_cliff_start_is_rejected() {
     let header = &scenario.map.header;
     let output = json!({
         "schema_version":1,"native_size":[header.width,header.height],
-        "width":scenario.sim().zone_grid.as_ref().unwrap().width,
-        "height":scenario.sim().zone_grid.as_ref().unwrap().height,
+        "width":scenario.sim().zone_grid.as_ref().unwrap().width(),
+        "height":scenario.sim().zone_grid.as_ref().unwrap().height(),
         "local_size":[header.local_left,header.local_top,header.local_width,header.local_height],
         "map_hash":format!("{:016x}",scenario.map.ini.content_hash()),
         "rules_hash":format!("{:016x}",scenario.runtime.resources.rules.simulation_config_hash()),
@@ -278,7 +294,7 @@ fn retail_hills_engineer_enters_hut_and_repairs() {
         .values()
         .find_map(|e| {
             (runtime.simulation.interner.resolve(e.type_ref()) == "CABHUT"
-                && (e.position.rx, e.position.ry) == (68, 74))
+                && (e.position.rx(), e.position.ry()) == (68, 74))
                 .then_some(e.stable_id())
         })
         .unwrap();
@@ -304,22 +320,23 @@ fn retail_hills_engineer_enters_hut_and_repairs() {
             ),
         None
     );
-    let owner = runtime.simulation.session.current_house.unwrap();
+    let owner = runtime.simulation.session.current_house().unwrap();
     let owner_name = runtime.simulation.interner.resolve(owner).to_owned();
     let engineer = runtime
         .simulation
-        .spawn_object(
+        .spawn_object_with_overlay_registry(
             "ENGINEER",
             &owner_name,
             start.0,
             start.1,
             0,
             &runtime.resources.rules,
+            runtime.resources.rules.overlay_registry(),
         )
         .unwrap();
     let command = CommandEnvelope::new(
         owner,
-        runtime.simulation.session.tick + 1,
+        runtime.simulation.session.tick() + 1,
         Command::CaptureBuilding {
             engineer_id: engineer,
             target_building_id: hut,
@@ -339,11 +356,12 @@ fn retail_hills_engineer_enters_hut_and_repairs() {
                 },
                 crate::headless_scenario::SIM_TICK_MS,
                 TickLane::Ordinary,
+                &mut crate::sim::world::FrameEffects::default(),
             )
             .unwrap();
         let actor = runtime.simulation.entities().get(engineer);
         if approach_snapshot.is_none()
-            && actor.is_some_and(|e| (e.position.rx, e.position.ry) == (67, 75))
+            && actor.is_some_and(|e| (e.position.rx(), e.position.ry()) == (67, 75))
         {
             approach_snapshot = Some((
                 GameSnapshot::save_validated(
@@ -356,11 +374,12 @@ fn retail_hills_engineer_enters_hut_and_repairs() {
                 engineer_navigation_state(actor.unwrap()),
             ));
         }
-        let mut state=actor.map_or(Value::Null,|e|json!({
-            "position":e.position,"lifecycle":e.lifecycle,"mission":e.mission,
-            "navigation":e.navigation,"locomotor":e.locomotor,"movement_target":e.movement_target,
-            "capture_target":e.capture_target,
-        }));
+        let mut state = actor.map_or(Value::Null, |e| {
+            json!({
+                "position":e.position,"lifecycle":e.lifecycle,"mission":e.mission,
+                "navigation":e.navigation,"locomotor":e.locomotor,
+            })
+        });
         if let Some(mission) = state.get_mut("mission").and_then(Value::as_object_mut) {
             mission.remove("ai_counter");
         }
@@ -369,12 +388,6 @@ fn retail_hills_engineer_enters_hut_and_repairs() {
             trace.push(json!({"frame":frame,"state":state}));
             previous = state;
         }
-        assert!(
-            !actor
-                .and_then(|e| e.movement_target.as_ref())
-                .is_some_and(|m| m.adapter_route),
-            "ordinary Engineer may not fall back to a supplied bridge route at frame{frame}"
-        );
         repaired = runtime
             .simulation
             .resolved_terrain
@@ -384,7 +397,7 @@ fn retail_hills_engineer_enters_hut_and_repairs() {
             .unwrap()
             .bridge_facts
             .has_structural_bridge();
-        if repaired && actor.is_none_or(|e| !e.lifecycle.object_alive) {
+        if repaired && actor.is_none_or(|e| !e.lifecycle.object_alive()) {
             break;
         }
     }
@@ -404,7 +417,7 @@ fn retail_hills_engineer_enters_hut_and_repairs() {
             .simulation
             .entities()
             .get(engineer)
-            .is_none_or(|e| !e.lifecycle.object_alive),
+            .is_none_or(|e| !e.lifecycle.object_alive()),
         "repair consumes the Engineer"
     );
     assert_repaired_hills_authorities(&runtime.simulation, engineer, hut);
@@ -431,6 +444,7 @@ fn retail_hills_engineer_enters_hut_and_repairs() {
                     &[],
                     crate::headless_scenario::SIM_TICK_MS,
                     TickLane::Ordinary,
+                    &mut crate::sim::world::FrameEffects::default(),
                 )
                 .unwrap();
             std::mem::swap(&mut runtime.simulation, &mut second);
@@ -454,7 +468,6 @@ fn engineer_navigation_state(actor: &crate::sim::game_entity::GameEntity) -> Val
     json!({
         "position":actor.position, "mission":actor.mission,
         "navigation":actor.navigation, "locomotor":actor.locomotor,
-        "movement_target":actor.movement_target, "capture_target":actor.capture_target,
     })
 }
 
@@ -485,12 +498,15 @@ fn assert_repaired_hills_authorities(sim: &Simulation, engineer: u64, hut: u64) 
     );
     // Original constructor25 writes raw100/state9 on non-anchor side cells
     // while leaving their own overlay at -1; only the center carries25.
-    assert_eq!(cell.bridge_facts.overlay_id, None);
+    assert_eq!(
+        sim.overlay_grid.as_ref().unwrap().cell(64, 69).overlay_id,
+        None
+    );
     assert!(
         sim.entities().get(engineer).is_none(),
         "Engineer retired after repair"
     );
-    assert!(sim.entities().get(hut).unwrap().lifecycle.object_alive);
+    assert!(sim.entities().get(hut).unwrap().lifecycle.object_alive());
     for at in [(66, 76), (67, 75), (68, 74)] {
         assert!(
             sim.cell_objects(at, crate::sim::movement::locomotor::MovementLayer::Ground)

@@ -4,23 +4,16 @@
 //! Executed controls: tools/projectile_oracle/guided_step.py.
 
 use super::native_math::*;
-use super::{ProjectileCoord as Coord, ProjectileGuidance, ProjectileVelocity as Velocity};
-use crate::map::retail_trig::TrigTable;
-use crate::util::native_x87::{NativeF64Bits as D, X87Chop53 as X, X87Ordering, X87Value};
+use super::{
+    ProjectileCollisionPolicy, ProjectileCoord as Coord, ProjectileGuidance,
+    ProjectileVelocity as Velocity,
+};
+use crate::util::direction_tables::{facing16_from_angle, round_facing16_to_8};
+use crate::util::native_x87::{
+    MaskedX87Chop53 as M, MaskedX87Value, NativeF64Bits as D, X87Chop53 as X, X87Ordering,
+};
+use crate::util::retail_trig::TrigTable;
 
-fn square(value: X87Value) -> X87Value {
-    X::mul(value, value)
-}
-fn length2(v: Velocity) -> X87Value {
-    sqrt(X::add(square(d(v.x)), square(d(v.y))))
-}
-fn length3(v: Velocity, order: [usize; 3]) -> X87Value {
-    let t = v.native().map(|x| square(d(x)));
-    sqrt(X::add(X::add(t[order[0]], t[order[1]]), t[order[2]]))
-}
-fn zero(value: D) -> bool {
-    value.bits() & 0x7fff_ffff_ffff_ffff == 0
-}
 fn advance(p: Coord, v: Velocity, scale: i32) -> Coord {
     let step = v.integer_projection();
     Coord::new(
@@ -93,6 +86,8 @@ pub(super) fn ramp(mut v: Velocity, g: &mut ProjectileGuidance, frame: i32) -> V
 
 /// 466BC5..466CF9: signed wrap/remainder, table sine, two separate ftol
 /// conversions (the second only inside 256 leptons), then the low byte.
+/// An infinite `MissileROTVar` (ReadDouble past binary32) plays as native:
+/// the masked sum is infinite or NaN and `Math::ftol` (`0x007C5F00`) gives 0.
 pub(super) fn turn_word(
     g: &ProjectileGuidance,
     identity: i32,
@@ -106,12 +101,15 @@ pub(super) fn turn_word(
         X::mul(X::load_i32(phase), d(D::from_bits(0x3fb1_1111_1111_1111))),
         d(D::from_bits(0x4019_21fb_5444_2d18)),
     ));
-    let variation = d(g.missile_rot_var);
-    let varied = X::add(
-        X::mul(sin(trig, angle), variation),
-        X::add(variation, X::load_i32(1)),
+    let variation = M::load_f64(g.missile_rot_var);
+    let varied = M::add(
+        M::mul(
+            MaskedX87Value::from(trig.sin_from_table(d(angle))),
+            variation,
+        ),
+        M::add(variation, M::load_i32(1)),
     );
-    let mut rate = int(X::mul(varied, X::load_i32(g.rot)));
+    let mut rate = M::ftol_i32_low_masked(M::mul(varied, M::load_i32(g.rot)));
     if distance(delta(old, target), [1, 2, 0]) < 256 {
         rate = int(X::mul(
             X::load_i32(rate),
@@ -137,23 +135,6 @@ fn clamp(current: u16, desired: u16, turn: u16) -> u16 {
         current.wrapping_add(turn)
     }
 }
-fn pitch(v: Velocity) -> u16 {
-    angle_word(atan(d(v.z), round(length2(v))))
-}
-fn apply_pitch(mut v: Velocity, desired: u16, order: [usize; 3], trig: &TrigTable) -> Velocity {
-    let current = radians(pitch(v));
-    let magnitude = round(length3(v, order));
-    if !zero(current) {
-        let divisor = cos(trig, current);
-        v.x = store(X::div(d(v.x), divisor).expect("finite native pitch cosine"));
-        v.y = store(X::div(d(v.y), divisor).expect("finite native pitch cosine"));
-    }
-    let angle = radians(desired);
-    v.x = store(X::mul(cos(trig, angle), d(v.x)));
-    v.y = store(X::mul(cos(trig, angle), d(v.y)));
-    v.z = store(X::mul(sin(trig, angle), magnitude));
-    v
-}
 
 pub(super) struct TrackResult {
     pub candidate: Coord,
@@ -169,6 +150,7 @@ pub(super) fn track(
     target: Coord,
     turn: u16,
     g: &ProjectileGuidance,
+    kind: &ProjectileCollisionPolicy,
     target_is_aircraft: bool,
     mut floor_with_bridge: impl FnMut(Coord) -> i32,
     trig: &TrigTable,
@@ -189,32 +171,26 @@ pub(super) fn track(
         square(X::load_i32(difference.x)),
         square(X::load_i32(difference.y)),
     )));
-    let current_yaw = angle_word(atan(X::neg(d(velocity.y)), d(velocity.x)));
-    let desired_yaw = angle_word(atan(
+    let current_yaw = facing16_from_angle(atan(X::neg(d(velocity.y)), d(velocity.x)));
+    let desired_yaw = facing16_from_angle(atan(
         X::neg(X::load_i32(difference.y)),
         X::load_i32(difference.x),
     ));
-    let yaw = radians(clamp(current_yaw, desired_yaw, turn));
-    if zero(velocity.x) && zero(velocity.y) {
-        velocity.x = Velocity::new(100, 0, 0).x;
-    }
-    let horizontal_speed = round(length2(velocity));
-    velocity.x = store(X::mul(cos(trig, yaw), horizontal_speed));
-    velocity.y = store(X::neg(X::mul(sin(trig, yaw), horizontal_speed)));
+    velocity = turn_xy(velocity, clamp(current_yaw, desired_yaw, turn), trig);
     let current_pitch = pitch(velocity);
     let mut new_pitch = current_pitch;
-    let quantum = (((u32::from(turn) >> 7) + 1) >> 1) & 0xff;
+    let quantum = round_facing16_to_8(turn);
     if !target_is_aircraft
-        && (g.airburst || horizontal > if g.very_high { 1536 } else { 768 })
+        && (kind.airburst || horizontal > if g.very_high { 1536 } else { 768 })
         && quantum > 1
     {
         let floor = floor_with_bridge(advance(candidate, velocity, 6));
-        let levels = if g.airburst || g.very_high {
+        let levels = if kind.airburst || g.very_high {
             10
         } else {
             (distance3 / 256).min(5)
         };
-        if !g.level {
+        if !kind.level {
             let error = candidate
                 .z
                 .wrapping_sub(levels.wrapping_mul(104))
@@ -233,7 +209,7 @@ pub(super) fn track(
             };
             new_pitch = clamp(current_pitch, desired, ((turn as i16) / 2) as u16);
         }
-    } else if !g.level {
+    } else if !kind.level {
         let desired = pitch(Velocity::new(difference.x, difference.y, difference.z));
         new_pitch = clamp(
             current_pitch,
@@ -243,7 +219,7 @@ pub(super) fn track(
     }
     velocity = apply_pitch(velocity, new_pitch, [2, 0, 1], trig);
     // The pre-clearance target delta is retained for HomingTrack's return.
-    difference.z = if g.airburst { 0 } else { difference.z / 4 };
+    difference.z = if kind.airburst { 0 } else { difference.z / 4 };
     TrackResult {
         candidate,
         velocity,
@@ -255,6 +231,7 @@ pub(super) fn track(
 /// store; preserve the separate signed warmup counter and lock latch.
 pub(super) fn closing(
     g: &mut ProjectileGuidance,
+    airburst: bool,
     old: Coord,
     candidate: Coord,
     target: Coord,
@@ -275,7 +252,7 @@ pub(super) fn closing(
             X::load_i32(delta),
         );
         g.closing_accumulator_bits = store(value).bits();
-        !less(value, X::load_i32(0)) && less(value, X::load_i32(60)) && !g.airburst && !g.very_high
+        !less(value, X::load_i32(0)) && less(value, X::load_i32(60)) && !airburst && !g.very_high
     }
 }
 
@@ -286,7 +263,6 @@ pub(super) struct StepResult {
 }
 
 /// Complete guided arm through 467B7A, before coordinate commit/shared probe.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn step(
     projectile: &mut super::Projectile,
     target_position: Coord,
@@ -297,10 +273,11 @@ pub(super) fn step(
     shared_cell_dummy: &crate::map::resolved_terrain::SharedCellDummy,
 ) -> StepResult {
     let mut guidance = projectile.guidance.expect("guided branch");
+    let kind = projectile.collision;
     let previous_position = projectile.position;
     let mut impact_flag = false;
     let mut impact_reason = super::ProjectileDetonationReason::Collision;
-    let (trig, _) = crate::map::retail_trig::required_math_tables();
+    let trig = TrigTable::embedded();
     let ramped = ramp(projectile.velocity, &mut guidance, binary_frame);
     let turn = turn_word(
         &guidance,
@@ -316,42 +293,41 @@ pub(super) fn step(
         target_position,
         turn,
         &guidance,
+        &kind,
         target_is_aircraft,
         |coord| {
             let floor = super::projectile_ground_z(terrain, shared_cell_dummy, coord);
-            floor.wrapping_add(
-                if super::structural_bridge_at(terrain, shared_cell_dummy, coord) {
-                    crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS
-                } else {
-                    0
-                },
-            )
+            let cell = super::projectile_cell_at(terrain, shared_cell_dummy, coord);
+            if super::is_structural_bridge_cell(&cell) {
+                super::fixed_deck_z_for_cell_ref(terrain, &cell).unwrap_or_else(|| {
+                    crate::sim::movement::ground_pose::z_at_height(floor, 0, true)
+                })
+            } else {
+                floor
+            }
         },
         trig,
     );
     let mut candidate = tracked.candidate;
     // 466D44 resolves candidate Cell before copying the steered velocity.
-    let candidate_structural = super::structural_bridge_at(terrain, shared_cell_dummy, candidate);
+    let candidate_cell = super::projectile_cell_at(terrain, shared_cell_dummy, candidate);
+    let candidate_structural = super::is_structural_bridge_cell(&candidate_cell);
     projectile.velocity = tracked.velocity;
     projectile.speed_leptons_per_frame = super::projectile_velocity_magnitude(projectile.velocity)
         .clamp(0.0, f64::from(u16::MAX)) as u16;
     let old_height = previous_position
         .z
-        .wrapping_sub(super::projectile_ground_z(
+        .wrapping_sub(super::projectile_surface_z(
             terrain,
             shared_cell_dummy,
             previous_position,
-        ))
-        .wrapping_sub(if projectile.on_bridge {
-            crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS
-        } else {
-            0
-        });
+            projectile.on_bridge,
+        ));
     let (admit, snap) = super::homing_impact_admission(
         tracked.reached_distance,
         projectile.velocity,
         old_height,
-        guidance.airburst,
+        kind.airburst,
         target_position != Coord::new(0, 0, 0),
     );
     if admit {
@@ -369,23 +345,36 @@ pub(super) fn step(
     if target_position == Coord::new(0, 0, 0) && old_height >= safety_altitude {
         impact_flag = true;
     }
-    if closing(&mut guidance, previous_position, candidate, target_position) {
+    if closing(
+        &mut guidance,
+        kind.airburst,
+        previous_position,
+        candidate,
+        target_position,
+    ) {
         impact_flag = true;
         impact_reason = super::ProjectileDetonationReason::ReachedTarget;
     }
     // Guided bridge contact 467032 probes Cell before floor and uses
     // strict endpoint inequalities, unlike Vertical's contact helper.
-    if !impact_flag
-        && (candidate_structural
-            || super::structural_bridge_at(terrain, shared_cell_dummy, previous_position))
-    {
-        let deck = super::projectile_ground_z(terrain, shared_cell_dummy, candidate)
-            .wrapping_add(crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS);
-        if (previous_position.z < deck && candidate.z > deck)
-            || (previous_position.z > deck && candidate.z < deck)
-        {
-            candidate.z = deck;
-            impact_flag = true;
+    if !impact_flag {
+        let bridge = if candidate_structural {
+            Some(candidate_cell)
+        } else {
+            let previous_cell =
+                super::projectile_cell_at(terrain, shared_cell_dummy, previous_position);
+            super::is_structural_bridge_cell(&previous_cell).then_some(previous_cell)
+        };
+        if let Some(bridge) = bridge {
+            let floor = super::projectile_ground_z(terrain, shared_cell_dummy, candidate);
+            let deck = super::fixed_deck_z_for_cell_ref(terrain, &bridge)
+                .unwrap_or_else(|| crate::sim::movement::ground_pose::z_at_height(floor, 0, true));
+            if (previous_position.z < deck && candidate.z > deck)
+                || (previous_position.z > deck && candidate.z < deck)
+            {
+                candidate.z = deck;
+                impact_flag = true;
+            }
         }
     }
     projectile.guidance = Some(guidance);
@@ -396,7 +385,7 @@ pub(super) fn step(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_p_s))]
 mod tests {
     use super::*;
     use serde_json::Value;
@@ -414,8 +403,8 @@ mod tests {
 
     #[test]
     fn original_38_cardinal_ramp_visits_keep_fractional_velocity() {
-        let corpus: Value = serde_json::from_str(include_str!(
-            "../../../tools/rules_oracle/weapon_speed.json"
+        let corpus: Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/rules_oracle/weapon_speed.json",
         ))
         .unwrap();
         let mut guidance = ProjectileGuidance {
@@ -424,13 +413,9 @@ mod tests {
             course_lock_duration: 0,
             course_frames: 0,
             course_locked: true,
-            airburst: false,
-            inaccurate: false,
             very_high: false,
-            level: false,
             max_speed: 102,
             acceleration: 3,
-            fuse_reference: Coord::new(0, 0, 0),
             closing_frames: 0,
             closing_accumulator_bits: 0,
         };
@@ -459,11 +444,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires verified gamemd.exe math tables"]
     fn original_guided_boundaries_preserve_null_aircraft_and_signed_controls() {
         use super::super::{ProjectileStore, ProjectileTarget};
-        let corpus: Value = serde_json::from_str(include_str!(
-            "../../../tools/projectile_oracle/ifv_guided_controls.json"
+        let corpus: Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/projectile_oracle/ifv_guided_controls.json",
         ))
         .unwrap();
         let mut terrain = crate::map::resolved_terrain::test_flat_ground_grid(32);
@@ -472,7 +456,7 @@ mod tests {
             .collect();
         terrain.test_set_native_allocated_cells(&mapped);
         for &(x, y) in &mapped {
-            terrain.cell_mut(x, y).unwrap().level = 6;
+            terrain.cell_mut_for_test(x, y).unwrap().level = 6;
         }
         let rows = corpus["rows"].as_array().unwrap();
         assert_eq!(rows.len(), 31);
@@ -491,6 +475,8 @@ mod tests {
             shot.origin = old;
             shot.velocity = velocity;
             shot.initial_target_position = target;
+            shot.collision.airburst = prepared["airburst"].as_bool().unwrap();
+            shot.collision.level = prepared["level_flight"].as_bool().unwrap();
             shot.guidance = Some(ProjectileGuidance {
                 rot: 60,
                 missile_rot_var: D::from_bits(
@@ -501,18 +487,14 @@ mod tests {
                 course_lock_duration: prepared["course_lock_duration"].as_i64().unwrap() as i32,
                 course_frames: input["counter"].as_i64().unwrap_or(0) as i32,
                 course_locked: input["locked"].as_bool().unwrap_or(false),
-                airburst: prepared["airburst"].as_bool().unwrap(),
-                inaccurate: false,
                 very_high: prepared["very_high"].as_bool().unwrap(),
-                level: prepared["level_flight"].as_bool().unwrap(),
                 max_speed: prepared["maximum_speed"].as_i64().unwrap() as i32,
                 acceleration: prepared["acceleration"].as_i64().unwrap() as i32,
-                fuse_reference: target,
                 closing_frames: input["closing_count"].as_i64().unwrap_or(0) as i32,
                 closing_accumulator_bits: input["closing_accum"].as_f64().unwrap_or(0.0).to_bits(),
             });
             let mut store = ProjectileStore::new();
-            store.spawn_at(1, 0, shot);
+            store.spawn_at(1, 0, shot, shot.origin);
             let bullet = store.get_mut(1).unwrap();
             let result = step(
                 bullet,
@@ -566,24 +548,19 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires retail INIs and verified gamemd.exe math tables"]
     fn original_ifv_launch_and_125_flight_visits_match_bits_and_live_bridge_transitions() {
         use super::super::{ProjectileStore, ProjectileTarget, ProjectileTrajectory, launch};
-        let Some((ini, art)) = crate::rules::retail_ini_fixture::retail_rules_and_art() else {
+        let Some(rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules() else {
             return;
         };
-        let rules =
-            crate::rules::ruleset::RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
         let weapon = rules.weapon("HoverMissile").unwrap();
         let kind = rules
             .projectile(weapon.projectile.as_deref().unwrap())
             .unwrap();
         assert_eq!(weapon.speed, 102);
         assert_eq!(kind.rot, 60);
-        let (trig, _) = crate::map::retail_trig::required_math_tables();
-        assert!(trig.matches_retail());
-        let corpus: Value = serde_json::from_str(include_str!(
-            "../../../tools/projectile_oracle/ifv_launch.json"
+        let corpus: Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/projectile_oracle/ifv_launch.json",
         ))
         .unwrap();
         let mut compared = 0;
@@ -596,10 +573,17 @@ mod tests {
                 delta: delta(target, origin),
                 speed: weapon.speed,
                 homing: true,
+                radial_segments: 0,
+                radial_index: 0,
+                body_heading: 0,
                 vertical: false,
                 heading: Some(input["source_heading"].as_u64().unwrap() as u16),
                 arcing: kind.arcing,
-                gravity: super::super::projectile_gravity(rules.general.gravity, kind.floater),
+                gravity: super::super::projectile_gravity(
+                    rules.general.gravity,
+                    kind.gravity(),
+                    kind.floater,
+                ),
                 high_root: false,
                 voxel_downward: None,
                 building_pitch_height: None,
@@ -616,7 +600,7 @@ mod tests {
                 .collect();
             terrain.test_set_native_allocated_cells(&mapped);
             for &(x, y) in &mapped {
-                terrain.cell_mut(x, y).unwrap().level = 6;
+                terrain.cell_mut_for_test(x, y).unwrap().level = 6;
             }
             let bridges: Vec<(u16, u16)> = if let Some(band) = input["bridge_band"].as_array() {
                 band.iter()
@@ -628,7 +612,11 @@ mod tests {
                 Vec::new()
             };
             for &(x, y) in &bridges {
-                terrain.cell_mut(x, y).unwrap().bridge_facts.raw_flags = 0x100;
+                terrain
+                    .cell_mut_for_test(x, y)
+                    .unwrap()
+                    .bridge_facts
+                    .raw_flags = 0x100;
             }
             let mut shot = super::super::tests::spawn(ProjectileTarget::Cell { rx: 16, ry: 20 });
             shot.native_unique_id = native["unique_id"].as_i64().unwrap() as i32;
@@ -640,35 +628,37 @@ mod tests {
             shot.tracks_target = true;
             shot.ranged_fuse = true;
             shot.arm_frames = kind.arm;
+            shot.collision.airburst = kind.airburst;
+            shot.collision.inaccurate = kind.inaccurate;
+            shot.collision.level = kind.level;
             shot.guidance = Some(ProjectileGuidance {
                 rot: kind.rot,
                 missile_rot_var: D::from_bits(rules.general.missile_rot_var.to_bits()),
                 course_lock_duration: kind.course_lock_duration,
                 course_frames: 0,
                 course_locked: true,
-                airburst: kind.airburst,
-                inaccurate: kind.inaccurate,
                 very_high: kind.very_high,
-                level: kind.level,
                 max_speed: weapon.speed,
                 acceleration: kind.acceleration,
-                fuse_reference: target,
                 closing_frames: 0,
                 closing_accumulator_bits: 0,
             });
             let mut store = ProjectileStore::new();
-            store.spawn_at(1, 0, shot);
+            store.spawn_at(1, 0, shot, shot.origin);
             for row in case["frames"].as_array().unwrap() {
                 let frame = row["frame"].as_u64().unwrap() as u32;
                 for change in input["between_frame_flag_changes"].as_array().unwrap() {
                     if change["frame"].as_u64().unwrap() as u32 == frame {
                         for &(x, y) in &bridges {
-                            terrain.cell_mut(x, y).unwrap().bridge_facts.raw_flags =
-                                if change["live"].as_bool().unwrap() {
-                                    0x100
-                                } else {
-                                    0
-                                };
+                            terrain
+                                .cell_mut_for_test(x, y)
+                                .unwrap()
+                                .bridge_facts
+                                .raw_flags = if change["live"].as_bool().unwrap() {
+                                0x100
+                            } else {
+                                0
+                            };
                         }
                     }
                 }
@@ -686,6 +676,7 @@ mod tests {
                         false,
                         rules.general.safety_altitude,
                         |_, _, _| None,
+                        None,
                     )
                     .unwrap();
                 let bullet = store.get(1).unwrap();
@@ -729,12 +720,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires RA2_DIR with verified gamemd.exe math tables"]
     fn original_guided_steps_preserve_velocity_phase_and_bridge_clearance() {
-        let (trig, _) = crate::map::retail_trig::required_math_tables();
-        assert!(trig.matches_retail());
-        let corpus: Value = serde_json::from_str(include_str!(
-            "../../../tools/projectile_oracle/guided_step.json"
+        let trig = TrigTable::embedded();
+        let corpus: Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/projectile_oracle/guided_step.json",
         ))
         .unwrap();
         for row in corpus["rows"].as_array().unwrap() {
@@ -759,13 +748,9 @@ mod tests {
                 course_lock_duration: 0,
                 course_frames: 0,
                 course_locked: true,
-                airburst: false,
-                inaccurate: false,
                 very_high: false,
-                level: false,
                 max_speed: 102,
                 acceleration: 3,
-                fuse_reference: target,
                 closing_frames: 0,
                 closing_accumulator_bits: 0,
             };
@@ -790,6 +775,7 @@ mod tests {
                 target,
                 turn,
                 &g,
+                &super::super::ProjectileCollisionPolicy::NONE,
                 false,
                 |p| 624 + if bridge(p.x, p.y) { 416 } else { 0 },
                 trig,
@@ -804,7 +790,7 @@ mod tests {
                 bits(&row["velocity"]["bits"]),
                 "{name} steered velocity"
             );
-            closing(&mut g, old, tracked.candidate, target);
+            closing(&mut g, false, old, tracked.candidate, target);
             assert_eq!(
                 g.closing_accumulator_bits,
                 row["closing_accum"].as_f64().unwrap().to_bits(),
@@ -826,7 +812,7 @@ mod tests {
             let mut terrain = crate::map::resolved_terrain::test_flat_ground_grid(32);
             for y in 16..25 {
                 for x in 6..25 {
-                    let cell = terrain.cell_mut(x, y).unwrap();
+                    let cell = terrain.cell_mut_for_test(x, y).unwrap();
                     cell.level = 6;
                     cell.bridge_facts.raw_flags = if bridge(i32::from(x) * 256, i32::from(y) * 256)
                     {
@@ -875,6 +861,32 @@ mod tests {
                 bullet.guidance.unwrap().closing_accumulator_bits,
                 row["closing_accum"].as_f64().unwrap().to_bits(),
                 "{name} complete closing"
+            );
+        }
+    }
+
+    #[test]
+    fn an_infinite_rot_variation_turns_as_native_instead_of_stopping() {
+        let g = ProjectileGuidance {
+            rot: 60,
+            missile_rot_var: D::from_bits(f64::INFINITY.to_bits()),
+            course_lock_duration: 0,
+            course_frames: 0,
+            course_locked: false,
+            very_high: false,
+            max_speed: 102,
+            acceleration: 3,
+            closing_frames: 0,
+            closing_accumulator_bits: 0,
+        };
+        let old = Coord::new(0, 0, 0);
+        // Phase 0 makes 0·inf (NaN) and phase 4 a positive sine (inf), each
+        // far from and inside the 256-lepton step.
+        for (frame, target) in [(0, 4096), (4, 4096), (4, 100)] {
+            let target = Coord::new(target, 0, 0);
+            assert_eq!(
+                turn_word(&g, 0, frame, old, target, TrigTable::embedded()),
+                0
             );
         }
     }

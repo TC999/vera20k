@@ -5,9 +5,40 @@
 //! landing-effect and Display transactions are separate callers, still being
 //! migrated. Native comparisons: tools/spatial_oracle/fly_height.{py,json}.
 
+use super::air_movement::{FlySpeedFacts, MIN_CREEP_SPEED, fly_may_slow};
+#[cfg(any(test, feature = "test-support"))]
 use super::locomotor::AirMovePhase;
 use crate::sim::components::DriveCoord;
+#[cfg(any(test, feature = "test-support"))]
 use crate::util::fixed_math::SimFixed;
+use crate::util::native_x87::{NativeF64Bits, X87Chop53 as X, X87Ordering, X87Value};
+
+/// Original7E3860, added/subtracted with PC53/chop at4CE441..4CE495.
+const FLY_SPEED_RAMP_STEP: NativeF64Bits = NativeF64Bits::from_bits(0x3fb9_9999_9999_999a);
+
+/// The target speed of a Fly crawling in under the 0.1 slowdown floor
+/// (`0x004CE27C`).
+const FLY_CRAWL_SPEED: NativeF64Bits = FLY_SPEED_RAMP_STEP;
+
+/// Horizontal_Step's arrival distances (`0x004CF4F1`, `0x004CF527`,
+/// `0x004CF543`) and the speeds they ask for.
+pub(crate) const ARRIVAL_STOP: i32 = 0x80;
+const ARRIVAL_HALF: i32 = 0x200;
+pub(crate) const ARRIVAL_THREE_QUARTERS: i32 = 0x300;
+const HALF_SPEED: NativeF64Bits = NativeF64Bits::HALF;
+const THREE_QUARTER_SPEED: NativeF64Bits = NativeF64Bits::from_bits(0x3fe8_0000_0000_0000);
+
+fn speed_value(bits: NativeF64Bits) -> X87Value {
+    X::load_f64(bits).expect("constructor-owned Fly speed is finite")
+}
+
+fn stored_speed(value: X87Value) -> u64 {
+    X::store_f64(value).expect("bounded Fly speed store").bits()
+}
+
+const fn speed_is_zero(bits: u64) -> bool {
+    bits & 0x7fff_ffff_ffff_ffff == 0
+}
 
 /// Constructor4CC9EE..4CC9FA clears target+38 and takeoff/landing+50/+51.
 /// Only this owner mutates those fields. Object coordinates own current Z.
@@ -36,20 +67,211 @@ pub struct FlyRuntime {
     /// Landing reads this instance value; BeginLanding separately reads live type.
     #[serde(default)]
     airport_bound: bool,
-    /// Fly+58, the fall counter: the constructor clears it (`0x004CCA06`) and
-    /// only Process's fall block writes it (`0x004CD6C6`), never resetting it.
+    /// Fly+58, the fall counter: the constructor clears it (`0x004CCA06`),
+    /// Process's fall block adds to it (`0x004CD6C6`) and Power_Off of a
+    /// moving Fly (`0x004CFD20`) clears it again.
     #[serde(default)]
     fall_counter: i32,
+    /// Fly+53, Spinning: Power_Off of a moving Fly (`0x004CFD20`) sets it,
+    /// and Process's spin step (`0x004CE5A0`) clears it once power is back.
+    #[serde(default)]
+    spinning: bool,
+    /// Fly+54, SpinRate: what the spin step turns the owner by, in steps of
+    /// 256, before it moves one toward 0. Read only while spinning.
+    #[serde(default)]
+    spin_rate: i32,
     /// Fly+40, the target speed fraction the ramp chases. The constructor
     /// (`0x004CC9E5`) starts it at 0; Process's slowdown
-    /// (`air_movement::write_fly_target_speed`), the takeoff callback and the
-    /// landing write it.
+    /// ([`Self::write_target_speed`]), Horizontal_Step's arrival
+    /// ([`Self::slow_for_arrival`]), the takeoff callback and the landing write
+    /// it. Retain its binary64 store, including bits below one Q16 quantum.
     #[serde(default)]
-    pub(crate) target_speed: SimFixed,
-    /// Fly+48, the current speed fraction, chasing `target_speed` by 0.1 a
-    /// frame (`0x004CE441..0x004CE495`).
+    target_speed_bits: u64,
+    /// Fly+48, the binary64 current fraction, chasing target by stored0.1
+    /// with a PC53/chop operation and qword store each frame4CE441..4CE495.
     #[serde(default)]
-    pub(crate) current_speed: SimFixed,
+    current_speed_bits: u64,
+}
+
+impl FlyRuntime {
+    /// See the field.
+    pub(crate) const fn target_speed(&self) -> NativeF64Bits {
+        NativeF64Bits::from_bits(self.target_speed_bits)
+    }
+
+    /// See the field.
+    pub(crate) const fn current_speed(&self) -> NativeF64Bits {
+        NativeF64Bits::from_bits(self.current_speed_bits)
+    }
+
+    pub(crate) fn target_speed_is_zero(&self) -> bool {
+        speed_is_zero(self.target_speed_bits)
+    }
+
+    pub(crate) fn current_speed_is_positive(&self) -> bool {
+        X::compare(speed_value(self.current_speed()), X::load_i32(0)) == X87Ordering::Greater
+    }
+
+    pub(crate) fn current_speed_below_landing_threshold(&self) -> bool {
+        X::compare(
+            speed_value(self.current_speed()),
+            speed_value(MIN_CREEP_SPEED),
+        ) == X87Ordering::Less
+    }
+
+    /// Process `0x004CE441..0x004CE495`: the current speed (`+0x48`) chases
+    /// the target speed (`+0x40`) by 0.1 a frame.
+    pub(crate) fn ramp_speed(&mut self) {
+        let target = speed_value(self.target_speed());
+        let current = speed_value(self.current_speed());
+        match X::compare(current, target) {
+            X87Ordering::Less => {
+                let next = X::add(current, speed_value(FLY_SPEED_RAMP_STEP));
+                self.current_speed_bits = if X::compare(next, target) == X87Ordering::Less {
+                    stored_speed(next)
+                } else {
+                    self.target_speed_bits
+                };
+            }
+            X87Ordering::Greater => {
+                let next = X::sub(current, speed_value(FLY_SPEED_RAMP_STEP));
+                self.current_speed_bits = if X::compare(next, target) == X87Ordering::Greater {
+                    stored_speed(next)
+                } else {
+                    self.target_speed_bits
+                };
+            }
+            X87Ordering::Equal => {}
+        }
+    }
+
+    /// Fly Process `0x004CE145..0x004CE2DB`: the target speed (`+0x40`) that the
+    /// ramp chases, rewritten on every frame the Fly is moving and its owner
+    /// lives, is not landing, has climbed to half its takeoff height and holds a
+    /// destination:
+    /// - `0x004D0180` refusing: full speed. A locked aircraft, a cruising FlyBy
+    ///   and a cruising strafer or fighter with ammo never slow for their
+    ///   destination.
+    /// - HunterSeeker: full speed while it has a Target and is not taking off,
+    ///   else a stop.
+    /// - Otherwise `distance / SlowdownDistance`, capped at 1. Under 0.1 it is a
+    ///   0.1 crawl beyond 85 leptons and, within, a stop that halves the current
+    ///   speed. A current speed above the integer distance drops to it (only at
+    ///   distance 0). A Fly already at a standstill short of its destination gets
+    ///   a 0.05 current speed, which only the IsDropship attitude reads before the
+    ///   ramp (`0x004CE46F`) takes it back to the zero target: it moves nothing.
+    ///
+    /// The ratio remains on the PC53/chop stack across its qword target store
+    /// at4CE260. The converted integer distance remains below it and supplies
+    /// the current-speed clamp at4CE29A. Neither retained speed is quantized.
+    pub(crate) fn write_target_speed(&mut self, facts: &FlySpeedFacts) {
+        let taking_off = self.taking_off;
+        if facts.health <= 0
+            || self.landing
+            || (taking_off && facts.height < self.target_height / 2)
+            || self.destination() == (DriveCoord { x: 0, y: 0, z: 0 })
+        {
+            return;
+        }
+        if !fly_may_slow(self.landing, self.cruise_mode, &facts.slow) {
+            self.target_speed_bits = NativeF64Bits::ONE.bits();
+            return;
+        }
+        if facts.hunter_seeker {
+            self.target_speed_bits = if !taking_off && facts.target {
+                NativeF64Bits::ONE.bits()
+            } else {
+                NativeF64Bits::POSITIVE_ZERO.bits()
+            };
+            return;
+        }
+        let distance = X::load_i32(facts.distance);
+        let one = speed_value(NativeF64Bits::ONE);
+        //4CE249..4CE25A caps infinity and unordered0/0 to1. Other legal
+        // inputs divide bounded integers and retain a finite ratio.
+        let ratio = if facts.slowdown_distance == 0 {
+            one
+        } else {
+            X::div(distance, X::load_i32(facts.slowdown_distance)).unwrap()
+        };
+        let ratio = if X::compare(one, ratio) == X87Ordering::Less {
+            one
+        } else {
+            ratio
+        };
+        self.target_speed_bits = stored_speed(ratio);
+        if X::compare(ratio, speed_value(FLY_CRAWL_SPEED)) == X87Ordering::Less {
+            if facts.distance > 0x55 {
+                self.target_speed_bits = FLY_CRAWL_SPEED.bits();
+            } else {
+                self.current_speed_bits = stored_speed(X::mul(
+                    speed_value(self.current_speed()),
+                    speed_value(HALF_SPEED),
+                ));
+                self.target_speed_bits = NativeF64Bits::POSITIVE_ZERO.bits();
+            }
+        }
+        if X::compare(distance, speed_value(self.current_speed())) == X87Ordering::Less {
+            self.current_speed_bits = stored_speed(distance);
+        }
+        if self.target_speed_is_zero()
+            && speed_is_zero(self.current_speed_bits)
+            && facts.distance > 0
+        {
+            self.current_speed_bits = MIN_CREEP_SPEED.bits();
+        }
+    }
+
+    /// Horizontal_Step's arrival arm (`0x004CF4F1`, `0x004CF527`,
+    /// `0x004CF543`): a stop within `ARRIVAL_STOP`, half speed within
+    /// `ARRIVAL_HALF`, three quarters within `ARRIVAL_THREE_QUARTERS`; a
+    /// farther Fly keeps its target speed.
+    pub(crate) fn slow_for_arrival(&mut self, distance: i32) {
+        if distance < ARRIVAL_STOP {
+            self.target_speed_bits = NativeF64Bits::POSITIVE_ZERO.bits();
+        } else if distance < ARRIVAL_HALF {
+            self.target_speed_bits = HALF_SPEED.bits();
+        } else if distance < ARRIVAL_THREE_QUARTERS {
+            self.target_speed_bits = THREE_QUARTER_SPEED.bits();
+        }
+    }
+
+    /// The takeoff callback (`0x004CE680`) asks full speed.
+    pub(crate) fn request_full_speed(&mut self) {
+        self.target_speed_bits = NativeF64Bits::ONE.bits();
+    }
+
+    /// The landing callback (`0x004CE840`) asks a stop; the current speed
+    /// ramps down to it.
+    pub(crate) fn request_stop(&mut self) {
+        self.target_speed_bits = NativeF64Bits::POSITIVE_ZERO.bits();
+    }
+
+    /// A completed landing stands the Fly still: target and current speed 0.
+    pub(crate) fn halt(&mut self) {
+        self.target_speed_bits = NativeF64Bits::POSITIVE_ZERO.bits();
+        self.current_speed_bits = NativeF64Bits::POSITIVE_ZERO.bits();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_target_speed_for_test(&mut self, target_speed: SimFixed) {
+        self.target_speed_bits = target_speed.to_num::<f64>().to_bits();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_current_speed_for_test(&mut self, current_speed: SimFixed) {
+        self.current_speed_bits = current_speed.to_num::<f64>().to_bits();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_target_speed_bits_for_test(&mut self, bits: NativeF64Bits) {
+        self.target_speed_bits = bits.bits();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_current_speed_bits_for_test(&mut self, bits: NativeF64Bits) {
+        self.current_speed_bits = bits.bits();
+    }
 }
 
 /// Techno-owned approach pitch. Native stores f32; the engine uses SimFixed.
@@ -63,6 +285,11 @@ pub(crate) struct FlightAttitude {
 impl FlightAttitude {
     pub(crate) fn blocks_landing(&self) -> bool {
         self.pitch > crate::util::fixed_math::SIM_ZERO
+    }
+
+    /// `+0x2E8 == 0.0`, as Aircraft Unload tests it (`0x0041520D`).
+    pub(crate) fn is_level(&self) -> bool {
+        self.pitch == crate::util::fixed_math::SIM_ZERO
     }
 
     /// Fly4CE2E5..4CE3BA. Caller owns IsDropship, health, speed and takeoff gates.
@@ -125,6 +352,12 @@ impl FlyRuntime {
         self.moving
     }
 
+    /// `Is_Moving_Now` `0x004CCAC0`: the current speed (Fly+48) is not zero.
+    /// The +34 request is not asked.
+    pub(crate) fn is_moving_now(&self) -> bool {
+        !speed_is_zero(self.current_speed_bits)
+    }
+
     pub(crate) fn landing_effect_latched(&self) -> bool {
         self.landing_effect_latched
     }
@@ -139,6 +372,45 @@ impl FlyRuntime {
 
     pub(crate) fn fall_counter(&self) -> i32 {
         self.fall_counter
+    }
+
+    /// Power_Off for a moving Fly (`0x004CFD20`): it spins at `rate`.
+    pub(crate) fn start_spin(&mut self, rate: i32) {
+        self.spinning = true;
+        self.spin_rate = rate;
+    }
+
+    /// See the field.
+    pub(crate) fn clear_fall(&mut self) {
+        self.fall_counter = 0;
+    }
+
+    /// SpinRate while the Fly spins, else None.
+    pub(crate) fn spin(&self) -> Option<i32> {
+        self.spinning.then_some(self.spin_rate)
+    }
+
+    /// The spin step (`0x004CE5A0`) for a Fly whose owner is alive: None
+    /// while it does not spin, and a powered one stops spinning
+    /// (`0x004CE636`). An unpowered one answers the PrimaryFacing turn,
+    /// `SpinRate << 8` as a 16-bit direction, and steps SpinRate one toward
+    /// 0 (`0x004CE60A..0x004CE62E`).
+    pub(crate) fn spin_step(&mut self, powered: bool) -> Option<u16> {
+        if !self.spinning {
+            return None;
+        }
+        if powered {
+            self.spinning = false;
+            return None;
+        }
+        let turn = self.spin_rate.wrapping_shl(8) as u16;
+        let step = self.spin_rate.wrapping_abs().min(1);
+        self.spin_rate = if self.spin_rate < 0 {
+            self.spin_rate.wrapping_add(step)
+        } else {
+            self.spin_rate.wrapping_sub(step)
+        };
+        Some(turn)
     }
 
     ///4CEB53..4CEB90, once per admitted BeginLanding, strictly below300.
@@ -161,7 +433,9 @@ impl FlyRuntime {
         self.moving = false;
     }
 
-    pub(crate) fn clear_destination_after_failed_landing(&mut self) {
+    /// Destination = the empty coordinate after a C4 self-destruct: the
+    /// landing retry's (`0x004CEBCD`) and Stop_Moving's (`0x004CD273`).
+    pub(crate) fn clear_destination(&mut self) {
         self.destination = [0; 3];
     }
 
@@ -207,6 +481,42 @@ impl FlyRuntime {
 
     pub(crate) fn cruise_mode(&self) -> bool {
         self.cruise_mode
+    }
+
+    /// Process `0x004CCB47..0x004CCB81`, first in every visit: a Fly neither
+    /// landing nor taking off, with a target speed of at least 1 and no
+    /// height target, takes its type's FlightLevel (type vt+0xBC) again.
+    pub(crate) fn restore_flight_level(&mut self, flight_level: i32) {
+        if !self.landing
+            && !self.taking_off
+            && X::compare(
+                speed_value(self.target_speed()),
+                speed_value(NativeF64Bits::ONE),
+            ) != X87Ordering::Less
+            && self.target_height == 0
+        {
+            self.target_height = flight_level;
+        }
+    }
+
+    /// Horizontal_Step's height target (`0x004CF3F6`, `0x004CF4B6`,
+    /// `0x004CF4CF`), rewritten on each step.
+    pub(crate) fn set_flight_level(&mut self, flight_level: i32) {
+        self.target_height = flight_level;
+    }
+
+    /// Ares 3.0 FlyLocomotionClass_UpdateLanding 1004D8A0 (hook 0x4CE85A):
+    /// a HunterSeeker that found a target stops landing (+0x51) and climbs
+    /// back to its type's flight level (+0x38).
+    pub(crate) fn resume_hunt(&mut self, flight_level: i32) {
+        self.landing = false;
+        self.target_height = flight_level;
+    }
+
+    /// Ares 3.0 1004DA90 (hook 0x4CD9C8): a HunterSeeker's
+    /// MovingDestination (`+0x1C`) follows its Target every frame.
+    pub(crate) fn hunt_destination(&mut self, at: DriveCoord) {
+        self.destination = [at.x, at.y, at.z];
     }
 
     /// Process4CD664..4CD67F, before its power/health branches. The effective
@@ -275,6 +585,7 @@ impl FlyRuntime {
         (self.target_height, self.taking_off, self.landing)
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn target_height(&self) -> i32 {
         self.target_height
     }
@@ -309,12 +620,9 @@ impl FlyRuntime {
         self.target_height = 0;
     }
 
-    pub(crate) fn set_target_height(&mut self, height: i32) {
-        self.target_height = height;
-    }
-
-    /// Read projection for the remaining legacy mission adapters. This is
-    /// deliberately not the native+50/+51 flags or an independently saved FSM.
+    /// A test projection of the flight phase. This is deliberately not the
+    /// native+50/+51 flags or an independently saved FSM.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn mission_phase(&self, height: i32) -> AirMovePhase {
         if height == 0 && self.target_height == 0 {
             AirMovePhase::Landed
@@ -332,44 +640,50 @@ impl FlyRuntime {
             world_z,
             ground_z,
             mut on_bridge,
-            structural_bridge,
+            bridge_deck_z,
             health,
             has_passenger,
             is_dropship,
             flight_level,
+            hunter_seeker,
         } = input;
-        // Object GetHeight5F5F40 subtracts ground and its current OnBridge
-        // adjustment. Fly then independently normalizes an unattached deck.
-        let mut height = super::ground_pose::height_at_z(world_z, ground_z, on_bridge);
-        let mut bridge_bonus = 0;
-        if !on_bridge
-            && height >= crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS
-            && structural_bridge
-        {
-            height = height.wrapping_sub(crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS);
-            bridge_bonus = crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS;
-        }
+        // Object GetHeight5F5F40 subtracts the current surface. The Fly
+        // height step (4CDD0D..4CDFB6) also uses an unattached structural deck
+        // once the aircraft's Location reaches it.
+        let on_bridge_surface_z = bridge_deck_z
+            .unwrap_or_else(|| super::ground_pose::z_at_height(ground_z, 0, true));
+        let reached_bridge = !on_bridge && bridge_deck_z.is_some_and(|deck| world_z >= deck);
+        let surface_z = if on_bridge || reached_bridge {
+            on_bridge_surface_z
+        } else {
+            ground_z
+        };
+        let mut height = world_z.wrapping_sub(surface_z);
         let mut output_z = world_z;
         if height < self.target_height && health > 0 {
-            let rate = if is_dropship {
-                16
-            } else if has_passenger {
-                10
-            } else {
-                20
-            };
+            let ordinary = if has_passenger { 10 } else { 20 };
+            // Ares 3.0 FlyLocomotionClass_sub_4CD600_HunterSeeker_Ascent
+            // 1004D930 (hook 0x4CDE64): a HunterSeeker that is not a
+            // Dropship climbs at its EmergeSpeed while taking off (+0x50),
+            // else at its AscentSpeed. `hunter_seeker` is `None` without
+            // Ares, which leaves the stock rate.
+            let ordinary = hunter_seeker.map_or(ordinary, |climb| {
+                if self.taking_off {
+                    climb.emerge
+                } else {
+                    climb.ascent
+                }
+            });
+            let rate = if is_dropship { 16 } else { ordinary };
             let step = self.target_height.wrapping_sub(height).min(rate);
             // SetHeight happens BEFORE OnBridge is cleared (4CDE9D/4CDEA6).
-            output_z = super::ground_pose::z_at_height(
-                ground_z,
-                height.wrapping_add(step).wrapping_add(bridge_bonus),
-                on_bridge,
-            );
+            output_z = surface_z.wrapping_add(height).wrapping_add(step);
             on_bridge = false;
         }
         // Native compares the original normalized height again. Health==0
         // forces descent, while a negative health is not interchangeable.
-        if height > self.target_height || health == 0 {
+        let descended = height > self.target_height || health == 0;
+        if descended {
             let delta = height.wrapping_sub(self.target_height);
             let step = if is_dropship {
                 if self.landing {
@@ -382,28 +696,28 @@ impl FlyRuntime {
                     })
                 }
             } else {
-                delta.min(delta / 20).clamp(20, 50)
+                // Ares 3.0 FlyLocomotionClass_sub_4CD600_HunterSeeker_Descent
+                // 1004DA20 (hook 0x4CDF54): a HunterSeeker descends at its
+                // DescentSpeed, at most the remaining distance (to 0x4CDF81).
+                let hunter_descent = hunter_seeker.map(|climb| delta.min(climb.descent));
+                hunter_descent.unwrap_or_else(|| delta.min(delta / 20).clamp(20, 50))
             };
             height = height.wrapping_sub(step);
             if health == 0 && height <= 1 {
                 height = 1;
             } else if height <= 0 {
                 height = 0;
-                if bridge_bonus > 0 {
+                if reached_bridge {
                     on_bridge = true;
-                    bridge_bonus = 0;
                 }
             }
-            output_z = super::ground_pose::z_at_height(
-                ground_z,
-                height.wrapping_add(bridge_bonus),
-                on_bridge,
-            );
+            output_z = surface_z.wrapping_add(height);
         }
         HeightOutput {
             world_z: output_z,
             on_bridge,
-            height: super::ground_pose::height_at_z(output_z, ground_z, on_bridge),
+            height: output_z.wrapping_sub(if on_bridge { on_bridge_surface_z } else { ground_z }),
+            descended,
         }
     }
 }
@@ -412,11 +726,14 @@ pub(crate) struct HeightInput {
     pub world_z: i32,
     pub ground_z: i32,
     pub on_bridge: bool,
-    pub structural_bridge: bool,
+    pub bridge_deck_z: Option<i32>,
     pub health: i32,
     pub has_passenger: bool,
     pub is_dropship: bool,
     pub flight_level: i32,
+    /// A `HunterSeeker=` type's climb and descent speeds when Ares plays,
+    /// else `None`.
+    pub hunter_seeker: Option<crate::rules::ares_techno_type::HunterSeekerClimb>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -424,17 +741,27 @@ pub(crate) struct HeightOutput {
     pub world_z: i32,
     pub on_bridge: bool,
     pub height: i32,
+    /// The descent block ran (`0x004CDED8..0x004CDFB6`): Process's landing
+    /// drift follows its SetHeight.
+    descended: bool,
 }
 
-#[cfg(test)]
+impl HeightOutput {
+    /// The descent block ran: Process's landing drift follows.
+    pub(crate) fn descended(&self) -> bool {
+        self.descended
+    }
+}
+
+#[cfg(all(test, tests_sim_movement))]
 mod tests {
     use super::*;
 
     #[test]
     fn native_approach_attitude_and_completion_histories() {
         use crate::util::fixed_math::SimFixed;
-        let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-            "../../../tools/spatial_oracle/fly_attitude.json"
+        let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/fly_attitude.json",
         ))
         .unwrap();
         assert_eq!(rows.len(), 65);
@@ -470,8 +797,8 @@ mod tests {
 
     #[test]
     fn all_saved_original_vertical_steps_match() {
-        let rows: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../tools/spatial_oracle/fly_height.json"
+        let rows: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/fly_height.json",
         ))
         .unwrap();
         let rows = rows.as_array().unwrap();
@@ -486,7 +813,7 @@ mod tests {
             if flag("landing") {
                 state.begin_landing();
             }
-            state.set_target_height(target);
+            state.set_flight_level(target);
             let ground_z = crate::util::lepton::ground_height_leptons(
                 integer("level", 0) as u8,
                 integer("slope", 0) as u8,
@@ -499,7 +826,8 @@ mod tests {
                 world_z: integer("z", 0),
                 ground_z,
                 on_bridge: flag("on_bridge"),
-                structural_bridge: flag("bridge"),
+                bridge_deck_z: flag("bridge")
+                    .then(|| super::super::ground_pose::z_at_height(ground_z, 0, true)),
                 health: integer("health", 100),
                 has_passenger: flag("loaded") && c["kind"].as_str() != Some("unit"),
                 is_dropship: flag("dropship"),
@@ -508,17 +836,56 @@ mod tests {
                 } else {
                     authored_level
                 },
+                hunter_seeker: None,
             });
             assert_eq!(
-                actual,
-                HeightOutput {
-                    world_z: row["z"].as_i64().unwrap() as i32,
-                    on_bridge: row["on_bridge"].as_bool().unwrap(),
-                    height: row["height"].as_i64().unwrap() as i32,
-                },
+                (actual.world_z, actual.on_bridge, actual.height),
+                (
+                    row["z"].as_i64().unwrap() as i32,
+                    row["on_bridge"].as_bool().unwrap(),
+                    row["height"].as_i64().unwrap() as i32,
+                ),
                 "{}",
                 c["name"]
             );
         }
+    }
+
+    /// Ares HunterSeeker_Ascent (1004D930, hook 0x4CDE64) and _Descent
+    /// (1004DA20, hook 0x4CDF54): a HunterSeeker climbs at EmergeSpeed while
+    /// taking off, else at AscentSpeed, and descends at DescentSpeed, each
+    /// capped by the remaining distance; stock would step 20 each way.
+    #[test]
+    fn ares_hunter_seeker_climbs_and_descends_at_its_speeds() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        let climb = crate::rules::ares_techno_type::HunterSeekerClimb {
+            ascent: 7,
+            descent: 9,
+            emerge: 3,
+        };
+        let step = |state: &FlyRuntime, world_z| {
+            state
+                .step_height(HeightInput {
+                    world_z,
+                    ground_z: 0,
+                    on_bridge: false,
+                    bridge_deck_z: None,
+                    health: 100,
+                    has_passenger: false,
+                    is_dropship: false,
+                    flight_level: 600,
+                    hunter_seeker: Some(climb),
+                })
+                .height
+        };
+        let mut state = FlyRuntime::default();
+        state.begin_takeoff(600);
+        assert_eq!(step(&state, 100), 103);
+        state.set_flight_level(600);
+        state.taking_off = false;
+        assert_eq!(step(&state, 100), 107);
+        assert_eq!(step(&state, 596), 600);
+        assert_eq!(step(&state, 700), 691);
+        assert_eq!(step(&state, 605), 600);
     }
 }

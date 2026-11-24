@@ -1,6 +1,8 @@
 use super::*;
 use crate::rules::ini_parser::IniFile;
+use crate::sim::combat::TargetKind;
 use crate::sim::command::{Command, CommandEnvelope};
+use crate::sim::components::NavTargetRef;
 use crate::sim::movement::FacingClass;
 use crate::sim::world::TickResult;
 
@@ -17,9 +19,13 @@ fn fixture_with_sound(
 ) -> (Simulation, RuleSet, u64) {
     let sound_line = sound.map_or(String::new(), |s| format!("DeploySound={s}\n"));
     let text = format!(
-        "[InfantryTypes]\n[AircraftTypes]\n[VehicleTypes]\n0={kind}\n[BuildingTypes]\n0=YARD\n[{kind}]\nStrength=1000\nSpeed=5\nROT={rot}\nLocomotor={{4A582741-9839-11d1-B709-00A024DDAFD1}}\nDeploysInto=YARD\n{sound_line}[YARD]\nStrength=1000\nConstructionYard=yes\nFoundation=4x3\nDeployFacing={deploy_facing}\n[Unload]\nRate=0.016\n[Clear]\nBuildable=yes\n"
+        "[InfantryTypes]\n[AircraftTypes]\n[VehicleTypes]\n0={kind}\n[BuildingTypes]\n0=YARD\n[{kind}]\nStrength=1000\nSpeed=5\nROT={rot}\nLocomotor={{4A582741-9839-11d1-B709-00A024DDAFD1}}\nDeploysInto=YARD\n{sound_line}[YARD]\nStrength=1000\nConstructionYard=yes\nDeployFacing={deploy_facing}\n[Unload]\nRate=0.016\n[Clear]\nBuildable=yes\n"
     );
-    let rules = RuleSet::from_ini(&IniFile::from_str(&text)).unwrap();
+    let rules = RuleSet::from_ini_with_fixed_art_for_test(
+        &IniFile::from_str(&text),
+        &IniFile::from_str("[YARD]\nFoundation=4x3\n"),
+    )
+    .unwrap();
     let mut sim = Simulation::new();
     crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
     // No house AI/opponent defeat system in these command/locomotor fixtures.
@@ -34,7 +40,7 @@ fn tick(sim: &mut Simulation, rules: &RuleSet, command: Option<Command>) -> Tick
         .map(|cmd| {
             CommandEnvelope::new(
                 sim.interner.get("Americans").unwrap(),
-                sim.session.tick + 1,
+                sim.session.tick() + 1,
                 cmd,
             )
         })
@@ -46,7 +52,7 @@ fn yards(sim: &Simulation) -> usize {
     sim.substrate
         .entities
         .values()
-        .filter(|e| !e.dying && sim.interner.resolve(e.type_ref()) == "YARD")
+        .filter(|e| !e.death.is_dying() && sim.interner.resolve(e.type_ref()) == "YARD")
         .count()
 }
 fn finish(sim: &mut Simulation, rules: &RuleSet, id: u64) -> usize {
@@ -54,7 +60,12 @@ fn finish(sim: &mut Simulation, rules: &RuleSet, id: u64) -> usize {
     for _ in 0..140 {
         let out = tick(sim, rules, None);
         receipts += usize::from(out.spawned_entities);
-        if sim.substrate.entities.get(id).is_none_or(|e| e.dying) {
+        if sim
+            .substrate
+            .entities
+            .get(id)
+            .is_none_or(|e| e.death.is_dying())
+        {
             break;
         }
     }
@@ -65,38 +76,22 @@ fn finish(sim: &mut Simulation, rules: &RuleSet, id: u64) -> usize {
         sim.substrate.entities.get(id).map(|e| (
             &e.position,
             &e.navigation,
-            &e.drive_locomotion,
-            &e.movement_target,
+            e.locomotor
+                .as_ref()
+                .and_then(|l| l.selected_drive_runtime())
+                .and_then(|r| r.retained())
+                .cloned(),
             &e.body_facing,
-            e.mcv_deploy_pending,
+            e.seldom.mcv_deploy_pending.is_pending(),
             &e.mission,
             &e.foot_speed
         ))
     );
     receipts
 }
-#[test]
-fn one_command_turns_and_converts_all_stock_mcv_types() {
-    for kind in ["AMCV", "SMCV", "PCV"] {
-        for facing in [0, 32, 64, 127, 128, 192, 255] {
-            let (mut sim, rules, id) = fixture(kind, facing, 5, 4);
-            let accepted = tick(&mut sim, &rules, Some(Command::DeployMcv { entity_id: id }));
-            assert!(!accepted.spawned_entities, "acceptance is not conversion");
-            assert_eq!(yards(&sim), 0);
-            assert_eq!(finish(&mut sim, &rules, id), 1, "one conversion receipt");
-            let yard = sim
-                .substrate
-                .entities
-                .values()
-                .find(|e| !e.dying && e.category == EntityCategory::Structure)
-                .unwrap();
-            assert_eq!((yard.position.rx, yard.position.ry), (19, 21));
-        }
-    }
-}
 /// Deploy lifts the MCV (`Mark(UP)`, `0x00739670`) before the yard is built
-/// and marked. VERA lifts it after, at its UnInit; the cell the MCV stood on
-/// must still end like every other yard cell.
+/// and marked. Its own cell must admit Building449440 and end like every
+/// other yard cell, with no surviving raw vehicle claim.
 #[test]
 fn the_cell_the_mcv_stood_on_ends_as_a_yard_cell() {
     let (mut sim, rules, id) = fixture("AMCV", 128, 5, 4);
@@ -106,7 +101,7 @@ fn the_cell_the_mcv_stood_on_ends_as_a_yard_cell() {
         .substrate
         .entities
         .values()
-        .find(|e| !e.dying && e.category == EntityCategory::Structure)
+        .find(|e| !e.death.is_dying() && e.category() == EntityCategory::Structure)
         .unwrap()
         .stable_id();
     let bits = |cell: (u16, u16)| {
@@ -121,35 +116,139 @@ fn the_cell_the_mcv_stood_on_ends_as_a_yard_cell() {
 }
 
 /// The yard an MCV deploys into in frame D builds up from its type's Buildup
-/// control and completes at D + 1 + (count - 1) * rate: Deploy's ready byte
-/// commences the queued Construction mission in D and its first visit is D+1
-/// (`sim::building_construction`); the tactical capture ledger pins this
-/// route.
+/// control. The conversion removes the current Logic object; the compacting
+/// cursor skips its appended yard that frame. Its first visit at D+1 promotes
+/// Construction after the body; the first handler at D+2 begins the raw clock.
+
+/// Phobos `IronCurtain.KeptOnDeploy` / `ForceShield.KeptOnDeploy`: a
+/// converting MCV carries an active curtain when the type's key (else the
+/// `[CombatDamage]` global) allows it. Force Shield's global default is
+/// false and Iron Curtain's is true.
+#[cfg(feature = "phobos")]
+#[test]
+fn deploy_carries_the_curtain_only_when_kept_on_deploy_allows_it() {
+    use crate::sim::superweapon::invulnerability::{
+        InvulnKind, apply_invulnerability, is_invulnerable,
+    };
+
+    let fixture = |vehicle_extra: &str, extra: &str| {
+        let text = format!(
+            "[InfantryTypes]\n[AircraftTypes]\n[VehicleTypes]\n0=MCV\n[BuildingTypes]\n0=YARD\n\
+             [MCV]\nStrength=1000\nSpeed=5\nROT=5\n\
+             Locomotor={{4A582741-9839-11d1-B709-00A024DDAFD1}}\nDeploysInto=YARD\n{vehicle_extra}\
+             [YARD]\nStrength=1000\nConstructionYard=yes\nDeployFacing=0\n\
+             [Unload]\nRate=0.016\n[Clear]\nBuildable=yes\n{extra}"
+        );
+        let rules = RuleSet::from_ini_with_fixed_art_for_test(
+            &IniFile::from_str(&text),
+            &IniFile::from_str("[YARD]\nFoundation=4x3\n"),
+        )
+        .unwrap();
+        let mut sim = Simulation::new();
+        crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
+        let id = sim
+            .spawn_object("MCV", "Americans", 20, 22, 0, &rules)
+            .unwrap();
+        (sim, rules, id)
+    };
+
+    for (kind, vehicle_extra, combat_extra, carried) in [
+        ("IronCurtain", "", "", true),
+        (
+            "IronCurtain",
+            "",
+            "[CombatDamage]\nIronCurtain.KeptOnDeploy=no\n",
+            false,
+        ),
+        (
+            "IronCurtain",
+            "IronCurtain.KeptOnDeploy=yes\n",
+            "[CombatDamage]\nIronCurtain.KeptOnDeploy=no\n",
+            true,
+        ),
+        ("ForceShield", "", "", false),
+        ("ForceShield", "ForceShield.KeptOnDeploy=yes\n", "", true),
+    ] {
+        let (mut sim, rules, id) = fixture(vehicle_extra, combat_extra);
+        let kind = match kind {
+            "IronCurtain" => InvulnKind::IronCurtain,
+            _ => InvulnKind::ForceShield,
+        };
+        let frame = sim.session.binary_frame();
+        apply_invulnerability(
+            sim.substrate.entities.get_mut(id).unwrap(),
+            frame,
+            1000,
+            kind,
+        );
+        assert!(is_invulnerable(
+            sim.substrate
+                .entities
+                .get(id)
+                .unwrap()
+                .invulnerability
+                .as_ref(),
+            frame
+        ));
+        tick(&mut sim, &rules, Some(Command::DeployMcv { entity_id: id }));
+        let mut yard = None;
+        for _ in 0..200 {
+            tick(&mut sim, &rules, None);
+            yard = sim
+                .substrate
+                .entities
+                .values()
+                .find(|e| !e.death.is_dying() && e.category() == EntityCategory::Structure)
+                .map(|e| e.stable_id());
+            if yard.is_some() {
+                break;
+            }
+        }
+        let yard = yard.expect("the MCV converts");
+        let carried_state = sim
+            .substrate
+            .entities
+            .get(yard)
+            .unwrap()
+            .invulnerability
+            .clone();
+        assert_eq!(
+            carried_state.is_some(),
+            carried,
+            "{kind:?} {vehicle_extra:?} {combat_extra:?}"
+        );
+        if let Some(state) = carried_state {
+            assert_eq!(state.kind(), kind);
+        }
+    }
+}
+
+/// Original construction route rows pin the subsequent 29x1 completion.
 #[test]
 fn a_deployed_yard_completes_its_buildup_after_the_conversion_frame() {
     let (mut sim, mut rules, id) = fixture("SMCV", 0, 5, 4);
-    rules.set_buildup_control_for_test("YARD", [0, 31, 1]);
+    rules.set_buildup_control_for_test("YARD", [0, 29, 1]);
     tick(&mut sim, &rules, Some(Command::DeployMcv { entity_id: id }));
     let mut converted = None;
     let mut completed = None;
     for _ in 0..200 {
-        let frame = sim.session.binary_frame;
+        let frame = sim.session.binary_frame();
         tick(&mut sim, &rules, None);
         let yard = sim
             .substrate
             .entities
             .values()
-            .find(|e| !e.dying && e.category == EntityCategory::Structure);
+            .find(|e| !e.death.is_dying() && e.category() == EntityCategory::Structure);
         if let Some(yard) = yard {
             converted.get_or_insert(frame);
-            if yard.building_up.is_none() {
+            if !yard.building_up() {
                 completed = Some(frame);
                 break;
             }
         }
     }
     let converted = converted.expect("the MCV converts");
-    assert_eq!(completed, Some(converted + 1 + 30));
+    assert_eq!(completed, Some(converted + 2 + 28));
 }
 
 #[test]
@@ -174,13 +273,13 @@ fn turn_completion_converts_before_the_next_mission_retry() {
     tick(&mut sim, &rules, Some(Command::DeployMcv { entity_id: id }));
     tick(&mut sim, &rules, None);
     let e = sim.substrate.entities.get(id).unwrap();
-    assert!(e.mcv_deploy_pending);
+    assert!(e.seldom.mcv_deploy_pending.is_pending());
     // Still turning toward DeployFacing=4 (0x8000) at ROT 10.
     assert_eq!(e.body_facing.destination(), 0x8000);
-    assert!(e.body_facing.is_rotating(sim.session.binary_frame));
+    assert!(e.body_facing.is_rotating(sim.session.binary_frame()));
     let due = e.mission.dispatch_timer();
     for _ in 0..10 {
-        let before = sim.session.binary_frame;
+        let before = sim.session.binary_frame();
         let out = tick(&mut sim, &rules, None);
         if out.spawned_entities {
             assert!(!due.due(before), "conversion is the Drive edge callback");
@@ -216,13 +315,21 @@ fn pending_turn_roundtrips_through_save_and_hashes_its_latches() {
         .entities
         .get_mut(id)
         .unwrap()
-        .mcv_deploy_pending = false;
+        .seldom
+        .mcv_deploy_pending
+        .set_for_test(false);
     assert_ne!(hash, sim.state_hash());
     sim.substrate
         .entities
         .get_mut(id)
         .unwrap()
-        .mcv_deploy_pending = true;
+        .seldom
+        .mcv_deploy_pending
+        .set_for_test(true);
+    assert!(rules.object("AMCV").unwrap().move_sound.is_empty());
+    let sound = sim.substrate.entities.get(id).unwrap().move_sound;
+    assert!(!sound.is_active());
+    assert_eq!(sound.countdown(), 3);
     let data = crate::sim::snapshot::GameSnapshot::save_validated(&sim, 1, 2, "pending MCV", 0);
     let mut restored = crate::sim::snapshot::GameSnapshot::load(&data).unwrap().sim;
     restored.restore_after_snapshot_load().unwrap();
@@ -231,6 +338,13 @@ fn pending_turn_roundtrips_through_save_and_hashes_its_latches() {
     // Retail's save reader deliberately reinitializes Scenario RNG. Align the
     // control run to that documented load contract before comparing continuation.
     sim.scenario_rng = crate::sim::rng::SimRng::new(0);
+    let loaded_sound = restored.substrate.entities.get(id).unwrap().move_sound;
+    assert!(!loaded_sound.is_active());
+    assert_eq!(loaded_sound.countdown(), 0);
+    // The turn refreshed Foot+540 despite the empty MoveSound vector.
+    // FootLoad4DB60D..4DB624 resets it; align that one load transition too,
+    // without reloading the control's deployment/facing/mission authority.
+    sim.substrate.restore_move_sound_state_after_load(id);
     assert_eq!(sim.state_hash(), restored.state_hash());
     for _ in 0..80 {
         let a = tick(&mut sim, &rules, None);
@@ -243,10 +357,10 @@ fn pending_turn_roundtrips_through_save_and_hashes_its_latches() {
 #[test]
 fn facing_matches_original_drive_oracle() {
     let vectors: serde_json::Value =
-        serde_json::from_str(include_str!("../../tools/mcv_deploy_oracle.json")).unwrap();
+        serde_json::from_str(crate::test_fixture::text("tools/mcv_deploy_oracle.json")).unwrap();
     for row in vectors["turns"].as_array().unwrap() {
         let rate = row["rate"].as_u64().unwrap() as u16;
-        if rate % 256 != 0 {
+        if !rate.is_multiple_of(256) {
             continue;
         } // native sub-byte rates are outside rules ROT constructor
         let mut facing =
@@ -274,21 +388,16 @@ fn moving_mcv_finishes_committed_segment_then_deploys_once() {
             entity_id: id,
             target_rx: 30,
             target_ry: 22,
-            queue: false,
         }),
     );
     for _ in 0..8 {
         tick(&mut sim, &rules, None);
     }
-    assert!(
-        sim.substrate
-            .entities
-            .get(id)
-            .unwrap()
-            .movement_target
-            .is_some()
+    assert_eq!(
+        crate::sim::movement::motion_query::is_moving(sim.substrate.entities.get(id).unwrap()),
+        Some(true)
     );
-    let position = sim.substrate.entities.get(id).unwrap().position.clone();
+    let position = sim.substrate.entities.get(id).unwrap().position;
     tick(&mut sim, &rules, Some(Command::DeployMcv { entity_id: id }));
     assert_eq!(yards(&sim), 0);
     assert_eq!(finish(&mut sim, &rules, id), 1);
@@ -296,11 +405,11 @@ fn moving_mcv_finishes_committed_segment_then_deploys_once() {
         .substrate
         .entities
         .values()
-        .find(|e| !e.dying && e.category == EntityCategory::Structure)
+        .find(|e| !e.death.is_dying() && e.category() == EntityCategory::Structure)
         .unwrap();
-    assert!(yard.position.rx < 29, "must abandon the old destination");
+    assert!(yard.position.rx() < 29, "must abandon the old destination");
     assert!(
-        yard.position.rx.abs_diff(position.rx) <= 3,
+        yard.position.rx().abs_diff(position.rx()) <= 3,
         "finish the committed segment only"
     );
 }
@@ -309,9 +418,11 @@ fn placement_is_rechecked_on_turn_completion() {
     let (mut sim, rules, id) = fixture("AMCV", 64, 5, 4);
     tick(&mut sim, &rules, Some(Command::DeployMcv { entity_id: id }));
     tick(&mut sim, &rules, None);
-    // A structure arrives after the initial attempt has already accepted the turn.
+    // A structure arrives after the initial attempt has already accepted the
+    // turn. Its foundation overlaps the requested yard, but excludes the live
+    // MCV at20,22 so the blocker's own ordinary placement is legal.
     let blocker = sim
-        .spawn_object("YARD", "Americans", 19, 21, 0, &rules)
+        .spawn_object("YARD", "Americans", 21, 21, 0, &rules)
         .unwrap();
     for _ in 0..35 {
         tick(&mut sim, &rules, None);
@@ -321,7 +432,7 @@ fn placement_is_rechecked_on_turn_completion() {
         .entities
         .get(id)
         .expect("blocked MCV survives");
-    assert!(!mcv.dying && !mcv.mcv_deploy_pending);
+    assert!(!mcv.death.is_dying() && !mcv.seldom.mcv_deploy_pending.is_pending());
     assert_eq!(yards(&sim), 1, "only the blocking building exists");
     sim.uninit_with_rules(blocker, &rules);
     for _ in 0..35 {
@@ -344,20 +455,19 @@ fn move_order_during_turn_prevents_conversion_at_the_old_site() {
             entity_id: id,
             target_rx: 40,
             target_ry: 22,
-            queue: false,
         }),
     );
     for _ in 0..10 {
         assert!(!tick(&mut sim, &rules, None).spawned_entities);
     }
     assert_eq!(yards(&sim), 0);
-    assert!(!sim.substrate.entities.get(id).unwrap().dying);
+    assert!(!sim.substrate.entities.get(id).unwrap().death.is_dying());
 }
 
 #[test]
 fn continuation_result_and_rotation_edge_match_original_blocks() {
     let v: serde_json::Value =
-        serde_json::from_str(include_str!("../../tools/mcv_deploy_oracle.json")).unwrap();
+        serde_json::from_str(crate::test_fixture::text("tools/mcv_deploy_oracle.json")).unwrap();
     for row in v["mission_branches"].as_array().unwrap() {
         let kind = row["kind"].as_str().unwrap();
         if kind == "state0" {
@@ -365,16 +475,25 @@ fn continuation_result_and_rotation_edge_match_original_blocks() {
         } // state0 includes the separate path reset/radio handoff
         let (mut sim, _rules, id) = fixture("AMCV", 64, 5, 4);
         let e = sim.substrate.entities.get_mut(id).unwrap();
-        e.dying = row["alive"].as_u64().unwrap() == 0;
-        e.mcv_deploy_pending = row["flag"].as_u64().unwrap() != 0;
-        e.navigation.nav_com = (row["nav"].as_u64().unwrap() != 0)
-            .then_some(crate::sim::components::NavTargetRef::cell(30, 30));
+        e.death
+            .set_dying_for_test(row["alive"].as_u64().unwrap() == 0);
+        e.seldom
+            .mcv_deploy_pending
+            .set_for_test(row["flag"].as_u64().unwrap() != 0);
+        e.navigation.set_nav_com_for_test(
+            (row["nav"].as_u64().unwrap() != 0)
+                .then_some(crate::sim::components::NavTargetRef::cell(30, 30)),
+        );
         e.mission
             .set_handler_state(if kind == "initial" { 1 } else { 2 });
         if kind == "initial" {
-            finish_initial_attempt(&mut sim, id);
+            finish_initial_attempt(
+                &mut sim,
+                id,
+                crate::rules::ruleset::RuleSet::empty_for_test(),
+            );
         } else {
-            finish_retry(&mut sim, id, row["result"].as_u64().unwrap() != 0);
+            finish_retry(&mut sim.substrate, id, row["result"].as_u64().unwrap() != 0);
         }
         let e = sim.substrate.entities.get(id).unwrap();
         assert_eq!(
@@ -383,7 +502,7 @@ fn continuation_result_and_rotation_edge_match_original_blocks() {
             "{row}"
         );
         assert_eq!(
-            e.mcv_deploy_pending,
+            e.seldom.mcv_deploy_pending.is_pending(),
             row["out_flag"].as_u64().unwrap() != 0,
             "{row}"
         );
@@ -410,15 +529,49 @@ fn conversion_receipt_rebuilds_navigation_in_the_conversion_frame() {
     }
     panic!("missing conversion frame");
 }
+/// A Slave Miner deployed at or below ConditionYellow passes its health ratio
+/// to YAREFN (`UnitClass::Deploy`, `0x00739946`), whose opening takes the
+/// IdleAnim slot's damaged name (`Grand_Opening`, `0x004461BB..0x004461F6`).
+/// ReadINI's copy at `0x00464028` made that `YAREFN_A`.
 #[test]
-fn retail_mcv_and_target_rules_deploy_with_one_command() {
-    let Some((rules_ini, art_ini)) = crate::rules::retail_ini_fixture::retail_rules_and_art()
+fn retail_slave_miner_deployed_damaged_opens_its_idle_anim() {
+    let Some(mut rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art()
     else {
         return;
     };
-    let mut rules = RuleSet::from_ini(&rules_ini).unwrap();
-    let art = crate::rules::art_data::ArtRegistry::from_ini(&art_ini);
-    rules.install_art_data(art);
+    // YGREFN_A.SHP's raw frame count (render::sprite_atlas's retail test).
+    rules.bind_anim_frame_count_for_test("YAREFN_A", 4);
+    let mut sim = Simulation::new();
+    crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
+    let id = sim
+        .spawn_object("SMIN", "Americans", 20, 22, 0, &rules)
+        .unwrap();
+    let strength = rules.object("SMIN").unwrap().strength;
+    let miner = sim.substrate.entities.get_mut(id).unwrap();
+    miner.health.set_for_test(strength * 2 / 5);
+    tick(&mut sim, &rules, Some(Command::DeployMcv { entity_id: id }));
+    for _ in 0..200 {
+        tick(&mut sim, &rules, None);
+        let Some(refinery) = sim.substrate.entities.values().find(|e| {
+            sim.interner.resolve(e.type_ref()) == "YAREFN" && e.building_art.actually_placed()
+        }) else {
+            continue;
+        };
+        let anim = refinery.building_art.anim_slots()[18].expect("YAREFN's IdleAnim slot");
+        assert_eq!(
+            sim.interner.resolve(sim.anim(anim).unwrap().type_id()),
+            "YAREFN_A"
+        );
+        assert!(refinery.building_art.damage_state_active());
+        return;
+    }
+    panic!("the deployed refinery never opened");
+}
+#[test]
+fn retail_mcv_and_target_rules_deploy_with_one_command() {
+    let Some(rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art() else {
+        return;
+    };
     for kind in ["AMCV", "SMCV", "PCV"] {
         for facing in [0, 64, 128, 192] {
             let mut sim = Simulation::new();
@@ -441,7 +594,7 @@ fn retail_mcv_and_target_rules_deploy_with_one_command() {
                 sim.substrate
                     .entities
                     .values()
-                    .filter(|e| !e.dying && sim.interner.resolve(e.type_ref()) == target)
+                    .filter(|e| !e.death.is_dying() && sim.interner.resolve(e.type_ref()) == target)
                     .count(),
                 1
             );
@@ -449,17 +602,65 @@ fn retail_mcv_and_target_rules_deploy_with_one_command() {
     }
 }
 
+/// Event9's4C77C7 query must not find a factory after its Mark removal just
+/// because the retained entity still has its old foundation/position.
+#[test]
+fn cell_building_query_deploy_ignores_a_stored_unmarked_factory() {
+    let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let rules = retail.rules;
+    assert!(rules.object("GAWEAP").unwrap().weapons_factory);
+    let mut sim = Simulation::new();
+    crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
+    let factory = sim
+        .spawn_object("GAWEAP", "Americans", 20, 20, 0, &rules)
+        .unwrap();
+    assert!(sim.unmark_entity_remove(factory, crate::sim::world::UninitContext::new(&rules)));
+    let mcv = sim
+        .spawn_object("AMCV", "Americans", 21, 21, 0, &rules)
+        .unwrap();
+    assert!(crate::sim::deploy::issue_order(
+        &mut sim,
+        mcv,
+        &rules,
+        &mut crate::sim::world::FrameEffects::default()
+    ));
+    assert_eq!(
+        sim.entities().get(mcv).unwrap().mission.queued().known(),
+        Some(MissionType::Unload)
+    );
+}
+
 #[test]
 fn active_track_and_same_cell_destination_preserve_the_rotation_latch() {
     let (mut sim, rules, id) = fixture("AMCV", 128, 5, 4);
     let e = sim.substrate.entities.get_mut(id).unwrap();
-    e.mcv_deploy_pending = true;
-    let drive = e.drive_locomotion.get_or_insert_with(Default::default);
-    drive.turn_latched = true;
-    drive.track.turn_index = 3;
-    drive.track_valid = true;
+    e.seldom.mcv_deploy_pending.set_for_test(true);
+    let drive = e.locomotor.as_mut().unwrap();
+    assert!(drive.ensure_installed_track_state());
+    assert!(drive.store_track_turn_latched(
+        crate::sim::movement::track_process::TrackFamily::Drive,
+        true
+    ));
+    {
+        let mut progress = drive
+            .track_progress(crate::sim::movement::track_process::TrackFamily::Drive)
+            .unwrap();
+        progress.set_turn_index(3);
+        assert!(drive.store_track_progress(
+            crate::sim::movement::track_process::TrackFamily::Drive,
+            progress
+        ));
+    };
+    assert!(drive.store_track_valid(
+        crate::sim::movement::track_process::TrackFamily::Drive,
+        true
+    ));
     assert!(
-        drive.head_to.is_none(),
+        drive
+            .track_head(crate::sim::movement::track_process::TrackFamily::Drive)
+            .is_none(),
         "the native +63/selector gate is independent of Head_To"
     );
     sim.process_ground_locomotor_for_test(id, Some(&rules), None, None)
@@ -469,15 +670,21 @@ fn active_track_and_same_cell_destination_preserve_the_rotation_latch() {
             .entities
             .get(id)
             .unwrap()
-            .drive_locomotion
+            .locomotor
             .as_ref()
+            .and_then(|l| l.selected_drive_runtime())
+            .and_then(|r| r.retained())
             .unwrap()
-            .turn_latched
+            .turn_latched()
     );
     assert_eq!(yards(&sim), 0);
     let e = sim.substrate.entities.get_mut(id).unwrap();
-    e.drive_locomotion.as_mut().unwrap().track_valid = false;
-    e.navigation.nav_com = Some(crate::sim::components::NavTargetRef::cell(20, 22));
+    assert!(e.locomotor.as_mut().unwrap().store_track_valid(
+        crate::sim::movement::track_process::TrackFamily::Drive,
+        false
+    ));
+    e.navigation
+        .set_nav_com_for_test(Some(crate::sim::components::NavTargetRef::cell(20, 22)));
     sim.process_ground_locomotor_for_test(id, Some(&rules), None, None)
         .unwrap();
     assert!(
@@ -485,19 +692,81 @@ fn active_track_and_same_cell_destination_preserve_the_rotation_latch() {
             .entities
             .get(id)
             .unwrap()
-            .drive_locomotion
+            .locomotor
             .as_ref()
+            .and_then(|l| l.selected_drive_runtime())
+            .and_then(|r| r.retained())
             .unwrap()
-            .turn_latched
+            .turn_latched()
     );
     assert_eq!(yards(&sim), 0);
     let e = sim.substrate.entities.get_mut(id).unwrap();
-    e.navigation.nav_com = None;
+    e.navigation.set_nav_com_for_test(None);
     // A retained selector alone cannot override the cleared +63 authority.
-    assert_eq!(e.drive_locomotion.as_ref().unwrap().track.turn_index, 3);
-    assert!(!e.drive_locomotion.as_ref().unwrap().track_valid);
+    assert_eq!(
+        e.locomotor
+            .as_ref()
+            .and_then(|l| l.selected_drive_runtime())
+            .and_then(|r| r.retained())
+            .unwrap()
+            .track()
+            .turn_index(),
+        3
+    );
+    assert!(
+        !e.locomotor
+            .as_ref()
+            .and_then(|l| l.selected_drive_runtime())
+            .and_then(|r| r.retained())
+            .unwrap()
+            .track_valid()
+    );
     sim.process_ground_locomotor_for_test(id, Some(&rules), None, None)
         .unwrap();
+    assert_eq!(yards(&sim), 1);
+}
+
+/// `UnitClass::Deploy @ 0x007393C0` refuses while the locomotor's Is_Moving
+/// (vt+0x10 at `0x00739405`) is true, whichever locomotor answers it: a Hover
+/// deployer still under way stays a unit, and deploys once its Hover stops.
+#[test]
+fn deploy_refuses_while_any_locomotor_is_moving() {
+    use crate::rules::locomotor_type::LocomotorKind;
+    use crate::sim::movement::hover::HoverRuntime;
+    use crate::util::native_x87::NativeF64Bits;
+    let (mut sim, rules, id) = fixture("AMCV", 128, 5, 4);
+    let set_hover = |sim: &mut Simulation, destination| {
+        let e = sim.substrate.entities.get_mut(id).unwrap();
+        let mut locomotor =
+            crate::sim::movement::locomotor::LocomotorState::for_test_kind(LocomotorKind::Hover);
+        *locomotor.hover_runtime_mut().expect("Hover payload") =
+            HoverRuntime::moving_for_test(destination, NativeF64Bits::ONE);
+        e.locomotor = Some(locomotor);
+    };
+    set_hover(
+        &mut sim,
+        Some(crate::sim::components::DriveCoord::cell(24, 22, 0)),
+    );
+    assert!(
+        !sim.deploy_mcv(
+            id,
+            &rules,
+            None,
+            &mut crate::sim::world::FrameEffects::default()
+        ),
+        "a moving Hover refuses"
+    );
+    assert_eq!(yards(&sim), 0);
+    set_hover(&mut sim, None);
+    assert!(
+        sim.deploy_mcv(
+            id,
+            &rules,
+            None,
+            &mut crate::sim::world::FrameEffects::default()
+        ),
+        "a stopped Hover deploys"
+    );
     assert_eq!(yards(&sim), 1);
 }
 
@@ -511,7 +780,7 @@ fn mcv_deploy_sound_occurs_once_with_conversion_at_the_source_cell() {
         for _ in 0..50 {
             // Repeated D while waiting must not repeat the conversion cue.
             let command = (yards(&sim) == 0).then_some(Command::DeployMcv { entity_id: id });
-            sim.sound_events.clear();
+            sim.sound_events.clear_for_test();
             let result = tick(&mut sim, &rules, command);
             let cues: Vec<_> = sim
                 .sound_events
@@ -519,9 +788,11 @@ fn mcv_deploy_sound_occurs_once_with_conversion_at_the_source_cell() {
                 .filter_map(|event| match event {
                     SimSoundEvent::EntityDeployed {
                         deploy_sound_id,
-                        rx,
-                        ry,
-                    } => Some((sim.interner.resolve(*deploy_sound_id), *rx, *ry)),
+                        world,
+                    } => {
+                        let (rx, ry, ..) = world.to_cell_sub_z();
+                        Some((sim.interner.resolve(*deploy_sound_id), rx, ry))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -544,7 +815,9 @@ fn blocked_or_unconfigured_mcv_deploy_does_not_emit_deploy_sound() {
         tick(&mut sim, &rules, Some(Command::DeployMcv { entity_id: id }));
         tick(&mut sim, &rules, None);
         if blocked {
-            sim.spawn_object("YARD", "Americans", 19, 21, 0, &rules)
+            // Overlap the requested deployment footprint without covering
+            // the still-live MCV at20,22 during blocker construction.
+            sim.spawn_object("YARD", "Americans", 21, 21, 0, &rules)
                 .unwrap();
         }
         for _ in 0..50 {
@@ -561,7 +834,12 @@ fn blocked_or_unconfigured_mcv_deploy_does_not_emit_deploy_sound() {
                 1,
                 "an unconfigured cue must not prevent conversion"
             );
-            assert!(sim.substrate.entities.get(id).is_none_or(|e| e.dying));
+            assert!(
+                sim.substrate
+                    .entities
+                    .get(id)
+                    .is_none_or(|e| e.death.is_dying())
+            );
         }
     }
 }
@@ -575,28 +853,42 @@ fn house_fixture(human: bool, land: &str) -> (Simulation, RuleSet, u64) {
         "[InfantryTypes]\n[AircraftTypes]\n[VehicleTypes]\n0=AMCV\n[BuildingTypes]\n0=YARD\n\
          [AI]\nBuildConst=YARD\n\
          [AMCV]\nStrength=1000\nSpeed=5\nROT=5\nLocomotor={{4A582741-9839-11d1-B709-00A024DDAFD1}}\nDeploysInto=YARD\n\
-         [YARD]\nStrength=1000\nConstructionYard=yes\nFoundation=4x3\nDeployFacing=4\n\
+         [YARD]\nStrength=1000\nConstructionYard=yes\nDeployFacing=4\n\
          [Hunt]\nRate=0.016\n[Guard]\nRate=0.016\n[Unload]\nRate=0.016\n{land}"
     );
-    let rules = RuleSet::from_ini(&IniFile::from_str(&text)).unwrap();
+    let rules = RuleSet::from_ini_with_fixed_art_for_test(
+        &IniFile::from_str(&text),
+        &IniFile::from_str("[YARD]\nFoundation=4x3\n"),
+    )
+    .unwrap();
     let mut sim = Simulation::new();
     crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
-    sim.session.game_mode_nonzero = true;
-    let owner = sim.interner.intern("Americans");
-    let mut house = crate::sim::house_state::HouseState::new(owner, 0, None, human, 5000, 10);
-    house.ai_activation.auto_base_building = true;
-    house.base_plan.nodes = vec![crate::sim::base_plan::BasePlanNode {
-        type_or_control: 0,
-        packed_cell: 0,
-        filled: true,
-        retry_count: 0,
-    }];
-    sim.houses.insert(owner, house);
-    sim.session.house_order.push(owner);
+    install_base_building_house(&mut sim, human);
     let id = sim
         .spawn_object("AMCV", "Americans", 20, 22, 128, &rules)
         .unwrap();
     (sim, rules, id)
+}
+
+/// [`house_fixture`]'s `Americans`, in a multiplayer game.
+fn install_base_building_house(sim: &mut Simulation, human: bool) {
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
+    let owner = sim.interner.intern("Americans");
+    let mut house = crate::sim::house_state::HouseState::new(owner, 0, None, human, 5000, 10);
+    house.set_ai_activation_for_test(crate::sim::house_state::HouseAiActivationLatches {
+        auto_base_building: true,
+        ..house.ai_activation()
+    });
+    house
+        .base_plan_mut()
+        .set_nodes_for_test(vec![crate::sim::base_plan::BasePlanNode {
+            type_or_control: 0,
+            packed_cell: 0,
+            filled: true,
+            retry_count: 0,
+        }]);
+    sim.houses.register(house);
 }
 
 const BUILDABLE: &str = "[Clear]\nBuildable=yes\n";
@@ -605,15 +897,55 @@ fn yard_cells(sim: &Simulation) -> Vec<(u16, u16)> {
     sim.substrate
         .entities
         .values()
-        .filter(|e| !e.dying && sim.interner.resolve(e.type_ref()) == "YARD")
-        .map(|e| (e.position.rx, e.position.ry))
+        .filter(|e| !e.death.is_dying() && sim.interner.resolve(e.type_ref()) == "YARD")
+        .map(|e| (e.position.rx(), e.position.ry()))
         .collect()
+}
+
+/// CanDeploySlashUnload asks vt+0x37C at `0x00700E47`: EMP or a running death
+/// count refuses it, and a refused pending deploy keeps the original retry
+/// byte (`deploy_admission` in tools/mcv_deploy_oracle.json).
+#[test]
+fn deploy_admission_matches_the_original_rows() {
+    let native = crate::test_fixture::json("tools/mcv_deploy_oracle.json");
+    let int = |value: &serde_json::Value| value.as_i64().unwrap() as i32;
+    for row in native["deploy_admission"].as_array().unwrap() {
+        let (mut sim, rules, id) = fixture("AMCV", 64, 5, 4);
+        let unit = sim.substrate.entities.get_mut(id).unwrap();
+        unit.set_emp_remaining_for_test(int(&row["emp_counter"]));
+        unit.unit_death_counter
+            .set_for_test(int(&row["death_frame"]));
+        let allowed = row["result"]["allowed"].as_bool().unwrap();
+        assert_eq!(sim.can_deploy_slash_unload(id, &rules), allowed, "{row}");
+        if row["entry"] == "unit_deploy" && !allowed {
+            let unit = sim.substrate.entities.get_mut(id).unwrap();
+            unit.seldom.mcv_deploy_pending.set_for_test(true);
+            assert!(!sim.deploy_mcv(
+                id,
+                &rules,
+                None,
+                &mut crate::sim::world::FrameEffects::empty()
+            ));
+            let pending = sim
+                .substrate
+                .entities
+                .get(id)
+                .unwrap()
+                .seldom
+                .mcv_deploy_pending;
+            assert_eq!(
+                i32::from(pending.is_pending()),
+                int(&row["result"]["deploy_retry"]),
+                "{row}"
+            );
+        }
+    }
 }
 
 #[test]
 fn try_to_deploy_sites_match_the_original_table() {
     let vectors: serde_json::Value =
-        serde_json::from_str(include_str!("../../tools/mcv_deploy_oracle.json")).unwrap();
+        serde_json::from_str(crate::test_fixture::text("tools/mcv_deploy_oracle.json")).unwrap();
     let native: Vec<(i16, i16)> = vectors["try_to_deploy_sites"]
         .as_array()
         .unwrap()
@@ -628,15 +960,6 @@ fn try_to_deploy_sites_match_the_original_table() {
     assert_eq!(native, TRY_TO_DEPLOY_SITES);
 }
 
-#[test]
-fn try_to_deploy_admits_a_clear_spot_where_the_unit_stands() {
-    let (mut sim, rules, id) = house_fixture(false, BUILDABLE);
-    assert!(try_to_deploy(&mut sim, id, &rules, None));
-    let mcv = sim.substrate.entities.get(id).unwrap();
-    assert!(mcv.navigation.nav_com.is_none());
-    assert!(sim.substrate.occupancy.contains_entity(20, 22, id));
-}
-
 /// A blocker inside the unit's own foundation also refuses the first four
 /// northern sites; `(0, -3)` is the first whose foundation misses it, and the
 /// destination is that site's cell, not its origin.
@@ -645,10 +968,16 @@ fn try_to_deploy_drives_to_the_first_clear_site_in_table_order() {
     let (mut sim, rules, id) = house_fixture(false, BUILDABLE);
     sim.spawn_object("AMCV", "Americans", 20, 21, 0, &rules)
         .unwrap();
-    assert!(!try_to_deploy(&mut sim, id, &rules, None));
+    assert!(!try_to_deploy(
+        &mut sim,
+        id,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default()
+    ));
     let mcv = sim.substrate.entities.get(id).unwrap();
     assert_eq!(
-        mcv.navigation.nav_com,
+        mcv.navigation.nav_com(),
         Some(crate::sim::components::NavTargetRef::cell(20, 19))
     );
     assert!(sim.substrate.occupancy.contains_entity(20, 22, id));
@@ -659,9 +988,16 @@ fn with_no_site_a_computer_mcv_scatters_and_a_human_one_waits() {
     for human in [false, true] {
         let (mut sim, rules, id) = house_fixture(human, "[Clear]\nBuildable=no\n");
         let rng = sim.scenario_rng.logical_state();
-        assert!(!try_to_deploy(&mut sim, id, &rules, None));
+        assert!(!try_to_deploy(
+            &mut sim,
+            id,
+            &rules,
+            None,
+            &mut crate::sim::world::FrameEffects::default()
+        ));
         let mcv = sim.substrate.entities.get(id).unwrap();
-        let scattered = mcv.movement_target.is_some() || mcv.navigation.nav_com.is_some();
+        let scattered = crate::sim::movement::motion_query::is_moving(&mcv) == Some(true)
+            || mcv.navigation.nav_com().is_some();
         assert_eq!(scattered, !human, "human={human}");
         // The Unit receiver's null arm draws nothing (0x00743A50).
         assert!(sim.scenario_rng.logical_state() == rng, "human={human}");
@@ -686,7 +1022,210 @@ fn a_computer_house_without_a_yard_hunts_and_deploys_its_mcv() {
         yard_cells(&sim).is_empty(),
         "a human's MCV waits for orders"
     );
-    assert!(sim.substrate.entities.get(id).is_some_and(|e| !e.dying));
+    assert!(
+        sim.substrate
+            .entities
+            .get(id)
+            .is_some_and(|e| !e.death.is_dying())
+    );
+}
+
+/// UnitClass::AI (0x007363DE..0x0073645B) and the initial Unload result
+/// (0x0073DDCB..0x0073DE1E) keep their HouseClass::IsControlledByHuman gate.
+#[test]
+fn mcv_deploy_hunt_follows_admitted_rules_and_house_control() {
+    use crate::sim::scenario_session::ScenarioGameMode;
+
+    let campaign = ScenarioGameMode::from_game_mode(0);
+    let skirmish = ScenarioGameMode::from_game_mode(5);
+    let campaign_rules = campaign.stock_rule_policy(None);
+    let campaign_managed_base = campaign_rules.with_uses_managed_ai_base(true);
+    for (mode, policy, player_control, hunts) in [
+        (campaign, campaign_rules, false, false),
+        // Mode 5 treats the House's PlayerControl byte differently from mode 0.
+        (skirmish, skirmish.stock_rule_policy(None), true, true),
+        (campaign, campaign_managed_base, false, true),
+        (campaign, campaign_managed_base, true, false),
+    ] {
+        let (mut sim, rules, id) = house_fixture(false, BUILDABLE);
+        sim.install_session_admission(mode, None, policy);
+        let owner = sim.interner.get("Americans").unwrap();
+        sim.houses
+            .get_mut(&owner)
+            .unwrap()
+            .set_player_control_for_test(player_control);
+        let rng = sim.scenario_rng.logical_state();
+        sim.substrate
+            .mission_assign_exact(id, MissionId::from_known(MissionType::Guard), 0)
+            .unwrap();
+        ai_queue_hunt(&mut sim, id, &rules);
+        let queued = |sim: &Simulation| sim.substrate.entities.get(id).unwrap().mission.queued();
+        let hunt = MissionId::from_known(MissionType::Hunt);
+        let guard = MissionId::from_known(MissionType::Guard);
+        assert_eq!(queued(&sim), if hunts { hunt } else { MissionId::NONE });
+
+        sim.substrate
+            .mission_assign_exact(id, MissionId::from_known(MissionType::Unload), 0)
+            .unwrap();
+        sim.substrate
+            .entities
+            .get_mut(id)
+            .unwrap()
+            .mission
+            .set_handler_state(1);
+        finish_initial_attempt(&mut sim, id, &rules);
+        assert_eq!(queued(&sim), if hunts { hunt } else { guard });
+        assert!(sim.scenario_rng.logical_state() == rng);
+    }
+}
+
+/// [`house_fixture`] with a tank and an infantryman for `Americans` and a
+/// tank for a human `Russians` house, each holding an archive target.
+fn ground_force_fixture(human: bool) -> (Simulation, RuleSet, u64, [u64; 3]) {
+    ground_force_fixture_with(human, "")
+}
+
+fn ground_force_fixture_with(human: bool, general: &str) -> (Simulation, RuleSet, u64, [u64; 3]) {
+    let text = format!(
+        "[General]\n{general}\n[InfantryTypes]\n0=E1\n[AircraftTypes]\n[VehicleTypes]\n0=AMCV\n1=MTNK\n\
+         [BuildingTypes]\n0=YARD\n[AI]\nBuildConst=YARD\n\
+         [AMCV]\nStrength=1000\nSpeed=5\nROT=5\nLocomotor={{4A582741-9839-11d1-B709-00A024DDAFD1}}\nDeploysInto=YARD\n\
+         [MTNK]\nStrength=400\nSpeed=6\nROT=5\nLocomotor={{4A582741-9839-11d1-B709-00A024DDAFD1}}\n\
+         [E1]\nStrength=125\nSpeed=4\nLocomotor={{4A582744-9839-11d1-B709-00A024DDAFD1}}\n\
+         [YARD]\nStrength=1000\nConstructionYard=yes\nDeployFacing=4\n\
+         [Hunt]\nRate=0.016\n[Guard]\nRate=0.016\n[Unload]\nRate=0.016\n[Clear]\nBuildable=yes\n"
+    );
+    let rules = RuleSet::from_ini_with_fixed_art_for_test(
+        &IniFile::from_str(&text),
+        &IniFile::from_str("[YARD]\nFoundation=4x3\n"),
+    )
+    .unwrap();
+    let mut sim = Simulation::new();
+    crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
+    install_base_building_house(&mut sim, human);
+    let enemy = sim.interner.intern("Russians");
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            enemy, 1, None, true, 0, 10,
+        ));
+    let mcv = sim
+        .spawn_object("AMCV", "Americans", 20, 22, 128, &rules)
+        .unwrap();
+    let forces = [
+        ("MTNK", "Americans", 8, 26),
+        ("E1", "Americans", 9, 27),
+        ("MTNK", "Russians", 28, 8),
+    ]
+    .map(|(kind, owner, x, y)| {
+        let id = sim.spawn_object(kind, owner, x, y, 0, &rules).unwrap();
+        sim.substrate
+            .entities
+            .get_mut(id)
+            .unwrap()
+            .set_archive_target(Some(TargetKind::Cell(x, y)));
+        id
+    });
+    (sim, rules, mcv, forces)
+}
+
+/// A computer house's yard deploy calls `HouseClass::MoveGroundForcesToBase
+/// @ 0x0050C920`: its Units and Infantry get one shared cell destination
+/// beside the base, lose their archive target and queue Move. The new yard
+/// and another house's tank keep their orders, and a human house's deploy
+/// moves nobody.
+#[test]
+fn a_computer_yard_deploy_sends_its_ground_force_to_the_base() {
+    for human in [false, true] {
+        let (mut sim, rules, mcv, [tank, infantry, enemy]) = ground_force_fixture(human);
+        let command = human.then_some(Command::DeployMcv { entity_id: mcv });
+        let mut deploy_frame = sim.session.binary_frame();
+        tick(&mut sim, &rules, command);
+        for _ in 0..140 {
+            if !yard_cells(&sim).is_empty() {
+                break;
+            }
+            deploy_frame = sim.session.binary_frame();
+            tick(&mut sim, &rules, None);
+        }
+        let yard = yard_cells(&sim);
+        assert_eq!(yard.len(), 1, "human={human}");
+        // The new yard's base origin seeds the Foot 4x4 search, whose
+        // no-target pick reads the deploy frame's counter. The port's
+        // arguments and filters are pinned by its own test in house_base.
+        let owner = sim.interner.get("Americans").unwrap();
+        let origin = sim.houses[&owner].base_origin();
+        let frame = sim.session.binary_frame();
+        sim.session.set_binary_frame_for_test(deploy_frame);
+        let destination = sim
+            .nearby_passable_cell(
+                (i32::from(origin.0), i32::from(origin.1)),
+                crate::sim::find_nearby_cell::NearbyArgs::plain(
+                    crate::sim::find_nearby_cell::PassabilityArgs {
+                        speed_type: crate::rules::locomotor_type::SpeedType::Foot,
+                        required_zone_id: None,
+                        movement_zone: crate::rules::locomotor_type::MovementZone::Normal,
+                        bridge_aware_zone: false,
+                    },
+                    crate::sim::find_nearby_cell::NearbyFootprint::new(4, 4),
+                ),
+            )
+            .map(|(x, y)| NavTargetRef::cell(x + 1, y + 1));
+        sim.session.set_binary_frame_for_test(frame);
+        let entity = |id| sim.substrate.entities.get(id).unwrap();
+        let ordered = |id| {
+            let mission = &entity(id).mission;
+            mission.current() == MissionId::from_known(MissionType::Move)
+                || mission.queued() == MissionId::from_known(MissionType::Move)
+        };
+        let enemy_cell = Some(TargetKind::Cell(28, 8));
+        assert_eq!(entity(enemy).archive_target(), enemy_cell, "human={human}");
+        assert!(!ordered(enemy) && entity(enemy).navigation.nav_com().is_none());
+        if human {
+            for id in [tank, infantry] {
+                assert!(entity(id).archive_target().is_some());
+                assert!(!ordered(id) && entity(id).navigation.nav_com().is_none());
+            }
+            continue;
+        }
+        assert!(destination.is_some());
+        for id in [tank, infantry] {
+            assert_eq!(entity(id).navigation.nav_com(), destination);
+            assert_eq!(entity(id).archive_target(), None);
+            assert!(ordered(id));
+        }
+        let yard_id = sim
+            .substrate
+            .entities
+            .iter_sorted()
+            .find(|(_, e)| e.category() == EntityCategory::Structure)
+            .unwrap()
+            .0;
+        assert!(!ordered(yard_id));
+    }
+}
+
+/// Phobos `[General] GatherWhenMCVDeploy=no` skips only the native call at
+/// `0x00739926`: the yard still deploys and every earlier write stays.
+#[test]
+fn gather_when_mcv_deploy_no_leaves_the_ground_force_alone() {
+    let (mut sim, rules, _mcv, [tank, infantry, _enemy]) =
+        ground_force_fixture_with(false, "GatherWhenMCVDeploy=no");
+    for _ in 0..140 {
+        if !yard_cells(&sim).is_empty() {
+            break;
+        }
+        tick(&mut sim, &rules, None);
+    }
+    assert_eq!(yard_cells(&sim).len(), 1, "the yard still deploys");
+    let entity = |id| sim.substrate.entities.get(id).unwrap();
+    for id in [tank, infantry] {
+        assert!(entity(id).archive_target().is_some());
+        assert!(entity(id).navigation.nav_com().is_none());
+        assert!(
+            entity(id).mission.current() != MissionId::from_known(MissionType::Move)
+                && entity(id).mission.queued() != MissionId::from_known(MissionType::Move)
+        );
+    }
 }
 
 /// With a yard already standing, Mission_Guard's arm queues Unload and the
@@ -697,7 +1236,7 @@ fn a_computer_mcv_on_guard_unloads_when_its_house_has_a_yard() {
     sim.spawn_object("YARD", "Americans", 4, 4, 0, &rules)
         .unwrap();
     let owner = sim.interner.get("Americans").unwrap();
-    assert_eq!(sim.houses[&owner].build_const_order.len(), 1);
+    assert_eq!(sim.houses[&owner].build_const_order().len(), 1);
     assert!(guard_queues_unload(&sim, id, &rules));
     for _ in 0..8 {
         tick(&mut sim, &rules, None);
@@ -721,7 +1260,7 @@ fn retail_dustbowl_computer_mcv() -> (
         .filter(|path| !path.trim().is_empty())
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
-            crate::util::config::GameConfig::load()
+            crate::test_fixture::game_config()
                 .expect("set RA2_DIR or provide config.toml for this ignored test")
                 .paths
                 .ra2_dir
@@ -733,17 +1272,19 @@ fn retail_dustbowl_computer_mcv() -> (
         resources,
     } = &mut scenario.runtime;
     let rules = &resources.rules;
-    sim.session.game_mode_nonzero = true;
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
     let owner = sim.interner.intern("Russians");
     let mut house =
         crate::sim::house_state::HouseState::new(owner, 1, Some(owner), false, 10_000, 10);
-    house.current_iq = rules.general.max_iq_levels;
-    sim.houses.insert(owner, house);
-    sim.session.house_order.push(owner);
+    house.set_current_iq_for_test(rules.general.max_iq_levels);
+    sim.houses.register(house);
 
-    let (width, height) = crate::rules::foundation::foundation_dimensions(
-        &rules.object("NACNST").expect("retail NACNST").foundation,
-    );
+    let (width, height) = rules
+        .object("NACNST")
+        .expect("retail NACNST")
+        .foundation
+        .dimensions();
     // Retail `[Clear]` and `[Rough]` both read `Buildable=yes`.
     let buildable = [
         crate::rules::terrain_rules::LandType::Clear.as_index(),
@@ -765,7 +1306,7 @@ fn retail_dustbowl_computer_mcv() -> (
                     terrain.cell(cx, cy).is_some_and(|cell| {
                         cell.level == level
                             && cell.slope_type == 0
-                            && buildable.contains(&cell.yr_cell_land_type)
+                            && buildable.contains(&cell.land_type)
                             && cell.terrain_object_occupation.is_none()
                             && !cell.has_bridge_deck
                             && !cell.bridge_facts.has_structural_bridge()
@@ -773,7 +1314,7 @@ fn retail_dustbowl_computer_mcv() -> (
                 })
             });
             let alone = sim.substrate.entities.values().all(|entity| {
-                entity.position.rx.abs_diff(x) > 5 || entity.position.ry.abs_diff(y) > 5
+                entity.position.rx().abs_diff(x) > 5 || entity.position.ry().abs_diff(y) > 5
             });
             if !site || !alone {
                 return None;
@@ -793,6 +1334,7 @@ fn retail_frame(scenario: &mut crate::headless_scenario::HeadlessScenario) {
             &[],
             crate::headless_scenario::SIM_TICK_MS,
             crate::sim::world::TickLane::Ordinary,
+            &mut crate::sim::world::FrameEffects::default(),
         )
         .expect("retail frame");
 }
@@ -802,8 +1344,8 @@ fn retail_yard_at(scenario: &crate::headless_scenario::HeadlessScenario) -> Opti
     sim.substrate
         .entities
         .values()
-        .find(|e| !e.dying && sim.interner.resolve(e.type_ref()) == "NACNST")
-        .map(|e| (e.position.rx, e.position.ry))
+        .find(|e| !e.death.is_dying() && sim.interner.resolve(e.type_ref()) == "NACNST")
+        .map(|e| (e.position.rx(), e.position.ry()))
 }
 
 /// A computer house's MCV on retail Dustbowl through the production frame.
@@ -818,7 +1360,7 @@ fn retail_dustbowl_a_computer_mcv_deploys_where_it_stands() {
     let (mut scenario, owner, mcv, (x, y)) = retail_dustbowl_computer_mcv();
     retail_frame(&mut scenario);
     let sim = scenario.sim();
-    assert!(sim.houses[&owner].ai_activation.auto_base_building);
+    assert!(sim.houses[&owner].ai_activation().auto_base_building);
     let mut frames = 1;
     while retail_yard_at(&scenario).is_none() && frames < 600 {
         retail_frame(&mut scenario);
@@ -830,8 +1372,13 @@ fn retail_dustbowl_a_computer_mcv_deploys_where_it_stands() {
         "after {frames} frames"
     );
     let sim = scenario.sim();
-    assert!(sim.substrate.entities.get(mcv).is_none_or(|e| e.dying));
-    assert_eq!(sim.houses[&owner].base_center, Some((x - 1, y - 1)));
+    assert!(
+        sim.substrate
+            .entities
+            .get(mcv)
+            .is_none_or(|e| e.death.is_dying())
+    );
+    assert_eq!(sim.houses[&owner].base_center(), Some((x - 1, y - 1)));
 }
 
 /// The deployed yard then builds from its House's BasePlan
@@ -855,17 +1402,17 @@ fn retail_dustbowl_the_computer_yard_places_its_planned_buildings() {
                 .entities
                 .values()
                 .filter(|e| {
-                    !e.dying
-                        && !e.lifecycle.in_limbo
+                    !e.death.is_dying()
+                        && !e.lifecycle.in_limbo()
                         && e.owner() == owner
-                        && e.category == crate::map::entities::EntityCategory::Structure
+                        && e.category() == crate::map::entities::EntityCategory::Structure
                         && sim.interner.resolve(e.type_ref()) != "NACNST"
                 })
                 .map(|e| {
                     (
                         e.stable_id(),
                         sim.interner.resolve(e.type_ref()).to_string(),
-                        (e.position.rx, e.position.ry),
+                        (e.position.rx(), e.position.ry()),
                     )
                 })
                 .collect();
@@ -893,8 +1440,8 @@ fn retail_dustbowl_the_computer_yard_places_its_planned_buildings() {
             );
             assert!(
                 house
-                    .base_plan
-                    .nodes
+                    .base_plan()
+                    .nodes()
                     .iter()
                     .any(|node| node.type_or_control == index && node.packed_cell == node_cell),
                 "frame {frames}: {building:?} stands on a node of its type"
@@ -932,15 +1479,15 @@ fn retail_dustbowl_the_computer_yard_places_a_base_defense() {
             .entities
             .values()
             .filter(|e| {
-                !e.dying
-                    && !e.lifecycle.in_limbo
+                !e.death.is_dying()
+                    && !e.lifecycle.in_limbo()
                     && e.owner() == owner
-                    && e.category == crate::map::entities::EntityCategory::Structure
+                    && e.category() == crate::map::entities::EntityCategory::Structure
             })
             .map(|e| {
                 (
                     sim.interner.resolve(e.type_ref()).to_string(),
-                    (e.position.rx, e.position.ry),
+                    (e.position.rx(), e.position.ry()),
                 )
             })
             .find(|(name, _)| defenses.iter().any(|id| id.eq_ignore_ascii_case(name)))
@@ -962,8 +1509,8 @@ fn retail_dustbowl_the_computer_yard_places_a_base_defense() {
         crate::sim::base_plan::pack_base_plan_cell(i32::from(cell.0), i32::from(cell.1));
     assert!(
         sim.houses[&owner]
-            .base_plan
-            .nodes
+            .base_plan()
+            .nodes()
             .iter()
             .any(|node| node.type_or_control == index && node.packed_cell == node_cell),
         "{name} at {cell:?} stands on a node of its type"
@@ -985,7 +1532,7 @@ fn retail_dustbowl_a_hard_computer_walls_its_yard() {
         .houses
         .get_mut(&owner)
         .expect("the computer house")
-        .difficulty = crate::sim::house_state::HouseDifficulty::Hard;
+        .set_difficulty_for_test(crate::sim::house_state::HouseDifficulty::Hard);
     let mut frames = 0;
     while retail_yard_at(&scenario).is_none() && frames < 600 {
         retail_frame(&mut scenario);
@@ -995,9 +1542,11 @@ fn retail_dustbowl_a_hard_computer_walls_its_yard() {
     let (yard, wall, overlay, mut ring) = {
         let resources = &scenario.runtime.resources;
         let rules = &resources.rules;
-        let (width, height) = crate::rules::foundation::foundation_dimensions(
-            &rules.object("NACNST").expect("retail NACNST").foundation,
-        );
+        let (width, height) = rules
+            .object("NACNST")
+            .expect("retail NACNST")
+            .foundation
+            .dimensions();
         let (x, y) = (i32::from(x), i32::from(y));
         let (right, bottom) = (x + i32::from(width), y + i32::from(height));
         let ring: Vec<u32> = (x - 1..=right)
@@ -1008,7 +1557,7 @@ fn retail_dustbowl_a_hard_computer_walls_its_yard() {
         let overlay = rules
             .object("NAWALL")
             .and_then(|ty| ty.to_overlay.as_deref())
-            .and_then(|name| resources.overlay_registry.id_for_name(name))
+            .and_then(|name| resources.rules.overlay_registry().id_for_name(name))
             .expect("retail NAWALL's overlay");
         (
             rules.building_type_index("NACNST").expect("retail NACNST"),
@@ -1019,7 +1568,7 @@ fn retail_dustbowl_a_hard_computer_walls_its_yard() {
     };
     ring.sort_unstable();
     let walls = |scenario: &crate::headless_scenario::HeadlessScenario| {
-        let nodes = &scenario.sim().houses[&owner].base_plan.nodes;
+        let nodes = scenario.sim().houses[&owner].base_plan().nodes();
         let first = nodes.iter().position(|node| node.type_or_control == wall)?;
         let cells: Vec<u32> = nodes[first..]
             .iter()
@@ -1094,12 +1643,12 @@ fn retail_dustbowl_a_computer_without_its_yard_sells_off_and_hunts() {
         tank
     };
     let timer = |scenario: &crate::headless_scenario::HeadlessScenario| {
-        scenario.sim().houses[&owner].strategy_timer
+        *scenario.sim().houses[&owner].strategy_timer()
     };
     let mut ticks = Vec::new();
     let mut frames = 0;
     let mut step = |scenario: &mut crate::headless_scenario::HeadlessScenario| {
-        let frame = scenario.sim().session.binary_frame as i32;
+        let frame = scenario.sim().session.binary_frame() as i32;
         let before = timer(scenario);
         retail_frame(scenario);
         let after = timer(scenario);
@@ -1112,7 +1661,7 @@ fn retail_dustbowl_a_computer_without_its_yard_sells_off_and_hunts() {
     // The yard stands and builds on.
     let owned_buildings = |scenario: &crate::headless_scenario::HeadlessScenario| {
         scenario.sim().houses[&owner]
-            .base_projection
+            .base_projection()
             .buildings()
             .len()
     };
@@ -1125,13 +1674,17 @@ fn retail_dustbowl_a_computer_without_its_yard_sells_off_and_hunts() {
         "no building after {frames} frames"
     );
     let sim = scenario.sim();
-    assert!(!sim.houses[&owner].strategy_emergency.all_to_hunt_bias);
+    assert!(!sim.houses[&owner].strategy_emergency().all_to_hunt_bias());
     let yard = sim
         .substrate
         .entities
         .values()
-        .find(|e| !e.dying && e.owner() == owner && sim.interner.resolve(e.type_ref()) == "NACNST")
-        .map(|e| (e.stable_id(), e.health.current))
+        .find(|e| {
+            !e.death.is_dying()
+                && e.owner() == owner
+                && sim.interner.resolve(e.type_ref()) == "NACNST"
+        })
+        .map(|e| (e.stable_id(), e.health.current()))
         .expect("the yard");
 
     // The yard goes, with no attacker (so no building attack is noted).
@@ -1155,13 +1708,18 @@ fn retail_dustbowl_a_computer_without_its_yard_sells_off_and_hunts() {
                 arg6: true,
             },
         );
-        sim.commit_direct_damage_receiver(&resources.rules, None, hit);
+        sim.commit_direct_damage_receiver(
+            &resources.rules,
+            None,
+            hit,
+            &mut crate::sim::world::FrameEffects::default(),
+        );
     }
-    let lost = scenario.sim().session.binary_frame as i32;
+    let lost = scenario.sim().session.binary_frame() as i32;
     let start = frames;
     while !scenario.sim().houses[&owner]
-        .strategy_emergency
-        .all_to_hunt_bias
+        .strategy_emergency()
+        .all_to_hunt_bias()
         && frames < start + 2000
     {
         step(&mut scenario);
@@ -1169,14 +1727,14 @@ fn retail_dustbowl_a_computer_without_its_yard_sells_off_and_hunts() {
     }
     let sim = scenario.sim();
     assert!(
-        sim.houses[&owner].strategy_emergency.all_to_hunt_bias,
+        sim.houses[&owner].strategy_emergency().all_to_hunt_bias(),
         "no sell-off {} frames after the yard's loss at frame {lost}",
         frames - start
     );
     let sold_at = *ticks.last().unwrap();
     assert!(sold_at > 900 && sold_at >= lost, "sold at frame {sold_at}");
     let left: Vec<u64> = sim.houses[&owner]
-        .base_projection
+        .base_projection()
         .buildings()
         .iter()
         .copied()
@@ -1184,18 +1742,13 @@ fn retail_dustbowl_a_computer_without_its_yard_sells_off_and_hunts() {
             sim.substrate
                 .entities
                 .get(id)
-                .is_some_and(|b| b.is_ai_alive() && !b.lifecycle.in_limbo)
+                .is_some_and(|b| b.is_ai_alive() && !b.lifecycle.in_limbo())
         })
         .collect();
     assert!(!left.is_empty(), "something to sell");
     for id in left {
         assert!(
-            sim.substrate
-                .entities
-                .get(id)
-                .unwrap()
-                .building_down
-                .is_some(),
+            sim.substrate.entities.get(id).unwrap().building_down(),
             "building {id} sells"
         );
     }

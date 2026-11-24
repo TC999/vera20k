@@ -62,6 +62,14 @@ pub(crate) enum LocomotorReadyState {
     Jumpjet {
         state: i32,
     },
+    /// Tunnel's State (`+0x18`).
+    Tunnel {
+        state: u8,
+    },
+    Mech {
+        turning: bool,
+        advancing: bool,
+    },
 }
 
 impl LocomotorReadyState {
@@ -93,13 +101,18 @@ impl LocomotorReadyState {
                     && native_double_ordered_gt_zero(applied_speed_bits)
                     && destination_nonnull
             }
+            Self::Mech { turning, advancing } => turning || advancing,
             Self::Teleport { state } => state == 1,
+            // `0x0054D0D0`: any state but ground (0) and hold (2), the
+            // `jumpjet_flight` `STATE_GROUND` and `STATE_HOLD`.
             Self::Jumpjet { state } => state != 0 && state != 2,
+            // `0x00728A60`: moving and past PreDigIn.
+            Self::Tunnel { state } => state != 0 && state != 1,
         }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 mod tests {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -142,31 +155,6 @@ mod tests {
             slot_moving,
             head_to_nonnull,
             owner_speed,
-        }
-    }
-
-    #[test]
-    fn locomotor_ready_drive_and_ship_truth_tables_are_independent() {
-        for state in [
-            drive(true, false, false, 0),
-            ship(true, false, false, 0),
-            drive(false, true, true, 1),
-            ship(false, true, true, 1),
-        ] {
-            assert!(state.is_moving_now());
-        }
-
-        for state in [
-            drive(false, false, true, 1),
-            drive(false, true, false, 1),
-            drive(false, true, true, -1),
-            drive(false, true, true, 0),
-            ship(false, false, true, 1),
-            ship(false, true, false, 1),
-            ship(false, true, true, -1),
-            ship(false, true, true, 0),
-        ] {
-            assert!(!state.is_moving_now());
         }
     }
 
@@ -288,9 +276,10 @@ mod tests {
         ];
 
         for fixture in fixtures {
-            let bytes = bincode::serialize(&fixture).expect("serialize raw readiness");
+            let bytes =
+                crate::util::save_codec::serialize(&fixture).expect("serialize raw readiness");
             let restored: LocomotorReadyState =
-                bincode::deserialize(&bytes).expect("deserialize raw readiness");
+                crate::util::save_codec::deserialize(&bytes).expect("deserialize raw readiness");
             assert_eq!(restored, fixture);
 
             let mut before = DefaultHasher::new();

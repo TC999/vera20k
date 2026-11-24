@@ -1,4 +1,5 @@
-//! The inland/mountainous extra pass: cliff repair, then a full region rebuild.
+//! The inland/mountainous extra pass: cliff repair, then a full region rebuild
+//! (`RandomMapGenerator::BridgeAndConnectorPass @ 0x0058EF10`, steps 2-5).
 //!
 //! Map types 3 and 4 run one more pass after the region partition. It repairs
 //! cliff lines by raising cells that are pinched between higher ground, and
@@ -12,39 +13,18 @@
 //!
 //! After this rebuild the pipeline hands the refreshed region-neighbour list to
 //! the active connector/low-deck owner in `carve_driver`; that separation keeps
-//! this module's only draw in the narrow dissolve case (see [`flood_build`]).
+//! this module's only draw, in the rebuild flood's narrow dissolve case.
 
-use crate::map::rmg::grid::RmgGrid;
-use crate::map::rmg::rng::RmgRng;
+use crate::map::rmg::grid::{CellRef, RmgGrid};
 use crate::map::rmg::scratch::RmgScratch;
 use crate::map::rmg::tiles::TileIds;
-use crate::map::rmg::x87::{self, TruncF64};
 
-use super::regions::{Regions, RmgRegion};
+use super::regions::{self, RegionCtx, Regions};
 
 /// One terrain step. Cliff lines are exactly this far apart, which is what
 /// makes "is my neighbour one step up" a test for equality rather than
 /// ordering.
 const LEVEL_STEP: u8 = 4;
-
-/// A blob at or below this many cells is not a region — it gets dissolved into
-/// a neighbouring plateau, or merged into an adjacent region.
-const SMALL_BLOB_CELLS: i32 = 0x4A;
-
-/// The uniform shape this subtree uses: `span · (1 + 2⁻³²) · 2⁻³²` folded into
-/// one constant, one multiply, truncate. Not interchangeable with the river
-/// family's `6/(2³²−1)` shape — the roundings differ.
-const UNIFORM_SCALE_BITS: u64 = 0x3DF0_0000_0010_0000;
-
-/// Everything the pass borrows.
-pub struct IslandCtx<'a> {
-    pub grid: &'a mut RmgGrid,
-    pub scratch: &'a mut RmgScratch,
-    pub ids: &'a TileIds,
-    pub rng: &'a mut RmgRng,
-    /// Level written to a dissolved blob when its chosen neighbour has none.
-    pub default_level: u8,
-}
 
 /// Higher-neighbour ring mask: bit set per direction whose neighbour sits
 /// **exactly** one terrain step above this cell and carries ordinary ground.
@@ -62,28 +42,31 @@ pub(crate) fn ring_mask(
     x: i32,
     y: i32,
 ) -> u8 {
-    if !scratch.in_diamond(x, y) || !scratch.get(x, y).shore_enable {
+    // Original579B70 reads signed Cell+11B, then acquires all eight
+    // neighbor pointers before classifying NW,N,NE,W,E,SW,S,SE. Retain the
+    // shared border identity rather than copying its changing coordinate.
+    let target = i32::from(grid.cell_native(x, y).level as i8) + 4;
+    if !scratch.in_diamond(x, y) || !scratch.shore_enable(x, y) {
         return 0;
     }
-    let Some(here) = grid.get(x, y) else {
-        return 0;
-    };
-    let target = here.level.wrapping_add(LEVEL_STEP);
-
-    let mut mask = 0u8;
-    for dir in 0..8usize {
+    let mut neighbors = [(CellRef::Border, (0, 0)); 8];
+    for dir in [1, 2, 3, 4, 5, 6, 7, 0] {
         let (nx, ny) = RmgGrid::step(x, y, dir);
+        let (nx, ny) = (i32::from(nx as i16), i32::from(ny as i16));
+        neighbors[dir] = (grid.cell_ref(nx, ny), (nx, ny));
+    }
+    let mut mask = 0;
+    for dir in [7, 0, 1, 6, 2, 5, 4, 3] {
+        let (held, (nx, ny)) = neighbors[dir];
         if !scratch.in_diamond(nx, ny) {
             continue;
         }
-        let cell = grid.cell_native(nx, ny);
-        if cell.level != target {
-            continue;
+        let cell = grid.ref_cell(held);
+        if i32::from(cell.level as i8) == target
+            && !ids.cliffs.is_special_terrain_tile(cell.tile, cell.sub_tile)
+        {
+            mask |= 1 << ((dir + 7) % 8);
         }
-        if ids.is_special_terrain(cell.tile, cell.sub_tile) {
-            continue;
-        }
-        mask |= 1u8 << ((dir + 7) % 8);
     }
     mask
 }
@@ -111,9 +94,7 @@ fn is_pinched(
     const W: u8 = 0x20;
     const NW: u8 = 0x40;
 
-    if mask & (N | W) == (N | W) && mask & (NE | SW) == (NE | SW) {
-        return true;
-    }
+    let mut pinched = mask & (N | W) == (N | W) && mask & (NE | SW) == (NE | SW);
     // The four trench tests, each against the opposite bit of the far cell.
     let trench = [
         (W, (x + 1, y), E),
@@ -122,21 +103,30 @@ fn is_pinched(
         (N, (x, y + 1), S),
     ];
     for (near, (fx, fy), far) in trench {
-        if mask & near != 0 && ring_mask(grid, scratch, ids, fx, fy) & far != 0 {
-            return true;
+        if mask & near != 0
+            && ring_mask(
+                grid,
+                scratch,
+                ids,
+                i32::from(fx as i16),
+                i32::from(fy as i16),
+            ) & far
+                != 0
+        {
+            pinched = true;
         }
     }
     if mask & (NE | SW) == (NE | SW)
         && (mask & (E | S) != (E | S) || mask & (N | W | NW) != 0)
         && (mask & (N | W) != (N | W) || mask & (E | SE | S) != 0)
     {
-        return true;
+        pinched = true;
     }
     if mask & (SE | NW) == (SE | NW)
         && (mask & (S | W) != (S | W) || mask & (N | NE | E) != 0)
         && (mask & (N | E) != (N | E) || mask & (S | SW | W) != 0)
     {
-        return true;
+        pinched = true;
     }
     // Eight two-bit corner patterns: a diagonal present with its flanking
     // cardinal absent.
@@ -150,7 +140,7 @@ fn is_pinched(
         (0x86, 0x84),
         (0xB0, 0x90),
     ];
-    PATTERNS.iter().any(|&(m, want)| mask & m == want)
+    pinched || PATTERNS.iter().any(|&(m, want)| mask & m == want)
 }
 
 /// Raise a pinched cell one step and recurse into its neighbours.
@@ -158,254 +148,90 @@ fn is_pinched(
 /// Raising removes the exact-one-step relation that set the bits, so the
 /// recursion terminates on its own. The region tag it writes is what forces
 /// the rebuild that follows.
-fn raise_pinched(ctx: &mut IslandCtx<'_>, x: i32, y: i32, tag: i32, depth: u32) {
-    // The original recurses without a depth limit and relies on the terrain
-    // converging. Ours keeps a ceiling so a malformed fixture cannot blow the
-    // stack; it is far above any reachable chain on a real map.
-    const MAX_DEPTH: u32 = 4096;
-    if depth > MAX_DEPTH || !ctx.scratch.in_diamond(x, y) {
-        return;
-    }
-    let mask = ring_mask(ctx.grid, ctx.scratch, ctx.ids, x, y);
-    const N: u8 = 0x80;
-    const E: u8 = 0x02;
-    const S: u8 = 0x08;
-    const W: u8 = 0x20;
-    let forced = mask & (N | S) == (N | S) || mask & (E | W) == (E | W);
-    if !forced && !is_pinched(ctx.grid, ctx.scratch, ctx.ids, x, y, mask) {
-        return;
-    }
-
-    let cell = ctx.grid.cell_native_mut(x, y);
-    cell.level = cell.level.wrapping_add(LEVEL_STEP);
-    ctx.scratch.get_mut(x, y).region = tag;
-
-    for dir in 0..8usize {
-        let (nx, ny) = RmgGrid::step(x, y, dir);
-        raise_pinched(ctx, nx, ny, tag, depth + 1);
-    }
-}
-
-/// The class flag that decides which cells a flood may join: the exact native
-/// WaterSet/shore/waterfall family or green. A flood only claims neighbours
-/// whose flag matches its seed's.
-fn is_class_cell(ids: &TileIds, tile: i32) -> bool {
-    ids.is_water_shore_or_waterfall(tile) || ids.is_green_lat(tile)
-}
-
-/// One uniform over `[0, span)`, redrawn while it lands at or above `span`.
-///
-/// The rejection cannot fire under the original's truncating rounding, but it
-/// costs nothing and is what the binary does.
-fn uniform_below(rng: &mut RmgRng, span: i32) -> i32 {
-    let scale = TruncF64::from_f64(f64::from_bits(UNIFORM_SCALE_BITS));
+pub(super) fn raise_pinched(
+    grid: &mut RmgGrid,
+    scratch: &mut RmgScratch,
+    ids: &TileIds,
+    x: i32,
+    y: i32,
+    tag: i32,
+) -> bool {
+    // Original579010 recursively visits directions0..7 and ignores child
+    // refusal. Explicit frames preserve that depth-first order without a
+    // host-stack limit that silently truncates a valid native chain.
+    let mut frames: Vec<(CellRef, usize)> = Vec::new();
+    let mut pending = Some((x, y));
     loop {
-        let value = x87::ftol(
-            TruncF64::from_f64(f64::from(rng.next_u32()))
-                .mul(TruncF64::from_f64(f64::from(span)))
-                .mul(scale)
-                .to_f64(),
-        );
-        if value < span {
-            return value;
-        }
-    }
-}
-
-/// Cells of `region` that touch a differently-owned cell, row-major.
-fn border_of(scratch: &RmgScratch, region: i32) -> Vec<(i32, i32)> {
-    let width = scratch.width() as i32;
-    let mut border = Vec::new();
-    for y in 0..width {
-        for x in 0..width {
-            if !scratch.in_diamond(x, y) || scratch.get(x, y).region != region {
-                continue;
-            }
-            for dir in 0..8usize {
-                let (nx, ny) = RmgGrid::step(x, y, dir);
-                if scratch.in_diamond(nx, ny) && scratch.get(nx, ny).region != region {
-                    border.push((x, y));
-                    break;
+        if let Some((cx, cy)) = pending.take() {
+            let held = grid.cell_ref(cx, cy);
+            let mask = ring_mask(grid, scratch, ids, cx, cy);
+            // All trench probes precede the final opposite-cardinal test.
+            let pinched = is_pinched(grid, scratch, ids, cx, cy, mask);
+            let forced = mask & 0x88 == 0x88 || mask & 0x22 == 0x22;
+            if forced || pinched {
+                let (tx, ty) = grid.ref_coord(held);
+                let owner = scratch.get(tx, ty).region;
+                if owner > 0 && owner != tag && tag != -1 {
+                    if frames.is_empty() {
+                        return false;
+                    }
+                } else {
+                    let cell = grid.ref_cell_mut(held);
+                    cell.level = cell.level.wrapping_add(LEVEL_STEP);
+                    scratch.get_mut(tx, ty).region = tag;
+                    frames.push((held, 0));
                 }
             }
         }
-    }
-    border
-}
-
-/// Repaint every cell of `from` to level `level`, releasing it to `to`.
-fn repaint(ctx: &mut IslandCtx<'_>, from: i32, to: i32, level: u8) {
-    let cells: Vec<(i32, i32)> = ctx.grid.native_cells().collect();
-    for &(x, y) in &cells {
-        if ctx.scratch.get(x, y).region != from {
+        let Some((held, next_dir)) = frames.last_mut() else {
+            return true;
+        };
+        if *next_dir == 8 {
+            frames.pop();
             continue;
         }
-        let slot = ctx.scratch.get_mut(x, y);
-        slot.region = to;
-        slot.water_region = false;
-        let cell = ctx.grid.cell_native_mut(x, y);
-        cell.tile = 0;
-        cell.sub_tile = 0;
-        cell.level = level;
+        let (px, py) = grid.ref_coord(*held);
+        let (nx, ny) = RmgGrid::step(px, py, *next_dir);
+        *next_dir += 1;
+        pending = Some((i32::from(nx as i16), i32::from(ny as i16)));
     }
-}
-
-/// Flood one region out from `seed`, or dissolve/merge it if it comes out too
-/// small.
-///
-/// Returns the region when one was built. The small-blob paths return `None`
-/// **without** consuming an id, which is exactly why the dissolve path can run
-/// more than once per rebuild: it leaves the counter at zero, so the next small
-/// land blob takes the same branch and draws again.
-fn flood_build(ctx: &mut IslandCtx<'_>, seed: (i32, i32), id: i32) -> Option<RmgRegion> {
-    let seed_cell = *ctx.grid.cell_native(seed.0, seed.1);
-    let waterish = is_class_cell(ctx.ids, seed_cell.tile);
-    let level = seed_cell.level;
-
-    // Claim-at-enqueue: `stamp` marks a cell as already considered, and it is
-    // written even for cells then rejected on level or class, so a rejected
-    // cell is never re-tested by this flood.
-    let mut stack = vec![seed];
-    let mut claimed = 0i32;
-    while let Some((x, y)) = stack.pop() {
-        {
-            let slot = ctx.scratch.get_mut(x, y);
-            slot.stamp = id;
-            slot.region = id;
-        }
-        claimed += 1;
-        for dir in 0..8usize {
-            let (nx, ny) = RmgGrid::step(x, y, dir);
-            if !ctx.scratch.in_diamond(nx, ny) {
-                continue;
-            }
-            {
-                let slot = ctx.scratch.get(nx, ny);
-                if slot.region != -1 || slot.stamp == id {
-                    continue;
-                }
-            }
-            ctx.scratch.get_mut(nx, ny).stamp = id;
-            let cell = *ctx.grid.cell_native(nx, ny);
-            if cell.level != level {
-                continue;
-            }
-            if is_class_cell(ctx.ids, cell.tile) == waterish {
-                stack.push((nx, ny));
-            }
-        }
-    }
-
-    if claimed > SMALL_BLOB_CELLS || waterish {
-        // A water blob is never dissolved, however small.
-        let count = ctx
-            .grid
-            .native_cells()
-            .filter(|&(x, y)| ctx.scratch.get(x, y).region == id)
-            .count() as i32;
-        return Some(RmgRegion::rebuilt(id, level, waterish, seed, count));
-    }
-
-    if id == 0 {
-        // Dissolve: pick one of this blob's own border cells at random, take a
-        // neighbouring plateau's level, and repaint the blob to it. This is the
-        // pass's only draw.
-        let border = border_of(ctx.scratch, id);
-        if border.is_empty() {
-            return None;
-        }
-        let pick = border[uniform_below(ctx.rng, border.len() as i32) as usize];
-        let pick_level = ctx.grid.cell_native(pick.0, pick.1).level;
-        let mut adopted = None;
-        for dir in 0..8usize {
-            let (nx, ny) = RmgGrid::step(pick.0, pick.1, dir);
-            if !ctx.scratch.in_diamond(nx, ny) {
-                continue;
-            }
-            let cell = *ctx.grid.cell_native(nx, ny);
-            if cell.level != pick_level && !ctx.ids.is_water_shore_or_waterfall(cell.tile) {
-                adopted = Some(cell.level);
-                break;
-            }
-        }
-        let level = adopted.unwrap_or(ctx.default_level);
-        repaint(ctx, id, -1, level);
-        return None;
-    }
-
-    // Merge: adopt the west neighbour's region, or the north one if west is off
-    // the map. If both are off, the blob becomes a region after all.
-    let west = (seed.0 - 1, seed.1);
-    let north = (seed.0, seed.1 - 1);
-    let host = if ctx.scratch.in_diamond(west.0, west.1) {
-        Some(west)
-    } else if ctx.scratch.in_diamond(north.0, north.1) {
-        Some(north)
-    } else {
-        None
-    };
-    let Some((hx, hy)) = host else {
-        let count = ctx
-            .grid
-            .native_cells()
-            .filter(|&(x, y)| ctx.scratch.get(x, y).region == id)
-            .count() as i32;
-        return Some(RmgRegion::rebuilt(id, level, waterish, seed, count));
-    };
-    let host_region = ctx.scratch.get(hx, hy).region;
-    let host_level = ctx.grid.cell_native(hx, hy).level;
-    repaint(ctx, id, host_region, host_level);
-    None
 }
 
 /// Run the pass. Only map types 3 and 4 reach it.
 ///
 /// Returns the rebuilt partition, which replaces the one the region phase
 /// produced.
-pub fn run(ctx: &mut IslandCtx<'_>) -> Regions {
+pub fn run(ctx: &mut RegionCtx<'_>) -> Regions {
     // Step 1: repair the cliff lines. The tag is the original's -1, which is
     // why its own foreign-zone bail can never fire from here.
     let cells: Vec<(i32, i32)> = ctx.grid.native_cells().collect();
     for &(x, y) in &cells {
-        raise_pinched(ctx, x, y, -1, 0);
+        let _ = raise_pinched(ctx.grid, ctx.scratch, ctx.ids, x, y, -1);
     }
 
-    // Step 2: the repair stomped region tags, so throw the partition away.
-    for &(x, y) in &cells {
-        let slot = ctx.scratch.get_mut(x, y);
-        slot.region = -1;
-        slot.stamp = -1;
-    }
+    // Step 2: the repair stomped region tags, so throw the partition away:
+    // every slot's +0x38 and +0x3C to -1.
+    ctx.scratch.reset_region_ids();
 
-    // Step 3: rebuild, seeding one flood per still-unowned cell in row-major
-    // order over the working grid.
+    // Step 3: rebuild with the partition's own flood, one per still-unowned
+    // slot in linear order.
     let mut rebuilt = Regions::default();
-    let width = ctx.scratch.width() as i32;
-    for y in 0..width {
-        for x in 0..width {
-            if !ctx.scratch.in_diamond(x, y) || ctx.scratch.get(x, y).region != -1 {
-                continue;
-            }
-            let id = rebuilt.id_counter;
-            if let Some(region) = flood_build(ctx, (x, y), id) {
-                rebuilt.list.push(region);
-                rebuilt.id_counter += 1;
-            }
-        }
-    }
+    regions::flood_unowned(ctx, &mut rebuilt);
     rebuilt
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod tests {
     use super::*;
-    use crate::map::rmg::tiles::SpecialTerrain;
+    use crate::map::rmg::rng::RmgRng;
+    use crate::map::theater::TheaterCliffRanges;
 
     fn ids() -> TileIds {
         TileIds {
             clear: 0,
             ramp_base: -1,
             ramp_smooth: -1,
+            slope_set_pieces: -1,
             rough: -1,
             sand: -1,
             green: 100,
@@ -421,7 +247,7 @@ mod tests {
             paved_roads: -1,
             paved_road_ends: -1,
             medians: -1,
-            special: SpecialTerrain::default(),
+            cliffs: TheaterCliffRanges::default(),
         }
     }
 
@@ -436,6 +262,53 @@ mod tests {
             cell.level = level;
         }
         (grid, scratch)
+    }
+
+    fn region_ctx<'a>(
+        grid: &'a mut RmgGrid,
+        scratch: &'a mut RmgScratch,
+        ids: &'a TileIds,
+        rng: &'a mut RmgRng,
+    ) -> RegionCtx<'a> {
+        RegionCtx {
+            grid,
+            scratch,
+            ids,
+            rng,
+            map_type: 3,
+            default_level: 4,
+        }
+    }
+
+    /// `FloodBuildRegion @ 0x0058C800`: a small first land blob whose border
+    /// pick finds no differently-levelled land neighbour is kept as region 0
+    /// (0x0058CC70 -> 0x0058CDF6) after its one draw, not repainted.
+    #[test]
+    fn a_small_blob_with_no_other_level_stays_a_region() {
+        let (mut grid, mut scratch) = harness(4);
+        let ids = ids();
+        // A land tile outside every water/shore/waterfall/green family; the
+        // default cliff ranges put a waterfall family at tile 0.
+        let mut land = 0;
+        for (x, y) in grid.native_cells().collect::<Vec<_>>() {
+            let cell = grid.get_mut(x, y).unwrap();
+            if y > 3 {
+                cell.tile = ids.water_base;
+            } else {
+                cell.tile = 300;
+                land += 1;
+            }
+        }
+        assert!((1..=0x4A).contains(&land));
+        let mut rng = RmgRng::new(1);
+        let mut ctx = region_ctx(&mut grid, &mut scratch, &ids, &mut rng);
+        let regions = run(&mut ctx);
+        assert_eq!(regions.list.len(), 2);
+        assert!(!regions.list[0].active);
+        assert_eq!(regions.list[0].cell_count, land);
+        let mut once = RmgRng::new(1);
+        once.next_u32();
+        assert_eq!(ctx.rng.next_u32(), once.next_u32(), "one dissolve draw");
     }
 
     #[test]
@@ -471,36 +344,20 @@ mod tests {
         // North and south both one step up: the unconditional arm.
         let (mut grid, mut scratch) = harness(4);
         let ids = ids();
-        let mut rng = RmgRng::new(1);
         grid.get_mut(40, 49).expect("native cell").level = 8;
         grid.get_mut(40, 51).expect("native cell").level = 8;
-        let mut ctx = IslandCtx {
-            grid: &mut grid,
-            scratch: &mut scratch,
-            ids: &ids,
-            rng: &mut rng,
-            default_level: 4,
-        };
-        raise_pinched(&mut ctx, 40, 50, -1, 0);
-        assert_eq!(ctx.grid.cell_native(40, 50).level, 8, "raised one step");
-        assert_eq!(ctx.scratch.get(40, 50).region, -1, "tag stamped");
+        let _ = raise_pinched(&mut grid, &mut scratch, &ids, 40, 50, -1);
+        assert_eq!(grid.cell_native(40, 50).level, 8, "raised one step");
+        assert_eq!(scratch.get(40, 50).region, -1, "tag stamped");
     }
 
     #[test]
     fn an_open_cell_is_left_alone() {
         let (mut grid, mut scratch) = harness(4);
         let ids = ids();
-        let mut rng = RmgRng::new(1);
         grid.get_mut(40, 49).expect("native cell").level = 8;
-        let mut ctx = IslandCtx {
-            grid: &mut grid,
-            scratch: &mut scratch,
-            ids: &ids,
-            rng: &mut rng,
-            default_level: 4,
-        };
-        raise_pinched(&mut ctx, 40, 50, -1, 0);
-        assert_eq!(ctx.grid.cell_native(40, 50).level, 4, "one high side only");
+        let _ = raise_pinched(&mut grid, &mut scratch, &ids, 40, 50, -1);
+        assert_eq!(grid.cell_native(40, 50).level, 4, "one high side only");
     }
 
     #[test]
@@ -516,18 +373,199 @@ mod tests {
         assert_eq!(before, probe.next_u32(), "probe tracks the generator");
 
         let mut rng = RmgRng::new(1);
-        let mut ctx = IslandCtx {
-            grid: &mut grid,
-            scratch: &mut scratch,
-            ids: &ids,
-            rng: &mut rng,
-            default_level: 4,
-        };
+        let mut ctx = region_ctx(&mut grid, &mut scratch, &ids, &mut rng);
         let regions = run(&mut ctx);
         assert_eq!(regions.list.len(), 1, "one flat region");
-        assert!(regions.list[0].cell_count > SMALL_BLOB_CELLS);
+        assert!(regions.list[0].cell_count > 0x4A);
         // No draw was consumed: the flood was never small.
         let mut fresh = RmgRng::new(1);
         assert_eq!(ctx.rng.next_u32(), fresh.next_u32(), "rebuild drew nothing");
+    }
+
+    /// Whole original `BridgeAndConnectorPass @ 0x0058EF10` calls from
+    /// `tools/rmg_oracle/bridge_pass.py` over declared terrains (not a
+    /// Generate prefix): the raise and rebuild here, then the production
+    /// connector/deck driver. Every changed cell, region owner, rebuilt
+    /// region, repair hut and the exit RNG state. Stock controls, run without
+    /// Ares.dll: Ares' bridge hooks (0x58FA51, 0x58FE7B, 0x58FBDD..0x5900F7)
+    /// change the deck validation and end coins.
+    #[test]
+    fn native_bridge_pass_controls() {
+        use super::super::carve::CarveCtx;
+        use super::super::carve_driver;
+        use super::super::cliff_native_tests::{blocks, native_state, ranges};
+        use crate::map::playfield::PlayfieldBounds;
+        use crate::map::rmg::RmgConstructionTrace;
+        use crate::map::rmg::grid::GridCell;
+        use serde_json::Value;
+
+        let doc = crate::test_fixture::json("tools/rmg_oracle/bridge_pass.json");
+        let int = |v: &Value| v.as_i64().unwrap() as i32;
+        let scene = &doc["scene"];
+        let size = int(&scene["size"]);
+        let (stride, low, high) = ((2 * size + 1) as usize, size, 3 * size);
+        let tile = |name: &str| int(&scene["tiles"][name]);
+        let identity = TileIds {
+            ramp_base: tile("ramp_base"),
+            slope_set_pieces: tile("slope_set_pieces"),
+            green: tile("green"),
+            green_lat: tile("green_lat"),
+            pave: tile("pave"),
+            water_base: tile("water"),
+            shore: tile("shore"),
+            misc_pave: tile("misc_pave"),
+            paved_roads: tile("paved_roads"),
+            paved_road_ends: tile("paved_road_ends"),
+            cliffs: ranges(doc, &Value::Null),
+            ..ids()
+        };
+        let tile_blocks = blocks(doc);
+        let generated = &scene["gen"];
+        let playfield = PlayfieldBounds::from_normalized_local_size(
+            size,
+            2,
+            5,
+            int(&generated[0]),
+            int(&generated[1]),
+        );
+        // Row-major in-diamond cells, the corpus's run order.
+        let probe = RmgGrid::new(stride, low, high);
+        let cells: Vec<(i32, i32)> = (0..stride as i32)
+            .flat_map(|y| (0..stride as i32).map(move |x| (x, y)))
+            .filter(|&(x, y)| probe.is_valid(x, y))
+            .collect();
+        assert_eq!(cells.len(), int(&scene["cell_count"]) as usize);
+        let expand = |runs: &Value| -> Vec<Vec<i32>> {
+            let mut out = Vec::new();
+            for run in runs.as_array().unwrap() {
+                let run = run.as_array().unwrap();
+                for _ in 0..int(&run[0]) {
+                    out.push(run[1..].iter().map(int).collect());
+                }
+            }
+            out
+        };
+        let state = |cell: &GridCell| {
+            vec![
+                cell.tile,
+                i32::from(cell.sub_tile),
+                i32::from(cell.level),
+                i32::from(cell.slope),
+                cell.overlay,
+                i32::from(cell.density),
+                i32::from(cell.occupied),
+            ]
+        };
+        let rows = doc["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 11);
+        for row in rows {
+            let input = &row["input"];
+            let context = input["id"].as_str().unwrap();
+            let mut grid = RmgGrid::new(stride, low, high);
+            let mut scratch = RmgScratch::new(stride, low, high);
+            scratch.reset_region_ids();
+            for (&(x, y), value) in cells.iter().zip(expand(&row["terrain"])) {
+                let cell = grid.get_mut(x, y).unwrap();
+                (cell.tile, cell.level, cell.sub_tile, cell.slope) =
+                    (value[0], value[1] as u8, 0, 0);
+            }
+            let border_before = state(grid.ref_cell(CellRef::Border));
+            let before: Vec<Vec<i32>> = cells
+                .iter()
+                .map(|&(x, y)| state(grid.get(x, y).unwrap()))
+                .collect();
+            let mut rng = RmgRng::new(input["seed"].as_u64().unwrap() as u16);
+            let regions = {
+                let mut ctx = RegionCtx {
+                    grid: &mut grid,
+                    scratch: &mut scratch,
+                    ids: &identity,
+                    rng: &mut rng,
+                    map_type: 3,
+                    default_level: 0,
+                };
+                run(&mut ctx)
+            };
+            let listed: Vec<[i32; 4]> = regions
+                .list
+                .iter()
+                .map(|r| {
+                    let count = super::super::adjacency::region_cell_count(&scratch, r.id);
+                    [r.id, count, i32::from(r.level), i32::from(r.active)]
+                })
+                .collect();
+            let mut structures = Vec::new();
+            let mut trace = RmgConstructionTrace::default();
+            let mut ctx = CarveCtx {
+                grid: &mut grid,
+                scratch: &mut scratch,
+                ids: &identity,
+                blocks: &tile_blocks,
+                rng: &mut rng,
+                playfield: &playfield,
+                ares: false,
+            };
+            carve_driver::connect_regions(
+                &mut ctx,
+                &regions,
+                int(&input["accessibility"]),
+                &mut structures,
+                &mut trace,
+            );
+            let native_listed: Vec<[i32; 4]> = row["listed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| std::array::from_fn(|i| int(&r[i])))
+                .collect();
+            assert_eq!(listed, native_listed, "{context}: rebuilt regions");
+            assert_eq!(regions.id_counter, int(&row["next_region_id"]), "{context}");
+            let changed: Vec<Vec<i32>> = cells
+                .iter()
+                .zip(&before)
+                .filter_map(|(&(x, y), was)| {
+                    let now = state(grid.get(x, y).unwrap());
+                    (&now != was).then(|| [vec![x, y], now].concat())
+                })
+                .collect();
+            let native_changed: Vec<Vec<i32>> = row["changed"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c.as_array().unwrap().iter().map(int).collect())
+                .collect();
+            assert_eq!(changed, native_changed, "{context}: cells");
+            let owners: Vec<Vec<i32>> = cells
+                .iter()
+                .map(|&(x, y)| vec![scratch.get(x, y).region])
+                .collect();
+            assert_eq!(owners, expand(&row["regions"]), "{context}: region owners");
+            let huts: Vec<[i32; 2]> = structures
+                .iter()
+                .map(|(name, x, y)| {
+                    assert_eq!(name, "CABHUT");
+                    [i32::from(*x), i32::from(*y)]
+                })
+                .collect();
+            let native_huts: Vec<[i32; 2]> = row["huts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| [int(&c[0]), int(&c[1])])
+                .collect();
+            assert_eq!(huts, native_huts, "{context}: repair huts");
+            let border = state(grid.ref_cell(CellRef::Border));
+            if row["dummy"].is_null() {
+                assert_eq!(border, border_before, "{context}: Dummy untouched");
+            } else {
+                let native: Vec<i32> = row["dummy"].as_array().unwrap().iter().map(int).collect();
+                assert_eq!(border, native, "{context}: Dummy");
+            }
+            assert_eq!(
+                rng.into_continuation().into_native_parts(),
+                native_state(doc, &row["rng_after"]).into_native_parts(),
+                "{context}: exit RNG"
+            );
+        }
     }
 }

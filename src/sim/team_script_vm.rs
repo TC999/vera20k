@@ -16,6 +16,7 @@
 //!   script step, with `Recalc`, `Calc_Center`, `Regroup`, the
 //!   under-strength retreat and a member's damage report.
 //! - `actions`: the script step and the ported script actions.
+//! - `super_actions`: the superweapon script actions 55 and 57.
 //! - `orders`: the member virtuals team code calls.
 //!
 //! Each submodule lists its residuals. The TeamType's Tag (`+0xD0`, created
@@ -29,17 +30,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::rules::locomotor_type::MovementZone;
 use crate::rules::object_type::ObjectCategory;
+use crate::rules::rule_policy::TeamLimitScope;
 use crate::rules::ruleset::{CountryIdx, GeneralRules};
 use crate::rules::team_ai_ini::TeamAiDefinitionSource;
 use crate::sim::intern::InternedId;
 use crate::sim::timer::CdTimer;
-use crate::util::native_x87::{NativeF64Bits, X87Chop53, X87Ordering};
+use crate::util::native_x87::{MaskedX87Chop53, MaskedX87Ordering, NativeF64Bits};
 
 mod actions;
+mod follow_friendlies;
+#[cfg(all(test, tests_sim_t_z))]
+mod follow_friendlies_tests;
 mod membership;
 mod orders;
 mod registry_install;
+mod reinforcements;
+mod super_actions;
 mod team_ai;
+
+#[cfg(all(test, tests_sim_t_z))]
+mod ground_strike_tests;
 
 /// One resolved ScriptType action record.
 ///
@@ -117,8 +127,32 @@ pub struct TeamTypeDefinition {
 
 /// The TeamType's other INI fields, beside the definition, and where it was
 /// defined.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamTypeIniMetadata {
+    /// ReadHouseType475540 called by6F1090; GetHouse6F2070 resolves it.
+    #[serde(default)]
+    house: Option<TeamTypeHouse>,
+    /// VeteranLevel(+A0), constructor default1; native reader6F1090.
+    #[serde(default = "one")]
+    veteran_level: i32,
+    /// Waypoint(+D4), constructor -1; ReadString64/FromLetters763690.
+    #[serde(default = "minus_one")]
+    waypoint: i32,
+    /// TeamType+B1, exact-case `UseTransportOrigin`: ctor6F0759 clears it;
+    /// ReadBool5295F0 at6F122F retains its current value, store6F1234.
+    /// Reinforcement65DBF9 selects TransportWaypoint instead of House edge.
+    #[serde(default)]
+    use_transport_origin: bool,
+    /// TeamType+D8, exact-case `TransportWaypoint`: ctor6F07A5 writes-1.
+    /// ReadString64 at6F1461 uses ToLetters763610(current) as default,
+    /// FromLetters763690 stores at6F1473 when the returned length is positive.
+    /// Fixed AIMD and map rereads share this same definition input owner.
+    #[serde(default = "minus_one")]
+    transport_waypoint: i32,
+    #[serde(default)]
+    full: bool,
+    #[serde(default)]
+    whiner: bool,
     /// `Max=` (`+0xB8`, constructor -1): a house's team limit of this type;
     /// negative is none.
     pub max_teams: i32,
@@ -137,6 +171,18 @@ pub struct TeamTypeIniMetadata {
     /// 0x006F1870`).
     #[serde(default = "minus_one")]
     group: i32,
+    /// TeamType+F2: `AvoidThreats=`; ctor6F07D9 clears it. ReadBool5295F0
+    /// at6F1386 retains the prior byte by default and stores6F138B. Foot
+    /// getter4DC760 returns1.0 for members of a type whose byte is set.
+    #[serde(default)]
+    avoid_threats: bool,
+    /// TeamType+B3: exact-case `OnTransOnly`; ctor6F0765 clears it.
+    /// ReadBool5295F0 at6F12CB retains the prior byte, stored6F12D0.
+    /// AddMember6EA58C..6EA5B0 restricts Tag inheritance to members whose
+    /// type has signed Passengers>0 only while this byte is set.
+    /// Executed reader/member controls: tools/spatial_oracle/team_creation.
+    #[serde(default)]
+    on_trans_only: bool,
     /// `Recruiter=` (`+0xA8`, ReadBool at `0x006F1249`): recruitment passes
     /// over the group filter.
     #[serde(default)]
@@ -151,7 +197,11 @@ pub struct TeamTypeIniMetadata {
     guard_slower: bool,
     /// `TransportsReturnOnUnload=` (`+0xF4`, ReadBool at `0x006F13EE`): a
     /// transport member keeps its ArchiveTarget as the script advances
-    /// (`0x006E9393`).
+    /// (`0x006E9393`); action 14 archives the loading cell there and action
+    /// 8 sends the unloaded transport out of the team to it. A transport its
+    /// riders fill ends action 14 on the no-transport arm unarchived, so
+    /// action 8 gives it no destination, as in every retail TeamType with the
+    /// key but the two Ivan teams.
     #[serde(default)]
     transports_return_on_unload: bool,
     /// `MindControlDecision=` (`+0xC0`, ReadInt at `0x006F1139`, constructor
@@ -166,11 +216,26 @@ pub struct TeamTypeIniMetadata {
     #[serde(default)]
     droppod: bool,
     /// `OnlyTargetHouseEnemy=` (`+0xF7`, ReadBool at `0x006F13D4`,
-    /// constructor 0 at `0x006F07F7`): action 0's scan takes only the
-    /// house's current enemy's objects.
+    /// constructor 0 at `0x006F07F7`): action 0's scan, and the building
+    /// actions 46 and 47 look for, take only the house's current enemy's.
     #[serde(default)]
     only_target_house_enemy: bool,
+    /// `Loadable=` (`+0xA4`, ReadBool at `0x006F115F`, constructor 0 at
+    /// `0x006F070B`): a member is a carrier the player's infantry may board
+    /// (`0x0051EDD8..0x0051EDED`). No retail TeamType sets it.
+    #[serde(default)]
+    loadable: bool,
     pub source: TeamAiDefinitionSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum TeamTypeHouse {
+    Country(CountryIdx),
+    PlayerAt(u8),
+}
+
+const fn one() -> i32 {
+    1
 }
 
 const fn minus_one() -> i32 {
@@ -180,11 +245,20 @@ const fn minus_one() -> i32 {
 impl Default for TeamTypeIniMetadata {
     fn default() -> Self {
         Self {
+            house: None,
+            veteran_level: 1,
+            waypoint: -1,
+            use_transport_origin: false,
+            transport_waypoint: -1,
+            full: false,
+            whiner: false,
             max_teams: -1,
             autocreate: false,
             are_team_members_recruitable: true,
             reinforce: false,
             group: -1,
+            avoid_threats: false,
+            on_trans_only: false,
             recruiter: false,
             annoyance: false,
             guard_slower: false,
@@ -192,6 +266,7 @@ impl Default for TeamTypeIniMetadata {
             mind_control_decision: 0,
             droppod: false,
             only_target_house_enemy: false,
+            loadable: false,
             source: TeamAiDefinitionSource::FixedAimd,
         }
     }
@@ -275,32 +350,39 @@ impl AiTriggerTrackRecord {
     ///   TrackRecordCoefficient))`, then `n` grows by one;
     ///
     /// where `n` is the attempts and `s` the successes (the adjustment is 0
-    /// while `n <= 0`), and `w'` is stored as a double and clamped: below
-    /// `min` it becomes `min`, above `max` it becomes `max`
-    /// (`TEST AH,0x41`, so an unordered compare keeps it).
-    fn record(&mut self, succeeded: bool, bounds: [NativeF64Bits; 2], rules: &TeamRules) {
-        type X = X87Chop53;
-        let load = |bits: NativeF64Bits| {
-            X::load_f64(bits).expect("AI trigger weights and Rules deltas are finite")
-        };
+    /// while `n <= 0`), and `w'` is stored as a double (`FST`) and clamped:
+    /// `w'` below `min` or unordered with it (`FCOMP`, `TEST AH,0x1`) becomes
+    /// `min`; the stored weight above `max` (`TEST AH,0x41`, so an unordered
+    /// compare keeps it) becomes `max`.
+    ///
+    /// Exceptions are masked: an infinite Rules double (the three keys are
+    /// ReadDouble into binary64, so about `1.8e308` and up, e.g. `1e309`, in
+    /// the INI), the infinite weight it gives and the NaN an infinity times
+    /// zero gives flow through the same instructions instead of trapping.
+    fn record(
+        &mut self,
+        succeeded: bool,
+        bounds: [NativeF64Bits; 2],
+        rules: &AiTriggerFeedbackRules,
+    ) {
+        type X = MaskedX87Chop53;
         let zero = X::load_i32(0);
         let mut adjustment = zero;
         if self.attempts > 0 {
             let attempts = X::load_i32(self.attempts);
-            let ratio =
-                X::div(X::load_i32(self.successes), attempts).expect("attempts is positive");
-            let mut record = X::sub(ratio, load(NativeF64Bits::HALF));
+            let ratio = X::div(X::load_i32(self.successes), attempts);
+            let mut record = X::sub(ratio, X::load_f64(NativeF64Bits::HALF));
             if !succeeded {
-                record = X::mul(record, load(rules.track_record_coefficient));
+                record = X::mul(record, X::load_f64(rules.track_record_coefficient));
             }
             let product = X::mul(attempts, record);
-            // `FCOM 0.0`: success keeps a product that is not below zero
-            // (`TEST AH,0x1`), failure one that is below or equal
-            // (`TEST AH,0x41`).
+            // `FCOM 0.0`: success keeps a product that is above or equal to
+            // zero (`TEST AH,0x1`), failure one that is below, equal or
+            // unordered (`TEST AH,0x41`).
             let keep = match X::compare(product, zero) {
-                X87Ordering::Less => !succeeded,
-                X87Ordering::Equal => true,
-                X87Ordering::Greater => succeeded,
+                MaskedX87Ordering::Equal => true,
+                MaskedX87Ordering::Greater => succeeded,
+                MaskedX87Ordering::Less | MaskedX87Ordering::Unordered => !succeeded,
             };
             if keep {
                 adjustment = product;
@@ -311,13 +393,20 @@ impl AiTriggerTrackRecord {
         } else {
             rules.failure_weight_delta
         };
-        let weight = X::add(X::add(load(delta), load(self.weight)), adjustment);
-        self.weight = X::store_f64(weight).expect("an AI trigger weight stays finite");
+        let weight = X::add(
+            X::add(X::load_f64(delta), X::load_f64(self.weight)),
+            adjustment,
+        );
+        self.weight = X::store_f64_masked_chop(weight);
         let [minimum, maximum] = bounds;
-        if X::compare(load(self.weight), load(minimum)) == X87Ordering::Less {
+        if matches!(
+            X::compare(weight, X::load_f64(minimum)),
+            MaskedX87Ordering::Less | MaskedX87Ordering::Unordered
+        ) {
             self.weight = minimum;
         }
-        if X::compare(load(self.weight), load(maximum)) == X87Ordering::Greater {
+        if X::compare(X::load_f64(self.weight), X::load_f64(maximum)) == MaskedX87Ordering::Greater
+        {
             self.weight = maximum;
         }
         if succeeded {
@@ -327,13 +416,9 @@ impl AiTriggerTrackRecord {
     }
 }
 
-/// What `TeamClass` reads beyond its own object: the game mode and the Rules
-/// keys of the empty-team dissolve and the AI trigger feedback.
+/// The Rules keys the team destructor reads for AI trigger feedback.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct TeamRules {
-    game_mode_nonzero: bool,
-    /// `[General] DissolveUnfilledTeamDelay=` (`Rules+0x1190`).
-    dissolve_unfilled_team_delay: i32,
+struct AiTriggerFeedbackRules {
     /// `[General] AITriggerSuccessWeightDelta=` (`Rules+0xC0`).
     success_weight_delta: NativeF64Bits,
     /// `[General] AITriggerFailureWeightDelta=` (`Rules+0xC8`).
@@ -342,11 +427,9 @@ pub(crate) struct TeamRules {
     track_record_coefficient: NativeF64Bits,
 }
 
-impl TeamRules {
-    pub(crate) fn new(general: &GeneralRules, game_mode_nonzero: bool) -> Self {
+impl AiTriggerFeedbackRules {
+    fn new(general: &GeneralRules) -> Self {
         Self {
-            game_mode_nonzero,
-            dissolve_unfilled_team_delay: general.dissolve_unfilled_team_delay,
             success_weight_delta: general.ai_trigger_success_weight_delta,
             failure_weight_delta: general.ai_trigger_failure_weight_delta,
             track_record_coefficient: general.ai_trigger_track_record_coefficient,
@@ -388,36 +471,28 @@ pub enum TeamAiInstallDiagnostic {
     },
 }
 
-impl TeamAiInstallDiagnostic {
-    pub(crate) fn source(&self) -> TeamAiDefinitionSource {
-        match self {
-            Self::UnknownTaskForceMember { source, .. }
-            | Self::MissingTeamTypeScript { source, .. }
-            | Self::MissingTeamTypeTaskForce { source, .. }
-            | Self::MissingAiTriggerTeamType { source, .. }
-            | Self::UnknownAiTriggerOwner { source, .. }
-            | Self::UnknownAiTriggerObject { source, .. } => *source,
-        }
-    }
-
-    pub(crate) fn is_fixed_source_refusal(&self) -> bool {
-        self.source() == TeamAiDefinitionSource::FixedAimd
-    }
-}
-
 /// A candidate member passed to a test seam's TaskForce admission.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamScriptMember {
     pub entity_id: u64,
     pub member_type: TeamMemberTypeIdentity,
 }
 
-/// The first unported action a team's script reached, kept for diagnostics.
-/// The team stays on it, running everything else `TeamClass::AI` does.
+/// The first action a team's script reached that VERA cannot run, kept for
+/// diagnostics. The team stays on it, running everything else
+/// `TeamClass::AI` does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TeamScriptRefusal {
-    UnsupportedAction { action_id: i32 },
+    UnsupportedAction {
+        action_id: i32,
+    },
+    /// An argument naming no type VERA can use, past the end of the native
+    /// array or without a definition.
+    InvalidArgument {
+        action_id: i32,
+        argument: i32,
+    },
 }
 
 /// One entry of a team's member list (`TeamClass+0x54`, linked through
@@ -435,9 +510,10 @@ pub struct TeamMember {
 
 /// An `AbstractClass*` a team keeps: its centre (`+0x34`), mission target
 /// (`+0x3C`) or move target (`+0x40`). A cell is the `CellClass` at those
-/// coordinates; natively an out-of-map lookup gives the shared dummy cell,
-/// whose coordinates a later miss restamps (not represented: no ported path
-/// takes a team off the map).
+/// coordinates. Invalid lookup tokens name the shared Dummy allocation;
+/// its live coordinate can change after another map miss. Native pointer
+/// comparisons use NavTargetRef::same_pointer; GetCoords uses the retained
+/// target-coordinate owner rather than coordinate equality or another lookup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TeamTarget {
     Cell { x: i16, y: i16 },
@@ -454,11 +530,30 @@ impl TeamTarget {
     }
 }
 
+impl From<crate::sim::combat::TargetKind> for TeamTarget {
+    /// A TarCom or ArchiveTarget (`+0x218`) as a team target.
+    fn from(target: crate::sim::combat::TargetKind) -> Self {
+        match target {
+            crate::sim::combat::TargetKind::Cell(x, y) => Self::Cell {
+                x: x as i16,
+                y: y as i16,
+            },
+            crate::sim::combat::TargetKind::Entity(id) => Self::Object(id),
+        }
+    }
+}
+
 /// Persistent `TeamClass` state (constructor `0x006E8A90`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TeamScriptState {
     id: u64,
     owner: InternedId,
+    /// Team+30, Script_Scout6EE800's selected House. Constructor6E8AB0
+    /// clears it; Load6EC51E..527 fixes its pointer. It persists across
+    /// action visits. Houses never retire during a Rust scenario; a new
+    /// scenario replaces both registries, so entity-u64 expiry cannot alias it.
+    #[serde(default)]
+    scout_house: Option<InternedId>,
     team_type_id: Option<InternedId>,
     task_force_id: Option<InternedId>,
     script_id: InternedId,
@@ -482,7 +577,7 @@ pub struct TeamScriptState {
     members: Vec<TeamMember>,
     /// `+0x88`: the members counted against each TaskForce entry, which
     /// `Add_Member` raises for the first entry of the member's type.
-    slot_counts: [i32; 6],
+    slot_counts: [i32; TASK_FORCE_SLOTS],
     /// `+0x84`: the team succeeded (script action 49). Its destruction then
     /// counts as its AI triggers' success.
     succeeded: bool,
@@ -492,6 +587,10 @@ pub struct TeamScriptState {
     created_frame: i32,
     /// `+0x7F`, IsMoving: the team has formed and runs its script.
     formed: bool,
+    /// +77, set by reinforcement creation65DD64. It permits a partial Team
+    /// to start and initiates every member at the formation slot6E91B5.
+    #[serde(default)]
+    forced_active: bool,
     /// `+0x79`, IsFullStrength: it has as many members as its TaskForce.
     full_strength: bool,
     /// `+0x7A`, IsUnderStrength. Constructor set.
@@ -528,12 +627,12 @@ impl TeamScriptState {
     /// been full (`+0x78`) or, in a multiplayer game, one whose age
     /// (`Frame - +0x50`, wrapping) is above `DissolveUnfilledTeamDelay=`
     /// (signed) is destroyed.
-    fn dissolves(&self, rules: &TeamRules, current_frame: i32) -> bool {
+    fn dissolves(&self, current_frame: i32, unfilled_team_timeout: Option<i32>) -> bool {
         self.members.is_empty()
             && (self.has_been_full
-                || (rules.game_mode_nonzero
-                    && current_frame.wrapping_sub(self.created_frame)
-                        > rules.dissolve_unfilled_team_delay))
+                || unfilled_team_timeout.is_some_and(|timeout| {
+                    current_frame.wrapping_sub(self.created_frame) > timeout
+                }))
     }
 
     pub fn owner(&self) -> InternedId {
@@ -544,6 +643,21 @@ impl TeamScriptState {
         self.team_type_id
     }
 
+    #[cfg(feature = "telemetry")]
+    pub(crate) fn task_force_id(&self) -> Option<InternedId> {
+        self.task_force_id
+    }
+
+    #[cfg(feature = "telemetry")]
+    pub(crate) fn under_strength(&self) -> bool {
+        self.under_strength
+    }
+
+    #[cfg(feature = "telemetry")]
+    pub(crate) fn is_suspended(&self) -> bool {
+        self.suspended
+    }
+
     pub fn script_id(&self) -> InternedId {
         self.script_id
     }
@@ -552,6 +666,7 @@ impl TeamScriptState {
         self.cursor
     }
 
+    #[cfg(test)]
     pub fn advance_pending(&self) -> bool {
         self.advance_pending
     }
@@ -561,11 +676,29 @@ impl TeamScriptState {
         self.members.iter().map(|member| member.id)
     }
 
+    /// The native Foot+5D8 successor, derived from this owner's member list.
+    /// Callers cache it before callbacks that can unlink the current member.
+    /// No second retained link list is stored or restored.
+    pub(super) fn next_member_after(&self, current: u64) -> Option<u64> {
+        self.members
+            .windows(2)
+            .find(|pair| pair[0].id == current)
+            .map(|pair| pair[1].id)
+    }
+
+    #[cfg(test)]
     pub fn member_count(&self) -> usize {
         self.members.len()
     }
 
-    #[cfg(test)]
+    /// Read-only observation of the existing TaskForce counting owner for
+    /// cross-module native destructor comparisons. It never mutates the Team.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) const fn taskforce_counts_for_test(&self) -> [i32; 6] {
+        self.slot_counts
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn response_suspension_state(&self) -> (bool, bool, bool, i32, i32) {
         (
             self.altered,
@@ -576,16 +709,25 @@ impl TeamScriptState {
         )
     }
 
+    #[cfg(test)]
     pub fn succeeded(&self) -> bool {
         self.succeeded
     }
 
+    #[cfg(test)]
     pub fn refusal(&self) -> Option<TeamScriptRefusal> {
         self.refusal
     }
 
+    #[cfg(any(test, feature = "telemetry"))]
     pub fn formed(&self) -> bool {
         self.formed
+    }
+
+    /// The team's mission target, for cross-module script tests.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn mission_target_for_test(&self) -> Option<TeamTarget> {
+        self.mission_target
     }
 
     pub(crate) const fn created_frame(&self) -> i32 {
@@ -595,9 +737,9 @@ impl TeamScriptState {
     /// The unit choosers' filter (`0x004FEC20..0x004FEC47`): a team still
     /// wants members while its TeamType is `Reinforce=` and it is not full
     /// (`+0x79`), or while it is neither forced (`+0x77`, which only
-    /// reinforcements set: none is ported) nor has been full (`+0x78`).
+    /// reinforcements set: `reinforcements.rs`) nor has been full (`+0x78`).
     pub(crate) const fn wants_members(&self, reinforce: bool) -> bool {
-        (reinforce && !self.full_strength) || !self.has_been_full
+        (reinforce && !self.full_strength) || (!self.forced_active && !self.has_been_full)
     }
 
     /// The selector's cancel test (`0x006F0E05..0x006F0E11`): the team is
@@ -606,6 +748,94 @@ impl TeamScriptState {
         !self.formed || self.reforming
     }
 }
+
+/// Each member's team, by member id (`FootClass+0x5D4`), as a map, with a
+/// bit per id beside it that says whether the map can hold that id.
+///
+/// VERA-only: every infantryman asks for its team on every step
+/// (`InfantryClass::AI 0x0051BE3E`), and most objects are in no team, so the
+/// bit answers "none" without walking the map. The map is the source of
+/// truth and all that is saved; [`Self::insert`] sets a bit, a removal
+/// leaves it set (a set bit only means "ask the map"), and a load rebuilds
+/// the bits. Debug builds under the live-read check compare each "none"
+/// with the map.
+#[derive(Debug, Clone, Default)]
+struct MemberTeams {
+    teams: BTreeMap<u64, u64>,
+    /// Bit `id` of word `id / 64`, for ids below [`Self::LISTED_IDS`].
+    listed: Vec<u64>,
+}
+
+impl MemberTeams {
+    /// Ids from here up are always asked of the map, so a stray huge id
+    /// cannot grow the bits without bound.
+    const LISTED_IDS: u64 = 1 << 24;
+
+    fn get(&self, id: &u64) -> Option<&u64> {
+        if *id < Self::LISTED_IDS
+            && self
+                .listed
+                .get((*id / 64) as usize)
+                .is_none_or(|word| word & (1 << (*id % 64)) == 0)
+        {
+            debug_assert!(
+                !crate::sim::touch_log::live_read_check_enabled() || !self.teams.contains_key(id),
+                "member {id} is in a team its bit does not list"
+            );
+            return None;
+        }
+        self.teams.get(id)
+    }
+
+    #[cfg(test)]
+    fn contains_key(&self, id: &u64) -> bool {
+        self.get(id).is_some()
+    }
+
+    fn insert(&mut self, id: u64, team: u64) -> Option<u64> {
+        self.list(id);
+        self.teams.insert(id, team)
+    }
+
+    fn remove(&mut self, id: &u64) -> Option<u64> {
+        self.teams.remove(id)
+    }
+
+    fn list(&mut self, id: u64) {
+        if id < Self::LISTED_IDS {
+            let word = (id / 64) as usize;
+            if self.listed.len() <= word {
+                self.listed.resize(word + 1, 0);
+            }
+            self.listed[word] |= 1 << (id % 64);
+        }
+    }
+}
+
+impl Serialize for MemberTeams {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.teams.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for MemberTeams {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let teams = BTreeMap::<u64, u64>::deserialize(deserializer)?;
+        let mut members = Self {
+            teams,
+            listed: Vec::new(),
+        };
+        let ids: Vec<u64> = members.teams.keys().copied().collect();
+        for id in ids {
+            members.list(id);
+        }
+        Ok(members)
+    }
+}
+
+/// The TaskForce entries a team counts (`TeamClass+0x88`, six dwords); the
+/// TaskForce reader (`rules::team_ai_ini`) reads keys 0 to 5 only.
+pub(crate) const TASK_FORCE_SLOTS: usize = 6;
 
 /// Owns resolved TeamType/TaskForce/ScriptType definitions and live TeamClass
 /// state.
@@ -618,8 +848,6 @@ pub struct TeamScriptVm {
     #[serde(default)]
     task_force_order: Vec<InternedId>,
     team_types: BTreeMap<InternedId, TeamTypeDefinition>,
-    #[serde(default)]
-    team_type_order: Vec<InternedId>,
     #[serde(default)]
     team_type_ini: BTreeMap<InternedId, TeamTypeIniMetadata>,
     #[serde(default)]
@@ -639,7 +867,7 @@ pub struct TeamScriptVm {
     /// head drop in [`Self::pointer_expired`]) change either, and it is saved
     /// with them.
     #[serde(default)]
-    member_team: BTreeMap<u64, u64>,
+    member_team: MemberTeams,
     /// Each object's team to rejoin (`TechnoClass+0x434`): a
     /// `RejoinTeamIfLimboed=` Foot's team as it LimboLaunches at an Infantry
     /// target (`TechnoClass::Fire @ 0x006FF7A3..0x006FF7E9`), which its
@@ -650,9 +878,34 @@ pub struct TeamScriptVm {
     /// destructor, not its Limbo or UnInit.
     #[serde(default)]
     rejoin_team: BTreeMap<u64, u64>,
+    /// Scratch for a script action's copy of a team's member ids
+    /// ([`Self::copy_members`]), kept so the walks allocate once
+    /// per match instead of once per team per step. Empty between walks;
+    /// saves and the state hash leave it out.
+    #[serde(skip)]
+    member_ids: Vec<u64>,
 }
 
 impl TeamScriptVm {
+    /// Team `team_id`'s member ids in list order (none for a missing team),
+    /// copied for a walk whose callbacks can change the list: a member's
+    /// join, move or death. The copy is the VM's scratch buffer, taken out
+    /// here; hand it back with [`Self::restore_member_ids`]. A walk reached
+    /// from inside another finds the scratch taken and makes its own copy.
+    pub(crate) fn copy_members(&mut self, team_id: u64) -> Vec<u64> {
+        let mut ids = std::mem::take(&mut self.member_ids);
+        if let Some(team) = self.teams.get(&team_id) {
+            ids.extend(team.members());
+        }
+        ids
+    }
+
+    /// Take back the buffer [`Self::copy_members`] lent, emptied.
+    pub(crate) fn restore_member_ids(&mut self, mut ids: Vec<u64>) {
+        ids.clear();
+        self.member_ids = ids;
+    }
+
     pub fn register_script(&mut self, definition: TeamScriptDefinition) {
         if !self.scripts.contains_key(&definition.id) {
             self.script_order.push(definition.id);
@@ -668,9 +921,6 @@ impl TeamScriptVm {
     }
 
     pub fn register_team_type(&mut self, definition: TeamTypeDefinition) {
-        if !self.team_types.contains_key(&definition.id) {
-            self.team_type_order.push(definition.id);
-        }
         self.team_type_ini.entry(definition.id).or_default();
         self.team_types.insert(definition.id, definition);
     }
@@ -698,35 +948,44 @@ impl TeamScriptVm {
     /// (`+0x50`, and the timers `+0x58`/`+0x64` start there with no time),
     /// its script (`0x006913C0`) before its first action.
     ///
-    /// RESIDUAL: the constructor's centre is the TeamType's `Waypoint=` cell
-    /// (`0x006E8D1A..0x006E8D58`); `Waypoint=` is not read, and no retail
-    /// AIMD TeamType sets one, so every team starts without a centre. The
-    /// TeamType's Tag (`+0xD0`, created by `0x006E4DE0`) is not ported either;
-    /// no retail TeamType names one.
     pub(crate) fn construct_team(
         &mut self,
         team_type_id: InternedId,
         owner: InternedId,
-        game_mode_nonzero: bool,
+        limit_scope: TeamLimitScope,
         current_frame: i32,
+        placement_scope_active: bool,
+        initial_zone: Option<TeamTarget>,
     ) -> Option<u64> {
-        let team_type = *self.team_types.get(&team_type_id)?;
-        if self.at_max_teams(team_type_id, owner, !game_mode_nonzero) {
+        if !placement_scope_active && self.at_max_teams(team_type_id, owner, limit_scope) {
             return None;
         }
+        self.construct_team_instance(team_type_id, owner, current_frame, initial_zone)
+    }
+
+    /// Sole Team6E8A90/Script6913C0 constructor. Reinforcement65DD30 calls
+    /// it directly; CreateTeam6F09C0 performs its limit gate first. Neither
+    /// Abstract-derived instance consumes Scenario's concrete Create_ID.
+    fn construct_team_instance(
+        &mut self,
+        team_type_id: InternedId,
+        owner: InternedId,
+        current_frame: i32,
+        initial_zone: Option<TeamTarget>,
+    ) -> Option<u64> {
+        let team_type = *self.team_types.get(&team_type_id)?;
         let id = self.next_team_id;
         self.next_team_id = self.next_team_id.wrapping_add(1);
-        self.teams.insert(
+        let mut team = TeamScriptState::new(
             id,
-            TeamScriptState::new(
-                id,
-                owner,
-                Some(team_type_id),
-                Some(team_type.task_force_id),
-                team_type.script_id,
-                current_frame,
-            ),
+            owner,
+            Some(team_type_id),
+            Some(team_type.task_force_id),
+            team_type.script_id,
+            current_frame,
         );
+        team.zone = initial_zone;
+        self.teams.insert(id, team);
         Some(id)
     }
 
@@ -735,7 +994,7 @@ impl TeamScriptVm {
     /// the team's outcome (`+0x84`: success, else failure; see
     /// [`AiTriggerTrackRecord::record`]). The destructor then removes the
     /// members and the team (`membership::destroy_team`).
-    fn record_trigger_outcome(&mut self, team_id: u64, rules: &TeamRules) {
+    fn record_trigger_outcome(&mut self, team_id: u64, rules: &AiTriggerFeedbackRules) {
         let Some(team) = self.teams.get(&team_id) else {
             return;
         };
@@ -757,8 +1016,15 @@ impl TeamScriptVm {
     }
 
     /// Live teams in TeamClass::Array order (their construction order).
-    pub(crate) fn teams_in_order(&self) -> impl Iterator<Item = &TeamScriptState> {
+    pub fn teams_in_order(&self) -> impl Iterator<Item = &TeamScriptState> {
         self.teams.values()
+    }
+
+    /// TeamType6F1F70: first live registry entry of this exact type, without
+    /// owner, member, formed, health or limbo filtering. Steam gamemd.
+    pub(crate) fn first_team_of_type(&self, id: InternedId) -> Option<&TeamScriptState> {
+        self.teams_in_order()
+            .find(|team| team.team_type_id() == Some(id))
     }
 
     pub(crate) fn team_type_definition(&self, id: InternedId) -> Option<&TeamTypeDefinition> {
@@ -767,18 +1033,19 @@ impl TeamScriptVm {
 
     /// Whether the TeamType's `Max=` (`+0xB8`; -1, none, for a TeamType
     /// without metadata), when not negative, is reached by `owner`'s teams of
-    /// the type (`0x005095D0`), or with `every_house` by every house's (the
+    /// the type (`0x005095D0`), or by every house's (the
     /// campaign's `+0xDC`).
     pub(crate) fn at_max_teams(
         &self,
         team_type_id: InternedId,
         owner: InternedId,
-        every_house: bool,
+        limit_scope: TeamLimitScope,
     ) -> bool {
         let max_teams = self
             .team_type_ini
             .get(&team_type_id)
             .map_or(-1, |metadata| metadata.max_teams);
+        let every_house = limit_scope == TeamLimitScope::AllHouses;
         max_teams >= 0
             && self
                 .teams
@@ -844,11 +1111,25 @@ impl TeamScriptVm {
         needed
     }
 
-    /// The TaskForce of TeamType `team_type_id`, if it resolved.
-    pub(crate) fn task_force_of(
+    /// TaskForce `id`'s entries; none for a TaskForce that did not resolve.
+    pub(crate) fn task_force_entries_of(&self, id: InternedId) -> &[TeamTaskForceEntry] {
+        self.task_forces
+            .get(&id)
+            .map_or(&[], |task_force| &task_force.entries)
+    }
+
+    /// Entry `index` of TaskForce `id`, for a walk whose body takes the
+    /// simulation.
+    pub(crate) fn task_force_entry(
         &self,
-        team_type_id: InternedId,
-    ) -> Option<&TeamTaskForceDefinition> {
+        id: InternedId,
+        index: usize,
+    ) -> Option<TeamTaskForceEntry> {
+        self.task_force_entries_of(id).get(index).copied()
+    }
+
+    /// The TaskForce of TeamType `team_type_id`, if it resolved.
+    pub fn task_force_of(&self, team_type_id: InternedId) -> Option<&TeamTaskForceDefinition> {
         let team_type = self.team_types.get(&team_type_id)?;
         self.task_forces.get(&team_type.task_force_id)
     }
@@ -873,6 +1154,16 @@ impl TeamScriptVm {
         self.teams.get(&id)
     }
 
+    /// Puts team `id` on script line `line` (0-based) as action 6 does
+    /// (`0x006E98AE`): its next step runs that line with `first` set.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn seek_line_for_test(&mut self, id: u64, line: i32) {
+        if let Some(team) = self.teams.get_mut(&id) {
+            team.cursor = line.wrapping_sub(1);
+            team.advance_pending = true;
+        }
+    }
+
     /// `entity_id`'s team (`FootClass+0x5D4`) and whether its TeamType is
     /// `IsBaseDefense=` (`+0xF6`).
     pub(crate) fn team_for_member(&self, entity_id: u64) -> Option<(u64, bool)> {
@@ -886,27 +1177,16 @@ impl TeamScriptVm {
         Some((team_id, is_base_defense))
     }
 
-    /// `0x006EC300`'s exits before its waypoint read: `member`'s team has
-    /// formed (`+0x7F`), its script cursor names an action (`0x006915D0`,
-    /// unsigned `cursor < count`) and that action is 3. Only then does the
-    /// original read the action's waypoint and ask whether it lies outside
-    /// the playfield (mode 1). VERA has no waypoint table in the
-    /// simulation, so callers must treat `true` as an unported read.
-    pub(crate) fn member_step_reads_waypoint(&self, member: u64) -> bool {
-        let Some(team) = self
-            .member_team
-            .get(&member)
-            .and_then(|id| self.teams.get(id))
-        else {
-            return false;
-        };
-        team.formed()
-            && self.script(team.script_id()).is_some_and(|script| {
-                script
-                    .actions
-                    .get(team.cursor() as u32 as usize)
-                    .is_some_and(|action| action.action_id == 3)
-            })
+    /// Data input to the shared Simulation6EC300 port. Native early exits
+    /// precede Scenario's signed packed waypoint read and Map578460(mode1).
+    fn team_step_waypoint(&self, team_id: u64) -> Option<i32> {
+        let team = self.teams.get(&team_id)?;
+        if !team.formed {
+            return None;
+        }
+        script_action_at(self.scripts.get(&team.script_id), team.cursor)
+            .filter(|action| action.action_id == 3)
+            .map(|action| action.argument)
     }
 
     /// `TechnoClass::Fire @ 0x006FF7A3..0x006FF7E9`: `entity_id` remembers
@@ -928,6 +1208,28 @@ impl TeamScriptVm {
         self.rejoin_team.retain(|_, team| *team != team_id);
     }
 
+    /// Latch TeamClass+0x82 for `entity_id`'s current team (Foot+0x5D4),
+    /// consumed by the empty-team event23 predicate. InfantryAI51BE3E..51BE52
+    /// writes it from retained playfield membership; Fly's latch also writes
+    /// it for retreating aircraft/passengers (`0x004CD59F`, `0x004CD5CC`).
+    pub(crate) fn mark_member_team_leaving_map(&mut self, entity_id: u64) {
+        if let Some(team) = self
+            .member_team
+            .get(&entity_id)
+            .and_then(|team_id| self.teams.get_mut(team_id))
+        {
+            team.leaving_map = true;
+        }
+    }
+
+    /// HasOccurred23 at71EEA9 scans Team+24, head+54 and leaving byte+82.
+    /// The Team owner supplies the same live query before Recalc destroys it.
+    pub(crate) fn has_empty_leaving_team(&self, team_type: Option<InternedId>) -> bool {
+        self.teams_in_order().any(|team| {
+            team.team_type_id == team_type && team.members.is_empty() && team.leaving_map
+        })
+    }
+
     /// The object's destructor: its team to rejoin goes with it.
     pub(crate) fn object_deleted(&mut self, entity_id: u64) {
         self.rejoin_team.remove(&entity_id);
@@ -939,6 +1241,53 @@ impl TeamScriptVm {
         let team_id = *self.member_team.get(&entity_id)?;
         self.team_types
             .get(&self.teams.get(&team_id)?.team_type_id?)
+    }
+
+    /// Foot4DC760's Team+24 -> TeamType+F2 gate, using the existing live
+    /// membership index. Leaving a team immediately removes this override;
+    /// the Foot's retained+530 coefficient remains its navigation owner's.
+    pub(crate) fn member_avoids_threats(&self, entity_id: u64) -> bool {
+        self.member_team
+            .get(&entity_id)
+            .and_then(|id| self.teams.get(id))
+            .and_then(|team| team.team_type_id)
+            .and_then(|id| self.team_type_ini.get(&id))
+            .is_some_and(|metadata| metadata.avoid_threats)
+    }
+
+    /// Infantry51EDD8's Team+24 -> TeamType+A4 gate: whether the team
+    /// `entity_id` belongs to has a `Loadable=` TeamType, `None` outside a
+    /// team.
+    pub(crate) fn member_team_loadable(&self, entity_id: u64) -> Option<bool> {
+        self.member_team
+            .get(&entity_id)
+            .and_then(|id| self.teams.get(id))
+            .and_then(|team| team.team_type_id)
+            .and_then(|id| self.team_type_ini.get(&id))
+            .map(|metadata| metadata.loadable)
+    }
+
+    /// The TeamType's `TransportsReturnOnUnload=` (`+0xF4`), false for a
+    /// team without one.
+    fn transports_return_on_unload(&self, team: &TeamScriptState) -> bool {
+        team.team_type_id
+            .and_then(|id| self.team_type_ini.get(&id))
+            .is_some_and(|metadata| metadata.transports_return_on_unload)
+    }
+
+    /// A restored save's TaskForces: a team indexes its slot counts by entry
+    /// position, so a saved TaskForce with more entries than
+    /// [`TASK_FORCE_SLOTS`] can only come from a damaged save. Members are
+    /// not required to be live: `PointerExpired` drops only a team's head.
+    pub(crate) fn validate_restored_task_forces(&self) -> Result<(), &'static str> {
+        if self
+            .task_forces
+            .values()
+            .any(|task_force| task_force.entries.len() > TASK_FORCE_SLOTS)
+        {
+            return Err("a TaskForce has more entries than a team has slots");
+        }
+        Ok(())
     }
 
     /// The team's TaskForce entries, none for a team without a TeamType.
@@ -993,6 +1342,30 @@ impl TeamScriptVm {
         Some(member)
     }
 
+    /// gamemd.exe Detach70D554..70D57B walks the live Team roster after the Techno
+    /// sweep, clearing only matching +3C/+40. Unlike AssignMissionTarget
+    /// 6E9050, it issues no member orders and preserves zone/membership.
+    pub(crate) fn detach_target(
+        &mut self,
+        target: TeamTarget,
+        terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
+    ) {
+        //70D562/70D577 compare Cell pointers too: fixed-stride aliases and
+        //different requests for the shared Dummy identify the same allocation.
+        let matches = |held: TeamTarget| {
+            crate::sim::components::NavTargetRef::from(held.target_kind())
+                .same_pointer(target.target_kind().into(), terrain)
+        };
+        for team in self.teams.values_mut().rev() {
+            if team.mission_target.is_some_and(matches) {
+                team.mission_target = None;
+            }
+            if team.focus.is_some_and(matches) {
+                team.focus = None;
+            }
+        }
+    }
+
     /// `TeamClass::PointerExpired @ 0x006EAE60` for every team, as the
     /// pointer-expired broadcast (`0x007258D0`) reaches each through its
     /// listener vector: a team forgets `expired` as its centre, closest
@@ -1000,9 +1373,11 @@ impl TeamScriptVm {
     /// the head of its list (a member leaves through `Remove_Member` first,
     /// so only a list the removal missed has it there). The team's own
     /// update is the only reader of what it clears, so the teams' place in
-    /// the listener order does not matter.
-    pub(crate) fn pointer_expired(&mut self, expired: u64, all: bool) {
+    /// the listener order does not matter. Answers whether any team named
+    /// `expired`.
+    pub(crate) fn pointer_expired(&mut self, expired: u64, all: bool) -> bool {
         let object = Some(TeamTarget::Object(expired));
+        let mut named = false;
         for team in self.teams.values_mut() {
             if all
                 && team
@@ -1010,24 +1385,40 @@ impl TeamScriptVm {
                     .first()
                     .is_some_and(|member| member.id == expired)
             {
+                named = true;
                 team.members.remove(0);
                 if self.member_team.get(&expired) == Some(&team.id) {
                     self.member_team.remove(&expired);
                 }
             }
             if team.focus == object {
+                named = true;
                 team.focus = None;
             }
             if team.mission_target == object {
+                named = true;
                 team.mission_target = None;
             }
             if team.zone == object {
+                named = true;
                 team.zone = None;
             }
             if team.closest_member == Some(expired) {
+                named = true;
                 team.closest_member = None;
             }
         }
+        named
+    }
+
+    /// The TeamType's authored initial waypoint (`Waypoint=`, `+0xD4`,
+    /// constructor -1): the letter index reinforcement action 7 and a
+    /// formed team's initial zone resolve through the Scenario's waypoint
+    /// table. `-1` when the type carries none.
+    pub fn team_type_waypoint(&self, team_type: InternedId) -> i32 {
+        self.team_type_ini
+            .get(&team_type)
+            .map_or(-1, |metadata| metadata.waypoint)
     }
 }
 
@@ -1045,6 +1436,7 @@ impl TeamScriptState {
         Self {
             id,
             owner,
+            scout_house: None,
             team_type_id,
             task_force_id,
             script_id,
@@ -1061,6 +1453,7 @@ impl TeamScriptState {
             refusal: None,
             created_frame: current_frame,
             formed: false,
+            forced_active: false,
             full_strength: false,
             under_strength: true,
             reforming: false,
@@ -1092,6 +1485,24 @@ impl TeamScriptState {
 }
 
 impl TeamScriptVm {
+    /// World-hash retention query. Team+34/+3C/+40 keep Abstract pointers;
+    /// later CalcCenter/CoordinateMove6EAEE0/6EBAD0 reads their live Cell+48.
+    /// Dummy bytes remain with their process/map owner, not in Team state.
+    pub(crate) fn retains_dummy_cell(
+        &self,
+        terrain: &crate::map::resolved_terrain::ResolvedTerrainGrid,
+    ) -> bool {
+        self.teams.values().any(|team| {
+            [team.zone, team.mission_target, team.focus]
+                .into_iter()
+                .flatten()
+                .any(|target| {
+                    target.target_kind().cell_identity(terrain)
+                        == Some(crate::map::cell_index::NativeCellIdentity::Dummy)
+                })
+        })
+    }
+
     /// Folds each team's creation frame and forming byte, the AI triggers
     /// whose track record left its registered state (tagged), and each team's
     /// recruitment state once it leaves its constructor values plus the
@@ -1104,9 +1515,31 @@ impl TeamScriptVm {
         for (id, team) in &self.teams {
             id.hash(hasher);
             team.team_type_id.hash(hasher);
+            // Retained type gates change the Foot getter and future member
+            // Tag admission. Definitions remain frozen map input; include
+            // active true gates with the surrounding Team identity, preserving
+            // the historical false-gate feed. This is VERA state hashing, not
+            // a claim that native ComputeCRC feeds these definition bytes.
+            if let Some(metadata) = team.team_type_id.and_then(|id| self.team_type_ini.get(&id)) {
+                if metadata.avoid_threats {
+                    b"team-avoid-threats-v1".hash(hasher);
+                }
+                if metadata.on_trans_only {
+                    b"team-on-trans-only-v1".hash(hasher);
+                }
+                if metadata.use_transport_origin || metadata.transport_waypoint != -1 {
+                    b"team-transport-origin-v1".hash(hasher);
+                    metadata.use_transport_origin.hash(hasher);
+                    metadata.transport_waypoint.hash(hasher);
+                }
+            }
             team.task_force_id.hash(hasher);
             team.script_id.hash(hasher);
             team.owner.hash(hasher);
+            if let Some(house) = team.scout_house {
+                b"team-scout-house-v1".hash(hasher);
+                house.hash(hasher);
+            }
             team.cursor.hash(hasher);
             team.advance_pending.hash(hasher);
             // The retired test-only wait counter, always 0.
@@ -1120,12 +1553,15 @@ impl TeamScriptVm {
             team.altered.hash(hasher);
             team.just_altered.hash(hasher);
             team.suspended.hash(hasher);
-            team.members().collect::<Vec<u64>>().hash(hasher);
+            hash_member_ids(team.members.len(), team.members(), hasher);
             // The retired target and per-type counts, always empty.
             None::<u64>.hash(hasher);
             Vec::<(TeamMemberTypeIdentity, u32)>::new().hash(hasher);
             team.created_frame.hash(hasher);
             team.formed.hash(hasher);
+            if team.forced_active {
+                b"team-forced-active-v1".hash(hasher);
+            }
             if team.recruitment_state_moved(current_frame) {
                 b"team-recruitment-v1".hash(hasher);
                 team.members.hash(hasher);
@@ -1171,7 +1607,7 @@ impl TeamScriptVm {
     /// A formed team without a TeamType, running `script_id` from its first
     /// action (cursor 0, already stepped), whose members are `members` in
     /// list order, all joined up.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn create_team(
         &mut self,
         owner: InternedId,
@@ -1207,7 +1643,7 @@ impl TeamScriptVm {
     /// `candidates` admitted in TaskForce-entry order, preserving input order
     /// within each type, listed in admission order and all initiated: the
     /// state after it formed and ran into its first action (cursor 0).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn create_team_from_type(
         &mut self,
         owner: InternedId,
@@ -1281,7 +1717,7 @@ pub(crate) fn member_type_identity(
     entity: &crate::sim::game_entity::GameEntity,
 ) -> TeamMemberTypeIdentity {
     use crate::map::entities::EntityCategory;
-    let category = match entity.category {
+    let category = match entity.category() {
         EntityCategory::Infantry => ObjectCategory::Infantry,
         EntityCategory::Unit => ObjectCategory::Vehicle,
         EntityCategory::Aircraft => ObjectCategory::Aircraft,
@@ -1303,7 +1739,7 @@ fn script_action_at(
 
 /// Puts `members`, all of the first one's type, in a team of that many whose
 /// TeamType has `Suicide=suicide` and `Aggressive=aggressive`, and returns it.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn join_team_for_test(
     sim: &mut crate::sim::world::Simulation,
     members: &[u64],
@@ -1353,16 +1789,93 @@ pub(crate) fn join_team_for_test(
     teams.create_team_from_type(owner, team_type_id, &candidates, 0)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_t_z))]
+mod firesale_retail_tests;
+#[cfg(all(test, tests_sim_t_z))]
+mod group_recruitment_tests;
+#[cfg(all(test, tests_sim_t_z))]
 mod oracle_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_t_z))]
+mod packed_cell_tests;
+#[cfg(all(test, tests_sim_t_z))]
+mod path_threat_input_tests;
+#[cfg(all(test, tests_sim_t_z))]
+mod recruit_candidates_tests;
+#[cfg(all(test, tests_sim_t_z))]
 mod recruit_oracle_tests;
+#[cfg(all(test, any(tests_sim_t_z, tests_sim_trigger)))]
+pub(crate) mod reinforcements_tests;
+#[cfg(all(test, tests_sim_t_z))]
+mod type_conversion_tests;
+#[cfg(all(test, tests_sim_t_z))]
+mod vera_only_distance_tests;
 
-#[cfg(test)]
+/// Hash `count` member ids as the `Vec<u64>` they were once copied into
+/// hashes: the count, then every id's bytes in one write. A team of up to
+/// [`INLINE_MEMBER_IDS`] members is laid out on the stack; a larger one, which
+/// no retail TaskForce makes, is laid out on the heap.
+fn hash_member_ids(count: usize, ids: impl Iterator<Item = u64>, hasher: &mut impl Hasher) {
+    count.hash(hasher);
+    if count <= INLINE_MEMBER_IDS {
+        let mut bytes = [0u8; INLINE_MEMBER_IDS * 8];
+        for (slot, id) in bytes.as_chunks_mut::<8>().0.iter_mut().zip(ids) {
+            *slot = id.to_ne_bytes();
+        }
+        hasher.write(&bytes[..count * 8]);
+    } else {
+        let bytes: Vec<u8> = ids.flat_map(u64::to_ne_bytes).collect();
+        hasher.write(&bytes);
+    }
+}
+
+/// VERA's own bound for [`hash_member_ids`]'s stack layout.
+const INLINE_MEMBER_IDS: usize = 64;
+
+#[cfg(all(test, tests_sim_t_z))]
 mod tests {
+    /// The member fold feeds the state hasher what hashing a `Vec<u64>` of
+    /// the members fed it, on either side of the stack layout's bound.
+    #[test]
+    fn member_ids_hash_as_their_vec() {
+        use std::hash::{Hash, Hasher};
+        for count in [0, 3, super::INLINE_MEMBER_IDS, super::INLINE_MEMBER_IDS + 1] {
+            let ids: Vec<u64> = (0..count as u64).map(|i| i * 0x0101_0101 + 7).collect();
+            let mut folded = crate::util::state_hasher::StateHasher::new();
+            super::hash_member_ids(count, ids.iter().copied(), &mut folded);
+            let mut copied = crate::util::state_hasher::StateHasher::new();
+            ids.hash(&mut copied);
+            assert_eq!(folded.finish(), copied.finish(), "{count} members");
+        }
+    }
+
+    /// The bits beside the member map answer "none" only for an id the map
+    /// does not hold: a removal leaves the bit, a load rebuilds the bits,
+    /// and an id past the bits is asked of the map.
+    #[test]
+    fn member_teams_answer_as_their_map_does() {
+        let mut members = super::MemberTeams::default();
+        let far = super::MemberTeams::LISTED_IDS + 5;
+        assert_eq!(members.get(&7), None);
+        members.insert(7, 100);
+        members.insert(700, 101);
+        members.insert(far, 102);
+        assert_eq!(members.get(&7), Some(&100));
+        assert_eq!(members.get(&8), None);
+        assert_eq!(members.get(&far), Some(&102));
+        assert_eq!(members.remove(&7), Some(100));
+        assert_eq!(members.get(&7), None);
+        let saved = serde_json::to_string(&members).unwrap();
+        assert_eq!(saved, serde_json::to_string(&members.teams).unwrap());
+        let loaded: super::MemberTeams = serde_json::from_str(&saved).unwrap();
+        assert_eq!(loaded.get(&700), Some(&101));
+        assert_eq!(loaded.get(&far), Some(&102));
+        assert_eq!(loaded.get(&7), None);
+    }
+
     use super::*;
     use std::collections::hash_map::DefaultHasher;
 
+    use crate::rules::rule_policy::RulePolicy;
     use crate::rules::ruleset::RuleSet;
     use crate::rules::team_ai_ini::TeamAiIniRegistry;
     use crate::sim::intern::StringInterner;
@@ -1377,7 +1890,7 @@ mod tests {
     /// `0x006EC300` reaches its waypoint read only for a formed team
     /// (`+0x7F`) whose cursor names action 3 (`0x006915D0`, unsigned).
     #[test]
-    fn member_step_reads_waypoint_follows_the_original_exits() {
+    fn team_step_waypoint_follows_the_original_exits() {
         let mut vm = TeamScriptVm::default();
         let script = InternedId::from_index(7);
         vm.register_script(TeamScriptDefinition {
@@ -1387,16 +1900,17 @@ mod tests {
         });
         let owner = InternedId::from_index(1);
         let team = vm.create_team(owner, script, vec![50], 0);
-        assert!(vm.member_step_reads_waypoint(50));
-        assert!(!vm.member_step_reads_waypoint(51), "not a team member");
+        assert_eq!(vm.team_step_waypoint(team), Some(0));
+        assert_eq!(vm.team_step_waypoint(team + 1), None, "not a team");
         vm.teams.get_mut(&team).unwrap().formed = false;
-        assert!(!vm.member_step_reads_waypoint(50), "a forming team exits");
+        assert_eq!(vm.team_step_waypoint(team), None, "a forming team exits");
         vm.teams.get_mut(&team).unwrap().formed = true;
         vm.teams.get_mut(&team).unwrap().cursor = 1;
-        assert!(!vm.member_step_reads_waypoint(50), "action 2 exits");
+        assert_eq!(vm.team_step_waypoint(team), None, "action 2 exits");
         vm.teams.get_mut(&team).unwrap().cursor = -1;
-        assert!(
-            !vm.member_step_reads_waypoint(50),
+        assert_eq!(
+            vm.team_step_waypoint(team),
+            None,
             "a negative cursor is a huge unsigned index"
         );
     }
@@ -1529,7 +2043,9 @@ mod tests {
         let mut vm = TeamScriptVm::default();
         register_team_type(&mut vm, team_type, Vec::new());
 
-        let team = vm.construct_team(team_type, owner, true, -19).unwrap();
+        let team = vm
+            .construct_team(team_type, owner, TeamLimitScope::PerHouse, -19, false, None)
+            .unwrap();
         let state = vm.team(team).unwrap();
         assert!(!state.has_been_full);
         assert!(state.under_strength && state.advance_pending && !state.formed);
@@ -1574,7 +2090,9 @@ mod tests {
         let team_type = InternedId::from_index(4);
         let mut vm = TeamScriptVm::default();
         register_team_type(&mut vm, team_type, Vec::new());
-        let team = vm.construct_team(team_type, owner, true, 0).unwrap();
+        let team = vm
+            .construct_team(team_type, owner, TeamLimitScope::PerHouse, 0, false, None)
+            .unwrap();
         let constructed = state_hash_at(&vm, 0);
 
         vm.teams.get_mut(&team).unwrap().zone = Some(TeamTarget::Cell { x: 3, y: 4 });
@@ -1620,16 +2138,16 @@ mod tests {
              [AITriggerTypes]\nAT=Trigger,TT1,British,2,4,E1,{comparison},40,10,40,1,0,1,0,TT2,1,0,1\n"
         ));
         let map = IniFile::from_str("[TaskForces]\n0=TF1\n[TF1]\n0=-2,E1\nGroup=9\n");
-        let registry = TeamAiIniRegistry::from_sources(&fixed, &map, true);
+        let registry =
+            TeamAiIniRegistry::from_sources(&fixed, &map, RulePolicy::stock_multiplayer());
         let mut interner = StringInterner::new();
         let (vm, diagnostics) = TeamScriptVm::from_ini_registry(&registry, &mut interner, &rules);
 
         assert!(diagnostics.is_empty());
         assert_eq!(vm.registry_counts(), (1, 1, 2, 1));
         assert_eq!(
-            vm.team_type_order()
-                .iter()
-                .map(|id| interner.resolve(*id))
+            crate::sim::trigger_runtime::RuntimeDefinitions::read_teams(&registry)
+                .team_type_ids()
                 .collect::<Vec<_>>(),
             ["TT1", "TT2"]
         );
@@ -1722,7 +2240,6 @@ mod tests {
         let encoded = serde_json::to_string(&vm).unwrap();
         let restored: TeamScriptVm = serde_json::from_str(&encoded).unwrap();
         assert_eq!(restored.registry_counts(), vm.registry_counts());
-        assert_eq!(restored.team_type_order(), vm.team_type_order());
         assert_eq!(restored.ai_trigger_order(), vm.ai_trigger_order());
         assert_eq!(
             restored.ai_trigger(interner.get("AT").unwrap()),
@@ -1779,7 +2296,11 @@ mod tests {
              AT2=Threshold up,UP,<all>,99,0,<none>,{comparison},1,1,1,1,0,1,0,<none>,1,1,1\n\
              AT3=Missing default,DEFAULTED,<all>,99,0,<none>,{comparison},1,1,1,1,0,1,0,<none>,1,1,1\n"
         ));
-        let registry = TeamAiIniRegistry::from_sources(&fixed, &IniFile::from_str(""), true);
+        let registry = TeamAiIniRegistry::from_sources(
+            &fixed,
+            &IniFile::from_str(""),
+            RulePolicy::stock_multiplayer(),
+        );
         let mut interner = StringInterner::new();
         let (vm, diagnostics) = TeamScriptVm::from_ini_registry(&registry, &mut interner, &rules);
 
@@ -1805,7 +2326,11 @@ mod tests {
             "an omitted TechLevel keeps the native constructor value in nonzero modes"
         );
 
-        let registry = TeamAiIniRegistry::from_sources(&fixed, &IniFile::from_str(""), false);
+        let registry = TeamAiIniRegistry::from_sources(
+            &fixed,
+            &IniFile::from_str(""),
+            RulePolicy::stock_campaign(),
+        );
         let mut interner = StringInterner::new();
         let (vm, diagnostics) = TeamScriptVm::from_ini_registry(&registry, &mut interner, &rules);
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
@@ -1861,7 +2386,11 @@ mod tests {
              [BUILDING_TF]\n0=1,BLD\n\
              [DUP_TF]\n0=1,DUP\n",
         );
-        let registry = TeamAiIniRegistry::from_sources(&fixed, &IniFile::from_str(""), true);
+        let registry = TeamAiIniRegistry::from_sources(
+            &fixed,
+            &IniFile::from_str(""),
+            RulePolicy::stock_multiplayer(),
+        );
         let mut interner = StringInterner::new();
         let (vm, diagnostics) = TeamScriptVm::from_ini_registry(&registry, &mut interner, &rules);
 
@@ -1982,7 +2511,11 @@ mod tests {
             "[AITriggerTypes]\n\
              AT=Duplicate,<none>,<all>,0,0,DUP,{comparison},1,1,1,1,0,1,0,<none>,1,1,1\n"
         ));
-        let registry = TeamAiIniRegistry::from_sources(&fixed, &IniFile::from_str(""), true);
+        let registry = TeamAiIniRegistry::from_sources(
+            &fixed,
+            &IniFile::from_str(""),
+            RulePolicy::stock_multiplayer(),
+        );
         let mut interner = StringInterner::new();
         let (vm, diagnostics) = TeamScriptVm::from_ini_registry(&registry, &mut interner, &rules);
 
@@ -2029,7 +2562,11 @@ mod tests {
              [ScriptTypes]\n0=FIRST_SCRIPT\n[FIRST_SCRIPT]\n0=2,0\n\
              [TaskForces]\n0=FIRST_TF\n[FIRST_TF]\n0=1,E1\n",
         );
-        let registry = TeamAiIniRegistry::from_sources(&fixed, &IniFile::from_str(""), true);
+        let registry = TeamAiIniRegistry::from_sources(
+            &fixed,
+            &IniFile::from_str(""),
+            RulePolicy::stock_multiplayer(),
+        );
         let mut interner = StringInterner::new();
         let (vm, diagnostics) = TeamScriptVm::from_ini_registry(&registry, &mut interner, &rules);
 
@@ -2072,7 +2609,11 @@ mod tests {
         .expect("minimal rules");
         let fixed =
             IniFile::from_str("[TaskForces]\n0=PARTIAL_TF\n[PARTIAL_TF]\n0=1,E1\n1=2,GHOST\n");
-        let registry = TeamAiIniRegistry::from_sources(&fixed, &IniFile::from_str(""), true);
+        let registry = TeamAiIniRegistry::from_sources(
+            &fixed,
+            &IniFile::from_str(""),
+            RulePolicy::stock_multiplayer(),
+        );
         let mut interner = StringInterner::new();
         let (vm, diagnostics) = TeamScriptVm::from_ini_registry(&registry, &mut interner, &rules);
 
@@ -2115,7 +2656,8 @@ mod tests {
              [TaskForces]\n0=LATER_TF\n1=EARLIER_TF\n\
              [EARLIER_TF]\n0=1,E1\n[LATER_TF]\n0=2,E1\n",
         );
-        let registry = TeamAiIniRegistry::from_sources(&fixed, &map, true);
+        let registry =
+            TeamAiIniRegistry::from_sources(&fixed, &map, RulePolicy::stock_multiplayer());
         let mut interner = StringInterner::new();
         let (vm, diagnostics) = TeamScriptVm::from_ini_registry(&registry, &mut interner, &rules);
 
@@ -2160,7 +2702,11 @@ mod tests {
              [ScriptTypes]\n0=FIRST_SCRIPT\n[FIRST_SCRIPT]\n0=2,0\n\
              [TaskForces]\n0=FIRST_TF\n[FIRST_TF]\n0=1,E1\n",
         );
-        let registry = TeamAiIniRegistry::from_sources(&fixed, &IniFile::from_str(""), true);
+        let registry = TeamAiIniRegistry::from_sources(
+            &fixed,
+            &IniFile::from_str(""),
+            RulePolicy::stock_multiplayer(),
+        );
         let mut interner = StringInterner::new();
         let (vm, diagnostics) = TeamScriptVm::from_ini_registry(&registry, &mut interner, &rules);
 
@@ -2197,7 +2743,11 @@ mod tests {
         .expect("minimal rules");
         let fixed =
             IniFile::from_str("[TeamTypes]\n0=ONLY\n[ONLY]\nScript=NONE\nTaskForce=<NONE>\n");
-        let registry = TeamAiIniRegistry::from_sources(&fixed, &IniFile::from_str(""), true);
+        let registry = TeamAiIniRegistry::from_sources(
+            &fixed,
+            &IniFile::from_str(""),
+            RulePolicy::stock_multiplayer(),
+        );
         let mut interner = StringInterner::new();
         let (vm, diagnostics) = TeamScriptVm::from_ini_registry(&registry, &mut interner, &rules);
 
@@ -2221,7 +2771,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires extracted retail rulesmd.ini and aimd.ini"]
+    #[ignore = "requires VERA20K_RETAIL_AIMD and VERA20K_RETAIL_RULESMD naming extracted retail INIs"]
     fn gsi_04_05_retail_aimd_installs_all_resolved_definitions_without_teams() {
         use crate::rules::ini_parser::IniFile;
 
@@ -2242,7 +2792,11 @@ mod tests {
         let aimd = IniFile::from_bytes(&aimd_bytes).expect("parse aimd.ini");
         let rules_ini = IniFile::from_bytes(&rules_bytes).expect("parse rulesmd.ini");
         let rules = RuleSet::from_ini(&rules_ini).expect("load retail rules");
-        let registry = TeamAiIniRegistry::from_sources(&aimd, &IniFile::from_str(""), true);
+        let registry = TeamAiIniRegistry::from_sources(
+            &aimd,
+            &IniFile::from_str(""),
+            RulePolicy::stock_multiplayer(),
+        );
         let mut interner = StringInterner::new();
         let (vm, diagnostics) = TeamScriptVm::from_ini_registry(&registry, &mut interner, &rules);
 
@@ -2263,8 +2817,8 @@ mod tests {
             12
         );
         let zone_rows = vm
-            .team_type_order()
-            .iter()
+            .team_types
+            .keys()
             .map(|id| {
                 let team_type = vm.team_type(*id).expect("ordered TeamType");
                 format!(
@@ -2320,7 +2874,9 @@ mod tests {
         let anti_nuke = vm
             .ai_trigger(interner.get("0CAD0DCC-G").expect("stock trigger identity"))
             .expect("resolved stock Allied Anti-Nuke trigger");
-        assert_eq!(anti_nuke.display_name, "Allied Anti-Nuke 1");
+        // AITrigger ReadINI41F5D3..41F60F preserves token0's authored space;
+        // original CRT strtok controls: tools/rules_oracle/ini_token_readers.
+        assert_eq!(anti_nuke.display_name, "Allied Anti-Nuke 1 ");
         assert_eq!(anti_nuke.owner, Some(TeamAiTriggerOwner::All));
         assert_eq!(anti_nuke.tokens[3], "9");
         assert_eq!(anti_nuke.threshold, 9);
@@ -2362,8 +2918,11 @@ mod tests {
             "every game-mode-nonzero retail AITrigger threshold must match the native oracle"
         );
 
-        let zero_mode_registry =
-            TeamAiIniRegistry::from_sources(&aimd, &IniFile::from_str(""), false);
+        let zero_mode_registry = TeamAiIniRegistry::from_sources(
+            &aimd,
+            &IniFile::from_str(""),
+            RulePolicy::stock_campaign(),
+        );
         let mut zero_mode_interner = StringInterner::new();
         let (zero_mode_vm, zero_mode_diagnostics) =
             TeamScriptVm::from_ini_registry(&zero_mode_registry, &mut zero_mode_interner, &rules);

@@ -1,5 +1,7 @@
 //! Foot4DBDF0 navigation coordinates and the active locomotor's retained head.
 //! Native witnesses: tools/spatial_oracle/foot_navigation_coordinate.{py,json}.
+//! Hover Head_To514D10 uses this same retained-head/null-current projection;
+//! locomotor_force_track.hover_mark_all executes it through the actual+9C caller.
 //! These are read projections; paths, selectors and lifecycle do not own them.
 
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
@@ -28,34 +30,21 @@ pub(super) fn current_coordinate(entity: &GameEntity) -> DriveCoord {
     }
 }
 
-/// Publish the integer displacement of an existing altitude controller without
-/// reinterpreting an exact owner coordinate as its ground baseline. Quantize
-/// each endpoint separately: the stored Object coordinate has integer leptons.
-pub(super) fn publish_altitude_change(
-    position: &mut crate::sim::components::Position,
-    previous: crate::util::fixed_math::SimFixed,
-    next: crate::util::fixed_math::SimFixed,
-) {
-    let before = previous.to_num::<i32>();
-    let after = next.to_num::<i32>();
-    let z = position.exact_z_leptons.map_or_else(
-        || {
-            super::ground_pose::position_world_coord(position)
-                .z
-                .wrapping_add(after)
-        },
-        |z| z.wrapping_sub(before).wrapping_add(after),
-    );
-    position.exact_z_leptons = Some(z);
-}
-
 /// Stored head, before the Head_To null fallback. AtCoord's handoff transform
 /// needs these original XY values even when Head_To resolves to current XYZ.
 pub(super) fn stored_head(entity: &GameEntity) -> Option<DriveCoord> {
     match entity.locomotor.as_ref()?.active_kind() {
-        LocomotorKind::Drive => entity.drive_locomotion.as_ref()?.head_to,
-        LocomotorKind::Ship => entity.ship_locomotion.as_ref()?.head_to,
-        LocomotorKind::Walk | LocomotorKind::Hover => entity.locomotor.as_ref()?.step_head(),
+        LocomotorKind::Drive => entity
+            .locomotor
+            .as_ref()?
+            .track_head(super::track_process::TrackFamily::Drive),
+        LocomotorKind::Ship => entity
+            .locomotor
+            .as_ref()?
+            .track_head(super::track_process::TrackFamily::Ship),
+        LocomotorKind::Walk | LocomotorKind::Mech | LocomotorKind::Hover => {
+            entity.locomotor.as_ref()?.step_head()
+        }
         _ => None,
     }
 }
@@ -66,9 +55,9 @@ pub(super) fn navigation_coordinate(
 ) -> Result<DriveCoord, String> {
     // Foot+684 is tested before dereferencing the locomotor, even on a row
     // awaiting Uninit. Tube+28 is the exit, not the retained transit target.
-    if let Some(state) = entity.low_bridge_tube_state {
+    if let Some(state) = entity.active_tube() {
         let tube = terrain
-            .and_then(|grid| grid.tube(state.tube_id))
+            .and_then(|grid| grid.tube(state.tube_id()))
             .ok_or("Foot coordinate references a missing active TubeClass")?;
         return Ok(DriveCoord {
             x: i32::from(tube.exit.0 as i16) * 256 + 128,
@@ -82,7 +71,11 @@ pub(super) fn navigation_coordinate(
         .ok_or("Foot coordinate requires an active locomotor")?;
     let current = current_coordinate(entity);
     match loco.active_kind() {
-        LocomotorKind::Drive | LocomotorKind::Ship | LocomotorKind::Walk | LocomotorKind::Hover => {
+        LocomotorKind::Drive
+        | LocomotorKind::Ship
+        | LocomotorKind::Walk
+        | LocomotorKind::Mech
+        | LocomotorKind::Hover => {
             // The owner installs constructor-default Drive/Ship storage
             // lazily as None. This is a null retained head, not a missing
             // active locomotor. Original constructors 4AF540/69EC50 and
@@ -90,8 +83,11 @@ pub(super) fn navigation_coordinate(
             // see tools/spatial_oracle/foot_bridge_layer.{json,md}.
             Ok(head_or_current(stored_head(entity), current))
         }
-        // Fly/Rocket/Teleport share +18/55ACA0: copy linked Object+9C.
-        LocomotorKind::Teleport | LocomotorKind::Fly | LocomotorKind::Rocket => Ok(current),
+        // Fly/Rocket/Teleport/Tunnel share +18/55ACA0: copy linked Object+9C.
+        LocomotorKind::Teleport
+        | LocomotorKind::Fly
+        | LocomotorKind::Rocket
+        | LocomotorKind::Tunnel => Ok(current),
         LocomotorKind::Jumpjet => {
             let state = loco
                 .jumpjet_runtime()
@@ -102,7 +98,37 @@ pub(super) fn navigation_coordinate(
 }
 
 impl Simulation {
-    pub(crate) fn foot_navigation_coordinate(&self, id: u64) -> Result<DriveCoord, String> {
+    /// `FootClass::ShouldBeOnBridge @ 0x004DDC40` with false: in a Tube the
+    /// Location itself, otherwise the navigation coordinate (vt+0x4C)
+    /// against the Location ([`super::ground_pose::navigation_should_be_on_bridge`]).
+    pub(crate) fn foot_should_be_on_bridge(&self, id: u64) -> Result<bool, String> {
+        let entity = self
+            .substrate
+            .entities
+            .get(id)
+            .ok_or("Foot bridge owner disappeared")?;
+        let terrain = self
+            .resolved_terrain
+            .as_ref()
+            .ok_or("ShouldBeOnBridge requires map cells")?;
+        let cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
+        let current = super::ground_pose::position_world_coord(&entity.position);
+        let in_tube = entity.active_tube().is_some();
+        let navigation = if in_tube {
+            current
+        } else {
+            self.foot_navigation_coordinate(id)?
+        };
+        super::ground_pose::navigation_should_be_on_bridge(
+            &cells,
+            navigation,
+            current,
+            entity.on_bridge(),
+            in_tube,
+        )
+    }
+
+    pub fn foot_navigation_coordinate(&self, id: u64) -> Result<DriveCoord, String> {
         let entity = self
             .substrate
             .entities
@@ -110,8 +136,19 @@ impl Simulation {
             .ok_or("Foot coordinate owner disappeared")?;
         navigation_coordinate(entity, self.resolved_terrain.as_ref())
     }
+
+    /// The object's own coordinate ([`current_coordinate`]), altitude
+    /// included.
+    pub(crate) fn foot_current_coordinate(&self, id: u64) -> Result<DriveCoord, String> {
+        let entity = self
+            .substrate
+            .entities
+            .get(id)
+            .ok_or("Foot coordinate owner disappeared")?;
+        Ok(current_coordinate(entity))
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 #[path = "foot_coordinate_tests.rs"]
 mod tests;

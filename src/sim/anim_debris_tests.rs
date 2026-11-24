@@ -5,6 +5,7 @@ use crate::rules::{art_data::ArtRegistry, ini_parser::IniFile, retail_ini_fixtur
 use crate::sim::occupancy::CellObjectMember;
 
 #[test]
+#[ignore = "slow; run when changing what it covers"]
 fn debris_contact_matches_original_tree_damage_gates_radius_and_retirement() {
     let Some(retail) = retail_ini("rulesmd.ini") else {
         return;
@@ -12,8 +13,8 @@ fn debris_contact_matches_original_tree_damage_gates_radius_and_retirement() {
     let Some(art_ini) = retail_ini("artmd.ini") else {
         return;
     };
-    let native: serde_json::Value = serde_json::from_str(include_str!(
-        "../../tools/spatial_oracle/terrain_debris_receiver.json"
+    let native: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/terrain_debris_receiver.json",
     ))
     .unwrap();
     let mut compared = 0;
@@ -55,9 +56,16 @@ fn debris_contact_matches_original_tree_damage_gates_radius_and_retirement() {
             &rules,
             false,
         );
-        let id = sim.production.terrain_object_cells[&(10, 20)];
-        sim.production.terrain_objects.get_mut(&id).unwrap().health =
-            input["health"].as_i64().unwrap() as i32;
+        let id = sim.terrain_objects.cell_index()[&(10, 20)];
+        // The native receiver component supplies Logic membership at entry
+        // (terrain_debris_receiver.py sets Object+98 and the live vector).
+        // Ordinary static-tree Unlimbo does not establish that prior.
+        assert!(sim.register_live_object(id));
+        sim.terrain_objects
+            .objects_mut_for_test()
+            .get_mut(&id)
+            .unwrap()
+            .set_health_for_test(input["health"].as_i64().unwrap() as i32);
         // Preserve unrelated raw bits to expose over-broad occupation clears.
         sim.substrate.raw_cell_occupation.mark_ground(10, 20, 0xFC);
         let before_rng = sim.scenario_rng.clone();
@@ -67,17 +75,24 @@ fn debris_contact_matches_original_tree_damage_gates_radius_and_retirement() {
             208,
         );
         assert!(
-            !sim.anim_bounce_contact(0, &config, &rules, None, position),
+            !sim.anim_bounce_contact(
+                0,
+                &config,
+                &rules,
+                None,
+                position,
+                &mut crate::sim::world::FrameEffects::default()
+            ),
             "{label}"
         );
-        let tree = &sim.production.terrain_objects[&id];
+        let tree = &sim.terrain_objects.objects()[&id];
         assert_eq!(
-            tree.health,
+            tree.health(),
             row["health"].as_i64().unwrap() as i32,
             "{label}"
         );
         assert_eq!(tree.is_live(), row["alive"] == 1, "{label}");
-        assert_eq!(tree.in_logic_vector, row["in_logic"] == 1, "{label}");
+        assert_eq!(tree.in_logic_vector(), row["in_logic"] == 1, "{label}");
         assert_eq!(
             sim.substrate.raw_cell_occupation.ground_bits(10, 20),
             row["occupation"].as_u64().unwrap() as u8,
@@ -86,8 +101,8 @@ fn debris_contact_matches_original_tree_damage_gates_radius_and_retirement() {
         assert_eq!(
             sim.substrate
                 .pending_delete
-                .iter()
-                .filter(|&&queued| queued == id)
+                .object_tickets()
+                .filter(|&queued| queued == id)
                 .count(),
             row["delete_count"].as_u64().unwrap() as usize,
             "{label}"

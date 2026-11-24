@@ -1,8 +1,42 @@
-//! Building447E90 (+4C), GetDockCoord447B20 (+A8) and their live inputs.
-//! Full native receiver corpus: tools/spatial_oracle/building_navigation_coordinate.*.
+//! Building447E90 (+4C), GetDockCoord447B20 (+A8), GetExitCoords44F640 (+B4).
+//! Native receivers: tools/spatial_oracle/building_navigation_coordinate.*;
+//! ExitCoords: tools/spatial_oracle/anytown_damage/unit_unlimbo.*.
 use crate::rules::object_type::ObjectType;
 use crate::sim::components::DriveCoord;
 use crate::sim::radio::Contacts;
+
+///The one foundation exit-track point shared by Building ClearBib449540
+///and Mission_Unload44DCDD..44DD38. Type+ED4 element10 supplies both signed
+///cell words; native subtracts one from X, centres XY and sets requested Z0.
+///This is distinct from the configured ExitCoord used by object Unlimbo.
+pub(crate) fn factory_exit_track_coordinate(
+    current: DriveCoord,
+    object: &ObjectType,
+) -> DriveCoord {
+    let (dx, dy) = crate::sim::docking::building_dock::foundation_exit_pair(&object.foundation, 10)
+        .expect("every native foundation exit row retains30 pair slots");
+    let x = ((current.x / 256) as i16)
+        .wrapping_add(dx as i16)
+        .wrapping_sub(1);
+    let y = ((current.y / 256) as i16).wrapping_add(dy as i16);
+    DriveCoord {
+        x: i32::from(x) * 256 + 128,
+        y: i32::from(y) * 256 + 128,
+        z: 0,
+    }
+}
+
+/// A war factory's exit Cell: the Cell of its Location (`+0x9C`, signed
+/// truncation) plus (4, 1). Mission_Unload sends a product whose active
+/// locomotor is neither Drive, Teleport nor Tunnel there (`0x0044DF1C`), and
+/// Unit Assign_Destination's WeaponsFactory arm lets only that destination
+/// through (`0x00742D98..0x00742DFD`).
+pub(crate) fn war_factory_exit_cell(location: DriveCoord) -> (u16, u16) {
+    (
+        ((location.x / 256) as i16).wrapping_add(4) as u16,
+        ((location.y / 256) as i16).wrapping_add(1) as u16,
+    )
+}
 
 /// Read the destination's type, physical coordinate, center and sparse contact
 /// slots at the call boundary. The requester coordinate is read only for Bunker;
@@ -64,7 +98,7 @@ pub(crate) fn dock_coordinate(
         );
         //447C44 rounds the full DirStruct to a byte before quadrant selection.
         // A high-byte truncation or sign-only quadrant differs near the axes.
-        let direction = ((u32::from(facing) >> 7) + 1) >> 1 & 0xFF;
+        let direction = crate::util::direction_tables::round_facing16_to_8(facing);
         return Ok(DriveCoord {
             x: center
                 .x
@@ -100,6 +134,25 @@ pub(crate) fn dock_coordinate(
     })
 }
 
-#[cfg(test)]
+/// BuildingClass::GetExitCoords44F640, virtual+B4. A nonempty ExitCoord adds
+/// to physical Location at44F678..44F6AA. The constructor's missing vector and
+/// an explicit all-zero vector call the existing GetCoords+48 owner at44F6BC.
+/// Native execution: anytown_damage/unit_unlimbo's factory_exit_coordinate_rows.
+pub(crate) fn exit_coordinate(
+    current: DriveCoord,
+    object: &ObjectType,
+    centre: impl FnOnce() -> DriveCoord,
+) -> DriveCoord {
+    let Some((x, y, z)) = object.exit_coord.filter(|&coord| coord != (0, 0, 0)) else {
+        return centre();
+    };
+    DriveCoord {
+        x: current.x.wrapping_add(x),
+        y: current.y.wrapping_add(y),
+        z: current.z.wrapping_add(z),
+    }
+}
+
+#[cfg(all(test, tests_sim_movement))]
 #[path = "building_coordinate_tests.rs"]
 mod tests;

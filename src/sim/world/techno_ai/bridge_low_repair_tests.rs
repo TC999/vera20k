@@ -19,8 +19,8 @@ fn export_scene(scene: &HeadlessScenario, phase: &str) {
             Some(json!({
                 "coord":[x,y], "tile":cell.final_tile_index,
                 "subtile":cell.final_sub_tile, "level":cell.level,
-                "slope":cell.slope_type, "land":cell.yr_cell_land_type,
-                "base_land":cell.base_yr_cell_land_type,
+                "slope":cell.slope_type, "land":cell.land_type,
+                "base_land":cell.base_land_type,
                 "zone_type":cell.zone_type,
                 "bridge":cell.bridge_facts,
                 "ground_walk_blocked":cell.ground_walk_blocked,
@@ -32,11 +32,11 @@ fn export_scene(scene: &HeadlessScenario, phase: &str) {
     let entities: Vec<Value> = sim
         .entities()
         .values()
-        .filter(|e| (110..=121).contains(&e.position.rx) && (50..=68).contains(&e.position.ry))
+        .filter(|e| (110..=121).contains(&e.position.rx()) && (50..=68).contains(&e.position.ry()))
         .map(|e| json!({"type":sim.resolve(e.type_ref()), "entity":e}))
         .collect();
     let result = json!({
-        "phase":phase, "frame":sim.session.binary_frame,
+        "phase":phase, "frame":sim.session.binary_frame(),
         "map_hash":format!("{:016x}",scene.map.ini.content_hash()),
         "rules_hash":format!("{:016x}",scene.runtime.resources.rules.simulation_config_hash()),
         "theater":scene.map.header.theater,
@@ -54,7 +54,7 @@ fn export_scene(scene: &HeadlessScenario, phase: &str) {
     }
     eprintln!(
         "SHRAPNEL_BOUNDARY {phase} frame{}",
-        sim.session.binary_frame
+        sim.session.binary_frame()
     );
 }
 
@@ -72,8 +72,17 @@ fn retail_shrapnel_engineer_repairs_authored_water_gap() {
             .unwrap()
             .cell(x, 59)
             .unwrap();
-        assert_eq!(cell.bridge_facts.overlay_id, Some(101));
-        assert_eq!(cell.yr_cell_land_type, LandType::Water.as_index());
+        assert_eq!(
+            scene
+                .sim()
+                .overlay_grid
+                .as_ref()
+                .unwrap()
+                .cell(x, 59)
+                .overlay_id,
+            Some(101)
+        );
+        assert_eq!(cell.land_type, LandType::Water.as_index());
         assert!(!cell.bridge_facts.has_structural_bridge());
     }
     let runtime = &mut scene.runtime;
@@ -83,11 +92,11 @@ fn retail_shrapnel_engineer_repairs_authored_water_gap() {
         .values()
         .find_map(|entity| {
             (runtime.simulation.resolve(entity.type_ref()) == "CABHUT"
-                && (entity.position.rx, entity.position.ry) == (117, 56))
+                && (entity.position.rx(), entity.position.ry()) == (117, 56))
                 .then_some(entity.stable_id())
         })
         .unwrap();
-    let owner = runtime.simulation.session.current_house.unwrap();
+    let owner = runtime.simulation.session.current_house().unwrap();
     let owner_name = runtime.simulation.resolve(owner).to_owned();
     let engineer = runtime
         .simulation
@@ -102,7 +111,7 @@ fn retail_shrapnel_engineer_repairs_authored_water_gap() {
         .expect("ordinary Engineer placement on the hut's bank");
     let command = CommandEnvelope::new(
         owner,
-        runtime.simulation.session.tick + 1,
+        runtime.simulation.session.tick() + 1,
         Command::CaptureBuilding {
             engineer_id: engineer,
             target_building_id: hut,
@@ -127,12 +136,7 @@ fn retail_shrapnel_engineer_repairs_authored_water_gap() {
             approach_snapshot = Some(save_scene(&scene, "Shrapnel Engineer approaching hut"));
         }
         let actor = scene.sim().entities().get(engineer);
-        assert!(
-            !actor
-                .and_then(|e| e.movement_target.as_ref())
-                .is_some_and(|m| m.adapter_route)
-        );
-        if actor.is_none_or(|entity| !entity.lifecycle.object_alive) {
+        if actor.is_none_or(|entity| !entity.lifecycle.object_alive()) {
             consumed = true;
             eprintln!("SHRAPNEL_ENGINEER consumed after {} frames", frame + 1);
             break;
@@ -152,11 +156,16 @@ fn retail_shrapnel_engineer_repairs_authored_water_gap() {
             .cell(x, 59)
             .unwrap();
         assert!(
-            cell.bridge_facts
+            scene
+                .sim()
+                .overlay_grid
+                .as_ref()
+                .unwrap()
+                .cell(x, 59)
                 .overlay_id
                 .is_some_and(|overlay| (83..=86).contains(&overlay))
         );
-        assert_eq!(cell.yr_cell_land_type, LandType::Road.as_index());
+        assert_eq!(cell.land_type, LandType::Road.as_index());
         assert!(!cell.bridge_facts.has_structural_bridge());
     }
     let repaired_snapshot = save_scene(&scene, "Shrapnel low bridge repaired");
@@ -195,7 +204,7 @@ fn retail_shrapnel_engineer_repairs_authored_water_gap() {
                 .unwrap()
                 .cell(x, 59)
                 .unwrap();
-            assert_eq!(cell.yr_cell_land_type, LandType::Road.as_index());
+            assert_eq!(cell.land_type, LandType::Road.as_index());
             assert!(!cell.bridge_facts.has_structural_bridge());
         }
         cross_repaired_road(&mut scene);
@@ -204,7 +213,7 @@ fn retail_shrapnel_engineer_repairs_authored_water_gap() {
 
 fn cross_repaired_road(scene: &mut HeadlessScenario) {
     let runtime = &mut scene.runtime;
-    let owner = runtime.simulation.session.current_house.unwrap();
+    let owner = runtime.simulation.session.current_house().unwrap();
     let owner_name = runtime.simulation.resolve(owner).to_owned();
     let fv = runtime
         .simulation
@@ -215,17 +224,16 @@ fn cross_repaired_road(scene: &mut HeadlessScenario) {
             55,
             0,
             &runtime.resources.rules,
-            &runtime.resources.overlay_registry,
+            runtime.resources.rules.overlay_registry(),
         )
         .expect("ordinary FV on the north road");
     let command = CommandEnvelope::new(
         owner,
-        runtime.simulation.session.tick + 1,
+        runtime.simulation.session.tick() + 1,
         Command::Move {
             entity_id: fv,
             target_rx: 115,
             target_ry: 63,
-            queue: false,
         },
     );
     let mut crossed_gap = false;
@@ -242,20 +250,16 @@ fn cross_repaired_road(scene: &mut HeadlessScenario) {
             .unwrap();
         let actor = runtime.simulation.entities().get(fv).unwrap();
         assert!(
-            !actor.on_bridge,
+            !actor.on_bridge(),
             "low road must not create raised-deck occupation"
         );
         assert!(actor.low_bridge_tube_state.is_none());
-        assert!(
-            !actor
-                .movement_target
-                .as_ref()
-                .is_some_and(|target| target.adapter_route)
-        );
-        crossed_gap |= (114..=116).contains(&actor.position.rx) && actor.position.ry == 59;
-        if (actor.position.rx, actor.position.ry) == (115, 63) && actor.movement_target.is_none() {
+        crossed_gap |= (114..=116).contains(&actor.position.rx()) && actor.position.ry() == 59;
+        if (actor.position.rx(), actor.position.ry()) == (115, 63)
+            && crate::sim::movement::motion_query::is_moving(&actor) != Some(true)
+        {
             assert!(crossed_gap, "the FV must physically cross the repaired row");
-            assert_eq!(actor.position.exact_z_leptons, Some(208));
+            assert_eq!(actor.position.exact_z_leptons(), Some(208));
             assert!(
                 runtime
                     .simulation
@@ -272,10 +276,10 @@ fn cross_repaired_road(scene: &mut HeadlessScenario) {
 #[test]
 #[ignore = "physical Shrapnel naval head meeting ordinary Engineer repair"]
 fn retail_shrapnel_repair_reaches_moving_water_neighbor() {
-    use crate::sim::world::{LifecycleOutput, LifecycleTestEvent, TickLane};
+    use crate::sim::world::{LifecycleTestEvent, TickLane};
 
-    let head_native: Value = serde_json::from_str(include_str!(
-        "../../../../tools/spatial_oracle/naval_head_producer.json"
+    let head_native: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/naval_head_producer.json",
     ))
     .unwrap();
     let head_input = &head_native["input"];
@@ -285,8 +289,8 @@ fn retail_shrapnel_repair_reaches_moving_water_neighbor() {
         .iter()
         .find(|stage| stage["stage"] == "process")
         .unwrap()["state"];
-    let corpus: Value = serde_json::from_str(include_str!(
-        "../../../../tools/spatial_oracle/naval_lifetime_cleanup.json"
+    let corpus: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/naval_lifetime_cleanup.json",
     ))
     .unwrap();
     let native = corpus["cases"]
@@ -298,8 +302,8 @@ fn retail_shrapnel_repair_reaches_moving_water_neighbor() {
                 && row["input"]["moving_input"] == true
         })
         .unwrap();
-    let sink: Value = serde_json::from_str(include_str!(
-        "../../../../tools/spatial_oracle/naval_sink_tick.json"
+    let sink: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/naval_sink_tick.json",
     ))
     .unwrap();
     let suffix = |name| {
@@ -320,7 +324,7 @@ fn retail_shrapnel_repair_reaches_moving_water_neighbor() {
     let mut scene = loaded_shrapnel();
     let pristine = scene.sim().resolved_terrain.as_ref().unwrap().clone();
     let runtime = &mut scene.runtime;
-    let owner = runtime.simulation.session.current_house.unwrap();
+    let owner = runtime.simulation.session.current_house().unwrap();
     let owner_name = runtime.simulation.resolve(owner).to_owned();
     let hut = runtime
         .simulation
@@ -328,7 +332,7 @@ fn retail_shrapnel_repair_reaches_moving_water_neighbor() {
         .values()
         .find_map(|entity| {
             (runtime.simulation.resolve(entity.type_ref()) == "CABHUT"
-                && (entity.position.rx, entity.position.ry) == (117, 56))
+                && (entity.position.rx(), entity.position.ry()) == (117, 56))
                 .then_some(entity.stable_id())
         })
         .unwrap();
@@ -352,7 +356,7 @@ fn retail_shrapnel_repair_reaches_moving_water_neighbor() {
             59,
             64,
             &runtime.resources.rules,
-            &runtime.resources.overlay_registry,
+            runtime.resources.rules.overlay_registry(),
         )
         .expect("ordinary AEGIS placement in the untouched water lane");
     let ship_type = runtime.simulation.entities().get(ship).unwrap().type_ref();
@@ -370,6 +374,7 @@ fn retail_shrapnel_repair_reaches_moving_water_neighbor() {
         Some(object),
         object.speed,
         runtime.resources.rules.general.veteran_speed,
+        crate::sim::movement::owner_speed_bonus(&runtime.simulation.houses, actor, Some(object)),
     );
     assert_eq!(
         i64::from(crate::sim::movement::owner_current_speed_from_fraction(
@@ -398,11 +403,11 @@ fn retail_shrapnel_repair_reaches_moving_water_neighbor() {
     );
     let ships = |sim: &crate::sim::world::Simulation| {
         sim.houses[&owner]
-            .tracking
+            .tracking()
             .active_count(crate::map::entities::EntityCategory::Unit, ship_type)
     };
     let other_ships = ships(&runtime.simulation) - 1;
-    let initial_losses = runtime.simulation.houses[&owner].stats.units_lost;
+    let initial_losses = runtime.simulation.houses[&owner].stats().units_lost();
     let ship_delay: usize = std::env::var("VERA20K_LOW_NAVAL_DELAY")
         .ok()
         .map(|value| value.parse().unwrap())
@@ -414,7 +419,7 @@ fn retail_shrapnel_repair_reaches_moving_water_neighbor() {
     let mut retained_track = None;
     let mut saw_last_live_height = false;
     for frame in 0..150 {
-        let visit_frame = scene.sim().session.binary_frame;
+        let visit_frame = scene.sim().session.binary_frame();
         if frame == ship_delay {
             // The native interval begins at Unit741970 after command
             // dispatch. Match its explicit inputs at our ordinary order edge;
@@ -423,7 +428,7 @@ fn retail_shrapnel_repair_reaches_moving_water_neighbor() {
             let coord = crate::sim::movement::ground_pose::position_world_coord(&actor.position);
             assert_eq!(u64::from(visit_frame), head_input["order_frame"]);
             assert_eq!(
-                json!([actor.position.rx, actor.position.ry]),
+                json!([actor.position.rx(), actor.position.ry()]),
                 head_input["source_cell"]
             );
             assert_eq!(json!([coord.x, coord.y, coord.z]), head_input["source_xyz"]);
@@ -431,8 +436,17 @@ fn retail_shrapnel_repair_reaches_moving_water_neighbor() {
                 u64::from(actor.body_facing_current(visit_frame)),
                 head_input["facing_raw"]
             );
-            assert_eq!(actor.lifecycle.cell_marked, head_input["initial_marked"]);
-            assert!(actor.ship_locomotion.as_ref().unwrap().head_to.is_none());
+            assert_eq!(actor.lifecycle.cell_marked(), head_input["initial_marked"]);
+            assert!(
+                actor
+                    .locomotor
+                    .as_ref()
+                    .and_then(|l| l.selected_ship_runtime())
+                    .and_then(|r| r.retained())
+                    .unwrap()
+                    .head_to()
+                    .is_none()
+            );
             assert_eq!(head_input["initial_head"], json!([0, 0, 0]));
         }
         let command = if frame == 0 {
@@ -447,16 +461,15 @@ fn retail_shrapnel_repair_reaches_moving_water_neighbor() {
                     .unwrap(),
                 target_ry: u16::try_from(head_input["destination_cell"][1].as_u64().unwrap())
                     .unwrap(),
-                queue: false,
             })
         } else {
             None
         };
         let envelope = command
-            .map(|command| CommandEnvelope::new(owner, scene.sim().session.tick + 1, command));
+            .map(|command| CommandEnvelope::new(owner, scene.sim().session.tick() + 1, command));
         let before = scene.sim().entities().get(ship).map(|e| {
             json!({
-                "position":e.position,"ship":e.ship_locomotion,"lifecycle":e.lifecycle,
+                "position":e.position,"ship":e.locomotor.as_ref().and_then(|l| l.selected_ship_runtime()).and_then(|r| r.retained()).cloned(),"lifecycle":e.lifecycle,
                 "health":e.health,"entity":e,
             })
         });
@@ -468,15 +481,20 @@ fn retail_shrapnel_repair_reaches_moving_water_neighbor() {
         let lifetime_start = scene.sim().lifecycle_test_events_for_test().len();
         let output = scene
             .runtime
-            .advance_frame(envelope.as_slice(), SIM_TICK_MS, TickLane::Ordinary)
+            .advance_frame(
+                envelope.as_slice(),
+                SIM_TICK_MS,
+                TickLane::Ordinary,
+                &mut crate::sim::world::FrameEffects::default(),
+            )
             .unwrap();
         let lifetime = &scene.sim().lifecycle_test_events_for_test()[lifetime_start..];
         let actor = scene.sim().entities().get(ship);
         let engineer_present = scene.sim().entities().get(engineer).is_some();
         trace.push(json!({
-            "frame":frame,"binary_frame":scene.sim().session.binary_frame,
+            "frame":frame,"binary_frame":scene.sim().session.binary_frame(),
             "before":before,"after":actor,"engineer_present":engineer_present,
-            "owner_losses":scene.sim().houses[&owner].stats.units_lost,
+            "owner_losses":scene.sim().houses[&owner].stats().units_lost(),
             "lifecycle":format!("{lifetime:?}"),
             "fire_sources":output.fire_events.iter().map(|event|event.attacker_id).collect::<Vec<_>>(),
         }));
@@ -491,9 +509,14 @@ fn retail_shrapnel_repair_reaches_moving_water_neighbor() {
                 // Full native Ship69FC10 -> Foot4D3920 -> AStar429A90
                 // produces this first head without supplied path answers.
                 // Compare the live logical queue, not its unused raw suffix.
-                let loco = actor.ship_locomotion.as_ref().unwrap();
-                let head = loco.head_to.unwrap();
-                let destination = loco.destination.unwrap();
+                let loco = actor
+                    .locomotor
+                    .as_ref()
+                    .and_then(|l| l.selected_ship_runtime())
+                    .and_then(|r| r.retained())
+                    .unwrap();
+                let head = loco.head_to().unwrap();
+                let destination = loco.destination().unwrap();
                 let coord =
                     crate::sim::movement::ground_pose::position_world_coord(&actor.position);
                 let route: Vec<u8> = head_process["path"]
@@ -510,18 +533,21 @@ fn retail_shrapnel_repair_reaches_moving_water_neighbor() {
                     json!([destination.x, destination.y, destination.z]),
                     head_process["destination"]
                 );
-                assert_eq!(actor.navigation.path_replay.remaining_directions(), route);
+                assert_eq!(actor.navigation.path_replay().remaining_directions(), route);
                 assert_eq!(
-                    i64::from(loco.track.turn_index),
+                    i64::from(loco.track().turn_index()),
                     head_process["track_selector"]
                 );
-                assert_eq!(i64::from(loco.track.cursor), head_process["track_cursor"]);
-                assert_eq!(u64::from(loco.track_valid), head_process["head_valid"]);
                 assert_eq!(
-                    loco.target_speed_fraction.to_num::<f64>(),
+                    i64::from(loco.track().cursor()),
+                    head_process["track_cursor"]
+                );
+                assert_eq!(u64::from(loco.track_valid()), head_process["head_valid"]);
+                assert_eq!(
+                    loco.target_speed_fraction().to_num::<f64>(),
                     head_process["fraction"].as_f64().unwrap()
                 );
-                let timer = actor.navigation.path_runtime.movement_timer;
+                let timer = actor.navigation.path_runtime().movement_timer();
                 assert_eq!(
                     i64::from(timer.start_frame()),
                     head_process["movement_timer"][0]
@@ -531,15 +557,15 @@ fn retail_shrapnel_repair_reaches_moving_water_neighbor() {
                     head_process["movement_timer"][2]
                 );
                 assert_eq!(
-                    u64::from(actor.navigation.path_runtime.retries_left),
+                    u64::from(actor.navigation.path_runtime().retries_left()),
                     head_process["retries"]
                 );
                 assert_eq!(
-                    u64::from(actor.lifecycle.cell_marked),
+                    u64::from(actor.lifecycle.cell_marked()),
                     head_process["marked"]
                 );
                 assert_eq!(
-                    actor.health.current,
+                    actor.health.current(),
                     native["initial"]["health"].as_i64().unwrap() as i32
                 );
             }
@@ -551,12 +577,17 @@ fn retail_shrapnel_repair_reaches_moving_water_neighbor() {
                     &native["after_damage"],
                     initial_losses,
                 );
-                let loco = actor.ship_locomotion.as_ref().unwrap();
+                let loco = actor
+                    .locomotor
+                    .as_ref()
+                    .and_then(|l| l.selected_ship_runtime())
+                    .and_then(|r| r.retained())
+                    .unwrap();
                 let coord =
                     crate::sim::movement::ground_pose::position_world_coord(&actor.position);
                 if repair_frame.is_none() {
                     repair_frame = Some(frame);
-                    retained_track = Some(loco.track);
+                    retained_track = Some(loco.track());
                     assert_eq!(
                         json!([coord.x, coord.y, coord.z]),
                         native["after_damage"]["coord"]
@@ -576,7 +607,11 @@ fn retail_shrapnel_repair_reaches_moving_water_neighbor() {
                     assert_eq!((coord.x, coord.y), (before.x, before.y));
                     assert_eq!(coord.z - before.z, fall_per_visit, "frame{frame}");
                 }
-                assert_eq!(Some(loco.track), retained_track, "sinking bypasses Process");
+                assert_eq!(
+                    Some(loco.track()),
+                    retained_track,
+                    "sinking bypasses Process"
+                );
                 saw_last_live_height |= coord.z == last_live_z;
                 assert_eq!(
                     ships(scene.sim()) - other_ships,
@@ -609,11 +644,7 @@ fn retail_shrapnel_repair_reaches_moving_water_neighbor() {
             );
             assert!(lifetime.contains(&LifecycleTestEvent::ConcealLimboSet));
             assert_eq!(terminal["limbo"], 1);
-            assert!(
-                output
-                    .lifecycle_outputs
-                    .contains(&LifecycleOutput::DisplayRemove { stable_id: ship })
-            );
+            assert!(lifetime.contains(&LifecycleTestEvent::ConcealDisplayBoundary));
             // Native cleanup stops after UnInit; the same ordinary Rust frame
             // additionally runs its production pending-delete drain.
             assert!(lifetime.contains(&LifecycleTestEvent::FinalizedCommon { stable_id: ship }));
@@ -671,7 +702,12 @@ fn retail_shrapnel_repair_reaches_moving_water_neighbor() {
         for _ in 0..2 {
             let output = scene
                 .runtime
-                .advance_frame(&[], SIM_TICK_MS, TickLane::Ordinary)
+                .advance_frame(
+                    &[],
+                    SIM_TICK_MS,
+                    TickLane::Ordinary,
+                    &mut crate::sim::world::FrameEffects::default(),
+                )
                 .unwrap();
             assert!(
                 output
@@ -692,8 +728,8 @@ fn retail_shrapnel_repair_reaches_moving_water_neighbor() {
             "restored frame{frame}"
         );
         assert_eq!(
-            scene.sim().houses[&owner].stats,
-            second.houses[&owner].stats
+            scene.sim().houses[&owner].stats(),
+            second.houses[&owner].stats()
         );
         if scene.sim().entities().contains(ship) {
             assert_retained_naval_ship(scene.sim(), ship, &native["after_damage"], initial_losses);
@@ -720,14 +756,17 @@ fn assert_retained_naval_ship(
     use crate::sim::world::display_layers::DisplayLayer;
     let actor = sim.entities().get(id).unwrap();
     assert_eq!(
-        actor.health.current,
+        actor.health.current(),
         native["health"].as_i64().unwrap() as i32
     );
-    assert_eq!(actor.lifecycle.object_alive, native["alive"] == 1);
-    assert_eq!(actor.lifecycle.in_limbo, native["limbo"] == 1);
-    assert_eq!(actor.lifecycle.cell_marked, native["marked"] == 1);
+    assert_eq!(actor.lifecycle.object_alive(), native["alive"] == 1);
+    assert_eq!(actor.lifecycle.in_limbo(), native["limbo"] == 1);
+    assert_eq!(actor.lifecycle.cell_marked(), native["marked"] == 1);
     assert_eq!(actor.sinking.is_active(), native["sinking"] == 1);
-    assert_eq!(actor.in_logic_vector, native["logic_registered"] == 1);
+    assert_eq!(
+        actor.seldom.in_logic_vector.is_member(),
+        native["logic_registered"] == 1
+    );
     assert_eq!(
         sim.logic_order()
             .iter()
@@ -747,7 +786,7 @@ fn assert_retained_naval_ship(
         native["display_count"].as_u64().unwrap() as usize
     );
     assert_eq!(
-        sim.substrate.pending_delete.contains(&id),
+        sim.substrate.pending_delete.contains_object(&id),
         native["deferred_is_self"].as_bool().unwrap()
     );
     let coord = crate::sim::movement::ground_pose::position_world_coord(&actor.position);
@@ -755,13 +794,18 @@ fn assert_retained_naval_ship(
         json!([coord.x, coord.y]),
         json!([native["coord"][0], native["coord"][1]])
     );
-    let loco = actor.ship_locomotion.as_ref().unwrap();
-    let head = loco.head_to.unwrap();
+    let loco = actor
+        .locomotor
+        .as_ref()
+        .and_then(|l| l.selected_ship_runtime())
+        .and_then(|r| r.retained())
+        .unwrap();
+    let head = loco.head_to().unwrap();
     assert_eq!(json!([head.x, head.y, head.z]), native["head"]);
-    assert!(loco.destination.is_none());
+    assert!(loco.destination().is_none());
     assert_eq!(native["destination"], json!([0, 0, 0]));
     assert_eq!(
-        sim.houses[&actor.owner()].stats.units_lost - initial_losses,
+        sim.houses[&actor.owner()].stats().units_lost() - initial_losses,
         native["owner_losses"].as_u64().unwrap() as u32
     );
     assert_eq!(
@@ -770,7 +814,7 @@ fn assert_retained_naval_ship(
             .unwrap()
             .cell(113, 59)
             .unwrap()
-            .yr_cell_land_type,
+            .land_type,
         native["land"].as_u64().unwrap() as u8
     );
     assert_no_naval_cell_member(sim, id);
@@ -811,10 +855,10 @@ fn assert_naval_cleanup(
     assert!(sim.display_layers().layer_of(id).is_none());
     assert_eq!(native["layer"], -1);
     assert_eq!(
-        sim.houses[&owner].stats.units_lost - initial_losses,
+        sim.houses[&owner].stats().units_lost() - initial_losses,
         native["owner_losses"].as_u64().unwrap() as u32
     );
     assert!(!sim.entities().contains(id));
-    assert!(!sim.substrate.pending_delete.contains(&id));
+    assert!(!sim.substrate.pending_delete.contains_object(&id));
     assert_no_naval_cell_member(sim, id);
 }

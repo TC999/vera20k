@@ -4,14 +4,20 @@
 //! while their synchronous Mark effects mutate CellClass state. Ordinary and
 //! wall paths die and enter the deferred queue; Terrain and steep-slope rejects
 //! remain registered until scene teardown. The authored reader and admitted
-//! Main_Tick tail drain this same owner. None of these records are gameplay
-//! entities, LogicClass objects, serialized state, or checksum authority.
+//! Main_Tick tail share the substrate's one ordered deferred queue. Registry
+//! records are saved with retained Overlay tickets; they are not LogicClass
+//! entities. Their retained lifetime/registry state joins the Simulation hash;
+//! cell gameplay remains with the canonical CellClass authority.
 
+use super::substrate::DeferredDeleteQueue;
 use std::collections::BTreeMap;
+use std::hash::Hash;
 
 /// Collision-free Rust identity for one transient load OverlayClass analogue.
 /// Native numeric IDs are stored separately and may duplicate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub(crate) struct LoadOverlayHandle(u64);
 
 impl LoadOverlayHandle {
@@ -19,14 +25,14 @@ impl LoadOverlayHandle {
         Self(stable_id)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) const fn stable_id(self) -> u64 {
         self.0
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LoadObjectRegistryKind {
+pub enum LoadObjectRegistryKind {
     Object,
     PointerExpiration,
     AllAbstract,
@@ -34,17 +40,15 @@ pub(crate) enum LoadObjectRegistryKind {
     Overlay,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 enum LoadOverlayTerminalPath {
     Constructed,
     UnrevealedSurvivor,
     CommonQueued,
-    #[cfg(test)]
-    WallQueued,
     SlopeSurvivor,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Hash, serde::Serialize, serde::Deserialize)]
 struct LoadOverlayObject {
     cell: (u16, u16),
     world: [i32; 3],
@@ -57,7 +61,7 @@ struct LoadOverlayObject {
     terminal_path: LoadOverlayTerminalPath,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LoadOverlayObjectSnapshot {
     pub(crate) stable_id: u64,
@@ -93,7 +97,7 @@ pub(crate) enum LoadObjectLifecycleEvent {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum LoadOverlayLifecycleError {
+pub enum LoadOverlayLifecycleError {
     #[error("load Overlay stable handle {0} already exists")]
     DuplicateHandle(u64),
     #[error("load Overlay handle {0} does not exist")]
@@ -108,11 +112,9 @@ pub(crate) enum LoadOverlayLifecycleError {
 
 /// Shared owner for native OverlayClass registry membership. The historical
 /// load-prefixed handle names do not restrict the lifetime to map reading.
-/// Stock runtime bridge constructors publish only Cell state, not references
-/// to these objects; their partitioned destruction commutes with gameplay
-/// finalization at the same admitted725C70 boundary. Revisit that separation
-/// before publishing Overlay handles or adding cross-owner destructor effects.
-#[derive(Debug)]
+/// It owns Overlay readiness/destruction; substrate owns every deferred ticket.
+/// Gameplay and Tag/Trigger callbacks therefore retain native interleaving.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LoadObjectLifecycle {
     objects: BTreeMap<LoadOverlayHandle, LoadOverlayObject>,
     object_registry: Vec<LoadOverlayHandle>,
@@ -120,36 +122,32 @@ pub(crate) struct LoadObjectLifecycle {
     all_abstract_registry: Vec<LoadOverlayHandle>,
     tag_removal_registry: Vec<LoadOverlayHandle>,
     overlay_registry: Vec<LoadOverlayHandle>,
-    deferred: Vec<LoadOverlayHandle>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
+    #[serde(skip)]
     events: Vec<LoadObjectLifecycleEvent>,
-    #[cfg(test)]
-    fail_next_registry: Option<LoadObjectRegistryKind>,
-    #[cfg(test)]
-    fail_next_queue: bool,
-}
-
-impl Default for LoadObjectLifecycle {
-    fn default() -> Self {
-        Self {
-            objects: BTreeMap::new(),
-            object_registry: Vec::new(),
-            pointer_expiration_registry: Vec::new(),
-            all_abstract_registry: Vec::new(),
-            tag_removal_registry: Vec::new(),
-            overlay_registry: Vec::new(),
-            deferred: Vec::new(),
-            #[cfg(test)]
-            events: Vec::new(),
-            #[cfg(test)]
-            fail_next_registry: None,
-            #[cfg(test)]
-            fail_next_queue: false,
-        }
-    }
 }
 
 impl LoadObjectLifecycle {
+    pub(crate) fn has_overlay(&self, id: u64) -> bool {
+        self.objects.contains_key(&LoadOverlayHandle(id))
+    }
+    /// Retained physical identities participate in the shared object-ID
+    /// namespace even after their Logic/cell publication has ended.
+    pub(crate) fn retained_overlay_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.objects.keys().map(|handle| handle.0)
+    }
+    pub(crate) fn hash_state(&self, hasher: &mut impl std::hash::Hasher) {
+        if self.objects.is_empty() {
+            return;
+        }
+        "RetainedOverlayRegistry".hash(hasher);
+        self.objects.hash(hasher);
+        self.object_registry.hash(hasher);
+        self.pointer_expiration_registry.hash(hasher);
+        self.all_abstract_registry.hash(hasher);
+        self.tag_removal_registry.hash(hasher);
+        self.overlay_registry.hash(hasher);
+    }
     /// Construct the base object, join four base registries, assign the native
     /// ID, then join the Overlay registry. A growth failure is a hard load
     /// error at its exact point; the staged Simulation retains earlier effects.
@@ -205,19 +203,24 @@ impl LoadObjectLifecycle {
     pub(crate) fn begin_mark(
         &mut self,
         handle: LoadOverlayHandle,
+        requested_world: Option<[i32; 3]>,
     ) -> Result<(u16, u16), LoadOverlayLifecycleError> {
         let object = self.object_mut_for_transition(handle)?;
         if object.terminal_path != LoadOverlayTerminalPath::Constructed {
             return Err(LoadOverlayLifecycleError::InvalidTransition(handle.0));
         }
         object.limbo = false;
-        //5FC380 supplies the requested signed CellStruct center to5F4EC0.
-        // A Terrain/EmptyCell rejection never reaches this world-position store.
-        object.world = [
-            i32::from(object.cell.0 as i16) * 256 + 128,
-            i32::from(object.cell.1 as i16) * 256 + 128,
-            0,
-        ];
+        //5FC380 supplies a signed CellStruct center; Building440580 calls
+        //5FD270 with its original XYZ. OverlayType5FEA30 (vt7EF600+6C)
+        //copies that XYZ unchanged before Object5F4FA8 commits Location.
+        //Terrain/EmptyCell rejection never reaches this position store.
+        object.world = requested_world.unwrap_or_else(|| {
+            [
+                i32::from(object.cell.0 as i16) * 256 + 128,
+                i32::from(object.cell.1 as i16) * 256 + 128,
+                0,
+            ]
+        });
         object.on_map = true;
         object.redraw = true;
         let cell = object.cell;
@@ -246,18 +249,19 @@ impl LoadObjectLifecycle {
     pub(crate) fn finish_common(
         &mut self,
         handle: LoadOverlayHandle,
+        queue: &mut DeferredDeleteQueue,
     ) -> Result<(), LoadOverlayLifecycleError> {
-        self.finish_queued(handle, LoadOverlayTerminalPath::CommonQueued, false)
+        self.finish_queued(handle, false, queue)
     }
 
     /// Wall rejection performs its ordinary UnInit broadcast and a full-Limbo
     /// broadcast before queueing; the destructor supplies the third broadcast.
-    #[cfg(test)]
     pub(crate) fn finish_wall_reject(
         &mut self,
         handle: LoadOverlayHandle,
+        queue: &mut DeferredDeleteQueue,
     ) -> Result<(), LoadOverlayLifecycleError> {
-        self.finish_queued(handle, LoadOverlayTerminalPath::WallQueued, true)
+        self.finish_queued(handle, true, queue)
     }
 
     /// A derived steep-slope failure returns through base Unlimbo. It restores
@@ -276,31 +280,24 @@ impl LoadObjectLifecycle {
         Ok(())
     }
 
-    /// Native725C70's reader-epilogue or admitted late-frame forward scan.
-    /// Alive queued entries advance;
-    /// a dead entry is destroyed, all duplicate queue entries are removed
-    /// stably, and the same live index is examined again.
-    pub(crate) fn drain_deferred(&mut self) -> Result<(), LoadOverlayLifecycleError> {
-        let mut index = 0;
-        while index < self.deferred.len() {
-            let handle = self.deferred[index];
-            let alive = self
-                .objects
-                .get(&handle)
-                .ok_or(LoadOverlayLifecycleError::UnknownHandle(handle.0))?
-                .alive;
-            if alive {
-                index += 1;
-                continue;
-            }
-            self.destroy(handle)?;
-        }
-        Ok(())
+    /// Object5F4100 readiness for the shared725C70 virtual dispatch.
+    pub(super) fn queued_overlay_is_ready(&self, id: u64) -> bool {
+        !self
+            .objects
+            .get(&LoadOverlayHandle(id))
+            .expect("queued Overlay ticket requires its retained registry object")
+            .alive
+    }
+
+    /// The common queue removed duplicates before this virtual destructor.
+    pub(super) fn destroy_queued_overlay(&mut self, id: u64) {
+        self.destroy(LoadOverlayHandle(id))
+            .expect("selected Overlay ticket requires its retained registry object");
     }
 
     /// Release the registered constructor survivors when the scene is
     /// torn down. Iteration order is intentionally not claimed as native parity.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn release_scene_survivors(&mut self) -> Result<usize, LoadOverlayLifecycleError> {
         let survivors: Vec<_> = self
             .objects
@@ -320,8 +317,12 @@ impl LoadObjectLifecycle {
         Ok(survivors.len())
     }
 
-    #[cfg(test)]
-    pub(crate) fn snapshot(&self, handle: LoadOverlayHandle) -> Option<LoadOverlayObjectSnapshot> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn snapshot(
+        &self,
+        handle: LoadOverlayHandle,
+        queue: &DeferredDeleteQueue,
+    ) -> Option<LoadOverlayObjectSnapshot> {
         let object = self.objects.get(&handle)?;
         Some(LoadOverlayObjectSnapshot {
             stable_id: handle.0,
@@ -333,17 +334,17 @@ impl LoadObjectLifecycle {
             on_map: object.on_map,
             redraw: object.redraw,
             expiration_broadcasts: object.expiration_broadcasts,
-            queued: self.deferred.contains(&handle),
+            queued: queue.contains_overlay(handle.0),
             slope_survivor: object.terminal_path == LoadOverlayTerminalPath::SlopeSurvivor,
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn object_count(&self) -> usize {
         self.objects.len()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn registry_counts(&self) -> [usize; 5] {
         [
             self.object_registry.len(),
@@ -354,16 +355,11 @@ impl LoadObjectLifecycle {
         ]
     }
 
-    #[cfg(test)]
-    pub(crate) fn queue_count(&self) -> usize {
-        self.deferred.len()
-    }
-
     fn finish_queued(
         &mut self,
         handle: LoadOverlayHandle,
-        terminal_path: LoadOverlayTerminalPath,
         full_limbo: bool,
+        queue: &mut DeferredDeleteQueue,
     ) -> Result<(), LoadOverlayLifecycleError> {
         {
             let object = self.object_mut_for_transition(handle)?;
@@ -374,7 +370,10 @@ impl LoadObjectLifecycle {
             object.alive = false;
             object.on_map = false;
             object.limbo = true;
-            object.terminal_path = terminal_path;
+            // Both UnInit paths share one queued lifetime. Wall refusal's
+            // extra broadcast is already retained by its owned fields/events;
+            // it does not require another serialized terminal discriminator.
+            object.terminal_path = LoadOverlayTerminalPath::CommonQueued;
         }
         self.record(LoadObjectLifecycleEvent::UninitBroadcast(handle));
         if full_limbo {
@@ -387,7 +386,9 @@ impl LoadObjectLifecycle {
             self.record(LoadObjectLifecycleEvent::UninitBroadcast(handle));
         }
 
-        self.try_queue(handle)?;
+        queue
+            .queue_overlay(handle.0)
+            .map_err(|_| LoadOverlayLifecycleError::DeferredQueueCapacity)?;
         self.record(LoadObjectLifecycleEvent::Queue(handle));
         Ok(())
     }
@@ -397,12 +398,6 @@ impl LoadObjectLifecycle {
         registry: LoadObjectRegistryKind,
         handle: LoadOverlayHandle,
     ) -> Result<(), LoadOverlayLifecycleError> {
-        #[cfg(test)]
-        if self.fail_next_registry == Some(registry) {
-            self.fail_next_registry = None;
-            return Err(LoadOverlayLifecycleError::RegistryCapacity { registry });
-        }
-
         let entries = match registry {
             LoadObjectRegistryKind::Object => &mut self.object_registry,
             LoadObjectRegistryKind::PointerExpiration => &mut self.pointer_expiration_registry,
@@ -415,18 +410,6 @@ impl LoadObjectLifecycle {
             .map_err(|_| LoadOverlayLifecycleError::RegistryCapacity { registry })?;
         entries.push(handle);
         self.record(LoadObjectLifecycleEvent::Join(registry, handle));
-        Ok(())
-    }
-
-    fn try_queue(&mut self, handle: LoadOverlayHandle) -> Result<(), LoadOverlayLifecycleError> {
-        #[cfg(test)]
-        if std::mem::take(&mut self.fail_next_queue) {
-            return Err(LoadOverlayLifecycleError::DeferredQueueCapacity);
-        }
-        self.deferred
-            .try_reserve(1)
-            .map_err(|_| LoadOverlayLifecycleError::DeferredQueueCapacity)?;
-        self.deferred.push(handle);
         Ok(())
     }
 
@@ -456,7 +439,6 @@ impl LoadObjectLifecycle {
         }
 
         self.record(LoadObjectLifecycleEvent::ClearType(handle));
-        self.deferred.retain(|queued| *queued != handle);
         self.record(LoadObjectLifecycleEvent::RemoveQueuedDuplicates(handle));
         for registry in [
             LoadObjectRegistryKind::Object,
@@ -497,36 +479,38 @@ impl LoadObjectLifecycle {
     }
 
     fn record(&mut self, event: LoadObjectLifecycleEvent) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.events.push(event);
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         let _ = event;
     }
 
-    #[cfg(test)]
-    fn fail_next_join_for_test(&mut self, registry: LoadObjectRegistryKind) {
-        self.fail_next_registry = Some(registry);
-    }
-
-    #[cfg(test)]
-    fn fail_next_queue_for_test(&mut self) {
-        self.fail_next_queue = true;
-    }
-
-    #[cfg(test)]
-    fn queue_existing_for_test(&mut self, handle: LoadOverlayHandle) {
-        self.deferred.push(handle);
-    }
-
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn events(&self) -> &[LoadObjectLifecycleEvent] {
         &self.events
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_c_o))]
 mod tests {
+    use super::super::substrate::DeferredDeleteTicket;
     use super::*;
+    use crate::sim::world::Simulation;
+
+    // Supplied Overlay-only scenes still execute the sole production drain.
+    fn drain_fixture(lifecycle: &mut LoadObjectLifecycle, queue: &mut DeferredDeleteQueue) {
+        let mut sim = Simulation::new();
+        sim.load_objects = std::mem::take(lifecycle);
+        sim.substrate.pending_delete = std::mem::take(queue);
+        sim.process_pending_delete_with(
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            &mut crate::sim::world::FrameEffects::default(),
+            1,
+            false,
+        );
+        *lifecycle = sim.load_objects;
+        *queue = sim.substrate.pending_delete;
+    }
 
     fn construct(
         lifecycle: &mut LoadObjectLifecycle,
@@ -541,11 +525,12 @@ mod tests {
     #[test]
     fn constructor_joins_four_base_registries_then_id_then_overlay() {
         let mut lifecycle = LoadObjectLifecycle::default();
+        let queue = DeferredDeleteQueue::default();
         let handle = construct(&mut lifecycle, 7, 1_010_038);
 
         assert_eq!(handle.stable_id(), 7);
         assert_eq!(
-            lifecycle.snapshot(handle).unwrap().native_id,
+            lifecycle.snapshot(handle, &queue).unwrap().native_id,
             Some(1_010_038)
         );
         assert_eq!(
@@ -566,18 +551,19 @@ mod tests {
     #[test]
     fn common_wall_and_slope_paths_preserve_native_terminal_states() {
         let mut lifecycle = LoadObjectLifecycle::default();
+        let mut queue = DeferredDeleteQueue::default();
         let common = construct(&mut lifecycle, 1, 101);
         let wall = construct(&mut lifecycle, 2, 102);
         let slope = construct(&mut lifecycle, 3, 103);
 
-        lifecycle.begin_mark(common).unwrap();
-        lifecycle.finish_common(common).unwrap();
-        lifecycle.begin_mark(wall).unwrap();
-        lifecycle.finish_wall_reject(wall).unwrap();
-        lifecycle.begin_mark(slope).unwrap();
+        lifecycle.begin_mark(common, None).unwrap();
+        lifecycle.finish_common(common, &mut queue).unwrap();
+        lifecycle.begin_mark(wall, None).unwrap();
+        lifecycle.finish_wall_reject(wall, &mut queue).unwrap();
+        lifecycle.begin_mark(slope, None).unwrap();
         lifecycle.finish_slope_survivor(slope).unwrap();
 
-        let common_before_drain = lifecycle.snapshot(common).unwrap();
+        let common_before_drain = lifecycle.snapshot(common, &queue).unwrap();
         assert_eq!(
             (
                 common_before_drain.alive,
@@ -589,10 +575,10 @@ mod tests {
             ),
             (false, true, false, true, 1, true)
         );
-        let wall_before_drain = lifecycle.snapshot(wall).unwrap();
+        let wall_before_drain = lifecycle.snapshot(wall, &queue).unwrap();
         assert_eq!(wall_before_drain.expiration_broadcasts, 2);
         assert!(wall_before_drain.queued);
-        let slope_live = lifecycle.snapshot(slope).unwrap();
+        let slope_live = lifecycle.snapshot(slope, &queue).unwrap();
         assert_eq!(
             (
                 slope_live.alive,
@@ -606,10 +592,10 @@ mod tests {
             (true, true, true, true, 0, false, true)
         );
 
-        lifecycle.drain_deferred().unwrap();
-        assert!(lifecycle.snapshot(common).is_none());
-        assert!(lifecycle.snapshot(wall).is_none());
-        assert!(lifecycle.snapshot(slope).is_some());
+        drain_fixture(&mut lifecycle, &mut queue);
+        assert!(lifecycle.snapshot(common, &queue).is_none());
+        assert!(lifecycle.snapshot(wall, &queue).is_none());
+        assert!(lifecycle.snapshot(slope, &queue).is_some());
         assert_eq!(lifecycle.release_scene_survivors().unwrap(), 1);
         assert_eq!(lifecycle.object_count(), 0);
     }
@@ -617,74 +603,32 @@ mod tests {
     #[test]
     fn duplicate_aware_drain_rechecks_same_live_index_and_keeps_alive_entries() {
         let mut lifecycle = LoadObjectLifecycle::default();
+        let mut queue = DeferredDeleteQueue::default();
         let alive_a = construct(&mut lifecycle, 1, 11);
         let dead_b = construct(&mut lifecycle, 2, 12);
         let alive_c = construct(&mut lifecycle, 3, 13);
         let dead_d = construct(&mut lifecycle, 4, 14);
         for handle in [dead_b, dead_d] {
-            lifecycle.begin_mark(handle).unwrap();
-            lifecycle.finish_common(handle).unwrap();
+            lifecycle.begin_mark(handle, None).unwrap();
+            lifecycle.finish_common(handle, &mut queue).unwrap();
         }
-        lifecycle.deferred.clear();
+        queue.clear_for_test();
         for handle in [alive_a, dead_b, dead_b, alive_c, dead_d] {
-            lifecycle.queue_existing_for_test(handle);
+            queue.queue_overlay(handle.0).unwrap();
         }
 
-        lifecycle.drain_deferred().unwrap();
+        drain_fixture(&mut lifecycle, &mut queue);
 
-        assert!(lifecycle.snapshot(dead_b).is_none());
-        assert!(lifecycle.snapshot(dead_d).is_none());
-        assert!(lifecycle.snapshot(alive_a).is_some());
-        assert!(lifecycle.snapshot(alive_c).is_some());
-        assert_eq!(lifecycle.deferred, vec![alive_a, alive_c]);
-    }
-
-    #[test]
-    fn every_registry_growth_failure_stops_at_its_exact_join() {
-        for registry in [
-            LoadObjectRegistryKind::Object,
-            LoadObjectRegistryKind::PointerExpiration,
-            LoadObjectRegistryKind::AllAbstract,
-            LoadObjectRegistryKind::TagRemoval,
-            LoadObjectRegistryKind::Overlay,
-        ] {
-            let mut lifecycle = LoadObjectLifecycle::default();
-            lifecycle.fail_next_join_for_test(registry);
-            let mut id_calls = 0;
-            let error = lifecycle
-                .construct_overlay(1, (1, 2), || {
-                    id_calls += 1;
-                    77
-                })
-                .unwrap_err();
-            assert_eq!(
-                error,
-                LoadOverlayLifecycleError::RegistryCapacity { registry }
-            );
-            assert_eq!(
-                id_calls,
-                usize::from(registry == LoadObjectRegistryKind::Overlay),
-                "native ID is assigned only after all four base joins"
-            );
-        }
-    }
-
-    #[test]
-    fn queue_growth_failure_retains_committed_uninit_prefix() {
-        let mut lifecycle = LoadObjectLifecycle::default();
-        let handle = construct(&mut lifecycle, 1, 99);
-        lifecycle.begin_mark(handle).unwrap();
-        lifecycle.fail_next_queue_for_test();
-
+        assert!(lifecycle.snapshot(dead_b, &queue).is_none());
+        assert!(lifecycle.snapshot(dead_d, &queue).is_none());
+        assert!(lifecycle.snapshot(alive_a, &queue).is_some());
+        assert!(lifecycle.snapshot(alive_c, &queue).is_some());
         assert_eq!(
-            lifecycle.finish_common(handle),
-            Err(LoadOverlayLifecycleError::DeferredQueueCapacity)
+            queue.tickets(),
+            vec![
+                DeferredDeleteTicket::Overlay(alive_a.0),
+                DeferredDeleteTicket::Overlay(alive_c.0)
+            ]
         );
-        let snapshot = lifecycle.snapshot(handle).unwrap();
-        assert!(!snapshot.alive);
-        assert!(snapshot.limbo);
-        assert!(!snapshot.on_map);
-        assert_eq!(snapshot.expiration_broadcasts, 1);
-        assert!(!snapshot.queued);
     }
 }

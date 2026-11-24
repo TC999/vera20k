@@ -1,7 +1,7 @@
 //! Production replay must submit before Metal's native command-buffer pool
 //! fills, including when ordinary Unit/SHP draws fence every Bullet span.
 use super::super::draw_plan_lowering::{
-    ObjectPieceInstance, PlannedObjectInstance, lower_object_instances,
+    ObjectPieceInstance, OwnedPlannedObject, lower_object_instances,
 };
 use super::*;
 use crate::render::batch::InstanceBufferPool;
@@ -15,11 +15,11 @@ fn many_ordinary_fences_submit_in_order_and_preserve_native_destination_words() 
     let gpu = Gpu::new();
     let size = [12, 4];
     // Each round fences two Bullet edits with actual UnitAtlas and SHP draws.
-    // The resulting >3200 render passes exceeded the pinned backend's 4096
+    // The resulting >2500 render passes exceeded the pinned backend's 4096
     // native-buffer pool before any submission in the former implementation.
     const ROUNDS: usize = 640;
     let native_half =
-        include_bytes!("../../../../tools/projectile_oracle/bridge_render_pixels.rgb565.bin");
+        crate::test_fixture::bytes("tools/projectile_oracle/bridge_render_pixels.rgb565.bin");
     for format in [
         wgpu::TextureFormat::Bgra8UnormSrgb,
         wgpu::TextureFormat::Rgba8UnormSrgb,
@@ -56,17 +56,16 @@ fn many_ordinary_fences_submit_in_order_and_preserve_native_destination_words() 
                 &[33],
             ),
         }]);
-        let palette = crate::assets::pal_file::Palette {
-            colors: [crate::assets::pal_file::Color::rgb(0, 252, 0); 256],
-        };
+        let palette = crate::assets::pal_file::Palette::from_rgb(|_| [0, 252, 0]);
         let ramps = crate::rules::house_colors::HouseColorRamps::from_schemes(&[]);
-        let palettes = PaletteSet::new_on_device(&gpu.device, &gpu.queue, &palette, &ramps, &[]);
+        let palettes =
+            PaletteSet::new_on_device(&gpu.device, &gpu.queue, &palette, &palette, &ramps, &[]);
         let mut parents = Vec::with_capacity(ROUNDS * 4);
         for round in 0..ROUNDS {
             for piece in 0..4 {
                 let (target, render_z, mut instance) = match piece {
                     0 => (
-                        ObjectTexture::ProjectileShp(0, TerrainPiece::Body),
+                        ObjectTexture::SpriteAtlasEdit(0, TerrainPiece::Body),
                         RenderZPolicy::ReadOnly,
                         sprite([0., 1.], [8., 2.], 3.),
                     ),
@@ -81,7 +80,7 @@ fn many_ordinary_fences_submit_in_order_and_preserve_native_destination_words() 
                         sprite([2., 1.], [2., 2.], 0.),
                     ),
                     _ => (
-                        ObjectTexture::ProjectileShp(0, TerrainPiece::Shadow),
+                        ObjectTexture::SpriteAtlasEdit(0, TerrainPiece::Shadow),
                         RenderZPolicy::ReadOnly,
                         sprite([0., 1.], [8., 2.], 3.),
                     ),
@@ -94,7 +93,7 @@ fn many_ordinary_fences_submit_in_order_and_preserve_native_destination_words() 
                     instance.zshape_origin = [1., 2.];
                 }
                 let id = (round * 4 + piece) as u64;
-                parents.push(PlannedObjectInstance::object(
+                parents.push(OwnedPlannedObject::object(
                     ObjectDraw {
                         id,
                         layer: TacticalLayer(3),
@@ -109,7 +108,7 @@ fn many_ordinary_fences_submit_in_order_and_preserve_native_destination_words() 
                 ));
             }
         }
-        let layers = lower_object_instances(parents);
+        let layers = lower_object_instances(parents.into());
         let layer = &layers[3];
         assert_eq!(layer.runs.len(), ROUNDS * 4);
         let mut pool = InstanceBufferPool::new();
@@ -124,6 +123,7 @@ fn many_ordinary_fences_submit_in_order_and_preserve_native_destination_words() 
         );
         let stats = draw_native_object_pass(
             &mut encoder,
+            crate::app::render::merge_passes::ObjectDrawPhase::Display,
             &cv,
             &dv,
             &mut terrain,
@@ -134,13 +134,24 @@ fn many_ordinary_fences_submit_in_order_and_preserve_native_destination_words() 
             None,
             Some(&units),
             None,
-            &VxlSlopeTransitionCache::default(),
             Some(&shp),
             Some(&palettes),
             batch.default_zshape_bind_group(),
+            None,
+            None,
         );
         assert_eq!(stats.pieces, ROUNDS * 2);
-        assert_eq!(stats.passes, (ROUNDS + 1) * 4);
+        // A resolve joins the next ordinary pass; only the last draws in one
+        // of its own. WebGL2 reduces each of the ROUNDS + 1 read-only intervals
+        // in three passes. Against the live depth test the first, a lone body,
+        // takes one pass and each interval holding a shadow two.
+        let webgl = crate::render::gpu::webgl_fallback(&gpu.device);
+        let intervals = if webgl {
+            (ROUNDS + 1) * 3
+        } else {
+            1 + ROUNDS * 2
+        };
+        assert_eq!(stats.passes, intervals + 1);
         assert_eq!(stats.tile_dependencies, 0);
         assert!(
             terrain.submissions() > 0,

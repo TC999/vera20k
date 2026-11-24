@@ -1,12 +1,6 @@
-//! Frontend shell route (F11): one enum owns which shell surface is active
-//! on the `MainMenu` screen.
+//! Frontend shell route: one enum owns which shell surface is active on the
+//! `MainMenu` screen.
 //!
-//! Replaces three mutually-entangled booleans
-//! (`main_menu_show_single_player_shell`, `main_menu_show_native_skirmish_shell`,
-//! `skirmish_shell_return_to_single_player_shell`) that six hand-written
-//! teardown blocks each cleared with slightly different subsets. Exclusivity
-//! is now structural: the state can no longer represent two shells at once,
-//! and the skirmish return arrow travels inside the variant it belongs to.
 //! A terminal menu error is owned separately by the frontend; it stops shell
 //! rendering and input without creating an alternate gameplay route.
 
@@ -21,111 +15,24 @@ pub(crate) enum ShellRoute {
     MoviesAndCredits,
     /// Movie list `0x129`, reached from Movies & Credits.
     MovieList,
+    /// VERA's Mods page (`ui::mods_shell`), reached from the main menu.
+    Mods,
     /// Campaign selection `0x94`, reached from Single Player.
     Campaign,
     /// Load Saved Game `0xB7`, reached from Single Player.
     LoadSavedGame,
-    /// Westwood Online welcome `0x10E` (and its `TXT_APIMISSING` box),
-    /// reached from Internet.
-    WolWelcome,
-    /// The native skirmish shell. `return_to_single_player` is the return
-    /// arrow: entered from the single-player shell, Back returns there
-    /// instead of the main menu.
-    Skirmish { return_to_single_player: bool },
-}
-
-impl ShellRoute {
-    pub(crate) fn single_player(self) -> bool {
-        matches!(self, Self::SinglePlayer)
-    }
-
-    /// Movies & Credits `0x101`.
-    pub(crate) fn movies_and_credits(self) -> bool {
-        matches!(self, Self::MoviesAndCredits)
-    }
-
-    /// Movie list `0x129`.
-    pub(crate) fn movie_list(self) -> bool {
-        matches!(self, Self::MovieList)
-    }
-
-    /// Campaign selection `0x94`.
-    pub(crate) fn campaign(self) -> bool {
-        matches!(self, Self::Campaign)
-    }
-
-    /// Load Saved Game `0xB7`.
-    pub(crate) fn load_saved_game(self) -> bool {
-        matches!(self, Self::LoadSavedGame)
-    }
-
-    /// Westwood Online welcome `0x10E`.
-    pub(crate) fn wol_welcome(self) -> bool {
-        matches!(self, Self::WolWelcome)
-    }
-
-    pub(crate) fn skirmish(self) -> bool {
-        matches!(self, Self::Skirmish { .. })
-    }
-
-    pub(crate) fn skirmish_returns_to_single_player(self) -> bool {
-        matches!(
-            self,
-            Self::Skirmish {
-                return_to_single_player: true
-            }
-        )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ShellRoute;
-
-    /// F11: shell surfaces are mutually exclusive by construction, and the
-    /// return arrow only exists inside the skirmish variant.
-    #[test]
-    fn shell_routes_are_exclusive_and_carry_the_return_arrow() {
-        assert_eq!(ShellRoute::default(), ShellRoute::MainMenu);
-        for route in [
-            ShellRoute::MainMenu,
-            ShellRoute::SinglePlayer,
-            ShellRoute::MoviesAndCredits,
-            ShellRoute::MovieList,
-            ShellRoute::Campaign,
-            ShellRoute::LoadSavedGame,
-            ShellRoute::WolWelcome,
-            ShellRoute::Skirmish {
-                return_to_single_player: false,
-            },
-            ShellRoute::Skirmish {
-                return_to_single_player: true,
-            },
-        ] {
-            // At most one surface active — the predicates cannot both hold.
-            let active = [
-                route.single_player(),
-                route.movies_and_credits(),
-                route.movie_list(),
-                route.campaign(),
-                route.load_saved_game(),
-                route.wol_welcome(),
-                route.skirmish(),
-            ];
-            assert!(active.iter().filter(|&&on| on).count() <= 1);
-        }
-        assert!(
-            ShellRoute::Skirmish {
-                return_to_single_player: true
-            }
-            .skirmish_returns_to_single_player()
-        );
-        assert!(
-            !ShellRoute::Skirmish {
-                return_to_single_player: false
-            }
-            .skirmish_returns_to_single_player()
-        );
-        assert!(!ShellRoute::SinglePlayer.skirmish_returns_to_single_player());
-    }
+    /// Westwood Online before the lobby, reached from Internet: welcome
+    /// `0x10E`, login `0x10F`, the wait box `0xC4` and the boxes
+    /// `0xD0`/`0x126` over the empty backdrop.
+    Wol,
+    /// The Westwood Online custom-match lobby `0x113`.
+    WolLobby,
+    /// LAN discovery BB.
+    LanLobby,
+    /// LAN host BC or guest BD; MatchSession owns the host role.
+    NetworkSetup,
+    /// The native skirmish shell `0x102`. It is entered only from the
+    /// single-player shell (directly, or on resume after a match), so Back
+    /// returns there.
+    Skirmish,
 }

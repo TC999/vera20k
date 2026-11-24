@@ -5,8 +5,10 @@
 //! outside this module.
 
 use std::hash::Hash;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::hash::Hasher;
+
+use crate::rules::rule_policy::AiBasePolicy;
 
 /// One native 16-byte BasePlan node represented without pointer aliases.
 #[derive(
@@ -24,8 +26,8 @@ pub struct BasePlanNode {
 /// The authoritative ordered `HouseClass` BasePlan.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BasePlanState {
-    pub percent_built: i32,
-    pub nodes: Vec<BasePlanNode>,
+    percent_built: i32,
+    nodes: Vec<BasePlanNode>,
 }
 
 /// Pack the native `CellStruct` words after signed-16 narrowing.
@@ -39,13 +41,137 @@ pub(crate) const fn unpack_base_plan_cell(packed: u32) -> (i16, i16) {
 }
 
 impl BasePlanState {
+    /// `BaseClass+0x24`, read from the House section's `PercentBuilt=`.
+    pub const fn percent_built(&self) -> i32 {
+        self.percent_built
+    }
+
+    /// The nodes in plan order.
+    pub fn nodes(&self) -> &[BasePlanNode] {
+        &self.nodes
+    }
+
+    /// `BaseClass::Read_INI` from `HouseClass::Read_Scenario_INI`: the House
+    /// section's `PercentBuilt=` and its authored nodes, in order.
+    pub(crate) fn read_scenario(
+        &mut self,
+        percent_built: i32,
+        nodes: impl IntoIterator<Item = BasePlanNode>,
+    ) {
+        self.percent_built = percent_built;
+        self.nodes = nodes.into_iter().collect();
+    }
+
+    /// `AI_RecalcBuildOptions` empties the vector and appends one unplaced
+    /// node per chosen type or control, in order
+    /// ([`crate::sim::base_plan_generation::recalc_base_plan`]).
+    pub(crate) fn rebuild(&mut self, types_or_controls: impl IntoIterator<Item = i32>) {
+        self.nodes.clear();
+        self.nodes.extend(
+            types_or_controls
+                .into_iter()
+                .map(|type_or_control| BasePlanNode {
+                    type_or_control,
+                    packed_cell: 0,
+                    filled: false,
+                    retry_count: 0,
+                }),
+        );
+    }
+
+    /// Node zero takes the base anchor's cell, before the BasePlan center
+    /// (`0x0050C2F5..` after a BuildConst pick, `0x00739926..` after an MCV
+    /// deploy). An empty plan has no node to take it.
+    pub(crate) fn anchor_first_node(&mut self, packed_cell: u32) {
+        if let Some(node) = self.nodes.first_mut() {
+            node.packed_cell = packed_cell;
+        }
+    }
+
+    /// The ordered insert at `index`: the node there and the rest shift up.
+    pub(crate) fn insert(&mut self, index: usize, node: BasePlanNode) {
+        self.nodes.insert(index, node);
+    }
+
+    /// The site search stores its cell in node `index`; a node that may
+    /// replan forgets its cell (zero). Nothing past the end.
+    pub(crate) fn assign_site(&mut self, index: usize, packed_cell: u32) {
+        if let Some(node) = self.nodes.get_mut(index) {
+            node.packed_cell = packed_cell;
+        }
+    }
+
+    /// `HouseClass::AI_ChooseNextProduction @ 0x00506EF0`'s writes
+    /// (`0x00507A4C..0x00507B7B`): a placeholder node (negative) becomes the
+    /// defense at the cell; a WallTower node takes the cell, and hands the
+    /// defense and the cell to the next node when that is `-1`.
+    pub(crate) fn place_defense(&mut self, index: usize, defense_type: i32, packed_cell: u32) {
+        let Some(node) = self.nodes.get_mut(index) else {
+            return;
+        };
+        if node.type_or_control < 0 {
+            node.type_or_control = defense_type;
+            node.packed_cell = packed_cell;
+            return;
+        }
+        node.packed_cell = packed_cell;
+        if let Some(next) = self.nodes.get_mut(index + 1)
+            && next.type_or_control == -1
+        {
+            next.type_or_control = defense_type;
+            next.packed_cell = packed_cell;
+        }
+    }
+
+    /// Manage_Build_Queue's rebuild node (`0x004FE1D6..0x004FE2BD`): `node`
+    /// goes in at `index`. Past the count (1 on a plan the sale emptied)
+    /// native writes the slot past the count, which grows to take in slot 0:
+    /// `slot_zero`, the node last removed, returns instead. With
+    /// `drop_later_same_type`, later nodes of `node`'s type go.
+    pub(crate) fn insert_rebuild_node(
+        &mut self,
+        index: usize,
+        node: BasePlanNode,
+        slot_zero: Option<BasePlanNode>,
+        drop_later_same_type: bool,
+    ) {
+        if index > self.nodes.len() {
+            self.nodes.extend(slot_zero);
+            return;
+        }
+        self.nodes.insert(index, node);
+        if drop_later_same_type {
+            let later = self.nodes.split_off(index + 1);
+            self.nodes.extend(
+                later
+                    .into_iter()
+                    .filter(|later| later.type_or_control != node.type_or_control),
+            );
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_percent_built_for_test(&mut self, percent_built: i32) {
+        self.percent_built = percent_built;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_nodes_for_test(&mut self, nodes: Vec<BasePlanNode>) {
+        self.nodes = nodes;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn nodes_mut_for_test(&mut self) -> &mut Vec<BasePlanNode> {
+        &mut self.nodes
+    }
+
     /// Fold the exact fields consumed by `FUN_0042F180 @ 0x0042F180`
     /// (`BaseClass::CalculateChecksum`).
     ///
     /// PercentBuilt, filled latches, and retry counters are intentionally not
     /// part of this native compatibility helper. Rust's authoritative world
     /// hash covers them separately.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn hash_native_checksum_fields(&self, hasher: &mut impl Hasher) {
         (self.nodes.len() as i32).hash(hasher);
         for node in &self.nodes {
@@ -89,12 +215,13 @@ impl BasePlanState {
     ///
     /// Native authority is `FUN_0050A490 @ 0x0050A490`, called by
     /// `BuildingClass__Limbo @ 0x00445880` before `TechnoClass__Limbo`.
+    /// The nonzero mode arm converts the matched defense at `0x0050A582`.
     pub(crate) fn invalidate_limbo_building(
         &mut self,
         building_type_index: i32,
         packed_cell: u32,
         is_base_defense: bool,
-        game_mode_nonzero: bool,
+        policy: AiBasePolicy,
     ) -> Option<usize> {
         let matched = self.nodes.iter().position(|node| {
             node.type_or_control == building_type_index && node.packed_cell == packed_cell
@@ -106,7 +233,7 @@ impl BasePlanState {
             }
         }
 
-        if is_base_defense && game_mode_nonzero {
+        if is_base_defense && policy == AiBasePolicy::ReplaceUnavailableNodes {
             self.nodes[matched].type_or_control = -1;
             self.nodes[matched].packed_cell = 0;
         }
@@ -125,20 +252,20 @@ impl BasePlanState {
     }
 
     /// Count a try-later exit against node `index` (`0x0042F380` returns the
-    /// incremented signed count); a skirmish drops the node once the count
+    /// incremented signed count); a nonzero mode drops the node once the count
     /// exceeds `maximum_failures` (`0x00445249..0x004452C3`, the ordered
     /// shift-left removal). Returns whether the node was dropped.
     pub(crate) fn count_placement_failure(
         &mut self,
         index: usize,
-        game_mode_nonzero: bool,
+        policy: AiBasePolicy,
         maximum_failures: i32,
     ) -> bool {
         let Some(node) = self.nodes.get_mut(index) else {
             return false;
         };
         node.retry_count = node.retry_count.wrapping_add(1);
-        if game_mode_nonzero && node.retry_count > maximum_failures {
+        if policy == AiBasePolicy::ReplaceUnavailableNodes && node.retry_count > maximum_failures {
             self.nodes.remove(index);
             return true;
         }
@@ -172,7 +299,7 @@ impl BasePlanState {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 mod tests {
     use std::hash::Hasher;
 
@@ -260,10 +387,14 @@ mod tests {
             ],
         };
 
-        for (is_defense, nonzero_mode) in [(false, true), (true, false)] {
+        let replacement = AiBasePolicy::ReplaceUnavailableNodes;
+        for (is_defense, policy) in [
+            (false, replacement),
+            (true, AiBasePolicy::RetainAuthoredNodes),
+        ] {
             let mut plan = original.clone();
             assert_eq!(
-                plan.invalidate_limbo_building(7, cell, is_defense, nonzero_mode),
+                plan.invalidate_limbo_building(7, cell, is_defense, policy),
                 Some(0)
             );
             assert_eq!(plan.nodes[0], original.nodes[0]);
@@ -275,7 +406,7 @@ mod tests {
         }
 
         let mut skirmish_defense = original;
-        skirmish_defense.invalidate_limbo_building(7, cell, true, true);
+        skirmish_defense.invalidate_limbo_building(7, cell, true, replacement);
         assert_eq!(skirmish_defense.nodes[0].type_or_control, -1);
         assert_eq!(skirmish_defense.nodes[0].packed_cell, 0);
         assert!(skirmish_defense.nodes[0].filled);
@@ -310,10 +441,11 @@ mod tests {
             ],
         };
 
+        let replacement = AiBasePolicy::ReplaceUnavailableNodes;
         let mut retail = source.clone();
-        assert!(!retail.count_placement_failure(1, true, 3));
+        assert!(!retail.count_placement_failure(1, replacement, 3));
         assert_eq!(retail.nodes[1].retry_count, 3);
-        assert!(retail.count_placement_failure(1, true, 3));
+        assert!(retail.count_placement_failure(1, replacement, 3));
         assert_eq!(
             retail
                 .nodes
@@ -325,16 +457,16 @@ mod tests {
 
         let mut equality = source.clone();
         equality.nodes[1].retry_count = 2;
-        assert!(!equality.count_placement_failure(1, true, 3));
+        assert!(!equality.count_placement_failure(1, replacement, 3));
         assert_eq!(equality.nodes[1].retry_count, 3);
 
         let mut campaign = source.clone();
-        assert!(!campaign.count_placement_failure(1, false, -100));
+        assert!(!campaign.count_placement_failure(1, AiBasePolicy::RetainAuthoredNodes, -100));
         assert_eq!(campaign.nodes[1].retry_count, 3);
 
         let mut negative = source.clone();
         negative.nodes[0].retry_count = 0;
-        assert!(negative.count_placement_failure(0, true, -1));
+        assert!(negative.count_placement_failure(0, replacement, -1));
         assert_eq!(
             negative
                 .nodes
@@ -346,8 +478,8 @@ mod tests {
 
         let mut wrapping = source;
         wrapping.nodes[0].retry_count = i32::MAX;
-        assert!(!wrapping.count_placement_failure(0, true, 3));
+        assert!(!wrapping.count_placement_failure(0, replacement, 3));
         assert_eq!(wrapping.nodes[0].retry_count, i32::MIN);
-        assert!(!wrapping.count_placement_failure(99, true, 3));
+        assert!(!wrapping.count_placement_failure(99, replacement, 3));
     }
 }

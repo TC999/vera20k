@@ -1,10 +1,12 @@
-//! Immutable lexical audio definitions selected once for a process.
+//! Immutable audio definitions selected once for a process.
 //!
 //! Init_Game reads SOUNDMD at 52C763/52C796, then EVAMD at 52C843/52C8A0.
 //! The ordinary shell/scenario loop at 48CCD8..48CFAA does not repeat these
 //! reads. Neither reader opens the RA2 base INI. Sources are selected through
 //! the shared AssetManager/physical byte parser, independently of an audio
-//! device or sample index. Lexical sample names are not native admitted slots.
+//! device. With the process sample index, `Sounds=` names are admitted as
+//! native slots ([`AudioDefinitions::select_admitting`]); without it they stay
+//! lexical.
 //!
 //! Missing inputs retain VERA's tolerant empty-catalog policy; native startup
 //! fails instead. Evidence and bounds: tools/audio_catalog_owner.md.
@@ -12,30 +14,56 @@
 use std::sync::Arc;
 
 use crate::assets::asset_manager::AssetManager;
-use crate::rules::retail_sources::{IniSourceIdentity, select_ini};
+use crate::assets::audio_bag::AudioIndex;
+use crate::rules::retail_sources::{IniSourceIdentity, select_game_ini};
 use crate::rules::sound_ini::{EvaRegistry, SoundRegistry};
 
 #[derive(Debug)]
-pub(crate) struct AudioDefinitions {
+pub struct AudioDefinitions {
     sounds: Arc<SoundRegistry>,
-    eva: EvaRegistry,
+    eva: Arc<EvaRegistry>,
     sound_source: Option<IniSourceIdentity>,
     eva_source: Option<IniSourceIdentity>,
 }
 
 impl AudioDefinitions {
-    pub(crate) fn select(assets: &AssetManager) -> Self {
-        let sound = select_ini(assets, "soundmd.ini")
+    /// Definitions with lexical `Sounds=` names, for owners without a
+    /// sample index (headless, tools, tests).
+    pub fn select(assets: &AssetManager) -> Self {
+        Self::select_admitting(assets, None)
+    }
+
+    /// Definitions whose `Sounds=` names `AddSample @ 0x004064A0` admits
+    /// against the process sample index, selected before these readers as
+    /// startup does (`406CE8` before `52C796`).
+    pub fn select_admitting(assets: &AssetManager, index: Option<&AudioIndex>) -> Self {
+        Self::select_for_game(assets, index, assets.ships_ares())
+    }
+
+    /// [`Self::select_admitting`] for a game that ships `ares.mix` or not,
+    /// whatever the archives `assets` mounted: Ares reads both its own way in
+    /// such a game (`ares_switch::ares_way`). A fixture that reads a stock
+    /// install as an Ares game says so here.
+    pub(crate) fn select_for_game(
+        assets: &AssetManager,
+        index: Option<&AudioIndex>,
+        ships_ares: bool,
+    ) -> Self {
+        let _ares_way = crate::rules::ares_switch::read_ares_way(ships_ares);
+        // `[ini] sound`/`eva` override the profile's shared SOUNDMD/EVAMD names;
+        // both readers stay presentation-only and unlayered.
+        let roots = assets.ini_roots();
+        let sound = select_game_ini(assets, roots.sound(), ships_ares)
             .map_err(|error| log::warn!("Audio definitions: {error}"))
             .ok();
         let sounds = Arc::new(
             sound
                 .as_ref()
                 .map_or_else(SoundRegistry::default, |selected| {
-                    SoundRegistry::from_ini(&selected.ini)
+                    SoundRegistry::from_ini_admitting(&selected.ini, index)
                 }),
         );
-        let eva = select_ini(assets, "evamd.ini")
+        let eva = select_game_ini(assets, roots.eva(), ships_ares)
             .map_err(|error| log::warn!("Audio definitions: {error}"))
             .ok();
         let eva_registry = eva.as_ref().map_or_else(EvaRegistry::default, |selected| {
@@ -43,30 +71,30 @@ impl AudioDefinitions {
         });
         Self {
             sounds,
-            eva: eva_registry,
+            eva: Arc::new(eva_registry),
             sound_source: sound.map(|selected| selected.source),
             eva_source: eva.map(|selected| selected.source),
         }
     }
 
-    pub(crate) fn sounds(&self) -> &Arc<SoundRegistry> {
+    pub fn sounds(&self) -> &Arc<SoundRegistry> {
         &self.sounds
     }
 
-    pub(crate) fn eva(&self) -> &EvaRegistry {
+    pub fn eva(&self) -> &Arc<EvaRegistry> {
         &self.eva
     }
 
-    pub(crate) fn sound_source(&self) -> Option<&IniSourceIdentity> {
+    pub fn sound_source(&self) -> Option<&IniSourceIdentity> {
         self.sound_source.as_ref()
     }
 
-    pub(crate) fn eva_source(&self) -> Option<&IniSourceIdentity> {
+    pub fn eva_source(&self) -> Option<&IniSourceIdentity> {
         self.eva_source.as_ref()
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_rules_a_n))]
 mod tests {
     use super::*;
     use crate::map::source::test_support::TestDirectory;
@@ -118,6 +146,45 @@ mod tests {
         assert_eq!(source.logical_name, "evamd.ini");
         assert_eq!(source.payload_len, evamd.len());
         assert_eq!(source.source_sha256, sha256_hex(evamd));
+    }
+
+    #[test]
+    fn selected_audio_roots_replace_the_shared_sound_and_eva_names() {
+        let directory = TestDirectory::new("custom-audio-roots");
+        let sound = b"[SoundList]\n0=Alt\n[Alt]\nSounds=alt\n";
+        let eva = b"[DialogList]\n0=EVA_Alt\n[EVA_Alt]\nAllied=cevaAlt\n";
+        directory.write("my-sound.ini", sound);
+        directory.write("my-eva.ini", eva);
+        directory.write(
+            "soundmd.ini",
+            b"[SoundList]\n0=Default\n[Default]\nSounds=default\n",
+        );
+        directory.write(
+            "evamd.ini",
+            b"[DialogList]\n0=EVA_Default\n[EVA_Default]\nAllied=cevaDefault\n",
+        );
+        let config = crate::util::ini_roots::IniRootConfig {
+            sound: Some("my-sound.ini".into()),
+            eva: Some("my-eva.ini".into()),
+            ..Default::default()
+        };
+        let assets = AssetManager::from_loose_root_for_test(directory.path())
+            .with_ini_roots(&config)
+            .unwrap();
+        let definitions = AudioDefinitions::select(&assets);
+
+        assert!(definitions.sounds().get("Alt").is_some());
+        assert!(definitions.sounds().get("Default").is_none());
+        assert_eq!(
+            definitions.eva().get("EVA_Alt", EvaSide::Allied),
+            Some("cevaAlt")
+        );
+        assert!(definitions.eva().entry("EVA_Default").is_none());
+        assert_eq!(
+            definitions.sound_source().unwrap().logical_name,
+            "my-sound.ini"
+        );
+        assert_eq!(definitions.eva_source().unwrap().logical_name, "my-eva.ini");
     }
 
     #[test]
@@ -175,6 +242,7 @@ mod tests {
             None,
             IniFile::empty(),
             Arc::clone(definitions.sounds()),
+            Arc::clone(definitions.eva()),
         )
         .unwrap();
         directory.write(
@@ -187,7 +255,10 @@ mod tests {
         );
         for _ in 0..2 {
             let (rules, _, _, _) = owner
-                .load_noncampaign_scenario(None, &IniFile::empty())
+                .load_scenario(
+                    crate::rules::process_owner::NativeScenarioRulesPrefix::NonCampaign(None),
+                    &IniFile::empty(),
+                )
                 .unwrap()
                 .into_parts();
             assert!(Arc::ptr_eq(definitions.sounds(), owner.fixed_sounds()));
@@ -198,7 +269,10 @@ mod tests {
         }
         assert!(
             owner
-                .load_noncampaign_scenario(None, &IniFile::from_str("[Tiberiums]\n-1=INVALID\n"))
+                .load_scenario(
+                    crate::rules::process_owner::NativeScenarioRulesPrefix::NonCampaign(None),
+                    &IniFile::from_str("[Tiberiums]\n-1=INVALID\n")
+                )
                 .is_err()
         );
         assert!(Arc::ptr_eq(definitions.sounds(), owner.fixed_sounds()));
@@ -207,5 +281,155 @@ mod tests {
             definitions.eva().get("EVA_Test", EvaSide::Allied),
             Some("old")
         );
+    }
+
+    #[test]
+    fn superweapon_money_eva_reads_retain_catalog_matches_through_layers_and_save() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        use crate::rules::native_processing::ProcessedRulesLayers;
+        use crate::rules::process_owner::NativeScenarioRulesPrefix;
+
+        // Ares10063660 registers [DialogList] names through char[40]
+        // (spatial_oracle/ares_eva), so the long entry is the 39-byte prefix.
+        let long_name = "E".repeat(160);
+        let registered_long_name = "E".repeat(39);
+        let catalog = Arc::new(EvaRegistry::from_ini(&IniFile::from_str(&format!(
+            "[DialogList]\n0=EVA_InsufficientFunds\n1=Known\n2={long_name}\n"
+        ))));
+        for (root_cue, mode_cue, map_cue, expected) in [
+            ("", "", "", Some("EVA_InsufficientFunds")),
+            ("Known", "Missing", "", Some("Known")),
+            ("Known", "", "Missing", Some("Known")),
+            ("Known", "none", "Missing", None),
+            ("Known", "<none>", "", None),
+            ("Known", "none", "Known", Some("Known")),
+            (
+                "Known",
+                "",
+                registered_long_name.as_str(),
+                Some(registered_long_name.as_str()),
+            ),
+            ("Known", "", long_name.as_str(), Some("Known")),
+        ] {
+            let root = IniFile::from_str(&format!(
+                "[SuperWeaponTypes]\n0=Paid\n[Paid]\nType=PsychicReveal\nMoney.Amount=-500\nEVA.InsufficientFunds={root_cue}\n"
+            ));
+            let mode = IniFile::from_str(&format!("[Paid]\nEVA.InsufficientFunds={mode_cue}\n"));
+            let map = IniFile::from_str(&format!("[Paid]\nEVA.InsufficientFunds={map_cue}\n"));
+            let mut owner = NativeRulesProcessOwner::from_cold_start_sources(
+                root,
+                None,
+                IniFile::empty(),
+                Arc::default(),
+                Arc::clone(&catalog),
+            )
+            .unwrap();
+            let (rules, _, _, _) = owner
+                .load_scenario(NativeScenarioRulesPrefix::NonCampaign(Some(&mode)), &map)
+                .unwrap()
+                .into_parts();
+            assert_eq!(
+                rules
+                    .super_weapon("Paid")
+                    .unwrap()
+                    .insufficient_funds_eva
+                    .as_deref(),
+                expected,
+                "root={root_cue}, mode={mode_cue}, map={map_cue}"
+            );
+            let saved =
+                crate::util::save_codec::serialize(owner.saved_scenario_rules().unwrap()).unwrap();
+            let restored: ProcessedRulesLayers =
+                crate::util::save_codec::deserialize(&saved).unwrap();
+            let loaded = owner.project_saved_scenario_rules(&restored).unwrap();
+            assert_eq!(
+                loaded
+                    .super_weapon("Paid")
+                    .unwrap()
+                    .insufficient_funds_eva
+                    .as_deref(),
+                expected
+            );
+            assert_eq!(
+                loaded.simulation_config_hash(),
+                rules.simulation_config_hash()
+            );
+        }
+        let root = IniFile::from_str(
+            "[SuperWeaponTypes]\n0=Paid\n[Paid]\nType=PsychicReveal\nMoney.Amount=-500\nEVA.InsufficientFunds=Missing\n",
+        );
+        let mut owner = NativeRulesProcessOwner::from_cold_start_sources(
+            root,
+            None,
+            IniFile::empty(),
+            Arc::default(),
+            Arc::default(),
+        )
+        .unwrap();
+        let (rules, _, _, _) = owner
+            .load_scenario(
+                NativeScenarioRulesPrefix::NonCampaign(None),
+                &IniFile::empty(),
+            )
+            .unwrap()
+            .into_parts();
+        assert!(
+            rules
+                .super_weapon("Paid")
+                .unwrap()
+                .insufficient_funds_eva
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn superweapon_money_eva_keeps_startup_catalog_after_files_change() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        use crate::rules::process_owner::NativeScenarioRulesPrefix;
+        use crate::rules::retail_sources::RetailRulesSources;
+
+        let directory = TestDirectory::new("money-fixed-eva");
+        directory.write("rulesmd.ini", b"[SuperWeaponTypes]\n0=Paid\n[Paid]\nType=PsychicReveal\nMoney.Amount=-500\nEVA.InsufficientFunds=Known\n");
+        directory.write("artmd.ini", b"; fixed art\n");
+        directory.write(
+            "evamd.ini",
+            b"[DialogList]\n0=EVA_InsufficientFunds\n1=Known\n",
+        );
+        let assets = AssetManager::from_loose_root_with_ares_for_test(directory.path());
+        let definitions = AudioDefinitions::select(&assets);
+        let (startup, _, mut owner) = RetailRulesSources::select(&assets)
+            .unwrap()
+            .into_startup(
+                Arc::clone(definitions.sounds()),
+                Arc::clone(definitions.eva()),
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(
+            startup
+                .unwrap()
+                .super_weapon("Paid")
+                .unwrap()
+                .insufficient_funds_eva
+                .as_deref(),
+            Some("Known")
+        );
+        directory.write("evamd.ini", b"[DialogList]\n0=Missing\n");
+        let (rules, _, _, _) = owner
+            .load_scenario(
+                NativeScenarioRulesPrefix::NonCampaign(None),
+                &IniFile::from_str("[Paid]\nEVA.InsufficientFunds=Missing\n"),
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(
+            rules
+                .super_weapon("Paid")
+                .unwrap()
+                .insufficient_funds_eva
+                .as_deref(),
+            Some("Known")
+        );
+        assert!(definitions.eva().entry("Missing").is_none());
     }
 }

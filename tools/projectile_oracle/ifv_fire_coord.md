@@ -1,7 +1,6 @@
 # FV numbered FLH and two burst tails
 
-`ifv_fire_coord.py/json/meta.json` execute original `gamemd.exe`, SHA256
-`1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c`.
+`ifv_fire_coord.py/json/meta.json` execute original `gamemd.exe`.
 The saved metadata pins Unicorn 2.1.4 and physical input hashes. The fixture
 imports the common type/map preparation from `guided_step.py`; there are no
 `/tmp` imports, patched original instructions, Rust values or calculated goldens.
@@ -105,7 +104,7 @@ Regression tests are `sim::combat::fire_coord::tests::`:
 The production dispatch regression
 `sim::combat::ifv_fireat_tests::empty_fv_two_shot_fireat_matches_native_muzzles_ids_rearm_and_rng`
 sets the declared source pose, Scenario ID21, Seed31 and frames0/4, then calls
-`world_receiver::emit_admitted_fire` for each shot, using a supplied admission
+`world_fire::emit_admitted_fire` for each shot, using a supplied admission
 receipt at the same post-gate boundary as native6FE4F2. Physical HoverMissile
 Range is6 (1536leptons), MinimumRange1 (256); the prior Range5 description was
 incorrect. This comparison does not execute ordinary admission or establish
@@ -129,3 +128,73 @@ post6FF43F effects, full scenario prefix, impact and retirement are outside this
 fixture. [The separate launch corpus](ifv_launch.md) executes full Bullet AI;
 its supplied origin and source boundary differ, so the corpora must not be
 presented as one contiguous whole-world execution.
+
+## Spawn launch: GetFLH base and SpawnManagerClass::AI case 0
+
+`spawn_launch` (the JSON's `spawn_launch` object) uses the same command and inputs.
+It constructs real UnitTypes V3, DRED and BSUB (7470D0). It finds or allocates
+their weapons (772FA0). For each rules layer, in RULESMD→MPBattleMD→Hills order,
+it runs the full Weapon reader 772080 and the shared TechnoType rules slices.
+It then runs the ART reader from HasTurrets 715B10 through the SecondSpawnOffset
+store (71602E..71605B) on the physical ARTMD sections. Native reads:
+
+- FLH: V3 PrimaryFireFLH `-160,0,75`; DRED `30,43,92`; BSUB `225,65,0` and
+  SecondaryFireFLH `0,0,-40`.
+- SecondSpawnOffset: BSUB `-70,0,0`; zeros for the others.
+- Weapons: V3Launcher Burst1 Spawner; DredLauncher Burst2 Spawner; BoomerTorpedo
+  Burst2; CruiseLauncher Burst2 Spawner.
+
+Each owner is supplied Unit state at `[2688,2688,416]`:
+
+- Primary and Secondary facing 0x2000, flags 4, frame 0, rookie.
+- The original Drive (V3) or Ship (DRED, BSUB) constructor runs. Draw_Matrix
+  4AFF60 or 69F670 executes inside GetFLH.
+
+GetFLH 6F3AD0, called with a base:
+
+| Control | Owner | Index | Burst | Base | Native |
+|---|---|---:|---:|---|---|
+| retail SecondSpawnOffset | BSUB | 1 | 1 | `-70,0,0` | `[2639,2737,376]` |
+| zero base | BSUB | 1 | 1 | `0,0,0` | `[2688,2688,376]` |
+| supplied lateral base | DRED | 0 | 1 | `0,25,0` | `[2757,2714,508]` |
+| supplied lateral base | DRED | 0 | 0 | `0,25,0` | `[2662,2619,508]` |
+
+The lateral rows show that the base joins the FLH (6F3B37..6F3B58) before the
+odd-burst mirror (6F3C82).
+
+Each case-0 row runs from 6B73C4 to the child's Unlimbo call at 6B7505, then
+the burst reset block 6B757A..6B758F. The supplied manager and slot memory:
+
+- The slot's IsSpawnedMissile is 1.
+- The owner's burst index starts at 1.
+- Rules+548 CMislType is a supplied pointer identity. Native compares the
+  pointer only.
+
+| Owner | Slot | GetFLH index, base, burst | Unlimbo coordinate | Dir | Burst after |
+|---|---:|---|---|---:|---:|
+| V3 | 0 | 0, `0,0,0`, 1 | `[2575,2801,501]` | 32 | 1 |
+| DRED | 0 | 0, `0,0,0`, 0 | `[2679,2637,518]` | 32 | 0 |
+| DRED | 1 | 0, `0,0,0`, 1 | `[2739,2697,518]` | 32 | 0 |
+| BSUB | 0 | 1, `0,0,0`, 0 | `[2648,2648,386]` | 32 | 0 |
+| BSUB | 1 | 1, `-70,0,0`, 1 | `[2599,2697,386]` | 32 | 0 |
+
+Several parts are not executed:
+
+- The child's Unlimbo.
+- The CMislType V3TAKOFF anim block 6B750B..6B7579. The BSUB rows resume at
+  6B757A instead.
+- The rest of AI and its scheduling.
+
+Hooks reject any RNG draw, ID allocation, allocation or AnimClass constructor;
+none is reached. Coverage is one flat pose and heading. It has no slope tilt
+(the GSI-08.04 residual), no turret and no elite weapon.
+
+Rust regressions:
+
+- `sim::combat::fire_coord::tests::retail_flh_base_matches_original_get_flh`
+  compares the GetFLH rows through the production readers.
+- `sim::spawn_manager_tests::retail_missiles_keep_their_launch_coordinate_from_unlimbo`
+  runs the production spawn manager on the same pose. It compares each child's
+  Location and exact Z, the owner's rounded direction and its final burst index
+  with the case-0 rows. It also checks the production readers against the
+  native type and weapon reads.

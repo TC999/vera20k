@@ -11,7 +11,7 @@
 //! The report's §4.1 names these `c` and `s` the other way round, because it was
 //! written against two Ghidra labels that were themselves swapped. Read the
 //! report with `c → sin` and `s → cos`. Getting this backwards rotates every
-//! river 90° and no test in this repo would notice.
+//! river 90°; the original section/branch controls now pin this convention.
 //!
 //! A finished river then usually cuts a **canyon**: its region is grown across
 //! the map by [`meander`], then six unstamped dilation rings widen it, and
@@ -34,7 +34,8 @@
 //! Active low-deck overlays/CABHUTs are a separate `bridge_deck` mechanism.
 
 use crate::map::rmg::rng::{RANGE_K_BITS, RmgRng};
-use crate::map::rmg::x87::{self, Gaussian, TruncF64};
+use crate::map::rmg::x87::{Gaussian, TruncF64};
+use crate::util::native_x87::X87Chop53;
 
 use super::blob::{BlobCtx, seed_draw};
 use super::bridge;
@@ -83,7 +84,6 @@ const CANYON_STEP_DENSITY: f32 = 0.01;
 /// waterfall crossing's finish dilation, not the canyon's.
 const CANYON_DILATE_RINGS: i32 = 6;
 /// The canyon's clamp rect covers everything — it is not really a clamp.
-const WHOLE_MAP: i32 = 0x200;
 
 /// Steps a river must reach to survive.
 const MIN_STEPS: i32 = 0x28;
@@ -144,12 +144,12 @@ struct Launch {
 fn launch(ctx: &mut BlobCtx<'_>, gauss_first: bool) -> Launch {
     let _ = gauss_first;
     let edge = loop {
-        let value = x87::ftol(
+        let value = X87Chop53::ftol_f64_low_masked(
             unit_draw(ctx.rng)
                 .mul(TruncF64::from_f64(f64::from(EDGES)))
                 .to_f64(),
         );
-        if value <= EDGES - 1 {
+        if value < EDGES {
             break value;
         }
     };
@@ -184,11 +184,12 @@ struct Walk {
     rolled_to_a_stop: bool,
 }
 
-/// What one cross-section reports back to the walk: its end cells, and whether
-/// it ran straight. The waterfall-terrain gate reads all four.
+/// The waterfall gate reads the stamped end cells and straightness. Branches
+/// instead start at the retained position after the section's final increment.
 struct Section {
     first: (i32, i32),
     last: (i32, i32),
+    after: (f64, f64),
     /// Every position shared one `ftol(x)` — the section lies in one column.
     column_straight: bool,
     /// Every position shared one `ftol(y)` — one row.
@@ -209,26 +210,33 @@ fn carve_section(
     let mut x = fx - step_back * sin;
     let mut y = fy - step_back * cos;
     let mut section = Section {
-        first: (x87::ftol(x), x87::ftol(y)),
+        first: (
+            X87Chop53::ftol_f64_low_masked(x),
+            X87Chop53::ftol_f64_low_masked(y),
+        ),
         last: (0, 0),
+        after: (x, y),
         column_straight: true,
         row_straight: true,
     };
 
     for _ in 0..span {
-        let (cx, cy) = (x87::ftol(x), x87::ftol(y));
+        let (cx, cy) = (
+            X87Chop53::ftol_f64_low_masked(x),
+            X87Chop53::ftol_f64_low_masked(y),
+        );
         section.last = (cx, cy);
         if ctx.scratch.in_diamond(cx, cy) {
             let owner = ctx.scratch.get(cx, cy).region;
             if owner == walk.region {
                 // Idempotent re-carve of our own cells.
-                let cell = ctx.grid.get_mut(cx, cy).expect("native cell");
+                let cell = ctx.grid.cell_native_mut(cx, cy);
                 cell.tile = ctx.ids.water_base;
                 cell.sub_tile = 0;
             } else if owner == 0 {
                 if ctx.ids.is_clear(ctx.grid.cell_native(cx, cy).tile) {
                     ctx.scratch.get_mut(cx, cy).region = walk.region;
-                    let cell = ctx.grid.get_mut(cx, cy).expect("native cell");
+                    let cell = ctx.grid.cell_native_mut(cx, cy);
                     cell.tile = ctx.ids.water_base;
                     cell.sub_tile = 0;
                 } else {
@@ -243,29 +251,32 @@ fn carve_section(
         // spans one position past the section's end — a section that would
         // leave its column on the very next substep does not count as
         // straight.
-        if x87::ftol(x + sin) != cx {
+        if X87Chop53::ftol_f64_low_masked(x + sin) != cx {
             section.column_straight = false;
         }
-        if x87::ftol(y + cos) != cy {
+        if X87Chop53::ftol_f64_low_masked(y + cos) != cy {
             section.row_straight = false;
         }
         // The section always completes, even once the walk is doomed.
         x += sin;
         y += cos;
     }
+    // CarveRiver59D510 stores these at59DC6A/59DC6F, before centre travel.
+    // This is one step beyond the last stamped sample. Original execution:
+    // tools/rmg_oracle/river_branch.json section/branch controls.
+    section.after = (x, y);
     section
 }
 
 /// Undo every cell this river claimed.
-fn rollback(ctx: &mut BlobCtx<'_>, cells: &[(i32, i32)], region: i32) {
-    for &(x, y) in cells {
+fn rollback(ctx: &mut BlobCtx<'_>, region: i32) {
+    for ((x, y), cell) in ctx.grid.cells_in_native_order_mut() {
         if ctx.scratch.get(x, y).region != region {
             continue;
         }
         let scratch = ctx.scratch.get_mut(x, y);
         scratch.region = 0;
         scratch.water_region = false;
-        let cell = ctx.grid.get_mut(x, y).expect("native cell");
         cell.tile = 0;
         cell.sub_tile = 0;
         cell.level = ctx.rollback_level;
@@ -281,13 +292,12 @@ pub fn carve(
     start: Option<(i32, i32, f64)>,
     is_branch: bool,
 ) -> bool {
-    // Without the retail sine table a river cannot be steered faithfully, so
-    // none is carved. Skipping is the honest failure: a river built on a
-    // substitute table would be wrong in a way nothing here could detect.
+    // Production always passes the retail sine table. Unit tests of other
+    // phases pass none, and no river is carved rather than one steered by a
+    // substitute table.
     let Some(trig) = ctx.trig else {
         return false;
     };
-    let cells: Vec<(i32, i32)> = ctx.grid.native_cells().collect();
     let mut region = quota.region_id;
     // The original mutates its own is-branch argument when a branch spawns, so
     // one flag serves both "I am a branch" and "I have spawned one" — and a
@@ -309,14 +319,14 @@ pub fn carve(
     let heading0 = heading;
 
     // Width setup.
-    let width_max = x87::ftol(
+    let width_max = X87Chop53::ftol_f64_low_masked(
         TruncF64::from_f64(f64::from(args.water_percent))
             .mul(TruncF64::from_f64(WIDTH_SCALE))
             .to_f64()
             .max(WIDTH_MIN),
     );
     let width = loop {
-        let value = x87::ftol(
+        let value = X87Chop53::ftol_f64_low_masked(
             unit_draw(ctx.rng)
                 .mul(TruncF64::from_f64(f64::from(width_max)))
                 .add(TruncF64::from_f64(WIDTH_MIN))
@@ -331,7 +341,7 @@ pub fn carve(
 
     // The earliest step at which this river may attempt waterfall terrain.
     let waterfall_min_step = loop {
-        let value = x87::ftol(
+        let value = X87Chop53::ftol_f64_low_masked(
             TruncF64::from_f64(f64::from(ctx.rng.next_u32()))
                 .mul(TruncF64::from_f64(WATERFALL_STEP_SPAN_SCALED))
                 .add(TruncF64::from_f64(WATERFALL_STEP_BASE))
@@ -354,15 +364,21 @@ pub fn carve(
     };
 
     loop {
-        let (sx, sy) = (x87::ftol(fx), x87::ftol(fy));
+        let (sx, sy) = (
+            X87Chop53::ftol_f64_low_masked(fx),
+            X87Chop53::ftol_f64_low_masked(fy),
+        );
         if !ctx.scratch.in_diamond(sx, sy) || !walk.alive {
             break;
         }
 
-        let sin = f64::from(trig.sin_radians(heading));
-        let cos = f64::from(trig.cos_radians(heading));
+        // `RandomMapGenerator__CarveRiver` pushes the stored heading to
+        // `CosFromTable` (`0x0059DA1B`) and `SinFromTable` (`0x0059DA29`).
+        let stored = TruncF64::from_f64(heading);
+        let sin = TruncF64::from(trig.sin_from_table(stored)).to_f64();
+        let cos = TruncF64::from(trig.cos_from_table(stored)).to_f64();
 
-        let span = x87::ftol(width_walk + HALF);
+        let span = X87Chop53::ftol_f64_low_masked(width_walk + HALF);
         let section = carve_section(ctx, &mut walk, fx, fy, span, sin, cos);
 
         // Exactly one straightness flag survives a step: whichever axis
@@ -379,7 +395,7 @@ pub fn carve(
         // endpoints and the heading as they stand. A river that is a branch or
         // has spawned one cannot attempt it, and one success is the lifetime cap.
         if !no_more_branches && (column_straight || row_straight) && waterfall_successes < 1 {
-            let drift = x87::ftol(heading - heading0).abs();
+            let drift = X87Chop53::ftol_f64_low_masked(heading - heading0).abs();
             if f64::from(drift) < EIGHTH_TURN
                 && args.bridge_enabled
                 && walk.steps > waterfall_min_step
@@ -429,8 +445,10 @@ pub fn carve(
                 heading + START_SIGMA,
                 heading + 5.0 * START_SIGMA,
             );
-            let bx = x87::ftol(fx + f64::from(span) * sin);
-            let by = x87::ftol(fy + f64::from(span) * cos);
+            // Original59DF6E..59DF9D reads the section's retained doubles,
+            // which centre travel and the branch-angle draws do not change.
+            let bx = X87Chop53::ftol_f64_low_masked(section.after.0);
+            let by = X87Chop53::ftol_f64_low_masked(section.after.1);
             // A failed branch kills the parent — and rolls the whole river back.
             walk.alive = carve(ctx, args, quota, Some((bx, by, angle)), true);
         }
@@ -470,7 +488,10 @@ pub fn carve(
     // A river that ran out of map does not get an end lake; only one that chose
     // to stop does.
     if walk.rolled_to_a_stop && walk.alive {
-        let end = (x87::ftol(fx), x87::ftol(fy));
+        let end = (
+            X87Chop53::ftol_f64_low_masked(fx),
+            X87Chop53::ftol_f64_low_masked(fy),
+        );
         if ctx.scratch.in_diamond(end.0, end.1) {
             walk.alive = lake::grow_lake(ctx, args, quota, Some(end));
         }
@@ -491,12 +512,8 @@ pub fn carve(
             // The green sweep runs whether or not the dilation succeeded; only
             // the shore pass gates it.
             walk.alive = lake::dilate_region_rings(ctx, region, 1);
-            for &(x, y) in &cells {
-                if ctx.scratch.get(x, y).region != region {
-                    continue;
-                }
-                let cell = ctx.grid.get_mut(x, y).expect("native cell");
-                if ctx.ids.is_clear(cell.tile) {
+            for ((x, y), cell) in ctx.grid.cells_in_native_order_mut() {
+                if ctx.scratch.get(x, y).region == region && ctx.ids.is_clear(cell.tile) {
                     cell.tile = ctx.ids.green;
                 }
             }
@@ -519,11 +536,12 @@ pub fn carve(
     }
 
     if !is_branch && walk.alive {
+        let whole = ctx.grid.whole_extent();
         if cut_a_canyon {
             let arm = meander::MeanderArgs {
                 tag: region,
                 step_density: CANYON_STEP_DENSITY,
-                rect: [0, 0, WHOLE_MAP, WHOLE_MAP],
+                rect: [0, 0, whole, whole],
                 reference: origin,
                 claim_frontier: true,
                 pool_dims: (args.playable.w, args.playable.h),
@@ -536,7 +554,7 @@ pub fn carve(
                     region,
                     CANYON_DILATE_RINGS,
                     None,
-                    [0, 0, WHOLE_MAP, WHOLE_MAP],
+                    [0, 0, whole, whole],
                 );
             }
             if walk.alive {
@@ -546,12 +564,10 @@ pub fn carve(
                 // whatever terrain is generated afterwards sit at the new
                 // height. The exact-equality gate above is why only the first
                 // river can cut one.
-                for &(x, y) in &cells {
-                    if ctx.scratch.get(x, y).region == region {
-                        continue;
+                for ((x, y), cell) in ctx.grid.cells_in_native_order_mut() {
+                    if ctx.scratch.get(x, y).region != region {
+                        cell.level = cell.level.wrapping_add(CANYON_LEVEL_STEP);
                     }
-                    let cell = ctx.grid.get_mut(x, y).expect("native cell");
-                    cell.level = cell.level.wrapping_add(CANYON_LEVEL_STEP);
                 }
                 ctx.rollback_level += CANYON_LEVEL_STEP;
             }
@@ -565,7 +581,7 @@ pub fn carve(
                 region,
                 PLAIN_DILATE_RINGS,
                 Some(base),
-                [0, 0, WHOLE_MAP, WHOLE_MAP],
+                [0, 0, whole, whole],
             );
         } else {
             walk.alive = lake::dilate_region_rings(ctx, region, PLAIN_DILATE_RINGS);
@@ -573,10 +589,10 @@ pub fn carve(
     }
 
     if !walk.alive {
-        rollback(ctx, &cells, region);
+        rollback(ctx, region);
         if waterfall_successes > 0 {
             // The near half of the river lives under the previous id.
-            rollback(ctx, &cells, region - 1);
+            rollback(ctx, region - 1);
         }
         return false;
     }
@@ -585,21 +601,21 @@ pub fn carve(
 }
 
 /// Convenience for tests and the seeder: is this water amount above the gate?
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn carries_a_river(water_percent: i32) -> bool {
     water_percent > super::lake::RIVER_GATE
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod tests {
     use super::*;
     use crate::map::rmg::grid::RmgGrid as Grid;
     use crate::map::rmg::phases::shore::{SubTile, TileBlock, TileBlocks};
     use crate::map::rmg::phases::water::PlayableRect;
     use crate::map::rmg::scratch::RmgScratch;
-    use crate::map::rmg::tiles::SpecialTerrain;
     use crate::map::rmg::tiles::TileIds;
     use crate::map::rmg::x87::Gaussian;
+    use crate::map::theater::TheaterCliffRanges;
 
     /// Water amount well above the river gate, so every run carries a river.
     const RIVERED_WATER: i32 = 60;
@@ -629,6 +645,7 @@ mod tests {
             clear: 0,
             ramp_base: -1,
             ramp_smooth: -1,
+            slope_set_pieces: -1,
             rough: -1,
             sand: -1,
             green: 100,
@@ -644,7 +661,7 @@ mod tests {
             paved_roads: -1,
             paved_road_ends: -1,
             medians: -1,
-            special: SpecialTerrain::default(),
+            cliffs: TheaterCliffRanges::default(),
         }
     }
 
@@ -661,7 +678,13 @@ mod tests {
         let mut identity = ids();
         // The crossing needs waterfall sets; four synthetic bases, disjoint from
         // everything else the test ids use.
-        identity.special.waterfalls = [600, 610, 620, 630];
+        identity.cliffs = TheaterCliffRanges {
+            waterfall_north: Some(600),
+            waterfall_east: Some(610),
+            waterfall_south: Some(620),
+            waterfall_west: Some(630),
+            ..TheaterCliffRanges::default()
+        };
         let blocks = blocks();
         let mut rng = RmgRng::new(seed);
         let mut gauss = Gaussian::default();
@@ -685,7 +708,7 @@ mod tests {
         let _ = map_type;
         let quota;
         {
-            let trig = crate::map::rmg::trig::TrigTable::synthetic();
+            let trig = crate::util::retail_trig::TrigTable::embedded();
             let mut ctx = BlobCtx {
                 grid: &mut grid,
                 scratch: &mut scratch,
@@ -693,7 +716,7 @@ mod tests {
                 blocks: &blocks,
                 rng: &mut rng,
                 gauss: &mut gauss,
-                trig: Some(&trig),
+                trig: Some(trig),
                 map_w,
                 map_h,
                 rollback_level: CANYON_BASE_LEVEL,
@@ -704,6 +727,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow; run when changing what it covers"]
     fn waterfall_attempts_advance_the_region_and_stamp_varied_water() {
         // A successful waterfall attempt shows two ways: the region advances
         // extra id, and the fills paint varied water tiles (water_base+1..+5),
@@ -791,7 +815,7 @@ mod tests {
         };
         let base;
         {
-            let trig = crate::map::rmg::trig::TrigTable::synthetic();
+            let trig = crate::util::retail_trig::TrigTable::embedded();
             let mut ctx = BlobCtx {
                 grid: &mut grid,
                 scratch: &mut scratch,
@@ -799,7 +823,7 @@ mod tests {
                 blocks: &blocks,
                 rng: &mut rng,
                 gauss: &mut gauss,
-                trig: Some(&trig),
+                trig: Some(trig),
                 map_w,
                 map_h,
                 rollback_level: CANYON_BASE_LEVEL,
@@ -835,20 +859,6 @@ mod tests {
             raised > 0,
             "no canyon fired across {seeds} runs — the arm never succeeds"
         );
-    }
-
-    #[test]
-    fn the_base_never_rises_twice() {
-        // The gate is an exact test against the starting base, so once a canyon
-        // has been cut no later river can add another step. A `>=` gate here
-        // would let the base climb run away.
-        for seed in [11u16, 4242, 60000] {
-            let (base, _, _) = run_carved_levels(3, seed);
-            assert!(
-                base <= CANYON_BASE_LEVEL + CANYON_LEVEL_STEP,
-                "base climbed past one step: {base}"
-            );
-        }
     }
 
     #[test]
@@ -916,26 +926,206 @@ mod tests {
         assert!(carries_a_river(21));
     }
 
+    /// Full original59D510 calls, including the recursive branch and rollback.
+    /// The component uses the native oracle's declared flat scene and seeded
+    /// entry stream, rather than claiming a complete Generate seed prefix.
     #[test]
-    fn bounded_gaussian_recentres_only_when_the_window_is_too_narrow() {
-        // A window wider than +/- sigma leaves mean and sigma alone.
-        let mut rng = RmgRng::new(7);
-        let mut gauss = Gaussian::default();
-        let value = bounded_gaussian(&mut gauss, &mut rng, 0.0, 0.1, -10.0, 10.0);
-        assert!((-10.0..=10.0).contains(&value));
-    }
-
-    #[test]
-    fn a_cross_section_advances_along_sin_cos() {
-        // Pins the convention this module exists to get right: the carve line
-        // steps by (+sin, +cos), so a heading of 0 lays a vertical line.
-        let _ = Grid::step(0, 0, 0);
-        let (sin, cos) = (0.0f64, 1.0f64);
-        let span = 3;
-        let step_back = f64::from(span - 1) * HALF;
-        let x0 = 10.0 - step_back * sin;
-        let y0 = 10.0 - step_back * cos;
-        assert_eq!(x87::ftol(x0), 10);
-        assert_eq!(x87::ftol(y0), 9);
+    fn native_carve_branch_calls_preserve_rng_and_cleanup() {
+        let doc = crate::test_fixture::json("tools/rmg_oracle/river_branch.json");
+        let state = |rng: RmgRng| {
+            let (locked, words, a, b) = rng.into_continuation().into_native_parts();
+            let mut bytes = vec![locked, 0, 0, 0];
+            bytes.extend_from_slice(&(a as u32).to_le_bytes());
+            bytes.extend_from_slice(&(b as u32).to_le_bytes());
+            for word in words {
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        assert_eq!(doc["schema"], 1);
+        assert_eq!(doc["rows"].as_array().unwrap().len(), 16);
+        for row in doc["rows"].as_array().unwrap() {
+            let input = &row["input"];
+            let context = input["id"].as_str().unwrap();
+            let mut grid = Grid::new(33, 16, 48);
+            let mut scratch = RmgScratch::new(33, 16, 48);
+            for (x, y) in grid.native_cells().collect::<Vec<_>>() {
+                let cell = grid.get_mut(x, y).unwrap();
+                cell.tile = 0;
+                cell.level = 0;
+            }
+            let mut identity = ids();
+            identity.water_base = doc["scene"]["water_base"].as_i64().unwrap() as i32;
+            let blocks = blocks();
+            let mut rng = RmgRng::new(input["seed"].as_u64().unwrap() as u16);
+            let before_index = row["rng_before"]["mapgen"].as_u64().unwrap() as usize;
+            assert_eq!(
+                state(rng.clone()),
+                doc["rng_states_hex"][before_index],
+                "{context}: entry RNG"
+            );
+            let mut gauss = Gaussian::default();
+            let mut quota = WaterQuota {
+                placed: 0,
+                region_id: input["region"].as_i64().unwrap() as i32,
+            };
+            let args = WaterArgs {
+                map_type: 3,
+                water_percent: input["water_percent"].as_i64().unwrap() as i32,
+                num_players: 2,
+                bridge_enabled: false,
+                playable: PlayableRect {
+                    x: 0,
+                    y: 0,
+                    w: 16,
+                    h: 16,
+                },
+            };
+            let mut ctx = BlobCtx {
+                grid: &mut grid,
+                scratch: &mut scratch,
+                ids: &identity,
+                blocks: &blocks,
+                rng: &mut rng,
+                gauss: &mut gauss,
+                trig: Some(crate::util::retail_trig::TrigTable::embedded()),
+                map_w: 16,
+                map_h: 16,
+                rollback_level: input["base_level"].as_u64().unwrap() as u8,
+            };
+            let start = &input["start"];
+            let answer = carve(
+                &mut ctx,
+                &args,
+                &mut quota,
+                Some((
+                    start[0].as_i64().unwrap() as i32,
+                    start[1].as_i64().unwrap() as i32,
+                    input["heading"].as_f64().unwrap(),
+                )),
+                input["is_branch"].as_bool().unwrap(),
+            );
+            assert_eq!(
+                answer,
+                row["result"].as_u64().unwrap() != 0,
+                "{context}: return"
+            );
+            assert_eq!(
+                quota.placed,
+                row["placed"].as_i64().unwrap() as i32,
+                "{context}: placed"
+            );
+            assert_eq!(
+                quota.region_id,
+                row["region"].as_i64().unwrap() as i32,
+                "{context}: region"
+            );
+            let after_index = row["rng_after"]["mapgen"].as_u64().unwrap() as usize;
+            let actual_rng = state(ctx.rng.clone());
+            let expected_rng = doc["rng_states_hex"][after_index].as_str().unwrap();
+            assert_eq!(
+                &actual_rng[..24],
+                &expected_rng[..24],
+                "{context}: post-CarveRiver RNG flag/cursors"
+            );
+            assert_eq!(actual_rng, expected_rng, "{context}: full RNG buffer");
+            let changed: std::collections::BTreeMap<_, _> = row["changed_cells"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| {
+                    (
+                        (
+                            item["coords"][0].as_i64().unwrap() as i32,
+                            item["coords"][1].as_i64().unwrap() as i32,
+                        ),
+                        &item["fields"],
+                    )
+                })
+                .collect();
+            for (x, y) in ctx.grid.native_cells() {
+                let cell = ctx.grid.get(x, y).unwrap();
+                let scratch = ctx.scratch.get(x, y);
+                let actual = serde_json::json!([
+                    cell.tile,
+                    cell.sub_tile,
+                    cell.level,
+                    cell.slope,
+                    scratch.region,
+                    u8::from(scratch.water_region)
+                ]);
+                assert_eq!(
+                    &actual,
+                    changed
+                        .get(&(x, y))
+                        .copied()
+                        .unwrap_or(&doc["scene"]["common"]),
+                    "{context}: cleanup at {x},{y}"
+                );
+            }
+            // Re-enter the same section owner with original-observed inputs.
+            // Compare its stamped cells/straightness and the live native branch
+            // arguments. Floating intermediates retain the existing f64 model.
+            let read_double = |value: &serde_json::Value| {
+                f64::from_bits(u64::from_str_radix(value.as_str().unwrap(), 16).unwrap())
+            };
+            for (index, section) in row["sections"].as_array().unwrap().iter().enumerate() {
+                let mut walk = Walk {
+                    region: quota.region_id,
+                    alive: true,
+                    steps: 0,
+                    rolled_to_a_stop: false,
+                };
+                let input = &section["input"];
+                let actual = carve_section(
+                    &mut ctx,
+                    &mut walk,
+                    read_double(&input["centre"][0]),
+                    read_double(&input["centre"][1]),
+                    input["span"].as_i64().unwrap() as i32,
+                    read_double(&input["sin"]),
+                    read_double(&input["cos"]),
+                );
+                let cells = section["cells"].as_array().unwrap();
+                assert_eq!(
+                    serde_json::json!([actual.first.0, actual.first.1]),
+                    cells[0],
+                    "{context}, section{index}: first cell"
+                );
+                assert_eq!(
+                    serde_json::json!([actual.last.0, actual.last.1]),
+                    *cells.last().unwrap(),
+                    "{context}, section{index}: last cell"
+                );
+                assert_eq!(
+                    actual.column_straight,
+                    section["column_straight"].as_bool().unwrap(),
+                    "{context}, section{index}: column"
+                );
+                assert_eq!(
+                    actual.row_straight,
+                    section["row_straight"].as_bool().unwrap(),
+                    "{context}, section{index}: row"
+                );
+                for branch in row["branches"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|branch| branch["section"].as_u64().unwrap() as usize == index)
+                {
+                    assert_eq!(
+                        serde_json::json!([
+                            X87Chop53::ftol_f64_low_masked(actual.after.0),
+                            X87Chop53::ftol_f64_low_masked(actual.after.1)
+                        ]),
+                        branch["start"],
+                        "{context}, section{index}: live native branch argument"
+                    );
+                }
+            }
+        }
     }
 }

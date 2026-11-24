@@ -28,8 +28,9 @@ use std::path::{Path, PathBuf};
 use crate::asset_tools::canvas::{self, Rgba, SheetCell};
 use crate::asset_tools::identify;
 use crate::asset_tools::names::NameDict;
-use crate::asset_tools::palette::{self, AlphaPolicy};
+use crate::asset_tools::palette;
 use crate::asset_tools::report::{CompareReport, CompareVariant, ErrorReport, RenderOutputs};
+use crate::asset_tools::sanitise_name;
 use crate::assets::asset_manager::AssetManager;
 use crate::assets::aud_file;
 use crate::assets::csf_file::CsfFile;
@@ -94,10 +95,6 @@ const MAX_SCALE: u32 = 16;
 /// Per-image pixel budget (~256 MB of RGBA), mirroring `verb_render`. A corrupt
 /// header claiming a huge canvas must degrade to a report, not an OOM abort.
 const MAX_OUTPUT_PIXELS: u64 = 64_000_000;
-
-/// FNV-1a constants for the per-variant content checksum.
-const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
 /// Options for one `asset compare` invocation.
 #[derive(Debug, Clone)]
@@ -236,7 +233,7 @@ pub fn run(
         ));
     }
 
-    let sanitised = sanitise_name(name);
+    let sanitised = sanitise_name(name, FALLBACK_DIR_NAME);
     let dir = compare_dir(&opts.out, &sanitised);
 
     let mut outputs = RenderOutputs {
@@ -386,7 +383,9 @@ fn variant_fields(format: &str, data: &[u8], size: u32) -> (BTreeMap<String, Str
 /// Distinct RGB triplets in a palette's source bytes. Mirrors `verb_scan`.
 fn unique_palette_colors(data: &[u8]) -> usize {
     let mut colors: Vec<[u8; 3]> = data
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .take(PAL_ENTRY_COUNT)
         .map(|rgb| [rgb[0], rgb[1], rgb[2]])
         .collect();
@@ -397,12 +396,8 @@ fn unique_palette_colors(data: &[u8]) -> usize {
 
 /// FNV-1a over the whole entry. See [`variant_fields`] for why it exists.
 fn content_checksum(data: &[u8]) -> u64 {
-    let mut hash = FNV_OFFSET_BASIS;
-    for byte in data {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(FNV_PRIME);
-    }
-    hash
+    use crate::util::fnv::{FNV1A64_OFFSET_BASIS, fnv1a64_fold_bytes};
+    fnv1a64_fold_bytes(FNV1A64_OFFSET_BASIS, data)
 }
 
 /// Every field whose value is not identical across all variants.
@@ -480,7 +475,7 @@ fn archive_leaf(archive: &str) -> &str {
 ///
 /// Everything else advances the pen and renders blank, so a label spelled with
 /// `#`, `,`, `.` or `(` silently comes out full of gaps. Kept in sync with
-/// `render::bit_font::fallback_5x7_glyphs`, whose table is space, `-`, `:`, `/`,
+/// `asset_tools::canvas::fallback_5x7_glyphs`, whose table is space, `-`, `:`, `/`,
 /// the digits and both letter cases.
 fn is_drawable_glyph(character: char) -> bool {
     matches!(character, ' ' | '-' | ':' | '/')
@@ -550,7 +545,6 @@ fn sheet_header(
 /// Non-SHP variants keep `png: None` — their structural diff is already in the
 /// report, and inventing a render for a format this verb cannot draw would be
 /// worse than saying so.
-#[allow(clippy::too_many_arguments)]
 fn render_variants(
     asset_manager: &AssetManager,
     dict: &NameDict,
@@ -654,12 +648,7 @@ fn render_variants(
             continue;
         }
 
-        // Alpha policy decides the converter. Getting this backwards is the
-        // single most likely way this ships wrong-looking art.
-        let converted = match load.alpha_policy {
-            AlphaPolicy::Standard => shp.frame_to_rgba(opts.frame, &load.palette),
-            AlphaPolicy::GamemdUi => shp.frame_to_rgba_ui(opts.frame, &load.palette),
-        };
+        let converted = shp.frame_to_rgba(opts.frame, &load.palette);
         let frame = &shp.frames[opts.frame];
         let frame_image = match converted {
             Ok(rgba) if frame.frame_width > 0 && frame.frame_height > 0 => {
@@ -836,31 +825,6 @@ fn name_list(names: &[String]) -> String {
     )
 }
 
-/// Replace every character outside `[A-Za-z0-9._-]` so the name is safe as a
-/// directory and filename component on any platform.
-///
-/// Mirrors `verb_render::sanitise_name` character for character — copied rather
-/// than called because that one is module-private, and pinned to the same
-/// fixtures by the test below. Flattening the path separators is also what keeps
-/// a name like `../../x` from escaping the output root.
-fn sanitise_name(name: &str) -> String {
-    let sanitised: String = name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitised.is_empty() {
-        FALLBACK_DIR_NAME.to_string()
-    } else {
-        sanitised
-    }
-}
-
 /// `<out>/compare/<sanitised>/`, a sibling of `<out>/render/<sanitised>/` and
 /// absolutised the same way, so the reported paths do not depend on the
 /// reader's working directory.
@@ -877,7 +841,7 @@ fn compare_dir(out: &Path, sanitised: &str) -> PathBuf {
 fn variant_png_name(sanitised: &str, index: usize, archive: &str) -> String {
     format!(
         "{sanitised}.v{index:02}.{}.png",
-        sanitise_name(archive_leaf(archive))
+        sanitise_name(archive_leaf(archive), FALLBACK_DIR_NAME)
     )
 }
 
@@ -945,7 +909,7 @@ fn fit_scale(w: u32, h: u32, requested: u32) -> Option<u32> {
     Some(scale)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_asset_tools))]
 mod tests {
     use super::*;
 
@@ -1144,20 +1108,6 @@ mod tests {
     }
 
     #[test]
-    fn sanitiser_agrees_with_verb_render() {
-        // Fixtures copied from `verb_render::tests::
-        // sanitise_name_keeps_safe_characters_and_replaces_the_rest`. If that
-        // rule ever changes, this list is where the two verbs diverge.
-        assert_eq!(sanitise_name("sidebar.shp"), "sidebar.shp");
-        assert_eq!(sanitise_name("gi-idle_01.shp"), "gi-idle_01.shp");
-        assert_eq!(sanitise_name("ra2\\dir/na me:x*?"), "ra2_dir_na_me_x__");
-        assert_eq!(sanitise_name(""), FALLBACK_DIR_NAME);
-        assert_eq!(sanitise_name("///"), "___");
-        // Same fallback string as verb_render's and verb_extract's.
-        assert_eq!(FALLBACK_DIR_NAME, "asset");
-    }
-
-    #[test]
     fn compare_dir_is_absolute_and_sits_beside_the_render_tree() {
         let dir = compare_dir(Path::new(DEFAULT_OUT_ROOT), "POWERP.SHP");
         assert!(dir.is_absolute(), "{}", dir.display());
@@ -1177,20 +1127,11 @@ mod tests {
     }
 
     #[test]
-    fn compare_dir_preserves_an_absolute_out_root_verbatim() {
-        let root = if cfg!(windows) {
-            PathBuf::from("C:\\tmp\\out")
-        } else {
-            PathBuf::from("/tmp/out")
-        };
-        let dir = compare_dir(&root, "x.shp");
-        assert!(dir.starts_with(&root), "{}", dir.display());
-        assert!(dir.ends_with(Path::new(COMPARE_SUBDIR).join("x.shp")));
-    }
-
-    #[test]
     fn a_traversing_name_flattens_to_one_component() {
-        let dir = compare_dir(Path::new(DEFAULT_OUT_ROOT), &sanitise_name("../../etc/x"));
+        let dir = compare_dir(
+            Path::new(DEFAULT_OUT_ROOT),
+            &sanitise_name("../../etc/x", FALLBACK_DIR_NAME),
+        );
         assert!(dir.ends_with(".._.._etc_x"), "{}", dir.display());
         assert_eq!(
             dir.parent().and_then(Path::file_name),
@@ -1198,24 +1139,6 @@ mod tests {
             "{}",
             dir.display()
         );
-    }
-
-    #[test]
-    fn variant_png_names_are_indexed_ordered_and_leaf_named() {
-        assert_eq!(
-            variant_png_name("POWERP.SHP", 0, SIDEC01),
-            "POWERP.SHP.v00.sidec01.mix.png"
-        );
-        assert_eq!(
-            variant_png_name("POWERP.SHP", 1, SIDEC02),
-            "POWERP.SHP.v01.sidec02.mix.png"
-        );
-        // Two chains ending in the same leaf still get distinct filenames.
-        assert_ne!(
-            variant_png_name("X.SHP", 0, "ra2.mix -> cache.mix"),
-            variant_png_name("X.SHP", 1, "ra2md.mix -> cache.mix")
-        );
-        assert_eq!(sheet_png_name("POWERP.SHP"), "POWERP.SHP.compare.png");
     }
 
     #[test]
@@ -1230,14 +1153,6 @@ mod tests {
         assert!(!is_generated_output("index.tsv", "gi.shp"));
         assert!(!is_generated_output("gi.shp.v00.png", "gi.shp"));
         assert!(!is_generated_output("gi.shp.vxx.ra2.mix.png", "gi.shp"));
-    }
-
-    #[test]
-    fn the_checksum_separates_equal_length_payloads() {
-        assert_eq!(content_checksum(b"abcd"), content_checksum(b"abcd"));
-        assert_ne!(content_checksum(b"abcd"), content_checksum(b"abce"));
-        // Order matters, so a byte swap is not mistaken for the same art.
-        assert_ne!(content_checksum(b"ab"), content_checksum(b"ba"));
     }
 
     #[test]

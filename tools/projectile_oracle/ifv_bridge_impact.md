@@ -5,11 +5,11 @@ the earlier five-case launch and full-impact evidence unchanged. Independent
 `--check` passes for three controls, each with 17 full original Bullet AI visits.
 
 ```sh
-source /Users/halvor/Documents/vera20k-dev/env.sh
+source ~/Documents/vera20k-dev/env.sh
 PYTHONPATH=. PYTHONDONTWRITEBYTECODE=1 \
 VERA20K_PROJECTILE_RENDER_ASSETS=/tmp/bridge-ifv-assets-1dDM9D/extract \
 VERA20K_BRIDGE_ANIM_ASSETS=/tmp/bridge-debris-input-assets/extract \
-/Users/halvor/Documents/vera20k-dev/.venv/bin/python \
+~/Documents/vera20k-dev/.venv/bin/python \
 tools/projectile_oracle/ifv_bridge_impact.py --check
 ```
 
@@ -78,7 +78,7 @@ Boundaries required to interpret this evidence:
   probes. The script adapts only Python fixture setup statements in memory; it
   never patches original executable instructions.
 
-The companion metadata pins original executable identity and the saved payload.
+The companion metadata pins the saved payload.
 `--check` independently executes without writing; `--write` regenerates. Shared
 harness imports use only repository files. Both asset roots may be relocated;
 the input payload retains physical hashes. The stock crop path is repository

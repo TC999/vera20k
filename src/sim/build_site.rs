@@ -11,8 +11,9 @@
 //! cell-entry query (`BuildingTypeClass::CanPlaceAt`, TerrainType
 //! `0x0071C554`).
 //!
-//! In-game constants: the scenario-init / forced-placement bracket byte
-//! `0xA8E7AC` is clear, so nothing bypasses the test (`0x0047C632`); the byte
+//! The shared scenario-init / forced-placement bracket `0xA8E7AC` admits
+//! immediately when nonzero (`0x0047C632`); ordinary gameplay keeps it clear.
+//! The byte
 //! at `0xA8E9A0` is set once a game runs, so the object tests are live; the
 //! editor byte `0xA8ED6B` is clear, so the cell must lie in the playfield
 //! (`Is_Cell_In_Playfield(cell, 1)`, `0x0047C878`) and an overlay the type
@@ -20,15 +21,15 @@
 
 use crate::map::cell_index::NativeCellIdentity;
 use crate::map::entities::EntityCategory;
-use crate::map::overlay_types::OverlayTypeRegistry;
-use crate::map::resolved_terrain::ResolvedTerrainGrid;
+use crate::map::resolved_terrain::{NativeCellQuery, ResolvedTerrainGrid};
 use crate::rules::locomotor_type::SpeedType;
 use crate::rules::object_type::ObjectType;
+use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::intern::InternedId;
 use crate::sim::movement::locomotor::MovementLayer;
 use crate::sim::occupancy::{CellObjectMember, RawCellKey};
-use crate::sim::world::Simulation;
+use crate::sim::world::{FrameEffects, Simulation};
 
 /// CellClass+0x140 bit tested beside `0x400` by both the overlay and the
 /// terrain arms: a high bridge over the cell.
@@ -39,17 +40,14 @@ const FLAG_BRIDGE_BODY: u32 = 0x400;
 const OCCUPATION_INFANTRY_OR_VEHICLE: u8 = 0x3F;
 /// Overlay indices the wall arms compare (`0x0047C8B1`, `0x0047C903`):
 /// GASAND 0, GAWALL 2 and NAWALL 0x1A in the stock `[OverlayTypes]` list.
-const OVERLAY_GASAND: u8 = 0;
-const OVERLAY_GAWALL: u8 = 2;
-const OVERLAY_NAWALL: u8 = 0x1A;
+pub(crate) const OVERLAY_GASAND: u8 = 0;
+pub(crate) const OVERLAY_GAWALL: u8 = 2;
+pub(crate) const OVERLAY_NAWALL: u8 = 0x1A;
 /// The laser fence overlay a `LaserFence=` type may stand on (`0x0047C961`).
 const OVERLAY_LASER_FENCE: u8 = 0x7E;
 /// The overlay data a wall reaches once damaged (`0x0047C8D4`, `0x0047C926`):
 /// the high nibble is the damage stage.
 const WALL_DAMAGED_DATA: u8 = 0x10;
-/// WaterSet tiles a `Naval=` building accepts: the set's first 14 tiles
-/// (`0x0047CA20`).
-const WATER_SET_OPEN_WATER_TILES: i32 = 0xE;
 
 /// The SpeedType a building type carries into Is_Clear_To_Build.
 /// `BuildingTypeClass::ReadINI` overwrites TechnoType+0x67C with
@@ -57,6 +55,36 @@ const WATER_SET_OPEN_WATER_TILES: i32 = 0xE;
 /// building's own `SpeedType=` line never reaches placement.
 pub(crate) fn building_speed_type(ty: &ObjectType) -> Option<SpeedType> {
     ty.water_bound.then_some(SpeedType::Float)
+}
+
+/// A Unit lifted around a placement test without moving it, as Unit
+/// What_Action's self arm lifts its `DeploysInto=` unit
+/// (`0x0073FF5C..0x0073FF81`, put back at `0x0073FFC8..0x0073FFD9`): Mark(UP)
+/// takes it off its Cell's object list and clears its vehicle bit (0x20)
+/// where it is marked, and its locomotor's Mark_All_Occupation_Bits(0)
+/// clears the bits its track holds, the next Cell of a driving unit
+/// included. The test reads that state instead of writing it.
+pub struct LiftedUnit {
+    id: u64,
+    /// Cells whose ground-plane vehicle bit the lift clears.
+    ground_cells: Vec<(u16, u16)>,
+}
+
+impl LiftedUnit {
+    pub fn read(sim: &Simulation, id: u64) -> Self {
+        let ground_cells = sim
+            .unit_mark_up_raw_cleared(id)
+            .into_iter()
+            .chain(sim.locomotor_occupation_cleared(id))
+            .filter(|&(_, layer)| layer != MovementLayer::Bridge)
+            .map(|(at, _)| at)
+            .collect();
+        Self { id, ground_cells }
+    }
+
+    fn clears_ground(&self, cell: (u16, u16)) -> bool {
+        self.ground_cells.contains(&cell)
+    }
 }
 
 /// `BuildingTypeClass::CanPlaceAt @ 0x00464AC0`: a `PlaceAnywhere=` type
@@ -67,13 +95,19 @@ pub(crate) fn building_speed_type(ty: &ObjectType) -> Option<SpeedType> {
 /// shared dummy off the map) and tested — the walk does not stop at the first
 /// refusal. The foundation must be clear everywhere, except for a `ToTile=`
 /// type, which needs one clear cell (`0x00716260..0x00716280`).
-pub(crate) fn can_place_building_at(
+/// Simulation callers use the canonical lookup (`None`); presentation carries
+/// its isolated query through this same walk and every nested Cell decision.
+/// `lifted` reads the map as it stands while that Unit is lifted for the
+/// test ([`LiftedUnit`]).
+pub fn can_place_building_at(
     sim: &Simulation,
     rules: &RuleSet,
     registry: Option<&OverlayTypeRegistry>,
     ty: &ObjectType,
     origin: (i16, i16),
     house: Option<InternedId>,
+    native_cells: Option<&NativeCellQuery<'_>>,
+    lifted: Option<&LiftedUnit>,
 ) -> bool {
     if ty.place_anywhere {
         return true;
@@ -84,13 +118,24 @@ pub(crate) fn can_place_building_at(
     let Some(terrain) = sim.resolved_terrain.as_ref() else {
         return false;
     };
+    let canonical = NativeCellQuery::canonical(terrain);
+    let cells = native_cells.unwrap_or(&canonical);
     let speed = building_speed_type(ty);
     let mut refused = false;
     let mut admitted = false;
-    for (dx, dy) in crate::rules::foundation::foundation_cell_offsets(&ty.foundation) {
-        let cell =
-            terrain.native_cell_identity((origin.0.wrapping_add(dx), origin.1.wrapping_add(dy)));
-        if is_clear_to_build(sim, rules, registry, cell, speed, Some(ty), house) {
+    for (dx, dy) in ty.foundation.cell_offsets() {
+        let cell = cells.lookup((origin.0.wrapping_add(dx), origin.1.wrapping_add(dy)));
+        if is_clear_to_build(
+            sim,
+            rules,
+            registry,
+            cell,
+            speed,
+            Some(ty),
+            house,
+            Some(cells),
+            lifted,
+        ) {
             admitted = true;
         } else {
             refused = true;
@@ -106,6 +151,9 @@ pub(crate) fn can_place_building_at(
 /// `CellClass::Is_Clear_To_Build @ 0x0047C620` for `cell`, `speed` (`None` is
 /// -1), the building type (`None` for a TerrainType's test) and the placing
 /// house (`None` is null; it matches an unowned wall).
+/// A supplied query must be the context that resolved `cell`, so retained
+/// Dummy coordinates/ground fields come from that identity without relookup.
+/// `lifted` is a Unit its caller lifts around the test ([`LiftedUnit`]).
 pub(crate) fn is_clear_to_build(
     sim: &Simulation,
     rules: &RuleSet,
@@ -114,20 +162,35 @@ pub(crate) fn is_clear_to_build(
     speed: Option<SpeedType>,
     ty: Option<&ObjectType>,
     house: Option<InternedId>,
+    native_cells: Option<&NativeCellQuery<'_>>,
+    lifted: Option<&LiftedUnit>,
 ) -> bool {
+    // Original47C632 returns true while the shared A8E7AC bracket is raised.
+    // Building440580 still enters449440; the bypass belongs to this cell
+    // decision, not to a caller-specific skipping of Building's admission.
+    if sim.object_placement_scope_active() {
+        return true;
+    }
     let Some(terrain) = sim.resolved_terrain.as_ref() else {
         return false;
     };
+    let canonical = NativeCellQuery::canonical(terrain);
+    let cells = native_cells.unwrap_or(&canonical);
     if let Some(ty) = ty
-        && !objects_admit(sim, rules, terrain, cell, ty, house)
+        && !objects_admit(sim, rules, terrain, cell, ty, house, lifted)
     {
         return false;
     }
-    if !crate::sim::cell_rect::retained_cell_is_in_playfield(cell, sim.playfield_bounds, terrain) {
+    if !crate::sim::cell_rect::retained_cell_is_in_playfield(cell, sim.playfield_bounds(), cells) {
         return false;
     }
-    let flags = terrain.native_cell_flags(cell);
-    let slope = terrain.native_cell_ground_fields(cell).1;
+    // Deliberate developer override; object occupancy and bounds above still apply.
+    #[cfg(feature = "debug-tools")]
+    if ty.is_some() && house.is_some_and(|house| sim.debug_flags_for(house).build_anywhere) {
+        return true;
+    }
+    let flags = cells.flags(cell);
+    let slope = cells.ground_fields(cell).1;
     if let NativeCellIdentity::Real(index) = cell {
         let (rx, ry) = (terrain.cells()[index].rx, terrain.cells()[index].ry);
         if let Some(overlay) = sim.overlay_grid.as_ref().map(|grid| *grid.cell(rx, ry))
@@ -150,7 +213,7 @@ pub(crate) fn is_clear_to_build(
     // rules layer leaves its row as the process started it, 0.0 speeds and
     // not Buildable (`RulesClass::ReadSpeedTypeLandTypeTable @ 0x00674000`
     // skips it); a missing key reads 1.0 or false.
-    let land = land_type(terrain, cell);
+    let land = cells.land_type(cell) as u8;
     let semantics = rules.terrain_rules.semantics_for_land_type(land);
     match speed {
         None => {
@@ -158,17 +221,18 @@ pub(crate) fn is_clear_to_build(
                 return false;
             }
             if ty.is_some_and(|ty| ty.naval) {
-                let tile = terrain.native_cell_tile_index(cell);
-                let base = terrain.projectile_water_set_base();
-                tile >= base && tile < base + WATER_SET_OPEN_WATER_TILES
+                // `0x0047CA0F..0x0047CA25`: a Naval type needs a WaterSet tile.
+                terrain.native_cell_is_water_set_tile(cell)
             } else {
                 semantics.is_some_and(|land| land.buildable)
             }
         }
         // The LandType's float speed for this SpeedType is not 0.0
         // (`0x0047CA4D..0x0047CA6A`).
-        Some(speed) => semantics
-            .is_some_and(|land| land.cost_for_speed_type(speed).is_none_or(|cost| cost != 0)),
+        Some(speed) => semantics.is_some_and(|land| {
+            land.cost_for_speed_type(speed)
+                .is_none_or(|cost| !cost.is_zero())
+        }),
     }
 }
 
@@ -188,8 +252,8 @@ pub(crate) enum Flush {
 /// and the placing `house`: over the foundation cells on the map
 /// (`MapClass::In_Bounds`), an overlay blocks (a `WallTower=` type may stand
 /// on GAWALL, `0x0045EF11..0x0045EF26`), and so does the cell's first object
-/// (`+0xE4`) when it is a Terrain object, a building (whose
-/// `PowersUpBuilding=` arm `0x00452670` is dormant) or a unit whose house is
+/// (`+0xE4`) when it is a Terrain object, a building that refuses the upgrade
+/// (`0x00452670` skips an admitted host), or a unit whose house is
 /// not allied to `house`. Any other unit counts as told to leave; unless it
 /// is heading elsewhere already (a NavCom other than its own cell,
 /// `0x0045EF9D..0x0045EFDF`), its cell is scattered
@@ -203,6 +267,7 @@ pub(crate) fn flush_for_placement(
     ty: &ObjectType,
     origin: (i16, i16),
     house: InternedId,
+    effects: &mut FrameEffects<'_>,
 ) -> Flush {
     if origin == (0, 0) {
         return Flush::Clear;
@@ -214,7 +279,7 @@ pub(crate) fn flush_for_placement(
         .as_deref()
         .is_some_and(|name| name.eq_ignore_ascii_case(&ty.id));
     let mut scattered = false;
-    for (dx, dy) in crate::rules::foundation::foundation_cell_offsets(&ty.foundation) {
+    for (dx, dy) in ty.foundation.cell_offsets() {
         let cell = (origin.0.wrapping_add(dx), origin.1.wrapping_add(dy));
         if !sim.map_cell_in_bounds(cell) {
             continue;
@@ -238,25 +303,31 @@ pub(crate) fn flush_for_placement(
         let Some(object) = sim.substrate.entities.get(id) else {
             continue;
         };
-        let allied = crate::map::houses::is_allied_with(
-            &sim.house_alliances,
-            sim.interner.resolve(object.owner()),
-            sim.interner.resolve(house),
-        );
-        if object.category == EntityCategory::Structure || !allied {
+        let allied = sim
+            .house_alliances
+            .is_allied(&sim.interner, object.owner(), house);
+        if object.category() == EntityCategory::Structure {
+            // Flush45EF68..45EF7B skips this host, then scans the remaining
+            // foundation cells. Overlay admission above still applies.
+            if sim.can_install_building_upgrade(id, ty, house, rules) {
+                continue;
+            }
+            return Flush::Blocked;
+        }
+        if !allied {
             return Flush::Blocked;
         }
         scattered = true;
         let own_cell =
-            crate::sim::components::NavTargetRef::cell(object.position.rx, object.position.ry);
+            crate::sim::components::NavTargetRef::cell(object.position.rx(), object.position.ry());
         if object
             .navigation
-            .nav_com
+            .nav_com()
             .is_some_and(|nav_com| nav_com != own_cell)
         {
             continue;
         }
-        if let Err(cause) = sim.scatter_cell_contacts(cell, false, true, rules, registry) {
+        if let Err(cause) = sim.scatter_cell_contacts(cell, false, true, rules, registry, effects) {
             log::debug!("site cell {cell:?} did not scatter: {cause}");
         }
     }
@@ -276,18 +347,29 @@ fn objects_admit(
     cell: NativeCellIdentity,
     ty: &ObjectType,
     house: Option<InternedId>,
+    lifted: Option<&LiftedUnit>,
 ) -> bool {
+    let lifted_id = lifted.map(|lifted| lifted.id);
     let members: Vec<CellObjectMember> = match cell {
         NativeCellIdentity::Real(index) => {
             let cell = &terrain.cells()[index];
             sim.cell_objects((cell.rx, cell.ry), MovementLayer::Ground)
+                .filter(|member| Some(*member) != lifted_id.map(CellObjectMember::Entity))
                 .collect()
         }
         // The shared dummy carries no object list.
         NativeCellIdentity::Dummy => Vec::new(),
     };
+    let lifted_bits = match (lifted, cell) {
+        (Some(lifted), NativeCellIdentity::Real(index))
+            if lifted.clears_ground((terrain.cells()[index].rx, terrain.cells()[index].ry)) =>
+        {
+            crate::sim::occupancy::VEHICLE_OCCUPATION_BIT
+        }
+        _ => 0,
+    };
     let category = |member: &CellObjectMember| match *member {
-        CellObjectMember::Entity(id) => sim.substrate.entities.get(id).map(|e| e.category),
+        CellObjectMember::Entity(id) => sim.substrate.entities.get(id).map(|e| e.category()),
         CellObjectMember::Terrain(_) => None,
     };
     let is_terrain = |member: &CellObjectMember| matches!(member, CellObjectMember::Terrain(_));
@@ -296,6 +378,7 @@ fn objects_admit(
         sim.substrate
             .raw_cell_occupation
             .bits_at(key, MovementLayer::Ground)
+            & !lifted_bits
             & OCCUPATION_INFANTRY_OR_VEHICLE
             == 0
     };
@@ -318,7 +401,7 @@ fn objects_admit(
                     return None;
                 };
                 let cell = &terrain.cells()[index];
-                sim.nearest_cell_object((cell.rx, cell.ry), MovementLayer::Ground)
+                sim.nearest_cell_object((cell.rx, cell.ry), MovementLayer::Ground, lifted_id)
                     .map(CellObjectMember::Entity)
             })
             .or_else(|| members.iter().find(|member| is_terrain(member)).copied());
@@ -326,7 +409,7 @@ fn objects_admit(
             None => occupation_clear(),
             Some(CellObjectMember::Entity(id)) => {
                 sim.substrate.entities.get(id).is_some_and(|e| {
-                    e.category == EntityCategory::Structure
+                    e.category() == EntityCategory::Structure
                         && sim
                             .object_type(e.type_ref(), rules)
                             .is_some_and(|blocker| blocker.laser_fence)
@@ -355,7 +438,6 @@ fn objects_admit(
 
 /// The overlay arm (`0x0047C88D..0x0047C9C7`). `wall_owner` is the House that
 /// Cell+0x50 names, if any.
-#[allow(clippy::too_many_arguments)]
 fn overlay_admits(
     rules: &RuleSet,
     registry: Option<&OverlayTypeRegistry>,
@@ -367,39 +449,53 @@ fn overlay_admits(
     flags: u32,
     slope: u8,
 ) -> bool {
-    let Some(ty) = ty else {
-        return false;
-    };
-    // BuildingType+0xE54 ToOverlay, compared by OverlayType index.
-    let own_damaged_wall = || {
-        overlay_data >= WALL_DAMAGED_DATA
-            && ty
-                .to_overlay
-                .as_deref()
-                .and_then(|name| registry?.id_for_name(name))
-                == Some(overlay_id)
-    };
-    let gates = &rules.general.building_types;
-    if matches!(overlay_id, OVERLAY_GASAND | OVERLAY_GAWALL)
-        && (own_damaged_wall() || gates.stands_on_gdi_wall(&ty.id))
-        && wall_owner == house
+    let ares = rules.ares_form();
+    if ares
+        && ares_gate_on_wall(
+            rules,
+            registry,
+            overlay_id,
+            overlay_data,
+            wall_owner,
+            ty,
+            house,
+        )
     {
         return true;
     }
-    if overlay_id == OVERLAY_NAWALL
-        && (own_damaged_wall() || gates.stands_on_nod_wall(&ty.id))
-        && wall_owner == house
-    {
-        return true;
+    let Some(ty) = ty else {
+        return false;
+    };
+    if !ares {
+        let damaged = || own_damaged_wall(registry, ty, overlay_id, overlay_data);
+        let gates = &rules.general.building_types;
+        if matches!(overlay_id, OVERLAY_GASAND | OVERLAY_GAWALL)
+            && (damaged() || gates.stands_on_gdi_wall(&ty.id))
+            && wall_owner == house
+        {
+            return true;
+        }
+        if overlay_id == OVERLAY_NAWALL
+            && (damaged() || gates.stands_on_nod_wall(&ty.id))
+            && wall_owner == house
+        {
+            return true;
+        }
     }
     // A LaserFence type on the fence overlay or on ore
     // (`OverlayToTiberiumIndex @ 0x005FDD20` != -1).
     if ty.laser_fence
         && (overlay_id == OVERLAY_LASER_FENCE
             || registry.is_some_and(|registry| {
-                registry
-                    .tiberium_type_for_overlay(&rules.tiberium_types, overlay_id)
-                    .is_some()
+                match registry.tiberium_type_for_overlay(&rules.tiberium_types, overlay_id) {
+                    Ok(class) => class.is_some(),
+                    Err(error) => {
+                        // Safe admission refusal: malformed resource state
+                        // must not become permission to stamp a building.
+                        log::warn!("Cannot admit LaserFence over overlay {overlay_id}: {error}");
+                        false
+                    }
+                }
             }))
     {
         return flags & (FLAG_HIGH_BRIDGE | FLAG_BRIDGE_BODY) == 0 && slope == 0;
@@ -407,20 +503,74 @@ fn overlay_admits(
     false
 }
 
-/// CellClass+0xEC through the retained identity.
-fn land_type(terrain: &ResolvedTerrainGrid, cell: NativeCellIdentity) -> u8 {
-    match cell {
-        NativeCellIdentity::Real(index) => terrain.cells()[index].yr_cell_land_type,
-        NativeCellIdentity::Dummy => {
-            crate::map::resolved_terrain::NativeCellQuery::canonical(terrain).land_type(cell) as u8
+/// BuildingType+0xE54 `ToOverlay=` is this overlay (compared by OverlayType
+/// index) and the overlay data has reached the damaged stage.
+fn own_damaged_wall(
+    registry: Option<&OverlayTypeRegistry>,
+    ty: &ObjectType,
+    overlay_id: u8,
+    overlay_data: u8,
+) -> bool {
+    overlay_data >= WALL_DAMAGED_DATA
+        && ty
+            .to_overlay
+            .as_deref()
+            .and_then(|name| registry?.id_for_name(name))
+            == Some(overlay_id)
+}
+
+/// Ares 3.0 CellClass_CanThisExistHere_GateOnWall `10015780` (hook
+/// `0x0047C8AB`), in place of the two stock wall arms
+/// (`0x0047C8B1..0x0047C94D`). The placing house must own the wall first;
+/// then a `Gate=` type stands on any `Wall=yes` overlay, and a type whose
+/// `ToOverlay=` is the overlay on its damaged stage stands on any overlay
+/// index, not only GASAND, GAWALL and NAWALL. Otherwise the stock type lists
+/// decide, compared as Rules pointers: a null `ty` (a TerrainType's test)
+/// matches an unset `[General]` entry. A refusal continues at the laser
+/// fence arm (`0x0047C94F`).
+fn ares_gate_on_wall(
+    rules: &RuleSet,
+    registry: Option<&OverlayTypeRegistry>,
+    overlay_id: u8,
+    overlay_data: u8,
+    wall_owner: Option<InternedId>,
+    ty: Option<&ObjectType>,
+    house: Option<InternedId>,
+) -> bool {
+    if house != wall_owner {
+        return false;
+    }
+    if let Some(ty) = ty {
+        let wall = registry
+            .and_then(|registry| registry.flags(overlay_id))
+            .is_some_and(|flags| flags.wall);
+        if (ty.gate && wall) || own_damaged_wall(registry, ty, overlay_id, overlay_data) {
+            return true;
         }
+    }
+    let is = |name: &Option<String>| match (name.as_deref(), ty) {
+        (None, None) => true,
+        (Some(name), Some(ty)) => name.eq_ignore_ascii_case(&ty.id),
+        _ => false,
+    };
+    let types = &rules.general.building_types;
+    match overlay_id {
+        OVERLAY_GASAND | OVERLAY_GAWALL => {
+            [&types.wall_tower, &types.gdi_gate_one, &types.gdi_gate_two]
+                .into_iter()
+                .any(is)
+        }
+        OVERLAY_NAWALL => [&types.nod_gate_one, &types.nod_gate_two]
+            .into_iter()
+            .any(is),
+        _ => false,
     }
 }
 
 /// BuildingType+0xE58: `ToTile=` resolves (`0x00465CC0` → `0x00544CE0`) only
 /// when the theater registers that tile name. A terrain without a resident
 /// tile registry registers none.
-fn resolved_to_tile(terrain: &ResolvedTerrainGrid, ty: &ObjectType) -> bool {
+pub(crate) fn resolved_to_tile(terrain: &ResolvedTerrainGrid, ty: &ObjectType) -> bool {
     ty.to_tile.as_deref().is_some_and(|name| {
         terrain
             .resolve_registered_tile_name(name)
@@ -430,6 +580,6 @@ fn resolved_to_tile(terrain: &ResolvedTerrainGrid, ty: &ObjectType) -> bool {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 #[path = "build_site_tests.rs"]
 mod tests;

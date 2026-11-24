@@ -21,6 +21,7 @@ use crate::sim::projectile::{
     ProjectileVisualState, TargetExpiryPolicy,
 };
 use crate::sim::world::{Simulation, display_layers::DisplayLayers};
+use crate::util::save_codec;
 use serde_json::Value;
 use std::collections::HashSet;
 
@@ -74,11 +75,10 @@ fn fixture(row: &Value, kind: &crate::rules::projectile_type::ProjectileType) ->
     let mut sim = Simulation::with_seed(31);
     let mut terrain = test_flat_ground_grid(32);
     terrain.test_set_native_allocated_cells(&[cell_xy]);
-    *terrain.cell_mut(cell_xy.0, cell_xy.1).unwrap() = cell;
+    *terrain.cell_mut_for_test(cell_xy.0, cell_xy.1).unwrap() = cell;
     sim.install_resolved_terrain_for_new_map(terrain);
-    let weapon = sim.interner.intern("FIXTURE_UNUSED_WEAPON");
-    let warhead = sim.interner.intern("FIXTURE_UNUSED_WARHEAD");
-    let id = sim.allocate_stable_id();
+    let warhead = sim.intern("FIXTURE_UNUSED_WARHEAD");
+    let id = sim.substrate_mut_for_test().allocate_stable_id();
     sim.admit_projectile(
         id,
         ProjectileSpawn {
@@ -89,7 +89,7 @@ fn fixture(row: &Value, kind: &crate::rules::projectile_type::ProjectileType) ->
             origin: coord,
             target: ProjectileTarget::None,
             initial_target_position: coord,
-            payload: ProjectilePayload::new(0, warhead, weapon),
+            payload: ProjectilePayload::new(0, warhead, None, false),
             speed_leptons_per_frame: 0,
             velocity: input["velocity"].as_array().map_or_else(
                 || ProjectileVelocity::new(0, 0, 0),
@@ -116,7 +116,10 @@ fn fixture(row: &Value, kind: &crate::rules::projectile_type::ProjectileType) ->
             collision: ProjectileCollisionPolicy::NONE,
         },
     );
-    sim.projectiles.get_mut(id).unwrap().on_bridge = input["on_bridge"].as_i64().unwrap_or(0) != 0;
+    sim.projectiles_mut_for_test()
+        .get_mut(id)
+        .unwrap()
+        .set_on_bridge_for_test(input["on_bridge"].as_i64().unwrap_or(0) != 0);
     (sim, id)
 }
 
@@ -132,8 +135,8 @@ fn retail_bullet_atlas_geometry_and_layer_replay_match_original_shape_pixels() {
                 .ra2_dir
         });
     let assets = AssetManager::new(&root, MediaArchiveMode::STOCK_DIGITAL).unwrap();
-    let native: Value = serde_json::from_str(include_str!(
-        "../../../../tools/projectile_oracle/bridge_render_shape.json"
+    let native: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/projectile_oracle/bridge_render_shape.json",
     ))
     .unwrap();
     let rules = physical_rules(&assets, false);
@@ -227,6 +230,7 @@ fn compare_shape_corpus(
                 &[],
                 &HashSet::new(),
                 &HashSet::new(),
+                &Default::default(),
                 None,
                 atlas,
                 None,
@@ -260,7 +264,7 @@ fn compare_shape_corpus(
                 &atlas
             };
             let (mut sim, id) = fixture(row, &kind);
-            let grid = sim.resolved_terrain.as_ref().unwrap();
+            let grid = sim.resolved_terrain().unwrap();
             grid.shared_cell_dummy().stamp_coord(123, -44);
             let dummy_before = grid.shared_cell_dummy().snapshot();
             let before_hash = sim.state_hash();
@@ -270,24 +274,26 @@ fn compare_shape_corpus(
             ];
             let viewport = [size[0] as f32, size[1] as f32];
             let axis = DepthAxis::NONE;
-            let order = NativeDisplayOrder::from_display(sim.display_layers());
+            let order = NativeDisplayOrder::from_world(&sim, None);
             let object = projectile_draw_instance(
-                sim.projectiles.get(id).unwrap(),
+                sim.projectiles().get(id).unwrap(),
                 &kind,
                 type_id,
-                atlas,
+                crate::rules::house_colors::HouseColorIndex(0),
+                Some(atlas),
                 grid,
                 camera_pos,
                 viewport,
                 axis,
                 &order,
+                |_, _| None,
             );
             // Serialize the actual retained components, not a freshly sorted
             // list or new projectile constructor. Full savegame restoration is
             // tested by its owning runtime; this pins presentation consumers.
             let (restored_store, restored_display): (ProjectileStore, DisplayLayers) =
-                bincode::deserialize(
-                    &bincode::serialize(&(&sim.projectiles, sim.display_layers())).unwrap(),
+                save_codec::deserialize(
+                    &save_codec::serialize(&(sim.projectiles(), sim.display_layers())).unwrap(),
                 )
                 .unwrap();
             let restored_order = NativeDisplayOrder::from_display(&restored_display);
@@ -295,12 +301,14 @@ fn compare_shape_corpus(
                 restored_store.get(id).unwrap(),
                 &kind,
                 type_id,
-                atlas,
+                crate::rules::house_colors::HouseColorIndex(0),
+                Some(atlas),
                 grid,
                 camera_pos,
                 viewport,
                 axis,
                 &restored_order,
+                |_, _| None,
             );
             let layers = lower_object_instances(object.into_iter().collect());
             let restored_layers = lower_object_instances(restored.into_iter().collect());
@@ -327,11 +335,10 @@ fn compare_shape_corpus(
             );
             let mut view = camera(size);
             view.camera_pos = camera_pos;
-            // The original fixture explicitly supplies baseline1024; production
-            // uses32768. A test-only origin rebase matches that supplied buffer
-            // without changing producer Z terms. Canonical rows need no rebase.
-            view.native_z_origin_y =
-                input["depth_baseline"].as_i64().unwrap_or(1024) as f32 - 32768.;
+            // The original fixture supplies baseline 1024, a seed panned from
+            // production's 32768 (`native_z::ZSeed`), without changing
+            // producer Z terms. Canonical rows need no pan.
+            view.native_z_pan = (32768 - input["depth_baseline"].as_i64().unwrap_or(1024)) as f32;
             batch.write_camera(&gpu.queue, view);
             renderer.prepare(&gpu.device, &color, &dv, batch.camera_uniform());
             pool.upload_on_device(
@@ -360,6 +367,7 @@ fn compare_shape_corpus(
                 });
             draw_native_object_pass(
                 &mut encoder,
+                crate::app::render::merge_passes::ObjectDrawPhase::Display,
                 &cv,
                 &dv,
                 &mut renderer,
@@ -370,10 +378,11 @@ fn compare_shape_corpus(
                 None,
                 None,
                 None,
-                &VxlSlopeTransitionCache::default(),
                 Some(atlas),
                 None,
                 batch.default_zshape_bind_group(),
+                None,
+                None,
             );
             let reads = [
                 gpu.read(&mut encoder, &color),
@@ -386,9 +395,15 @@ fn compare_shape_corpus(
                     + pixel[0].as_u64().unwrap()) as usize;
                 expected[index] = encoded(pixel[2].as_u64().unwrap() as u16, format);
             }
-            for (index, (pixel, expected)) in output[0].chunks_exact(4).zip(expected).enumerate() {
+            for (index, (pixel, expected)) in output[0]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(expected)
+                .enumerate()
+            {
                 assert_eq!(
-                    pixel,
+                    *pixel,
                     expected,
                     "{format:?}, {}, pixel({}, {})",
                     input["name"],
@@ -398,9 +413,12 @@ fn compare_shape_corpus(
             }
             assert_eq!(row["z_unchanged"], true);
             assert!(
-                output[1].chunks_exact(4).all(
-                    |pixel| pixel == crate::render::native_z::stored_depth(old_z).to_le_bytes()
-                ),
+                output[1]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|pixel| *pixel
+                        == crate::render::native_z::stored_depth(old_z).to_le_bytes()),
                 "{format:?}, {} retained depth",
                 input["name"]
             );
@@ -412,20 +430,22 @@ fn compare_shape_corpus(
             );
             // The late store entry survives retirement, but its Display slot
             // is already gone. No storage-order rendering is admissible.
-            assert!(sim.retire_non_entity_object(id));
-            assert!(sim.projectiles.get(id).is_some());
-            let removed_order = NativeDisplayOrder::from_display(sim.display_layers());
+            assert!(sim.retire_non_entity_object(id, crate::sim::world::UninitContext::default()));
+            assert!(sim.projectiles().get(id).is_some());
+            let removed_order = NativeDisplayOrder::from_world(&sim, None);
             assert!(
                 projectile_draw_instance(
-                    sim.projectiles.get(id).unwrap(),
+                    sim.projectiles().get(id).unwrap(),
                     &kind,
                     type_id,
-                    atlas,
-                    sim.resolved_terrain.as_ref().unwrap(),
+                    crate::rules::house_colors::HouseColorIndex(0),
+                    Some(atlas),
+                    sim.resolved_terrain().unwrap(),
                     camera_pos,
                     viewport,
                     axis,
-                    &removed_order
+                    &removed_order,
+                    |_, _| None,
                 )
                 .is_none()
             );
@@ -470,8 +490,8 @@ fn retail_ifv_dragon_all_frames_and_flight_match_original_shape_pixels() {
     let mut rules =
         RuleSet::from_ini_with_fixed_art_for_test(&IniFile::from_str(&text), &art).unwrap();
     rules.install_art_data(ArtRegistry::from_ini(&art));
-    let native: Value = serde_json::from_str(include_str!(
-        "../../../../tools/projectile_oracle/ifv_render.json"
+    let native: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/projectile_oracle/ifv_render.json",
     ))
     .unwrap();
     let rows: Vec<_> = native["draws"].as_array().unwrap().iter().collect();

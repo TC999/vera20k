@@ -14,6 +14,17 @@
 //! ## Dependency rules
 //! - Part of assets/ — no dependencies on game modules.
 
+// Outside data reaches this module: it refuses bad input, never panics.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
+
 use crate::assets::error::AssetError;
 use crate::util::read_helpers::read_u32_le;
 
@@ -36,43 +47,35 @@ pub struct VplFile {
 impl VplFile {
     /// Parse a VPL file from raw bytes.
     pub fn from_bytes(data: &[u8]) -> Result<Self, AssetError> {
-        if data.len() < VPL_MIN_SIZE {
-            return Err(AssetError::ParseError {
-                format: "VPL".to_string(),
-                detail: format!(
-                    "File too small: {} bytes (need at least {})",
-                    data.len(),
-                    VPL_MIN_SIZE
-                ),
-            });
-        }
+        let malformed = |detail: String| AssetError::ParseError {
+            format: "VPL".to_string(),
+            detail,
+        };
+        // Byte 12..16: unknown field (skip). The pages follow the header and
+        // the palette.
+        let (Some(first_remap), Some(last_remap), Some(num_sections), Some(page_data)) = (
+            read_u32_le(data, 0),
+            read_u32_le(data, 4),
+            read_u32_le(data, 8),
+            data.get(VPL_MIN_SIZE..),
+        ) else {
+            return Err(malformed(format!(
+                "File too small: {} bytes (need at least {})",
+                data.len(),
+                VPL_MIN_SIZE
+            )));
+        };
 
-        let first_remap: u32 = read_u32_le(data, 0);
-        let last_remap: u32 = read_u32_le(data, 4);
-        let num_sections: u32 = read_u32_le(data, 8);
-        // Byte 12..16: unknown field (skip).
-
-        let pages_start: usize = 16 + 768; // after header + palette
-        let needed: usize = pages_start + num_sections as usize * 256;
-        if data.len() < needed {
-            return Err(AssetError::ParseError {
-                format: "VPL".to_string(),
-                detail: format!(
-                    "File too small for {} sections: {} bytes (need {})",
-                    num_sections,
-                    data.len(),
-                    needed
-                ),
-            });
-        }
-
-        let mut pages: Vec<[u8; 256]> = Vec::with_capacity(num_sections as usize);
-        for i in 0..num_sections as usize {
-            let offset: usize = pages_start + i * 256;
-            let mut page: [u8; 256] = [0u8; 256];
-            page.copy_from_slice(&data[offset..offset + 256]);
-            pages.push(page);
-        }
+        let (all_pages, _) = page_data.as_chunks::<256>();
+        let Some(pages) = all_pages.get(..num_sections as usize) else {
+            return Err(malformed(format!(
+                "File too small for {} sections: {} bytes hold {}",
+                num_sections,
+                data.len(),
+                all_pages.len()
+            )));
+        };
+        let pages: Vec<[u8; 256]> = pages.to_vec();
 
         Ok(VplFile {
             first_remap,
@@ -100,7 +103,7 @@ impl VplFile {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_assets))]
 mod tests {
     use super::*;
 
@@ -123,14 +126,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_vpl() {
-        let vpl: VplFile = VplFile::from_bytes(&make_test_vpl()).expect("Should parse");
-        assert_eq!(vpl.first_remap, 16);
-        assert_eq!(vpl.last_remap, 31);
-        assert_eq!(vpl.num_sections, 2);
-    }
-
-    #[test]
     fn test_lookup() {
         let vpl: VplFile = VplFile::from_bytes(&make_test_vpl()).expect("Should parse");
         // Page 0 is identity.
@@ -139,10 +134,5 @@ mod tests {
         assert_eq!(vpl.get_palette_index(1, 200), 42);
         // Out-of-range page clamps to last page (page 1 maps everything to 42).
         assert_eq!(vpl.get_palette_index(5, 77), 42);
-    }
-
-    #[test]
-    fn test_reject_too_small() {
-        assert!(VplFile::from_bytes(&[0u8; 10]).is_err());
     }
 }

@@ -12,6 +12,98 @@ use crate::util::native_x87::{
     MaskedX87Chop53 as X, MaskedX87Ordering, NativeF32Bits, NativeF64Bits,
 };
 
+/// The rearm countdown, `TechnoClass+0x2EC` (a CDTimerClass whose duration is
+/// `+0x2F4`). It belongs to the object, not to its target: `Assign_Target @
+/// 0x006FCDB0` never touches it, so a new target does not reload the weapon.
+///
+/// Writers, from a scan of every `+0x2EC..+0x2F4` operand in the image:
+/// - The constructor starts it at the current frame with no duration
+///   (`0x006F2E81`, [`Self::new`]).
+/// - `TechnoClass::FireAt`, every launched shot, with GetROF's value (the
+///   drawn gap mid-burst, the full reload after the burst's last shot),
+///   halved for a berserk firer (`0x006FF274..0x006FF2CB`). Its DiskLaser
+///   path stores the value unhalved, fires the disk laser and returns
+///   (`0x006FE4A4..0x006FE4EF`). Ported (`world_fire::emit_admitted_fire`,
+///   through `GameEntity::rearm_after_fire`); DiskLaser returns before the
+///   ordinary Bullet and report/muzzle/reveal tails.
+/// - `AircraftClass::Drop_Payload` restarts it with no duration
+///   (`0x00415E88`). Ported (the paradrop success arm).
+/// - A Prism support beam starts the supporter's downtime,
+///   {Frame, `PrismSupportDelay=`} (`0x0044ACD0..0x0044ACDC`). Ported
+///   (`building_missions::process_delayed_fire`).
+/// - A C4 plant arms the planter with `GetROF(1)`
+///   (`InfantryClass::Per_Cell_Process 0x0051A564`/`0x0051A624`). Ported
+///   (`sim::c4_plant`).
+/// - `UnitClass::ReceiveGunner`/`RemoveGunner` read the donor's active rearm
+///   (`0x0074643A`, `0x00746502`), increment the receiving owner's burst,
+///   and restart its timer with its own GetROF7/0 (`0x00746499`,
+///   `0x00746574`; `passenger::rearm_transferred_gunner`). No charge-delay
+///   write or burst remainder accompanies these callers.
+/// - RESIDUAL, with its mechanism:
+///   - `UnitClass::PerCellProcess` arms a unit that stops with no NavCom
+///     and no path with `GetROF(1) / 4` when its type has
+///     `MobileFire=no` (`0x0073ADCA..0x0073AE18`). Dormant: no retail
+///     type sets it (the constructor's default is yes, `0x00711150`).
+///
+/// Readers: GetFireError answers Rearm while it runs (`0x006FC94F`);
+/// `CanAutoCloak @ 0x006FBDC0` waits for it; `FootClass::Mission_Guard`
+/// returns its remaining frames as the next delay and draws nothing
+/// (`0x004D52A9`); the Prism walk skips a tower while it runs
+/// (`0x0044B3AE`); `TechnoClass::Compute_CRC` folds it (`0x0070C362`).
+/// RESIDUAL:
+/// - `AircraftClass::Mission_Guard` falls into the same Foot body
+///   (`0x0041A92B`), but VERA's aircraft Guard is not a port of it.
+/// - `CanDeploySlashUnload @ 0x00700D50` reads it only for a type with
+///   `UndeployDelay > -1` (`0x00700DF9..0x00700E23`); that type refuses
+///   deployment while it runs. Stock GI/GGI keep the reader default-1.
+///
+/// The charge-turret model index reads this with the saved +2F8 duration
+/// (6FA540); `game_entity::gunner` owns that presentation state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RearmTimer {
+    timer: crate::sim::timer::CdTimer,
+}
+
+impl RearmTimer {
+    /// The constructor's start: the current frame, no duration (`0x006F2E81`).
+    pub(crate) const fn new(frame: i32) -> Self {
+        Self {
+            timer: crate::sim::timer::CdTimer::started(frame, 0),
+        }
+    }
+
+    /// The countdown as a timer.
+    pub const fn timer(self) -> crate::sim::timer::CdTimer {
+        self.timer
+    }
+
+    /// The frame it was last started.
+    pub const fn start_frame(self) -> i32 {
+        self.timer.start_frame()
+    }
+
+    /// Its duration (`+0x2F4`).
+    pub const fn duration(self) -> i32 {
+        self.timer.duration()
+    }
+
+    /// The frames left at `current_frame`.
+    pub fn remaining(self, current_frame: i32) -> i32 {
+        self.timer.remaining(current_frame)
+    }
+
+    /// Start it: the writers listed on [`RearmTimer`].
+    pub(crate) fn start(&mut self, current_frame: i32, duration: i32) {
+        self.timer.start(current_frame, duration);
+    }
+
+    /// Install a fixture's countdown.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_for_test(&mut self, timer: crate::sim::timer::CdTimer) {
+        self.timer = timer;
+    }
+}
+
 /// The firer's live particle systems GetROF tests against the weapon's flags.
 /// FireAt creates the fired weapon's systems (`0x006FF15B..0x006FF26E`) before
 /// it calls GetROF, so inside FireAt a flagged weapon always has its own.
@@ -39,6 +131,21 @@ pub(crate) struct RofQuery<'a> {
     pub unit_burst_delays: Option<[i32; 4]>,
     /// The owner's ROF bias (`House+0x1A8`).
     pub house_rof: NativeF64Bits,
+    /// Phobos `TechnoClass_RearmDelay_ROF` (`0x006FD0B5`, 6 bytes replaced):
+    /// the active AttachEffect `ROFMultiplier` product, a C++ double multiply
+    /// on `ROF=` before the house fold and jitter. The direct sonic/particle
+    /// and mid-burst returns never reach it.
+    pub ae_rof: f64,
+    /// Installed Ares GetROF hooks10047A40/10047A60. None describes the
+    /// unpatched retail kernel, which is what a game without Ares gets; an
+    /// Ares game supplies Some even at identity, including the building-ammo
+    /// shortcut bypass.
+    pub attached_rof: Option<NativeF64Bits>,
+    /// Phobos `ROF.RandomDelay` as `0x006FD0B5` resolves it (the weapon's,
+    /// else `[CombatDamage]`). None describes the unpatched kernel for native
+    /// controls; Phobos gameplay always supplies Some.
+    #[cfg(feature = "phobos")]
+    pub rof_random_delay: Option<crate::rules::ini_value::PartialIntPair>,
     /// The rank holds the ROF ability: a veteran with the type's veteran byte
     /// (`+0x2A0`), or an elite with either byte (`+0x2A0`, `+0x2B2`).
     pub rof_ability: bool,
@@ -74,7 +181,9 @@ pub(crate) struct RofQuery<'a> {
 /// Every draw is Scenario `RandomRanged`; all x87 steps run under the
 /// process control word (53-bit, chop).
 pub(crate) fn get_rof(query: &RofQuery<'_>, rng: &mut SimRng) -> i32 {
-    if query.building_ammo.is_some_and(|ammo| ammo > 1) {
+    let stock_building_shortcut =
+        query.building_ammo.is_some_and(|ammo| ammo > 1) && query.attached_rof.is_none();
+    if stock_building_shortcut {
         return 1;
     }
     let Some(weapon) = query.weapon else {
@@ -99,8 +208,27 @@ pub(crate) fn get_rof(query: &RofQuery<'_>, rng: &mut SimRng) -> i32 {
         return rng.next_range_u32_inclusive(3, 5) as i32;
     }
     let jitter = rng.next_range_u32_inclusive(0, 2) as i32;
+    // Phobos `TechnoClass_RearmDelay_ROF` (`0x006FD0B5`) runs after that draw
+    // and replaces the jitter (EAX, stored at `0x006FD0BB`) with
+    // `GetRangedRandomOrSingleValue(ROF.RandomDelay)`.
+    #[cfg(feature = "phobos")]
+    let jitter = match query.rof_random_delay {
+        Some(range) if range.is_single() => range.low,
+        Some(range) => rng.next_range_i32_inclusive(range.low, range.high),
+        None => jitter,
+    };
+    // Phobos 0x006FD0B5 loads `ROF * AE` (C++ double) in place of the stock
+    // int `ROF`. An identity factor loads the same exact value.
+    let phobos_rof = f64::from(weapon.rof) * query.ae_rof;
+    let weapon_rof = X::load_f64(NativeF64Bits::from_bits(phobos_rof.to_bits()));
+    // Installed Ares TechnoClass_GetROF_AttachEffect10047A40 hooks6FD0BF,
+    // after FILD weaponROF, before House FMUL6FD0C5 and jitter FIADD6FD0CB.
+    // Direct particle/sonic and mid-burst returns never reach that hook.
+    let weapon_rof = query
+        .attached_rof
+        .map_or(weapon_rof, |factor| X::mul(weapon_rof, X::load_f64(factor)));
     let mut rof = X::ftol_i32_low_masked(X::add(
-        X::mul(X::load_i32(weapon.rof), X::load_f64(query.house_rof)),
+        X::mul(weapon_rof, X::load_f64(query.house_rof)),
         X::load_i32(jitter),
     ));
     if query.rof_ability {
@@ -135,10 +263,233 @@ pub(crate) fn get_rof(query: &RofQuery<'_>, rng: &mut SimRng) -> i32 {
     rof
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_d_z))]
 mod tests {
     use super::*;
     use crate::rules::ini_parser::IniFile;
+
+    /// `TechnoClass::GetROF`'s signed IDIV by the occupant count is the sole
+    /// mechanism that makes a full garrison fire faster than one occupant, in
+    /// both game.exe and gamemd.exe. RA2 has no OccupyROFMultiplier rule, so
+    /// its value stays at identity (1.0); the divisor must still apply. With
+    /// the same RNG the jitter draw is shared, so five occupants give a fifth
+    /// of the single-occupant reload. This guards the -ra2 garrison ROF path.
+    #[test]
+    fn garrison_occupant_divisor_applies_at_ra2_identity_multiplier() {
+        let weapon = {
+            let ini = IniFile::from_str("[GUN]\nROF=120\nBurst=1\n");
+            WeaponType::from_ini_section("GUN", ini.section("GUN").unwrap())
+        };
+        let rof_with = |occupants: i32, rng_seed: u64| {
+            let query = RofQuery {
+                building_ammo: None,
+                weapon: Some(&weapon),
+                live: LiveParticles::default(),
+                burst_index: 1,
+                unit_burst_delays: None,
+                house_rof: NativeF64Bits::ONE,
+                ae_rof: 1.0,
+                attached_rof: None,
+                #[cfg(feature = "phobos")]
+                rof_random_delay: None,
+                rof_ability: false,
+                veteran_rof: 1.0,
+                occupants: Some(occupants),
+                bunkered: false,
+                occupy_rof_multiplier: 1.0,
+                bunker_rof_multiplier: 1.0,
+            };
+            get_rof(&query, &mut SimRng::new(rng_seed))
+        };
+        // Same seed -> same jitter draw, so only the IDIV differs.
+        let one = rof_with(1, 9);
+        let five = rof_with(5, 9);
+        assert_eq!(
+            one / 5,
+            five,
+            "five occupants reload at a fifth of one occupant's rate"
+        );
+        assert!(five < one, "a full garrison fires faster than a lone one");
+    }
+
+    /// Phobos `TechnoClass_RearmDelay_ROF` (`0x006FD0B5`): after stock's
+    /// `RandomRanged(0, 2)`, a ranged `ROF.RandomDelay` draws the jitter again
+    /// and a single value replaces it without a draw.
+    #[cfg(feature = "phobos")]
+    #[test]
+    fn rof_random_delay_replaces_the_stock_jitter() {
+        use crate::rules::ini_value::PartialIntPair;
+        let ini = IniFile::from_str("[GUN]\nROF=40\nBurst=1\n");
+        let weapon = WeaponType::from_ini_section("GUN", ini.section("GUN").unwrap());
+        let rof = |range: PartialIntPair| {
+            let query = RofQuery {
+                building_ammo: None,
+                weapon: Some(&weapon),
+                live: LiveParticles::default(),
+                burst_index: 1,
+                unit_burst_delays: None,
+                house_rof: NativeF64Bits::ONE,
+                ae_rof: 1.0,
+                attached_rof: None,
+                rof_random_delay: Some(range),
+                rof_ability: false,
+                veteran_rof: 1.0,
+                occupants: None,
+                bunkered: false,
+                occupy_rof_multiplier: 1.0,
+                bunker_rof_multiplier: 1.0,
+            };
+            let mut rng = SimRng::new(9);
+            let value = get_rof(&query, &mut rng);
+            (value, rng.logical_state())
+        };
+        let mut expected = SimRng::new(9);
+        expected.next_range_u32_inclusive(0, 2);
+        let after_stock = expected.logical_state();
+        let jitter = expected.next_range_i32_inclusive(10, 20);
+
+        assert_eq!(
+            rof(PartialIntPair::single(7)),
+            (47, after_stock),
+            "a single value replaces the jitter with no second draw"
+        );
+        assert_eq!(
+            rof(PartialIntPair {
+                low: 10,
+                high: 20,
+                values: 2,
+            }),
+            (40 + jitter, expected.logical_state()),
+            "a range draws its own jitter after the stock draw"
+        );
+    }
+
+    /// Phobos `TechnoClass_RearmDelay_ROF` (`0x006FD0B5`): `ROF * AE` replaces
+    /// the stock `ROF=` before the house fold and jitter, while the direct
+    /// sonic/particle and mid-burst returns never see it.
+    #[test]
+    fn attach_effect_rof_scales_the_ordinary_arm_before_house_and_jitter() {
+        let weapon = |text: &str| {
+            let ini = IniFile::from_str(text);
+            WeaponType::from_ini_section("GUN", ini.section("GUN").unwrap())
+        };
+        let ordinary = weapon("[GUN]\nROF=40\nBurst=1\n");
+        fn query<'a>(weapon: &'a WeaponType, ae_rof: f64) -> RofQuery<'a> {
+            RofQuery {
+                building_ammo: None,
+                weapon: Some(weapon),
+                live: LiveParticles::default(),
+                burst_index: 1,
+                unit_burst_delays: None,
+                house_rof: NativeF64Bits::ONE,
+                ae_rof,
+                attached_rof: None,
+                #[cfg(feature = "phobos")]
+                rof_random_delay: None,
+                rof_ability: false,
+                veteran_rof: 1.0,
+                occupants: None,
+                bunkered: false,
+                occupy_rof_multiplier: 1.0,
+                bunker_rof_multiplier: 1.0,
+            }
+        }
+        let mut base_rng = SimRng::new(9);
+        let mut ae_rng = SimRng::new(9);
+        let base = get_rof(&query(&ordinary, 1.0), &mut base_rng);
+        let doubled = get_rof(&query(&ordinary, 2.0), &mut ae_rng);
+        assert_eq!(
+            doubled,
+            base + 40,
+            "the shared jitter draw cancels; only ROF is doubled"
+        );
+
+        let sonic = weapon("[GUN]\nROF=40\nBurst=1\nIsSonic=yes\n");
+        let mut rng = SimRng::new(3);
+        assert_eq!(
+            get_rof(&query(&sonic, 2.0), &mut rng),
+            40,
+            "the sonic return precedes the AE multiply"
+        );
+    }
+
+    #[test]
+    fn attached_rof_hook_preserves_native_reload_order_and_rng() {
+        // Executed installed Ares10047A40 at retail6FD0BF, with the real
+        // reader10058A50, aggregate100460A0, GetROF6FCFA0 and Scenario RNG.
+        // Only class/weapon/House query boundaries were supplied. These four
+        // cases distinguish pre-jitter multiplication, decimal chop and the
+        // installed BuildingHack10047A60 bypass; no new native corpus.
+        for (raw_rof, house, factor, ammo, stock, ares) in [
+            (
+                45,
+                0x3ff0_0000_0000_0000,
+                0x3ffc_0000_0000_0000_u64,
+                None,
+                46,
+                79,
+            ),
+            (
+                45,
+                0x3fe9_9999_a000_0000,
+                0x3ffc_0000_0000_0000,
+                None,
+                37,
+                64,
+            ),
+            (
+                10,
+                0x3ff0_0000_0000_0000,
+                0x3fc9_9999_9999_9999,
+                None,
+                11,
+                2,
+            ),
+            (
+                45,
+                0x3ff0_0000_0000_0000,
+                0x3ffc_0000_0000_0000,
+                Some(2),
+                1,
+                79,
+            ),
+        ] {
+            let ini = IniFile::from_str(&format!("[GUN]\nROF={raw_rof}\nBurst=1\n"));
+            let weapon = WeaponType::from_ini_section("GUN", ini.section("GUN").unwrap());
+            // Nothing installs the hook without Ares, so the query carries no
+            // factor and the unpatched kernel answers, building shortcut and all.
+            for (attached, expected) in [
+                (None, stock),
+                (Some(NativeF64Bits::from_bits(factor)), ares),
+            ] {
+                let query = RofQuery {
+                    building_ammo: ammo,
+                    weapon: Some(&weapon),
+                    live: LiveParticles::default(),
+                    burst_index: 1,
+                    unit_burst_delays: None,
+                    house_rof: NativeF64Bits::from_bits(house),
+                    ae_rof: 1.0,
+                    attached_rof: attached,
+                    #[cfg(feature = "phobos")]
+                    rof_random_delay: None,
+                    rof_ability: false,
+                    veteran_rof: 1.0,
+                    occupants: None,
+                    bunkered: false,
+                    occupy_rof_multiplier: 1.0,
+                    bunker_rof_multiplier: 1.0,
+                };
+                let mut rng = SimRng::new(31);
+                assert_eq!(get_rof(&query, &mut rng), expected);
+                let mut expected_rng = SimRng::new(31);
+                if attached.is_some() || ammo.is_none() {
+                    expected_rng.next_range_u32_inclusive(0, 2);
+                }
+                assert_eq!(rng.logical_state(), expected_rng.logical_state());
+            }
+        }
+    }
 
     /// `tools/spatial_oracle/techno_rearm.py` runs the original GetROF over
     /// every arm (supplied class, weapon slot, garrison and occupant queries;
@@ -147,8 +498,8 @@ mod tests {
     /// through [`get_rof`] from the same seed.
     #[test]
     fn get_rof_matches_the_original() {
-        let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-            "../../../tools/spatial_oracle/techno_rearm.json"
+        let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/techno_rearm.json",
         ))
         .unwrap();
         assert_eq!(rows.len(), 535);
@@ -197,6 +548,10 @@ mod tests {
                 burst_index: int("burst_index", 1),
                 unit_burst_delays: (class == 1).then_some(delays),
                 house_rof: NativeF64Bits::from_bits(hex("house_bits", "3ff0000000000000")),
+                ae_rof: 1.0,
+                attached_rof: None,
+                #[cfg(feature = "phobos")]
+                rof_random_delay: None,
                 rof_ability: (veteran && veteran_byte) || (elite && (veteran_byte || elite_byte)),
                 veteran_rof: f64::from_bits(hex("veteran_bits", "3fe3333340000000")),
                 occupants: (int("garrison", 0) != 0).then(|| int("occupants", 0)),

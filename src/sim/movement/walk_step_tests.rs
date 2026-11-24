@@ -1,13 +1,13 @@
 use super::*;
 use crate::map::entities::EntityCategory;
 use crate::rules::locomotor_type::LocomotorKind;
-use crate::sim::components::{DriveCoord, MovementTarget};
+use crate::sim::components::DriveCoord;
 use crate::sim::movement::{FacingClass, locomotor::LocomotorState};
 
 #[test]
 fn paid_walk_matches_original_numeric_facing_and_boundary_vectors() {
-    let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/walk_paid_step.json"
+    let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/walk_paid_step.json",
     ))
     .unwrap();
     assert_eq!(rows.len(), 40);
@@ -26,14 +26,19 @@ fn paid_walk_matches_original_numeric_facing_and_boundary_vectors() {
             (current.x / 256) as u16,
             (current.y / 256) as u16,
         );
-        entity.category = EntityCategory::Infantry;
-        entity.position.sub_x = SimFixed::from_num(current.x % 256);
-        entity.position.sub_y = SimFixed::from_num(current.y % 256);
-        entity.position.exact_z_leptons = Some(current.z);
+        entity.set_category_for_test(EntityCategory::Infantry);
+        entity
+            .position
+            .set_sub_x_for_test(SimFixed::from_num(current.x % 256));
+        entity
+            .position
+            .set_sub_y_for_test(SimFixed::from_num(current.y % 256));
+        entity
+            .position
+            .set_exact_z_leptons_for_test(Some(current.z));
         let mut loco = LocomotorState::for_test_kind(LocomotorKind::Walk);
         loco.set_step_head(Some(coord("head")));
         entity.locomotor = Some(loco);
-        entity.movement_target = Some(MovementTarget::default());
         let mut body = FacingClass::new(
             input["initial_previous"].as_u64().unwrap() as u16,
             input["rot"].as_u64().unwrap() as u8,
@@ -43,7 +48,10 @@ fn paid_walk_matches_original_numeric_facing_and_boundary_vectors() {
         }
         entity.body_facing = body;
         entity.foot_speed.set_speed_fraction(SimFixed::lit("0.5"));
-        entity.navigation.path_runtime.path_blocked = true;
+        entity
+            .navigation
+            .path_runtime_mut()
+            .set_path_blocked_for_test(true);
         let speed = input["speed"].as_i64().unwrap() as i32;
         // The corpus stops before the same-cell SetCoords/SetHeight
         // (`0x0075C20F`, `0x0075C21C`), so it records the proposal's Z. Stand
@@ -64,6 +72,7 @@ fn paid_walk_matches_original_numeric_facing_and_boundary_vectors() {
         advance(
             &mut entity,
             SimFixed::from_num(speed * 15),
+            None,
             None,
             100,
             Some(&terrain),
@@ -86,14 +95,14 @@ fn paid_walk_matches_original_numeric_facing_and_boundary_vectors() {
         let heading = entity.body_facing.current(100);
         assert_eq!(u64::from(heading), row["facing"].as_u64().unwrap());
         assert_eq!(entity.foot_speed.applied_fraction(), SIM_ONE);
-        assert!(!entity.navigation.path_runtime.path_blocked);
+        assert!(!entity.navigation.path_runtime().path_blocked());
     }
 }
 
 #[test]
 fn idle_walk_scold_tails_match_original_through_ordinary_process() {
-    let corpus: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/foot_scold_latch.json"
+    let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/foot_scold_latch.json",
     ))
     .unwrap();
     let mut checked = 0;
@@ -106,27 +115,26 @@ fn idle_walk_scold_tails_match_original_through_ordinary_process() {
         let mut sim = crate::sim::world::Simulation::new();
         sim.interner = crate::sim::intern::test_interner();
         let mut actor = GameEntity::test_default(1, "E1", "Americans", 9, 10);
-        actor.category = EntityCategory::Infantry;
+        actor.set_category_for_test(EntityCategory::Infantry);
         actor.locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Walk));
         if let crate::sim::movement::locomotion::LocomotorRuntimePayload::Walk(state) =
-            &mut actor.locomotor.as_mut().unwrap().runtime_payload
+            actor.locomotor.as_mut().unwrap().runtime_payload_mut()
         {
             // Supplied retained byte at the native tail boundary.
-            state.animation_moving = true;
+            state.set_animation_moving_for_test(true);
         }
         actor.foot_speed.set_speed_fraction(initial_speed);
         actor
             .navigation
-            .path_runtime
+            .path_runtime_mut()
             .set_scold_latch_for_test(row["supplied_byte"].as_u64().unwrap() as u8);
         sim.substrate.entities.insert(actor);
 
-        // No movement adapter is needed for this native Process corridor.
         sim.process_ground_locomotor_for_test(1, None, None, None)
             .unwrap();
         let actor = sim.substrate.entities.get(1).unwrap();
         assert_eq!(
-            u64::from(actor.navigation.path_runtime.scold_latch_raw()),
+            u64::from(actor.navigation.path_runtime().scold_latch_raw()),
             row["final_byte"].as_u64().unwrap(),
             "{row}"
         );
@@ -147,8 +155,8 @@ fn idle_walk_scold_tails_match_original_through_ordinary_process() {
 
 #[test]
 fn same_cell_paid_walk_scold_clear_matches_original_commit_tail() {
-    let corpus: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/foot_scold_latch.json"
+    let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/foot_scold_latch.json",
     ))
     .unwrap();
     let mut checked = 0;
@@ -157,10 +165,10 @@ fn same_cell_paid_walk_scold_clear_matches_original_commit_tail() {
             continue;
         }
         let mut actor = GameEntity::test_default(1, "E1", "Americans", 9, 10);
-        actor.category = EntityCategory::Infantry;
-        actor.position.sub_x = SimFixed::from_num(186);
-        actor.position.sub_y = SimFixed::from_num(64);
-        actor.position.exact_z_leptons = Some(104);
+        actor.set_category_for_test(EntityCategory::Infantry);
+        actor.position.set_sub_x_for_test(SimFixed::from_num(186));
+        actor.position.set_sub_y_for_test(SimFixed::from_num(64));
+        actor.position.set_exact_z_leptons_for_test(Some(104));
         actor.locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Walk));
         actor
             .locomotor
@@ -173,13 +181,21 @@ fn same_cell_paid_walk_scold_clear_matches_original_commit_tail() {
             }));
         actor
             .navigation
-            .path_runtime
+            .path_runtime_mut()
             .set_scold_latch_for_test(row["supplied_byte"].as_u64().unwrap() as u8);
-        advance(&mut actor, SimFixed::from_num(90), None, 100, None, None);
+        advance(
+            &mut actor,
+            SimFixed::from_num(90),
+            None,
+            None,
+            100,
+            None,
+            None,
+        );
         let position = crate::sim::movement::ground_pose::position_world_coord(&actor.position);
         assert_eq!((position.x / 256, position.y / 256), (9, 10));
         assert_eq!(
-            u64::from(actor.navigation.path_runtime.scold_latch_raw()),
+            u64::from(actor.navigation.path_runtime().scold_latch_raw()),
             row["final_byte"].as_u64().unwrap(),
             "{row}"
         );

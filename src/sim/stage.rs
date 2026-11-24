@@ -1,9 +1,8 @@
-//! One native Techno stage clock, shared by Infantry actions, harvesting and
+//! Native StageClass clock operations, shared by Infantry actions, harvesting and
 //! building controls. Original identities: constructor6F2B5E..6F2B81;
 //! Techno6FABC4..6FAC31; Building4509DE..450A38. Native Building steps before
 //! its Techno AI and skips the latter block; other classes step after Mission
-//! dispatch. VERA retains late Construction and mission-dispatch Sell calls;
-//! their early Building Update scheduling remains a separate required chain.
+//! dispatch. Construction and Selling read that same early Building clock.
 //!
 //! Native evidence: tools/spatial_oracle/anytown_damage/foot_missions.json
 //! ground_firing_receipt and stage_clock_receipt (36 original Techno/Building
@@ -13,10 +12,11 @@
 
 use crate::sim::timer::CdTimer;
 
-/// The single retained +F8/+FC/+100/+108/+10C/+110 state on a GameEntity.
+/// The retained +F8/+FC/+100/+108/+10C/+110 Techno clock; Building repair
+/// owns a distinct instance at+620 (constructor43B7F5, Repair44BBF2).
 /// Fields remain private; family receivers use the owner's operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub(crate) struct StageClass {
+pub struct StageClass {
     value: i32,
     changed: u8,
     timer: CdTimer,
@@ -25,7 +25,9 @@ pub(crate) struct StageClass {
 }
 
 impl StageClass {
-    pub(crate) const fn constructed(now: i32) -> Self {
+    /// The same semantic initial value/rate/increment as Sidebar record
+    /// constructor6AC7C0; presentation retains its own instance.
+    pub const fn constructed(now: i32) -> Self {
         Self {
             value: 0,
             changed: 0,
@@ -35,9 +37,21 @@ impl StageClass {
         }
     }
 
-    /// Original6FABC4 and4509DE: advance at most once, even after a long gap.
+    /// Whether [`Self::advance`] changes the stage at `now`: it steps, or it
+    /// clears the changed byte a step set.
+    pub fn advances(&self, now: i32) -> bool {
+        (self.timer.expired(now) && self.rate != 0) || self.changed != 0
+    }
+
+    /// Whether the stage stands still: no rate and no changed byte to clear,
+    /// so [`Self::advances`] is false at every frame.
+    pub fn rests(&self) -> bool {
+        self.rate == 0 && self.changed == 0
+    }
+
+    /// Original6FABC4,4509DE and StripAI6A8FBE: advance at most once, even after a long gap.
     /// The changed byte records passing the gate, including increment zero.
-    pub(crate) fn advance(&mut self, now: i32) -> bool {
+    pub fn advance(&mut self, now: i32) -> bool {
         let stepped = self.timer.expired(now) && self.rate != 0;
         self.changed = u8::from(stepped);
         if stepped {
@@ -47,9 +61,10 @@ impl StageClass {
         stepped
     }
 
-    /// DoAction51D9D2..51DA96 and the existing harvesting/building receivers
+    /// DoAction51D9D2..51DA96, Unit Unlimbo737BF5..737C75, and the
+    /// existing harvesting/building receivers
     /// restart value/rate/timer while retaining the independent FC/110 fields.
-    pub(crate) fn restart(&mut self, value: i32, now: i32, rate: i32) {
+    pub fn restart(&mut self, value: i32, now: i32, rate: i32) {
         self.value = value;
         self.timer.start(now, rate);
         self.rate = rate;
@@ -60,21 +75,31 @@ impl StageClass {
         self.value = value;
     }
 
-    pub(crate) const fn value(&self) -> i32 {
+    pub const fn value(&self) -> i32 {
         self.value
     }
 
-    #[cfg(test)]
-    pub(crate) const fn timer(&self) -> CdTimer {
+    /// Whether the last [`Self::advance`] passed its gate (`+0xFC`).
+    pub const fn changed(&self) -> bool {
+        self.changed != 0
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub const fn timer(&self) -> CdTimer {
         self.timer
     }
 
-    pub(crate) const fn rate(&self) -> i32 {
+    /// Repair44BCD6 changes only the rate, retaining the existing timer.
+    pub(crate) fn set_rate(&mut self, rate: i32) {
+        self.rate = rate;
+    }
+
+    pub const fn rate(&self) -> i32 {
         self.rate
     }
 
     /// Raw prior state supplied by a native corpus, never a production writer.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) const fn from_native_fixture(
         value: i32,
         changed: u8,

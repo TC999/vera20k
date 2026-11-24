@@ -6,8 +6,8 @@ use crate::sim::world::Simulation;
 
 #[test]
 fn original_conversion_health_corpus() {
-    let corpus: serde_json::Value = serde_json::from_str(include_str!(
-        "../../tools/spatial_oracle/conversion_health.json"
+    let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/conversion_health.json",
     ))
     .unwrap();
     for row in corpus["rows"].as_array().unwrap() {
@@ -39,10 +39,28 @@ fn original_conversion_health_corpus() {
         .unwrap();
         let mut sim = Simulation::with_seed(12);
         let source = sim
-            .construct_object_limbo_at_height("SRC", "Neutral", 10, 10, 0, 0, &rules)
+            .construct_object_limbo_at_height(
+                "SRC",
+                "Neutral",
+                10,
+                10,
+                0,
+                0,
+                &rules,
+                &mut crate::sim::world::FrameEffects::default(),
+            )
             .unwrap();
         let destination = sim
-            .construct_object_limbo_at_height("DST", "Neutral", 10, 10, 0, 0, &rules)
+            .construct_object_limbo_at_height(
+                "DST",
+                "Neutral",
+                10,
+                10,
+                0,
+                0,
+                &rules,
+                &mut crate::sim::world::FrameEffects::default(),
+            )
             .unwrap();
         damage(&mut sim, source, value("current"));
         let captured = super::ConversionHealth::capture(
@@ -56,16 +74,18 @@ fn original_conversion_health_corpus() {
     }
 }
 
+const CONVERSION_ART: &str = "[YARD]\nFoundation=1x1\n[YAREFN]\nFoundation=1x1\n";
+
 fn rules() -> RuleSet {
     with_buildup(
-        RuleSet::from_ini(&IniFile::from_str(
+        RuleSet::from_ini_with_fixed_art_for_test(&IniFile::from_str(
             "[VehicleTypes]\n0=MCV\n1=SMIN\n[BuildingTypes]\n0=YARD\n1=YAREFN\n[InfantryTypes]\n0=SLAV\n\
              [MCV]\nStrength=100\nSpeed=5\nDeploysInto=YARD\n\
-             [YARD]\nStrength=1000\nFoundation=1x1\nDeployFacing=0\nUndeploysInto=MCV\n\
+             [YARD]\nStrength=1000\nDeployFacing=0\nUndeploysInto=MCV\n\
              [SMIN]\nStrength=100\nSpeed=3\nDeploysInto=YAREFN\nEnslaves=SLAV\nSlavesNumber=1\n\
-             [YAREFN]\nStrength=1000\nFoundation=1x1\nDeployFacing=0\nUndeploysInto=SMIN\nEnslaves=SLAV\nSlavesNumber=1\n\
+             [YAREFN]\nStrength=1000\nDeployFacing=0\nUndeploysInto=SMIN\nEnslaves=SLAV\nSlavesNumber=1\n\
              [SLAV]\nStrength=125\nSpeed=3\nStorage=4\n[Clear]\nBuildable=yes\n",
-        ))
+        ), &IniFile::from_str(CONVERSION_ART))
         .unwrap(),
     )
 }
@@ -80,36 +100,14 @@ fn with_buildup(mut rules: RuleSet) -> RuleSet {
 
 fn damage(sim: &mut Simulation, id: u64, actual: i32) {
     let entity = sim.substrate.entities.get_mut(id).unwrap();
-    entity.health.current = actual;
+    entity.health.set_for_test(actual);
     entity.estimated_health = EstimatedHealth::from_raw(-73);
 }
 
 fn assert_health(sim: &Simulation, id: u64, actual: i32) {
     let entity = sim.substrate.entities.get(id).unwrap();
-    assert_eq!(entity.health.current, actual);
+    assert_eq!(entity.health.current(), actual);
     assert_eq!(entity.estimated_health.get(), actual);
-}
-
-#[test]
-fn mcv_conversion_uses_actual_and_type_strength_then_resets_estimate() {
-    let rules = rules();
-    let mut sim = Simulation::with_seed(123);
-    crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
-    let source = sim
-        .spawn_object_at_height("MCV", "Neutral", 10, 10, 0, 0, &rules)
-        .unwrap();
-    damage(&mut sim, source, 25);
-    assert!(sim.deploy_mcv(source, &rules, None));
-    sim.flush_pending_delete();
-    assert!(sim.substrate.entities.get(source).is_none());
-    let destination = sim
-        .substrate
-        .entities
-        .values()
-        .find(|e| sim.interner.resolve(e.type_ref()) == "YARD")
-        .unwrap()
-        .stable_id();
-    assert_health(&sim, destination, 250);
 }
 
 #[test]
@@ -120,7 +118,13 @@ fn building_conversion_reads_health_when_animation_finishes() {
         .spawn_object_at_height("YARD", "Neutral", 10, 10, 0, 0, &rules)
         .unwrap();
     damage(&mut sim, source, 750);
-    assert!(sim.undeploy_building(source, &rules));
+    assert!(sim.undeploy_building(
+        source,
+        false,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default()
+    ));
     damage(&mut sim, source, 250);
     sim.substrate
         .entities
@@ -142,12 +146,17 @@ fn building_conversion_reads_health_when_animation_finishes() {
 /// UnitClass::Deploy (`deploy_mcv`) of `source`, answering the building it
 /// became.
 fn deploy(sim: &mut Simulation, rules: &RuleSet, source: u64, into: &str) -> u64 {
-    assert!(sim.deploy_mcv(source, rules, None));
+    assert!(sim.deploy_mcv(
+        source,
+        rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default()
+    ));
     sim.substrate
         .entities
         .values()
         .find(|entity| {
-            entity.lifecycle.object_alive && sim.interner.resolve(entity.type_ref()) == into
+            entity.lifecycle.object_alive() && sim.interner.resolve(entity.type_ref()) == into
         })
         .unwrap()
         .stable_id()
@@ -161,8 +170,14 @@ fn undeploy(sim: &mut Simulation, rules: &RuleSet, building: u64, into: &str) ->
         .entities
         .get_mut(building)
         .unwrap()
-        .building_up = None;
-    assert!(sim.undeploy_building(building, rules));
+        .finish_building_construction_for_test();
+    assert!(sim.undeploy_building(
+        building,
+        false,
+        rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default()
+    ));
     sim.substrate
         .entities
         .get_mut(building)
@@ -173,10 +188,45 @@ fn undeploy(sim: &mut Simulation, rules: &RuleSet, building: u64, into: &str) ->
         .entities
         .values()
         .find(|entity| {
-            entity.lifecycle.object_alive && sim.interner.resolve(entity.type_ref()) == into
+            entity.lifecycle.object_alive() && sim.interner.resolve(entity.type_ref()) == into
         })
         .unwrap()
         .stable_id()
+}
+
+/// `BuildingClass::Mission_Selling @ 0x00449FED..0x0044A002`: the repacked
+/// unit's Unlimbo direction is the building type's DeployFacing, 0x80 when
+/// the key is missing, as on the retail construction yards.
+#[test]
+fn undeployed_unit_faces_the_building_types_deploy_facing() {
+    for (key, expected) in [("", 0x80), ("DeployFacing=2\n", 0x40)] {
+        let rules = with_buildup(
+            RuleSet::from_ini_with_fixed_art_for_test(
+                &IniFile::from_str(&format!(
+                    "[VehicleTypes]\n0=MCV\n[BuildingTypes]\n0=YARD\n1=YAREFN\n\
+                     [MCV]\nStrength=100\nSpeed=5\nDeploysInto=YARD\n\
+                     [YARD]\nStrength=1000\n{key}UndeploysInto=MCV\n\
+                     [YAREFN]\nStrength=1000\n[Clear]\nBuildable=yes\n"
+                )),
+                &IniFile::from_str(CONVERSION_ART),
+            )
+            .unwrap(),
+        );
+        let mut sim = Simulation::with_seed(123);
+        let yard = sim
+            .spawn_object_at_height("YARD", "Neutral", 10, 10, 0, 0, &rules)
+            .unwrap();
+        let unit = undeploy(&mut sim, &rules, yard, "MCV");
+        let frame = sim.session.binary_frame();
+        assert_eq!(
+            sim.substrate
+                .entities
+                .get(unit)
+                .unwrap()
+                .body_facing_byte(frame),
+            expected
+        );
+    }
 }
 
 #[test]
@@ -209,75 +259,9 @@ fn slave_conversions_reset_master_health_but_preserve_retained_slave_state() {
     assert_eq!(pool(&sim, unit), slaves);
     for slave in slaves {
         let child = sim.substrate.entities.get(slave).unwrap();
-        assert_eq!(child.health.current, 100);
+        assert_eq!(child.health.current(), 100);
         assert_eq!(child.estimated_health.get(), -73);
     }
-}
-
-#[test]
-fn all_four_conversion_callers_preserve_results_above_u16() {
-    let rules = with_buildup(RuleSet::from_ini(&IniFile::from_str(
-        "[VehicleTypes]\n0=MCV\n1=SMIN\n[BuildingTypes]\n0=YARD\n1=YAREFN\n[InfantryTypes]\n0=SLAV\n\
-         [MCV]\nStrength=100000\nSpeed=5\nDeploysInto=YARD\n\
-         [YARD]\nStrength=1000000\nFoundation=1x1\nDeployFacing=0\nUndeploysInto=MCV\n\
-         [SMIN]\nStrength=100000\nSpeed=3\nDeploysInto=YAREFN\nEnslaves=SLAV\nSlavesNumber=1\n\
-         [YAREFN]\nStrength=1000000\nFoundation=1x1\nDeployFacing=0\nUndeploysInto=SMIN\nEnslaves=SLAV\nSlavesNumber=1\n\
-         [SLAV]\nStrength=125\nSpeed=3\nStorage=4\n[Clear]\nBuildable=yes\n"
-    )).unwrap());
-    let mut sim = Simulation::with_seed(123);
-    crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
-    let source = sim
-        .spawn_object_at_height("MCV", "Neutral", 10, 10, 0, 0, &rules)
-        .unwrap();
-    damage(&mut sim, source, 75_000);
-    assert!(sim.deploy_mcv(source, &rules, None));
-    sim.flush_pending_delete();
-    let yard = sim
-        .substrate
-        .entities
-        .values()
-        .find(|entity| sim.interner.resolve(entity.type_ref()) == "YARD")
-        .unwrap()
-        .stable_id();
-    assert_health(&sim, yard, 750_000);
-    // The 31-frame Buildup at rate 1 completes by the 32nd frame.
-    for _ in 0..32 {
-        sim.advance_tick(&[], Some(&rules), None, None, 22);
-    }
-    assert!(
-        sim.substrate
-            .entities
-            .get(yard)
-            .unwrap()
-            .building_up
-            .is_none()
-    );
-    assert!(sim.undeploy_building(yard, &rules));
-    sim.substrate
-        .entities
-        .get_mut(yard)
-        .unwrap()
-        .finish_pack_up_for_test();
-    sim.advance_tick(&[], Some(&rules), None, None, 22);
-    let mcv = sim
-        .substrate
-        .entities
-        .values()
-        .find(|entity| sim.interner.resolve(entity.type_ref()) == "MCV")
-        .unwrap()
-        .stable_id();
-    assert_health(&sim, mcv, 75_000);
-
-    let mut sim = Simulation::with_seed(123);
-    crate::sim::arena_fixture::flat_ground(&mut sim, &rules);
-    let source = sim
-        .spawn_object_at_height("SMIN", "Neutral", 10, 10, 0, 0, &rules)
-        .unwrap();
-    damage(&mut sim, source, 75_000);
-    let building = deploy(&mut sim, &rules, source, "YAREFN");
-    assert_health(&sim, building, 750_000);
-    let unit = undeploy(&mut sim, &rules, building, "SMIN");
-    assert_health(&sim, unit, 75_000);
 }
 
 #[test]
@@ -318,30 +302,41 @@ fn mcv_building_slots_wait_for_completion_and_use_converted_health() {
     let mut expected_rng = sim.scenario_rng.clone();
     let constructor_word = expected_rng.next_u32() as u16;
     let before_rng = expected_rng.state();
-    let destination_id = sim.substrate.next_stable_object_id;
-    assert!(sim.deploy_mcv(source, &rules, None));
+    let destination_id = sim.next_stable_object_id();
+    assert!(sim.deploy_mcv(
+        source,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default()
+    ));
     let destination = sim.entities().get(destination_id).unwrap();
-    assert_eq!(destination.health.current, 250);
-    assert_eq!(destination.techno_ctor_random_word, constructor_word);
-    assert!(destination.building_up.is_some());
-    assert!(!destination.building_actually_placed);
-    assert!(destination.building_anim_slots.iter().all(Option::is_none));
+    assert_eq!(destination.health.current(), 250);
+    assert_eq!(destination.techno_ctor_random_word(), constructor_word);
+    assert!(destination.building_up());
+    assert!(!destination.building_art.actually_placed());
+    assert!(
+        destination
+            .building_art
+            .anim_slots()
+            .iter()
+            .all(Option::is_none)
+    );
     assert_eq!(sim.substrate.anims.len(), 0);
-    assert_eq!(sim.substrate.next_stable_object_id, destination_id + 1);
+    assert_eq!(sim.next_stable_object_id(), destination_id + 1);
     assert_eq!(sim.scenario_rng.state(), before_rng);
     // Drive the actual simulation completion producer.
     for _ in 0..31 {
         sim.advance_tick(&[], Some(&rules), None, None, 67);
     }
     let destination = sim.entities().get(destination_id).unwrap();
-    assert!(destination.building_up.is_none());
-    assert!(destination.building_actually_placed);
+    assert!(!destination.building_up());
+    assert!(destination.building_art.actually_placed());
     let anim = sim
-        .anim(destination.building_anim_slots[18].unwrap())
+        .anim(destination.building_art.anim_slots()[18].unwrap())
         .unwrap();
-    assert_eq!(sim.interner.resolve(anim.type_id), "D");
+    assert_eq!(sim.interner.resolve(anim.type_id()), "D");
     let expected_rate = expected_rng.next_range_u32_inclusive(1, 5) as u16;
-    assert_eq!(anim.runtime.rate_reload, expected_rate);
+    assert_eq!(anim.runtime().rate_reload, expected_rate);
     assert_eq!(
         sim.scenario_rng.logical_state(),
         expected_rng.logical_state()

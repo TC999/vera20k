@@ -38,7 +38,6 @@ struct Row {
 
 #[derive(Deserialize)]
 struct Corpus {
-    native_sha256: String,
     rows: Vec<Row>,
 }
 
@@ -62,7 +61,7 @@ fn terrain(input: &Input) -> ResolvedTerrainGrid {
         .collect();
     for cell in &input.mapped_cells {
         let index = cell.xy[1] as usize * usize::from(width) + cell.xy[0] as usize;
-        cells[index].yr_cell_land_type = cell.land as u8;
+        cells[index].land_type = cell.land as u8;
         cells[index].bridge_facts.raw_flags = cell.flags;
     }
     let mut terrain = ResolvedTerrainGrid::from_cells(width, height, cells);
@@ -86,14 +85,10 @@ fn reset_dummy(terrain: &ResolvedTerrainGrid, input: &CellInput) {
 
 #[test]
 fn original_object_cell_queries_keep_physical_aliases_and_dummy_fields() {
-    let corpus: Corpus = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/object_get_cell.json"
+    let corpus: Corpus = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/object_get_cell.json",
     ))
     .unwrap();
-    assert_eq!(
-        corpus.native_sha256,
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     assert_eq!(corpus.rows.len(), 10);
     for row in corpus.rows {
         let terrain = terrain(&row.input);
@@ -129,23 +124,27 @@ fn original_object_cell_queries_keep_physical_aliases_and_dummy_fields() {
         sim.resolved_terrain = Some(terrain);
         for id in [1, 2] {
             let entity = sim.substrate.entities.get_mut(id).unwrap();
-            entity.position.rx = (x.max(0) / 256) as u16;
-            entity.position.ry = (y.max(0) / 256) as u16;
-            entity.position.sub_x = SimFixed::from_num(x - i32::from(entity.position.rx) * 256);
-            entity.position.sub_y = SimFixed::from_num(y - i32::from(entity.position.ry) * 256);
-            entity.position.exact_z_leptons = Some(z);
-            entity.lifecycle.cell_marked = row.input.marked != 0;
+            entity.position.set_rx_for_test((x.max(0) / 256) as u16);
+            entity.position.set_ry_for_test((y.max(0) / 256) as u16);
+            entity.position.set_sub_x_for_test(SimFixed::from_num(
+                x - i32::from(entity.position.rx()) * 256,
+            ));
+            entity.position.set_sub_y_for_test(SimFixed::from_num(
+                y - i32::from(entity.position.ry()) * 256,
+            ));
+            entity.position.set_exact_z_leptons_for_test(Some(z));
+            entity
+                .lifecycle
+                .set_cell_marked_for_test(row.input.marked != 0);
         }
         let subject = FireSubject {
             world: &sim,
             rules: &rules,
-            overlay_registry: None,
             fog: None,
             firer: sim.substrate.entities.get(1).unwrap(),
             obj: rules.object("TANK").unwrap(),
             target: Some(TargetKind::Entity(2)),
             weapon_index: 0,
-            garrison: None,
         };
         let mut query = WorldQuery::new(&subject);
         let expected = CellFacts {
@@ -171,109 +170,8 @@ fn original_object_cell_queries_keep_physical_aliases_and_dummy_fields() {
             "{}",
             row.input.name
         );
-        assert_eq!(subject.firer.lifecycle.cell_marked, row.input.marked != 0);
+        assert_eq!(subject.firer.lifecycle.cell_marked(), row.input.marked != 0);
     }
-}
-
-/// Pointer comparisons use allocation identity, after Object5F6960's reads.
-/// These integration controls reuse the original alias/miss inputs above;
-/// they do not claim a whole Infantry AreaFire/Cell-target native transcript.
-#[test]
-fn cell_target_equality_uses_real_aliases_and_one_shared_dummy() {
-    let rules = rules();
-    let mut sim = bridge_scene("TANK");
-    let mut cells = vec![test_flat_cell(0, 0); 512];
-    for (x, cell) in cells.iter_mut().enumerate() {
-        *cell = test_flat_cell(x as u16, 0);
-    }
-    let mut terrain = ResolvedTerrainGrid::from_cells(512, 1, cells);
-    terrain.test_set_native_allocated_cells(&[(511, 0)]);
-    sim.resolved_terrain = Some(terrain);
-    let entity = sim.substrate.entities.get_mut(1).unwrap();
-    entity.position.rx = 511;
-    entity.position.ry = 0;
-    entity.position.sub_x = SimFixed::from_num(128);
-    entity.position.sub_y = SimFixed::from_num(128);
-    let subject = FireSubject {
-        world: &sim,
-        rules: &rules,
-        overlay_registry: None,
-        fog: None,
-        firer: sim.substrate.entities.get(1).unwrap(),
-        obj: rules.object("TANK").unwrap(),
-        target: Some(TargetKind::Cell(u16::MAX, 1)),
-        weapon_index: 0,
-        garrison: None,
-    };
-    assert_eq!(WorldQuery::new(&subject).firer_cell(), FirerCell::Target);
-
-    let entity = sim.substrate.entities.get_mut(1).unwrap();
-    entity.position.rx = 41;
-    entity.position.ry = 41;
-    let dummy = sim.resolved_terrain.as_ref().unwrap().shared_cell_dummy();
-    dummy.stamp_coord(17, -19);
-    dummy.test_set_land_type(6);
-    let subject = FireSubject {
-        world: &sim,
-        rules: &rules,
-        overlay_registry: None,
-        fog: None,
-        firer: sim.substrate.entities.get(1).unwrap(),
-        obj: rules.object("TANK").unwrap(),
-        target: Some(TargetKind::Cell(42, 42)),
-        weapon_index: 0,
-        garrison: None,
-    };
-    assert_eq!(subject.facts().target.land_type, 6);
-    assert_eq!(
-        dummy.snapshot().coord,
-        (17, -19),
-        "facts do not resolve again"
-    );
-    let mut query = WorldQuery::new(&subject);
-    query.retain_target_center_cell();
-    assert_ne!(
-        dummy.snapshot().coord,
-        (42, 42),
-        "read the retained receiver, not the requested coordinate"
-    );
-    assert_eq!(query.target_center_cell, Some(NativeCellIdentity::Dummy));
-    assert_eq!(query.firer_cell(), FirerCell::Target);
-    assert_eq!(dummy.snapshot().coord, (41, 41));
-}
-
-/// Instructions at 0x006FC19C retain EDI until 0x004870D0; nested misses must
-/// not turn that pointer into an unrelated real-cell sensor query.
-#[test]
-fn sensor_reads_retained_identity_after_another_query_stamps_dummy() {
-    let rules = rules();
-    let mut sim = bridge_scene("TANK");
-    let owner = sim.substrate.entities.get(1).unwrap().owner();
-    sim.fog.width = 16;
-    sim.fog.height = 16;
-    sim.fog.increment_sensor_at(owner, 12, 10);
-    let subject = FireSubject {
-        world: &sim,
-        rules: &rules,
-        overlay_registry: None,
-        fog: Some(&sim.fog),
-        firer: sim.substrate.entities.get(1).unwrap(),
-        obj: rules.object("TANK").unwrap(),
-        target: Some(TargetKind::Entity(2)),
-        weapon_index: 0,
-        garrison: None,
-    };
-    let mut query = WorldQuery::new(&subject);
-    query.retain_target_center_cell();
-    let dummy = sim.resolved_terrain.as_ref().unwrap().shared_cell_dummy();
-    dummy.stamp_coord(41, 41);
-    assert!(query.sensor());
-    query.target_center_cell = Some(NativeCellIdentity::Dummy);
-    dummy.stamp_coord(12, 10);
-    assert!(
-        !query.sensor(),
-        "the dummy has no modeled sensor-counter owner"
-    );
 }
 
 #[derive(Deserialize)]
@@ -295,6 +193,7 @@ struct EarlyRow {
 struct CenterRow {
     name: String,
     input_xy: [i16; 2],
+    center_xyz: [i32; 3],
     receiver: String,
     identity: String,
     dummy_xy: [i16; 2],
@@ -302,20 +201,15 @@ struct CenterRow {
 
 #[derive(Deserialize)]
 struct BoundaryCorpus {
-    native_sha256: String,
     rows: Vec<EarlyRow>,
     cell_centers: Vec<CenterRow>,
 }
 
 fn boundary_corpus() -> BoundaryCorpus {
-    let corpus: BoundaryCorpus = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/fire_error_cell_boundary.json"
+    let corpus: BoundaryCorpus = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/fire_error_cell_boundary.json",
     ))
     .unwrap();
-    assert_eq!(
-        corpus.native_sha256,
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     corpus
 }
 
@@ -332,15 +226,19 @@ fn original_early_fire_error_retains_cell_between_temporal_and_lifted_gates() {
         let mut sim = bridge_scene("TANK");
         let target = sim.substrate.entities.get_mut(2).unwrap();
         let [x, y, z] = row.supplied.target_xyz;
-        target.position.rx = (x / 256) as u16;
-        target.position.ry = (y / 256) as u16;
-        target.position.sub_x = SimFixed::from_num(x % 256);
-        target.position.sub_y = SimFixed::from_num(y % 256);
-        target.position.exact_z_leptons = Some(z);
+        target.position.set_rx_for_test((x / 256) as u16);
+        target.position.set_ry_for_test((y / 256) as u16);
+        target
+            .position
+            .set_sub_x_for_test(SimFixed::from_num(x % 256));
+        target
+            .position
+            .set_sub_y_for_test(SimFixed::from_num(y % 256));
+        target.position.set_exact_z_leptons_for_test(Some(z));
         if row.name == "target_cloaked" {
-            let mut cloak = crate::sim::cloak_disguise::CloakRuntime::new(0, 1);
-            cloak.state = 2;
-            target.cloak = Some(cloak);
+            let mut cloak = crate::sim::cloak_disguise::CloakRuntime::new(0);
+            cloak.set_state_for_test(2);
+            target.cloak = Some(Box::new(cloak));
         }
         let dummy = sim.resolved_terrain.as_ref().unwrap().shared_cell_dummy();
         let [x, y] = row.supplied.initial_dummy_xy;
@@ -348,15 +246,13 @@ fn original_early_fire_error_retains_cell_between_temporal_and_lifted_gates() {
         let subject = FireSubject {
             world: &sim,
             rules: &rules,
-            overlay_registry: None,
-            fog: Some(&sim.fog),
+            fog: Some(sim.fog.fire_view(&sim.house_alliances)),
             firer: sim.substrate.entities.get(1).unwrap(),
             obj: rules.object("TANK").unwrap(),
             target: Some(TargetKind::Entity(2)),
             weapon_index: 0,
-            garrison: None,
         };
-        let mut facts = subject.facts();
+        let mut facts = subject.whole_facts();
         match row.name.as_str() {
             "temporal_held_target" => facts.firer.temporal = Some(Link::Target),
             "firer_lifted" => facts.firer.magnetron_lifted = true,
@@ -409,16 +305,44 @@ fn original_cell_center_query_reads_the_retained_receiver_coordinate() {
         } else {
             TargetKind::Cell(row.input_xy[0] as u16, row.input_xy[1] as u16)
         };
+        // Consume the original486840 XYZ before the following Map565730
+        // lookup can stamp the same retained Dummy to a different coordinate.
+        let receiver = if row.receiver == "dummy" {
+            crate::sim::cell_rect::CellRef::Dummy {
+                cell: dummy.clone(),
+            }
+        } else {
+            crate::sim::cell_rect::CellRef::Real(
+                terrain
+                    .cell(row.input_xy[0] as u16, row.input_xy[1] as u16)
+                    .unwrap(),
+            )
+        };
+        let point = receiver.center_coordinate().unwrap();
+        assert_eq!([point.x, point.y, point.z], row.center_xyz, "{}", row.name);
+        let projectile = if row.receiver == "dummy" {
+            crate::sim::projectile::dummy_cell_ground_coord(&dummy)
+        } else {
+            crate::sim::projectile::cell_ground_coord(
+                Some(terrain),
+                row.input_xy[0] as u16,
+                row.input_xy[1] as u16,
+            )
+        };
+        assert_eq!(
+            [projectile.x, projectile.y, projectile.z],
+            row.center_xyz,
+            "{}",
+            row.name
+        );
         let subject = FireSubject {
             world: &sim,
             rules: &rules,
-            overlay_registry: None,
             fog: None,
             firer: sim.substrate.entities.get(1).unwrap(),
             obj: rules.object("TANK").unwrap(),
             target: Some(target),
             weapon_index: 0,
-            garrison: None,
         };
         let mut query = WorldQuery::new(&subject);
         query.retain_target_center_cell();

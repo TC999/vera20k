@@ -11,8 +11,13 @@ from unicorn.x86_const import *
 from tools.rules_oracle.bridge_anim_inputs import Reader,crc,physical_sections
 from tools.spatial_oracle.building_body_rules import INI,SP,dwords
 from tools.native_oracle import run_checked,RET_MAGIC,finish_vectors,provenance
+from tools.native_oracle import require
 ROOT=Path(os.environ.get('VERA20K_BRIDGE_CHILD_SOUND_ASSETS',str(Path(os.environ.get('CARGO_TARGET_DIR','target'))/'asset/bridge-child-sound/extract')))
 def sections(raw):
+ # A last line without LF is not loaded: ReadINITextLine 65D5C0 flags the end
+ # of the file and a fresh LoadFromStraw 525A60 discards that line (executed
+ # controls: tools/storage_oracle/ini_crc). Retail ARTMD and MPMeatMD end so.
+ raw=raw[:raw.rfind(b'\n')+1]
  out={};cur=None
  for line in raw.decode('latin1').splitlines():
   line=line.split(';',1)[0].strip()
@@ -21,6 +26,20 @@ def sections(raw):
    k,v=map(str.strip,line.split('=',1))
    if k and v:cur[k]=v
  return out
+
+def playing_handle(m, entry, *, handle=None, serial=41, event=None):
+ """Supply this fixture's tagged playing-event boundary in an existing VM.
+
+ No device channel or sample buffer is attached. Original Release/Stop bodies
+ own every later mutation; callers may attach the handle to their real object.
+ """
+ if event is None:event=m.alloc(0x300)
+ if handle is None:handle=m.alloc(16)
+ m.u.mem_write(event+0x24,dwords(entry));m.u.mem_write(event+0x138,dwords(serial))
+ m.u.mem_write(event+0x1c,dwords(3));m.u.mem_write(event+0x18,dwords(8))
+ m.u.mem_write(handle,dwords(event,serial,entry,0x87e294))
+ return event,handle
+
 class Sound(Reader):
  def __init__(self):
   self.samples=[];self.calls=[]
@@ -47,7 +66,8 @@ class Sound(Reader):
  def hook(self,u,p,n,d):
   if p==0x4015c0:
    name=self.string(u.reg_read(UC_X86_REG_EDX));self.samples.append(name)
-   self.ret({'gexp06a':0,'gexpshaa':1}[name.lower()]);return
+   sample_ids=getattr(self,'sample_ids',None)
+   self.ret(({'gexp06a':0,'gexpshaa':1} if sample_ids is None else sample_ids)[name.lower()]);return
   if p in (0x406060,0x405d40,0x4052f0,0x65c7e0,0x65c780):self.calls.append(hex(p))
   super().hook(u,p,n,d)
  def read(self,name):
@@ -58,7 +78,7 @@ class Sound(Reader):
   keys={'control':0x10,'type_flags':0x14,'volume_fixed16_raw':0x1c,'priority':0x40,'limit':0x48,'loop_count':0x4c,'range':0x50,'delay_min':0x58,'delay_max':0x5c,'fshift_min':0x60,'fshift_max':0x64,'vshift':0x68,'sample_count':0x134}
   return ptr,dict(name=name,registry_index=index,admitted=ok,volume_linear=self.read32(ptr+0x1c)>>16,samples=self.samples.copy(),**{k:struct.unpack('<i',self.u.mem_read(ptr+v,4))[0] for k,v in keys.items()})
  def release(self,entry,fn):
-  e=self.alloc(0x300);h=self.alloc(16);self.u.mem_write(e+0x24,dwords(entry));self.u.mem_write(e+0x138,dwords(41));self.u.mem_write(e+0x1c,dwords(3));self.u.mem_write(e+0x18,dwords(8));self.u.mem_write(h,dwords(e,41,entry,0x87e294))
+  e,h=playing_handle(self,entry)
   before=bytes(self.u.mem_read(e,0x300));self.calls=[];self.invoke(fn,h)
   after=bytes(self.u.mem_read(e,0x300))
   return dict(function=hex(fn),event_unchanged=before==after,event_state=self.read32(e+0x1c),event_flags=self.read32(e+0x18),event_serial=self.read32(e+0x138),handle_event_is_present=bool(self.read32(h)),handle_sound_is_present=bool(self.read32(h+8)),calls=self.calls.copy())
@@ -70,7 +90,7 @@ def generate():
  m.assets.update({p.name.upper():p.read_bytes() for p in art_root.glob('*') if p.is_file()})
  m.make_ini(physical_sections(art));anims=[]
  for name in ['SMOKEY2','TWLT026','TWLT036']:
-  ptr=m.alloc(0x400);m.invoke(0x427530,ptr,(m.cstring(name),));assert m.invoke(0x427d00,ptr,(INI,))
+  ptr=m.alloc(0x400);m.invoke(0x427530,ptr,(m.cstring(name),));require(m.invoke(0x427d00,ptr,(INI,)), 'native 0x427D00 returned an unexpected result')
   report=struct.unpack('<i',m.u.mem_read(ptr+0x2f8,4))[0]
   report_name=None
   if report>=0:report_name=m.string(m.read32(m.read32(m.read32(0xb1d37c)+report*4))+0x6c)

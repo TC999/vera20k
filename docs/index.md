@@ -5,107 +5,83 @@ title: VERA20k Engine
 
 # VERA20k
 
+[Svenska](sv/) · [简体中文](zh-CN/) · [Deutsch](de/) · [العربية](ar/) · [Русский](ru/) · [ไทย](th/) · [Türkçe](tr/) · **English**
+
 Red Alert 2: Yuri's Revenge — rebuilt from scratch in Rust.
 
-This page is a short tour of the code. If it disagrees with the code, the code is right.
+A short map of the code. If it disagrees with the code, the code is right. Each module's `//!` header says what it does and what it may depend on.
 
-The engine is built mostly from plain structs and functions, organized by concern in files and folders.
+## The code
 
-The top-level layout under `src/`, roughly bottom-up:
+Source paths below are under `src/`. The workspace has two crates:
 
-- `assets/` — format parsers for `.mix`, `.shp`, `.vxl`, `.hva`, `.pal`, `.tmp`, `.csf`, `.aud`, `.pcx` and Bink video. Written from scratch in this repository, with no third-party C&C format libraries.
-- `util/` — low-level helpers: fixed-point math, the original game's trig table and x87 arithmetic, config loading, compression.
-- `rules/` — parses the retail YR INIs (`rulesmd.ini`, `artmd.ini`, `aimd.ini`, sound and EVA) with their language, game-mode and map layers, and exposes the resolved game rules. Its module header documents how gamemd reads them.
-- `map/` — `.mmx` / `.map` parsing, theaters, resolved terrain, map triggers and the random map generator (`map/rmg/`).
-- `sim/` — game state and deterministic behavior. Owns `Simulation`. Never depends on `render/`, `ui/`, `sidebar/`, `audio/` or `net/`. Major subsystems sit in their own subdirs: `combat/`, `movement/`, `pathfinding/`, `aircraft/`, `production/`, `miner/`, `superweapon/`, `vision/`, `docking/`, `world/`.
-- `render/` — the wgpu renderer: atlases, terrain, sprites, voxels, radar, shroud and sidebar chrome.
-- `sidebar/` — the in-game sidebar's layout and state (cameos, tabs, power bar). The drawing happens in `render/` and `app/presentation/`.
-- `ui/` — menus, dialogs and in-game screens: main menu, skirmish setup, pause menu, score screen, messages.
-- `audio/` — sound effects and music through `rodio`; plays the sound events the simulation produces.
-- `net/` — deterministic lockstep. There is no network transport yet.
-- `bin/` — extra programs: MIX browser, Bink video player, INI extractor and asset inspection tools.
-- `app/` — the app layer that wires sim, render, ui, audio and net together.
+- `vera20k-core` (`src/Cargo.toml`) contains assets, rules, maps, simulation,
+  networking, shared utilities and the headless/skirmish entry points.
+- `vera20k` (`Cargo.toml`) contains the app, renderer, UI, audio, asset tools and
+  game executable. It re-exports core's modules.
 
-A few files at the root of `src/` handle skirmish and match startup (`skirmish_*.rs`, `match_bootstrap.rs`) and headless retail-map loading for tools (`headless_scenario.rs`).
+- `sim/` — all game state and deterministic gameplay.
+- `render/` — the wgpu renderer.
+- `app/` — window, input, loading and saving; wires sim, render, ui, audio and net together.
+- `ui/` — menus, dialogs, in-game screens and the sidebar.
+- `audio/` — sound effects and music.
+- `net/` — LAN and online UDP transport, reliable delivery and synchronized command exchange.
+  [Networking.md](Networking.md) describes how LAN and online play work.
+- `rules/` — the retail INI files and their layers.
+- `map/` — maps, theaters, terrain, triggers and the random map generator.
+- `assets/` — parsers for the original file formats (`.mix`, `.shp`, `.vxl`, `.pal`, Bink video and more).
+- `util/`, `asset_tools/` and `bin/` — shared helpers, asset inspection and extra programs.
 
-When adding a new file, ask which of those concerns it belongs to. If it's gameplay logic, it goes in `sim/`. If it touches the GPU, it goes in `render/`. If it connects the two, it's app layer.
+## How it fits together
 
-To learn what a specific file does, read its `//!` header. Most modules start with a short comment stating their purpose and what they may depend on.
+`Simulation` (`src/sim/world/mod.rs`) owns mutable gameplay state.
+`SimRuntime` binds it to match resources; `SimRuntime::advance_frame()` advances
+the deterministic frame phases.
 
-All mutable game state lives in one struct: `Simulation` (`src/sim/world/mod.rs`). Match data that never changes during a match (rules, map heights, trigger definitions) is bound beside it in `SimRuntime` (`src/sim/runtime.rs`).
+The app turns player input into commands for the simulation. After each frame it hands the new state to the renderer and plays the sounds the frame produced. Rendering only reads simulation state, and `sim/` never depends on `render/`, `ui/`, `audio/` or `net/`.
 
-`Simulation` contains, among other fields:
+![Application sends commands to simulation, which returns world state; application sends draw data to rendering.](images/architecture.png)
 
-- `substrate: ObjectSubstrate` — the object stores and their order. Units, buildings and aircraft live in its `EntityStore`; animations, voxel debris and particle systems have their own stores. It also holds the active-object order and the cell occupancy grids. (Projectiles and waves are separate `Simulation` fields.)
-- `session: ScenarioSession` — scenario identity, seed, match options and the frame counters (`tick`, `binary_frame`)
-- `houses` — per-player state such as credits and defeat status (the original's `HouseClass`)
-- `house_alliances` — the alliance graph
-- `production: ProductionState` — production bookkeeping (finished items, active factories), plus ore growth and terrain objects
-- `fog: FogState` — shroud and visibility per player
-- `power_states` — per-player power (output, drain, low power, spy blackout timer)
-- `super_weapons` — per-player superweapon instances and their charge timers
-- `projectiles` — shots in flight
-- `terrain_costs` — pathfinding cost grids
-- `zone_grid` — zone connectivity for unreachability checks
-- `overlay_grid` — per-cell overlay state on the map (ore density, wall damage, bridge frames)
-- `bridge_state` — bridge runtime state (damage and destruction, used by combat and pathfinding)
-- `scenario_rng`, `main_rng`, `mapgen_rng` — the three deterministic random number streams (see Determinism below)
+## Determinism
 
-Each `GameEntity` is one struct with optional fields.
+The same state, inputs and random seed must give the same result on every platform and CPU.
 
-Every infantry unit, vehicle, ship, building and aircraft is the same struct. Always-present fields include `stable_id`, `position`, `health`, `owner`, `facing`, `type_ref` and `category`. Optional parts are `Option<T>`: a moving unit has a `locomotor`, a harvester has a `miner`.
+- Simulation math prefers `SimFixed` fixed-point over floats.
+- Three random streams match the original's three generators. A draw on the wrong stream changes every later draw.
+- Objects take their turns in the original's active-object order.
 
-Behavior lives in functions and in methods on `Simulation`, grouped by mechanism.
+Normal play hashes the whole state once every 15 frames for its diagnostic replay
+log; tests and benchmarks can hash every frame. Multiplayer has a separate
+per-frame sync checksum, with calculation, exchange and comparison handled by the
+simulation, session and network command owners.
 
-Some examples:
-- `advance_live_object_pass()` — every active object takes its turn (AI, movement, lifecycle effects), in the original's active-object order
-- `refresh_fog()` — updates shroud and visibility
-- `tick_power_states()` — recalculates each player's power
-- `tick_superweapon_instances()` — advances superweapon charge timers and handles power suspend and resume
-- `update_repair_and_power()` — in a building's turn: the computer's auto-repair start or low-credit sale, then the repair step that heals it and charges its owner
-- `tick_ore_growth_rungs()` — grows and spreads ore in the overlay grid
+## Feature docs
 
-The frame.
-
-One production entry point runs one frame: `SimRuntime::advance_frame()`, which calls `Simulation::advance_master_frame()` in `src/sim/world/mod.rs`. It follows the original game's frame order: commands due this frame → triggers → ore growth and active superweapon effects → team scripts → the live object pass → vision → power → superweapon timers → combat → crates → production and docks → houses, defeat checks and AI → frame commit → removal of dead objects → state hash. `Simulation::advance_tick()` is only a test adapter around the same frame.
-
-Output for the rest of the program leaves through per-frame batches (`SimFrameOutput`: sound events, weapon-fire events, lifecycle outputs, overlay changes, lighting events) that the app drains each frame. Inside `sim/`, some mechanisms keep their own queues and message links, such as the radio contact bus between objects (`sim/radio/`), which uses the original's radio message codes.
-
-Planning history. A May 2026 plan for moving the frame onto the original's scheduler is at `docs/plans/2026-05-28-foundational-scheduler-roadmap-todo.md`. Parts of it have landed since then (the active-object pass above), so read the code first.
-
-Rendering.
-
-A 2D renderer using wgpu. At map load, terrain tiles and sprites (buildings, infantry, overlays) are packed into atlas textures — big images containing many images side by side. Voxel models (vehicles, aircraft) are rasterized to 2D images as well; see `unit_atlas.rs` and the `vxl_*.rs` files in `render/`.
-
-Each frame, the app's presentation code (`src/app/presentation/`) reads entity state from the simulation — position, facing, health, animation frame — and builds sprite instances, and `render/` draws them. Isometric depth is handled by draw order and depth values.
-
-Rendering reads simulation state and never writes back. You can change rendering without touching game logic, and vice versa.
-
-App layer.
-
-The app layer wires everything together: the window and event loop, input, menus, loading, saving, and the hand-off between simulation, renderer and audio. Gameplay rules belong in `sim/`, not here.
-
-When you click on a unit, the app layer handles that. It figures out which entity you clicked, translates it into a command, and passes it to the simulation. The app layer is the translator between "what the player did" and "what the simulation understands."
-
-Timing. `src/util/fixed_math.rs` defines two rates:
-
-- `RA2_LOGIC_FRAMES_PER_SECOND = 15` — the original game's logic-frame rate at normal speed. INI time values come in different units (`ROF=` is already in frames; `C4Delay=`, `URepairRate=` and mission `Rate=` are minutes), and each key's conversion and rounding follow its native reader.
-- `SIM_TICK_HZ = 45` — VERA's own fixed step constant. The game passes its step length, `SIM_TICK_MS` = 22 ms, to every simulation frame. It is not the original's logic rate. Headless tools step at 66 ms instead; `src/headless_scenario.rs` records that difference.
-
-The simulation never reads wall-clock time. The app's frame pacer (`src/app/match_runtime/frame_pacer.rs`) decides when the next gameplay frame may run, using the original's GameSpeed timing, and the app advances the simulation one frame at a time.
-
-After each frame, the app layer hands the updated simulation state to the renderer, which draws the frame. It also drains the sound events that the simulation produced (weapon fired, unit died, construction complete) and plays them through the audio system.
-
-Like everything else, it's split into folders by concern — `app/input/`, `app/presentation/`, `app/match_runtime/`, `app/frontend/`, `app/loading/`, `app/persistence/` — around one shared `AppState` struct.
-
-Determinism.
-
-Everything in `Simulation` must be deterministic: the same state, inputs and random seed give the same result on every supported platform and CPU.
-
-- Math. Simulation math prefers `SimFixed`, a 16.16 fixed-point type (`src/util/fixed_math.rs`), because floats can differ across CPUs and compilers. Where the original game's floating-point behavior matters, some code reproduces it exactly with integer arithmetic (`src/util/native_x87.rs`). Some `sim/` code still uses `f32` / `f64` directly; the project rule is that each such use is documented and validated.
-- Randomness. There are three `SimRng` streams, matching the original's three generators: `scenario_rng` (in-game draws such as scatter, debris and ore growth), `main_rng` (the original's global generator; death sounds, for example) and `mapgen_rng` (map generation). Which stream a draw uses matters: a draw on the wrong stream changes every later draw.
-- Order. Entities in `EntityStore` are kept in a `BTreeMap` keyed by stable id, so storage iteration is sorted. The order in which objects take their turn is separate: the active-object vector in `ObjectSubstrate`, which follows the original.
-
-At the end of every frame the simulation produces a state hash. Two clients with the same inputs must agree on it. Lockstep multiplayer depends on this (the network transport does not exist yet), and the diagnostic command log records the hashes to help find desyncs. It's also why nothing in `sim/` is allowed to call into `render/`, `ui/`, `sidebar/`, `audio/` or `net/`.
-
----
+- [Campaign manifests](campaign-manifest.md) covers stages, roles, carry-over, local checks and room setup.
+- [Auto Repair](auto-repair.md): tick it in Options and your damaged buildings start repairing by themselves.
+- [Colour-vision filter](color-vision-config.md): the `[VERA] ColorVisionMode=` whole-viewport daltonization option.
+- [End-game screens](ini-end-game-screens.md): the verdict card, its theme and the score page's own art.
+- [Ferry order](ferry.md): press J and click a drop spot to have a transport carry units there and come back for more.
+- [Formation line](formation-line.md): hold F and drag with the left button to line a group up along a drawn line.
+- [Health-strip modes](health-bars.md): the `[VERA] HealthBars=` client option.
+- [RA2 Mode](ra2-mode.md): tick it in Options to play original Red Alert 2 from the next start.
+- [Lobby player colours](skirmish-colors.md): the thirty colours a lobby lists, and `[SkirmishColors]` for a mod's own.
+- [Interface layout](interface-layout.md): `veraui.ini`, a mod's own places for the sidebar, the command bar and the sidebar's parts.
+- [Computer players pick the nearest enemy](ai-nearest-enemy.md): the `[General] AINearestEnemy=` rules key that stops every computer player in a free-for-all from choosing the human as its enemy.
+- [Jumpjets land beside a taken cell](jumpjet-land-nearby.md): the `[JumpjetControls] LandNearby=` rules key that sends a Nighthawk refused its landing cell to the nearest clear one.
+- [Smooth Jumpjet facing](jumpjet-smooth-facing.md): the `[JumpjetControls] SmoothFacing=` rules key that stops a Nighthawk's body snapping at take-off and unload.
+- [Level high-bridge decks](level-bridge-decks.md): a high bridge keeps one deck height, so a map can run it over a valley or a slope.
+- [Minimap beacons](minimap-beacons.md): tick it in Options, press B and click the minimap to place a beacon far away.
+- [Menu reference](menu-reference.md): every page and menu a player can open, in or out of a match, with where each setting is saved.
+- [Map format](map-format.md): bigger maps and maps for up to 30 players, for people who write map editors and tools.
+- [Primary rotation](primary-rotation.md): select several factories and press I to have them take turns being the primary.
+- [Random map Extras](random-map-extras.md): share codes, presets and choices that add to a generated map, and `RMGMD.INI [Extras]` for a mod's own.
+- [External launches](spawn.md): `vera20k --probe` and `--generate-map`, which a launcher runs before a `-SPAWN` match, and the browser's `probe()` and `generate_map()`.
+- [Relation colours](relation-colours.md): press Alt+A to draw your side blue, your allies green and your enemies red.
+- [SHP building turrets](ini-shp-turret-anims.md): the rules keys for a building turret drawn as a 32-frame animation.
+- [Sidebar build-list columns](sidebar-columns.md): the Options list that lays three to five build pictures a row inside the sidebar's own width.
+- [Skirmish cheat codes](skirmish-cheats.md) let you grant credits, reveal the map and spawn vehicles in an offline match.
+- [Terrain deformation](terrain-deformation.md): the skirmish Game Options box that lets explosions dent the ground and nukes leave craters.
+- [Superweapon Limit](superweapon-limit.md): the skirmish Game Options slider that allows up to 20 of each superweapon, each charging its own shot, and the `SuperWeaponPerBuilding=` key.
+- [Stock rules retail leaves off](dormant-stock-rules.md): `Assaulter=`, `CanDetonateTimeBomb=` and other gamemd keys only a mod or map switches on.
+- [Tiberian Sun Ion Cannon](ts-ion-cannon.md): `Type=IonCannon`, the Tiberian Sun superweapon that fires an ion blast at a cell, which a mod or map switches on by listing it.

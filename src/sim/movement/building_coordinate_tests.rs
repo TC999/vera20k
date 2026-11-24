@@ -11,8 +11,8 @@ use crate::util::fixed_math::SimFixed;
 use serde_json::Value;
 
 fn rows() -> Vec<Value> {
-    serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/building_navigation_coordinate.json"
+    serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/building_navigation_coordinate.json",
     ))
     .unwrap()
 }
@@ -61,8 +61,10 @@ fn rules(input: &Value) -> RuleSet {
         let c = coord(offset);
         art.push_str(&format!("DockingOffset{i}={},{},{}\n", c.x, c.y, c.z));
     }
-    let mut rules = RuleSet::from_ini(&IniFile::from_str(&ini)).unwrap();
-    rules.install_art_data(ArtRegistry::from_ini(&IniFile::from_str(&art)));
+    let ini = IniFile::from_str(&ini);
+    let art = IniFile::from_str(&art);
+    let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
+    rules.install_art_data(ArtRegistry::from_ini(&art));
     rules
 }
 
@@ -125,11 +127,15 @@ fn building_navigation_matches_all_native_dispatch_and_direction_rows() {
 }
 
 fn position(entity: &mut GameEntity, c: DriveCoord) {
-    entity.position.rx = (c.x / 256) as u16;
-    entity.position.ry = (c.y / 256) as u16;
-    entity.position.sub_x = SimFixed::from_num(c.x % 256);
-    entity.position.sub_y = SimFixed::from_num(c.y % 256);
-    entity.position.exact_z_leptons = Some(c.z);
+    entity.position.set_rx_for_test((c.x / 256) as u16);
+    entity.position.set_ry_for_test((c.y / 256) as u16);
+    entity
+        .position
+        .set_sub_x_for_test(SimFixed::from_num(c.x % 256));
+    entity
+        .position
+        .set_sub_y_for_test(SimFixed::from_num(c.y % 256));
+    entity.position.set_exact_z_leptons_for_test(Some(c.z));
 }
 
 #[test]
@@ -142,11 +148,20 @@ fn building_navigation_capture_command_preserves_the_native_dock_coordinate() {
     let input = &row["input"];
     let rules = rules(input);
     let mut sim = Simulation::with_seed(0);
-    let mut building = GameEntity::test_default(2, "BUILDING", "Soviet", 5, 6);
-    building.category = EntityCategory::Structure;
-    building.foundation = rules.object("BUILDING").unwrap().foundation.clone();
-    building.radio_contacts = contacts(input);
-    building.lifecycle.in_limbo = false;
+    let mut building = GameEntity::test_default_of_category(
+        2,
+        "BUILDING",
+        "Soviet",
+        5,
+        6,
+        EntityCategory::Structure,
+    );
+    building
+        .seldom
+        .type_facts
+        .set_foundation_for_test(rules.object("BUILDING").unwrap().foundation.clone().into());
+    building.seldom.radio_contacts = contacts(input);
+    building.lifecycle.set_in_limbo_for_test(false);
     position(&mut building, coord(&input["current"]));
     let mut engineer = GameEntity::new_at_frame_zero_for_test(
         1,
@@ -155,14 +170,14 @@ fn building_navigation_capture_command_preserves_the_native_dock_coordinate() {
         0,
         0,
         test_intern("Americans"),
-        crate::sim::components::Health { current: 100 },
+        crate::sim::combat::Health::new(100),
         test_intern("ENGI"),
         EntityCategory::Infantry,
         0,
         5,
         true,
     );
-    engineer.lifecycle.in_limbo = false;
+    engineer.lifecycle.set_in_limbo_for_test(false);
     engineer.locomotor = Some(
         crate::sim::movement::locomotor::LocomotorState::from_object_type(
             rules.object("ENGI").unwrap(),
@@ -183,11 +198,7 @@ fn building_navigation_capture_command_preserves_the_native_dock_coordinate() {
     );
     assert!(accepted);
     let engineer = sim.substrate.entities.get(1).unwrap();
-    assert_eq!(engineer.capture_target, Some(2));
-    assert_eq!(
-        engineer.navigation.nav_com,
-        Some(NavTargetRef::Building { id: 2 })
-    );
+    assert_eq!(engineer.navigation.nav_com(), Some(NavTargetRef::object(2)));
     assert_eq!(
         engineer.locomotor.as_ref().unwrap().walk_destination(),
         Some(coord(&row["coordinate"]))
@@ -213,10 +224,19 @@ fn building_navcom_reads_live_type_requester_and_radio_slots_after_restore() {
         }
         let rules = rules(input);
         let mut sim = Simulation::with_seed(0);
-        let mut building = GameEntity::test_default(2, "BUILDING", "Americans", 5, 6);
-        building.category = EntityCategory::Structure;
-        building.foundation = rules.object("BUILDING").unwrap().foundation.clone();
-        building.radio_contacts = contacts(input);
+        let mut building = GameEntity::test_default_of_category(
+            2,
+            "BUILDING",
+            "Americans",
+            5,
+            6,
+            EntityCategory::Structure,
+        );
+        building
+            .seldom
+            .type_facts
+            .set_foundation_for_test(rules.object("BUILDING").unwrap().foundation.clone().into());
+        building.seldom.radio_contacts = contacts(input);
         position(&mut building, current);
         sim.substrate.entities.insert(building);
         if let Some(c) = requester {
@@ -231,6 +251,7 @@ fn building_navcom_reads_live_type_requester_and_radio_slots_after_restore() {
             .entities
             .get(2)
             .unwrap()
+            .seldom
             .radio_contacts
             .iter_live()
             .collect();
@@ -246,31 +267,25 @@ fn building_navcom_reads_live_type_requester_and_radio_slots_after_restore() {
             }
         }
         sim.interner = test_interner();
-        sim.substrate.next_stable_object_id = 200;
-        for target in [
-            NavTargetRef::Entity { id: 2 },
-            NavTargetRef::Building { id: 2 },
-            NavTargetRef::Object { id: 2 },
-        ] {
-            let before = super::super::nav_target_coordinate(
-                target,
-                requester.map(|_| 1),
-                &sim.substrate.entities,
-                None,
-                Some((&rules, &sim.interner)),
-            )
-            .unwrap();
-            assert_eq!(before, coord(&row["coordinate"]), "{input}");
-        }
+        sim.set_next_stable_object_id_for_test(200);
+        let before = super::super::nav_target_coordinate(
+            NavTargetRef::object(2),
+            requester.map(|_| 1),
+            &sim,
+            None,
+            Some((&rules, &sim.interner)),
+        )
+        .unwrap();
+        assert_eq!(before, coord(&row["coordinate"]), "{input}");
         if checked % 13 == 0 {
             let saved = GameSnapshot::save(&sim, 0, 0, "building destination", 0);
             let mut restored = GameSnapshot::load(&saved).unwrap().sim;
             restored.restore_after_snapshot_load().unwrap();
             assert_eq!(sim.state_hash(), restored.state_hash());
             let result = super::super::nav_target_coordinate(
-                NavTargetRef::Building { id: 2 },
+                NavTargetRef::Object { id: 2 },
                 requester.map(|_| 1),
-                &restored.substrate.entities,
+                &restored,
                 None,
                 Some((&rules, &restored.interner)),
             )

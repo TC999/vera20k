@@ -1,20 +1,7 @@
 //! Water finalizer: assigns visible water tile variants.
 //!
-//! gamemd: `MapClass::RmgFinalizeWaterShore` 0x0057A0C0 and the three helpers
-//! it alone calls — `ClearBridgeCell_Low` 0x0057A320, `UpdateBridgeTile_Low`
-//! 0x0057A430 and `SelectBridgeTileVariant_Low` 0x0057ACF0 — all three of
-//! which read `MapClass::ComputeBridgeSurfaceMask` 0x0057B210. Verified by
-//! `get_function_callers`: none of them has a runtime caller, and
-//! 0x0057A430 works in `RmgGrid__GetRegionTag` / `SetRegionTag` and
-//! `g_WaterSet_TileSetBase`, so the cluster is map-generation tile work, not
-//! in-match bridge behaviour. `MapClass::ComputeBridgeAdjacencyMask_Low`
-//! 0x00579B70 sits in the same band and is called only from
-//! `RaisePinchedCliffCell` 0x00579010, `SelectAndStampCliffFaceTile`
-//! 0x00579620 and `RandomMapGenerator::JitterCliffEdges` 0x005A19E0.
-//! Despite its inherited label, `CellClass::HasBridgeOverlay` 0x004865D0 is a
-//! tile-family range predicate: it does not read overlay `Cell+0x44`. The
-//! active low-deck validator uses it to admit waterfall families. This cluster
-//! is reached by stock Create Random Map/`.SED` generation.
+//! gamemd: `RandomMapGenerator::VaryWaterTiles` 0x0059C630, called from
+//! `RandomMapGenerator::Generate` at 0x00598B14.
 //!
 //! For 2x2 all-water clusters (anchor + E/S/SE, none sub-tiled yet) a large
 //! multi-cell variant may be placed; single cells get one of six band
@@ -24,9 +11,12 @@
 
 use crate::map::rmg::grid::RmgGrid;
 use crate::map::rmg::rng::RmgRng;
+use crate::map::rmg::scratch::RmgScratch;
 use crate::map::rmg::tiles::TileIds;
-use crate::map::rmg::x87::{self, TruncF64};
+use crate::map::rmg::x87::TruncF64;
+use crate::util::native_x87::X87Chop53;
 
+use super::carve::stamp_iso_block;
 use super::shore::TileBlocks;
 
 /// ~10*2^-32 — 2x2-vs-single selector scale (with +1.0 offset).
@@ -39,7 +29,7 @@ const K201_BITS: u64 = 0x3E69_2000_0019_2000;
 fn scaled_draw(rng: &mut RmgRng, k_bits: u64, offset: f64, max: i32) -> i32 {
     let scale = TruncF64::from_f64(f64::from_bits(k_bits));
     loop {
-        let value = x87::ftol(
+        let value = X87Chop53::ftol_f64_low_masked(
             TruncF64::from_f64(f64::from(rng.next_u32()))
                 .mul(scale)
                 .add(TruncF64::from_f64(offset))
@@ -51,11 +41,16 @@ fn scaled_draw(rng: &mut RmgRng, k_bits: u64, offset: f64, max: i32) -> i32 {
     }
 }
 
-pub fn run(grid: &mut RmgGrid, ids: &TileIds, blocks: &dyn TileBlocks, rng: &mut RmgRng) {
-    let coords: Vec<(i32, i32)> = grid.native_cells().collect();
-    for &(x, y) in &coords {
+pub fn run(
+    grid: &mut RmgGrid,
+    scratch: &mut RmgScratch,
+    ids: &TileIds,
+    blocks: &dyn TileBlocks,
+    rng: &mut RmgRng,
+) {
+    for (x, y) in grid.native_cells() {
         let anchor_ok = {
-            let cell = grid.get(x, y).expect("native cell");
+            let cell = grid.cell_native(x, y);
             cell.tile == ids.water_base && cell.sub_tile == 0
         };
         if !anchor_ok {
@@ -73,46 +68,37 @@ pub fn run(grid: &mut RmgGrid, ids: &TileIds, blocks: &dyn TileBlocks, rng: &mut
             let selector = scaled_draw(rng, K10_BITS, 1.0, 10);
             if selector != 1 {
                 let draw = scaled_draw(rng, K242_BITS, 0.0, 241);
-                let variant = if draw < 240 { draw / 10 } else { 0xF7 - draw };
-                place_block(grid, blocks, ids.water_base + variant, (x, y));
+                // 59C74B: signed /40 (0x66666667, SAR 4), so draws 0..239
+                // pick +0..+5 and only 240/241 pick +7/+6, which are rocks
+                // in water (Rock land) in the retail temperate/snow sets.
+                let variant = if draw < 240 { draw / 40 } else { 0xF7 - draw };
+                // 59C75E..59C795: the anchor's scratch region and level -1,
+                // so the stamp keeps every cell's level.
+                let region = scratch.get(x, y).region;
+                stamp_iso_block(
+                    grid,
+                    scratch,
+                    blocks,
+                    ids.water_base + variant,
+                    (x, y),
+                    region,
+                    None,
+                );
                 continue;
             }
         }
 
         // Single-cell path: six bands, band 5 only at draw 200.
         let draw = scaled_draw(rng, K201_BITS, 0.0, 200);
-        grid.get_mut(x, y).expect("native cell").tile = ids.water_base + 8 + draw / 40;
+        grid.cell_native_mut(x, y).tile = ids.water_base + 8 + draw / 40;
     }
 }
 
-/// Multi-cell tile placement: writes tile, sub-tile index, and the block's
-/// height byte per covered cell (the region/player args of the original are
-/// inert on this path).
-fn place_block(grid: &mut RmgGrid, blocks: &dyn TileBlocks, tile: i32, anchor: (i32, i32)) {
-    let Some(block) = blocks.block(tile) else {
-        return;
-    };
-    let block = block.clone();
-    for j in 0..block.height {
-        for i in 0..block.width {
-            let Some(sub) = block.subtiles[(j * block.width + i) as usize] else {
-                continue;
-            };
-            if let Some(cell) = grid.get_mut(anchor.0 + i, anchor.1 + j) {
-                cell.tile = tile;
-                cell.sub_tile = (j * block.width + i) as u8;
-                cell.level = sub.height;
-                cell.slope = 0;
-            }
-        }
-    }
-}
-
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod tests {
     use super::*;
     use crate::map::rmg::phases::shore::{SubTile, TileBlock};
-    use crate::map::rmg::tiles::SpecialTerrain;
+    use crate::map::theater::TheaterCliffRanges;
 
     struct TwoByTwo(TileBlock);
 
@@ -142,6 +128,7 @@ mod tests {
             clear: 0,
             ramp_base: -1,
             ramp_smooth: -1,
+            slope_set_pieces: -1,
             rough: -1,
             sand: -1,
             green: -1,
@@ -157,7 +144,7 @@ mod tests {
             paved_roads: -1,
             paved_road_ends: -1,
             medians: -1,
-            special: SpecialTerrain::default(),
+            cliffs: TheaterCliffRanges::default(),
         }
     }
 
@@ -170,80 +157,25 @@ mod tests {
         grid
     }
 
-    #[test]
-    fn every_water_cell_leaves_the_base_tile() {
+    /// Run the finalizer over an all-water grid whose cells sit at level 4,
+    /// the level the sea seeder leaves.
+    fn finalized(seed: u16) -> RmgGrid {
         let mut grid = water_grid();
-        let identity = ids();
-        let block_table = blocks();
-        let mut rng = RmgRng::new(1234);
-        run(&mut grid, &identity, &block_table, &mut rng);
-
-        for (x, y) in grid.native_cells().collect::<Vec<_>>() {
-            let cell = grid.get(x, y).unwrap();
-            assert_ne!(
-                (cell.tile, cell.sub_tile),
-                (500, 0),
-                "({x},{y}) still holds the untouched base water tile"
-            );
-            assert!(
-                cell.tile >= 500 && cell.tile < 500 + 24,
-                "({x},{y}) holds a water variant (2x2 variants span 0..24)"
-            );
-        }
-    }
-
-    #[test]
-    fn single_cells_use_the_six_band_variants() {
-        let mut grid = water_grid();
-        let identity = ids();
-        let block_table = blocks();
-        // Turn everything but one isolated water cell to land.
-        let coords: Vec<(i32, i32)> = grid.native_cells().collect();
-        for &(x, y) in &coords {
-            if (x, y) != (10, 10) {
-                grid.get_mut(x, y).unwrap().tile = 0;
-            }
-        }
-        let mut rng = RmgRng::new(7);
-        run(&mut grid, &identity, &block_table, &mut rng);
-        let tile = grid.get(10, 10).unwrap().tile;
-        assert!(
-            (508..=513).contains(&tile),
-            "isolated water gets a band variant, got {tile}"
+        let mut scratch = RmgScratch::new(30, 10, 26);
+        run(
+            &mut grid,
+            &mut scratch,
+            &ids(),
+            &blocks(),
+            &mut RmgRng::new(seed),
         );
-    }
-
-    #[test]
-    fn band_math_uses_the_fp_chain_not_modulo() {
-        // Raw draw 0x80000000: the FP chain gives trunc(2^31 * ~201*2^-32)
-        // = 100 -> band 2; a modulo implementation would give 3 -> band 0.
-        let scale = TruncF64::from_f64(f64::from_bits(K201_BITS));
-        let value = x87::ftol(
-            TruncF64::from_f64(f64::from(0x8000_0000u32))
-                .mul(scale)
-                .to_f64(),
-        );
-        assert_eq!(value, 100, "scaled-draw semantics");
-        assert_ne!(value, 0x8000_0000u32 as i32 % 201, "modulo would differ");
-    }
-
-    #[test]
-    fn selector_range_is_one_to_ten() {
-        let mut rng = RmgRng::new(99);
-        for _ in 0..500 {
-            let v = scaled_draw(&mut rng, K10_BITS, 1.0, 10);
-            assert!((1..=10).contains(&v));
-        }
+        grid
     }
 
     #[test]
     fn finalize_is_deterministic() {
         let tiles = |seed| {
-            let mut grid = water_grid();
-            let identity = ids();
-            let block_table = blocks();
-            let mut rng = RmgRng::new(seed);
-            run(&mut grid, &identity, &block_table, &mut rng);
+            let grid = finalized(seed);
             grid.native_cells()
                 .collect::<Vec<_>>()
                 .iter()
@@ -254,5 +186,29 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(tiles(4321), tiles(4321));
+    }
+
+    /// 59C790 pushes level -1, so the 2x2 stamp keeps each cell's level.
+    /// Writing the TMP height (0) instead sank the clusters four levels below
+    /// the surrounding sea, where they drew as black, impassable holes.
+    #[test]
+    fn water_blocks_keep_the_sea_level() {
+        let grid = finalized(4321);
+        assert!(
+            grid.native_cells()
+                .all(|(x, y)| grid.get(x, y).unwrap().level == 4)
+        );
+    }
+
+    /// 59C74B divides the 0..239 draw by 40, so a 2x2 cluster takes one of
+    /// the WaterSet's 2x2 tiles (+0..+7), never a tile past the 14-tile set.
+    #[test]
+    fn water_blocks_stay_inside_the_water_set() {
+        let grid = finalized(4321);
+        let water_set = 500..514;
+        assert!(
+            grid.native_cells()
+                .all(|(x, y)| water_set.contains(&grid.get(x, y).unwrap().tile))
+        );
     }
 }

@@ -5,18 +5,19 @@
 //! owners; match-scoped input and presentation live inside MatchState.
 //! The architecture guards keep unrelated flat fields from returning.
 
-use super::{BTreeMap, OverlayTypeRegistry, ResolvedTerrainGrid};
+use super::{OverlayTypeRegistry, ResolvedTerrainGrid};
+use crate::app::shell_route::ShellRoute;
 
 mod platform;
 
-pub(crate) use platform::PlatformState;
+pub(crate) use platform::{CapturePresentation, PlatformState};
 
 /// All initialized state. Created in `resumed()` when the window is available.
 /// pub(crate) so the app presentation/render paths can access fields.
 pub(crate) struct AppState {
     pub(crate) platform: PlatformState,
     /// Process-wide renderer owner (F12): GPU context, batch renderer,
-    /// pools, passes, egui, fonts, and rendering caches.
+    /// pools, passes, fonts, and rendering caches.
     pub(crate) renderer: crate::app::renderer_state::RendererState,
     /// Process diagnostics owner (F12): debug toggles, frame stepper,
     /// parity digest sink, dev-overlay bookkeeping.
@@ -34,19 +35,91 @@ pub(crate) struct AppState {
     pub(crate) persistence: crate::app::persistence::PersistenceState,
 }
 
-/// Drop app-owned scenario-exit runtime after a successful world replacement.
-/// Serialized HouseState remains the sole authority for any loaded SavourDelay;
-/// wall waits are reconstructed from its expiry latch without replaying EVA.
+/// Drop app-owned scenario-exit runtime and failure modal after a successful world replacement.
+/// Serialized HouseState owns SavourDelay and pending flags; ScenarioSession
+/// retains admitted requests. A saved frame cursor resumes its House wait
+/// with a fresh process clock, without replaying the result announcement.
+/// ClearScene685213..68521F and ordinary load cleanup69BB40 reset the shared
+/// 87E758 output scalar, not Theme's slots/fading. ThemeLoad721040 must see
+/// that process state unchanged; fresh-start request cancellation stays there.
 pub(crate) fn reset_scenario_exit_runtime(state: &mut AppState) {
     state.match_state.scenario_outcome = None;
     state.match_state.scenario_exit = None;
-    state.audio.cancel_scenario_theme_request();
-    state.audio.set_master_output_scale(1.0);
+    state
+        .match_state
+        .match_presentation
+        .outcome_banner_presentation = Default::default();
+    state.match_state.network_failure = None;
+    state.match_state.frame_stopped = false;
+    crate::app::lan_service::return_transport(state);
+    state.audio.restore_sound_master();
+}
+
+/// The correction matrix for `[VERA] ColorVisionMode=`, or `None` for `Off`.
+/// Startup needs it before an `AppState` exists, so the mapping lives here
+/// rather than on the state: `render/` only ever sees a plain matrix.
+pub(crate) fn color_vision_matrix_for(
+    mode: crate::ui::main_menu_dialogs::options::ColorVisionMode,
+) -> Option<crate::render::color_vision::Mat3> {
+    use crate::render::color_vision as cv;
+    use crate::ui::main_menu_dialogs::options::ColorVisionMode as Mode;
+    match mode {
+        Mode::Off => None,
+        Mode::Generic | Mode::Deuteranopia => Some(cv::CORRECT_DEUTERANOPIA),
+        Mode::Protanopia => Some(cv::CORRECT_PROTANOPIA),
+        Mode::Tritanopia => Some(cv::CORRECT_TRITANOPIA),
+    }
 }
 
 impl AppState {
+    /// Client presentation preference; the simulation never reads this option.
+    pub(crate) fn translucent_fog_enabled(&self) -> bool {
+        self.platform
+            .game_config
+            .as_ref()
+            .is_some_and(|config| config.graphics.translucent_fog)
+    }
+
+    /// `[VERA] HealthBars=`: the client health-strip policy. Presentation only;
+    /// the simulation never reads it.
+    pub(crate) fn health_bar_mode(&self) -> crate::ui::main_menu_dialogs::options::HealthBarMode {
+        self.persistence.options_profile.health_bars
+    }
+
+    /// `[VERA] ColorVisionMode=`: the final-frame colour filter. Presentation
+    /// only; the simulation never reads it, and the frame reads it live.
+    pub(crate) fn color_vision_mode(
+        &self,
+    ) -> crate::ui::main_menu_dialogs::options::ColorVisionMode {
+        self.persistence.options_profile.color_vision
+    }
+
+    /// Publish this frame's matrix to the shared frame-output filter.
+    pub(crate) fn color_vision_matrix(&self) -> Option<crate::render::color_vision::Mat3> {
+        color_vision_matrix_for(self.color_vision_mode())
+    }
+
+    /// Is the match frozen because the window is not the foreground? Only the
+    /// configured freeze, and only offline: `Main_Tick` (`0x0055D38D`) sleeps
+    /// until reactivated in GameMode 0 or 5, but a network game sleeps 10 ms
+    /// and runs on, so peers never stall on a deactivated player.
+    pub(crate) fn focus_freeze_active(&self) -> bool {
+        self.platform.focus_freeze_configured()
+            && self.match_state.session_mode().is_single_player()
+    }
+
+    /// The game folder map lookups start from: the configured one, else the
+    /// asset manager's.
+    pub(crate) fn ra2_dir(&self) -> Option<&std::path::Path> {
+        self.platform
+            .game_config
+            .as_ref()
+            .map(|config| config.paths.ra2_dir.as_path())
+            .or_else(|| self.process_assets.manager().map(|assets| assets.ra2_dir()))
+    }
+
     /// Current projection: frontend/result use physical window pixels; tactical
-    /// rendering and pending tactical installation use the optional upscaler.
+    /// rendering and pending tactical installation use the optional zoom pass.
     /// Loading artwork explicitly uses GPU/window dimensions in loading::pump.
     fn render_dimensions(&self) -> (u32, u32) {
         platform::render_dimensions(
@@ -70,47 +143,170 @@ impl AppState {
         self.render_dimensions().1
     }
 
-    /// Modal shells use physical window pixels, while the retained tactical
-    /// cursor stays in battlefield source pixels even during an upscaled match.
-    pub(crate) fn window_cursor_position(&self) -> (f32, f32) {
+    /// The sidebar's place and size in the match frame (`ui::sidebar::frame`),
+    /// drawn at the window's pixels when the match zooms.
+    pub(crate) fn sidebar_frame(&self) -> crate::ui::sidebar::SidebarFrame {
+        let zoom = self
+            .match_zoom_pass()
+            .map_or(100, |pass| pass.geometry().percent);
+        self.sidebar_frame_for(self.render_width(), self.render_height())
+            .in_window(zoom, self.hd_radar() || self.smooth_sidebar())
+    }
+
+    /// Whether VERA's HD radar is on (`[VERA] HdRadar=`); a capture takes its
+    /// profile's choice (`CapturePresentation`).
+    pub(crate) fn hd_radar(&self) -> bool {
+        if self.platform.capture_client_size.is_some() {
+            self.platform.capture_presentation.hd_radar
+        } else {
+            self.persistence.options_profile.hd_radar
+        }
+    }
+
+    /// Whether VERA's smooth sidebar is on (`[VERA] SmoothSidebar=`); a
+    /// capture takes its profile's choice (`CapturePresentation`).
+    pub(crate) fn smooth_sidebar(&self) -> bool {
+        if self.platform.capture_client_size.is_some() {
+            self.platform.capture_presentation.smooth_sidebar
+        } else {
+            self.persistence.options_profile.smooth_sidebar
+        }
+    }
+
+    /// Whether VERA's online client draws its enlarged art smoothed
+    /// (`[VERA] SmoothOnlineMenus=`). The native-UI diagnostics, the only
+    /// sessions without that client, keep their art's own pixels.
+    pub(crate) fn smooth_online_menus(&self) -> bool {
+        self.persistence.options_profile.smooth_online_menus && !self.frontend.native_shell_ui
+    }
+
+    /// Whether the setup screens show VERA's own map pictures
+    /// (`[VERA] HdMapPreviews=`, `app::map_picture`). Captures keep the map's
+    /// `[PreviewPack]` picture, which retail comparisons check, and the
+    /// browser build cannot start the hidden run that draws one.
+    pub(crate) fn hd_map_previews(&self) -> bool {
+        crate::ui::main_menu_dialogs::options::HAS_HD_MAP_PREVIEWS
+            && self.platform.capture_client_size.is_none()
+            && self.persistence.options_profile.hd_map_previews
+    }
+
+    /// The same for a frame of `width` x `height`. Captures take their own
+    /// size (`CapturePresentation`), Normal unless the profile says.
+    pub(crate) fn sidebar_frame_for(
+        &self,
+        width: u32,
+        height: u32,
+    ) -> crate::ui::sidebar::SidebarFrame {
+        let size = if self.platform.capture_client_size.is_some() {
+            self.platform.capture_presentation.sidebar
+        } else {
+            self.persistence.options_profile.sidebar
+        };
+        // The side's layout decides how wide the column is and where it and
+        // the bar sit.
+        let spec = self.match_state.match_presentation.sidebar_layout_spec;
+        crate::ui::sidebar::SidebarFrame::new(width, height, size.percent(width, height))
+            .with_column_width(spec.sidebar_width as u32)
+            .with_band_height(spec.side_height as u32)
+            .with_places(spec.places)
+    }
+
+    /// The zoom pass a match frame goes through: the battlefield and the
+    /// active-game shells draw into it at the source size. Loading and the
+    /// menus never zoom.
+    pub(crate) fn match_zoom_pass(&self) -> Option<&crate::render::upscale_pass::UpscalePass> {
+        (self.frontend.screen == crate::ui::game_screen::GameScreen::InGame)
+            .then_some(self.renderer.upscale_pass.as_ref())
+            .flatten()
+    }
+
+    /// The zoom between the window and the match frame, whose cursor, layout
+    /// and drawing all use source pixels.
+    pub(crate) fn tactical_zoom(
+        &self,
+    ) -> Option<crate::ui::main_menu_dialogs::options::ZoomGeometry> {
+        self.match_zoom_pass().map(|pass| pass.geometry())
+    }
+
+    /// Store a pointer position given in window pixels, in the space this
+    /// screen reads it in.
+    pub(crate) fn set_cursor_from_window(&mut self, x: f32, y: f32) {
+        let zoom = self.tactical_zoom();
+        self.match_state.input.set_cursor_from_window(
+            (x, y),
+            zoom,
+            self.platform.pointer_held && self.platform.window_active,
+        );
+    }
+
+    /// Move the stored cursor into the space the current screen reads it in,
+    /// before each window event: leaving a zoomed match or resizing one would
+    /// otherwise leave it in the old space until the pointer moves.
+    pub(crate) fn sync_cursor_space(&mut self) {
+        let zoom = self.tactical_zoom();
+        self.match_state.input.sync_cursor_space(zoom);
+    }
+
+    /// The pointer in the pixels the current screen paints and hit-tests in:
+    /// the match frame's during a match (source pixels when zoomed), the
+    /// window's elsewhere.
+    pub(crate) fn cursor_position(&self) -> (f32, f32) {
         (
-            self.match_state.input.cursor_x * self.renderer.gpu.config.width as f32
-                / self.render_width().max(1) as f32,
-            self.match_state.input.cursor_y * self.renderer.gpu.config.height as f32
-                / self.render_height().max(1) as f32,
+            self.match_state.input.cursor_x,
+            self.match_state.input.cursor_y,
         )
     }
 
+    /// The status cards paint in window pixels, even over a zoomed match.
+    pub(crate) fn window_cursor_position(&self) -> (f32, f32) {
+        let (x, y) = (
+            self.match_state.input.cursor_x,
+            self.match_state.input.cursor_y,
+        );
+        self.tactical_zoom()
+            .map_or((x, y), |zoom| zoom.source_to_window(x, y))
+    }
+
     /// Whether the software cursor (mouse.shp) should be active this frame.
-    /// Returns false when an egui interactive panel is open so the OS cursor shows.
+    /// Asset-independent status cards and diagnostic modals use the OS cursor,
+    /// and so does the pointer once it leaves the client area: mouse.shp has no
+    /// art for the title bar or resize border, and the OS arrow is drawn there
+    /// whether VERA asks for it or not. The same holds over an inactive window. Main-menu dialogs (Options, Keyboard,
+    /// the exit confirm) are shell pages that draw mouse.shp themselves, so
+    /// they keep it; excluding them showed the OS arrow beside it.
     pub(crate) fn use_software_cursor(&self) -> bool {
-        !(self.frontend.screen == crate::ui::game_screen::GameScreen::MainMenu
-            && self.frontend.main_menu_shell_error.is_some())
+        self.platform.owns_pointer()
+            && !(self.frontend.screen == crate::ui::game_screen::GameScreen::MainMenu
+                && self.frontend.main_menu_shell_error.is_some())
             && self
                 .match_state
                 .match_presentation
                 .software_cursor
                 .is_some()
             && (!self.match_state.paused()
-                || crate::app::frontend::skirmish_shell_render::native_in_game_shell_active(self))
-            && !self.match_state.match_presentation.show_save_load_panel
-            && !self.main_menu_dialog_open()
+                || crate::app::frontend::skirmish_shell_render::native_in_game_shell_active(self)
+                || self
+                    .match_state
+                    .match_presentation
+                    .in_game_menu
+                    .draws_over_battlefield())
     }
 
-    /// Capture-only observation of the exact font and scale inputs consumed by
-    /// the most recently completed egui pass.
-    pub(crate) fn capture_egui_observation(
-        &self,
-    ) -> crate::render::egui_integration::EguiCaptureObservation<'_> {
-        self.renderer
-            .egui
-            .capture_observation(&self.platform.window)
+    /// The main menu at rest, where a box may ask or tell the player
+    /// something: its page takes input (not sliding, no movie, page or error
+    /// over it), past the splash, with no dialog.
+    pub(crate) fn main_menu_at_rest(&self) -> bool {
+        use crate::app::input::precedence::{InputLayer, ScreenPage, input_layer};
+        input_layer(self) == InputLayer::Screen(ScreenPage::MainMenu)
+            && self.frontend.shell_route == ShellRoute::MainMenu
+            && self.frontend.startup_splash.is_none()
+            && !self.main_menu_dialog_open()
     }
 
     /// Whether any main-menu modal dialog (exit confirm, options, keyboard)
     /// is currently open.
     pub(crate) fn main_menu_dialog_open(&self) -> bool {
-        self.frontend.exit_confirm_modal.is_some()
+        self.frontend.shell_message_box.is_some()
             || self.frontend.options_dialog.is_some()
             || self.frontend.keyboard_dialog.is_some()
     }
@@ -142,18 +338,19 @@ impl AppState {
     /// hold `&mut` app fields keep the `sim_runtime` field chain and call
     /// `rt.view()` directly for split borrows.
     pub(crate) fn sim_view(&self) -> Option<crate::sim::runtime::SimView<'_>> {
-        self.match_state.sim_runtime.as_ref().map(|rt| rt.view())
+        self.match_state.sim_runtime.runtime().map(|rt| rt.view())
     }
 
-    /// Load-time cell levels the input and presentation click resolution
-    /// reads (see `MatchPresentationState::height_map`).
-    pub(crate) fn height_map(&self) -> &BTreeMap<(u16, u16), u8> {
-        &self.match_state.match_presentation.height_map
-    }
-
-    /// Load-time high-bridge deck levels for the same click resolution.
-    pub(crate) fn bridge_height_map(&self) -> &BTreeMap<(u16, u16), u8> {
-        &self.match_state.match_presentation.bridge_height_map
+    /// Current terrain authority, replaced together with the running world on
+    /// map load and restore. No presentation height projection is retained.
+    pub(crate) fn resolved_terrain(
+        &self,
+    ) -> Option<&crate::map::resolved_terrain::ResolvedTerrainGrid> {
+        self.match_state
+            .sim_runtime
+            .runtime()?
+            .simulation
+            .resolved_terrain()
     }
 }
 
@@ -163,9 +360,9 @@ impl AppState {
     pub(crate) fn overlay_registry(&self) -> Option<&OverlayTypeRegistry> {
         self.match_state
             .sim_runtime
-            .as_ref()
-            .map(|rt| &rt.resources.overlay_registry)
-            .or(self.frontend.shell_preview_overlay_registry.as_ref())
+            .runtime()
+            .map(|rt| rt.resources.rules.overlay_registry())
+            .or(self.frontend.shell_preview_overlay_registry.as_deref())
     }
 }
 
@@ -173,11 +370,30 @@ impl AppState {
     /// The active rules: runtime-bound during a match, startup-shell rules
     /// otherwise. Matches the old field's Option shape at every consumer.
     pub(crate) fn rules(&self) -> Option<&crate::rules::ruleset::RuleSet> {
+        let route = self.frontend.shell_route;
+        if self.frontend.screen == crate::ui::game_screen::GameScreen::MainMenu
+            && (matches!(route, ShellRoute::Wol | ShellRoute::WolLobby)
+                || route == ShellRoute::LanLobby
+                || route == ShellRoute::NetworkSetup)
+        {
+            // Network choices must agree before loading. Keep the old world's
+            // Rules with its objects, but don't offer its map's colors or Types
+            // in the next room. PrepareSession refreshed startup's Countries.
+            return self.frontend.frontend_rules.as_ref();
+        }
         self.match_state
             .sim_runtime
-            .as_ref()
+            .runtime()
             .map(|rt| &rt.resources.rules)
             .or(self.frontend.frontend_rules.as_ref())
+    }
+
+    /// The colours a lobby lists under the loaded rules; YR's eight before
+    /// any rules load.
+    pub(crate) fn lobby_colors(&self) -> crate::rules::skirmish_colors::SkirmishColorMode {
+        self.rules()
+            .map(crate::rules::ruleset::RuleSet::skirmish_colors)
+            .unwrap_or_default()
     }
 }
 
@@ -187,7 +403,59 @@ impl AppState {
     pub(crate) fn terrain_template(&self) -> Option<&ResolvedTerrainGrid> {
         self.match_state
             .sim_runtime
-            .as_ref()
+            .runtime()
             .and_then(|rt| rt.resources.terrain_template.as_ref())
+    }
+}
+
+/// The app's Main886B88 draws: voices, the theme and the other interface
+/// draws. The app keeps its own process cell; a fresh install moves the
+/// bootstrap cursor into it and the scenario's simulation continues from
+/// there in a cell of its own (`Simulation::install_fresh_process_main`), so
+/// the two threads share no RNG (docs/sim-thread.md).
+pub(crate) fn process_main_draws(
+    frontend: &crate::sim::rng::MainRng,
+) -> crate::sim::rng::MainRngDraws {
+    frontend.draws()
+}
+
+#[cfg(all(test, tests_app))]
+mod main_draw_tests {
+    use super::process_main_draws;
+    use crate::sim::{
+        rng::{MainRng, SimRng},
+        world::Simulation,
+    };
+
+    #[test]
+    fn an_installed_scenario_draws_its_own_main_from_the_installed_cursor() {
+        let frontend = MainRng::new(31);
+        let retained = frontend.draws();
+        let mut installed = Simulation::with_seed(42);
+        let scenario = installed.rng_state().scenario;
+        let mut reference = SimRng::new(42);
+        for _ in 0..7 {
+            assert_eq!(
+                installed.main_rng_mut_for_test().next_u32(),
+                reference.next_u32()
+            );
+        }
+        installed.install_fresh_process_main(&frontend);
+        // The app's cell takes the bootstrap cursor ...
+        assert_eq!(frontend.logical_state(), reference.logical_state());
+        // ... and so does the simulation's, but they draw apart.
+        assert_eq!(installed.rng_state().main, reference.logical_state());
+        let mut world = reference.clone();
+        assert_eq!(
+            process_main_draws(&frontend).ranged(0, 4),
+            reference.next_range_i32_inclusive(0, 4)
+        );
+        assert_eq!(
+            installed.main_rng_mut_for_test().next_u32(),
+            world.next_u32()
+        );
+        assert_eq!(retained.next_u32(), reference.next_u32());
+        assert_eq!(installed.rng_state().main, world.logical_state());
+        assert_eq!(installed.rng_state().scenario, scenario);
     }
 }

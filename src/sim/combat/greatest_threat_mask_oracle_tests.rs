@@ -1,7 +1,7 @@
 //! `tools/threat_mask_oracle.py`'s native rows replayed: `Greatest_Threat`'s
 //! flags word, `Evaluate_Candidate`'s All-To-Hunt and quarry terms with its
-//! final acceptance, and `Calculate_Threat_Score`'s SpecialThreatValue term
-//! with `EnemyHouseThreatBonus=`.
+//! final acceptance, `Calculate_Threat_Score`'s SpecialThreatValue term
+//! with `EnemyHouseThreatBonus=`, and `Evaluate_Candidate`'s distance cutoff.
 
 use super::*;
 use crate::sim::house_state::HouseState;
@@ -9,7 +9,7 @@ use serde_json::Value;
 
 fn rows(section: &str) -> Vec<Value> {
     let oracle: Value =
-        serde_json::from_str(include_str!("../../../tools/threat_mask_oracle.json")).unwrap();
+        serde_json::from_str(crate::test_fixture::text("tools/threat_mask_oracle.json")).unwrap();
     oracle[section].as_array().unwrap().clone()
 }
 
@@ -45,9 +45,9 @@ fn quarry_terms_and_acceptance_match_the_original() {
     let other = interner.intern("Other");
     for (number, row) in rows("quarry_terms").iter().enumerate() {
         let mut house = HouseState::new(scanner, 0, None, false, 0, 10);
-        house.enemy_house = flag(&row["enemy"]).then_some(enemy);
+        house.set_enemy_house_for_test(flag(&row["enemy"]).then_some(enemy));
         if flag(&row["bias"]) {
-            house.strategy_emergency.set_all_to_hunt_bias();
+            house.strategy_emergency_mut().set_all_to_hunt_bias();
         }
         let owner = if flag(&row["enemy_owns"]) {
             enemy
@@ -96,5 +96,93 @@ fn special_threat_and_enemy_house_bonus_match_the_original() {
             u64::from_str_radix(row["result_bits"].as_str().unwrap(), 16).unwrap(),
             "bonus row {number}: {row}"
         );
+    }
+}
+
+#[test]
+fn distance_cutoff_matches_the_original() {
+    let rows = rows("cutoff");
+    assert_eq!(rows.len(), 173);
+    for (number, row) in rows.iter().enumerate() {
+        let coord = |key: &str| DriveCoord {
+            x: int(&row[key][0]),
+            y: int(&row[key][1]),
+            z: int(&row[key][2]),
+        };
+        let high_flying = flag(&row["high_flying"]);
+        assert_eq!(
+            cutoff_distance(coord("scanner"), coord("candidate"), high_flying),
+            int(&row["distance"]),
+            "cutoff row {number}: {row}"
+        );
+        assert_eq!(
+            !candidate_beyond_cutoff(
+                coord("scanner"),
+                coord("candidate"),
+                high_flying,
+                int(&row["range"])
+            ),
+            flag(&row["admitted"]),
+            "cutoff row {number}: {row}"
+        );
+    }
+}
+
+/// Evaluate_Candidate's disguise arm (`0x006F84B1..0x006F854B`) executed
+/// natively: the blink's remaining frames through `CdTimer::remaining`, the
+/// gate, and one Scenario `RandomRanged(0, 99)` (stream offset `0x218`) only
+/// for a computer attacker while the candidate blinks.
+#[test]
+fn disguise_arm_matches_the_original() {
+    use crate::sim::cloak_disguise::{DisguiseGateOutcome, disguise_rejects_candidate};
+    use crate::sim::house_state::HouseDifficulty;
+    use crate::sim::rng::SimRng;
+    use crate::sim::timer::CdTimer;
+
+    let mut rules =
+        RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str("")).expect("rules");
+    rules.general.disabled_disguise_detection_percent = vec![15, 5, 2];
+    let scanner = crate::sim::intern::test_interner().intern("Scanner");
+    let rows = rows("disguise");
+    assert!(
+        rows.iter()
+            .any(|row| row["admitted"] == true && !row["draws"].as_array().unwrap().is_empty())
+    );
+    for row in rows {
+        let blink = CdTimer::from_raw(int(&row["start"]), int(&row["duration"]))
+            .remaining(int(&row["frame"]));
+        let outcome = disguise_rejects_candidate(
+            flag(&row["disguised"]),
+            flag(&row["detects"]),
+            blink,
+            flag(&row["human"]),
+        );
+        let draws = row["draws"].as_array().unwrap();
+        let mut house = HouseState::new(scanner, 0, None, flag(&row["human"]), 0, 10);
+        house.set_difficulty_for_test(
+            HouseDifficulty::from_native(int(&row["difficulty"])).unwrap(),
+        );
+        let roll = int(&row["roll"]);
+        let mut rng = SimRng::answering(0, 99, roll);
+        let mut once = rng.clone();
+        once.next_range_i32_inclusive(0, 99);
+        let admitted = match outcome {
+            DisguiseGateOutcome::Accept => true,
+            DisguiseGateOutcome::Reject => false,
+            DisguiseGateOutcome::AiDetectionRoll => {
+                let admitted = disguise_detection_roll(&mut rng, Some(&house), &rules);
+                assert_eq!(rng.logical_state(), once.logical_state(), "{row}");
+                admitted
+            }
+        };
+        assert_eq!(admitted, flag(&row["admitted"]), "{row}");
+        assert_eq!(
+            outcome == DisguiseGateOutcome::AiDetectionRoll,
+            !draws.is_empty(),
+            "{row}"
+        );
+        for draw in draws {
+            assert_eq!(draw, &serde_json::json!([0x218, 0, 99]), "{row}");
+        }
     }
 }

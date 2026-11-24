@@ -1,9 +1,8 @@
 # Ordinary Cannon / 120MM bridge rendering
 
 This corpus bounds the common `MTNK → 105mm → Cannon → Image=120MM` SHP
-presentation route. Original executable SHA-256 is
-`1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c`;
-all executions use the hash-enforcing shared runner and Unicorn 2.1.4.
+presentation route. All executions use original `gamemd.exe` through the shared
+runner and Unicorn 2.1.4.
 The separate [input corpus](bridge_render_inputs.py) establishes the selected
 original constructors, readers, image and palette prerequisites. `120MM` is the
 projectile's image identifier; it is not the `120mm` weapon.
@@ -36,6 +35,39 @@ check-only compares that file byte-for-byte. These commands were run with
 | `bridge_render_pixels` | 400 signed-depth/transparency/repeat cases across all four Bullet-selected plain/RLE leaves; four multi-pixel stencil cases; both shadow leaves over every 16-bit destination word | Prepared Convert leaf/palette/A/Z inputs. Body color `0x55AA` is deliberately synthetic. Shape decoding and retail colors belong to the preceding corpus. |
 
 ## Native chain and ABI
+
+The shared surface owner also serves the physical Flat voxel controls in
+`tools/voxel_oracle/raster_fixtures.py --bullet-flat`. The optional mode keeps
+the existing 22 `--bullet` Kirov raster controls unchanged and extends the same
+`raster.py` machine through completed Bullet draw, native Convert selection,
+packed-raster BSurface, clipping, rowwalker and RGB565 leaves:
+
+```sh
+VERA20K_PROJECTILE_RENDER_ASSETS=/path/to/extract \
+python -m tools.voxel_oracle.raster_fixtures --bullet-flat --check
+```
+
+The extraction directory needs `SUBT.VXL`, `SUBT.HVA`, `VOXELS.VPL`,
+`UNITTEM.PAL`, `ANIM.PAL`, `PALETTE.PAL` and the physical `RULESMD.INI`.
+Existing native palette owners parse LightGold and execute selected temperate
+palette expansion plus whole ColorScheme/LightConvert constructors; voxel
+draws receive that actual ColorScheme Convert, not an SHP palette substitute.
+The selected theater/name, paired registry and retained Bullet/surface inputs
+are explicit component boundaries. Successful allocator and CRT destructor
+registration transports supply no gameplay or pixel result.
+
+`bullet_flat_fixtures.json` records compact supplied depth/A inputs, physical
+asset identities, native matrices/sparse raster indices, source and destination
+rectangles, original leaf candidates, and RGB565 changes after each ordered
+draw. Unlisted pixels retain the input background. Exact full Z/A bytes remain
+unchanged. Controls include accept/reject/tie, edge/full clipping, physical zero
+holes, varied A, two draws, non-Flat passthrough, signed negative candidates,
+and a circular Z/A scroll crossing the buffer end. Input patches use physical
+buffer indices; observed leaf offsets retain their screen-to-buffer mapping.
+The file-backed Flat bias is used as inspected; no universal runtime value,
+native submarine launch, native Display traversal or whole-scene/GPU parity is
+established by this component corpus. Source assets and execution receipts stay
+outside the repository; sidecars pin the executable and command, not tool sources.
 
 The actual Bullet vtable is `7E46E4`; `+104 → 5F4B10` is Object Render,
 `+114 → 468090` Bullet Draw, `+48 → 5F65A0` retained coordinate getter,

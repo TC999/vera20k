@@ -6,7 +6,7 @@
 //   if (byte == 0) discard;
 //   if (16 <= byte < 32) → rgb = house_ramp[house_idx][byte - 16]
 //   else                 → rgb = palette[byte]
-//   color = apply_fx(color, fx_flags, fx_params, effect_tint);
+//   color = apply_fx(color, fx_flags, fx_params);
 //   return palette_light(rgb, tint), alpha;  (tint applied in sRGB byte space)
 //
 // Bind groups:
@@ -25,7 +25,7 @@ struct Camera {
     world_height: f32,
     pad1: f32,
     native_z_origin_y: f32,
-    native_z_pad: f32,
+    native_z_pan: f32,
 };
 
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -41,13 +41,14 @@ struct Instance {
     @location(1) size: vec2f,
     @location(2) uv_origin: vec2f,
     @location(3) uv_size: vec2f,
-    @location(4) depth: f32,
+    // No `depth` (location 4): fs_main writes frag_depth itself, and WebGL2
+    // has room for 15 inputs beside `vertex_index`.
     @location(5) tint: vec3f,
     @location(6) alpha: f32,
     @location(7) remap_row: u32,
     @location(8) fx_flags: u32,
     @location(9) fx_params: vec4f,
-    @location(10) effect_tint: vec4f,
+    @location(10) sinking_row: f32,
     @location(11) z_adjust: f32,
     @location(12) z_gradient: u32,
     // (top, height) of the composite blit rect this layer belongs to; zero
@@ -55,6 +56,7 @@ struct Instance {
     // barrel are one native cache blit (`0x0073B140`), so they share one seed.
     @location(13) z_rect: vec2f,
     @location(14) palette_light: vec4u,
+    @location(15) source_palette: u32,
 };
 
 struct VertexOutput {
@@ -65,7 +67,7 @@ struct VertexOutput {
     @location(3) @interpolate(flat) remap_row: u32,
     @location(4) @interpolate(flat) fx_flags: u32,
     @location(5) fx_params: vec4f,
-    @location(6) effect_tint: vec4f,
+    @location(6) @interpolate(flat) sinking_row: f32,
     // World-pixel position of this fragment (unpadded quad).
     @location(7) world_pos: vec2f,
     // Blit rect top row and height in world pixels.
@@ -73,6 +75,7 @@ struct VertexOutput {
     @location(9) @interpolate(flat) z_adjust: f32,
     @location(10) @interpolate(flat) z_gradient: u32,
     @location(11) @interpolate(flat) palette_light: vec4u,
+    @location(12) @interpolate(flat) source_palette: u32,
 };
 
 @vertex
@@ -92,9 +95,8 @@ fn vs_main(
 
     let local: vec2f = quad_pos[idx];
     let is_zoomed: bool = abs(camera.zoom - 1.0) >= 0.001;
-    let pad: f32 = select(0.0, 0.5 / camera.zoom, is_zoomed);
-    let raw_pos: vec2f = (instance.position - vec2f(pad, pad)
-        + local * (instance.size + vec2f(pad * 2.0, pad * 2.0))
+    // Match the exact source scale used by the other tactical blitters.
+    let raw_pos: vec2f = (instance.position + local * instance.size
         - camera.camera_pos) * camera.zoom;
     let pixel_pos: vec2f = select(raw_pos, floor(raw_pos + vec2f(0.5, 0.5)), !is_zoomed);
 
@@ -111,7 +113,7 @@ fn vs_main(
     out.remap_row = instance.remap_row;
     out.fx_flags = instance.fx_flags;
     out.fx_params = instance.fx_params;
-    out.effect_tint = instance.effect_tint;
+    out.sinking_row = instance.sinking_row;
     out.world_pos = instance.position + local * instance.size;
     out.rect_top_height = select(
         vec2f(instance.position.y, instance.size.y),
@@ -121,6 +123,7 @@ fn vs_main(
     out.z_adjust = instance.z_adjust;
     out.z_gradient = instance.z_gradient;
     out.palette_light = instance.palette_light;
+    out.source_palette = instance.source_palette;
     return out;
 }
 
@@ -129,62 +132,45 @@ fn vs_main(
 // gradient table (`VXL_CacheBlit @ 0x00707480` -> extended blitter).
 
 
-fn native_depth(in: VertexOutput) -> f32 {
-    let camera_row: i32 = i32(round(camera.camera_pos.y + camera.native_z_origin_y));
-    var rect_top: f32 = in.rect_top_height.x;
-    var height: i32 = max(i32(round(in.rect_top_height.y)), 1);
-    var gradient: u32 = in.z_gradient & 0xFFu;
-    var z_adjust: i32 = i32(round(in.z_adjust));
-    // Unit final composite 0x73B140: full-width upper h-16 then bottom 16,
-    // seeded independently by Standard_SHP_blitter. A shared rectangle across
-    // hull/turret/barrel makes their depth decision identical at every pixel.
-    // Retain full quads/UVs so the split introduces no extra zoom-padding edge.
-    if ((in.z_gradient & 0x400u) != 0u) {
-        rect_top = round(rect_top);
-        if (height > 16) {
-            let boundary: f32 = rect_top + f32(height - 16);
-            if (in.world_pos.y < boundary) {
-                height = height - 16;
-                gradient = 0u;
-                z_adjust = z_adjust - 5;
-            } else {
-                rect_top = boundary;
-                height = 16;
-                gradient = 2u;
-            }
-        }
-        // fx_params.w is this voxel body's tactical clip height in world
-        // pixels, supplied from the actual scissor. Zero retains the whole
-        // viewport for offscreen callers. Do not bake the sidebar/footer size
-        // into this shader or infer it from atlas storage padding.
-        let clip_height: f32 = select(
-            camera.screen_size.y / camera.zoom,
-            in.fx_params.w,
-            in.fx_params.w > 0.0,
-        );
-        let bottom: f32 = min(rect_top + f32(height), f32(camera_row) + round(clip_height));
-        rect_top = max(rect_top, f32(camera_row));
-        height = i32(bottom - rect_top);
-        if (height <= 0 || in.world_pos.y < rect_top || in.world_pos.y >= bottom) {
-            discard;
-        }
+fn native_candidate(in: VertexOutput) -> i32 {
+    // fx_params.w is this voxel body's tactical clip height in world pixels,
+    // supplied from the actual scissor. Zero retains the whole viewport for
+    // offscreen callers. Do not bake the sidebar/footer size into this
+    // shader or infer it from atlas storage padding.
+    let view_top: f32 = camera.camera_pos.y + camera.native_z_origin_y;
+    let candidate: vec2i = unit_composite_candidate(in.rect_top_height, in.world_pos.y,
+        in.z_gradient, in.z_adjust,
+        view_rows(view_top, in.fx_params.w, camera.screen_size.y / camera.zoom),
+        native_z_origin_row(view_top, camera.native_z_pan));
+    if (candidate.y == 0) {
+        discard;
     }
-    let screen_top: i32 = i32(round(rect_top)) - camera_row;
-    let row: i32 = clamp(i32(floor(in.world_pos.y - rect_top)), 0, height - 1);
-    let z: i32 = native_row_z(gradient, screen_top, height, z_adjust, row);
-    return stored_native_depth(z);
+    return candidate.x;
 }
 
-fn apply_fx(color: vec4f, _flags: u32, params: vec4f, effect_tint: vec4f) -> vec4f {
+// PackedSpriteGpu keeps this shared prefix up to apply_fx; source-palette
+// selection must stay in the prefix alongside the shared projection/Z owner.
+// The global Convert (Init_Game52BFCE; VoxelAnim749E5A) reads UNITSNO
+// directly, including indices16..31. The ordinary and packed blitters share
+// this selection so representation cannot introduce a house substitution.
+// Both tables are Rgba8Unorm: the result is the encoded colour.
+fn voxel_source_rgb(index: u32, remap_row: u32, source_palette: u32) -> vec3f {
+    if source_palette == 0u && index >= 16u && index < 32u {
+        return textureLoad(house_ramp, vec2i(i32(index - 16u), i32(remap_row)), 0).rgb;
+    }
+    return textureLoad(palette, vec2i(i32(index), i32(source_palette)), 0).rgb;
+}
+
+fn apply_fx(color: vec4f, _flags: u32, params: vec4f) -> vec4f {
     // Original location: `RA2-GAME.EXE-IDB` canon,
     // `rendering.drawStateEffects.ra2yr.json`; the same branch exists in the
     // SHP shader so representation does not affect active visual state.
-    // Match the SHP path exactly: selector opacity plus independent YR
-    // invulnerability brightness, with no inferred EMP or mirror styling.
-    // Invulnerability/temporal brightness is folded into the gamma-space
-    // light multiply by the caller (natively 0x0070E380 scales the brightness
-    // argument itself, which selects the same LightConvert row); only opacity
-    // is applied here.
+    // Match the SHP path exactly: selector opacity, with no inferred EMP or
+    // mirror styling. An effect on the object's light, such as the Iron
+    // Curtain's tint, scales the intensity its PaletteLight carries
+    // (natively GetEffectTintIntensity 0x0070E360 scales the intensity
+    // argument, which selects the LightConvert row); only opacity is applied
+    // here.
     return vec4f(color.rgb, color.a * params.x);
 }
 
@@ -195,7 +181,8 @@ fn apply_fx(color: vec4f, _flags: u32, params: vec4f, effect_tint: vec4f) -> vec
 // RA2_DEBUG_DEPTH_VIEW (camera.pad1 > 0.5): depth as grey, wrapping every
 // 128 world rows, so depth ordering can be read off a screenshot.
 fn debug_depth_color(depth: f32) -> vec4f {
-    let rows: f32 = world_row_from_native_depth(depth, camera.camera_pos.y + camera.native_z_origin_y);
+    let rows: f32 = world_row_from_native_depth(depth,
+        native_z_origin_row(camera.camera_pos.y + camera.native_z_origin_y, camera.native_z_pan));
     let g: f32 = fract(rows / 128.0);
     return vec4f(g, g, g, 1.0);
 }
@@ -205,26 +192,53 @@ struct FragOutput {
     @builtin(frag_depth) depth: f32,
 };
 
+fn voxel_byte(in: VertexOutput) -> u32 {
+    let atlas_size: vec2f = vec2f(textureDimensions(atlas));
+    let atlas_coord: vec2i = vec2i(in.atlas_uv * atlas_size);
+    return textureLoad(atlas, atlas_coord, 0).r;
+}
+
+// The Z-read pipeline. A candidate above 65535 never draws and a negative
+// one always does (signed compare; zsprite_shader.wgsl `fs_main`), here
+// tested as 0. merge_passes replays an opaque body that can reach either
+// through the signed manual compare (`voxel_needs_manual_depth`).
 @fragment
 fn fs_main(in: VertexOutput) -> FragOutput {
     // Unit73BEA4..73BF7B intersects the caller clip with the retained +3CA
     // waterline. Keep full geometry/UV/depth inputs: only fragment admission
     // changes. Discard suppresses both color and depth output (WGSL9.4.11:
     // https://www.w3.org/TR/WGSL/#discard-statement).
-    if ((in.fx_flags & 128u) != 0u && in.world_pos.y >= in.effect_tint.w) {
+    if ((in.fx_flags & 128u) != 0u && in.world_pos.y >= in.sinking_row) {
         discard;
     }
-    let atlas_size: vec2f = vec2f(textureDimensions(atlas));
-    let atlas_coord: vec2i = vec2i(in.atlas_uv * atlas_size);
-    let byte: u32 = textureLoad(atlas, atlas_coord, 0).r;
-
+    let byte = voxel_byte(in);
     // Color 0 = transparent (matches gamemd visibility-map invariant).
     if (byte == 0u) {
         discard;
     }
+    let z = native_candidate(in);
+    if (z > 65535) {
+        discard;
+    }
+    return voxel_pixel(in, byte, max(z, 0));
+}
 
+// The colour/A-only pipeline (compare Always): no Z decision to make.
+@fragment
+fn fs_unread(in: VertexOutput) -> FragOutput {
+    if ((in.fx_flags & 128u) != 0u && in.world_pos.y >= in.sinking_row) {
+        discard;
+    }
+    let byte = voxel_byte(in);
+    if (byte == 0u) {
+        discard;
+    }
+    return voxel_pixel(in, byte, native_candidate(in));
+}
+
+fn voxel_pixel(in: VertexOutput, byte: u32, z: i32) -> FragOutput {
     var out: FragOutput;
-    out.depth = native_depth(in);
+    out.depth = stored_native_depth(z);
 
     // Ground shadow stencil (FX_SHADOW = 1 << 6): every non-zero atlas byte
     // darkens the destination. The native darken blitter halves the encoded
@@ -237,22 +251,13 @@ fn fs_main(in: VertexOutput) -> FragOutput {
         return out;
     }
 
-    // RGB substitution: bytes in [16, 32) sample the per-house ramp; all
-    // others sample the theater palette directly.
-    var rgb: vec3f;
-    if (byte >= 16u && byte < 32u) {
-        let ramp_coord: vec2i = vec2i(i32(byte - 16u), i32(in.remap_row));
-        rgb = textureLoad(house_ramp, ramp_coord, 0).rgb;
-    } else {
-        let palette_coord: vec2i = vec2i(i32(byte), 0);
-        rgb = textureLoad(palette, palette_coord, 0).rgb;
-    }
+    let rgb = voxel_source_rgb(byte, in.remap_row, in.source_palette);
 
     // The waterline changes geometry admission only. It must not opt an
     // otherwise opaque body out of the native packed-palette conversion.
     let color_flags = in.fx_flags & ~128u;
-    var color: vec4f = vec4f(resolve_palette(rgb, in.tint, in.effect_tint.rgb, opaque_palette(in.palette_light, in.alpha, color_flags), byte), in.alpha);
-    color = apply_fx(color, in.fx_flags, in.fx_params, in.effect_tint);
+    var color: vec4f = vec4f(resolve_palette(rgb, in.tint, opaque_palette(in.palette_light, in.alpha, color_flags), byte, tactical_a_at(in.clip_position.xy)), in.alpha);
+    color = apply_fx(color, in.fx_flags, in.fx_params);
     out.color = color;
     if (camera.pad1 > 0.5) {
         out.color = debug_depth_color(out.depth);

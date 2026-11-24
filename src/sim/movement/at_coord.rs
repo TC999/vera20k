@@ -1,6 +1,6 @@
 //! Original locomotor Is_At_Coord projection, shared by live and snapshot callers.
 //!
-//! Drive4B4920 / Ship6A3F50 / Walk75CA80 / Hover517210. The caller supplies the
+//! Drive4B4920 / Ship6A3F50 / Walk75CA80 / Mech5B1AA0 / Hover517210. The caller supplies the
 //! active instance's retained state in raw world leptons; this query never
 //! reconstructs a committed head from a path or newly changed terrain.
 //! Native comparisons: tools/spatial_oracle/locomotor_at_coord.{py,json}.
@@ -45,26 +45,24 @@ impl AtCoordQuery {
     /// and its retained head are reread; a path is not a substitute for either.
     pub(crate) fn from_entity(entity: &crate::sim::game_entity::GameEntity) -> Option<Self> {
         let locomotor = entity.locomotor.as_ref()?;
-        let track = match locomotor.kind {
-            LocomotorKind::Drive => entity.drive_locomotion.as_ref().map(|s| s.track),
-            LocomotorKind::Ship => entity.ship_locomotion.as_ref().map(|s| s.track),
-            _ => None,
-        }
-        .unwrap_or_default();
+        let track = super::track_process::TrackFamily::from_kind(locomotor.active_kind())
+            .and_then(|family| locomotor.track_progress(family))
+            .unwrap_or_default();
         let head = super::foot_coordinate::stored_head(entity);
         let current = super::foot_coordinate::current_coordinate(entity);
         Self::from_state(
-            locomotor.kind,
+            locomotor.active_kind(),
             current,
             head,
             AtCoordTrack {
-                turn_index: track.turn_index,
-                cursor: track.cursor,
-                reversed: track.reversed,
+                turn_index: track.turn_index(),
+                cursor: track.cursor(),
+                reversed: track.reversed(),
             },
         )
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn head_z(self) -> i32 {
         self.head.z
     }
@@ -76,7 +74,12 @@ impl AtCoordQuery {
         track: AtCoordTrack,
     ) -> Option<Self> {
         let track_family = matches!(kind, LocomotorKind::Drive | LocomotorKind::Ship);
-        if !track_family && !matches!(kind, LocomotorKind::Walk | LocomotorKind::Hover) {
+        if !track_family
+            && !matches!(
+                kind,
+                LocomotorKind::Walk | LocomotorKind::Mech | LocomotorKind::Hover
+            )
+        {
             // Active Fly/Jumpjet/Rocket/Teleport share the false leaf4B6630.
             // Dormant TS classes are deliberately not implemented here.
             return None;
@@ -124,8 +127,8 @@ impl AtCoordQuery {
             || matches_coord(self.head, probe)
     }
 
-    /// The bridge peer snapshot retains these same native signed cell words;
-    /// its separate live-height test supplies the Z comparison.
+    /// The native signed cell words of the handoff and the head.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn cells(self) -> (Option<(i16, i16)>, (i16, i16)) {
         let cell = |point: DriveCoord| ((point.x / 256) as i16, (point.y / 256) as i16);
         (self.handoff.map(cell), cell(self.head))
@@ -138,6 +141,6 @@ fn matches_coord(point: DriveCoord, probe: DriveCoord) -> bool {
         && point.z.wrapping_sub(probe.z).wrapping_abs() <= GROUND_LEVEL_HEIGHT_LEPTONS
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 #[path = "at_coord_tests.rs"]
 mod tests;

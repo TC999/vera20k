@@ -18,12 +18,12 @@
 
 use std::path::PathBuf;
 
-use vera20k::headless_scenario::{self, SIM_TICK_MS};
-use vera20k::map::entities::EntityCategory;
-use vera20k::sim::components::Health;
-use vera20k::sim::house_state::HouseState;
-use vera20k::sim::parity_digest::ParityDigestSink;
-use vera20k::sim::world::Simulation;
+use vera20k_core::headless_scenario::{self, SIM_TICK_MS};
+use vera20k_core::map::entities::EntityCategory;
+use vera20k_core::sim::combat::Health;
+use vera20k_core::sim::house_state::HouseState;
+use vera20k_core::sim::parity_digest::ParityDigestSink;
+use vera20k_core::sim::world::Simulation;
 
 const DEFAULT_TICKS: u64 = 600;
 /// Arbitrary but fixed, so two synthetic runs are comparable to each other.
@@ -87,16 +87,16 @@ fn build_synthetic_simulation(seed: u32) -> Simulation {
     let mut sim = Simulation::with_seed(u64::from(seed));
 
     for (index, (owner, side)) in [("Americans", 0u8), ("Russians", 1u8)].iter().enumerate() {
-        let owner_id = sim.interner.intern(owner);
+        let owner_id = sim.intern(owner);
         let mut house = HouseState::new(owner_id, *side, None, index == 0, 10_000, 10);
         // The structures below are raw-inserted without lifecycle registration, so
         // the defeat scan would read both houses as owning nothing and resolve the
         // match on tick 1, freezing the committed-tick counter. Passive houses are
         // exempt from defeat evaluation, keeping every tick committable.
-        house.multiplay_passive = true;
-        sim.houses.insert(owner_id, house);
+        house.make_multiplay_passive();
+        sim.register_house(house);
 
-        let type_ref = sim.interner.intern("GACNST");
+        let type_ref = sim.intern("GACNST");
         let base_x = 10 + (index as u16) * 20;
         for slot in 0..3u16 {
             sim.insert_synthetic_techno_for_diagnostics(
@@ -105,7 +105,7 @@ fn build_synthetic_simulation(seed: u32) -> Simulation {
                 0,
                 0,
                 owner_id,
-                Health { current: 1000 },
+                Health::new(1000),
                 type_ref,
                 EntityCategory::Structure,
                 0,
@@ -138,8 +138,8 @@ fn main() -> Result<(), String> {
             let mut scenario = headless_scenario::load(ra2_dir, map, args.seed)?;
             println!(
                 "loaded {map} ({}x{}, theater {}) seed 0x{:08X}",
-                scenario.sim().session.map_width,
-                scenario.sim().session.map_height,
+                scenario.sim().session().map_width(),
+                scenario.sim().session().map_height(),
                 scenario.map.header.theater,
                 args.seed
             );
@@ -155,9 +155,9 @@ fn main() -> Result<(), String> {
             // runtime transaction as everything else. Empty resources stand in
             // for the "no rules loaded" contract the synthetic scenario always
             // had; synthetic digests are self-comparable, not parity evidence.
-            let mut runtime = vera20k::sim::runtime::SimRuntime {
+            let mut runtime = vera20k_core::sim::runtime::SimRuntime {
                 simulation: build_synthetic_simulation(args.seed),
-                resources: vera20k::sim::runtime::SimResources::empty(),
+                resources: std::sync::Arc::new(vera20k_core::sim::runtime::SimResources::empty()),
             };
             for _ in 0..args.ticks {
                 runtime

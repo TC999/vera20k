@@ -3,10 +3,10 @@
 //! Retail computes the acquisition radius *inside* the threat scan, from a
 //! small mask the calling mission supplies — no caller passes a range. This
 //! module is that computation plus the mask selection, kept as a mechanism
-//! rather than folded into the candidate loop because the two missions that
-//! reach the scanner produce genuinely different filters.
+//! rather than folded into the candidate loop because callers select
+//! different filters.
 //!
-//! ## The two filters
+//! ## The radius filters
 //!
 //! - **Guard** (and the other plain passive-acquire missions) asks for the
 //!   object's own `GuardRange=`. When the type has none, the computed radius is
@@ -16,9 +16,11 @@
 //!   [`ScanRange::CanFireAt`].
 //! - **Area Guard** asks for `GuardRange=` **or** the wider of the type's two
 //!   weapon ranges, **doubled**, clamped to `[0,` [`AREA_GUARD_MAX_SCAN_CELLS`]`]`.
-//!   A non-zero radius is a hard Euclidean cutoff — the can-fire-at query is
-//!   not consulted at all. This is why a unit parked on Area Guard reaches out
-//!   roughly twice as far as the same unit sitting on plain Guard. The radius
+//!   A non-zero radius is a hard distance cutoff between the two objects'
+//!   GetCoords (`greatest_threat`'s `candidate_beyond_cutoff`) — the
+//!   can-fire-at query is not consulted at all. This is why a unit parked on
+//!   Area Guard reaches out roughly twice as far as the same unit sitting on
+//!   plain Guard. The radius
 //!   is zero only when neither slot reaches past zero: an open-topped
 //!   transport carrying a Spy (`MakeupKit` is `Range=-2`) caps both at -2
 //!   cells, and that zero takes the Guard zero case.
@@ -43,13 +45,15 @@
 //! The threat scan takes a bitmask, and the radius formula is selected from it:
 //! **bit0 set → the narrow formula; bit0 clear and bit1 set → the doubled one**
 //! (with a Patrol-only third variant). Nobody chooses that mask at the scan —
-//! the *caller* supplies it as a literal, and there are exactly two callers:
+//! the *caller* supplies it as a literal. The relevant ring callers include:
 //!
 //! - The common Techno AI body, which is the ONLY route to the scan for
 //!   missions {Move, Harvest, Guard} — those three ids and no others — pushes
 //!   the literal **1** together with the object's own coordinates.
 //! - `FootClass::Mission_AreaGuard`, which pushes the literal **2** together
 //!   with the guard post's coordinates.
+//! - `AircraftClass::Mission_Patrol417300`, which pushes **2** together with
+//!   a copy of its live Location (`0x00417461..0x00417481`).
 //!
 //! So Guard's mask cannot carry bit1: it is a hardcoded `1` in the caller.
 //! Guard therefore takes the narrow formula, which for a type with no
@@ -64,7 +68,17 @@
 //! freshly-moved latch below, whose only bit1 callers are Area Guard and
 //! Patrol. The same override clears the latch when a scan comes back empty.
 //!
-//! ## What is deliberately NOT modelled
+//! ## A healer on Guard
+//!
+//! When the scanner's `GetWeaponDamageValue(-1)` (`0x006F3970`) is negative
+//! *and* its mission is exactly Guard, retail replaces either radius with a
+//! hard 0x200 leptons (`0x006F9024..0x006F903E`), so the cutoff, not the
+//! healing weapon's InRange, decides, and the two-cell walk bound covers only
+//! rings 0 and 1. Retail's only healer is an IFV carrying an Engineer
+//! (`RepairBullet`, `Damage=-50`, `Range=1.8`): on Guard it repairs only what
+//! stands in or next to its own cell.
+//!
+//! ## Foot mask coercion and Patrol
 //!
 //! Foot's stopped-cannot-fire latch688 is private GameEntity state. Drive,
 //! Ship and Team write it through that owner; the concrete scanner coerces
@@ -72,40 +86,31 @@
 //! Foot result. The actual scan mask selects the range below. Hover's native
 //! Process/arrival continuation5164D0 still needs its separate owner.
 //!
-//! **The unarmed-Guard override.** When the scanning object has no usable
-//! weapon at all *and* its mission is exactly Guard, retail forces the radius
-//! to a flat 2 cells instead of computing one. Gated passive acquisition
-//! requires an armed type, but direct Greatest_Threat callers bypass that
-//! gate. The unarmed radius branch remains required outside the ordinary
-//! armed MTNK/E1 controls; missing candidate weapons still reject a target.
+//! A mask2 scanner currently on **Patrol** uses the same doubled-and-capped
+//! value as Area Guard with a 7-cell floor (`0x006F8FF8..0x006F900A`).
+//! The current mission selects that variant after the Foot mask coercion.
 //!
-//! Retail has a third radius formula, reached only when the scanning object is
-//! on **Patrol**: the same doubled-and-capped value as Area Guard but with a
-//! 7-cell *floor* underneath it. The shared scalar owner reproduces mode2;
-//! the Patrol caller and its scan topology still require their own audit.
-//!
-//! Retail walks outward cell by cell and bounds that walk at
-//! `wider weapon range + 1 + AirRangeBonus` cells. That number is a **search**
-//! bound, not an acceptance radius: the walk is a Chebyshev square strictly
-//! wider than the reach acceptance would allow, and it exists only on the
-//! radius-zero branch, so it never clips a candidate acceptance would have
-//! taken. Reading that bound as the acquisition radius is a recurring wrong
-//! turn — it is the reason this file exists rather than a widened per-candidate
-//! range. [`super::greatest_threat`] owns the walk and applies that bound;
-//! this file owns the acceptance radius the walk carries into each candidate.
+//! Retail's radius-zero ring walk uses the current weapon's range for
+//! a non-Gattling turreted type, GuardRange for an underwater, organic,
+//! self-healing type, or the wider range of slots 0/1 otherwise. It adds one
+//! cell and AirRangeBonus. That number is a **search** bound, not an acceptance
+//! radius: the candidate still has to pass its selected weapon's InRange.
+//! [`super::greatest_threat`] owns the walk and applies that bound; this file
+//! owns the acceptance radius the walk carries into each candidate.
 //!
 //! ## Dependency rules
 //! - Part of sim/ — depends on rules/ (RuleSet, ObjectType) and sim/ only.
-//! - sim/ NEVER depends on render/, ui/, sidebar/, audio/, net/.
+//! - sim/ NEVER depends on render/, ui/, audio/, net/.
 
 use crate::rules::object_type::ObjectType;
-use crate::sim::components::OrderIntent;
 use crate::sim::game_entity::GameEntity;
 use crate::sim::mission::MissionType;
-use crate::util::fixed_math::SimFixed;
 
 /// Retail doubles the Area Guard radius before clamping it.
 const AREA_GUARD_RANGE_MULTIPLIER: i32 = 2;
+
+/// A healer's radius on Guard, in leptons (`MOV EDI,0x200 @ 0x006F9039`).
+const HEALER_GUARD_RADIUS: i32 = 0x200;
 
 /// Ceiling on the doubled Area Guard radius, in cells. Retail clamps the
 /// lepton value to 0x1000; at 256 leptons per cell that is 16 cells.
@@ -139,7 +144,8 @@ pub enum ScanMission {
     /// Guard, Move, Harvest — the plain passive-acquire missions. All of them
     /// take the same mask, so they share one variant.
     Guard,
-    /// Area Guard — "hold this spot and cover it".
+    /// Mask2, shared by Area Guard and Aircraft Patrol. The scanner's current
+    /// mission independently selects Patrol's seven-cell radius floor.
     AreaGuard,
     /// Hunt — mask **0**, which is not a third radius formula but the absence
     /// of one.
@@ -179,21 +185,29 @@ pub enum ScanMission {
     /// callsite passes `-1`, and a non-`-1` arg6 rejects any candidate whose
     /// cell is in a different component under the attacker's own
     /// `MovementZone=` (`0x006F7E7E`-`0x006F7E9C`). A hunter reaches the far
-    /// side of the map but not the far side of a river.
+    /// side of the map but not the far side of a river, unless Phobos plays
+    /// and its type's `TargetZoneScanType` lets it
+    /// (`combat::greatest_threat::zone_admits`).
     ///
     /// **Mask 0 is a scan TOPOLOGY, not a radius.** The jump at `0x006F8FE2`
     /// lands past the airborne pre-pass *and* past the expanding-ring cell walk
-    /// (`0x006F9169` and `0x006F94D0` both sit below `0x006F9B6E`), so a
+    /// (`0x006F9169` and `0x006F9AE2` both sit below `0x006F9B6E`), so a
     /// hunting object never walks a single cell ring — it walks the global
     /// object array. [`super::greatest_threat`] owns that branch; this variant
     /// only names which mask the caller pushed.
     Hunt,
-    /// Team script action 0, Attack quarry (`TeamClass @ 0x006ED090`): the
-    /// quarry's mask (`0x00645BB0`) and the TeamType's
-    /// `OnlyTargetHouseEnemy=` (`+0xF7`), pushed as `Greatest_Threat`'s arg3
-    /// (`0x006ED14C..0x006ED15E`). No quarry mask carries bit 0 or 1, so it
-    /// takes Hunt's flat walk, measured from the leader's own Coords.
-    TeamQuarry {
+    /// A quarry's mask (`Quarry_To_Threat @ 0x00645BB0`) pushed directly:
+    /// - team script actions 0, Attack quarry (`TeamClass @ 0x006ED090`), and
+    ///   57, the Chronosphere's (`0x006F0130`), with the TeamType's
+    ///   `OnlyTargetHouseEnemy=` (`+0xF7`) as `Greatest_Threat`'s arg3
+    ///   (`0x006ED14C..0x006ED15E`, `0x006F0244..0x006F0253`);
+    /// - `AircraftClass::Mission_Hunt`'s multiplayer pass, the harvester mask
+    ///   `0x40` (any type with `Storage=`) with arg3 0
+    ///   (`0x00414AFD..0x00414B24`).
+    ///
+    /// No quarry mask carries bit 0 or 1, so it takes Hunt's flat walk,
+    /// measured from the scanner's own Coords.
+    Quarry {
         mask: u32,
         only_target_house_enemy: bool,
     },
@@ -201,22 +215,22 @@ pub enum ScanMission {
 
 impl ScanMission {
     /// The literal the caller pushes as `Greatest_Threat`'s arg1: Guard `1`
-    /// (the passive block), Area Guard `2`, Hunt `0` (`0x004D5373`), a team
+    /// (the passive block), Area Guard `2`, Hunt `0` (`0x004D5373`), a
     /// quarry its own mask.
     pub(crate) const fn literal_mask(self) -> u32 {
         match self {
             Self::Guard => 1,
             Self::AreaGuard => 2,
             Self::Hunt => 0,
-            Self::TeamQuarry { mask, .. } => mask,
+            Self::Quarry { mask, .. } => mask,
         }
     }
 
-    /// `Greatest_Threat`'s arg3, which only team action 0 sets.
+    /// `Greatest_Threat`'s arg3, which only team actions 0 and 57 set.
     pub(crate) const fn only_target_house_enemy(self) -> bool {
         matches!(
             self,
-            Self::TeamQuarry {
+            Self::Quarry {
                 only_target_house_enemy: true,
                 ..
             }
@@ -231,8 +245,10 @@ pub(crate) enum ScanRange {
     /// the attacker can actually fire at that candidate, which is a per-
     /// candidate question because weapon choice depends on the target.
     CanFireAt,
-    /// A hard Euclidean cutoff, in cells. The can-fire-at query is skipped.
-    Hard(SimFixed),
+    /// A non-zero `Threat_Range`, in leptons: `Evaluate_Candidate` refuses a
+    /// candidate farther than a positive one and skips the can-fire-at query
+    /// for any.
+    Hard(i32),
     /// Native's literal `-1` range argument (`PUSH -0x1 @ 0x006F9D70`), which
     /// `Evaluate_Candidate` treats as neither `> 0` (no distance reject) nor
     /// `== 0` (no Sight / can-fire-at fallback). Weapon legality still decides;
@@ -258,17 +274,11 @@ pub(crate) enum ScanRange {
 /// entity's mission field would make the mask a property of the mission, which
 /// it is not.
 ///
-/// Area Guard has two representations here and both mean the same retail
-/// mission: the committed mission substrate value, and the `OrderIntent::Guard`
-/// anchor a player "guard this spot" order installs. `OrderIntent` still owns
-/// the anchor coordinates because the mission substrate has no goal field yet,
-/// so an entity on a player guard order carries the intent and *not* the
-/// mission id — reading only the substrate would miss every player-issued
-/// guard.
+/// Player-issued and map-created Area Guard share the committed mission and
+/// its ArchiveTarget post. A queued order changes this choice only when the
+/// mission owner promotes it.
 pub(crate) fn scan_mission_for(entity: &GameEntity) -> ScanMission {
-    let committed_area_guard = entity.mission.current().known() == Some(MissionType::AreaGuard);
-    let ordered_area_guard = matches!(entity.order_intent, Some(OrderIntent::Guard { .. }));
-    if committed_area_guard || ordered_area_guard {
+    if entity.mission.current().known() == Some(MissionType::AreaGuard) {
         ScanMission::AreaGuard
     } else {
         ScanMission::Guard
@@ -279,7 +289,19 @@ pub(crate) fn scan_mission_for(entity: &GameEntity) -> ScanMission {
 /// `GetWeaponRange(0/1)` results from [`super::combat_weapon::weapon_range`].
 /// The native scalar owns only mode selection, doubling and clamps; it does
 /// not duplicate GetWeapon, veterancy or the cargo minimum reader.
-pub(crate) fn scan_range(obj: &ObjectType, mask: u32, weapon_ranges: [i32; 2]) -> ScanRange {
+/// `healer` is the scanner's `GetWeaponDamageValue(-1) < 0`. On mission
+/// Guard (`+0xAC == 5`) it replaces the mask's radius with
+/// [`HEALER_GUARD_RADIUS`] (`0x006F9024..0x006F903E`).
+pub(crate) fn scan_range(
+    obj: &ObjectType,
+    mask: u32,
+    weapon_ranges: [i32; 2],
+    healer: bool,
+    current_mission: Option<MissionType>,
+) -> ScanRange {
+    if healer && current_mission == Some(MissionType::Guard) && mask & 3 != 0 {
+        return ScanRange::Hard(HEALER_GUARD_RADIUS);
+    }
     match mask & 3 {
         1 | 3 => range_from_leptons(threat_range_leptons(obj, 0, weapon_ranges)),
         // Mask 0 never reaches the radius block at all: `TEST AL,0x3 ; JZ
@@ -291,7 +313,15 @@ pub(crate) fn scan_range(obj: &ObjectType, mask: u32, weapon_ranges: [i32; 2]) -
         // literal `PUSH -0x1` (`0x006F9D70`) so that a caller which does ask
         // gets the same answer the flat walk hardcodes.
         0 => ScanRange::NoCutoff,
-        2 => range_from_leptons(threat_range_leptons(obj, 1, weapon_ranges)),
+        2 => range_from_leptons(threat_range_leptons(
+            obj,
+            if current_mission == Some(MissionType::Patrol) {
+                2
+            } else {
+                1
+            },
+            weapon_ranges,
+        )),
         _ => unreachable!("two mask bits"),
     }
 }
@@ -300,7 +330,7 @@ fn range_from_leptons(leptons: i32) -> ScanRange {
     if leptons == 0 {
         ScanRange::CanFireAt
     } else {
-        ScanRange::Hard(SimFixed::from_bits(leptons.wrapping_mul(256)))
+        ScanRange::Hard(leptons)
     }
 }
 
@@ -337,15 +367,7 @@ pub(crate) fn threat_range_leptons(obj: &ObjectType, mode: i32, weapon_ranges: [
     )
 }
 
-/// Greatest_Threat6F90DE..6F9110's wider live weapon range in cells.
-/// Both raw signed inputs come from the sole GetWeaponRange owner.
-pub(crate) fn max_weapon_range(weapon_ranges: [i32; 2]) -> SimFixed {
-    let leptons = weapon_ranges[0].max(weapon_ranges[1]);
-    // One lepton is 1/256 cell: exact in I16F16 for map-space ranges.
-    SimFixed::from_bits(leptons.saturating_mul(256))
-}
-
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_d_z))]
 mod tests {
     use super::*;
     use crate::rules::ini_parser::IniFile;
@@ -375,7 +397,7 @@ GuardRange=9\n\n\
 
     fn type_weapon_ranges(rules: &RuleSet, obj: &ObjectType, veterancy: u16) -> [i32; 2] {
         let mut actor = crate::sim::game_entity::GameEntity::test_default(1, &obj.id, "Test", 0, 0);
-        actor.set_veterancy_rank(veterancy);
+        actor.veterancy.set_rank_for_test(veterancy);
         let entities = crate::sim::entity_store::EntityStore::new();
         let interner = crate::sim::intern::test_interner();
         std::array::from_fn(|index| {
@@ -399,7 +421,9 @@ GuardRange=9\n\n\
             scan_range(
                 obj(&rules, "NOGUARD"),
                 ScanMission::Guard.literal_mask(),
-                type_weapon_ranges(&rules, obj(&rules, "NOGUARD"), 0)
+                type_weapon_ranges(&rules, obj(&rules, "NOGUARD"), 0),
+                false,
+                Some(MissionType::Guard),
             ),
             ScanRange::CanFireAt
         );
@@ -419,11 +443,15 @@ GuardRange=9\n\n\
                 obj(&rules, type_id),
                 ScanMission::Guard.literal_mask(),
                 type_weapon_ranges(&rules, obj(&rules, type_id), 0),
+                false,
+                Some(MissionType::Guard),
             );
             let area = scan_range(
                 obj(&rules, type_id),
                 ScanMission::AreaGuard.literal_mask(),
                 type_weapon_ranges(&rules, obj(&rules, type_id), 0),
+                false,
+                Some(MissionType::AreaGuard),
             );
             assert_ne!(
                 guard, area,
@@ -440,40 +468,11 @@ GuardRange=9\n\n\
             scan_range(
                 obj(&rules, "WITHGUARD"),
                 ScanMission::Guard.literal_mask(),
-                type_weapon_ranges(&rules, obj(&rules, "WITHGUARD"), 0)
+                type_weapon_ranges(&rules, obj(&rules, "WITHGUARD"), 0),
+                false,
+                Some(MissionType::Guard),
             ),
-            ScanRange::Hard(SimFixed::from_num(9))
-        );
-    }
-
-    #[test]
-    fn guard_with_guard_range_is_a_hard_undoubled_cutoff() {
-        // GuardRange=9 on plain Guard is used as-is. The doubling belongs to
-        // the Area Guard branch only — a V3 on Guard scans 9 cells, not 18.
-        let rules = test_rules();
-        assert_eq!(
-            scan_range(
-                obj(&rules, "WITHGUARD"),
-                ScanMission::Guard.literal_mask(),
-                type_weapon_ranges(&rules, obj(&rules, "WITHGUARD"), 0)
-            ),
-            ScanRange::Hard(SimFixed::from_num(9))
-        );
-    }
-
-    #[test]
-    fn area_guard_without_guard_range_doubles_the_wider_weapon() {
-        // max(Primary 4, Secondary 6) = 6, doubled = 12. Note it is the wider
-        // of the two SLOTS, not the weapon that would be picked against any
-        // particular candidate.
-        let rules = test_rules();
-        assert_eq!(
-            scan_range(
-                obj(&rules, "NOGUARD"),
-                ScanMission::AreaGuard.literal_mask(),
-                type_weapon_ranges(&rules, obj(&rules, "NOGUARD"), 0)
-            ),
-            ScanRange::Hard(SimFixed::from_num(12))
+            ScanRange::Hard(9 * 256)
         );
     }
 
@@ -487,29 +486,14 @@ GuardRange=9\n\n\
             obj(&rules, "WITHGUARD"),
             ScanMission::AreaGuard.literal_mask(),
             type_weapon_ranges(&rules, obj(&rules, "WITHGUARD"), 0),
+            false,
+            Some(MissionType::AreaGuard),
         );
-        let ScanRange::Hard(cells) = clamped else {
+        let ScanRange::Hard(leptons) = clamped else {
             panic!("Area Guard always produces a hard cutoff");
         };
-        assert!(
-            cells > SimFixed::from_num(12),
-            "GuardRange must win: {cells}"
-        );
-        assert_eq!(clamped, ScanRange::Hard(SimFixed::from_num(16)));
-    }
-
-    #[test]
-    fn area_guard_uses_the_only_slot_when_the_type_has_one_weapon() {
-        // Primary 4 only -> 8. A missing Secondary must not drag the max to 0.
-        let rules = test_rules();
-        assert_eq!(
-            scan_range(
-                obj(&rules, "ONLYPRIMARY"),
-                ScanMission::AreaGuard.literal_mask(),
-                type_weapon_ranges(&rules, obj(&rules, "ONLYPRIMARY"), 0)
-            ),
-            ScanRange::Hard(SimFixed::from_num(8))
-        );
+        assert!(leptons > 12 * 256, "GuardRange must win: {leptons}");
+        assert_eq!(clamped, ScanRange::Hard(16 * 256));
     }
 
     /// `tools/spatial_oracle/threat_range_cargo.json`: original
@@ -519,13 +503,13 @@ GuardRange=9\n\n\
     /// the scanner adapter separately covers Hunt, Guard and Area Guard.
     #[test]
     fn original_threat_range_and_cargo_rows() {
-        use crate::sim::combat::combat_weapon::{WeaponOverride, weapon_range};
+        use crate::sim::combat::combat_weapon::weapon_range;
         use crate::sim::entity_store::EntityStore;
         use crate::sim::game_entity::GameEntity;
         use crate::sim::passenger::{PassengerCargo, PassengerRole};
 
-        let payload: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../tools/spatial_oracle/threat_range_cargo.json"
+        let payload: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/threat_range_cargo.json",
         ))
         .unwrap();
         assert_eq!(payload["modes"], serde_json::json!([-1, 0, 1, 2]));
@@ -619,26 +603,30 @@ GuardRange=9\n\n\
             .unwrap_or_else(|error| panic!("{name}: {error:?}"));
 
             let mut entities = EntityStore::new();
-            let mut cargo = PassengerCargo::new(5, 100);
+            let mut cargo = PassengerCargo::new(5, 100.0);
             for (index, rider) in riders.iter().enumerate().rev() {
                 let id = 10 + index as u64;
                 let mut passenger =
                     GameEntity::test_default(id, &format!("P{index}"), "Test", 0, 0);
-                passenger.set_veterancy_rank(veterancy(lookup(rider, rider_defaults, "veterancy")));
+                passenger.veterancy.set_rank_for_test(veterancy(lookup(
+                    rider,
+                    rider_defaults,
+                    "veterancy",
+                )));
                 let current = lookup(rider, rider_defaults, "current_weapon")
                     .as_u64()
                     .unwrap();
-                passenger.weapon_override = Some(WeaponOverride::IfvSlot(current as u32));
-                passenger.passenger_role = PassengerRole::Inside {
-                    transport_id: 1,
-                    open_topped,
-                };
+                passenger.set_gunner_selection_for_test(current as i32, -1);
+                passenger
+                    .set_passenger_role_for_test(PassengerRole::inside_for_test(1, open_topped));
                 entities.insert(passenger);
-                assert!(cargo.board(id, 1));
+                cargo.board_forced_chain(&[(id, 1.0)]);
             }
             let mut transport = GameEntity::test_default(1, "TRN", "Test", 0, 0);
-            transport.set_veterancy_rank(veterancy(lookup(input, defaults, "veterancy")));
-            transport.passenger_role = PassengerRole::Transport { cargo };
+            transport
+                .veterancy
+                .set_rank_for_test(veterancy(lookup(input, defaults, "veterancy")));
+            transport.set_passenger_role_for_test(PassengerRole::transport(cargo));
             let interner = crate::sim::intern::test_interner();
             let obj = rules.object("TRN").unwrap();
 
@@ -649,7 +637,7 @@ GuardRange=9\n\n\
             let expected = |leptons: i64| match leptons {
                 -1 => ScanRange::NoCutoff,
                 0 => ScanRange::CanFireAt,
-                leptons => ScanRange::Hard(SimFixed::from_bits(leptons as i32 * 256)),
+                leptons => ScanRange::Hard(leptons as i32),
             };
             let native = row["threat_range"].as_array().unwrap();
             for (index, mode) in [-1, 0, 1, 2].into_iter().enumerate() {
@@ -665,11 +653,21 @@ GuardRange=9\n\n\
                 (2, ScanMission::AreaGuard),
             ] {
                 assert_eq!(
-                    scan_range(obj, mission.literal_mask(), ranges),
+                    scan_range(obj, mission.literal_mask(), ranges, false, None),
                     expected(native[mode].as_i64().unwrap()),
                     "{name}: {mission:?}"
                 );
             }
+            assert_eq!(
+                scan_range(obj, 2, ranges, false, Some(MissionType::Patrol)),
+                expected(native[3].as_i64().unwrap()),
+                "{name}: Patrol selects native mode2",
+            );
+            assert_eq!(
+                scan_range(obj, 1, ranges, false, Some(MissionType::Patrol)),
+                expected(native[1].as_i64().unwrap()),
+                "{name}: Foot688-coerced Patrol still selects mode0",
+            );
         }
     }
 }

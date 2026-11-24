@@ -1,13 +1,10 @@
 use super::*;
 use crate::assets::asset_manager::MediaArchiveMode;
-use crate::rules::{ini_parser::IniFile, retail_ini_fixture::retail_ini};
+use crate::rules::{ini_parser::IniFile, retail_ini_fixture::retail_unlayered_rules_with_art};
 use serde_json::Value;
 
-fn native() -> Value {
-    serde_json::from_str(include_str!(
-        "../../tools/projectile_oracle/bridge_render_inputs.json"
-    ))
-    .unwrap()
+fn native() -> &'static Value {
+    crate::test_fixture::json("tools/projectile_oracle/bridge_render_inputs.json")
 }
 
 fn rules(rules: &str, art: &str) -> RuleSet {
@@ -25,16 +22,74 @@ fn simple_rules(art: &str) -> RuleSet {
     )
 }
 
+/// An Ares mod gives `[SeitaadMissileP] Image=NANOBALLSM` an AnimType with
+/// `CustomPalette=`. Hook 0x468379 gives the bullet that palette in every
+/// bullet context, but only when its Image is an AnimType (Find 1000D3E0);
+/// hook 0x4232CE gives an anim its own only when it has no scheme of its own
+/// and no AltPalette (0x4232AB, 0x4232D8). The name opens with its first
+/// `~~~` as the theater extension and no `.pal` added
+/// (CustomPalette::LoadFromINI 10076160).
+#[test]
+fn ares_custom_palette_reaches_bullets_and_plain_anims_only() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let rules = rules(
+        "[Animations]\n0=NANOBALLSM\n1=ALTANIM\n\
+         [VehicleTypes]\n0=SEITAAD\n\
+         [SEITAAD]\nPrimary=SeitaadMissile\nSecondary=LooseMissile\n\
+         [SeitaadMissile]\nProjectile=SeitaadMissileP\n\
+         [SeitaadMissileP]\nImage=NANOBALLSM\n\
+         [LooseMissile]\nProjectile=LooseP\n[LooseP]\nImage=LOOSE\n",
+        "[NANOBALLSM]\nCustomPalette=axes~~~.pal\n\
+         [ALTANIM]\nCustomPalette=alt~~~~~~\nAltPalette=yes\n\
+         [LOOSE]\nCustomPalette=axes~~~.pal\n",
+    );
+    let key = |palette_context, type_id: &str| ShpSpriteKey {
+        palette_context,
+        type_id: type_id.into(),
+        facing: 0,
+        frame: 0,
+        house_color: crate::rules::house_colors::NO_REMAP,
+    };
+    let bullets = [
+        ShpPaletteContext::BulletDefault,
+        ShpPaletteContext::BulletAnim,
+        ShpPaletteContext::BulletFirer,
+    ]
+    .map(|context| key(context, "SeitaadMissileP"));
+    let anim = key(ShpPaletteContext::GlobalAnim, "NANOBALLSM");
+    let schemed = key(ShpPaletteContext::AnimScheme, "NANOBALLSM");
+    let alt = key(ShpPaletteContext::GlobalAnim, "ALTANIM");
+    let loose = key(ShpPaletteContext::BulletDefault, "LooseP");
+    let mut ares = AresCustomPalettes::default();
+    let mut opened = Vec::new();
+    for key in bullets.iter().chain([&anim, &schemed, &alt, &loose]) {
+        ares.register(key, Some(&rules), Some(rules.art()), "sno", &mut |file| {
+            opened.push(file.to_owned());
+            true
+        });
+    }
+    assert_eq!(opened, ["axessno.pal", "axessno.pal", "altsno~~~"]);
+    let empty = HashSet::new();
+    let choose = |key| sprite_palette_for_key(key, Some(rules.art()), &empty, &empty, None, &ares);
+    for key in &bullets {
+        assert_eq!(
+            choose(key),
+            SpritePaletteChoice::AresCustom,
+            "{:?}",
+            key.palette_context
+        );
+    }
+    assert_eq!(choose(&anim), SpritePaletteChoice::AresCustom);
+    assert_eq!(choose(&schemed), SpritePaletteChoice::Unit);
+    assert_eq!(choose(&alt), SpritePaletteChoice::Unit);
+    assert_eq!(choose(&loose), SpritePaletteChoice::Bullet);
+}
+
 #[test]
 fn retail_projectile_reader_matches_original_selected_cannon_inputs() {
-    let Some(ini) = retail_ini("rulesmd.ini") else {
+    let Some(rules) = retail_unlayered_rules_with_art() else {
         return;
     };
-    let Some(art_ini) = retail_ini("artmd.ini") else {
-        return;
-    };
-    let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art_ini).unwrap();
-    rules.install_art_data(ArtRegistry::from_ini(&art_ini));
     let corpus = native();
     let expected = &corpus["layers"][0]["state"];
     let projectile = rules.projectile("Cannon").unwrap();
@@ -62,7 +117,7 @@ fn retail_projectile_reader_matches_original_selected_cannon_inputs() {
     }
     let selected = &corpus["ordinary_selection"]["rows"][0];
     assert_eq!(
-        rules.object("MTNK").unwrap().primary.as_deref(),
+        rules.object("MTNK").unwrap().primary(),
         selected["primary"].as_str()
     );
     let weapon = rules.weapon("105mm").unwrap();
@@ -105,7 +160,14 @@ fn bullet_palette_context_ignores_animation_aliases_and_alt_palette() {
         projectile.firers_palette = firer;
         let key = projectile_key("Cannon", &projectile, 0, HouseColorIndex(4));
         assert_eq!(
-            sprite_palette_for_key(&key, Some(art), &effects, &cells),
+            sprite_palette_for_key(
+                &key,
+                Some(art),
+                &effects,
+                &cells,
+                None,
+                &AresCustomPalettes::default()
+            ),
             expected
         );
         assert_eq!(
@@ -164,14 +226,17 @@ fn bullet_frame_lookup_preserves_native_stencil_and_rejects_out_of_range() {
     let hex = corpus["physical_image"]["hex"].as_str().unwrap();
     let bytes: Vec<_> = hex
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|c| u8::from_str_radix(std::str::from_utf8(c).unwrap(), 16).unwrap())
         .collect();
-    let source = ShpSource {
-        shp: ShpFile::from_bytes(&bytes).unwrap(),
-        found_name: "120MM.SHP".to_string(),
-        draw_offsets: (0, 0),
-    };
+    let source = ShpSource::decode(
+        std::sync::Arc::<[u8]>::from(bytes.as_slice()).into(),
+        "120MM.SHP".to_string(),
+        (0, 0),
+    )
+    .unwrap();
     let rules = simple_rules("");
     let projectile = rules.projectile("Cannon").unwrap();
     let key = projectile_key("Cannon", projectile, 0, HouseColorIndex(0));
@@ -183,52 +248,71 @@ fn bullet_frame_lookup_preserves_native_stencil_and_rejects_out_of_range() {
         }
     }
     let palette = Palette::from_bytes(&raw).unwrap();
-    let rendered = render_shp_frame(&source, &palette, false, &key, Some(&rules)).unwrap();
-    assert_eq!(rendered.indices, source.shp.frames[0].pixels);
+    let rendered = render_shp_key(
+        &source,
+        &palette,
+        false,
+        &key,
+        Some(&rules),
+        &mut ShpPalettes::default(),
+    )
+    .unwrap();
+    assert_eq!(rendered.frame, 0);
     assert_eq!([rendered.width, rendered.height], [4, 4]);
     assert_eq!([rendered.offset_x, rendered.offset_y], [-2.0, -2.0]);
     assert_eq!(rendered.canvas_rect, [-12.0, -12.0, 24.0, 24.0]);
     assert!(
-        render_shp_frame(
+        render_shp_key(
             &source,
             &palette,
             false,
             &projectile_key("Cannon", projectile, 1, HouseColorIndex(0)),
-            Some(&rules)
+            Some(&rules),
+            &mut ShpPalettes::default(),
         )
         .is_none()
     );
 }
 
 #[test]
-fn firer_registration_keeps_only_live_fallback_and_lookup_accepts_supplied_scheme() {
+fn firer_registration_covers_each_house_scheme_and_lookup_uses_the_supplied_one() {
     let rules = rules(
         "[VehicleTypes]\n0=MTNK\n[MTNK]\nPrimary=105mm\n[105mm]\nProjectile=Cannon\n[Cannon]\nImage=120MM\nFirersPalette=yes\n",
         "",
     );
     let projectile = rules.projectile("Cannon").unwrap();
     let assets = AssetManager::from_loose_root_for_test(&std::env::temp_dir());
-    // Already bound two-frame asset. Production has no retained Bullet scheme;
-    // atlas construction must materialize only the fallback it actually uses.
+    // Already bound two-frame asset. The draw selects the retained Bullet+114
+    // House's scheme or the local player's (`0x004683A1..0x004683D1`), so
+    // every House colour of the match is registered, and no ANIM.PAL key.
     let mut files = HashMap::from([("CANNON".to_string(), ("120MM.SHP".to_string(), 2))]);
+    let house_colors = HouseColorMap::from([
+        ("Russians".to_string(), HouseColorIndex(4)),
+        ("Americans".to_string(), HouseColorIndex(2)),
+        ("Neutral".to_string(), crate::rules::house_colors::NO_REMAP),
+    ]);
     let mut needed = HashSet::new();
     register_projectile_frames(
         &mut needed,
         &mut files,
         &assets,
         Some(&rules),
+        &house_colors,
         "tem",
         "TEMPERATE",
     );
-    assert_eq!(
-        needed.len(),
-        2,
-        "one fallback per frame, without unused house variants"
-    );
+    let expected: HashSet<_> = (0..2)
+        .flat_map(|frame| {
+            house_colors
+                .values()
+                .map(move |&color| projectile_key("Cannon", projectile, frame, color))
+        })
+        .collect();
+    assert_eq!(needed, expected);
     assert!(
         needed
             .iter()
-            .all(|key| key.palette_context == ShpPaletteContext::BulletAnim)
+            .all(|key| key.palette_context == ShpPaletteContext::BulletFirer)
     );
     let entry = |page| ShpSpriteEntry {
         uv_origin: [0.0; 2],
@@ -239,40 +323,32 @@ fn firer_registration_keeps_only_live_fallback_and_lookup_accepts_supplied_schem
         canvas_rect: [-12.0, -12.0, 24.0, 24.0],
         extended: false,
         page,
+        source_palette: 1,
     };
     for frame in 0..2 {
-        let fallback = unresolved_firer_key("Cannon", projectile, frame);
-        let retained = projectile_key("Cannon", projectile, frame, HouseColorIndex(4));
-        assert!(needed.contains(&fallback));
-        assert!(!needed.contains(&retained));
-        // This explicit entry checks context lookup only. It is supplied by the
-        // fixture, not registered for a live production retained House scheme.
+        let russian = projectile_key("Cannon", projectile, frame, HouseColorIndex(4));
+        let american = projectile_key("Cannon", projectile, frame, HouseColorIndex(2));
         let atlas = SpriteAtlas::new(
             Vec::new(),
-            HashMap::from([(fallback, entry(0)), (retained, entry(1))]),
+            HashMap::from([(russian, entry(0)), (american, entry(1))]),
+            ShpPalettes::default(),
         );
-        assert_eq!(
-            atlas
-                .projectile_sprite("Cannon", projectile, frame, None)
-                .unwrap()
-                .page,
-            0
-        );
-        assert_eq!(
-            atlas
-                .projectile_sprite("Cannon", projectile, frame, Some(HouseColorIndex(4)))
-                .unwrap()
-                .page,
-            1
-        );
+        for (scheme, page) in [(HouseColorIndex(4), 0), (HouseColorIndex(2), 1)] {
+            assert_eq!(
+                atlas
+                    .projectile_sprite("Cannon", projectile, frame, scheme)
+                    .unwrap()
+                    .page,
+                page
+            );
+        }
         assert!(
             atlas
-                .projectile_sprite("Cannon", projectile, 2, None)
+                .projectile_sprite("Cannon", projectile, 2, HouseColorIndex(4))
                 .is_none()
         );
     }
 }
-
 #[test]
 #[ignore = "requires physical retail archives; production selected Hills reader and SHP/palette binding"]
 fn retail_hills_projectile_assets_match_original_reader_and_physical_bytes() {
@@ -290,10 +366,7 @@ fn retail_hills_projectile_assets_match_original_reader_and_physical_bytes() {
     let assets = AssetManager::new(&root, MediaArchiveMode::STOCK_DIGITAL).unwrap();
     let corpus = native();
     let projectile = rules.projectile("Cannon").unwrap();
-    assert_eq!(
-        rules.object("MTNK").unwrap().primary.as_deref(),
-        Some("105mm")
-    );
+    assert_eq!(rules.object("MTNK").unwrap().primary(), Some("105mm"));
     assert_eq!(
         rules.weapon("105mm").unwrap().projectile.as_deref(),
         Some("Cannon")
@@ -305,6 +378,7 @@ fn retail_hills_projectile_assets_match_original_reader_and_physical_bytes() {
         &mut files,
         &assets,
         Some(rules),
+        &HouseColorMap::new(),
         "tem",
         "TEMPERATE",
     );
@@ -329,20 +403,24 @@ fn retail_hills_projectile_assets_match_original_reader_and_physical_bytes() {
         "TEMPERATE",
         Some(rules),
         Some(art),
+        ShpImageKind::Object,
     )
     .unwrap();
     source.draw_offsets = (0, 0);
     let palette = Palette::from_bytes(assets.get_ref("palette.pal").unwrap()).unwrap();
-    let sprite = render_shp_frame(
+    let mut palettes = ShpPalettes::default();
+    let sprite = render_shp_key(
         &source,
         &palette,
         false,
         &projectile_key("Cannon", projectile, 0, HouseColorIndex(0)),
         Some(rules),
+        &mut palettes,
     )
     .unwrap();
-    assert_eq!(sprite.indices, source.shp.frames[0].pixels);
-    for (index, rgba) in sprite.indices.iter().zip(sprite.rgba.chunks_exact(4)) {
+    assert_eq!(sprite.frame, 0);
+    let sprite_rgba = palettes.rgba(&sprite);
+    for (index, rgba) in sprite.indices().iter().zip(sprite_rgba.as_chunks::<4>().0) {
         let c = corpus["palettes"][0]["colors"]
             .as_array()
             .unwrap()
@@ -383,15 +461,17 @@ impl Drop for ProjectileAssetDirectory {
 #[test]
 fn projectile_asset_binding_uses_native_last_load_not_current_image_text() {
     use crate::rules::native_processing::{RulesLayerKind, RulesLayerStack};
-    let corpus: Value = serde_json::from_str(include_str!(
-        "../../tools/projectile_oracle/bridge_render_art_state.json"
+    let corpus: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/projectile_oracle/bridge_render_art_state.json",
     ))
     .unwrap();
     let bytes = native()["physical_image"]["hex"]
         .as_str()
         .unwrap()
         .as_bytes()
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect::<Vec<_>>();
     let directory = ProjectileAssetDirectory::new();
@@ -432,13 +512,13 @@ fn projectile_asset_binding_uses_native_last_load_not_current_image_text() {
             let candidates = projectile_shp_candidates(projectile, "tem", "TEMPERATE");
             let found = find_shp(&assets, &candidates);
             assert_eq!(
-                found.map(|(name, _)| name),
+                found.as_ref().map(|(name, _)| *name),
                 row["state"]["loaded_file"].as_str(),
                 "{} {}",
                 case["name"],
                 row["rules"]
             );
-            let count = found.map_or(0, |(_, bytes)| {
+            let count = found.as_ref().map_or(0, |(_, bytes)| {
                 ShpFile::frame_count_from_bytes(bytes).unwrap()
             });
             assert_eq!(
@@ -446,7 +526,7 @@ fn projectile_asset_binding_uses_native_last_load_not_current_image_text() {
                 row["state"]["frame_count"].as_u64().unwrap()
             );
             if let Some((_, bytes)) = found {
-                let shp = ShpFile::from_bytes(bytes).unwrap();
+                let shp = ShpFile::from_bytes(&bytes).unwrap();
                 assert_eq!(
                     serde_json::json!([shp.width, shp.height]),
                     row["state"]["canvas"]
@@ -459,6 +539,7 @@ fn projectile_asset_binding_uses_native_last_load_not_current_image_text() {
                 &mut files,
                 &assets,
                 Some(&rules),
+                &HouseColorMap::new(),
                 "tem",
                 "TEMPERATE",
             );

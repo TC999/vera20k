@@ -2,15 +2,12 @@
 //! the production shader and SpriteInstance; native frame goldens are checked
 //! separately through the production SHP/palette preparation.
 use super::{
-    batch::{CameraUniform, SpriteInstance},
-    frame_readback::PendingBgra8Readback,
-    radar_surface::RadarSurface,
+    batch::{BatchRenderer, BatchTexture, CameraUniform, SpriteInstance},
+    frame_readback::PendingTextureReadback,
 };
+use crate::render::gpu::block_on;
 use bytemuck::Zeroable;
-use std::{
-    mem::{offset_of, size_of},
-    time::Duration,
-};
+use std::{mem::size_of, time::Duration};
 use wgpu::util::DeviceExt;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
 struct Layer {
@@ -31,13 +28,12 @@ fn extent(s: [u32; 2]) -> wgpu::Extent3d {
 }
 impl Gpu {
     fn new() -> Self {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let adapter =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-                .expect("explicit sidebar GPU test requires adapter");
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+            .expect("explicit sidebar GPU test requires adapter");
         eprintln!("Sidebar GPU adapter: {:?}", adapter.get_info());
         let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+            block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
         Self { device, queue }
     }
     fn texture(
@@ -81,7 +77,7 @@ impl Gpu {
             .create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: None,
                 source: wgpu::ShaderSource::Wgsl(
-                    super::tactical_shader::source(include_str!("batch_shader.wgsl")).into(),
+                    super::tactical_shader::sprite_source(include_str!("batch_shader.wgsl")).into(),
                 ),
             });
         let pipeline = self
@@ -92,11 +88,11 @@ impl Gpu {
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some("vs_main"),
-                    buffers: &[wgpu::VertexBufferLayout {
+                    buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: size_of::<SpriteInstance>() as u64,
                         step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &INSTANCE_ATTRIBUTES,
-                    }],
+                        attributes: &crate::render::batch::SPRITE_INSTANCE_ATTRIBUTES,
+                    })],
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -112,16 +108,28 @@ impl Gpu {
                 primitive: Default::default(),
                 depth_stencil: None,
                 multisample: Default::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
+        let (neutral_a, neutral_a_uniform) =
+            super::shroud_buffer::neutral_gpu_source(&self.device, &self.queue);
         let camera_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
             layout: &pipeline.get_bind_group_layout(0),
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&neutral_a),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: neutral_a_uniform.as_entire_binding(),
+                },
+            ],
         });
         let output = self.device.create_texture(&wgpu::TextureDescriptor {
             label: None,
@@ -185,6 +193,7 @@ impl Gpu {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &camera_group, &[]);
@@ -192,7 +201,7 @@ impl Gpu {
             pass.set_vertex_buffer(0, instances.slice(..));
             pass.draw(0..6, 0..1);
         }
-        let readback = PendingBgra8Readback::encode(
+        let readback = PendingTextureReadback::encode(
             &self.device,
             &mut encoder,
             &output,
@@ -205,7 +214,36 @@ impl Gpu {
         readback
             .finish(&self.device, submission, Duration::from_secs(20))
             .unwrap()
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .flat_map(|p| [p[2], p[1], p[0], p[3]])
+            .collect()
+    }
+    /// Submit `encode`'s work, then read `texture` back as RGBA.
+    fn shown(
+        &self,
+        texture: &BatchTexture,
+        encode: impl FnOnce(&mut wgpu::CommandEncoder),
+    ) -> Vec<u8> {
+        let mut encoder = self.device.create_command_encoder(&Default::default());
+        encode(&mut encoder);
+        let readback = PendingTextureReadback::encode(
+            &self.device,
+            &mut encoder,
+            texture.view.texture(),
+            FORMAT,
+            texture.width,
+            texture.height,
+        )
+        .unwrap();
+        let submission = self.queue.submit([encoder.finish()]);
+        readback
+            .finish(&self.device, submission, Duration::from_secs(20))
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .iter()
             .flat_map(|p| [p[2], p[1], p[0], p[3]])
             .collect()
     }
@@ -221,112 +259,13 @@ fn quad(position: [f32; 2], size: [f32; 2]) -> SpriteInstance {
         ..Default::default()
     }
 }
-#[test]
-#[ignore = "requires a wgpu adapter; executes the production batch shader"]
-fn retained_radar_snapshot_matches_actual_gpu_crops_and_overlaps() {
-    let gpu = Gpu::new();
-    let source_size = [140, 108];
-    let source: Vec<u8> = (0..source_size[0] * source_size[1])
-        .flat_map(|i| {
-            [
-                (i % 256) as u8,
-                ((i * 73) % 256) as u8,
-                ((i * 191) % 256) as u8,
-                if i % 37 == 0 { 0 } else { 255 },
-            ]
-        })
-        .collect();
-    for origin in [
-        [0., 0.],
-        [632.25, -413.75],
-        [13852.375, 8181.625],
-        [631.4999, -412.5001],
-        [631.5001, -412.4999],
-    ] {
-        let mut cases = vec![
-            ([16., 1.], [0., 0.], [140., 108.]),
-            ([26., 11.], [10., 10.], [120., 88.]),
-            ([-3., -4.], [0., 0.], [140., 108.]),
-            ([137., 95.], [125., 98.], [15., 10.]),
-        ]
-        .into_iter()
-        .map(|(offset, crop, area)| {
-            (
-                offset,
-                [crop[0] / 140., crop[1] / 108.],
-                [area[0] / 140., area[1] / 108.],
-                area,
-            )
-        })
-        .collect::<Vec<_>>();
-        for (raw_w, raw_h) in [(300, 180), (180, 300), (173, 113), (140, 108)] {
-            let surface = super::native_radar_surface::NativeRadarSurfaceGeometry::from_raw_rect(
-                30, 20, raw_w, raw_h,
-            )
-            .unwrap();
-            let copy = super::minimap_projection::generated_primary_copy_frame(surface, 140., 108.);
-            cases.push((
-                [16. + copy.offset[0], 1. + copy.offset[1]],
-                copy.uv_origin,
-                copy.uv_size,
-                copy.size,
-            ));
-        }
-        for (offset, crop, uv_size, area) in cases {
-            let mut q = quad([origin[0] + offset[0], origin[1] + offset[1]], area);
-            q.uv_origin = crop;
-            q.uv_size = uv_size;
-            let mut line = quad([origin[0] + 4., origin[1] + 5.], [161., 1.]);
-            line.tint = super::sidebar_text::native_radar_outline_color(
-                super::sidebar_chrome::SidebarTheme::Allied,
-            );
-            let mut cpu = RadarSurface::new(168, 110);
-            cpu.paint_quad(&q, origin, &source, source_size);
-            cpu.paint_solid(&line, origin);
-            let actual = gpu.render(
-                &[
-                    Layer {
-                        quad: q,
-                        rgba: source.clone(),
-                        size: source_size,
-                    },
-                    Layer {
-                        quad: line,
-                        rgba: vec![255; 4],
-                        size: [1, 1],
-                    },
-                ],
-                [168, 110],
-                origin,
-            );
-            if origin == [0., 0.] && offset == [16., 1.] {
-                assert_eq!(
-                    &actual[(5 * 168 + 4) * 4..(5 * 168 + 5) * 4],
-                    &[164, 210, 255, 255],
-                    "native packed Allied outline after enrolled presentation"
-                );
-            }
-            let differences: Vec<_> = actual
-                .chunks_exact(4)
-                .zip(cpu.rgba.chunks_exact(4))
-                .enumerate()
-                .filter(|(_, (a, b))| a != b)
-                .collect();
-            assert!(
-                differences.is_empty(),
-                "{} differing pixels origin{origin:?}, offset{offset:?}, crop{crop:?}: {:?}",
-                differences.len(),
-                &differences[..differences.len().min(12)]
-            );
-        }
-    }
-}
-
 fn assert_pixels(actual: &[u8], expected: &[u8], label: &str) {
     assert_eq!(actual.len(), expected.len());
     let differences: Vec<_> = actual
-        .chunks_exact(4)
-        .zip(expected.chunks_exact(4))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(expected.as_chunks::<4>().0)
         .enumerate()
         .filter(|(_, (a, b))| a != b)
         .collect();
@@ -341,7 +280,7 @@ fn assert_pixels(actual: &[u8], expected: &[u8], label: &str) {
 #[test]
 #[ignore = "requires original retail archives and a real wgpu adapter"]
 fn retail_command_bar_atlas_and_production_append_match_native_capture() {
-    use crate::sidebar::{command_bar::CommandBarLayout, gadget_flash::SidebarGadgetState};
+    use crate::ui::sidebar::{command_bar::CommandBarLayout, gadget_flash::SidebarGadgetState};
     let root = std::env::var_os("RA2_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| {
@@ -391,10 +330,11 @@ fn retail_command_bar_atlas_and_production_append_match_native_capture() {
         })
         .collect();
     let actual = Gpu::new().render(&layers, [800, 600], camera);
-    let expected = include_bytes!("../../tools/sidebar_oracle/command_bar/neutral-bar-rgb565.bin");
+    let expected =
+        crate::test_fixture::bytes("tools/sidebar_oracle/command_bar/neutral-bar-rgb565.bin");
     let mut differences = 0;
-    for (i, word) in expected.chunks_exact(2).enumerate() {
-        let word = u16::from_le_bytes(word.try_into().unwrap());
+    for (i, word) in expected.as_chunks::<2>().0.iter().enumerate() {
+        let word = u16::from_le_bytes(*word);
         let p = ((568 + i / 632) * 800 + i % 632) * 4;
         // The native PCX stores zero-filled RGB565 components (7B05C0),
         // whereas live GPU output uses the independently enrolled presentation
@@ -404,24 +344,38 @@ fn retail_command_bar_atlas_and_production_append_match_native_capture() {
             | u16::from(actual[p + 2] >> 3);
         differences += usize::from(actual_word != word);
     }
-    eprintln!("Native command bar: 20224 GPU pixels through PCX RGB565 extraction, {differences} differences");
+    eprintln!(
+        "Native command bar: 20224 GPU pixels through PCX RGB565 extraction, {differences} differences"
+    );
     assert_eq!(differences, 0);
 }
 
+/// The housing's GPU replay: a loss shows the retained online draw, the
+/// minimap keeps showing through the closing doors' skipped pixels, and a
+/// reopening leaves no trails (`656EF2..6F0D`, `657578`, `4912B0`).
 #[test]
 #[ignore = "requires a wgpu adapter; checks production retained owner across availability changes"]
 fn production_radar_loss_and_reversal_preserve_final_gpu_pixels() {
-    use super::radar_anim::{RadarAnimPhase, RadarPresentation};
+    use super::radar::anim::{RadarAnimPhase, RadarAnimState};
     let gpu = Gpu::new();
+    let batch = BatchRenderer::new_with_device(&gpu.device, &gpu.queue, FORMAT);
     let origin = [632.25, -413.75];
-    let frames: Vec<Vec<u8>> = (0..33)
+    let mut frames: Vec<Vec<u8>> = (0..33)
         .map(|frame| [frame * 5, 24, 64, 255].repeat(168 * 110))
         .collect();
-    let mut radar = RadarPresentation::new(frames.clone(), 168, 110).unwrap();
-    radar.set_has_radar(true);
-    for frame in 0..32 {
-        assert!(radar.advance_draw(frame * 64));
+    // The first closing frame skips a band the map shows through.
+    for row in frames[31].chunks_mut(168 * 4) {
+        for pixel in row[24 * 4..40 * 4].as_chunks_mut::<4>().0 {
+            pixel[3] = 0;
+        }
     }
+    let mut radar =
+        RadarAnimState::new(&gpu.device, &gpu.queue, &batch, frames.clone(), 168, 110).unwrap();
+    let _ = radar.set_has_radar(true);
+    for frame in 0..32 {
+        radar.tick(1, frame * 64);
+    }
+    assert_eq!(radar.phase(), RadarAnimPhase::Online);
     let source: Vec<u8> = (0..140 * 108)
         .flat_map(|i| {
             [
@@ -432,11 +386,16 @@ fn production_radar_loss_and_reversal_preserve_final_gpu_pixels() {
             ]
         })
         .collect();
+    let changed_source = [80, 160, 208, 255].repeat(140 * 108);
+    let picture =
+        |rgba: &[u8]| batch.create_texture_on_device(&gpu.device, &gpu.queue, rgba, 140, 108, None);
+    let (map_texture, changed_map) = (picture(&source), picture(&changed_source));
+    let white = batch.create_texture_on_device(&gpu.device, &gpu.queue, &[255; 16], 2, 2, None);
     let housing = quad(origin, [168., 110.]);
     let geometry =
-        super::native_radar_surface::NativeRadarSurfaceGeometry::from_raw_rect(30, 20, 300, 180)
+        super::radar::geometry::NativeRadarSurfaceGeometry::from_raw_rect(30, 20, 300, 180)
             .unwrap();
-    let copy = super::minimap_projection::generated_primary_copy_frame(geometry, 140., 108.);
+    let copy = super::radar::projection::generated_primary_copy_frame(geometry, 140., 108.);
     let mut map = quad(
         [
             origin[0] + 16. + copy.offset[0],
@@ -450,14 +409,15 @@ fn production_radar_loss_and_reversal_preserve_final_gpu_pixels() {
     line.tint = super::sidebar_text::native_radar_outline_color(
         super::sidebar_chrome::SidebarTheme::Allied,
     );
+    let layer = |rgba: &[u8]| Layer {
+        quad: housing,
+        rgba: rgba.to_vec(),
+        size: [168, 110],
+    };
     let online = |base: &[u8], source: &[u8], line: SpriteInstance| {
         gpu.render(
             &[
-                Layer {
-                    quad: housing,
-                    rgba: base.to_vec(),
-                    size: [168, 110],
-                },
+                layer(base),
                 Layer {
                     quad: map,
                     rgba: source.to_vec(),
@@ -473,71 +433,53 @@ fn production_radar_loss_and_reversal_preserve_final_gpu_pixels() {
             origin,
         )
     };
-    let retained = |base: &[u8]| {
-        gpu.render(
-            &[Layer {
-                quad: housing,
-                rgba: base.to_vec(),
-                size: [168, 110],
-            }],
-            [168, 110],
-            origin,
-        )
+    let shown = |radar: &mut RadarAnimState| {
+        gpu.shown(&radar.texture().clone(), |encoder| {
+            radar.encode_paints(&gpu.device, &gpu.queue, &batch, encoder);
+        })
     };
+    assert_pixels(&shown(&mut radar), &frames[32], "opened housing");
     let displayed = online(&frames[32], &source, line);
-    radar.retain_online_content(&source, [140, 108], &[map], [line].into_iter(), origin);
-    assert_pixels(&radar.surface.rgba, &displayed, "retained online output");
-    radar.set_has_radar(false);
-    assert!(radar.advance_draw(2032));
-    assert_pixels(&retained(&radar.surface.rgba), &displayed, "pre-due loss");
-    let changed_source = [80, 160, 208, 255].repeat(140 * 108);
-    radar.retain_online_content(
-        &changed_source,
-        [140, 108],
-        &[map],
-        [line].into_iter(),
-        origin,
-    );
+    radar.retain_online_content(&map_texture, &white, &[map], [line].into_iter(), origin);
+    let _ = radar.set_has_radar(false);
+    radar.tick(1, 2032);
+    assert_pixels(&shown(&mut radar), &displayed, "pre-due loss");
+    radar.retain_online_content(&changed_map, &white, &[map], [line].into_iter(), origin);
+    radar.tick(1, 2032);
     assert_pixels(
-        &retained(&radar.surface.rgba),
+        &shown(&mut radar),
         &displayed,
         "internal map changes while closing",
     );
-    radar.set_has_radar(true);
-    assert!(!radar.advance_draw(2032));
-    assert_pixels(
-        &retained(&radar.surface.rgba),
-        &displayed,
-        "pre-due reversal",
-    );
-    assert!(radar.advance_draw(2048));
+    let _ = radar.set_has_radar(true);
+    radar.tick(1, 2032);
+    assert_pixels(&shown(&mut radar), &displayed, "pre-due reversal");
+    radar.tick(1, 2048);
     assert_eq!(radar.phase(), RadarAnimPhase::Online);
     assert_pixels(
-        &online(&radar.surface.rgba, &source, line),
+        &online(&shown(&mut radar), &source, line),
         &displayed,
         "unchanged final Online image at endpoint",
     );
     line.position[1] += 3.;
     let changed_display = online(&frames[32], &changed_source, line);
-    radar.retain_online_content(
-        &changed_source,
-        [140, 108],
-        &[map],
-        [line].into_iter(),
-        origin,
-    );
-    radar.set_has_radar(false);
-    assert!(radar.advance_draw(2080));
+    radar.retain_online_content(&changed_map, &white, &[map], [line].into_iter(), origin);
+    let _ = radar.set_has_radar(false);
+    radar.tick(1, 2080);
     assert_pixels(
-        &retained(&radar.surface.rgba),
+        &shown(&mut radar),
         &changed_display,
         "new Online map and outline retained without trails",
     );
-    assert!(radar.advance_draw(2112));
+    radar.tick(1, 2112);
     assert_pixels(
-        &retained(&radar.surface.rgba),
-        &retained(&frames[31]),
-        "first due closing frame replaces previous map",
+        &shown(&mut radar),
+        &gpu.render(
+            &[layer(&changed_display), layer(&frames[31])],
+            [168, 110],
+            origin,
+        ),
+        "first due closing frame over the retained map",
     );
 }
 
@@ -577,31 +519,3 @@ fn native_radar_outline_all_themes_match_gpu_presentation() {
         );
     }
 }
-
-macro_rules! attribute {
-    ($location:expr, $format:ident, $($field:tt)+) => {
-        wgpu::VertexAttribute {
-            format: wgpu::VertexFormat::$format,
-            offset: offset_of!(SpriteInstance, $($field)+) as u64,
-            shader_location: $location,
-        }
-    };
-}
-
-const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 15] = [
-    attribute!(0, Float32x2, position),
-    attribute!(1, Float32x2, size),
-    attribute!(2, Float32x2, uv_origin),
-    attribute!(3, Float32x2, uv_size),
-    attribute!(4, Float32, depth),
-    attribute!(5, Float32x3, tint),
-    attribute!(6, Float32, alpha),
-    attribute!(7, Uint32, draw_state.remap_row),
-    attribute!(8, Uint32, draw_state.fx_flags),
-    attribute!(9, Float32x4, draw_state.fx_params),
-    attribute!(10, Float32x4, draw_state.effect_tint),
-    attribute!(11, Float32, z_adjust),
-    attribute!(12, Uint32, z_gradient),
-    attribute!(13, Float32x2, zshape_origin),
-    attribute!(14, Uint32x4, palette_light),
-];

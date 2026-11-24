@@ -39,7 +39,7 @@ impl TubeId {
 /// Active YR stores this field as a signed 16-bit value.  A negative value or
 /// a nonnegative value outside the current Tube registry admits automatic
 /// construction; only an in-range nonnegative value is a gameplay `TubeId`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct NativeTubeCellIndex(i16);
 
 impl Default for NativeTubeCellIndex {
@@ -84,9 +84,10 @@ pub enum TubeSource {
 }
 
 impl TubeSource {
-    /// Compatibility spelling for generated/synthetic callers. Active authored
+    /// Compatibility spelling for synthetic test fixtures. Active authored
     /// ownership is the automatic Recalc shell named above.
-    #[allow(non_upper_case_globals)]
+    #[cfg(test)]
+    #[expect(non_upper_case_globals, reason = "the spelling old test fixtures use")]
     pub const AutoLowBridge: Self = Self::AutomaticRecalcShell;
 }
 
@@ -115,7 +116,7 @@ impl TubeFact {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn auto_low_bridge(cell: (u16, u16), direction: u8) -> Self {
         Self::automatic_recalc_shell(cell, direction)
     }
@@ -138,26 +139,11 @@ impl TubeFact {
     pub fn path_len(&self) -> usize {
         self.path_steps.len()
     }
-
-    pub fn path_steps(&self) -> &[i32] {
-        &self.path_steps
-    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn automatic_recalc_tube_is_same_cell_zero_step_shell() {
-        let tube = TubeFact::automatic_recalc_shell((12, 34), 2);
-
-        assert_eq!(tube.entry, (12, 34));
-        assert_eq!(tube.exit, (12, 34));
-        assert_eq!(tube.direction, 2);
-        assert_eq!(tube.path_len(), 0);
-        assert_eq!(tube.source, TubeSource::AutomaticRecalcShell);
-    }
 
     #[test]
     fn native_cell_index_preserves_signed_and_out_of_range_admission() {
@@ -175,16 +161,5 @@ mod tests {
         let truncated_negative = NativeTubeCellIndex::from_registry_ordinal(0x8000);
         assert_eq!(truncated_negative.raw(), i16::MIN);
         assert!(truncated_negative.admits_automatic_construction(0x8001));
-    }
-
-    #[test]
-    fn explicit_tube_preserves_path_steps() {
-        let tube = TubeFact::explicit((1, 1), (4, 1), 2, vec![2, 2, 2]);
-
-        assert_eq!(tube.entry, (1, 1));
-        assert_eq!(tube.exit, (4, 1));
-        assert_eq!(tube.path_steps, vec![2, 2, 2]);
-        assert_eq!(tube.path_len(), 3);
-        assert_eq!(tube.source, TubeSource::ExplicitMap);
     }
 }

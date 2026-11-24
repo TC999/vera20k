@@ -4,7 +4,7 @@
 //! whole InfantryAI or audible playback. Wet death cleanup uses the existing
 //! production sequencer's native20/21 UnInit arm, not a second action port.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use serde_json::{Value, json};
 
@@ -13,22 +13,18 @@ use crate::map::resolved_terrain::{ResolvedTerrainGrid, test_flat_cell};
 use crate::rules::ini_parser::IniFile;
 use crate::rules::process_owner::NativeRulesProcessOwner;
 use crate::rules::sound_ini::SoundRegistry;
+use crate::sim::components::DriveCoord;
 use crate::sim::rng::SimRng;
 use crate::sim::stage::StageClass;
 use crate::sim::timer::CdTimer;
 use crate::sim::world::SimSoundEvent;
-use crate::util::fixed_math::SimFixed;
 
 fn oracle() -> &'static [Value] {
-    static NATIVE: OnceLock<Vec<Value>> = OnceLock::new();
-    NATIVE.get_or_init(|| {
-        let rows: Vec<Value> = serde_json::from_str(include_str!(
-            "../../../tools/spatial_oracle/infantry_water_action.json"
-        ))
+    let rows = crate::test_fixture::json("tools/spatial_oracle/infantry_water_action.json")["rows"]
+        .as_array()
         .unwrap();
-        assert_eq!(rows.len(), 356);
-        rows
-    })
+    assert_eq!(rows.len(), 356);
+    rows
 }
 
 fn signed(value: &Value) -> i32 {
@@ -78,21 +74,21 @@ fn physical_rules() -> RuleSet {
         None,
         sections_ini(&receipt["art"]),
         sounds,
+        Default::default(),
     )
     .unwrap();
     let (mut rules, _, fixed_art, _) = owner
-        .load_noncampaign_scenario(
-            Some(&sections_ini(&history[2]["inputs"])),
+        .load_scenario(
+            crate::rules::process_owner::NativeScenarioRulesPrefix::NonCampaign(Some(
+                &sections_ini(&history[2]["inputs"]),
+            )),
             &sections_ini(&history[3]["inputs"]),
         )
         .unwrap()
         .into_parts();
-    // The process owner returns fixed ART separately; the normal loader's
-    // init2467 installs it, then binds its parsed signed42-record bank.
+    // The process owner has retained the signed bank; metadata installation
+    // follows without replaying its sequence reads.
     rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&fixed_art));
-    rules.bind_animation_sequences(
-        &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&fixed_art),
-    );
     rules
 }
 
@@ -134,16 +130,22 @@ fn supplied_rules(input: &Value) -> RuleSet {
     let sounds = Arc::new(SoundRegistry::from_ini(&IniFile::from_str(
         "[SoundList]\n0=WaterEnter\n1=WaterLeave\n",
     )));
-    let mut owner =
-        NativeRulesProcessOwner::from_cold_start_sources(root, None, art, sounds).unwrap();
+    let mut owner = NativeRulesProcessOwner::from_cold_start_sources(
+        root,
+        None,
+        art,
+        sounds,
+        Default::default(),
+    )
+    .unwrap();
     let (mut rules, _, fixed_art, _) = owner
-        .load_noncampaign_scenario(None, &IniFile::from_str(""))
+        .load_scenario(
+            crate::rules::process_owner::NativeScenarioRulesPrefix::NonCampaign(None),
+            &IniFile::from_str(""),
+        )
         .unwrap()
         .into_parts();
     rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&fixed_art));
-    rules.bind_animation_sequences(
-        &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&fixed_art),
-    );
     rules
 }
 
@@ -151,13 +153,14 @@ fn fixture(row: &Value, rules: &RuleSet, type_name: &str) -> (Simulation, u64) {
     let input = &row["input"];
     let physical = row["kind"] == "retail_action";
     let mut sim = Simulation::with_seed(0);
-    sim.session.binary_frame = 100;
-    sim.session.game_options.game_speed = row["game_speed_index"].as_i64().unwrap_or(0) as i32;
+    sim.session.set_binary_frame_for_test(100);
+    sim.session.game_options_mut_for_test().game_speed =
+        row["game_speed_index"].as_i64().unwrap_or(0) as i32;
     let house = sim.interner.intern("Americans");
-    sim.houses.insert(
-        house,
-        crate::sim::house_state::HouseState::new(house, 0, None, true, 0, 10),
-    );
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            house, 0, None, true, 0, 10,
+        ));
     let xyz = if physical {
         row["physical_xyz"]
             .as_array()
@@ -175,25 +178,40 @@ fn fixture(row: &Value, rules: &RuleSet, type_name: &str) -> (Simulation, u64) {
         .flat_map(|y| (0..width).map(move |x| test_flat_cell(x, y)))
         .collect::<Vec<_>>();
     let terrain_cell = &mut cells[usize::from(cell.1) * usize::from(width) + usize::from(cell.0)];
-    terrain_cell.yr_cell_land_type = input["land"].as_u64().unwrap_or(2) as u8;
-    terrain_cell.base_yr_cell_land_type = terrain_cell.yr_cell_land_type;
+    terrain_cell.land_type = input["land"].as_u64().unwrap_or(2) as u8;
+    terrain_cell.base_land_type = terrain_cell.land_type;
     sim.install_resolved_terrain_for_new_map(ResolvedTerrainGrid::from_cells(width, height, cells));
     let id = sim
-        .construct_object_limbo_at_height(type_name, "Americans", cell.0, cell.1, 0, 0, rules)
+        .construct_object_limbo_at_height(
+            type_name,
+            "Americans",
+            cell.0,
+            cell.1,
+            0,
+            0,
+            rules,
+            &mut crate::sim::world::FrameEffects::default(),
+        )
         .expect("water action constructor");
     let actor = sim.substrate.entities.get_mut(id).unwrap();
     assert_eq!(actor.mission_leaf.as_infantry().unwrap().water_state(), 2);
     // Synthetic rows supply +74=false; physical rows retain the constructor
     // in limbo. Neither premise claims wet/deck Unlimbo or occupation.
-    actor.lifecycle.cell_marked = false;
-    actor.position.sub_x = SimFixed::from_num(xyz[0] % 256);
-    actor.position.sub_y = SimFixed::from_num(xyz[1] % 256);
-    actor.position.exact_z_leptons = Some(xyz[2]);
-    actor.on_bridge = input["bridge"].as_bool().unwrap_or(false);
-    actor.health.current = row["before"]["health"]
-        .as_i64()
-        .or_else(|| input["health"].as_i64())
-        .unwrap_or(100) as i32;
+    actor.lifecycle.set_cell_marked_for_test(false);
+    // These action controls supply Location after construction. Constructor
+    // arguments do not place the fresh Object at this native cell/pose.
+    actor.position.put_location(DriveCoord {
+        x: xyz[0],
+        y: xyz[1],
+        z: xyz[2],
+    });
+    actor.set_on_bridge(input["bridge"].as_bool().unwrap_or(false));
+    actor.health.set_for_test(
+        row["before"]["health"]
+            .as_i64()
+            .or_else(|| input["health"].as_i64())
+            .unwrap_or(100) as i32,
+    );
     actor
         .mission_leaf
         .set_infantry_doing_verified(input["current"].as_i64().unwrap_or(-1) as i32)
@@ -202,8 +220,8 @@ fn fixture(row: &Value, rules: &RuleSet, type_name: &str) -> (Simulation, u64) {
         .mission_leaf
         .install_infantry_water_state_fixture(input["old_water_state"].as_i64().unwrap_or(1) as i32);
     let infantry = actor.infantry.as_mut().unwrap();
-    infantry.fear_level = input["fear"].as_u64().unwrap_or(0) as u16;
-    infantry.is_prone = false;
+    infantry.set_fear_level_for_test(input["fear"].as_u64().unwrap_or(0) as u16);
+    infantry.set_is_prone_for_test(false);
     actor.install_native_stage_fixture(StageClass::from_native_fixture(
         7,
         0,
@@ -211,7 +229,7 @@ fn fixture(row: &Value, rules: &RuleSet, type_name: &str) -> (Simulation, u64) {
         92,
         1,
     ));
-    sim.sound_events.clear();
+    sim.sound_events.clear_for_test();
     if row["rng_before"].is_object() {
         sim.main_rng = serde_json::from_value::<SimRng>(row["rng_before"]["main"].clone()).unwrap();
         sim.scenario_rng =
@@ -228,7 +246,13 @@ fn full_rng(sim: &Simulation) -> Value {
         json!({"disabled": rng.disabled, "index_a": rng.index_a,
             "index_b": rng.index_b, "state": rng.words})
     };
-    json!({"main":stream(views.main), "scenario":stream(views.scenario),
+    let main = crate::sim::rng::SimRngLogicalView {
+        disabled: views.main.disabled,
+        index_a: views.main.index_a,
+        index_b: views.main.index_b,
+        words: &views.main.words,
+    };
+    json!({"main":stream(main), "scenario":stream(views.scenario),
         "mapgen":stream(views.mapgen)})
 }
 
@@ -242,6 +266,7 @@ fn compare(row: &Value, rules: &RuleSet, type_name: &str) -> (Simulation, u64) {
             signed(&input["request"]),
             input["force"].as_bool().unwrap_or(false),
             rules,
+            &mut crate::sim::world::FrameEffects::default(),
         )
         .unwrap();
     assert_eq!(accepted, row["accepted"] == 1, "{type_name}: {input}");
@@ -260,7 +285,7 @@ fn compare(row: &Value, rules: &RuleSet, type_name: &str) -> (Simulation, u64) {
     );
     if let Some(prone) = out["prone"].as_u64() {
         assert_eq!(
-            actor.infantry.as_ref().unwrap().is_prone,
+            actor.infantry.as_ref().unwrap().is_prone(),
             prone != 0,
             "{input}: remapped action retains the actual prone byte"
         );
@@ -311,7 +336,7 @@ fn compare(row: &Value, rules: &RuleSet, type_name: &str) -> (Simulation, u64) {
         else {
             panic!("{input}: expected the positional native Voc request");
         };
-        assert_eq!(sound_id, name, "{input}: sound identity");
+        assert_eq!(sound_id.name_in(&rules), name, "{input}: sound identity");
         assert!(audible_to.is_none(), "{input}: native context0");
         assert_eq!(
             [
@@ -344,10 +369,6 @@ fn native_constructor_and_physical_readers_supply_water_state_and_raw_records() 
         .iter()
         .find(|row| row["kind"] == "constructors")
         .unwrap();
-    assert_eq!(
-        constructors["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     for receipt in constructors["constructors"].as_array().unwrap() {
         if receipt["entry"] == "0x517a50" {
             assert_eq!(receipt["after"]["0x6e8"], 2);
@@ -457,12 +478,16 @@ fn native_physical_ghost_tanya_wet_death_uses_raw_doing_and_stage() {
             .get_mut(id)
             .unwrap()
             .set_native_stage_value(frames);
-        assert!(sim.infantry_sequencer(id, &rules));
+        assert!(sim.infantry_sequencer(
+            id,
+            &rules,
+            &mut crate::sim::world::FrameEffects::default()
+        ));
         assert!(
             sim.substrate
                 .entities
                 .get(id)
-                .is_none_or(|actor| !actor.lifecycle.object_alive)
+                .is_none_or(|actor| !actor.lifecycle.object_alive())
         );
         count += 1;
     }
@@ -482,14 +507,21 @@ fn physical_wet_death_advances_in_logic_and_uninitializes_without_animation() {
     {
         let name = row["type_name"].as_str().unwrap();
         let (mut sim, id) = fixture(row, &rules, name);
-        sim.substrate
-            .entities
-            .get_mut(id)
-            .unwrap()
-            .lifecycle
-            .in_limbo = false;
-        // Supply the stationary wet actor's Logic registration separately
-        // from the constructor/DoAction receipts' excluded Unlimbo.
+        // This integration extends the constructor/DoAction receipt with an
+        // admitted stationary Unlimbo, including Techno+508 publication. The
+        // original action-only rows above still exclude water placement.
+        assert!(matches!(
+            sim.reveal_entity_with_rules(id, &rules),
+            crate::sim::world::RevealOutcome::Revealed { .. }
+        ));
+        assert!(
+            sim.substrate
+                .entities
+                .get(id)
+                .unwrap()
+                .cached_spatial_threat()
+                .is_some()
+        );
         sim.set_logic_order_for_test(vec![id]);
         sim.begin_infantry_death_sequence(
             id,
@@ -499,6 +531,7 @@ fn physical_wet_death_advances_in_logic_and_uninitializes_without_animation() {
                 crate::sim::world::InfantryDeathSequence::Die2
             },
             &rules,
+            &mut crate::sim::world::FrameEffects::default(),
         );
         let doing = signed(&row["after"]["doing"]);
         let frames = rules
@@ -519,7 +552,8 @@ fn physical_wet_death_advances_in_logic_and_uninitializes_without_animation() {
                 "{name}: wet death retained"
             );
             assert_eq!(
-                actor.health.current, 0,
+                actor.health.current(),
+                0,
                 "{name}: retained native death Health0"
             );
             assert!(

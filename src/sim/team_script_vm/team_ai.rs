@@ -11,58 +11,55 @@
 //! `distance` rows replay in `recruit_oracle_tests`.
 //!
 //! RESIDUALS:
-//! - `Calc_Center`'s branch for a team whose current action is 10 (follow a
-//!   friendly unit, `0x006EAF1C..0x006EB1B0`) is not ported; action 10 is
-//!   not, so such a team is stopped on it, and its centre is the mean as for
-//!   any other action.
-//! - `Recalc` destroying an empty team that was leaving the map (`+0x82`)
-//!   first springs trigger event 0x17 ("team leaves map") on every tag
-//!   (`0x006EA49F..0x006EA4D2`, `0x006E53A0`), whose evaluation draws on the
-//!   Scenario RNG for a trigger with event 51 (`0x007264C0` ->
-//!   `0x00726400`). VERA has no live tags (`trigger_runtime` residual), so
-//!   nothing is sprung. Trigger: a team sent to an off-map cell (action 54
-//!   without a passable cell) loses its last member. Effect: map triggers on
-//!   event 0x17 never fire from it.
 //! - `+0x75` (NeedsRegrouping, written by Regroup and the damage report)
 //!   and `+0x76` (written by Recalc under `GuardSlower=`) are not kept: no
-//!   TeamClass code reads either. `+0x77` (forced active) is written only by
-//!   reinforcements (`0x0065DD64`), not ported, and reads as clear.
-//! - The under-strength retreat moves the team to its centre: the search
-//!   for the house's nearest safe unarmed building (`0x006EA173..
-//!   0x006EA39B`), which weights distance by the House threat map
-//!   (`0x0056BCD0`, whose producers `AI_BuildThreatMap @ 0x0050940A` and
-//!   `Adjust_Threat @ 0x004FA31B` are not ported) and asks `0x004CBC40` for a
-//!   cell beside it, is not ported. Natively that search starts from the
-//!   same centre cell and keeps it when no building yields a cell. Trigger: a
-//!   formed team falls to a third of its TaskForce (`Reinforce=yes`, more
-//!   than two) or loses its first member. Effect: the team regroups where it
-//!   stands instead of falling back to a base building.
+//!   TeamClass code reads either. The private forced-active `+0x77` is
+//!   written by shared reinforcement creation (`0x0065DD64`) and read by
+//!   formation and recruitment in this owner.
 
 use crate::map::entities::EntityCategory;
-use crate::map::overlay_types::OverlayTypeRegistry;
+use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::components::DriveCoord;
 use crate::sim::game_entity::GameEntity;
-use crate::sim::movement::ground_pose::object_get_coords;
+use crate::sim::trigger_runtime::TeamTagOrder;
+
+use crate::sim::world::FrameEffects;
 use crate::sim::world::Simulation;
 
-use super::{TeamRules, TeamScriptState, TeamTarget, script_action_at};
+use super::{TeamScriptState, TeamTarget, script_action_at};
+use crate::sim::intern::StringInterner;
 
 /// Script actions 53 and 54 relax the stray distance (`Rules+0x1720`
 /// instead of `+0x171C`) for Regroup and Coordinate_Move.
 const RELAXED_STRAY_ACTIONS: [i32; 2] = [0x35, 0x36];
 
+#[cfg(all(test, tests_sim_t_z))]
+#[path = "guard_slower_tests.rs"]
+mod guard_slower_tests;
+
+#[cfg(all(test, tests_sim_t_z))]
+#[path = "retreat_tests.rs"]
+mod retreat_tests;
+
 /// The team code's live-member test (`0x006EF9E0`, inlined throughout):
 /// active (`+0x90`), with Health (`+0x6C`), out of limbo (`+0x81`;
-/// `ScenarioInit` is 0 in play).
-pub(super) fn member_is_live(entity: &GameEntity) -> bool {
-    entity.lifecycle.object_alive && entity.health.current != 0 && !entity.lifecycle.in_limbo
+/// the shared ScenarioInit/placement scope admits limbo members).
+pub(super) fn member_is_live(entity: &GameEntity, placement_scope_active: bool) -> bool {
+    entity.lifecycle.object_alive()
+        && entity.health.current() != 0
+        && (placement_scope_active || !entity.lifecycle.in_limbo())
 }
 
 /// A live member that has joined up (`+0x689`) or is an aircraft, which
 /// team code treats as joined wherever it is.
-pub(super) fn member_is_live_joined(entity: &GameEntity, initiated: bool) -> bool {
-    member_is_live(entity) && (initiated || entity.category == EntityCategory::Aircraft)
+pub(super) fn member_is_live_joined(
+    entity: &GameEntity,
+    initiated: bool,
+    placement_scope_active: bool,
+) -> bool {
+    member_is_live(entity, placement_scope_active)
+        && (initiated || entity.category() == EntityCategory::Aircraft)
 }
 
 /// A member as `Calc_Center` weighs it.
@@ -84,29 +81,36 @@ pub(super) fn center_sample(
     initiated: bool,
     doubled: bool,
     naval_transport: bool,
+    placement_scope_active: bool,
 ) -> Option<CenterSample> {
-    (member_is_live_joined(entity, initiated) && entity.in_playfield).then(|| CenterSample {
-        id: entity.stable_id(),
-        xy: crate::sim::movement::ground_pose::position_world_xy(&entity.position),
-        doubled,
-        naval_transport,
-    })
+    (member_is_live_joined(entity, initiated, placement_scope_active) && entity.in_playfield())
+        .then(|| CenterSample {
+            id: entity.stable_id(),
+            xy: crate::sim::movement::ground_pose::position_world_xy(&entity.position),
+            doubled,
+            naval_transport,
+        })
 }
 
 /// `Calc_Center`'s arithmetic (`0x006EB225..0x006EB31B`): the mean XY of
 /// the samples (wrapping sums, signed truncating division), and the one
-/// nearest `focus` by squared XY distance (`0x005F6500`, wrapping; 0
-/// without a focus). A smaller distance, or any distance after a kept 0,
-/// replaces the one kept, so without a focus the last sample is closest.
-/// `None` without samples.
+/// nearest `focus` by squared XY distance (`0x005F6500`,
+/// `native_coord::squared_xy_distance_for_map`; 0 without a focus). A smaller
+/// distance, or any distance after a kept 0, replaces the one kept, so without
+/// a focus the last sample is closest. `None` without samples. One pass in
+/// member order, so the caller hands its member walk over as it goes. A
+/// VERA-only map compares the true 64-bit square instead of the wrapped
+/// native one.
 pub(super) fn center_of(
-    samples: &[CenterSample],
+    samples: impl IntoIterator<Item = CenterSample>,
     focus: Option<[i32; 2]>,
+    ares: bool,
+    vera_only_map: bool,
 ) -> Option<([i32; 2], Option<u64>)> {
     let mut sum = [0i32; 2];
     let mut count = 0i32;
     let mut closest = None;
-    let mut closest_distance = 0i32;
+    let mut closest_distance = 0i64;
     for sample in samples {
         for _ in 0..if sample.doubled { 2 } else { 1 } {
             sum[0] = sum[0].wrapping_add(sample.xy[0]);
@@ -116,7 +120,14 @@ pub(super) fn center_of(
         if sample.naval_transport {
             continue;
         }
-        let distance = focus.map_or(0, |focus| squared_xy_distance(sample.xy, focus));
+        let distance = focus.map_or(0, |focus| {
+            crate::util::native_coord::squared_xy_distance_for_map(
+                sample.xy,
+                focus,
+                ares,
+                vera_only_map,
+            )
+        });
         if closest_distance == 0 || distance < closest_distance {
             closest_distance = distance;
             closest = Some(sample.id);
@@ -125,11 +136,15 @@ pub(super) fn center_of(
     (count != 0).then(|| ([sum[0] / count, sum[1] / count], closest))
 }
 
-/// `0x005F6500`/`0x005F6560`: the squared XY distance, wrapping.
-pub(super) fn squared_xy_distance(from: [i32; 2], to: [i32; 2]) -> i32 {
-    let dx = from[0].wrapping_sub(to[0]);
-    let dy = from[1].wrapping_sub(to[1]);
-    dx.wrapping_mul(dx).wrapping_add(dy.wrapping_mul(dy))
+/// Whether `entity`'s `GetWeapon(0)` (vt+0x3F8) holds a WeaponType.
+fn first_weapon_armed(interner: &StringInterner, entity: &GameEntity, rules: &RuleSet) -> bool {
+    interner
+        .object_type(entity.type_ref(), rules)
+        .and_then(|object| {
+            crate::sim::combat::combat_weapon::weapon_for_index(object, entity.veterancy.rank(), 0)
+                .and_then(|record| record.weapon_id)
+        })
+        .is_some()
 }
 
 impl TeamScriptState {
@@ -149,18 +164,36 @@ impl Simulation {
         &mut self,
         rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
+        frame_effects: &mut FrameEffects<'_>,
     ) {
+        let unfilled_team_timeout = self
+            .session
+            .rule_policy()
+            .unfilled_team_timeout(rules.general.dissolve_unfilled_team_delay);
         let teams: Vec<u64> = self.team_script_vm.teams.keys().copied().collect();
         for team_id in teams {
             if self.team_script_vm.teams.contains_key(&team_id) {
-                self.team_ai(team_id, rules, registry);
+                self.team_ai(
+                    team_id,
+                    rules,
+                    registry,
+                    frame_effects,
+                    unfilled_team_timeout,
+                );
             }
         }
     }
 
     /// `TeamClass::AI @ 0x006E9140` up to its action dispatch.
-    fn team_ai(&mut self, team_id: u64, rules: &RuleSet, registry: Option<&OverlayTypeRegistry>) {
-        let current_frame = self.session.binary_frame as i32;
+    fn team_ai(
+        &mut self,
+        team_id: u64,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        frame_effects: &mut FrameEffects<'_>,
+        unfilled_team_timeout: Option<i32>,
+    ) {
+        let current_frame = self.session.binary_frame() as i32;
         let Some(team) = self.team_script_vm.teams.get_mut(&team_id) else {
             return;
         };
@@ -173,14 +206,14 @@ impl Simulation {
         }
         // `0x006E917B`: a changed membership is recounted; an emptied team
         // that has been full is destroyed there.
-        if team.altered && !self.team_recalc(team_id, rules) {
+        if team.altered && !self.team_recalc(team_id, rules, registry, frame_effects) {
             return;
         }
         let Some(team) = self.team_script_vm.teams.get(&team_id) else {
             return;
         };
         if team.formed && team.under_strength {
-            self.team_under_strength_retreat(team_id, rules, registry);
+            self.team_under_strength_retreat(team_id, rules, registry, frame_effects);
         }
         let vm = &mut self.team_script_vm;
         let Some(team) = vm.teams.get_mut(&team_id) else {
@@ -188,11 +221,11 @@ impl Simulation {
         };
         // `0x006E91AD..0x006E91F5`: a full team forms: its members are
         // initiated when it was reforming, and its script starts over.
-        if !team.formed && team.full_strength {
+        if !team.formed && (team.full_strength || team.forced_active) {
             team.formed = true;
             team.has_been_full = true;
             team.under_strength = false;
-            if team.reforming {
+            if team.reforming || team.forced_active {
                 for member in &mut team.members {
                     member.initiated = true;
                 }
@@ -201,9 +234,9 @@ impl Simulation {
             team.advance_pending = true;
         }
         if team.reforming || team.formed || team.zone.is_none() || team.closest_member.is_none() {
-            self.team_calc_center(team_id, rules, registry);
+            self.team_calc_center(team_id, rules);
         }
-        self.team_recruit_short_entries(team_id, rules, registry);
+        self.team_recruit_short_entries(team_id, rules, frame_effects);
 
         let Some(team) = self.team_script_vm.teams.get(&team_id) else {
             return;
@@ -211,9 +244,18 @@ impl Simulation {
         // `0x006E929B..0x006E9339`: an empty team that has been full, or
         // that could not fill before `DissolveUnfilledTeamDelay=` in a
         // multiplayer game, is destroyed.
-        let team_rules = TeamRules::new(&rules.general, self.session.game_mode_nonzero);
-        if team.dissolves(&team_rules, current_frame) {
-            self.destroy_team(team_id, rules);
+        if team.dissolves(current_frame, unfilled_team_timeout) {
+            // TeamClass::AI @0x006E9140, retail gamemd.exe:6E92D0..6E9320
+            // raises23 while the empty Team still exists for HasOccurred23.
+            if team.leaving_map {
+                self.raise_team_left_map_tags(
+                    TeamTagOrder::Forward,
+                    rules,
+                    registry,
+                    frame_effects,
+                );
+            }
+            self.destroy_team(team_id, rules, frame_effects);
             return;
         }
         // The head member's warp-in (`vt+0x1D8`, Techno `+0x271`).
@@ -223,27 +265,27 @@ impl Simulation {
             .and_then(|head| self.substrate.entities.get(head.id))
             .is_some_and(GameEntity::is_warping_in);
         if !team.formed {
-            self.team_coordinate_move(team_id, rules, registry);
+            self.team_coordinate_move(team_id, rules, registry, frame_effects);
             return;
         }
         if team.reforming || team.under_strength || warping {
-            let regrouped = self.team_regroup(team_id, rules, registry);
+            let regrouped = self.team_regroup(team_id, rules, frame_effects);
             if let Some(team) = self.team_script_vm.teams.get_mut(&team_id) {
                 team.reforming = !regrouped;
             }
             return;
         }
-        self.team_step_script(team_id, rules, registry);
+        self.team_step_script(team_id, rules, registry, frame_effects);
     }
 
     /// `0x006E9227..0x006E9299`: a team still forming, or a `Reinforce=`
     /// team below full strength, recruits for each short TaskForce entry,
     /// unless its house is human and it has been full.
-    fn team_recruit_short_entries(
+    pub(super) fn team_recruit_short_entries(
         &mut self,
         team_id: u64,
         rules: &RuleSet,
-        registry: Option<&OverlayTypeRegistry>,
+        frame_effects: &mut FrameEffects<'_>,
     ) {
         let vm = &self.team_script_vm;
         let Some(team) = vm.teams.get(&team_id) else {
@@ -257,6 +299,7 @@ impl Simulation {
         {
             return;
         }
+        let mut walks = super::membership::RecruitWalks::default();
         let mut slot = 0;
         loop {
             let vm = &self.team_script_vm;
@@ -268,7 +311,7 @@ impl Simulation {
                 return;
             };
             if super::membership::entry_short(entry.count, team.slot_counts[slot]) {
-                self.team_recruit(team_id, slot, rules, registry);
+                self.team_recruit(team_id, slot, &mut walks, rules, frame_effects);
             }
             slot += 1;
         }
@@ -283,7 +326,13 @@ impl Simulation {
     /// members the team loses its centre and is under strength; one that has
     /// been full is destroyed (false), one that has not keeps its altered
     /// bytes, so the recount repeats every update.
-    pub(super) fn team_recalc(&mut self, team_id: u64, rules: &RuleSet) -> bool {
+    pub(super) fn team_recalc(
+        &mut self,
+        team_id: u64,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+        frame_effects: &mut FrameEffects<'_>,
+    ) -> bool {
         let vm = &mut self.team_script_vm;
         let Some(team) = vm.teams.get(&team_id) else {
             return false;
@@ -303,7 +352,17 @@ impl Simulation {
             team.full_strength = false;
             team.zone = None;
             if team.has_been_full {
-                self.destroy_team(team_id, rules);
+                if team.leaving_map {
+                    //6EA49F..6EA4D2 raises23 while this empty Team still
+                    //exists. Callbacks can destroy Teams or create new Tags.
+                    self.raise_team_left_map_tags(
+                        TeamTagOrder::Reverse,
+                        rules,
+                        registry,
+                        frame_effects,
+                    );
+                }
+                self.destroy_team(team_id, rules, frame_effects);
                 return false;
             }
         } else {
@@ -332,56 +391,72 @@ impl Simulation {
     /// `Calc_Center @ 0x006EAEE0` into the team's centre (`+0x34`) and
     /// closest member (`+0x38`): the mean XY (signed truncating division) of
     /// its live joined members in the playfield (`+0x3D5`), a
-    /// `GuardSlower=` team counting twice each member its weapon test
-    /// admits (`vt+0x4E0`); the cell there, unless the closest member
-    /// (nearest the team's move target by squared XY distance, the last in
+    /// `GuardSlower=` team counting twice each member of a slow kind
+    /// (`vt+0x4E0`, `guard_slower_weight`); the cell there, unless the
+    /// closest member (nearest the team's move target by squared XY distance, the last in
     /// list order while there is none; a naval transport never counts; the
     /// head when none does) cannot enter it (`vt+0x1AC`), when the centre is
     /// that member. Without such members both are cleared.
-    pub(crate) fn team_calc_center(
-        &mut self,
-        team_id: u64,
-        rules: &RuleSet,
-        registry: Option<&OverlayTypeRegistry>,
-    ) {
+    pub(crate) fn team_calc_center(&mut self, team_id: u64, rules: &RuleSet) {
         let vm = &self.team_script_vm;
         let Some(team) = vm.teams.get(&team_id) else {
             return;
         };
+        // Calc_Center6EAF13 branches before the ordinary member mean. This
+        // also applies to callers outside the action handler (formation,
+        // regroup and the team's ordinary AI pass).
+        if team.current_action(vm) == 10 {
+            let (zone, closest) = self.team_follow_friendly_center(team_id);
+            if let Some(team) = self.team_script_vm.teams.get_mut(&team_id) {
+                team.zone = zone;
+                team.closest_member = closest;
+            }
+            return;
+        }
         let guard_slower = team
             .team_type_id
             .and_then(|id| vm.team_type_ini.get(&id))
             .is_some_and(|metadata| metadata.guard_slower);
         let focus = team.focus.map(|focus| self.team_target_xy(focus));
-        let samples: Vec<CenterSample> = team
-            .members
-            .iter()
-            .filter_map(|member| {
-                let entity = self.substrate.entities.get(member.id)?;
-                let naval_transport = self
-                    .object_type(entity.type_ref(), rules)
-                    .is_some_and(|object| object.passengers > 0 && object.naval);
-                center_sample(
-                    entity,
-                    member.initiated,
-                    guard_slower && self.guard_slower_weight(entity, rules),
-                    naval_transport,
-                )
-            })
-            .collect();
+        let samples = team.members.iter().filter_map(|member| {
+            let entity = self.substrate.entities.get(member.id)?;
+            let naval_transport = self
+                .object_type(entity.type_ref(), rules)
+                .is_some_and(|object| object.passengers > 0 && object.naval);
+            center_sample(
+                entity,
+                member.initiated,
+                guard_slower && self.guard_slower_weight(entity, rules),
+                naval_transport,
+                self.object_placement_scope_active(),
+            )
+        });
         let head = team.members.first().map(|member| member.id);
-        let (zone, closest) = match center_of(&samples, focus) {
+        let (zone, closest) = match center_of(
+            samples,
+            focus,
+            rules.ares(),
+            self.session.map_exceeds_original_size(),
+        ) {
             None => (None, None),
             Some((mean, closest)) => {
-                let cell = TeamTarget::Cell {
-                    x: (mean[0] / 256) as i16,
-                    y: (mean[1] / 256) as i16,
-                };
+                // CalcCenter6EB331 selects Map565730's Cell before CanEnter.
+                let (x, y) = self.resolved_terrain.as_ref().map_or(
+                    ((mean[0] / 256) as i16, (mean[1] / 256) as i16),
+                    |terrain| {
+                        let cells =
+                            crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
+                        cells.coord(cells.lookup_world(mean[0], mean[1]))
+                    },
+                );
+                let cell = TeamTarget::Cell { x, y };
+                //6EB33C publishes the pointer before CanEnter's map queries.
+                if let Some(team) = self.team_script_vm.teams.get_mut(&team_id) {
+                    team.zone = Some(cell);
+                }
                 let closest = closest.or(head);
                 let zone = match closest {
-                    Some(member)
-                        if self.team_member_refuses_cell(member, cell, rules, registry) =>
-                    {
+                    Some(member) if self.team_member_refuses_cell(member, cell, rules) => {
                         TeamTarget::Object(member)
                     }
                     _ => cell,
@@ -396,29 +471,26 @@ impl Simulation {
     }
 
     /// `FootClass vt+0x4E0` (`0x004DBFD0`), which a `GuardSlower=` team's
-    /// centre weights twice: unarmed (`GetWeapon(0)`), or of `TechLevel=-1`,
-    /// or `DeploysInto=` a building, or of `Speed=` 13 or less.
+    /// centre weights twice: a type of `TechLevel=-1`, or `DeploysInto=` a
+    /// building, or of converted speed 13 leptons/frame or less
+    /// (`TechnoTypeClass::Read_INI @ 0x0071465F`). Its first test, a NULL
+    /// `GetWeapon(0)` (`0x004DBFD7..0x004DBFE1`), never passes: GetWeapon
+    /// `0x0070E140` returns NULL only for index -1 and otherwise the address
+    /// of a weapon slot (`0x007177C0`/`0x007177E0`), so an unarmed member is
+    /// weighted by those three tests alone.
     fn guard_slower_weight(&self, entity: &GameEntity, rules: &RuleSet) -> bool {
         self.object_type(entity.type_ref(), rules)
             .is_some_and(|object| {
-                crate::sim::combat::combat_weapon::weapon_for_index(object, entity.veterancy(), 0)
-                    .is_none()
-                    || object.tech_level == -1
+                self.object_tech_level(object) == -1
                     || object.deploys_into.is_some()
-                    || object.speed <= 13
+                    || crate::util::fixed_math::ra2_speed_to_leptons_per_frame(object.speed) <= 13
             })
     }
 
     /// `vt+0x1AC Can_Enter_Cell(cell, -1, -1, NULL, 1)` is not "move ok"
     /// (non-zero) for `member`, by its class's own answer
     /// ([`Simulation::mover_can_enter`]). An answer VERA cannot read admits.
-    fn team_member_refuses_cell(
-        &self,
-        member: u64,
-        cell: TeamTarget,
-        rules: &RuleSet,
-        registry: Option<&OverlayTypeRegistry>,
-    ) -> bool {
+    fn team_member_refuses_cell(&self, member: u64, cell: TeamTarget, rules: &RuleSet) -> bool {
         let TeamTarget::Cell { x, y } = cell else {
             return false;
         };
@@ -426,8 +498,8 @@ impl Simulation {
             member,
             (x, y),
             crate::sim::movement::infantry_entry::InfantryEntryArgs::REPAIR,
+            crate::sim::movement::infantry_entry::EntryQueryMode::CheckLocomotor,
             rules,
-            registry,
         )
         .is_ok_and(|code| code != 0)
     }
@@ -443,15 +515,16 @@ impl Simulation {
         &mut self,
         team_id: u64,
         rules: &RuleSet,
-        registry: Option<&OverlayTypeRegistry>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> bool {
         use crate::sim::mission::MissionType;
-        let Some(team) = self.team_script_vm.teams.get(&team_id) else {
+        if !self.team_script_vm.teams.contains_key(&team_id) {
             return true;
-        };
-        let members = team.members.clone();
+        }
+        // The walk reads a copy: a member's join or move can change the list.
+        let members = self.team_script_vm.copy_members(team_id);
         let mut regrouped = true;
-        for member in members {
+        for &member in &members {
             let Some(zone) = self
                 .team_script_vm
                 .teams
@@ -460,52 +533,55 @@ impl Simulation {
             else {
                 break;
             };
-            let Some(entity) = self.substrate.entities.get(member.id) else {
+            let Some(entity) = self.substrate.entities.get(member) else {
                 continue;
             };
-            if !entity.lifecycle.object_alive {
+            if !entity.lifecycle.object_alive() {
                 continue;
             }
-            self.team_member_join_up(team_id, member.id, rules, registry);
-            let Some(entity) = self.substrate.entities.get(member.id) else {
+            self.team_member_join_up(team_id, member, rules, frame_effects);
+            let Some(entity) = self.substrate.entities.get(member) else {
                 continue;
             };
-            let initiated = self.team_member_initiated(team_id, member.id);
-            if !member_is_live_joined(entity, initiated) {
+            let initiated = self.team_member_initiated(team_id, member);
+            if !member_is_live_joined(entity, initiated, self.object_placement_scope_active()) {
                 continue;
             }
             let stray = self.team_stray(team_id, rules);
             let mission = entity.mission.effective().known();
             let area_guarding_target =
-                mission == Some(MissionType::AreaGuard) && entity.attack_target.is_some();
+                mission == Some(MissionType::AreaGuard) && entity.attack_target.target().is_some();
             if self.team_member_distance(entity, zone) > stray && !area_guarding_target {
-                if entity.navigation.nav_com.is_some() {
+                if entity.navigation.nav_com().is_some() {
                     continue;
                 }
-                self.team_member_queue_mission(member.id, MissionType::Move, rules);
+                self.team_member_queue_mission(member, MissionType::Move, rules);
                 regrouped = false;
                 let cell = zone.and_then(|zone| self.team_target_cell_of_coord(zone));
-                self.team_member_set_destination(member.id, cell, rules, registry);
+                self.team_member_set_destination(member, cell, rules, frame_effects);
             } else {
                 if mission == Some(MissionType::AreaGuard) {
                     continue;
                 }
-                self.team_member_queue_mission(member.id, MissionType::Guard, rules);
-                self.team_member_set_destination(member.id, None, rules, registry);
+                self.team_member_queue_mission(member, MissionType::Guard, rules);
+                self.team_member_set_destination(member, None, rules, frame_effects);
             }
         }
+        self.team_script_vm.restore_member_ids(members);
         regrouped
     }
 
     /// `0x006EA0D0`, when a formed team is under strength: it stops (not
     /// formed, before its first action); an empty one loses its centre;
-    /// otherwise, with a centre (or its closest member as the centre), it
-    /// moves to the centre's cell (module residual).
+    /// otherwise it searches the House's unarmed buildings and falls back to
+    /// its centre when no candidate yields a cell. Original controls:
+    /// `tools.team_recruit_oracle --retreat`.
     fn team_under_strength_retreat(
         &mut self,
         team_id: u64,
         rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
+        frame_effects: &mut FrameEffects<'_>,
     ) {
         let Some(team) = self.team_script_vm.teams.get_mut(&team_id) else {
             return;
@@ -516,7 +592,7 @@ impl Simulation {
             team.zone = None;
             return;
         }
-        self.team_calc_center(team_id, rules, registry);
+        self.team_calc_center(team_id, rules);
         let Some(team) = self.team_script_vm.teams.get_mut(&team_id) else {
             return;
         };
@@ -527,11 +603,86 @@ impl Simulation {
             team.zone = Some(TeamTarget::Object(closest));
         }
         let zone = team.zone.expect("set above");
-        let focus = self.team_target_cell_of_coord(zone);
+        let owner = team.owner;
+        let mut focus = self.team_target_cell_of_coord(zone);
+        let mut best_score = i32::MAX;
+        if let Some(house) = self.houses.get(&owner) {
+            // 6EA173 iterates the retained House Building array, in order.
+            for &building_id in house.base_projection().buildings() {
+                let Some(building) = self.substrate.entities.get(building_id) else {
+                    continue;
+                };
+                if building.lifecycle.in_limbo() {
+                    continue;
+                }
+                let Some(object) = self.object_type(building.type_ref(), rules) else {
+                    continue;
+                };
+                if crate::sim::combat::combat_weapon::get_weapon(
+                    building,
+                    object,
+                    0,
+                    &self.substrate.entities,
+                    rules,
+                    &self.interner,
+                )
+                .is_some()
+                {
+                    continue;
+                }
+                let Some(destination) = self.team_target_coord(TeamTarget::Object(building_id))
+                else {
+                    continue;
+                };
+                let Some(source) = self.team_target_coord(zone) else {
+                    continue;
+                };
+                // 6EA1FF..6EA256 squares dx,dz,dy through the shared original
+                // Sqrt_Approx/ftol kernel; this is centre distance, no foundation subtraction.
+                let distance = crate::util::native_x87::sqrt_approx_length([
+                    destination.x.wrapping_sub(source.x),
+                    destination.z.wrapping_sub(source.z),
+                    destination.y.wrapping_sub(source.y),
+                ]);
+                let target = ((destination.x / 256) as i16, (destination.y / 256) as i16);
+                let Ok(threat) = self.house_threat_at_cell(owner, target) else {
+                    continue;
+                };
+                let mut score = distance.wrapping_mul(threat.wrapping_add(1));
+                // UnitRepair+16A9 gets signed division by two, 6EA274..288.
+                if object.unit_repair {
+                    score /= 2;
+                }
+                if score >= best_score {
+                    continue;
+                }
+                // Inline GetLeader6EA2E5..341 has the same owner as Script16,
+                // Script54 and House50D170: highest live joined LeadershipRating.
+                let Some(leader) = self.team_leader(team_id, rules) else {
+                    continue;
+                };
+                let from = ((source.x / 256) as i16, (source.y / 256) as i16);
+                let Some((x, y)) = self.foot_nearby_location(leader, from, target, 2..4, rules)
+                else {
+                    continue;
+                };
+                best_score = score;
+                focus = Some(TeamTarget::Cell { x, y });
+            }
+        }
+        // 6EA39B resolves the selected packed cell through Map5657A0 before
+        // retaining it. This also preserves fixed-stride aliases/Dummy stamps.
+        let focus = match (focus, self.resolved_terrain.as_ref()) {
+            (Some(TeamTarget::Cell { x, y }), Some(terrain)) => {
+                let (x, y) = terrain.native_cell_coord(terrain.native_cell_identity((x, y)));
+                Some(TeamTarget::Cell { x, y })
+            }
+            _ => focus,
+        };
         if let Some(team) = self.team_script_vm.teams.get_mut(&team_id) {
             team.focus = focus;
         }
-        self.team_coordinate_move(team_id, rules, registry);
+        self.team_coordinate_move(team_id, rules, registry, frame_effects);
     }
 
     /// `TeamClass::Took_Damage @ 0x006EB380`, from `FootClass::ReceiveDamage
@@ -540,9 +691,17 @@ impl Simulation {
     /// `Suicide=`, a forming team loses its centre and reforms; a formed one
     /// does too for an `Annoyance=` TeamType, unless `source` is a member,
     /// the head is an aircraft or unarmed (`GetWeapon(0)`), or `source` is
-    /// the team's move target. Nothing after those writes has an effect
-    /// (`0x006EB432..0x006EB477` ends in a discarded `WhatAmI`).
-    pub(crate) fn team_took_damage(&mut self, member: u64, source: Option<u64>, rules: &RuleSet) {
+    /// the team's move target. Nothing after those writes has an effect in
+    /// stock gamemd (`0x006EB432..0x006EB477` ends in a discarded `WhatAmI`);
+    /// Ares replaces that tail ([`Self::ares_team_retaliate`]).
+    pub(crate) fn team_took_damage(
+        &mut self,
+        member: u64,
+        source: Option<u64>,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+    ) {
+        let ares = rules.ares_form();
         let Some(source) = source else {
             return;
         };
@@ -557,7 +716,8 @@ impl Simulation {
         if definition.is_some_and(|definition| definition.suicide) {
             return;
         }
-        if team.formed {
+        let formed = team.formed;
+        if formed {
             if team.members.iter().any(|member| member.id == source) {
                 return;
             }
@@ -568,14 +728,8 @@ impl Simulation {
             else {
                 return;
             };
-            let armed = self
-                .object_type(head.type_ref(), rules)
-                .and_then(|object| {
-                    crate::sim::combat::combat_weapon::weapon_for_index(object, head.veterancy(), 0)
-                })
-                .is_some();
-            if head.category == EntityCategory::Aircraft
-                || !armed
+            if head.category() == EntityCategory::Aircraft
+                || !first_weapon_armed(&self.interner, head, rules)
                 || team.focus == Some(TeamTarget::Object(source))
             {
                 return;
@@ -585,12 +739,92 @@ impl Simulation {
                 .and_then(|id| vm.team_type_ini.get(&id))
                 .is_some_and(|metadata| metadata.annoyance);
             if !annoyance {
+                if ares {
+                    self.ares_team_retaliate(team_id, source, rules, registry);
+                }
                 return;
             }
         }
         if let Some(team) = self.team_script_vm.teams.get_mut(&team_id) {
             team.zone = None;
             team.reforming = true;
+        }
+        if ares && formed {
+            self.ares_team_retaliate(team_id, source, rules, registry);
+        }
+    }
+
+    /// Ares TeamClass_AttackedBy_Retaliate (1003A180, hook 0x6EB432), the
+    /// formed team's tail under `[General] TeamRetaliate=yes`. An armed
+    /// Techno focus (`+0x40`, `GetWeapon(0)`) is kept unless the team has a
+    /// centre (`+0x34`) that the focus is close enough to attack:
+    /// IsCloseEnoughToAttackCoords (vt+0x3B0, `0x006F7930`) is CanFireAt of
+    /// the cell at the centre's GetCoords with the weapon SelectWeapon picks
+    /// against that cell. Otherwise an attacker that is no Aircraft, of no
+    /// House the team's owner is allied with (IsAlliedWith, inlined) and, for
+    /// a Foot, neither in limbo nor `ConsideredAircraft=` becomes the focus.
+    fn ares_team_retaliate(
+        &mut self,
+        team_id: u64,
+        attacker: u64,
+        rules: &RuleSet,
+        registry: Option<&OverlayTypeRegistry>,
+    ) {
+        if !rules.ares_general().team_retaliate() {
+            return;
+        }
+        let Some(team) = self.team_script_vm.teams.get(&team_id) else {
+            return;
+        };
+        let (focus, zone, owner) = (team.focus, team.zone, team.owner);
+        if let Some(TeamTarget::Object(focus)) = focus
+            && self
+                .substrate
+                .entities
+                .get(focus)
+                .is_some_and(|entity| first_weapon_armed(&self.interner, entity, rules))
+        {
+            let Some(zone) = zone else {
+                return;
+            };
+            let cells = self
+                .resolved_terrain
+                .as_ref()
+                .map(crate::map::resolved_terrain::NativeCellQuery::canonical);
+            let Some(centre) = crate::sim::movement::ground_pose::target_get_coords(
+                zone.target_kind(),
+                self,
+                cells.as_ref(),
+            ) else {
+                return;
+            };
+            let (x, y) = crate::sim::movement::coord_cell(centre);
+            let cell = crate::sim::combat::TargetKind::Cell(x as u16, y as u16);
+            if !self.techno_can_fire_at_target(focus, cell, rules, registry) {
+                return;
+            }
+        }
+        let Some(attacker_entity) = self.substrate.entities.get(attacker) else {
+            return;
+        };
+        if attacker_entity.category() == EntityCategory::Aircraft
+            || crate::sim::combat::combat_weapon::is_ally_by_object(
+                Some(&self.house_alliances),
+                &self.interner,
+                owner,
+                attacker_entity.owner(),
+            )
+            || (attacker_entity.category().is_foot()
+                && (attacker_entity.lifecycle.in_limbo()
+                    || self
+                        .interner
+                        .object_type(attacker_entity.type_ref(), rules)
+                        .is_some_and(|object| object.considered_aircraft)))
+        {
+            return;
+        }
+        if let Some(team) = self.team_script_vm.teams.get_mut(&team_id) {
+            team.focus = Some(TeamTarget::Object(attacker));
         }
     }
 
@@ -604,13 +838,15 @@ impl Simulation {
         team_id: u64,
         member: u64,
         rules: &RuleSet,
-        registry: Option<&OverlayTypeRegistry>,
+        frame_effects: &mut FrameEffects<'_>,
     ) -> bool {
         use crate::sim::mission::MissionType;
         let Some(entity) = self.substrate.entities.get(member) else {
             return false;
         };
-        if !member_is_live(entity) || self.team_member_initiated(team_id, member) {
+        if !member_is_live(entity, self.object_placement_scope_active())
+            || self.team_member_initiated(team_id, member)
+        {
             return false;
         }
         let zone = self
@@ -619,13 +855,14 @@ impl Simulation {
             .get(&team_id)
             .and_then(|team| team.zone);
         if self.team_member_distance(entity, zone) <= self.team_stray(team_id, rules) {
-            self.team_set_member_initiated(team_id, member);
+            self.team_script_vm
+                .team_set_member_initiated(team_id, member);
             return false;
         }
-        if entity.navigation.nav_com.is_none() {
+        if entity.navigation.nav_com().is_none() {
             self.team_member_queue_mission(member, MissionType::Move, rules);
             self.team_member_clear_target(member, rules);
-            self.team_member_set_destination(member, zone, rules, registry);
+            self.team_member_set_destination(member, zone, rules, frame_effects);
         }
         true
     }
@@ -637,17 +874,6 @@ impl Simulation {
             .get(&team_id)
             .and_then(|team| team.members.iter().find(|record| record.id == member))
             .is_some_and(|record| record.initiated)
-    }
-
-    pub(super) fn team_set_member_initiated(&mut self, team_id: u64, member: u64) {
-        if let Some(record) = self
-            .team_script_vm
-            .teams
-            .get_mut(&team_id)
-            .and_then(|team| team.members.iter_mut().find(|record| record.id == member))
-        {
-            record.initiated = true;
-        }
     }
 
     /// `TeamClass::Get_Stray @ 0x006F03B0` (which `Regroup`, `Coordinate_Move`
@@ -671,17 +897,16 @@ impl Simulation {
     /// ([`object_get_coords`]): a building's foundation centre
     /// (`0x00447AC0`), any other object's Location.
     pub(super) fn team_target_coord(&self, target: TeamTarget) -> Option<DriveCoord> {
-        match target {
-            TeamTarget::Cell { x, y } => Some(crate::sim::movement::target_cell_coord(
-                x as u16,
-                y as u16,
-                self.resolved_terrain.as_ref(),
-            )),
-            TeamTarget::Object(id) => {
-                let entity = self.substrate.entities.get(id)?;
-                Some(object_get_coords(entity, self.resolved_terrain.as_ref()))
-            }
-        }
+        // Abstract+48 reads the retained pointer. The coordinate owner also
+        // keeps a Dummy's live coordinate instead of performing a new lookup.
+        crate::sim::movement::ground_pose::target_get_coords(
+            target.target_kind(),
+            self,
+            self.resolved_terrain
+                .as_ref()
+                .map(crate::map::resolved_terrain::NativeCellQuery::canonical)
+                .as_ref(),
+        )
     }
 
     /// A team target's XY (0, 0 for a missing object).
@@ -701,42 +926,31 @@ impl Simulation {
     }
 
     /// `ObjectClass::Distance @ 0x005F6360` from `member` to `target`
-    /// ([`crate::util::native_x87::object_distance`]), 0 without one. Both
-    /// ends are GetCoords (`vt+0x48` at `0x005F6383` and `0x005F6391`).
+    /// ([`Simulation::object_distance_to`]), 0 without one.
     pub(super) fn team_member_distance(
         &self,
         member: &GameEntity,
         target: Option<TeamTarget>,
     ) -> i32 {
-        let Some(target) = target else {
-            return 0;
-        };
-        let Some(to) = self.team_target_coord(target) else {
-            return 0;
-        };
-        let from = object_get_coords(member, self.resolved_terrain.as_ref());
-        let building = match target {
-            TeamTarget::Object(id) => self
-                .substrate
-                .entities
-                .get(id)
-                .filter(|building| building.category == EntityCategory::Structure)
-                .map(|building| {
-                    let (width, height) =
-                        crate::rules::foundation::foundation_dimensions(&building.foundation);
-                    (i32::from(width), i32::from(height))
-                }),
-            TeamTarget::Cell { .. } => None,
-        };
-        crate::util::native_x87::object_distance(
-            [from.x, from.y, from.z],
-            [to.x, to.y, to.z],
-            building,
-        )
+        target
+            .and_then(|target| self.object_distance_to(member.stable_id(), target.target_kind()))
+            .unwrap_or(0)
     }
 }
 
-#[cfg(test)]
+impl crate::sim::team_script_vm::TeamScriptVm {
+    pub(super) fn team_set_member_initiated(&mut self, team_id: u64, member: u64) {
+        if let Some(record) = self
+            .teams
+            .get_mut(&team_id)
+            .and_then(|team| team.members.iter_mut().find(|record| record.id == member))
+        {
+            record.initiated = true;
+        }
+    }
+}
+
+#[cfg(all(test, tests_sim_t_z))]
 mod tests {
     use super::TeamTarget;
 
@@ -746,7 +960,7 @@ mod tests {
     /// mapped.
     #[test]
     fn an_aircraft_member_refuses_a_shrouded_centre() {
-        let (mut sim, rules, registry) = crate::sim::world::entry_test_fixture::fixture();
+        let (mut sim, rules, _registry) = crate::sim::world::entry_test_fixture::fixture();
         let hornet = sim
             .spawn_object("HORNET", "Americans", 17, 15, 0, &rules)
             .expect("aircraft");
@@ -754,39 +968,56 @@ mod tests {
             .entities
             .get_mut(hornet)
             .expect("aircraft")
+            .seldom
             .discovery
-            .owned_by_current_house = true;
-        sim.fog = crate::sim::vision::FogState {
-            width: 33,
-            height: 33,
-            ..Default::default()
-        };
+            .set_owned_by_current_house_for_test(true);
+        sim.fog = crate::sim::vision::FogState::new(33, 33);
         let centre = TeamTarget::Cell { x: 12, y: 12 };
-        assert!(sim.team_member_refuses_cell(hornet, centre, &rules, Some(&registry)));
+        assert!(sim.team_member_refuses_cell(hornet, centre, &rules));
 
         let owner = sim.interner.intern("Americans");
         crate::sim::vision::reveal_radius(&mut sim.fog, owner, 12, 12, 2);
-        assert!(!sim.team_member_refuses_cell(hornet, centre, &rules, Some(&registry)));
+        assert!(!sim.team_member_refuses_cell(hornet, centre, &rules));
     }
 
-    /// `ObjectClass::Distance @ 0x005F6360` measures from the member's
-    /// GetCoords (`vt+0x48` at `0x005F6391`), whose Z is the object's world
-    /// Z: a hovering member's height counts.
+    /// Ares TeamClass_AttackedBy_Retaliate (1003A180, hook 0x6EB432): with
+    /// `[General] TeamRetaliate=yes` a formed team without a focus takes an
+    /// enemy attacker as its focus; with the stock tail it keeps none.
     #[test]
-    fn a_hovering_members_distance_counts_its_height() {
-        use crate::rules::locomotor_type::LocomotorKind;
-        use crate::sim::movement::locomotor::LocomotorState;
-        let mut sim = crate::sim::world::Simulation::new();
-        let mut member =
-            crate::sim::game_entity::GameEntity::test_default(1, "HOVER", "Americans", 4, 4);
-        let mut locomotor = LocomotorState::for_test_kind(LocomotorKind::Hover);
-        locomotor.altitude = crate::util::fixed_math::SimFixed::from_num(120);
-        member.locomotor = Some(locomotor);
-        sim.substrate.entities.insert(member);
-        let member = sim.substrate.entities.get(1).expect("member");
-        // The cell target is (4, 4)'s centre at its floor, straight below, so
-        // the whole distance is the height.
-        let distance = sim.team_member_distance(member, Some(TeamTarget::Cell { x: 4, y: 4 }));
-        assert_eq!(distance, 120);
+    fn ares_team_retaliate_focuses_an_enemy_attacker() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        for retaliate in [false, true] {
+            let ini = crate::sim::arena_fixture::clear_ground_ini(&format!(
+                "[General]\nTeamRetaliate={}\n\
+                 [Countries]\n0=Americans\n1=Russians\n\
+                 [VehicleTypes]\n0=TANK\n[WeaponTypes]\n0=GUN\n[Warheads]\n0=WH\n\
+                 [WH]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n\
+                 [GUN]\nDamage=10\nRange=5\nROF=20\nWarhead=WH\n\
+                 [TANK]\nStrength=300\nArmor=none\nSpeed=6\nPrimary=GUN\n",
+                if retaliate { "yes" } else { "no" }
+            ));
+            let rules = crate::rules::ruleset::RuleSet::from_ini(&ini).expect("rules");
+            let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 7);
+            sim.intern_rule_type_ids(&rules);
+            sim.resolve_type_handles(&rules);
+            let member = sim
+                .spawn_object("TANK", "Russians", 10, 10, 0, &rules)
+                .expect("member");
+            let attacker = sim
+                .spawn_object("TANK", "Americans", 14, 10, 0, &rules)
+                .expect("attacker");
+            let team =
+                crate::sim::team_script_vm::join_team_for_test(&mut sim, &[member], false, false);
+            let state = sim.team_script_vm.teams.get_mut(&team).expect("team");
+            state.formed = true;
+            state.focus = None;
+            sim.team_took_damage(member, Some(attacker), &rules, None);
+            let focus = sim.team_script_vm.teams.get(&team).expect("team").focus;
+            assert_eq!(
+                focus == Some(TeamTarget::Object(attacker)),
+                retaliate,
+                "{focus:?}"
+            );
+        }
     }
 }

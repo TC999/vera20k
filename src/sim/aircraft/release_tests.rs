@@ -1,11 +1,12 @@
-//! Original-instruction witnesses for the retained release lifecycle. These
-//! tests do not certify the still-unwired Mission_Attack emission/navigation.
+//! Original-instruction witnesses for the aircraft release lifecycle: the
+//! pending ammo charge, its debit on Commence, and a strike that releases
+//! nothing.
 
-use super::{AircraftMission, tick_aircraft_missions};
+use super::tick_aircraft_missions;
 use crate::map::entities::EntityCategory;
 use crate::rules::{ini_parser::IniFile, ruleset::RuleSet};
-use crate::sim::combat::AttackTarget;
-use crate::sim::docking::aircraft_dock::AircraftAmmo;
+use crate::sim::ammo::TechnoAmmo;
+use crate::sim::combat::TargetKind;
 use crate::sim::game_entity::GameEntity;
 use crate::sim::intern::test_interner;
 use crate::sim::mission::leaf::MissionLeafState;
@@ -15,11 +16,8 @@ use crate::sim::snapshot::GameSnapshot;
 use crate::sim::world::Simulation;
 use serde_json::Value;
 
-fn corpus() -> Value {
-    serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/aircraft_attack_release.json"
-    ))
-    .unwrap()
+fn corpus() -> &'static Value {
+    crate::test_fixture::json("tools/spatial_oracle/aircraft_attack_release.json")
 }
 
 fn fixture(input: &Value) -> (Simulation, RuleSet) {
@@ -33,19 +31,16 @@ fn fixture(input: &Value) -> (Simulation, RuleSet) {
     // out of the state/continuation comparison.
     let mut sim = Simulation::with_seed(0);
     let mut entity = GameEntity::test_default(1, "ORCA", "Americans", 10, 10);
-    entity.category = EntityCategory::Aircraft;
-    entity.mission_leaf = MissionLeafState::aircraft_raw_for_test(
-        u8::from(input["latch_6d2"].as_bool().unwrap()),
-        1,
-        false,
-    );
+    entity.set_category_for_test(EntityCategory::Aircraft);
+    entity.mission_leaf =
+        MissionLeafState::aircraft_raw_for_test(u8::from(input["latch_6d2"].as_bool().unwrap()), 1);
     entity.mission = MissionCom::at_frame(0);
-    let mut ammo = AircraftAmmo::new(2);
-    ammo.current = input["ammo"].as_i64().unwrap() as i32;
+    let mut ammo = TechnoAmmo::new(2);
+    ammo.set_current_for_test(input["ammo"].as_i64().unwrap() as i32);
     if input["pending"].as_bool().unwrap() {
         ammo.begin_release();
     }
-    entity.aircraft_ammo = Some(ammo);
+    entity.install_ammo_for_test(Some(ammo));
     entity.locomotor = Some(LocomotorState::from_object_type(
         rules.object("ORCA").unwrap(),
         0,
@@ -66,7 +61,7 @@ fn fixture(input: &Value) -> (Simulation, RuleSet) {
             dispatch_timer: crate::sim::mission::MissionDispatchTimer::at_frame(0),
         });
     sim.substrate.entities.insert(entity);
-    sim.substrate.next_stable_object_id = 2;
+    sim.set_next_stable_object_id_for_test(2);
     sim.interner = test_interner();
     sim.set_logic_order_for_test(vec![1]);
     (sim, rules)
@@ -74,8 +69,12 @@ fn fixture(input: &Value) -> (Simulation, RuleSet) {
 
 fn assert_native(sim: &Simulation, row: &Value) {
     let entity = sim.substrate.entities.get(1).unwrap();
-    let ammo = entity.aircraft_ammo.as_ref().unwrap();
-    assert_eq!(ammo.current, row["ammo"].as_i64().unwrap() as i32, "{row}");
+    let ammo = entity.ammo().unwrap();
+    assert_eq!(
+        ammo.current(),
+        row["ammo"].as_i64().unwrap() as i32,
+        "{row}"
+    );
     assert_eq!(
         ammo.release_pending(),
         row["pending"].as_bool().unwrap(),
@@ -95,10 +94,12 @@ fn aircraft_mission_entry_debits_match_original_instructions_and_save_restore() 
     assert_eq!(rows.len(), 72);
     for row in rows {
         let (mut sim, rules) = fixture(&row["input"]);
-        sim.substrate.entities.get_mut(1).unwrap().aircraft_mission =
-            Some(AircraftMission::Attack {
-                sub_state: row["input"]["state"].as_u64().unwrap() as u8,
-            });
+        sim.substrate
+            .entities
+            .get_mut(1)
+            .unwrap()
+            .mission
+            .set_handler_state(row["input"]["state"].as_u64().unwrap() as u32);
         let saved = GameSnapshot::save(&sim, 0, 0, "pending aircraft release", 0);
         let mut restored = GameSnapshot::load(&saved).unwrap().sim;
         restored.restore_after_snapshot_load().unwrap();
@@ -118,13 +119,17 @@ fn aircraft_ai_consumes_pending_after_commence_using_native_current_mission() {
     assert_eq!(rows.len(), 144);
     for row in rows {
         let (mut sim, rules) = fixture(&row["input"]);
-        // Deliberately contradictory legacy mirror: the original AI reads the
-        // canonical selector, not AircraftMission or target presence.
-        sim.substrate.entities.get_mut(1).unwrap().aircraft_mission =
-            Some(AircraftMission::Attack { sub_state: 4 });
-        sim.object_ai_post_movement_promote_one(1, Some(&rules));
+        // Deliberately contradictory handler state: the original AI reads
+        // the current mission, not Mission+0xBC or target presence.
+        sim.substrate
+            .entities
+            .get_mut(1)
+            .unwrap()
+            .mission
+            .set_handler_state(4);
+        sim.object_ai_post_movement_promote_one(1, &rules);
         assert_native(&sim, row);
-        sim.object_ai_post_movement_promote_one(1, Some(&rules));
+        sim.object_ai_post_movement_promote_one(1, &rules);
         assert_native(&sim, row); // the cleared pending flag prevents a second debit
     }
 }
@@ -139,14 +144,16 @@ fn aircraft_queued_order_debit_observes_successful_and_blocked_commence() {
             MissionId::from_raw(2),
             0,
             0,
-            &crate::sim::mission::authority::EntityReadyInputProvider,
+            &crate::sim::mission::authority::LiveReadyInputProvider {
+                rules: crate::rules::ruleset::RuleSet::empty_for_test(),
+            },
         )
         .unwrap();
-        sim.object_ai_post_movement_promote_one(1, Some(&rules));
+        sim.object_ai_post_movement_promote_one(1, &rules);
         let entity = sim.substrate.entities.get(1).unwrap();
-        let ammo = entity.aircraft_ammo.as_ref().unwrap();
+        let ammo = entity.ammo().unwrap();
         assert_eq!(entity.mission.current().raw(), if action { 1 } else { 2 });
-        assert_eq!(ammo.current, if action { 2 } else { 1 });
+        assert_eq!(ammo.current(), if action { 2 } else { 1 });
         assert_eq!(ammo.release_pending(), action);
     }
 }
@@ -157,33 +164,32 @@ fn aircraft_pending_charge_is_hashed_and_init_does_not_clear_it() {
     let (mut sim, rules) = fixture(&input);
     let before = sim.state_hash();
     let entity = sim.substrate.entities.get_mut(1).unwrap();
-    entity.aircraft_ammo.as_mut().unwrap().begin_release();
+    entity.ammo_mut().unwrap().begin_release();
     assert_ne!(before, sim.state_hash());
-    sim.substrate.entities.get_mut(1).unwrap().aircraft_mission =
-        Some(AircraftMission::Attack { sub_state: 0 });
     tick_aircraft_missions(&mut sim, &rules);
     let entity = sim.substrate.entities.get(1).unwrap();
-    assert!(entity.aircraft_ammo.as_ref().unwrap().release_pending());
-    assert_eq!(entity.aircraft_ammo.as_ref().unwrap().current, 2);
+    assert!(entity.ammo().unwrap().release_pending());
+    assert_eq!(entity.ammo().unwrap().current(), 2);
     assert_eq!(entity.mission_leaf.as_aircraft().unwrap().action_latch(), 0);
 }
 
+/// A strike whose GetFireError fails releases nothing. This Orca has no
+/// weapon (native GetFireError answers CANT, `0x006FC31C`), so state 4 takes
+/// its default arm (`0x00418544`): a loaded aircraft that does not strafe
+/// moves on to state 5.
 #[test]
-fn aircraft_mission_request_does_not_invent_a_successful_release() {
+fn failed_strike_fire_error_releases_nothing() {
     let input = serde_json::json!({"ammo":1,"pending":false,"latch_6d2":false});
     let (mut sim, rules) = fixture(&input);
     let entity = sim.substrate.entities.get_mut(1).unwrap();
-    entity.aircraft_mission = Some(AircraftMission::Attack { sub_state: 4 });
-    entity.attack_target = Some(AttackTarget::for_cell(10, 9));
-    for _ in 0..4 {
-        tick_aircraft_missions(&mut sim, &rules);
-        let entity = sim.substrate.entities.get(1).unwrap();
-        assert_eq!(entity.aircraft_ammo.as_ref().unwrap().current, 1);
-        assert!(!entity.aircraft_ammo.as_ref().unwrap().release_pending());
-        assert!(matches!(
-            entity.aircraft_mission,
-            Some(AircraftMission::Attack { sub_state: 4 })
-        ));
-        assert!(entity.attack_target.is_some());
-    }
+    entity.mission.set_handler_state(4);
+    entity
+        .attack_target
+        .set_for_test(Some(TargetKind::Cell(10, 9)));
+    tick_aircraft_missions(&mut sim, &rules);
+    let entity = sim.substrate.entities.get(1).unwrap();
+    assert_eq!(entity.ammo().unwrap().current(), 1);
+    assert!(!entity.ammo().unwrap().release_pending());
+    assert_eq!(crate::sim::aircraft::attack_state(entity), Some(5));
+    assert!(entity.attack_target.target().is_some());
 }

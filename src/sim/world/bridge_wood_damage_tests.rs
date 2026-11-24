@@ -21,10 +21,10 @@ fn export(scene: &HeadlessScenario, phase: &str) {
     };
     let sim = scene.sim();
     let result = json!({
-        "phase":phase, "frame":sim.session.binary_frame,
+        "phase":phase, "frame":sim.session.binary_frame(),
         "navigation":navigation_snapshot(sim, phase, points()),
         "entities":sim.entities().values().filter(|e|
-            (111..=120).contains(&e.position.rx) && (51..=67).contains(&e.position.ry)
+            (111..=120).contains(&e.position.rx()) && (51..=67).contains(&e.position.ry())
         ).map(|e| json!({"type":sim.resolve(e.type_ref()),"entity":e})).collect::<Vec<_>>(),
         "rng":{"main":sim.main_rng,"scenario":sim.scenario_rng,"mapgen":sim.mapgen_rng},
     });
@@ -43,15 +43,10 @@ fn assert_ground_surface(scene: &HeadlessScenario, collapsed: bool) {
             } else {
                 LandType::Road
             };
-            assert_eq!(cell.yr_cell_land_type, expected_land.as_index(), "{x},{y}");
+            assert_eq!(cell.land_type, expected_land.as_index(), "{x},{y}");
             assert_eq!(cell.level, 2);
             assert_eq!(cell.bridge_facts.raw_flags, 0);
             assert!(!cell.bridge_facts.has_structural_bridge());
-            assert_eq!(
-                sim.overlay_grid.as_ref().unwrap().cell(x, y).overlay_id,
-                cell.bridge_facts.overlay_id,
-                "OverlayGrid must mirror the raw Cell identity"
-            );
             assert!(
                 !sim.path_grid.as_ref().unwrap().is_walkable_on_layer(
                     x,
@@ -64,7 +59,7 @@ fn assert_ground_surface(scene: &HeadlessScenario, collapsed: bool) {
     }
     for hut in [(117, 56), (113, 62)] {
         assert_eq!(
-            crate::sim::world::bridge_orchestrator::bridge_hut_has_collapsed_span(sim, hut),
+            crate::sim::world::bridge_orchestrator::bridge_hut_can_repair(sim, hut),
             collapsed,
         );
     }
@@ -84,10 +79,9 @@ fn retail_wood_damage_repair_and_restore_publish_navigation() {
         save_scene(&scene, "healthy"),
         navigation_authority(scene.sim(), points()),
     )];
-    let scalar: Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tools/spatial_oracle/shrapnel_damage/scalar_test_vectors.json"
-    )))
+    let scalar: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/shrapnel_damage/scalar_test_vectors.json",
+    ))
     .unwrap();
     let physical = &scalar["physical_sequences"][1];
     for (step, phase, collapsed) in [(0, "damaged", false), (1, "collapsed", true)] {
@@ -100,12 +94,10 @@ fn retail_wood_damage_repair_and_restore_publish_navigation() {
             );
             let actual = scene
                 .sim()
-                .resolved_terrain
+                .overlay_grid
                 .as_ref()
                 .unwrap()
                 .cell(x, y)
-                .unwrap()
-                .bridge_facts
                 .overlay_id
                 .map_or(-1, i32::from);
             assert_eq!(actual, row[2].as_i64().unwrap() as i32, "{phase} {x},{y}");
@@ -185,7 +177,7 @@ fn retail_wood_force_fire_collapses_then_engineer_rebuilds() {
     repair_shrapnel_wood(&mut scene);
     export(&scene, "attack_healthy");
     let runtime = &mut scene.runtime;
-    let owner = runtime.simulation.session.current_house.unwrap();
+    let owner = runtime.simulation.session.current_house().unwrap();
     let owner_name = runtime.simulation.resolve(owner).to_owned();
     let tank = runtime
         .simulation
@@ -196,13 +188,13 @@ fn retail_wood_force_fire_collapses_then_engineer_rebuilds() {
             55,
             128,
             &runtime.resources.rules,
-            &runtime.resources.overlay_registry,
+            runtime.resources.rules.overlay_registry(),
         )
         .expect("ordinary Road firing placement");
     export(&scene, "attack_before_command");
     let command = CommandEnvelope::new(
         owner,
-        scene.sim().session.tick + 1,
+        scene.sim().session.tick() + 1,
         Command::ForceAttackCell {
             attacker_id: tank,
             target_rx: 115,
@@ -215,26 +207,30 @@ fn retail_wood_force_fire_collapses_then_engineer_rebuilds() {
             std::slice::from_ref(&command),
             SIM_TICK_MS,
             crate::sim::world::TickLane::Ordinary,
+            &mut crate::sim::world::FrameEffects::default(),
         )
         .unwrap();
     export(&scene, "attack_command_applied");
     let mut prior = scene
         .sim()
-        .resolved_terrain
+        .overlay_grid
         .as_ref()
         .unwrap()
         .cell(115, 59)
-        .unwrap()
-        .bridge_facts
         .overlay_id;
     let mut shots = Vec::new();
     let mut transitions = Vec::new();
     let mut collapsed = false;
     for _ in 0..18_000 {
-        let logic_frame = scene.sim().session.binary_frame;
+        let logic_frame = scene.sim().session.binary_frame();
         let output = scene
             .runtime
-            .advance_frame(&[], SIM_TICK_MS, crate::sim::world::TickLane::Ordinary)
+            .advance_frame(
+                &[],
+                SIM_TICK_MS,
+                crate::sim::world::TickLane::Ordinary,
+                &mut crate::sim::world::FrameEffects::default(),
+            )
             .unwrap();
         for shot in output
             .fire_events
@@ -247,12 +243,10 @@ fn retail_wood_force_fire_collapses_then_engineer_rebuilds() {
         }
         let overlay = scene
             .sim()
-            .resolved_terrain
+            .overlay_grid
             .as_ref()
             .unwrap()
             .cell(115, 59)
-            .unwrap()
-            .bridge_facts
             .overlay_id;
         if overlay != prior {
             transitions.push(json!({"completed_logic_frame":logic_frame,"overlay":overlay}));
@@ -289,14 +283,19 @@ fn retail_wood_force_fire_collapses_then_engineer_rebuilds() {
     let source = scene.sim().entities().get(tank).unwrap();
     assert!(source.is_alive());
     assert!(
-        source.attack_target.is_none(),
+        source.attack_target.target().is_none(),
         "70D4A0 must detach the Cell before the bullet continuation returns"
     );
     let mut guarding = false;
     for _ in 0..32 {
         let output = scene
             .runtime
-            .advance_frame(&[], SIM_TICK_MS, crate::sim::world::TickLane::Ordinary)
+            .advance_frame(
+                &[],
+                SIM_TICK_MS,
+                crate::sim::world::TickLane::Ordinary,
+                &mut crate::sim::world::FrameEffects::default(),
+            )
             .unwrap();
         assert!(
             !output

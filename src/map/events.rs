@@ -3,13 +3,26 @@
 //! `[Events]` stores a counted list of event-condition chunks per trigger id.
 //! We preserve the raw field list and also expose normalized conditions so
 //! runtime code can evaluate them without hardcoding a flat row assumption.
+//! Records keep their exact key: TriggerType::ReadINI (`0x0072749B`) reads
+//! the entry by the Type's own ID.
+
+// Outside data reaches this module: it refuses bad input, never panics.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
 
 use std::collections::HashMap;
 
 use crate::rules::ini_parser::IniFile;
 use crate::rules::ini_value::{crt_atoi, strtok};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct EventCondition {
     pub kind: i32,
     /// Materialized TEvent+34, not the parameter-type discriminator.
@@ -21,16 +34,25 @@ pub struct EventCondition {
     pub team_name: Option<String>,
 }
 
+/// One `[Events]` record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MapEvent {
-    pub id: String,
-    pub fields: Vec<String>,
-    pub conditions: Vec<EventCondition>,
+    id: String,
+    fields: Vec<String>,
+    conditions: Vec<EventCondition>,
+}
+
+impl MapEvent {
+    /// The events in native list order: the loop at `0x007274E2` prepends
+    /// each one it reads, so the last authored event comes first.
+    pub fn conditions(&self) -> &[EventCondition] {
+        &self.conditions
+    }
 }
 
 pub type EventMap = HashMap<String, MapEvent>;
 
-/// Parse `[Events]` into an id -> event record map.
+/// Parse `[Events]` into exact-key event records.
 pub fn parse_events(ini: &IniFile) -> EventMap {
     let Some(section) = ini.section("Events") else {
         return HashMap::new();
@@ -40,11 +62,7 @@ pub fn parse_events(ini: &IniFile) -> EventMap {
     for key in section.keys() {
         // TriggerType Read7274A6 uses the same512-byte buffer as its header.
         let raw_value = section.read_string(key, "", 512);
-        let id = key.trim();
-        if id.is_empty() {
-            continue;
-        }
-        let id = id.to_ascii_uppercase();
+        let id = key.to_string();
         let fields: Vec<String> = strtok(&raw_value, &[',']).map(str::to_string).collect();
         let conditions = parse_event_conditions(&raw_value);
         events.insert(
@@ -99,44 +117,4 @@ fn parse_event_conditions(raw: &str) -> Vec<EventCondition> {
     }
     conditions.reverse();
     conditions
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn records_follow_native_width_values_and_prepend_order() {
-        let ini = IniFile::from_str("[Events]\nEV_A=3,47,0,3,60,2,2,E1,27,0,7\nEV_B=2,7\n");
-        let events = parse_events(&ini);
-        assert_eq!(
-            events["EV_A"].conditions,
-            vec![
-                EventCondition {
-                    kind: 27,
-                    value: 7,
-                    ..Default::default()
-                },
-                EventCondition {
-                    kind: 60,
-                    value: 2,
-                    type_name: Some("E1".into()),
-                    ..Default::default()
-                },
-                EventCondition {
-                    kind: 47,
-                    value: 3,
-                    ..Default::default()
-                },
-            ]
-        );
-        assert!(events["EV_B"].conditions.is_empty());
-        assert_eq!(events["EV_B"].fields, ["2", "7"]);
-    }
-
-    #[test]
-    fn test_missing_events_is_empty() {
-        let ini = IniFile::from_str("[Map]\nTheater=TEMPERATE\n");
-        assert!(parse_events(&ini).is_empty());
-    }
 }

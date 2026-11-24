@@ -6,12 +6,8 @@ use crate::sim::bridge_state::DispatchPath;
 use crate::sim::rng::SimRng;
 use serde_json::{Value, json};
 
-fn corpus() -> Value {
-    serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tools/spatial_oracle/bridge_damage_admission.json"
-    )))
-    .unwrap()
+fn corpus() -> &'static Value {
+    crate::test_fixture::json("tools/spatial_oracle/bridge_damage_admission.json")
 }
 
 fn int(case: &Value, key: &str, default: i32) -> i32 {
@@ -52,12 +48,14 @@ impl<'a> Host<'a> {
                     tile: int(input, "tile", -1),
                     overlay: int(input, "overlay", -1),
                     level: int(input, "level", 0) as u8,
+                    fixed_deck_z: None,
                 },
                 CellFields {
                     flags: 0,
                     tile: -1,
                     overlay: int(input, "anchor_overlay", 0x18),
                     level: 0,
+                    fixed_deck_z: None,
                 },
             ],
             rng: SimRng::new(int(input, "seed", 31) as u64),

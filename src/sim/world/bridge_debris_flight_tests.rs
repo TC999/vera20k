@@ -58,8 +58,8 @@ fn flight_rules(producer: &Value, inputs: &Value) -> Option<RuleSet> {
 // This compares actual production RuleSet values; VERA's exports did not seed
 // the native readers. Every HE/Super entry and sampled damage result must match.
 fn assert_native_landing_inputs(rules: &RuleSet) {
-    let corpus: Value = serde_json::from_str(include_str!(
-        "../../../tools/rules_oracle/bridge_landing_inputs.json"
+    let corpus: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/rules_oracle/bridge_landing_inputs.json",
     ))
     .unwrap();
     let retail = corpus["layers"].as_array().unwrap().last().unwrap();
@@ -104,7 +104,13 @@ fn assert_native_landing_inputs(rules: &RuleSet) {
                 f32::from_bits(u32::from_str_radix(expected[key].as_str().unwrap(), 16).unwrap());
             assert_eq!(value.to_bits(), f64::from(native).to_bits(), "{name}/{key}");
         }
-        for (index, value) in actual.verses_f64.iter().enumerate() {
+        for index in 0..11 {
+            let value = f64::from_bits(
+                actual
+                    .interaction(crate::rules::armor::ArmorId::from_index(index))
+                    .multiplier()
+                    .bits(),
+            );
             let native =
                 u64::from_str_radix(expected["verses_bits"][index].as_str().unwrap(), 16).unwrap();
             assert_eq!(value.to_bits(), native, "{name}/armor{index}");
@@ -131,12 +137,12 @@ fn assert_native_landing_inputs(rules: &RuleSet) {
             "{name}"
         );
         assert_eq!(
-            serde_json::json!(actual.temperate_occupation_bits),
+            serde_json::json!(actual.raw_occupation_bits(false)),
             expected["temperate_occupation_bits"],
             "{name}"
         );
         assert_eq!(
-            serde_json::json!(actual.snow_occupation_bits),
+            serde_json::json!(actual.raw_occupation_bits(true)),
             expected["snow_occupation_bits"],
             "{name}"
         );
@@ -163,8 +169,8 @@ fn assert_native_landing_inputs(rules: &RuleSet) {
             row["damage"].as_i64().unwrap() as i32,
             he.cell_spread_f64,
             he.percent_at_max_f64,
-            &he.verses_f64,
-            crate::sim::combat::damage::ArmorClass(armor),
+            he.interaction(crate::rules::armor::ArmorId::from_index(usize::from(armor)))
+                .multiplier(),
             row["distance"].as_i64().unwrap() as i32,
             false,
             rules.combat_damage.max_damage,
@@ -180,8 +186,8 @@ fn bridge_landing_constructor_and_absent_keys_use_native_defaults() {
     use crate::rules::ruleset::GeneralRules;
     use crate::rules::terrain_object_type::TerrainObjectType;
 
-    let corpus: Value = serde_json::from_str(include_str!(
-        "../../../tools/rules_oracle/bridge_landing_inputs.json"
+    let corpus: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/rules_oracle/bridge_landing_inputs.json",
     ))
     .unwrap();
     let native = &corpus["constructor"]["rules"];
@@ -232,12 +238,7 @@ fn retail_hills_layered_bridge_landing_inputs_match_original_readers() {
 
     let retail = std::env::var("RA2_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            crate::util::config::GameConfig::load()
-                .unwrap()
-                .paths
-                .ra2_dir
-        });
+        .unwrap_or_else(|_| crate::test_fixture::game_config().unwrap().paths.ra2_dir);
     let assets = AssetManager::new(&retail, MediaArchiveMode::STOCK_DIGITAL).unwrap();
     let read = |name: &str| IniFile::from_bytes(&assets.get(name).unwrap()).unwrap();
     let root = read("RULESMD.INI");
@@ -254,10 +255,14 @@ fn retail_hills_layered_bridge_landing_inputs_match_original_readers() {
         None,
         art,
         std::sync::Arc::clone(audio_definitions.sounds()),
+        Default::default(),
     )
     .unwrap();
     let (mut rules, _, art, _) = owner
-        .load_noncampaign_scenario(Some(&mode), &map.ini)
+        .load_scenario(
+            crate::rules::process_owner::NativeScenarioRulesPrefix::NonCampaign(Some(&mode)),
+            &map.ini,
+        )
         .unwrap()
         .into_parts();
     let registry = crate::rules::art_data::ArtRegistry::from_ini(&art);
@@ -285,8 +290,6 @@ fn flight_fixture(rules: &RuleSet, input: &Value) -> (Simulation, BTreeSet<(u16,
                 cell.final_tile_index = if bridge { 1020 } else { -1 };
                 cell.bridge_facts.raw_flags = if bridge { 0x100 } else { 0 };
                 cell.land_type = if water { 2 } else { 0 };
-                cell.yr_cell_land_type = cell.land_type;
-                cell.is_water = water;
                 cell
             })
         })
@@ -305,9 +308,7 @@ fn flight_fixture(rules: &RuleSet, input: &Value) -> (Simulation, BTreeSet<(u16,
         // that boundary with real no-transition state255, not a Rust callback
         // hook. Tile1020/base1000/middle20 still admits the original A block.
         let anchor = terrain.native_cell_identity((0, 0));
-        terrain.cell_mut(0, 0).unwrap().bridge_facts.overlay_id = Some(0x18);
-        terrain.write_native_cell_state(anchor, 255);
-        for cell in &mut terrain.cells {
+        for cell in terrain.cells_mut_for_test() {
             cell.bridge_facts.native_anchor = Some(anchor);
         }
     }
@@ -319,7 +320,12 @@ fn flight_fixture(rules: &RuleSet, input: &Value) -> (Simulation, BTreeSet<(u16,
         ),
     );
     sim.install_resolved_terrain_for_new_map(terrain);
-    sim.session.binary_frame = 1000;
+    if bridge {
+        let anchor = sim.overlay_cell_mut_for_test(0, 0);
+        anchor.overlay_id = Some(0x18);
+        anchor.overlay_data = 255;
+    }
+    sim.session.set_binary_frame_for_test(1000);
     (sim, source)
 }
 
@@ -331,20 +337,20 @@ fn compare_body(body: &BounceState, native: &str, terminal: bool, context: &str)
     assert_eq!(bytes.len(), 0x50);
     let dword = |offset| u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
     let qword = |offset| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
-    assert_eq!(body.elasticity.bits(), qword(0), "{context}: elasticity");
-    assert_eq!(body.gravity.bits(), qword(8), "{context}: gravity");
+    assert_eq!(body.elasticity().bits(), qword(0), "{context}: elasticity");
+    assert_eq!(body.gravity().bits(), qword(8), "{context}: gravity");
     assert_eq!(
-        body.angular_velocity_magnitude.bits(),
+        body.angular_velocity_magnitude().bits(),
         qword(16),
         "{context}: clamp"
     );
     for axis in 0..3 {
         assert_eq!(
-            body.position[axis].bits(),
+            body.position()[axis].bits(),
             dword(24 + axis * 4),
             "{context}: position{axis}"
         );
-        let actual = body.velocity[axis].bits();
+        let actual = body.velocity()[axis].bits();
         let expected = dword(36 + axis * 4);
         if actual != expected && actual & 0x7fff_ffff == 0 && expected & 0x7fff_ffff == 0 {
             // Existing flat reflection/cliff-zero shortcuts can retain a
@@ -354,29 +360,35 @@ fn compare_body(body: &BounceState, native: &str, terminal: bool, context: &str)
             // and this Anim receives no subsequent physics visit. No tolerance
             // applies to nonzero velocity, position, timers or Scenario state.
             assert!(terminal, "{context}: airborne signed-zero difference");
-            assert_eq!(body.elasticity.bits() & 0x7fff_ffff_ffff_ffff, 0);
+            assert_eq!(body.elasticity().bits() & 0x7fff_ffff_ffff_ffff, 0);
         } else {
             assert_eq!(actual, expected, "{context}: velocity{axis}");
         }
     }
-    // SHP DBRIS has zero spin and its draw path does not consume quaternions.
-    // BounceState does not represent native quaternion bytes; no comparison of
-    // that unrepresented display-only state is claimed here.
-    assert_eq!(
-        body.spin_angle.bits(),
-        0,
-        "{context}: zero-spin fixture boundary"
-    );
+    // SHP DBRIS spins by a zero angle, so only the signs of the quaternions'
+    // zeros move, through each bounce's negation and the per-tick product.
+    for i in 0..4 {
+        assert_eq!(
+            body.orientation()[i].bits(),
+            dword(0x30 + i * 4),
+            "{context}: orientation{i}"
+        );
+        assert_eq!(
+            body.rotation()[i].bits(),
+            dword(0x40 + i * 4),
+            "{context}: rotation{i}"
+        );
+    }
 }
 
 #[test]
 fn native_bridge_producer_primary_flight_landing_and_rng_continuation() {
-    let rows: Vec<Value> = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/bridge_debris_flight.json"
+    let rows: Vec<Value> = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/bridge_debris_flight.json",
     ))
     .unwrap();
-    let inputs: Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/bridge_debris_flight.inputs.json"
+    let inputs: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/bridge_debris_flight.inputs.json",
     ))
     .unwrap();
     let Some(rules) = flight_rules(&native(), &inputs) else {
@@ -390,7 +402,7 @@ fn native_bridge_producer_primary_flight_landing_and_rng_continuation() {
             sim.scenario_rng.native_state_hex(),
             row["producer_rng_before"].as_str().unwrap()
         );
-        spawn_bridge_debris(&mut sim, &rules, &source);
+        spawn_bridge_debris(&mut sim, &rules, &source, None);
         assert_eq!(
             sim.scenario_rng.native_state_hex(),
             row["producer_rng_after"].as_str().unwrap(),
@@ -399,20 +411,21 @@ fn native_bridge_producer_primary_flight_landing_and_rng_continuation() {
         let id = sim
             .anims()
             .find_map(|(&id, anim)| {
-                (sim.interner.resolve(anim.type_id) == row["type"].as_str().unwrap()).then_some(id)
+                (sim.interner.resolve(anim.type_id()) == row["type"].as_str().unwrap())
+                    .then_some(id)
             })
             .expect("native-selected metallic type constructs");
         let birth = sim.anim(id).unwrap();
         assert_eq!(
             serde_json::json!([
-                birth.world_coord.x,
-                birth.world_coord.y,
-                birth.world_coord.z
+                birth.world_coord().x,
+                birth.world_coord().y,
+                birth.world_coord().z
             ]),
             row["birth_state"]["location"],
             "{input}: birth location"
         );
-        if let Some(body) = &birth.bounce {
+        if let Some(body) = &birth.bounce() {
             compare_body(
                 body,
                 row["birth_state"]["bounce_hex"].as_str().unwrap(),
@@ -425,70 +438,80 @@ fn native_bridge_producer_primary_flight_landing_and_rng_continuation() {
         for tick in row["ticks"].as_array().unwrap() {
             let number = tick["tick"].as_u64().unwrap();
             let context = format!("{input}, tick {number}");
-            sim.session.binary_frame = 1000 + number as u32;
+            sim.session.set_binary_frame_for_test(1000 + number as u32);
             assert!(
-                !sim.visit_anim(id, &rules, None),
+                !sim.visit_anim(
+                    id,
+                    &rules,
+                    None,
+                    &mut crate::sim::world::FrameEffects::default()
+                )
+                .unwrap(),
                 "false bridge-driver fixture: {context}"
             );
             let anim = sim
                 .anim(id)
                 .expect("deferred delete retains storage before drain");
             assert_eq!(
-                serde_json::json!([anim.world_coord.x, anim.world_coord.y, anim.world_coord.z]),
+                serde_json::json!([
+                    anim.world_coord().x,
+                    anim.world_coord().y,
+                    anim.world_coord().z
+                ]),
                 tick["location"],
                 "{context}"
             );
             assert_eq!(
-                anim.runtime.inactive,
+                anim.runtime().inactive,
                 tick["inactive"] != 0,
                 "{context}: native19B"
             );
             assert_eq!(
-                !sim.substrate.pending_delete.contains(&id),
+                !sim.substrate.pending_delete.contains_object(&id),
                 tick["alive"] == 1,
                 "{context}: retained logical Alive"
             );
             assert_eq!(
-                i64::from(anim.runtime.current_frame),
+                i64::from(anim.runtime().current_frame),
                 tick["current_frame"].as_i64().unwrap(),
                 "{context}: frame"
             );
             assert_eq!(
-                i64::from(anim.runtime.delay_remaining),
+                i64::from(anim.runtime().delay_remaining),
                 tick["delay_remaining"].as_i64().unwrap(),
                 "{context}: delay"
             );
             assert_eq!(
-                i64::from(anim.runtime.loop_remaining),
+                i64::from(anim.runtime().loop_remaining),
                 tick["loop_remaining"].as_i64().unwrap(),
                 "{context}: loop"
             );
             assert_eq!(
-                anim.runtime.first_ai_guard,
+                anim.runtime().first_ai_guard,
                 tick["first_ai_guard"] == 1,
                 "{context}: first guard"
             );
             assert_eq!(
-                i64::from(anim.runtime.frame_step),
+                i64::from(anim.runtime().frame_step),
                 tick["frame_step"].as_i64().unwrap(),
                 "{context}: frame step"
             );
             assert_eq!(
-                i64::from(anim.runtime.frame_timer.start_frame()),
+                i64::from(anim.runtime().frame_timer.start_frame()),
                 tick["timer_start"].as_i64().unwrap(),
                 "{context}: timer start"
             );
             assert_eq!(
-                i64::from(anim.runtime.frame_timer.duration()),
+                i64::from(anim.runtime().frame_timer.duration()),
                 tick["timer_duration"].as_i64().unwrap(),
                 "{context}: timer duration"
             );
             assert_eq!(
-                i64::from(anim.runtime.rate_reload),
+                i64::from(anim.runtime().rate_reload),
                 tick["rate_reload"].as_i64().unwrap(),
                 "{context}: rate reload"
             );
-            if let Some(body) = &anim.bounce {
+            if let Some(body) = &anim.bounce() {
                 compare_body(
                     body,
                     tick["body"].as_str().unwrap(),
@@ -509,10 +532,10 @@ fn native_bridge_producer_primary_flight_landing_and_rng_continuation() {
                 if known.insert(child_id) {
                     children.push(serde_json::json!({
                         "tick": number,
-                        "type": sim.interner.resolve(child.type_id),
-                        "coord": [child.world_coord.x, child.world_coord.y, child.world_coord.z],
-                        "delay": child.runtime.delay_remaining,
-                        "flags": child.draw_flags,
+                        "type": sim.interner.resolve(child.type_id()),
+                        "coord": [child.world_coord().x, child.world_coord().y, child.world_coord().z],
+                        "delay": child.runtime().delay_remaining,
+                        "flags": child.draw_flags(),
                     }));
                 }
             }
@@ -534,15 +557,15 @@ fn native_bridge_producer_primary_flight_landing_and_rng_continuation() {
             "{input}: trailer/landing constructor order"
         );
         let anim = sim.anim(id).unwrap();
-        assert!(sim.substrate.pending_delete.contains(&id), "{input}");
-        assert!(!anim.in_logic_vector, "{input}");
+        assert!(sim.substrate.pending_delete.contains_object(&id), "{input}");
+        assert!(!anim.in_logic_vector(), "{input}");
         assert!(
             sim.display_layers().layer_of(id).is_none(),
             "{input}: display unregistered"
         );
         assert_eq!(row["limbo"], 1);
         assert_eq!(row["in_logic"], 0);
-        assert!(sim.substrate.pending_delete.contains(&id), "{input}");
+        assert!(sim.substrate.pending_delete.contains_object(&id), "{input}");
         // Native may queue the pointer twice (Stopped before/after landing).
         // Rust queues once. This assertion bounds logical destruction; it does
         // not assert equal observer calls or pending-list multiplicity.

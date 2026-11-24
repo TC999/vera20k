@@ -5,6 +5,7 @@ use crate::map::entities::EntityCategory;
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::rules::ini_parser::IniFile;
 use crate::rules::object_type::ObjectCategory;
+use crate::rules::rule_policy::RulePolicy;
 use crate::rules::team_ai_ini::TeamAiDefinitionSource;
 use crate::sim::entity_store::EntityStore;
 use crate::sim::game_entity::GameEntity;
@@ -13,25 +14,12 @@ use crate::sim::intern::{test_intern, test_interner};
 use crate::sim::pathfinding::PathGrid;
 use crate::sim::pathfinding::zone_map::ZoneGrid;
 use crate::sim::rng::SimRng;
+use crate::sim::scenario_session::ScenarioGameMode;
 use crate::sim::team_script_vm::{
     TeamMemberTypeIdentity, TeamScriptAction, TeamScriptDefinition, TeamScriptMember,
     TeamTaskForceDefinition, TeamTaskForceEntry, TeamTypeDefinition,
 };
 use crate::sim::timer::CdTimer;
-use crate::util::native_x87::distance_3d_leptons;
-
-fn threat(threat_posed: i32, distance: i32, range: i32, speed: i32) -> ThreatFacts {
-    ThreatFacts {
-        threat_posed,
-        speed_leptons_per_frame: speed,
-        current_coord: [0, 0, 0],
-        attacker_coord: Some([distance, 0, 0]),
-        primary_range_leptons: range,
-        existing_target: ExistingTargetDisposition::NoneOrUnarmed,
-        in_non_base_defense_team: false,
-        mission_is_harvest: false,
-    }
-}
 
 fn clear_terrain(width: u16, height: u16) -> ResolvedTerrainGrid {
     crate::map::resolved_terrain::test_grid(
@@ -53,20 +41,27 @@ fn gsi_04_05_response_delay_is_the_native_ftol() {
 /// hands the world a copy of it.
 fn response_world(frame: u32, attacker_at: (u16, u16)) -> Simulation {
     let mut sim = Simulation::new();
-    sim.session.binary_frame = frame;
-    sim.session.game_mode_nonzero = true;
+    sim.session.set_binary_frame_for_test(frame);
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
     for (name, side) in [("Victim", 0), ("Enemy", 1)] {
         let id = test_intern(name);
         sim.houses
-            .insert(id, HouseState::new(id, side, None, false, 0, 10));
+            .register(HouseState::new(id, side, None, false, 0, 10));
     }
-    let mut victim = GameEntity::test_default(1, "VICTIM", "Victim", 4, attacker_at.1);
-    victim.category = EntityCategory::Structure;
+    let victim = GameEntity::test_default_of_category(
+        1,
+        "VICTIM",
+        "Victim",
+        4,
+        attacker_at.1,
+        EntityCategory::Structure,
+    );
     sim.substrate.entities.insert(victim);
     let mut attacker =
         GameEntity::test_default(2, "ATTACKER", "Enemy", attacker_at.0, attacker_at.1);
-    attacker.lifecycle.in_limbo = false;
-    attacker.lifecycle.cell_marked = true;
+    attacker.lifecycle.set_in_limbo_for_test(false);
+    attacker.lifecycle.set_cell_marked_for_test(true);
     sim.substrate.entities.insert(attacker);
     sim
 }
@@ -75,24 +70,18 @@ fn response_world(frame: u32, attacker_at: (u16, u16)) -> Simulation {
 fn with_clear_map(sim: &mut Simulation) {
     let terrain = clear_terrain(8, 8);
     let path_grid = PathGrid::from_resolved_terrain(&terrain);
-    sim.zone_grid = Some(ZoneGrid::build_with_terrain(
-        &path_grid,
-        &terrain,
-        &[],
-        8,
-        8,
-    ));
+    sim.zone_grid = Some(ZoneGrid::build_with_terrain(&path_grid, &terrain, &[], 8, 8).into());
     sim.resolved_terrain = Some(terrain);
-    sim.session.map_width = 8;
-    sim.session.map_height = 8;
-    sim.playfield_bounds = Some(crate::map::playfield::PlayfieldBounds {
+    sim.session.set_map_width_for_test(8);
+    sim.session.set_map_height_for_test(8);
+    sim.set_playfield_bounds_for_test(Some(crate::map::playfield::PlayfieldBounds {
         base: 8,
         off_fc: 0,
         off_100: 0,
         off_104: 8,
         off_108: 8,
-    });
-    sim.playfield_size_height = Some(8);
+    }));
+    sim.set_playfield_size_height_for_test(Some(8));
 }
 
 fn response_defender(id: u64, type_name: &str, x: u16) -> GameEntity {
@@ -102,20 +91,164 @@ fn response_defender(id: u64, type_name: &str, x: u16) -> GameEntity {
             crate::rules::locomotor_type::LocomotorKind::Drive,
         ),
     );
-    entity.drive_locomotion = Some(Default::default());
+    assert!(
+        entity
+            .locomotor
+            .as_mut()
+            .unwrap()
+            .install_drive_state_for_test(Some(Default::default()))
+    );
     entity
 }
 
 /// The victim building (1) calls for help against the attacker (2).
 fn respond(sim: &mut Simulation, rules: &RuleSet) {
     sim.interner = test_interner();
-    respond_to_base_attack(sim, rules, 1, 2);
+    respond_to_base_attack(
+        sim,
+        rules,
+        1,
+        2,
+        &mut crate::sim::world::FrameEffects::default(),
+    );
+}
+
+#[test]
+fn armed_victim_can_skip_base_defense_without_writing_the_attacker_cooldown() {
+    let rules = RuleSet::from_ini(&IniFile::from_str(concat!(
+        "[General]\nBaseDefenseDelay=.25\n[AI]\nComputerBaseDefenseResponse=-1\n",
+        "[VehicleTypes]\n0=ATTACKER\n[ATTACKER]\nStrength=100\nThreatPosed=50\n",
+        "[BuildingTypes]\n0=VICTIM\n[VICTIM]\nStrength=100\nPrimary=GUN\n",
+        "[GUN]\nDamage=10\nRange=5\nWarhead=HE\n[HE]\n"
+    )))
+    .unwrap();
+    let campaign_calls_for_help =
+        RulePolicy::stock_campaign().with_uses_campaign_base_defense(false);
+    for (mode, policy, responds) in [
+        (
+            ScenarioGameMode::Campaign,
+            RulePolicy::stock_campaign(),
+            false,
+        ),
+        (
+            ScenarioGameMode::Skirmish,
+            RulePolicy::stock_multiplayer(),
+            true,
+        ),
+        (ScenarioGameMode::Campaign, campaign_calls_for_help, true),
+    ] {
+        let mut sim = response_world(41, (5, 0));
+        sim.session.install_admission(mode, None, policy);
+        let before = sim
+            .substrate
+            .entities
+            .get(2)
+            .unwrap()
+            .seldom
+            .base_defense_response
+            .cooldown();
+        respond(&mut sim, &rules);
+        let after = sim
+            .substrate
+            .entities
+            .get(2)
+            .unwrap()
+            .seldom
+            .base_defense_response
+            .cooldown();
+        assert_eq!(
+            after,
+            if responds {
+                CdTimer::started(41, 225)
+            } else {
+                before
+            },
+            "{mode:?}"
+        );
+    }
+}
+
+#[test]
+fn retail_player_control_on_a_building_hit_suppresses_only_campaign_ai_response() {
+    use crate::sim::combat::{EntityDamageEvent, ReceiverCallFlags};
+
+    let Some((_, assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+        return;
+    };
+    let rules = crate::rules::retail_ini_fixture::retail_unlayered_rules().unwrap();
+    let map =
+        crate::map::map_file::MapFile::from_bytes(assets.get_ref("ALL01UMD.MAP").unwrap()).unwrap();
+    let roster =
+        crate::map::houses::parse_house_roster(&map.ini, &rules.color_schemes, Some(&rules));
+    let control = roster
+        .houses
+        .iter()
+        .find(|house| house.name == "Alliance")
+        .unwrap()
+        .player_control
+        .unwrap();
+    assert!(control);
+    // Reuse the retail House flag in a controlled arena. ALL01's Alliance
+    // does not supply this building/defender scene; this is no mission playthrough.
+    for (mode, player_control, responds) in [
+        (ScenarioGameMode::Campaign, false, true),
+        (ScenarioGameMode::Campaign, control, false),
+        (ScenarioGameMode::Skirmish, control, true),
+    ] {
+        let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 0x708080);
+        sim.session.set_game_mode(mode);
+        let owner = sim.interner.intern("Russians");
+        sim.houses
+            .get_mut(&owner)
+            .unwrap()
+            .assign_player_control(player_control);
+        let victim = sim
+            .spawn_object("GAPOWR", "Russians", 10, 10, 0, &rules)
+            .unwrap();
+        let attacker = sim
+            .spawn_object("E1", "Americans", 15, 10, 0, &rules)
+            .unwrap();
+        let defender = sim
+            .spawn_object("MTNK", "Russians", 12, 10, 0, &rules)
+            .unwrap();
+        let health = sim.substrate.entities.get(victim).unwrap().health.current();
+        let source = sim.interner.get("Americans").unwrap();
+        let warhead = sim.interner.intern("HE");
+        sim.commit_direct_damage_receiver(
+            &rules,
+            None,
+            EntityDamageEvent::direct_receiver(
+                victim,
+                20,
+                0,
+                attacker,
+                Some(source),
+                warhead,
+                ReceiverCallFlags {
+                    ignore_defenses: false,
+                    arg6: false,
+                },
+            ),
+            &mut FrameEffects::default(),
+        );
+        assert!(sim.substrate.entities.get(victim).unwrap().health.current() < health);
+        let defender = sim.substrate.entities.get(defender).unwrap();
+        assert_eq!(
+            defender.archive_target(),
+            responds.then_some(TargetKind::Entity(victim)),
+            "{mode:?}, PlayerControl={player_control}"
+        );
+        assert_eq!(
+            defender.attack_target.target(),
+            responds.then_some(TargetKind::Entity(attacker))
+        );
+    }
 }
 
 #[test]
 fn native_response_uses_the_paid_foot_head_instead_of_navcom() {
-    let rows: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/foot_navigation_coordinate.json"
+    let rows: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/foot_navigation_coordinate.json",
     ))
     .unwrap();
     let row = rows
@@ -133,25 +266,36 @@ fn native_response_uses_the_paid_foot_head_instead_of_navcom() {
         ),
     );
     let head = &row["input"]["stored_head"];
-    candidate.drive_locomotion = Some(crate::sim::components::DriveLocomotionRuntime {
-        head_to: Some(crate::sim::components::DriveCoord {
-            x: head[0].as_i64().unwrap() as i32,
-            y: head[1].as_i64().unwrap() as i32,
-            z: head[2].as_i64().unwrap() as i32,
-        }),
-        ..Default::default()
-    });
-    candidate.navigation.nav_com =
-        Some(crate::sim::components::NavTargetRef::Cell { rx: 7, ry: 7 });
-    let mut entities = EntityStore::new();
-    entities.insert(candidate.clone());
+    assert!(
+        candidate
+            .locomotor
+            .as_mut()
+            .unwrap()
+            .install_drive_state_for_test(Some(
+                crate::sim::movement::DriveLocomotionRuntime::default().with_head_to_for_test(
+                    Some(crate::sim::components::DriveCoord {
+                        x: head[0].as_i64().unwrap() as i32,
+                        y: head[1].as_i64().unwrap() as i32,
+                        z: head[2].as_i64().unwrap() as i32,
+                    })
+                )
+            ))
+    );
+    candidate
+        .navigation
+        .set_nav_com_for_test(Some(crate::sim::components::NavTargetRef::Cell {
+            rx: 7,
+            ry: 7,
+        }));
+    let mut sim = crate::sim::world::Simulation::new();
+    sim.substrate.entities.insert(candidate.clone());
     let rules = RuleSet::from_ini(&IniFile::from_str(
         "[VehicleTypes]\n0=DEFENDER\n[DEFENDER]\nStrength=100\n",
     ))
     .unwrap();
     let native = &row["coordinate"];
     assert_eq!(
-        destination_cell(&candidate, &entities, None, &rules, &test_interner()).unwrap(),
+        destination_cell(&candidate, &sim, None, &rules, &test_interner()).unwrap(),
         (
             native[0].as_i64().unwrap() as i32 / 256,
             native[1].as_i64().unwrap() as i32 / 256
@@ -239,6 +383,7 @@ fn gsi_04_05_zero_budget_still_suspends_low_priority_teams_before_scan_exit() {
             .entities
             .get(2)
             .unwrap()
+            .seldom
             .base_defense_response
             .cooldown,
         CdTimer::from_raw(-1, 0)
@@ -288,7 +433,7 @@ fn gsi_04_05_positive_transaction_queues_in_order_and_arms_only_on_overshoot() {
         );
         assert_eq!(responder.archive_target(), Some(TargetKind::Entity(1)));
         assert_eq!(
-            responder.attack_target.as_ref().map(|target| target.target),
+            responder.attack_target.target(),
             Some(TargetKind::Entity(2))
         );
     }
@@ -298,8 +443,121 @@ fn gsi_04_05_positive_transaction_queues_in_order_and_arms_only_on_overshoot() {
     );
     let attacker = sim.substrate.entities.get(2).unwrap();
     assert_eq!(
-        attacker.base_defense_response.cooldown,
+        attacker.seldom.base_defense_response.cooldown,
         CdTimer::started(41, 225)
+    );
+}
+
+/// A defender already firing at the attacker debits its ThreatPosed from the
+/// budget (`0x007085CC`). Debited to exactly zero, nothing arms; below zero,
+/// or negative from the start, the shared exit (`0x0070875C`) starts the
+/// attacker's cooldown with no assignment or draw.
+#[test]
+fn gsi_04_05_a_negative_budget_starts_the_cooldown_without_an_assignment() {
+    for (response, defender_threat, expected_cooldown) in [
+        (1, 50, CdTimer::from_raw(-1, 0)),
+        (1, 51, CdTimer::started(41, 225)),
+        (-1, 50, CdTimer::started(41, 225)),
+    ] {
+        let rules = RuleSet::from_ini(&IniFile::from_str(&format!(
+            "[General]\nBaseDefenseDelay=.25\n[AI]\nComputerBaseDefenseResponse={response}\n\
+             [VehicleTypes]\n0=ATTACKER\n1=DEFENDER\n\
+             [BuildingTypes]\n0=VICTIM\n\
+             [ATTACKER]\nStrength=100\nArmor=heavy\nCost=50\nThreatPosed=50\n\
+             [DEFENDER]\nStrength=100\nArmor=heavy\nCost=100\nThreatPosed={defender_threat}\nSpeed=4\nMovementZone=Normal\nPrimary=DEFENDERGUN\n\
+             [VICTIM]\nStrength=100\nArmor=wood\n\
+             [DEFENDERGUN]\nDamage=10\nRange=5\nWarhead=DEFENDERWH\n\
+             [DEFENDERWH]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
+        )))
+        .expect("engaged defender fixture");
+        let mut sim = response_world(41, (5, 0));
+        with_clear_map(&mut sim);
+        let mut defender = response_defender(3, "DEFENDER", 2);
+        defender
+            .attack_target
+            .set_for_test(Some(TargetKind::Entity(2)));
+        sim.substrate.entities.insert(defender);
+        sim.scenario_rng = SimRng::new(0x0405);
+        let rng_before = sim.scenario_rng.logical_state();
+
+        respond(&mut sim, &rules);
+
+        assert_eq!(sim.scenario_rng.logical_state(), rng_before);
+        let entities = &sim.substrate.entities;
+        assert_eq!(entities.get(3).unwrap().archive_target(), None);
+        assert_eq!(
+            entities
+                .get(2)
+                .unwrap()
+                .seldom
+                .base_defense_response
+                .cooldown,
+            expected_cooldown,
+            "response {response}, defender ThreatPosed {defender_threat}"
+        );
+    }
+}
+
+/// The scan takes only the victim's house's objects (admission refuses
+/// another house's): a nearer, lower-id defender of the attacker's house is
+/// not recruited, one handed to the victim's house is, and one handed away
+/// is not; each responder takes one draw.
+#[test]
+fn gsi_04_05_the_scan_takes_the_victim_house_s_objects_through_ownership_changes() {
+    let rules = RuleSet::from_ini(&IniFile::from_str(
+        "[General]\nBaseDefenseDelay=.25\n[AI]\nComputerBaseDefenseResponse=3\n\
+         [VehicleTypes]\n0=ATTACKER\n1=DEFENDER\n\
+         [BuildingTypes]\n0=VICTIM\n\
+         [ATTACKER]\nStrength=100\nArmor=heavy\nCost=50\nThreatPosed=50\n\
+         [DEFENDER]\nStrength=100\nArmor=heavy\nCost=100\nThreatPosed=100\nSpeed=4\nMovementZone=Normal\nPrimary=DEFENDERGUN\n\
+         [VICTIM]\nStrength=100\nArmor=wood\n\
+         [DEFENDERGUN]\nDamage=10\nRange=5\nWarhead=DEFENDERWH\n\
+         [DEFENDERWH]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
+    ))
+    .expect("positive response fixture");
+    let mut sim = response_world(41, (5, 0));
+    with_clear_map(&mut sim);
+    let (victim_house, enemy) = (test_intern("Victim"), test_intern("Enemy"));
+    // The attacker stands at x 5; 3 and 4 start as its house's.
+    for (id, x, owner) in [
+        (3, 3, enemy),
+        (4, 2, enemy),
+        (5, 6, victim_house),
+        (6, 1, victim_house),
+    ] {
+        let mut defender = response_defender(id, "DEFENDER", x);
+        defender.set_owner_for_test(owner);
+        sim.substrate.entities.insert(defender);
+    }
+    sim.substrate.entities.change_owner(4, victim_house);
+    sim.substrate.entities.change_owner(5, enemy);
+    let seed = 0x504F_5349;
+    sim.scenario_rng = SimRng::new(seed);
+    let mut expected_rng = SimRng::new(seed);
+    for _ in 0..2 {
+        expected_rng.next_range_u32_inclusive(0, 99);
+    }
+
+    respond(&mut sim, &rules);
+
+    let target_of = |id: u64| {
+        sim.substrate
+            .entities
+            .get(id)
+            .unwrap()
+            .attack_target
+            .target()
+    };
+    for (id, responds) in [(3, false), (4, true), (5, false), (6, true)] {
+        assert_eq!(
+            target_of(id),
+            responds.then_some(TargetKind::Entity(2)),
+            "defender {id}"
+        );
+    }
+    assert_eq!(
+        sim.scenario_rng.logical_state(),
+        expected_rng.logical_state()
     );
 }
 
@@ -343,112 +601,13 @@ fn gsi_04_05_a_defender_whose_weapon_zero_is_illegal_is_not_recruited() {
             .get(id)
             .unwrap()
             .attack_target
-            .as_ref()
-            .map(|target| target.target)
+            .target()
     };
     assert_eq!(target_of(3), None);
     assert_eq!(target_of(4), Some(TargetKind::Entity(2)));
     assert_eq!(
         sim.scenario_rng.logical_state(),
         expected_rng.logical_state()
-    );
-}
-
-#[test]
-fn gsi_04_05_threat_preserves_special_targets_and_signed_integer_math() {
-    let mut facts = threat(100, 1024, 256, 128);
-    assert_eq!(evaluate_target_threat(facts), (100_i32 << 10) / 6);
-    facts.attacker_coord = Some([256, 0, 0]);
-    assert_eq!(evaluate_target_threat(facts), 100_i32 << 10);
-    facts.existing_target = ExistingTargetDisposition::RequestedAttacker;
-    assert_eq!(evaluate_target_threat(facts), -100);
-    facts.existing_target = ExistingTargetDisposition::OtherArmedTarget;
-    assert_eq!(evaluate_target_threat(facts), 0);
-    facts.existing_target = ExistingTargetDisposition::NoneOrUnarmed;
-    facts.mission_is_harvest = true;
-    assert_eq!(evaluate_target_threat(facts), 0);
-}
-
-#[test]
-fn gsi_04_05_threat_uses_wrapping_base_and_native_sqrt_distance() {
-    let facts = threat(i32::MAX, 513, 0, 256);
-    assert_eq!(evaluate_target_threat(facts), 1);
-    let diagonal = ThreatFacts {
-        attacker_coord: Some([256, 256, 256]),
-        primary_range_leptons: 0,
-        speed_leptons_per_frame: 1,
-        threat_posed: 2,
-        ..threat(2, 0, 0, 1)
-    };
-    assert_eq!(distance_3d_leptons([0, 0, 0], [256, 256, 256]), 443);
-    assert_eq!(evaluate_target_threat(diagonal), 4);
-}
-
-#[test]
-fn gsi_04_05_negative_scores_debit_budget_with_class_specific_anchor_order() {
-    let mut selection = ResponseSelection::new(500);
-    selection.consider(1, -2, ResponderClass::Infantry, true);
-    assert_eq!(selection.remaining_budget(), 300);
-    selection.consider(2, -2, ResponderClass::Unit, true);
-    assert_eq!(selection.remaining_budget(), 298);
-    assert!(selection.can_scan());
-    selection.consider(3, -298, ResponderClass::Unit, false);
-    assert!(!selection.can_scan());
-}
-
-#[test]
-fn gsi_04_05_first_six_leave_minimum_zero_and_seventh_only_exposes_minimum() {
-    let mut selection = ResponseSelection::new(1);
-    for (id, score) in [(1, 9), (2, 2), (3, 8), (4, 3), (5, 7), (6, 4)] {
-        selection.consider(id, score, ResponderClass::Unit, false);
-    }
-    selection.consider(7, 100, ResponderClass::Unit, false);
-    let (_, ranked) = selection.into_ranked();
-    assert_eq!(
-        ranked
-            .iter()
-            .map(|entry| entry.entity_id)
-            .collect::<Vec<_>>(),
-        [1, 3, 5, 6, 4, 2]
-    );
-}
-
-#[test]
-fn gsi_04_05_replacement_overwrites_every_old_minimum_with_duplicates() {
-    let mut selection = ResponseSelection::new(1);
-    for (id, score) in [(1, 9), (2, 2), (3, 2), (4, 8), (5, 7), (6, 6)] {
-        selection.consider(id, score, ResponderClass::Unit, false);
-    }
-    selection.consider(7, 100, ResponderClass::Unit, false);
-    selection.consider(8, 5, ResponderClass::Unit, false);
-    let (_, ranked) = selection.into_ranked();
-    assert_eq!(
-        ranked.iter().filter(|entry| entry.entity_id == 8).count(),
-        2
-    );
-    assert_eq!(
-        ranked
-            .iter()
-            .map(|entry| entry.entity_id)
-            .collect::<Vec<_>>(),
-        [1, 4, 5, 6, 8, 8]
-    );
-}
-
-#[test]
-fn native_base_response_pairwise_exchange_sort_reorders_the_displaced_equal_score() {
-    let mut selection = ResponseSelection::new(1);
-    for (id, score) in [(1, 4), (2, 9), (3, 4), (4, 7)] {
-        selection.consider(id, score, ResponderClass::Infantry, false);
-    }
-    let (_, ranked) = selection.into_ranked();
-    assert_eq!(
-        ranked
-            .iter()
-            .map(|entry| entry.entity_id)
-            .collect::<Vec<_>>(),
-        // Original response sort708647..7086AF, executed on these four slots.
-        [2, 4, 3, 1]
     );
 }
 
@@ -494,39 +653,63 @@ fn gsi_04_05_is_armed_reads_one_slot_not_the_whole_weapon_array() {
     // every slot NULL — so `GetWeapon(0)` has no `WeaponType`.
     let turret_no_gun = GameEntity::test_default(4, "TURRETNOGUN", "Empty turret", 4, 1);
 
-    assert!(is_armed(&armed, rules.object("ARMED").expect("ARMED")));
+    let mut entities = EntityStore::new();
+    let interner = test_interner();
+    assert!(is_armed(
+        &armed,
+        rules.object("ARMED").expect("ARMED"),
+        &entities,
+        &rules,
+        &interner
+    ));
     assert!(!is_armed(
         &unarmed,
-        rules.object("UNARMED").expect("UNARMED")
+        rules.object("UNARMED").expect("UNARMED"),
+        &entities,
+        &rules,
+        &interner,
     ));
-    assert!(is_armed(&gunner, rules.object("GUNNER").expect("GUNNER")));
+    assert!(is_armed(
+        &gunner,
+        rules.object("GUNNER").expect("GUNNER"),
+        &entities,
+        &rules,
+        &interner
+    ));
     assert!(!is_armed(
         &turret_no_gun,
-        rules.object("TURRETNOGUN").expect("TURRETNOGUN")
+        rules.object("TURRETNOGUN").expect("TURRETNOGUN"),
+        &entities,
+        &rules,
+        &interner,
     ));
 
     // `FootClass::Evaluate_Target_Threat @ 0x004D97A0` scores 0 only when the
     // candidate's existing target is an ARMED Techno; an unarmed one falls
     // through to the real distance/threat score.
-    let mut entities = EntityStore::new();
     entities.insert(armed.clone());
     entities.insert(unarmed.clone());
     let mut candidate = GameEntity::test_default(9, "ARMED", "Responder", 9, 9);
-    let interner = test_interner();
 
-    candidate.attack_target = Some(crate::sim::combat::AttackTarget::new(1));
+    candidate
+        .attack_target
+        .set_for_test(Some(crate::sim::combat::TargetKind::Entity(1)));
     assert_eq!(
         current_target_disposition(&candidate, 99, &entities, &rules, &interner),
         ExistingTargetDisposition::OtherArmedTarget
     );
 
-    candidate.attack_target = Some(crate::sim::combat::AttackTarget::new(2));
+    candidate
+        .attack_target
+        .set_for_test(Some(crate::sim::combat::TargetKind::Entity(2)));
     assert_eq!(
         current_target_disposition(&candidate, 99, &entities, &rules, &interner),
         ExistingTargetDisposition::NoneOrUnarmed
     );
 
-    candidate.attack_target = Some(crate::sim::combat::AttackTarget::new(99));
+    candidate
+        .attack_target
+        .set_for_test(Some(crate::sim::combat::TargetKind::Entity(99)));
     assert_eq!(
         current_target_disposition(&candidate, 99, &entities, &rules, &interner),
         ExistingTargetDisposition::RequestedAttacker
@@ -581,16 +764,17 @@ fn run_native_bridge_response_seams(victim_is_slave: bool) {
         .unwrap();
         let mut sim = response_world(41, (5, 5));
         let terrain = native::terrain(input);
-        sim.zone_grid = Some(native::zones(&terrain, row));
+        sim.zone_grid = Some(native::zones(&terrain, row).into());
         sim.resolved_terrain = Some(terrain);
-        sim.playfield_bounds =
-            Some(crate::map::playfield::PlayfieldBounds::from_normalized_local_size(8, 0, 0, 8, 8));
-        sim.playfield_size_height = Some(8);
+        sim.set_playfield_bounds_for_test(Some(
+            crate::map::playfield::PlayfieldBounds::from_normalized_local_size(8, 0, 0, 8, 8),
+        ));
+        sim.set_playfield_size_height_for_test(Some(8));
         sim.substrate
             .entities
             .insert(native::candidate(&row["victim"], 1, "VICTIM"));
         if victim_is_slave {
-            sim.substrate.entities.get_mut(1).unwrap().slave =
+            sim.substrate.entities.get_mut(1).unwrap().seldom.slave =
                 crate::sim::slave_manager::SlaveLink::for_test(Some(99), Vec::new());
         }
         sim.substrate
@@ -611,8 +795,7 @@ fn run_native_bridge_response_seams(victim_is_slave: bool) {
             .get(3)
             .unwrap()
             .attack_target
-            .as_ref()
-            .map(|target| target.target);
+            .target();
         assert_eq!(
             selected,
             recruits.then_some(TargetKind::Entity(2)),
@@ -641,14 +824,9 @@ fn run_native_bridge_response_seams(victim_is_slave: bool) {
 #[test]
 fn retail_bridge_base_response_runs_through_the_protected_damage_receiver() {
     use crate::sim::movement::bridge_layer_oracle_tests as native;
-    let Some(ini) = crate::rules::retail_ini_fixture::retail_ini("rulesmd.ini") else {
+    let Some(rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art() else {
         return;
     };
-    let Some(art) = crate::rules::retail_ini_fixture::retail_ini("artmd.ini") else {
-        return;
-    };
-    let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
-    rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
     assert!(
         rules.object("HARV").unwrap().to_protect,
         "retail protected War Miner"
@@ -669,13 +847,14 @@ fn retail_bridge_base_response_runs_through_the_protected_damage_receiver() {
             .find(|row| row["input"]["family"] == "drive" && row["input"]["name"] == name)
             .unwrap();
         let mut sim = Simulation::with_seed(0x708080);
-        sim.session.game_mode_nonzero = true;
-        sim.session.binary_frame = 41;
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
+        sim.session.set_binary_frame_for_test(41);
         for (name, side) in [("Americans", 0), ("Russians", 1)] {
             let owner = sim.interner.intern(name);
             sim.houses
-                .insert(owner, HouseState::new(owner, side, None, false, 0, 10));
-            sim.session.house_order.push(owner);
+                .register(HouseState::new(owner, side, None, false, 0, 10));
         }
         crate::sim::arena_fixture::flat_arena(&mut sim, &rules);
         let victim = sim
@@ -692,35 +871,47 @@ fn retail_bridge_base_response_runs_through_the_protected_damage_receiver() {
         for supplied in row["input"]["cells"].as_array().unwrap() {
             let x = supplied["xy"][0].as_u64().unwrap() as u16;
             let y = supplied["xy"][1].as_u64().unwrap() as u16;
-            let cell = terrain.cell_mut(x, y).unwrap();
+            let cell = terrain.cell_mut_for_test(x, y).unwrap();
             cell.level = supplied["level"].as_i64().unwrap() as u8;
             cell.slope_type = supplied["slope"].as_u64().unwrap() as u8;
             cell.bridge_facts.raw_flags = supplied["flags"].as_u64().unwrap() as u32;
         }
-        sim.zone_grid = Some(native::zones(terrain, row));
-        sim.playfield_bounds =
-            Some(crate::map::playfield::PlayfieldBounds::from_normalized_local_size(8, 0, 0, 8, 8));
-        sim.playfield_size_height = Some(8);
+        sim.zone_grid = Some(native::zones(terrain, row).into());
+        sim.set_playfield_bounds_for_test(Some(
+            crate::map::playfield::PlayfieldBounds::from_normalized_local_size(8, 0, 0, 8, 8),
+        ));
+        sim.set_playfield_size_height_for_test(Some(8));
         for (id, input) in [(victim, &row["victim"]), (defender, &row["input"])] {
             let entity = sim.substrate.entities.get_mut(id).unwrap();
             let xyz = native::coord(&input["current"]);
-            entity.position.rx = (xyz.x / 256) as u16;
-            entity.position.ry = (xyz.y / 256) as u16;
-            entity.position.sub_x = crate::util::fixed_math::SimFixed::from_num(xyz.x % 256);
-            entity.position.sub_y = crate::util::fixed_math::SimFixed::from_num(xyz.y % 256);
-            entity.position.exact_z_leptons = Some(xyz.z);
+            entity.position.set_rx_for_test((xyz.x / 256) as u16);
+            entity.position.set_ry_for_test((xyz.y / 256) as u16);
             entity
-                .drive_locomotion
-                .get_or_insert_with(Default::default)
-                .head_to = Some(native::coord(&input["stored_head"]));
+                .position
+                .set_sub_x_for_test(crate::util::fixed_math::SimFixed::from_num(xyz.x % 256));
+            entity
+                .position
+                .set_sub_y_for_test(crate::util::fixed_math::SimFixed::from_num(xyz.y % 256));
+            entity.position.set_exact_z_leptons_for_test(Some(xyz.z));
+            {
+                let loco = entity.locomotor.as_mut().unwrap();
+                assert!(loco.ensure_installed_track_state());
+                assert!(loco.store_track_head(
+                    crate::sim::movement::track_process::TrackFamily::Drive,
+                    Some(native::coord(&input["stored_head"]))
+                ));
+            };
         }
         sim.substrate
             .entities
             .get_mut(defender)
             .unwrap()
             .navigation
-            .nav_com = Some(crate::sim::components::NavTargetRef::Cell { rx: 9, ry: 5 });
-        let health = sim.substrate.entities.get(victim).unwrap().health.current;
+            .set_nav_com_for_test(Some(crate::sim::components::NavTargetRef::Cell {
+                rx: 9,
+                ry: 5,
+            }));
+        let health = sim.substrate.entities.get(victim).unwrap().health.current();
         let warhead = sim.interner.intern("AP");
         let source_house = Some(sim.substrate.entities.get(attacker).unwrap().owner());
         sim.commit_direct_damage_receiver(
@@ -738,9 +929,10 @@ fn retail_bridge_base_response_runs_through_the_protected_damage_receiver() {
                     arg6: false,
                 },
             ),
+            &mut crate::sim::world::FrameEffects::default(),
         );
         assert!(
-            sim.substrate.entities.get(victim).unwrap().health.current < health,
+            sim.substrate.entities.get(victim).unwrap().health.current() < health,
             "{name}: real damage commit"
         );
         let selected = sim
@@ -749,8 +941,7 @@ fn retail_bridge_base_response_runs_through_the_protected_damage_receiver() {
             .get(defender)
             .unwrap()
             .attack_target
-            .as_ref()
-            .map(|target| target.target);
+            .target();
         assert_eq!(
             selected,
             row["output"]["reachable"]

@@ -9,8 +9,8 @@ use crate::sim::rng::SimRng;
 /// infantry_source_scatter).
 #[test]
 fn source_selection_matches_original_execution() {
-    let rows: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/infantry_source_scatter.json"
+    let rows: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/infantry_source_scatter.json",
     ))
     .unwrap();
     let mut checked = 0;
@@ -26,7 +26,7 @@ fn source_selection_matches_original_execution() {
         if let Some(cells) = input["cells"].as_array() {
             for cell in cells {
                 let out = terrain
-                    .cell_mut(
+                    .cell_mut_for_test(
                         cell[0].as_u64().unwrap() as u16,
                         cell[1].as_u64().unwrap() as u16,
                     )
@@ -64,7 +64,12 @@ fn source_selection_matches_original_execution() {
                     let facing = input["facing"].as_u64().unwrap() as u16;
                     null_start_direction((actor[0], actor[1]), facing, &mut rng)
                 } else {
-                    source_start_direction((actor[0], actor[1]), (source[0], source[1]), &mut rng)
+                    source_start_direction(
+                        (actor[0], actor[1]),
+                        (source[0], source[1]),
+                        OctantJitter::Infantry,
+                        &mut rng,
+                    )
                 };
                 assert_eq!(
                     start & 7,

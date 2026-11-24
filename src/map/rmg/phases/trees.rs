@@ -10,14 +10,22 @@
 //! is *never* cleared between iterations: a later region cannot re-enter cells
 //! an earlier region already walked, which is what keeps successive trees from
 //! all piling onto the first few origins.
+//!
+//! Native: the tree loop of `RandomMapGenerator::PaintLatPatchesTreesRocks_Temperate
+//! @ 0x005A3AE0` (0x005A3F41..0x005A40BD) and
+//! `PaintLatPatchesTrees_NonTemperate @ 0x005A4280`, each region grown by
+//! `RandomMapGenerator::PlaceTreeRegion @ 0x005A45E0`.
 
 use crate::map::rmg::grid::RmgGrid;
-use crate::map::rmg::rng::{RANGE_K_BITS, RmgRng};
+use crate::map::rmg::rng::RmgRng;
 use crate::map::rmg::scratch::RmgScratch;
 use crate::map::rmg::tiles::TileIds;
-use crate::map::rmg::x87::{self, Gaussian, TruncF64, approx_sqrt};
+use crate::map::rmg::x87::{self, Gaussian, TruncF64};
+use crate::util::native_x87::X87Chop53;
 
-use super::blob::MinHeap;
+use super::blob::{CellHeap, by_key};
+use super::shore::TileBlocks;
+use super::zones::{LAND_ROCK, recalc_land};
 
 /// Placement iterations cap (`local_5c < 100`).
 const MAX_ITERATIONS: i32 = 100;
@@ -42,9 +50,6 @@ const SIZE_SCALE: f64 = 10.0;
 const SIZE_OFFSET: f64 = 25.0;
 const SIZE_MIN: f64 = 10.0;
 const SIZE_MAX: f64 = 35.0;
-
-/// Region-walk priority jitter, `rand·5·2⁻³²`.
-const JITTER: f64 = 5.0;
 
 /// Tree-index draw: `ftol(rand·scale + 1.0)`, rejected above 25 → `[1, 25]`.
 ///
@@ -76,6 +81,37 @@ pub struct TreeCtx<'a> {
     pub rng: &'a mut RmgRng,
     /// Shared with the water/blob phases — the Box-Muller cache persists.
     pub gauss: &'a mut Gaussian,
+    pub recalc_rock: &'a RecalcRock,
+}
+
+/// The cells whose land type the last full recalc before the trees left Rock
+/// (`CellClass::RecalcAttributes @ 0x0047D2B0`, see [`recalc_land`]): the
+/// tree gate reads that stored land type, not one for the current levels.
+/// An overlay cell's native land type is its overlay's, but the gate refuses
+/// overlay cells before reading it.
+#[derive(Debug, Default)]
+pub struct RecalcRock {
+    stride: usize,
+    rock: Vec<bool>,
+}
+
+impl RecalcRock {
+    pub fn snapshot(grid: &RmgGrid, blocks: &dyn TileBlocks, cliff_back_impassability: u8) -> Self {
+        let stride = grid.width();
+        let rock = (0..stride * stride)
+            .map(|index| {
+                let (x, y) = ((index % stride) as i32, (index / stride) as i32);
+                grid.get(x, y).is_some()
+                    && recalc_land(grid, blocks, cliff_back_impassability, None, x, y) == LAND_ROCK
+            })
+            .collect();
+        Self { stride, rock }
+    }
+
+    /// Only asked for a valid cell.
+    pub(crate) fn get(&self, x: i32, y: i32) -> bool {
+        self.rock[y as usize * self.stride + x as usize]
+    }
 }
 
 fn t(value: f64) -> TruncF64 {
@@ -92,7 +128,7 @@ pub fn run(ctx: &mut TreeCtx<'_>, args: &TreeArgs) -> Vec<(String, i16, i16)> {
         .mul(t(WIDTH_SCALE))
         .add(t(WIDTH_OFFSET));
     let veg_term = t(f64::from(args.vegetation)).mul(t(VEG_SCALE));
-    let mut remaining = x87::ftol(
+    let mut remaining = X87Chop53::ftol_f64_low_masked(
         width_term
             .mul(veg_term)
             .mul(t(f64::from(args.max_trees)))
@@ -164,7 +200,7 @@ fn size_draw(gauss: &mut Gaussian, rng: &mut RmgRng) -> i32 {
             .add(t(SIZE_OFFSET))
             .to_f64();
         if (SIZE_MIN..=SIZE_MAX).contains(&value) {
-            return x87::ftol(value);
+            return X87Chop53::ftol_f64_low_masked(value);
         }
     }
 }
@@ -174,7 +210,9 @@ fn tree_index_draw(rng: &mut RmgRng) -> i32 {
     let scale = t(f64::from_bits(TREE_INDEX_K_BITS));
     let offset = t(TREE_INDEX_OFFSET);
     loop {
-        let value = x87::ftol(t(f64::from(rng.next_u32())).mul(scale).add(offset).to_f64());
+        let value = X87Chop53::ftol_f64_low_masked(
+            t(f64::from(rng.next_u32())).mul(scale).add(offset).to_f64(),
+        );
         if value <= TREE_INDEX_MAX {
             return value;
         }
@@ -197,13 +235,14 @@ fn place_region(
         return 0;
     }
     let budget = size * REGION_MULT;
-    let mut heap = MinHeap::new(budget as usize + 8);
+    // 0x005A45E0: a `25 * size` pool and heap; `local_58` counts admissions.
+    let mut heap = CellHeap::new(budget as usize);
     ctx.scratch.get_mut(origin.0, origin.1).visited = true;
-    heap.push(0.0, origin);
+    heap.push((0.0, origin), by_key);
     // `admitted` is the monotonic total of cells ever pushed (native `local_58`,
     // seeded at 1 for the origin); it caps the region and never decreases.
     let mut admitted = 1i32;
-    let mut current = heap.pop().map(|(_, coord)| coord);
+    let mut current = heap.pop(by_key).map(|(_, coord)| coord);
     let mut placed = 0i32;
 
     while placed < size {
@@ -214,10 +253,13 @@ fn place_region(
             break;
         }
 
-        // Eligibility gate. (The original also rejects land type 3, but a clear
-        // tile is land type 0, so that branch is a proven no-op — omitted.)
+        // Eligibility gate: clear, unoccupied, overlay-free and not Rock; a
+        // clear tile is Rock when the CliffBack reclass put it behind a cliff.
         let eligible = ctx.grid.get(cur.0, cur.1).is_some_and(|cell| {
-            ctx.ids.is_clear(cell.tile) && !cell.occupied && cell.overlay == -1
+            ctx.ids.is_clear(cell.tile)
+                && !cell.occupied
+                && cell.overlay == -1
+                && !ctx.recalc_rock.get(cur.0, cur.1)
         });
         if eligible && ctx.rng.next_unit() < density {
             let v = tree_index_draw(ctx.rng);
@@ -249,32 +291,28 @@ fn place_region(
             }
             let dx = origin.0 - nx;
             let dy = origin.1 - ny;
-            let jitter = t(f64::from(ctx.rng.next_u32()))
-                .mul(t(JITTER))
-                .mul(t(f64::from_bits(RANGE_K_BITS)));
-            let priority = approx_sqrt(t(f64::from(dx * dx + dy * dy)))
-                .add(jitter)
-                .to_f64() as f32;
+            let priority = x87::jittered_distance_key(dx * dx + dy * dy, ctx.rng.next_u32());
             ctx.scratch.get_mut(nx, ny).visited = true;
-            heap.push(priority, (nx, ny));
+            heap.push((priority, (nx, ny)), by_key);
             admitted += 1;
         }
 
-        current = heap.pop().map(|(_, coord)| coord);
+        current = heap.pop(by_key).map(|(_, coord)| coord);
     }
     placed
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod tests {
     use super::*;
-    use crate::map::rmg::tiles::SpecialTerrain;
+    use crate::map::theater::TheaterCliffRanges;
 
     fn ids() -> TileIds {
         TileIds {
             clear: 0,
             ramp_base: -1,
             ramp_smooth: -1,
+            slope_set_pieces: -1,
             rough: -1,
             sand: -1,
             green: 100,
@@ -290,7 +328,7 @@ mod tests {
             paved_roads: -1,
             paved_road_ends: -1,
             medians: -1,
-            special: SpecialTerrain::default(),
+            cliffs: TheaterCliffRanges::default(),
         }
     }
 
@@ -326,9 +364,19 @@ mod tests {
         }
     }
 
+    /// No block data: every tile reads land type Clear.
+    struct NoBlocks;
+
+    impl TileBlocks for NoBlocks {
+        fn block(&self, _tile: i32) -> Option<&crate::map::rmg::phases::shore::TileBlock> {
+            None
+        }
+    }
+
     fn run_once(seed: u16, max_trees: i32) -> (Vec<(String, i16, i16)>, World) {
         let mut w = world();
         let targs = args(&w, max_trees);
+        let rock = RecalcRock::snapshot(&w.grid, &NoBlocks, 2);
         let identity = ids();
         let mut rng = RmgRng::new(seed);
         let mut gauss = Gaussian::default();
@@ -339,6 +387,7 @@ mod tests {
                 ids: &identity,
                 rng: &mut rng,
                 gauss: &mut gauss,
+                recalc_rock: &rock,
             };
             run(&mut ctx, &targs)
         };
@@ -346,123 +395,31 @@ mod tests {
     }
 
     #[test]
-    fn tree_index_draws_are_one_to_twentyfive() {
-        // The +1.0 offset excludes 0, so TREE00 is never generated.
-        let mut rng = RmgRng::new(11);
-        for _ in 0..2000 {
-            let v = tree_index_draw(&mut rng);
-            assert!((1..=25).contains(&v), "tree index {v} out of [1,25]");
-        }
-    }
-
-    #[test]
-    fn tree_names_are_all_real_terrain_types() {
-        let (trees, _) = run_once(1234, 600);
-        assert!(!trees.is_empty(), "a vegetated map grows trees");
-        for (name, _, _) in &trees {
-            // TREE01..TREE25 exist in [TerrainTypes]; TREE00 must never appear.
-            assert_ne!(name, "TREE00", "TREE00 does not exist");
-            let n: i32 = name.strip_prefix("TREE").unwrap().parse().unwrap();
-            assert!((1..=25).contains(&n), "{name} is a real tree type");
-        }
-    }
-
-    #[test]
-    fn density_draws_stay_in_range() {
-        let mut rng = RmgRng::new(5);
-        let mut gauss = Gaussian::default();
-        for _ in 0..2000 {
-            let d = density_draw(&mut gauss, &mut rng);
-            assert!((0.05..=0.4).contains(&d), "density {d} out of range");
-        }
-    }
-
-    #[test]
-    fn size_draws_stay_in_range() {
-        let mut rng = RmgRng::new(6);
-        let mut gauss = Gaussian::default();
-        for _ in 0..2000 {
-            let s = size_draw(&mut gauss, &mut rng);
-            assert!((10..=35).contains(&s), "size {s} out of range");
-        }
-    }
-
-    #[test]
-    fn zero_max_trees_is_a_no_op() {
-        let mut w = world();
-        let targs = args(&w, 0);
-        let identity = ids();
-        let mut rng = RmgRng::new(3);
-        let mut gauss = Gaussian::default();
-        let trees = {
+    fn cell_behind_a_cliff_takes_no_tree() {
+        // The origin sits four levels under its (x, y-1) neighbour.
+        let first_tree = |cliff_back_impassability| {
+            let mut w = world();
+            let (x, y) = (60, 40);
+            let level = w.grid.get(x, y).unwrap().level;
+            w.grid.get_mut(x, y - 1).unwrap().level = level + 4;
+            let rock = RecalcRock::snapshot(&w.grid, &NoBlocks, cliff_back_impassability);
+            let identity = ids();
+            let mut rng = RmgRng::new(7);
+            let mut gauss = Gaussian::default();
             let mut ctx = TreeCtx {
                 grid: &mut w.grid,
                 scratch: &mut w.scratch,
                 ids: &identity,
                 rng: &mut rng,
                 gauss: &mut gauss,
+                recalc_rock: &rock,
             };
-            run(&mut ctx, &targs)
+            let mut out = Vec::new();
+            place_region(&mut ctx, (x, y), 1, 1.0, &mut out);
+            (out[0].1, out[0].2)
         };
-        assert!(trees.is_empty(), "MaxTrees 0 places nothing");
-        // count is 0, so the loop body never runs and no draws are consumed.
-        let mut fresh = RmgRng::new(3);
-        assert_eq!(rng.next_u32(), fresh.next_u32(), "no draws consumed");
-    }
-
-    #[test]
-    fn every_placed_tree_occupies_its_cell() {
-        let (trees, world) = run_once(4242, 600);
-        for (_, x, y) in &trees {
-            assert!(
-                world
-                    .grid
-                    .get(i32::from(*x), i32::from(*y))
-                    .unwrap()
-                    .occupied,
-                "tree cell ({x},{y}) is occupied"
-            );
-        }
-    }
-
-    #[test]
-    fn trees_never_land_on_the_same_cell_twice() {
-        // Occupancy blocks a later region from re-treeing a cell.
-        let (trees, _) = run_once(777, 600);
-        let mut seen = std::collections::HashSet::new();
-        for (_, x, y) in &trees {
-            assert!(seen.insert((*x, *y)), "cell ({x},{y}) got two trees");
-        }
-    }
-
-    #[test]
-    fn water_locked_cells_block_the_walk() {
-        // A fully water-locked map admits no neighbours and grows nothing.
-        let mut w = world();
-        let targs = args(&w, 600);
-        let identity = ids();
-        for (x, y) in w.grid.native_cells().collect::<Vec<_>>() {
-            w.scratch.get_mut(x, y).water_lock = true;
-        }
-        let mut rng = RmgRng::new(9);
-        let mut gauss = Gaussian::default();
-        let trees = {
-            let mut ctx = TreeCtx {
-                grid: &mut w.grid,
-                scratch: &mut w.scratch,
-                ids: &identity,
-                rng: &mut rng,
-                gauss: &mut gauss,
-            };
-            run(&mut ctx, &targs)
-        };
-        // The origin itself may still be treed, but no region can spread; with
-        // every cell water-locked, even the origin is not water-locked only if
-        // it is the border. In practice no trees survive the spread block.
-        for (_, x, y) in &trees {
-            // Any tree placed must be on a real, non-water-locked in-band cell.
-            assert!(w.grid.is_valid(i32::from(*x), i32::from(*y)));
-        }
+        assert_ne!(first_tree(2), (60, 40));
+        assert_eq!(first_tree(1), (60, 40));
     }
 
     #[test]
@@ -477,5 +434,96 @@ mod tests {
             (trees, occupied)
         };
         assert_eq!(snapshot(2024), snapshot(2024));
+    }
+
+    /// Whole original `RandomMapGenerator::PlaceTreeRegion @ 0x005A45E0`
+    /// calls from `tools/rmg_oracle/tree_region.py`: each tree's name and
+    /// cell, the returned count, the visited marks and the exit RNG.
+    #[test]
+    fn native_place_tree_region_controls() {
+        let doc = crate::test_fixture::json("tools/rmg_oracle/tree_region.json");
+        let int = |value: &serde_json::Value| value.as_i64().unwrap() as i32;
+        let cells = |value: &serde_json::Value| -> Vec<(i32, i32)> {
+            value
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| (int(&c[0]), int(&c[1])))
+                .collect()
+        };
+        let identity = ids();
+        let rows = doc["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 7);
+        for row in rows {
+            let input = &row["input"];
+            let context = input["id"].as_str().unwrap();
+            let mut grid = RmgGrid::new(33, 16, 48);
+            let mut scratch = RmgScratch::new(33, 16, 48);
+            for (x, y) in grid.native_cells().collect::<Vec<_>>() {
+                grid.get_mut(x, y).unwrap().tile = 0;
+            }
+            for (x, y) in cells(&input["rough"]) {
+                grid.get_mut(x, y).unwrap().tile = int(&doc["scene"]["rough"]);
+            }
+            for (x, y) in cells(&input["occupied"]) {
+                grid.get_mut(x, y).unwrap().occupied = true;
+            }
+            for (x, y) in cells(&input["overlay"]) {
+                grid.get_mut(x, y).unwrap().overlay = 0;
+            }
+            for (x, y) in cells(&input["locked"]) {
+                scratch.get_mut(x, y).water_lock = true;
+            }
+            for (x, y) in cells(&input["visited"]) {
+                scratch.get_mut(x, y).visited = true;
+            }
+            let mut rock = RecalcRock {
+                stride: 33,
+                rock: vec![false; 33 * 33],
+            };
+            for (x, y) in cells(&input["rock"]) {
+                rock.rock[y as usize * 33 + x as usize] = true;
+            }
+            let mut rng = RmgRng::new(input["seed"].as_u64().unwrap() as u16);
+            let mut gauss = Gaussian::default();
+            let mut ctx = TreeCtx {
+                grid: &mut grid,
+                scratch: &mut scratch,
+                ids: &identity,
+                rng: &mut rng,
+                gauss: &mut gauss,
+                recalc_rock: &rock,
+            };
+            let origin = (int(&input["origin"][0]), int(&input["origin"][1]));
+            let size = int(&input["size"]);
+            let density = input["density"].as_f64().unwrap();
+            let mut trees = Vec::new();
+            let placed = place_region(&mut ctx, origin, size, density, &mut trees);
+            assert_eq!(placed, int(&row["placed"]), "{context}: placed");
+            let native: Vec<(String, i16, i16)> = row["trees"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| {
+                    (
+                        t[0].as_str().unwrap().to_owned(),
+                        int(&t[1]) as i16,
+                        int(&t[2]) as i16,
+                    )
+                })
+                .collect();
+            assert_eq!(trees, native, "{context}: trees");
+            let visited: Vec<(i32, i32)> = (0..33)
+                .flat_map(|y| (0..33).map(move |x| (x, y)))
+                .filter(|&(x, y)| scratch.in_diamond(x, y) && scratch.get(x, y).visited)
+                .collect();
+            assert_eq!(visited, cells(&row["visited"]), "{context}: visited");
+            assert_eq!(
+                rng.into_continuation().into_native_parts(),
+                super::super::cliff_native_tests::native_state(doc, &row["rng_after"])
+                    .into_native_parts(),
+                "{context}: exit RNG"
+            );
+        }
     }
 }

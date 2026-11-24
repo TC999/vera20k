@@ -53,7 +53,7 @@ pub struct VoiceDecision {
     /// Stable id of the object whose line this is (native: the `TechnoClass`).
     pub owner: u64,
     /// The `sound(md).ini` id to start. gamemd stores the Voc index; VERA
-    /// carries the id string and compares it the same way.
+    /// carries the registry's canonical identity string.
     pub sound_id: String,
 }
 
@@ -79,9 +79,9 @@ impl VoiceQueue {
     ///
     /// The two gates ahead of the latch — `g_SelectionVoice_Enable @
     /// 0x00822CF2` and `HouseClass::IsHumanPlayer @ 0x0050B6F0` — are already
-    /// upstream in VERA: the app input layer issues selection and order voices
-    /// only for the local player's own objects, and only one object per
-    /// dispatch batch speaks.
+    /// upstream in VERA. Selection uses app sound_dispatch's native Select /
+    /// VoiceSelect admission; ordinary mouse batches admit the first success,
+    /// whereas other native selection commands have their own latch scope.
     pub fn queue(&mut self, owner: u64, sound_id: &str) {
         if sound_id.is_empty() {
             return;
@@ -89,79 +89,64 @@ impl VoiceQueue {
         self.pending.insert(owner, sound_id.to_string());
     }
 
-    /// `TechnoClass::AI_Update @ 0x006F9EBB` — drain every latched voice.
-    ///
-    /// `handle_live(owner)` is `VocHandle::ValidateOrClear @ 0x00406130` for
-    /// that object: true while the event the handle names is still the same
-    /// event playing the same entry.
-    ///
-    /// Native visits objects in the active-object scheduler's order; VERA
-    /// walks the map in ascending stable-id order so the pass is deterministic.
-    /// The two only differ when two objects both have a voice latched in the
-    /// same pass, which the one-voice-per-batch latch above already prevents
-    /// for player input.
-    pub fn drain(&mut self, mut handle_live: impl FnMut(u64) -> bool) -> Vec<VoiceDecision> {
-        // VERA-internal, gamemd has no counterpart: native stores the playing
-        // index inside the techno (`+0x4F4`), so it dies with the object and a
-        // stale value is harmless — `0x006F9F03` only reads it while the
-        // handle is live. VERA's map would otherwise keep one entry per object
-        // that ever spoke, so entries whose handle has gone are dropped at the
-        // top of the pass, before any of them can be compared.
-        self.playing.retain(|&owner, _| handle_live(owner));
+    /// The current pending owners, for a derived per-frame interest set.
+    /// Reading this view never consumes a latch or supplies visitation order.
+    pub fn pending_owners(&self) -> impl Iterator<Item = u64> + '_ {
+        self.pending.keys().copied()
+    }
 
-        let mut decisions = Vec::new();
-        let mut settled = Vec::new();
-
-        for (&owner, sound_id) in &self.pending {
-            if handle_live(owner) {
-                // `0x006F9EF7`: same index -> clear pending and let the line
-                // finish; different index -> leave it latched for next pass.
-                if self
-                    .playing
-                    .get(&owner)
-                    .is_some_and(|live| live == sound_id)
-                {
-                    settled.push(owner);
-                }
-            } else {
-                // `0x006F9ED9`: the handle is free, so this one starts now.
-                self.playing.insert(owner, sound_id.clone());
-                decisions.push(VoiceDecision {
-                    owner,
-                    sound_id: sound_id.clone(),
-                });
-                settled.push(owner);
+    /// One reached `TechnoClass::AI` voice slot6F9EBB..6F9F0D.
+    ///
+    /// The live Logic cursor, not this map's key order, chooses the caller.
+    /// `handle_live` comes from shared VocHandle406130 validation: a queued
+    /// event is live even before it acquires a channel or device output.
+    /// Audio servicing alone never visits this owner or consumes its latch.
+    pub fn visit(&mut self, owner: u64, handle_live: bool) -> Option<VoiceDecision> {
+        let pending = self.pending.get(&owner)?;
+        if handle_live {
+            if self.playing.get(&owner) == Some(pending) {
+                self.pending.remove(&owner);
             }
+            return None;
         }
-
-        for owner in settled {
-            self.pending.remove(&owner);
-        }
-
-        decisions
+        let sound_id = self.pending.remove(&owner).expect("pending owner remains");
+        //6F9EEA writes the playing identity before PlayAtPos; even a failed
+        //play consumes this request. The next reached visit probes the handle.
+        self.playing.insert(owner, sound_id.clone());
+        Some(VoiceDecision { owner, sound_id })
     }
 
     /// Forget one object entirely (removal, or a hard voice-slot reset).
-    #[cfg(test)]
     pub fn forget(&mut self, owner: u64) {
         self.pending.remove(&owner);
         self.playing.remove(&owner);
     }
 
+    /// A deploy conversion hands the voice to the object replacing the
+    /// speaker: `UnitClass::Deploy @ 0x00739986..0x007399B2` and
+    /// `BuildingClass::Mission_Selling @ 0x0044A0E9..0x0044A115` copy `+0x4F0`
+    /// and `+0x4F4` over the new object's and write `-1` to the old one's.
+    pub fn move_owner(&mut self, from: u64, to: u64) {
+        for slots in [&mut self.pending, &mut self.playing] {
+            match slots.remove(&from) {
+                Some(sound_id) => slots.insert(to, sound_id),
+                None => slots.remove(&to),
+            };
+        }
+    }
+
     /// The id latched for `owner`, if any — `TechnoClass+0x4F0`.
-    #[cfg(test)]
     pub fn pending_for(&self, owner: u64) -> Option<&str> {
         self.pending.get(&owner).map(String::as_str)
     }
 
     /// The id this object's handle is playing — `TechnoClass+0x4F4`.
-    #[cfg(test)]
     pub fn playing_for(&self, owner: u64) -> Option<&str> {
         self.playing.get(&owner).map(String::as_str)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_audio))]
 mod tests {
     use super::*;
 
@@ -171,28 +156,48 @@ mod tests {
         queue.queue(7, "GIMove");
         assert_eq!(queue.pending_for(7), Some("GIMove"));
 
-        let decisions = queue.drain(|_| false);
+        let decision = queue.visit(7, false);
         assert_eq!(
-            decisions,
-            vec![VoiceDecision {
+            decision,
+            Some(VoiceDecision {
                 owner: 7,
                 sound_id: "GIMove".to_string()
-            }]
+            })
         );
         assert_eq!(queue.pending_for(7), None, "0x006F9F07 clears the latch");
+    }
+
+    /// Deploy `0x00739986..0x007399B2`: both slots overwrite the new
+    /// object's and the old object's go back to `-1`.
+    #[test]
+    fn a_moved_voice_overwrites_the_new_owner_and_empties_the_old() {
+        let mut queue = VoiceQueue::new();
+        queue.queue(7, "MCVSelect");
+        assert!(queue.visit(7, false).is_some());
+        queue.queue(7, "MCVMove");
+        queue.queue(9, "Stale");
+
+        queue.move_owner(7, 9);
+        assert_eq!(queue.playing_for(9), Some("MCVSelect"));
+        assert_eq!(queue.pending_for(9), Some("MCVMove"));
+        assert_eq!((queue.pending_for(7), queue.playing_for(7)), (None, None));
+
+        // An idle old owner leaves the new one idle too.
+        queue.move_owner(7, 9);
+        assert_eq!((queue.pending_for(9), queue.playing_for(9)), (None, None));
     }
 
     #[test]
     fn the_same_line_while_it_is_still_playing_is_dropped_not_restarted() {
         let mut queue = VoiceQueue::new();
         queue.queue(7, "GIMove");
-        assert_eq!(queue.drain(|_| false).len(), 1);
+        assert!(queue.visit(7, false).is_some());
 
         // Second click on the same unit while its line is mid-word.
         queue.queue(7, "GIMove");
-        let decisions = queue.drain(|owner| owner == 7);
+        let decision = queue.visit(7, true);
         assert!(
-            decisions.is_empty(),
+            decision.is_none(),
             "0x006F9F03 same-index path must not start the line again"
         );
         assert_eq!(queue.pending_for(7), None, "and it clears the latch");
@@ -203,11 +208,11 @@ mod tests {
     fn a_different_line_waits_for_the_live_one_instead_of_cutting_it() {
         let mut queue = VoiceQueue::new();
         queue.queue(7, "GISelect");
-        assert_eq!(queue.drain(|_| false).len(), 1);
+        assert!(queue.visit(7, false).is_some());
 
         queue.queue(7, "GIMove");
         // Handle still live with a different index: hold, do not play.
-        assert!(queue.drain(|owner| owner == 7).is_empty());
+        assert!(queue.visit(7, true).is_none());
         assert_eq!(
             queue.pending_for(7),
             Some("GIMove"),
@@ -215,13 +220,13 @@ mod tests {
         );
 
         // The line finishes; the retry starts the held one.
-        let decisions = queue.drain(|_| false);
+        let decision = queue.visit(7, false);
         assert_eq!(
-            decisions,
-            vec![VoiceDecision {
+            decision,
+            Some(VoiceDecision {
                 owner: 7,
                 sound_id: "GIMove".to_string()
-            }]
+            })
         );
         assert_eq!(queue.playing_for(7), Some("GIMove"));
     }
@@ -232,9 +237,8 @@ mod tests {
         queue.queue(7, "GISelect");
         queue.queue(7, "GIMove");
         assert_eq!(queue.pending_for(7), Some("GIMove"));
-        let decisions = queue.drain(|_| false);
-        assert_eq!(decisions.len(), 1);
-        assert_eq!(decisions[0].sound_id, "GIMove");
+        let decision = queue.visit(7, false).expect("reached pending owner");
+        assert_eq!(decision.sound_id, "GIMove");
     }
 
     #[test]
@@ -242,40 +246,28 @@ mod tests {
         let mut queue = VoiceQueue::new();
         queue.queue(7, "");
         assert_eq!(queue.pending_for(7), None);
-        assert!(queue.drain(|_| false).is_empty());
+        assert!(queue.visit(7, false).is_none());
     }
 
     #[test]
-    fn two_objects_drain_in_ascending_stable_id_order() {
+    fn no_visit_keeps_pending_and_other_visits_do_not_drain_it() {
         let mut queue = VoiceQueue::new();
-        queue.queue(9, "DogMove");
-        queue.queue(3, "GIMove");
-        let decisions = queue.drain(|_| false);
-        assert_eq!(
-            decisions.iter().map(|d| d.owner).collect::<Vec<_>>(),
-            vec![3, 9]
-        );
-    }
-
-    #[test]
-    fn the_playing_map_does_not_grow_past_the_live_handles() {
-        let mut queue = VoiceQueue::new();
-        for owner in 0..8u64 {
-            queue.queue(owner, "GIMove");
-        }
-        queue.drain(|_| false);
-        // Nothing is live afterwards, so the bookkeeping empties out.
-        queue.drain(|_| false);
-        for owner in 0..8u64 {
-            assert_eq!(queue.playing_for(owner), None);
-        }
+        queue.queue(7, "GIMove");
+        queue.queue(9, "GISelect");
+        // Paused/no-AI frames may inspect interest, but never drain an owner.
+        assert_eq!(queue.pending_owners().collect::<Vec<_>>(), vec![7, 9]);
+        assert!(queue.visit(42, false).is_none());
+        assert!(queue.visit(9, false).is_some());
+        assert_eq!(queue.pending_owners().collect::<Vec<_>>(), vec![7]);
+        assert_eq!(queue.pending_for(7), Some("GIMove"));
+        assert_eq!(queue.playing_for(7), None);
     }
 
     #[test]
     fn forget_drops_both_halves() {
         let mut queue = VoiceQueue::new();
         queue.queue(7, "GIMove");
-        queue.drain(|_| false);
+        queue.visit(7, false);
         queue.queue(7, "GISelect");
         queue.forget(7);
         assert_eq!(queue.pending_for(7), None);

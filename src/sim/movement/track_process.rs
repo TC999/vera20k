@@ -12,13 +12,101 @@
 //! world effects: tools/spatial_oracle/locomotor_track_point_gates.{py,json,meta.json}.
 
 use super::drive_track::{self, TrackPoint, TurnTrack};
-use crate::sim::components::{DriveCoord, TrackProgress};
+use crate::sim::components::DriveCoord;
 use crate::util::native_x87::{NativeF32Bits, NativeF64Bits, X87Chop53};
 
 const POINT_COST: i32 = 7;
 
+/// One active Drive/Ship locomotor's retained track selector, signed cursor,
+/// short-track choice and residual (+58/+5C/+60/+4C). Curve geometry and a
+/// temporary Process_Track call must not own serialized copies of this state.
+/// Native evidence: tools/spatial_oracle/locomotor_track_cursor.json.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct TrackProgress {
+    turn_index: i32,
+    /// Next-to-consume cursor. Drive constructor4AF5A6/4AF5A9 and Ship
+    /// constructor69ECB6/69ECB9 initialize selector/cursor to -1;
+    /// fresh/forced acceptance and completion retirement instead store zero.
+    cursor: i32,
+    reversed: bool,
+    residual: i32,
+}
+
+impl TrackProgress {
+    /// A fixture's progress.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) const fn for_test(
+        turn_index: i32,
+        cursor: i32,
+        reversed: bool,
+        residual: i32,
+    ) -> Self {
+        Self {
+            turn_index,
+            cursor,
+            reversed,
+            residual,
+        }
+    }
+
+    /// See the field.
+    pub const fn turn_index(&self) -> i32 {
+        self.turn_index
+    }
+
+    /// A fixture's selector.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_turn_index(&mut self, turn_index: i32) {
+        self.turn_index = turn_index;
+    }
+
+    /// See the field.
+    pub const fn cursor(&self) -> i32 {
+        self.cursor
+    }
+
+    /// A fixture's cursor.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_cursor(&mut self, cursor: i32) {
+        self.cursor = cursor;
+    }
+
+    /// See the field.
+    pub(crate) const fn reversed(&self) -> bool {
+        self.reversed
+    }
+
+    /// A fixture's reversed.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_reversed(&mut self, reversed: bool) {
+        self.reversed = reversed;
+    }
+
+    /// See the field.
+    pub(crate) const fn residual(&self) -> i32 {
+        self.residual
+    }
+
+    /// A fixture's residual.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_residual(&mut self, residual: i32) {
+        self.residual = residual;
+    }
+}
+
+impl Default for TrackProgress {
+    fn default() -> Self {
+        Self {
+            turn_index: -1,
+            cursor: -1,
+            reversed: false,
+            residual: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum TrackFamily {
+pub enum TrackFamily {
     Drive,
     Ship,
 }
@@ -29,9 +117,6 @@ pub(crate) enum TrackFamily {
 pub(crate) struct TrackInvocation {
     pub entity_id: u64,
     pub family: TrackFamily,
-    /// Fresh ProcessMovement acceptance owes Apply1 before the paid loop.
-    /// This synchronous handoff never crosses a frame or snapshot boundary.
-    pub apply_fresh_occupation: bool,
     /// Called from the outer active-track gate (Drive 0x4B0576 / Ship
     /// 0x69FC86), whose false return may continue into Process_Movement in
     /// the same Process (`track_continuation`).
@@ -55,7 +140,6 @@ impl TrackInvocation {
         Self {
             entity_id,
             family,
-            apply_fresh_occupation: false,
             active_gate: false,
             retry: false,
         }
@@ -63,6 +147,14 @@ impl TrackInvocation {
 }
 
 impl TrackFamily {
+    pub fn from_kind(kind: crate::rules::locomotor_type::LocomotorKind) -> Option<Self> {
+        match kind {
+            crate::rules::locomotor_type::LocomotorKind::Drive => Some(Self::Drive),
+            crate::rules::locomotor_type::LocomotorKind::Ship => Some(Self::Ship),
+            _ => None,
+        }
+    }
+
     fn turn(self, index: i32) -> Option<&'static TurnTrack> {
         let count = match self {
             Self::Drive => 72,
@@ -76,17 +168,21 @@ impl TrackFamily {
 }
 
 impl TrackProgress {
-    /// Selector publication precedes fresh acceptance's later cursor-zero
-    /// write (Drive4B4016..4034 then4B4659; Ship6A3642..3660 then6A3C88).
-    pub(crate) fn select_fresh(&mut self, first: u8, second: u8) -> bool {
-        if first >= 8 || second >= 8 {
-            return false;
-        }
-        self.turn_index = drive_track::fresh_turn_index(first, second) as i32;
+    /// Publish a fresh selector ([`drive_track::fresh_turn_index`]) with the
+    /// reversed byte cleared. Selector publication precedes fresh acceptance's
+    /// later cursor-zero write (Drive4B4016..4034 then4B4659; Ship6A3642..3660
+    /// then6A3C88).
+    pub(crate) fn select_fresh(&mut self, turn_index: usize) {
+        assert!(
+            turn_index < 64,
+            "a fresh selector is one of the 64 from/to entries"
+        );
+        self.turn_index = turn_index as i32;
         self.reversed = false;
-        true
     }
 
+    /// Fresh acceptance's cursor-zero write (Drive `0x004B4659`, Ship
+    /// `0x006A3C88`).
     pub(crate) fn accept_fresh(&mut self) {
         self.cursor = 0;
     }
@@ -127,11 +223,24 @@ impl TrackProgress {
         self.cursor = 0;
     }
 
+    /// Selector -1 with the cursor kept: Process_Movement's fresh-track
+    /// rejection (Drive `0x004B3C75`, Ship `0x006A32C4`) and its path
+    /// retirement (`0x004B2F07`, Ship `0x006A2557`).
+    pub(crate) fn retire_selector(&mut self) {
+        self.turn_index = -1;
+    }
+
+    /// Residual 0 when Process_Track's descriptor and turn gates refuse
+    /// before its scalar prefix (Drive `0x004B25F2`, Ship `0x006A1C43`).
+    pub(crate) fn clear_residual(&mut self) {
+        self.residual = 0;
+    }
+
     fn selected_raw(&self, family: TrackFamily) -> Option<(u8, &'static TurnTrack)> {
-        let turn = family.turn(self.turn_index)?;
+        let turn = family.turn(self.turn_index())?;
         // Original read selects the short byte directly, without a fallback
         // to normal when that byte is zero. The process host owns that guard.
-        let raw = if self.reversed {
+        let raw = if self.reversed() {
             turn.short_track
         } else {
             turn.normal_track
@@ -148,12 +257,12 @@ impl TrackProgress {
         current: DriveCoord,
         head: DriveCoord,
     ) -> Option<ResidualStep> {
-        if self.residual < 1 {
+        if self.residual() < 1 {
             return None;
         }
         let (raw, turn) = self.selected_raw(family)?;
-        let point = raw_point(raw, self.cursor)?;
-        if self.cursor != 0 && point.x == 0 && point.y == 0 {
+        let point = raw_point(raw, self.cursor())?;
+        if self.cursor() != 0 && point.x == 0 && point.y == 0 {
             return None;
         }
         let (dx, dy, _) =
@@ -169,7 +278,7 @@ impl TrackProgress {
                 full.y.wrapping_sub(current.y),
                 0,
             ],
-            self.residual,
+            self.residual(),
         );
         Some(ResidualStep {
             current,
@@ -192,15 +301,7 @@ fn residual_delta(delta: [i32; 3], residual: i32) -> (NativeF32Bits, [i32; 3]) {
         X87Chop53::store_f32(X87Chop53::mul(X87Chop53::load_i32(residual), reciprocal))
             .expect("signed residual produces a finite f32 factor");
     let factor = X87Chop53::load_f32(factor_bits).expect("stored finite factor");
-    let other = X87Chop53::sub(X87Chop53::load_i32(1), factor);
-    let zero_term = X87Chop53::mul(X87Chop53::load_i32(0), other);
-    let scaled = delta.map(|component| {
-        X87Chop53::ftol_i64(X87Chop53::add(
-            X87Chop53::mul(X87Chop53::load_i32(component), factor),
-            zero_term,
-        ))
-        .expect("signed component and residual product fits i64") as i32
-    });
+    let scaled = crate::util::native_coord::interpolate([0; 3], delta, factor);
     (factor_bits, scaled)
 }
 
@@ -275,7 +376,7 @@ impl PaidSample {
         progress: &TrackProgress,
         head: DriveCoord,
     ) -> Option<([i32; 2], u8)> {
-        let turn = family.turn(progress.turn_index)?;
+        let turn = family.turn(progress.turn_index())?;
         let (x, y, facing) = drive_track::transform_track_point(
             i16::try_from(self.xy[0]).ok()?,
             i16::try_from(self.xy[1]).ok()?,
@@ -372,7 +473,7 @@ impl TrackProcess {
         fresh_budget: i32,
         retry: bool,
     ) -> Self {
-        let budget = invocation_budget(fresh_budget, progress.residual, retry);
+        let budget = invocation_budget(fresh_budget, progress.residual(), retry);
         Self {
             family,
             budget,
@@ -385,7 +486,7 @@ impl TrackProcess {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn budget(&self) -> i32 {
         self.budget
     }
@@ -401,11 +502,13 @@ impl TrackProcess {
     /// Do not capture this result in PaidSample before those world effects.
     pub fn is_at_occupation_handoff(&self, progress: &TrackProgress) -> bool {
         assert_eq!(self.phase, ProcessPhase::PointCallbacks);
-        progress.cursor != 0
+        progress.cursor() != 0
             && self
                 .selection
                 .and_then(|selection| drive_track::raw_track_meta(selection.raw_index))
-                .is_some_and(|raw| progress.cursor == i32::from(raw.occupation_handoff_point_index))
+                .is_some_and(|raw| {
+                    progress.cursor() == i32::from(raw.occupation_handoff_point_index)
+                })
     }
 
     /// Cursor portion of the later chain gate, Drive4B1B35..1B4A and
@@ -414,11 +517,11 @@ impl TrackProcess {
     /// query this separately from the occupation-handoff gate above.
     pub fn is_at_chain_cursor(&self, progress: &TrackProgress) -> bool {
         assert_eq!(self.phase, ProcessPhase::PointCallbacks);
-        progress.cursor != 0
+        progress.cursor() != 0
             && self
                 .selection
                 .and_then(|selection| drive_track::raw_track_meta(selection.raw_index))
-                .is_some_and(|raw| progress.cursor == i32::from(raw.chain_index))
+                .is_some_and(|raw| progress.cursor() == i32::from(raw.chain_index))
     }
 
     /// Accepted chaining explicitly replaces both retained progress and the
@@ -450,9 +553,9 @@ impl TrackProcess {
         // and the cached raw pointer. Callback selector/short writes do not
         // reselect this paid loop; the later residual branch does reselect.
         let raw_index = self.selection?.raw_index;
-        let point = raw_point(raw_index, progress.cursor)?;
+        let point = raw_point(raw_index, progress.cursor())?;
         self.budget = self.budget.wrapping_sub(POINT_COST);
-        let terminal = progress.cursor != 0 && point.x == 0 && point.y == 0;
+        let terminal = progress.cursor() != 0 && point.x == 0 && point.y == 0;
         self.phase = if terminal {
             ProcessPhase::TerminalCallbacks
         } else {
@@ -460,7 +563,7 @@ impl TrackProcess {
         };
         Some(TrackPayment::Sample(PaidSample {
             raw_index,
-            cursor: progress.cursor,
+            cursor: progress.cursor(),
             xy: [i32::from(point.x), i32::from(point.y)],
             facing: point.facing,
             terminal,
@@ -505,6 +608,6 @@ impl TrackProcess {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 #[path = "track_process_tests.rs"]
 mod tests;

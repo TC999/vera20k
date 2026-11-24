@@ -27,7 +27,7 @@ use crate::rules::ruleset::RuleSet;
 use crate::rules::terrain_rules::LandType;
 use crate::sim::combat::TargetKind;
 use crate::sim::components::NavTargetRef;
-use crate::sim::miner::{MinerState, ResourceType};
+use crate::sim::miner::MinerState;
 use crate::sim::ore_growth::OreGrowthState;
 use crate::sim::rng::SimRng;
 use crate::sim::tiberium::test_support;
@@ -44,22 +44,22 @@ const SKIPPED: &[&str] = &[
     "tick_not_harvester",
 ];
 
-fn corpus() -> Value {
-    serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/harvest_field.json"
-    ))
-    .unwrap()
+fn corpus() -> &'static Value {
+    crate::test_fixture::json("tools/spatial_oracle/harvest_field.json")
 }
 
 /// The refinery_dock rules with the row's `SpreadPercentage=` and
 /// `Harvester=`, the stock overlay list and the row's `[General]` values.
 fn rules_for(input: &Value) -> (RuleSet, IniFile) {
-    rules_for_with(input, |_| {})
+    rules_for_with(input, |_, _| {})
 }
 
 /// [`rules_for`] with `edit` applied to the rules text before the overlay
 /// and land sections are appended.
-fn rules_for_with(input: &Value, edit: impl FnOnce(&mut String)) -> (RuleSet, IniFile) {
+fn rules_for_with(
+    input: &Value,
+    edit: impl FnOnce(&mut String, &mut IniFile),
+) -> (RuleSet, IniFile) {
     let percentage = input["spread_percentage"].as_f64().unwrap_or(0.1);
     let mut text = super::refinery_dock_oracle_tests::RULES
         .replace(
@@ -78,22 +78,52 @@ fn rules_for_with(input: &Value, edit: impl FnOnce(&mut String)) -> (RuleSet, In
         text = text.replacen("1=MTNK\n", "1=MTNK\n2=CMIN\n3=CTNK\n", 1);
         text.push_str(super::cmin_dock_oracle_tests::CMIN);
     }
-    edit(&mut text);
+    let mut art = IniFile::from_str(
+        "[GAREFN]\nFoundation=4x3\nQueueingCell=4,1\n[GAREFX]\nFoundation=4x3\nQueueingCell=4,1\n[GAOREP]\nFoundation=2x2\n",
+    );
+    edit(&mut text, &mut art);
     let overlays = test_support::tiberium_rules_text();
-    text.push_str(&overlays[overlays.find("[OverlayTypes]").unwrap()..]);
+    let mut overlays = overlays[overlays.find("[OverlayTypes]").unwrap()..].to_owned();
+    // Complete the stock ordinal table through image4 without changing the
+    // common two-type fixture used by unrelated tests. Native reader range:
+    // TiberiumClass::ReadINI721C5C..721CD6; live controls are in harvest_field.py.
+    let mut extra_entries = String::new();
+    let mut extra_tiberium = Vec::new();
+    for raw_key in 125..=169 {
+        let name = match raw_key {
+            130..=149 => format!("TIB2_{:02}", raw_key - 129),
+            150..=169 => format!("TIB3_{:02}", raw_key - 149),
+            _ => format!("FILL{raw_key:03}"),
+        };
+        extra_entries.push_str(&format!("{raw_key}={name}\n"));
+        if name.starts_with("TIB") {
+            extra_tiberium.push(name);
+        }
+    }
+    // Extend the list rather than creating a second OverlayTypes section.
+    let list_end = overlays.find("\n[").unwrap();
+    overlays.insert_str(list_end + 1, &extra_entries);
+    text.push_str(&overlays);
+    for name in extra_tiberium {
+        text.push_str(&format!("[{name}]\nTiberium=yes\nLand=Tiberium\n"));
+    }
     for land in LandType::ALL.iter().take(9) {
         text.push_str(&format!(
             "[{}]\nFoot=100%\nTrack=100%\nWheel=100%\nBuildable=yes\n",
             land.section_name()
         ));
     }
-    let ini = IniFile::from_str(&text);
-    let mut rules = RuleSet::from_ini(&ini).unwrap();
-    rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(
-        &IniFile::from_str(
-            "[GAREFN]\nFoundation=4x3\nQueueingCell=4,1\n[GAREFX]\nFoundation=4x3\nQueueingCell=4,1\n",
-        ),
-    ));
+    let text = first_sections_only(&text);
+    // Scenes share a few rules and ART texts; each is parsed once.
+    let key = ("harvest scene rules", text.clone(), art.content_hash());
+    let (rules, ini) = crate::test_fixture::once_per_process(key, || {
+        let ini = IniFile::from_str(&text);
+        let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
+        rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
+        Some((rules, ini))
+    })
+    .unwrap();
+    let mut rules = rules.with_fresh_serial();
     rules.general.tiberium_short_scan = input["short_scan"].as_i64().unwrap_or(6 * 256) as i32;
     rules.general.tiberium_long_scan = input["long_scan"].as_i64().unwrap_or(48 * 256) as i32;
     rules.general.harvester_load_rate = input["load_rate"].as_i64().unwrap_or(2) as i32;
@@ -103,11 +133,11 @@ fn rules_for_with(input: &Value, edit: impl FnOnce(&mut String)) -> (RuleSet, In
 /// The overlay registry of the scene's rules: the stock list
 /// (`test_support::tiberium_rules_text`) with the scene's land rows, so a
 /// recalculated ore cell carries its `[Tiberium]` speed row.
-pub(super) fn registry() -> &'static crate::map::overlay_types::OverlayTypeRegistry {
-    static REGISTRY: std::sync::OnceLock<crate::map::overlay_types::OverlayTypeRegistry> =
+pub(super) fn registry() -> &'static crate::rules::overlay_types::OverlayTypeRegistry {
+    static REGISTRY: std::sync::OnceLock<crate::rules::overlay_types::OverlayTypeRegistry> =
         std::sync::OnceLock::new();
     REGISTRY.get_or_init(|| {
-        crate::map::overlay_types::OverlayTypeRegistry::from_ini(
+        crate::rules::overlay_types::OverlayTypeRegistry::from_ini(
             &rules_for(&serde_json::json!({})).1,
             None,
         )
@@ -119,6 +149,8 @@ fn overlay_name(kind: u64, variant: u64) -> String {
     match kind {
         0 => format!("TIB{:02}", variant + 1),
         1 => format!("GEM{:02}", variant + 1),
+        2 => format!("TIB2_{:02}", variant + 1),
+        3 => format!("TIB3_{:02}", variant + 1),
         other => panic!("tiberium {other}"),
     }
 }
@@ -127,11 +159,34 @@ fn overlay_name(kind: u64, variant: u64) -> String {
 /// so, its ore cells (LandType recomputed), the queues sized on the oracle's
 /// 16x16 MapSize, the archive, Unit+0x6D2 and the Scenario RNG seed.
 pub(super) fn row_scene(input: &Value) -> Scene {
-    row_scene_with(input, |_| {})
+    row_scene_with(input, |_, _| {})
 }
 
 /// [`row_scene`] on rules whose text `edit` extends (more types).
-pub(super) fn row_scene_with(input: &Value, edit: impl FnOnce(&mut String)) -> Scene {
+/// `text` with only the first section of each name. The scenes were checked
+/// against native runs with each name's first section in force; `IniFile`
+/// resolves a repeated name through gamemd's CRC lookup (#2732), which can
+/// pick a later one, such as the later land sections a scene's edit precedes.
+fn first_sections_only(text: &str) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let mut keep = true;
+    let mut out = String::with_capacity(text.len());
+    for line in text.split_inclusive('\n') {
+        if let Some(name) = line
+            .trim()
+            .strip_prefix('[')
+            .and_then(|l| l.strip_suffix(']'))
+        {
+            keep = seen.insert(name.to_owned());
+        }
+        if keep {
+            out.push_str(line);
+        }
+    }
+    out
+}
+
+pub(super) fn row_scene_with(input: &Value, edit: impl FnOnce(&mut String, &mut IniFile)) -> Scene {
     let mut input = input.clone();
     if input.get("linked").is_none() {
         input["linked"] = false.into();
@@ -185,28 +240,62 @@ pub(super) fn row_scene_with(input: &Value, edit: impl FnOnce(&mut String)) -> S
         grid.place_overlay(at.0, at.1, id, ore[4].as_u64().unwrap() as u8);
         grid.recalculate_runtime_cell(s.sim.resolved_terrain.as_mut().unwrap(), registry, at);
     }
-    let frame = s.sim.session.binary_frame;
-    s.sim.production.ore_growth_state = OreGrowthState::new(33, 33);
+    let frame = s.sim.session.binary_frame();
+    s.sim.ore_growth_state = OreGrowthState::new(33, 33);
     s.sim
-        .production
         .ore_growth_state
-        .reset_native_tiberium_classes_for_rect((16, 16), 2, frame);
+        .reset_native_tiberium_classes_for_rect((16, 16), 4, frame);
     for queued in input["spread_queued"].as_array().into_iter().flatten() {
         s.sim
-            .production
             .ore_growth_state
             .mark_native_spread_bitmap_for_tests(0, cell(queued));
     }
-    s.sim.production.ore_growth_config.spreads = input["spreads"] != false;
+    s.sim
+        .ore_growth_config
+        .set_spreads_for_test(input["spreads"] != false);
     {
         let entity = s.sim.substrate.entities.get_mut(s.miner).unwrap();
         if let Some(archive) = input.get("archive").filter(|a| !a.is_null()) {
             let (x, y) = cell(archive);
             entity.set_archive_target(Some(TargetKind::Cell(x, y)));
         }
-        entity.miner.as_mut().unwrap().harvesting = input["harvesting"] == true;
+        if let Some(miner) = entity.miner.as_mut() {
+            miner.set_harvesting_for_test(input["harvesting"] == true);
+        }
     }
     s.sim.scenario_rng = SimRng::new(input["seed"].as_u64().unwrap_or(1));
+    if let Some(owned) = input["owned_by_current_house"].as_bool() {
+        s.sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_game_mode(
+                input["game_mode"].as_i64().unwrap() as i32,
+            ),
+        );
+        let current = s.sim.substrate.entities.get(s.miner).unwrap().owner();
+        s.sim.session.set_current_house_for_test(Some(current));
+        s.sim
+            .substrate
+            .entities
+            .get_mut(s.miner)
+            .unwrap()
+            .seldom
+            .discovery
+            .set_owned_by_current_house_for_test(owned);
+        s.sim.fog = crate::sim::vision::FogState::new(33, 33);
+        s.sim.fog.reveal_cells_for_owner(
+            current,
+            input["mapped"].as_array().into_iter().flatten().map(cell),
+        );
+        for level in input["levels"].as_array().into_iter().flatten() {
+            let (x, y) = cell(level);
+            s.sim
+                .resolved_terrain
+                .as_mut()
+                .unwrap()
+                .cell_mut_for_test(x, y)
+                .unwrap()
+                .level = level[2].as_u64().unwrap() as u8;
+        }
+    }
     s
 }
 
@@ -230,7 +319,7 @@ fn cell_state(s: &Scene, at: (u16, u16)) -> Value {
 }
 
 /// Every compared field, in the oracle's names.
-fn compare_state(s: &Scene, row: &Value, context: &str) {
+pub(super) fn compare_state(s: &Scene, row: &Value, context: &str) {
     let native = &row["state"];
     for ore in row["input"]["ore"].as_array().unwrap() {
         let at = (
@@ -244,12 +333,7 @@ fn compare_state(s: &Scene, row: &Value, context: &str) {
             "{context}: cell {key}"
         );
     }
-    let classes = &s
-        .sim
-        .production
-        .ore_growth_state
-        .native_tiberium_state()
-        .classes;
+    let classes = &s.sim.ore_growth_state.native_tiberium_state().classes;
     for (index, heap) in native["spread"].as_array().unwrap().iter().enumerate() {
         let mut expected: Vec<(u16, u16, u32)> = heap
             .as_array()
@@ -279,8 +363,7 @@ fn compare_state(s: &Scene, row: &Value, context: &str) {
         "{context}: Scenario RNG cursors"
     );
     let entity = s.sim.substrate.entities.get(s.miner).unwrap();
-    let miner = entity.miner.as_ref().unwrap();
-    let nav = match entity.navigation.nav_com {
+    let nav = match entity.navigation.nav_com() {
         Some(NavTargetRef::Cell { rx, ry }) => serde_json::json!([rx, ry]),
         None => Value::Null,
         Some(other) => panic!("{context}: NavCom {other:?}"),
@@ -292,11 +375,6 @@ fn compare_state(s: &Scene, row: &Value, context: &str) {
         Some(other) => panic!("{context}: archive {other:?}"),
     };
     assert_eq!(archive, native["archive"], "{context}: ArchiveTarget");
-    assert_eq!(
-        u64::from(miner.harvesting),
-        native["harvesting"].as_u64().unwrap(),
-        "{context}: Unit+0x6D2"
-    );
     let stage = entity.native_stage();
     assert_eq!(
         serde_json::json!([
@@ -308,22 +386,36 @@ fn compare_state(s: &Scene, row: &Value, context: &str) {
         native["stage"],
         "{context}: StageClass"
     );
-    let count = |kind| {
-        miner
-            .cargo
-            .iter()
-            .filter(|bale| bale.resource_type == kind)
+    assert_eq!(
+        u64::from(
+            entity
+                .miner
+                .as_ref()
+                .is_some_and(|miner| miner.harvesting())
+        ),
+        native["harvesting"].as_u64().unwrap(),
+        "{context}: Unit+0x6D2"
+    );
+    let count = |slot| {
+        entity
+            .miner
+            .as_ref()
+            .into_iter()
+            .flat_map(|miner| miner.cargo())
+            .filter(|bale| usize::from(bale.tiberium_type.0) == slot)
             .count() as f64
     };
     let storage = native["storage"].as_array().unwrap();
-    assert_eq!(
-        (count(ResourceType::Ore), count(ResourceType::Gem)),
-        (storage[0].as_f64().unwrap(), storage[1].as_f64().unwrap()),
-        "{context}: cargo"
-    );
+    for slot in 0..4 {
+        assert_eq!(
+            count(slot),
+            storage[slot].as_f64().unwrap(),
+            "{context}: native slot{slot}"
+        );
+    }
     let owner = s.sim.interner.get("Americans").unwrap();
     assert_eq!(
-        u64::from(s.sim.houses[&owner].harvester_no_ore),
+        u64::from(s.sim.houses[&owner].harvester_no_ore()),
         native["house_no_ore"].as_u64().unwrap(),
         "{context}: House+0x242"
     );
@@ -345,12 +437,22 @@ fn reduce_tiberium_matches_the_original_cell_reduction() {
         let input = &row["input"];
         let mut s = row_scene(input);
         let at = cell(&input["cell"]);
-        let outcome = s.sim.reduce_tiberium_at_with_native_context(
+        let outcome = crate::sim::world::Simulation::reduce_tiberium_at_with_native_context(
+            &s.sim.terrain_objects,
+            &s.sim.ore_growth_config,
+            &mut s.sim.ore_growth_state,
+            &s.sim.session,
+            &mut s.sim.scenario_rng,
+            &s.sim.substrate,
+            &mut s.sim.resolved_terrain,
+            &mut s.sim.overlay_grid,
+            &mut s.sim.dirty_cells,
             at,
             input["amount"].as_i64().unwrap() as i32,
-            Some(&s.rules),
+            &s.rules,
             Some(registry()),
-        );
+        )
+        .unwrap();
         assert_eq!(
             u64::from(outcome.removed_amount),
             row["removed"].as_u64().unwrap(),
@@ -392,7 +494,8 @@ fn scan_for_tiberium_matches_the_original_ring_scan() {
             Some(registry()),
             s.miner,
             input["range"].as_i64().unwrap() as i32,
-        );
+        )
+        .unwrap();
         let found = found.map_or(serde_json::json!([0, 0]), |(x, y)| {
             serde_json::json!([x, y])
         });
@@ -414,7 +517,9 @@ fn search_for_tiberium_matches_the_original_search_and_move() {
             Some(registry()),
             s.miner,
             input["range"].as_i64().unwrap() as i32,
-        );
+            &mut crate::sim::world::FrameEffects::default(),
+        )
+        .unwrap();
         assert_eq!(
             u64::from(ok),
             row["ok"].as_u64().unwrap(),
@@ -452,15 +557,17 @@ fn mission_harvest_states_zero_and_one_match_the_original_dispatch() {
         let input = &row["input"];
         let mut s = row_scene(input);
         compare_reach(&s, row, &context);
-        let config = crate::sim::miner::MinerConfig::from_rules(&s.rules);
-        let frame = s.sim.session.binary_frame;
-        crate::sim::miner::dispatch_harvest_for_object(
+        let frame = s.sim.session.binary_frame();
+        crate::sim::world::dispatch_foot_mission(
             &mut s.sim,
-            &s.rules,
-            &config,
-            Some(registry()),
             s.miner,
-        );
+            &s.rules,
+            &mut crate::sim::world::ObjectAiCtx {
+                overlay_registry: Some(registry()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let entity = s.sim.substrate.entities.get(s.miner).unwrap();
         let timer = entity.mission.dispatch_timer();
         assert_eq!(
@@ -500,12 +607,51 @@ fn mission_harvest_states_zero_and_one_match_the_original_dispatch() {
 }
 
 #[test]
-fn replay_covers_every_row() {
-    let corpus = corpus();
-    let count = |group: &str| corpus[group].as_array().unwrap().len();
-    assert_eq!(count("reduce"), 16);
-    assert_eq!(count("scan"), 19);
-    assert_eq!(count("search"), 4);
-    assert_eq!(count("ore_tick"), 11);
-    assert_eq!(count("harvest"), 23);
+fn campaign_player_scan_rejects_unexplored_ore() {
+    let mut scene = row_scene(&serde_json::json!({
+        "name": "campaign_hidden_ore",
+        "game_mode": 0,
+        "mission": "harvest",
+        "miner_cell": [15, 15],
+        "ore": [[16, 15, 0, 0, 5]],
+    }));
+    let owner = scene
+        .sim
+        .substrate
+        .entities
+        .get(scene.miner)
+        .unwrap()
+        .owner();
+    scene.sim.session.set_current_house_for_test(Some(owner));
+    // The native control supplies Techno+41A=1 independently of House+1EC.
+    scene
+        .sim
+        .substrate
+        .entities
+        .get_mut(scene.miner)
+        .unwrap()
+        .seldom
+        .discovery
+        .set_owned_by_current_house_for_test(true);
+    scene.sim.fog = crate::sim::vision::FogState::new(33, 33);
+    assert!(crate::sim::vision::cell_is_shrouded(
+        &scene.sim.fog,
+        &crate::map::resolved_terrain::NativeCellQuery::canonical(
+            scene.sim.resolved_terrain.as_ref().unwrap()
+        ),
+        owner,
+        (16, 15),
+    ));
+    assert_eq!(
+        crate::sim::miner::ore_scan::scan_for_tiberium(
+            &mut scene.sim,
+            &scene.rules,
+            Some(registry()),
+            scene.miner,
+            6,
+        )
+        .unwrap(),
+        None,
+        "the native campaign scan rejects the only hidden candidate"
+    );
 }

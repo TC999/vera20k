@@ -6,17 +6,17 @@
 //!
 //! ## Dependency rules
 //! - Part of sim/ — depends on sim/zone_map, sim/zone_build, sim/zone_hierarchy.
-//! - sim/ NEVER depends on render/, ui/, sidebar/, audio/, net/.
+//! - sim/ NEVER depends on render/, ui/, audio/, net/.
 
 use super::PathGrid;
-use super::zone_build::{
+use super::zone_build::hierarchy::{
     LocalHierarchyPatchResult, build_zone_hierarchy_with_query, patch_zone_hierarchy_with_query,
-    projected_zone_record_index,
 };
+use super::zone_build::projected_zone_record_index;
 use super::zone_map::{ZONE_INVALID, ZoneGrid, ZoneId};
 use crate::map::resolved_terrain::{ResolvedTerrainGrid, zone_class};
 
-#[cfg(test)]
+#[cfg(all(test, any(tests_sim_pathfinding, tests_sim_movement)))]
 mod native_repair_tests {
     include!("base_zone_repair_native_tests.rs");
 }
@@ -138,11 +138,13 @@ pub(crate) fn repair_zone_cell(
     bridge_records: &[crate::sim::bridge_state::BridgeEndpointRecord],
 ) -> ZoneRepairOutcome {
     let coord = packed_coord.unpack();
-    let width = zone_grid.width;
-    let height = zone_grid.height;
+    let width = zone_grid.width();
+    let height = zone_grid.height();
     //56D460/56D5A0 read retained attributes only. Publication belongs to the
     //preceding Recalc, not to repair; raw Cell changes may intentionally differ.
-    let base = zone_grid.base_topology_mut();
+    // The decision only reads the retained topology; the Adopt arm below
+    // takes the writable borrow.
+    let base = zone_grid.base_topology();
     let index = projected_zone_record_index(width, height, base.native_bridge_source_size, coord);
     let decision = if let Some(index) = index {
         decide_base_zone_repair(
@@ -196,7 +198,7 @@ pub(crate) fn repair_zone_hierarchy_around_cell(
     resolved_terrain: &ResolvedTerrainGrid,
     bridge_records: &[crate::sim::bridge_state::BridgeEndpointRecord],
 ) {
-    let (width, height) = (zone_grid.width, zone_grid.height);
+    let (width, height) = (zone_grid.width(), zone_grid.height());
     let (base, hierarchy) = zone_grid.base_and_hierarchy_mut();
     // Every native caller invokes584550 independently of base eligibility.
     let patch_result = patch_zone_hierarchy_with_query(
@@ -249,7 +251,7 @@ fn decide_base_zone_repair(
     }
 
     let neighbors: [(u8, ZoneId); 8] = std::array::from_fn(|neighbor_index| {
-        let (dx, dy, _) = super::zone_build::NEIGHBORS[neighbor_index];
+        let (dx, dy) = crate::util::direction::DIRECTION_DELTAS[neighbor_index];
         let (nx, ny) = if let Some(size) = base.native_bridge_source_size {
             // The target was clamped once. Neighbors use raw pointer offsets
             // around that canonical native record, not separately clamped coords.
@@ -293,7 +295,13 @@ fn decide_base_zone_repair(
     let row0 = &base.raw_zone_ids_by_row[0];
     // Native reads the retained row even for cluster0.56CAF4 normally stores
     // FFFF there, but the selectors themselves do not substitute the sentinel.
-    let mapped = |cluster: ZoneId| row0.get(cluster as usize).copied().unwrap_or(u16::MAX);
+    let mapped = |cluster: ZoneId| {
+        row0.get(cluster as usize)
+            .copied()
+            .unwrap_or(super::zone_map::raw_zone_invalid(
+                crate::map::cell_index::CellGrid::for_extent(width, height),
+            ))
+    };
     let mut previous_cluster = ZONE_INVALID;
     let mut transitions = 0u8;
     for &(neighbor_type, cluster) in &neighbors {

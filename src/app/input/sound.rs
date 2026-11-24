@@ -1,17 +1,14 @@
 //! B8 orchestration and physical input. Original6B6300 owns control projection;
 //! Options/Theme retain values and playback, including while simulation is paused.
-use crate::app::persistence::options::{
-    self,
-    audio::{AudioVolume, apply_volume},
-};
+use super::dialog_page::InGameDialog;
+use crate::app::persistence::options::audio::{AudioVolume, apply_volume};
 use crate::app::{App, AppState};
 use crate::ui::pause_menu::InGameMenuState;
-use crate::ui::shell::list::ShellListGeometry;
+use crate::ui::shell::page::PageEvent;
 use crate::ui::shell::sound::{
-    SoundButton, SoundControl, SoundLayout, SoundSlider, SoundState, SoundTrackRow,
+    self, SoundButton, SoundControl, SoundLayout, SoundSlider, SoundState, SoundTrackRow,
 };
-use std::time::Instant;
-use winit::event::MouseButton;
+use crate::util::time::Instant;
 
 fn channel(id: SoundSlider) -> AudioVolume {
     match id {
@@ -20,25 +17,43 @@ fn channel(id: SoundSlider) -> AudioVolume {
         SoundSlider::Voice => AudioVolume::Voice,
     }
 }
-fn layout(state: &AppState) -> Option<SoundLayout> {
-    let (shell, size) =
-        crate::app::frontend::skirmish_shell_render::current_in_game_shell_layout(state)?;
-    Some(SoundLayout::new(
-        state.renderer.gpu.config.width as i32,
-        state.renderer.gpu.config.height as i32,
-        shell,
-        size,
-    ))
-}
+/// B8: title 0x694 and Back 0x686 as the lower right-panel button.
+pub(crate) const DIALOG: InGameDialog = InGameDialog {
+    id: sound::DIALOG,
+    title: Some(("GUI:SoundOptions", "Sound Options")),
+    lower: (0x686, ("GUI:Back", "Back")),
+    label: "Active Sound B8",
+    ui: |state| {
+        Some(
+            &state
+                .match_state
+                .match_presentation
+                .sound_dialog
+                .as_ref()?
+                .ui,
+        )
+    },
+    ui_mut: |state| {
+        Some(
+            &mut state
+                .match_state
+                .match_presentation
+                .sound_dialog
+                .as_mut()?
+                .ui,
+        )
+    },
+    own_checkbox_sound: false,
+};
 pub(crate) fn open(state: &mut AppState) {
     if !state.audio.launcher_audio_available {
         return;
     }
-    // 4E2370 -> accepted4E1D9A: parent apply/write precede state6/B8.
-    options::accept_in_game_options(state);
-    let p = &state.persistence.options_profile;
-    let positions = [p.score_volume, p.sound_volume, p.voice_volume]
-        .map(crate::ui::main_menu_dialogs::options::admitted_volume_position);
+    // 4E2370 -> accepted4E1D9A: parent apply/write precede state6/B8. The
+    // in-game menu, whose page the Sound button is on, does both as it closes
+    // for this state.
+    App::enter_in_game_menu_state(state, InGameMenuState::Sound);
+    let positions = volume_positions(state);
     let rows = state
         .audio
         .theme
@@ -68,51 +83,57 @@ pub(crate) fn open(state: &mut AppState) {
             }
         })
         .collect();
+    // BBB's 0x52D writes state 6; State_Machine 0x0048C8B0 then runs B8
+    // (0x006B6230 at 0x0048C9EF) inside the same pause bracket. The transition
+    // owner clears B8's retained state, so the new dialog is installed after it.
     state.match_state.match_presentation.sound_dialog = Some(SoundState::new(
         positions,
         rows,
         state.audio.theme.current_song(),
     ));
-    state.match_state.match_presentation.in_game_menu = InGameMenuState::Sound;
 }
-fn back(state: &mut AppState) {
-    let Some(dialog) = state.match_state.match_presentation.sound_dialog.take() else {
-        return;
-    };
+/// Back `0x686` in `0x6B6300`, shared by B8 and the shell's `0xD6`:
+/// re-apply the three volumes; a zero score volume queues the current song
+/// and stops it. No RA2MD write.
+pub(crate) fn apply_back_volumes(state: &mut AppState, positions: [u8; 3]) {
     for id in SoundSlider::ALL {
         apply_volume(
             state,
             channel(id),
-            (f64::from(dialog.positions[id as usize]) * 0.1) as f32,
+            (f64::from(positions[id as usize]) * 0.1) as f32,
             false,
         );
-        if id == SoundSlider::Music && dialog.positions[0] == 0 {
-            let now = crate::app::match_runtime::sim_tick::monotonic_frame_pacer_ms(
-                state,
-                std::time::Instant::now(),
-            );
+        if id == SoundSlider::Music && positions[0] == 0 {
+            let now = crate::app::match_runtime::frame_pacer::wall_clock_ms();
             state.audio.queue_then_stop_score_zero(now);
         }
     }
-    state.match_state.match_presentation.in_game_options =
-        options::in_game_options_from_profile(&state.persistence.options_profile);
-    state
-        .match_state
-        .match_presentation
-        .in_game_options
-        .sound_enabled = state.audio.launcher_audio_available;
-    state
-        .match_state
-        .match_presentation
-        .in_game_options
-        .on_open();
-    state.match_state.match_presentation.in_game_menu = InGameMenuState::Options;
+}
+
+/// Init `0x497`'s slider positions, rounded from the three volumes.
+pub(crate) fn volume_positions(state: &AppState) -> [u8; 3] {
+    let p = &state.persistence.options_profile;
+    [p.score_volume, p.sound_volume, p.voice_volume]
+        .map(crate::ui::main_menu_dialogs::options::admitted_volume_position)
+}
+
+/// A changed slider applies live (`WM_HSCROLL`).
+pub(crate) fn apply_slider_volume(state: &mut AppState, id: SoundSlider, volume: f32) {
+    apply_volume(state, channel(id), volume, true);
+}
+
+fn back(state: &mut AppState) {
+    let Some(dialog) = state.match_state.match_presentation.sound_dialog.take() else {
+        return;
+    };
+    apply_back_volumes(state, dialog.positions());
+    // State_Machine 0x0048C9F4 writes state 5 after B8 returns, where gamemd
+    // recreates BBB. VERA's Game Controls is the in-game menu's page, so the
+    // menu is what comes back.
+    App::enter_in_game_menu_state(state, InGameMenuState::Menu);
 }
 fn activate(state: &mut AppState, id: SoundButton) {
-    let now = crate::app::match_runtime::sim_tick::monotonic_frame_pacer_ms(
-        state,
-        std::time::Instant::now(),
-    );
+    let now = crate::app::match_runtime::frame_pacer::wall_clock_ms();
     match id {
         SoundButton::Back => back(state),
         SoundButton::Play => {
@@ -139,132 +160,67 @@ pub(crate) fn poll_scroll_repeat(state: &mut AppState) -> Option<Instant> {
     if state.match_state.match_presentation.in_game_menu != InGameMenuState::Sound {
         return None;
     }
-    let layout = layout(state)?;
-    let (x, y) = state.window_cursor_position();
     let dialog = state.match_state.match_presentation.sound_dialog.as_mut()?;
-    let geometry = ShellListGeometry::new(layout.list, dialog.rows.len(), dialog.top);
-    if dialog.scroll.poll(
-        geometry,
-        &mut dialog.top,
-        x.round() as i32,
-        y.round() as i32,
-        Instant::now(),
-    ) {
-        state.platform.window.request_redraw();
-    }
-    dialog.scroll.repeat_at()
+    let window = &state.platform.window;
+    dialog.ui.poll_then(|| window.request_redraw())
 }
-pub(crate) fn cursor_moved(state: &mut AppState) {
-    let Some(layout) = layout(state) else {
-        return;
-    };
-    let (x, y) = state.window_cursor_position();
-    let (x, y) = (x.round() as i32, y.round() as i32);
-    let Some(dialog) = state.match_state.match_presentation.sound_dialog.as_mut() else {
-        return;
-    };
-    dialog.hovered = layout.control_at(x, y);
-    dialog.buttons.hovered = match dialog.hovered {
-        Some(SoundControl::Button(id)) => Some(id),
-        _ => None,
-    };
-    let geometry = ShellListGeometry::new(layout.list, dialog.rows.len(), dialog.top);
-    dialog.scroll.pointer_moved(geometry, &mut dialog.top, x, y);
-    let changed = dialog.dragging.and_then(|id| {
-        dialog
-            .set_from_pointer(id, layout.sliders[id as usize], x)
-            .map(|v| (id, v))
-    });
-    if let Some((id, volume)) = changed {
-        apply_volume(state, channel(id), volume, true);
+
+/// Shuffle and Repeat exclude each other (`0x006B6300`); both write the
+/// Options owner, which the theme player reads.
+fn toggle_score_option(state: &mut AppState, shuffle: bool) {
+    let p = &mut state.persistence.options_profile;
+    if shuffle {
+        p.is_score_shuffle = !p.is_score_shuffle;
+        if p.is_score_shuffle {
+            p.is_score_repeat = false;
+        }
+    } else {
+        p.is_score_repeat = !p.is_score_repeat;
+        if p.is_score_repeat {
+            p.is_score_shuffle = false;
+        }
     }
+    state
+        .audio
+        .theme
+        .set_score_options(p.is_score_repeat, p.is_score_shuffle);
 }
-pub(crate) fn mouse(state: &mut AppState, button: MouseButton, pressed: bool) {
-    if button != MouseButton::Left {
-        return;
-    }
-    let Some(layout) = layout(state) else {
-        return;
-    };
-    let (x, y) = state.window_cursor_position();
-    let (x, y) = (x.round() as i32, y.round() as i32);
-    let Some(dialog) = state.match_state.match_presentation.sound_dialog.as_mut() else {
+
+/// One pointer message on B8 (`down`: `None` moves). Back, Play and Stop are
+/// owner-draw (GUIMainButtonSound, 0x0061376B); a row press plays the
+/// generic click; 6B6382/6B63EA/6B6444 suppress the rail's.
+pub(super) fn pointer(state: &mut AppState, down: Option<bool>) {
+    let Some(layout) = super::dialog_page::layout(state, SoundLayout::new) else {
         return;
     };
-    let hit = layout.control_at(x, y);
-    let over_button = match hit {
-        Some(SoundControl::Button(id)) => Some(id),
-        _ => None,
+    let profile = &state.persistence.options_profile;
+    let boxes = [
+        (SoundControl::Shuffle, profile.is_score_shuffle),
+        (SoundControl::Repeat, profile.is_score_repeat),
+    ];
+    let sync = |gui: &mut vera20k_gui::Gui, root| {
+        for (control, on) in boxes {
+            let value = vera20k_gui::Value::Bool(on);
+            crate::ui::shell::page::set(gui, root, control.id(), vera20k_gui::Prop::Checked, value);
+        }
     };
-    if !pressed {
-        dialog.dragging = None;
-        dialog.scroll.cancel();
-        state.platform.window.request_redraw();
-        let action = dialog.buttons.release(over_button);
-        if let Some(id) = action {
-            activate(state, id);
+    // SoundState::new built B8's controls.
+    let nodes = || vera20k_gui::NodeSpec::new(vera20k_gui::NodeKind::Dialog);
+    let events = DIALOG.route(state, down, nodes, |id| layout.rect(id), sync);
+    state.platform.window.request_redraw();
+    for event in events {
+        if let Some((id, volume)) = sound::shell_sound_volume(&event) {
+            apply_volume(state, channel(id), volume, true);
+            continue;
         }
-        return;
-    }
-    dialog.scroll.cancel();
-    dialog.buttons.press(over_button);
-    match hit {
-        Some(SoundControl::Button(_)) => App::play_skirmish_shell_generic_click_sound(state),
-        Some(SoundControl::Slider(id)) => {
-            let rect = layout.sliders[id as usize];
-            if !crate::ui::shell::trackbar::admits_press_y(y - rect.y, rect.h) {
-                return;
-            }
-            let left = rect.x + dialog.thumb_left(id, rect);
-            if (left..left + 12).contains(&x) {
-                dialog.dragging = Some(id);
-            } else if let Some(volume) = dialog.set_from_pointer(id, rect, x) {
-                apply_volume(state, channel(id), volume, true);
-            }
-            // 6B6382/6B63EA/6B6444 explicitly suppress generic rail click.
+        let (PageEvent::Activated(id) | PageEvent::Toggled(id, _)) = event else {
+            continue;
+        };
+        match SoundControl::from_id(id) {
+            Some(SoundControl::Button(button)) => activate(state, button),
+            Some(SoundControl::Shuffle) => toggle_score_option(state, true),
+            Some(SoundControl::Repeat) => toggle_score_option(state, false),
+            _ => {}
         }
-        Some(SoundControl::Shuffle | SoundControl::Repeat) => {
-            let shuffle = hit == Some(SoundControl::Shuffle);
-            let rect = if shuffle {
-                layout.shuffle
-            } else {
-                layout.repeat
-            };
-            if !crate::ui::shell::geom::RectPx::new(rect.x, rect.y, 18, 18).contains(x, y) {
-                return;
-            }
-            let p = &mut state.persistence.options_profile;
-            if shuffle {
-                p.is_score_shuffle = !p.is_score_shuffle;
-                if p.is_score_shuffle {
-                    p.is_score_repeat = false;
-                }
-            } else {
-                p.is_score_repeat = !p.is_score_repeat;
-                if p.is_score_repeat {
-                    p.is_score_shuffle = false;
-                }
-            }
-            state
-                .audio
-                .theme
-                .set_score_options(p.is_score_repeat, p.is_score_shuffle);
-            let cue = state
-                .rules()
-                .and_then(|r| r.general.gui_checkbox_sound.clone());
-            App::play_shell_ui_sound_by_id(state, cue.as_deref());
-        }
-        Some(SoundControl::List) => {
-            let geometry = ShellListGeometry::new(layout.list, dialog.rows.len(), dialog.top);
-            if let Some(part) = geometry.scroll_part_at(x, y) {
-                dialog
-                    .scroll
-                    .press(part, geometry, &mut dialog.top, y, Instant::now());
-            } else if let Some(row) = geometry.row_at(dialog.rows.len(), dialog.top, x, y) {
-                dialog.selected = Some(row);
-                App::play_skirmish_shell_generic_click_sound(state);
-            }
-        }
-        None => {}
     }
 }

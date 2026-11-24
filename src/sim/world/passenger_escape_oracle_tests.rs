@@ -26,8 +26,10 @@
 //! - the ramp rows that Unlimbo at the exact coordinate compare the floor
 //!   under the XY: native keeps the cell centre's Z, VERA's reveal grounds
 //!   the object;
-//! - `dropped_as_bomb` is skipped: VERA has no IsABomb byte (`+0x8F`), so
-//!   its passengers escape where native kills them (`0x007380AF`).
+//! - the `crashable` row is skipped: VERA lets a grounded `Crashable=`
+//!   transport's passengers out where gamemd keeps them aboard to die
+//!   (#2958), which its own test below checks;
+//! The dropped-as-bomb row includes the retained +8F passenger kill gate.
 
 use super::refinery_dock_oracle_tests::{cell, world_with};
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
@@ -35,8 +37,7 @@ use crate::rules::ini_parser::IniFile;
 use crate::rules::ruleset::RuleSet;
 use crate::rules::terrain_rules::SpeedCostProfile;
 use crate::sim::combat::TargetKind;
-use crate::sim::combat::combat_weapon::WeaponOverride;
-use crate::sim::components::NavTargetRef;
+use crate::sim::components::{DriveCoord, NavTargetRef};
 use crate::sim::crew_survival::DyingTransport;
 use crate::sim::movement::locomotor::MovementLayer;
 use crate::sim::occupancy::RawCellKey;
@@ -61,11 +62,8 @@ const RULES: &str = "[InfantryTypes]\n0=E1\n[VehicleTypes]\n0=APC\n\
 const SPOT_OFFSETS: [(i32, i32); 5] = [(128, 128), (64, 64), (192, 64), (64, 192), (192, 192)];
 const MISSION_HUNT: i64 = 15;
 
-fn corpus() -> Value {
-    serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/passenger_escape.json"
-    ))
-    .unwrap()
+fn corpus() -> &'static Value {
+    crate::test_fixture::json("tools/spatial_oracle/passenger_escape.json")
 }
 
 struct Scene {
@@ -108,7 +106,7 @@ fn edit_cells(input: &Value, terrain: &mut ResolvedTerrainGrid) {
         Vec::new()
     };
     for &(bx, by) in &bridge {
-        let c = terrain.cell_mut(bx, by).unwrap();
+        let c = terrain.cell_mut_for_test(bx, by).unwrap();
         c.bridge_facts.raw_flags = crate::map::bridge_facts::BRIDGE_FLAG_STRUCTURAL;
         c.has_bridge_deck = true;
         c.bridge_walkable = true;
@@ -121,25 +119,30 @@ fn edit_cells(input: &Value, terrain: &mut ResolvedTerrainGrid) {
             bridge.clone()
         };
         let none = SpeedCostProfile {
-            foot: Some(0),
-            track: Some(0),
-            wheel: Some(0),
-            float: Some(0),
-            amphibious: Some(0),
-            float_beach: Some(0),
-            hover: Some(0),
+            foot: Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO),
+            track: Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO),
+            wheel: Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO),
+            float: Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO),
+            amphibious: Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO),
+            float_beach: Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO),
+            hover: Some(crate::util::native_x87::NativeF32Bits::POSITIVE_ZERO),
+            winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
         };
         for (wx, wy) in water {
-            let c = terrain.cell_mut(wx, wy).unwrap();
-            c.yr_cell_land_type = 2;
-            c.base_yr_cell_land_type = 2;
-            c.is_water = true;
+            let c = terrain.cell_mut_for_test(wx, wy).unwrap();
+            c.land_type = 2;
+            c.base_land_type = 2;
             c.speed_costs = none;
             c.base_speed_costs = none;
         }
     }
     if let Some(slope) = input["slope"].as_u64() {
-        let c = terrain.cell_mut(x, y).unwrap();
+        // The ramp is a tile with the row's ramp type, which the Recalc(-1)
+        // an escapee's Place_Down runs reads back.
+        crate::map::resolved_terrain::install_clear_test_catalog(terrain, slope as u8);
+        let c = terrain.cell_mut_for_test(x, y).unwrap();
+        c.final_tile_index = 1;
+        c.final_sub_tile = 0;
         c.slope_type = slope as u8;
         c.has_ramp = true;
     }
@@ -152,30 +155,47 @@ fn scene(input: &Value) -> Scene {
     let human = input["human"] == true;
     let americans = sim.interner.intern("Americans");
     let mut house = crate::sim::house_state::HouseState::new(americans, 0, None, human, 0, 10);
-    house.player_control = human;
-    sim.houses.insert(americans, house);
+    house.set_player_control_for_test(human);
+    sim.houses.register(house);
     let foreign = sim.interner.intern("Foreign");
-    sim.houses.insert(
-        foreign,
-        crate::sim::house_state::HouseState::new(foreign, 1, None, false, 0, 10),
-    );
+    sim.houses
+        .register(crate::sim::house_state::HouseState::new(
+            foreign, 1, None, false, 0, 10,
+        ));
     if input["foreign_allied"] == true {
         for (a, b) in [("AMERICANS", "FOREIGN"), ("FOREIGN", "AMERICANS")] {
-            sim.house_alliances
+            sim.house_alliances_mut_for_test()
                 .entry(a.to_string())
                 .or_default()
                 .insert(b.to_string());
         }
     }
-    sim.session.game_mode_nonzero = true;
-    sim.session.binary_frame = input["frame"].as_u64().unwrap_or(200) as u32;
-    let frame = sim.session.binary_frame;
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
+    // A selected human transport is the local player's (IsHumanPlayer
+    // `0x0050B6F0` in a nonzero mode); its escapees pass Select's
+    // ownership gate (`0x006FBFA0`).
+    if human {
+        sim.session.set_current_house_for_test(Some(americans));
+    }
+    sim.session
+        .set_binary_frame_for_test(input["frame"].as_u64().unwrap_or(200) as u32);
+    let frame = sim.session.binary_frame();
 
     // The transport: in limbo at its coordinate, as its Mark(UP) leaves it.
     let (x, y) = input.get("cell").map_or((15, 15), cell);
     let on_bridge = input["on_bridge"] == true;
     let transport = sim
-        .construct_object_limbo_at_height("APC", "Americans", x, y, 0, 0, &rules)
+        .construct_object_limbo_at_height(
+            "APC",
+            "Americans",
+            x,
+            y,
+            0,
+            0,
+            &rules,
+            &mut crate::sim::world::FrameEffects::default(),
+        )
         .expect("transport");
     let sub = input.get("sub").map_or((128, 128), |sub| {
         (
@@ -195,22 +215,27 @@ fn scene(input: &Value) -> Scene {
     let facing = input["facing"].as_u64().unwrap_or(0xC000) as u16;
     {
         let unit = sim.substrate.entities.get_mut(transport).unwrap();
-        unit.position.sub_x = SimFixed::from_num(sub.0);
-        unit.position.sub_y = SimFixed::from_num(sub.1);
-        unit.position.z = if on_bridge { 4 } else { 0 };
-        unit.position.exact_z_leptons = Some(floor + if on_bridge { 416 } else { 0 } + height);
-        unit.on_bridge = on_bridge;
+        if input["dropped"] == true {
+            unit.begin_bomb_fall();
+        }
+        // make_fixture supplies the transport's full Object+9C XYZ after
+        // construction; the held constructor itself leaves Location zero.
+        unit.position.put_location(DriveCoord {
+            x: world_xy[0],
+            y: world_xy[1],
+            z: floor + if on_bridge { 416 } else { 0 } + height,
+        });
+        unit.position.set_z_for_test(if on_bridge { 4 } else { 0 });
+        unit.set_on_bridge(on_bridge);
         // The Unit's FacingClass (`+0x388`), settled on the row's facing.
         let mut body = crate::sim::movement::FacingClass::new(facing, 0);
         body.snap(facing, frame);
         unit.body_facing = body;
         if input["gunner"] == true {
-            unit.weapon_override = Some(WeaponOverride::IfvSlot(0));
+            unit.set_gunner_selection_for_test(0, -1);
         }
-        if unit.passenger_role.cargo().is_none() {
-            unit.passenger_role = PassengerRole::Transport {
-                cargo: PassengerCargo::new(5, 0),
-            };
+        if unit.passenger_role().cargo().is_none() {
+            unit.set_passenger_role_for_test(PassengerRole::transport(PassengerCargo::new(5, 0.0)));
         }
     }
     let attacker = sim
@@ -239,31 +264,37 @@ fn scene(input: &Value) -> Scene {
             sim.techno_limbo_with_rules(id, &rules),
             crate::sim::world::ConcealOutcome::Concealed
         );
-        sim.substrate.entities.get_mut(id).unwrap().passenger_role = PassengerRole::Inside {
-            transport_id: transport,
-            open_topped: input["open_topped"] == true,
-        };
-        assert!(
-            sim.substrate
-                .entities
-                .get_mut(transport)
-                .unwrap()
-                .passenger_role
-                .cargo_mut()
-                .unwrap()
-                .board(id, 1)
-        );
+        sim.substrate
+            .entities
+            .get_mut(id)
+            .unwrap()
+            .set_passenger_role_for_test(PassengerRole::boarded_for_test(
+                transport,
+                input["open_topped"] == true,
+            ));
+        sim.substrate
+            .entities
+            .get_mut(transport)
+            .unwrap()
+            .passenger_role_mut_for_test()
+            .cargo_mut()
+            .unwrap()
+            .board_forced_chain(&[(id, 1.0)]);
         if input["open_topped"] == true {
             assert!(sim.register_open_topped_passenger(id));
             // A target to drop: Assign_Target(NULL) is the only writer here.
-            let commits = crate::sim::mission::concrete_effects::assign_target_commits(
+            let stored = crate::sim::mission::concrete_effects::assign_target_stored(
                 &sim.substrate.entities,
+                sim.terrain_objects.objects(),
+                id,
                 Some(TargetKind::Entity(attacker)),
+                None,
             );
             crate::sim::mission::concrete_effects::represented_assign_target_admitted(
                 sim.substrate.entities.get_mut(id).unwrap(),
                 Some(TargetKind::Entity(attacker)),
-                commits,
+                stored,
+                rules.ares_form(),
             );
         }
     }
@@ -277,24 +308,38 @@ fn scene(input: &Value) -> Scene {
         };
         let spot = spec["spot"].as_u64().unwrap() as u8;
         let id = sim
-            .construct_object_limbo_at_height("E1", owner, x, y, 0, 0, &rules)
+            .construct_object_limbo_at_height(
+                "E1",
+                owner,
+                x,
+                y,
+                0,
+                0,
+                &rules,
+                &mut crate::sim::world::FrameEffects::default(),
+            )
             .expect("occupant");
-        sim.substrate.entities.get_mut(id).unwrap().sub_cell = Some(spot);
+        sim.substrate
+            .entities
+            .get_mut(id)
+            .unwrap()
+            .set_sub_cell(Some(spot));
         let (dx, dy) = SPOT_OFFSETS[usize::from(spot)];
         let outcome = sim.try_reveal_entity_with_context(
             id,
             RevealRequest {
-                position: RevealPosition {
-                    rx: x,
-                    ry: y,
-                    z: 0,
-                    sub_x: SimFixed::from_num(dx),
-                    sub_y: SimFixed::from_num(dy),
-                },
+                position: RevealPosition::new(
+                    x,
+                    y,
+                    0,
+                    None,
+                    SimFixed::from_num(dx),
+                    SimFixed::from_num(dy),
+                ),
                 placement: PlacementEvidence::MarkSucceeded,
                 logic_eligible: true,
             },
-            UninitContext::with_rules(&rules),
+            UninitContext::new(&rules),
         );
         assert!(matches!(outcome, RevealOutcome::Revealed { .. }));
     }
@@ -306,7 +351,7 @@ fn scene(input: &Value) -> Scene {
     // The oracle seeds the Scenario stream 31 and draws nothing before the
     // block.
     sim.scenario_rng = SimRng::new(31);
-    sim.substrate.pending_delete.clear();
+    sim.substrate.pending_delete.clear_for_test();
     Scene {
         sim,
         rules,
@@ -352,7 +397,13 @@ fn compare(row: &Value) {
     };
     // The oracle answers the Walk Process slot (`0x0075AC80`) as not moving.
     crate::sim::movement::answered_process::install();
-    sim.release_dying_unit_passengers(&rules, None, transport, dying);
+    sim.release_dying_unit_passengers(
+        &rules,
+        None,
+        transport,
+        dying,
+        &mut crate::sim::world::FrameEffects::default(),
+    );
     let processed = crate::sim::movement::answered_process::finish();
     let expected_processed: Vec<u64> = events
         .iter()
@@ -370,11 +421,11 @@ fn compare(row: &Value) {
         .entities
         .get(transport)
         .unwrap()
-        .passenger_role
+        .passenger_role()
         .cargo()
         .unwrap()
-        .passengers
-        .clone();
+        .passengers()
+        .to_vec();
     let head = cargo.first().map_or(Value::Null, |id| {
         passengers.iter().position(|p| p == id).into()
     });
@@ -396,8 +447,8 @@ fn compare(row: &Value) {
         "ground": raw.bits_at(key, MovementLayer::Ground),
         "deck": raw.bits_at(key, MovementLayer::Bridge),
         "owners": [
-            house_index(&sim, raw.owner_at(key, MovementLayer::Ground)),
-            house_index(&sim, raw.owner_at(key, MovementLayer::Bridge)),
+            house_index(&sim, raw.occupant_at(key, MovementLayer::Ground).1),
+            house_index(&sim, raw.occupant_at(key, MovementLayer::Bridge).1),
         ],
     });
     assert_eq!(occupation, native["occupation"], "{context}: occupation");
@@ -412,7 +463,7 @@ fn compare(row: &Value) {
         };
         let killed = of("uninit").is_some();
         assert_eq!(
-            sim.substrate.pending_delete.contains(&id),
+            sim.substrate.pending_delete.contains_object(&id),
             killed,
             "{context}: UnInit"
         );
@@ -422,7 +473,13 @@ fn compare(row: &Value) {
             let record = of("record_kill").expect("a killed passenger records its kill");
             let credited = (record[2] == "attacker").then(|| sim.interner.intern("Foreign"));
             assert_eq!(
-                sim.substrate.entities.get(id).unwrap().killed_by,
+                sim.substrate
+                    .entities
+                    .get(id)
+                    .unwrap()
+                    .seldom
+                    .kill_record
+                    .killer(),
                 credited,
                 "{context}: kill credit"
             );
@@ -430,18 +487,22 @@ fn compare(row: &Value) {
         }
         let entity = sim.substrate.entities.get(id).unwrap();
         assert_eq!(
-            u64::from(entity.lifecycle.in_limbo),
+            u64::from(entity.lifecycle.in_limbo()),
             expected["limbo"].as_u64().unwrap(),
             "{context}: limbo"
         );
-        let aboard = matches!(
-            entity.passenger_role,
-            PassengerRole::Inside { transport_id, .. } if transport_id == transport
+        // Transporter (`+0x11C`) is cleared after a successful Unlimbo
+        // (`0x007380FA`); the carrier relation ends with it.
+        let aboard = entity.passenger_role().inside_transport_id() == Some(transport);
+        assert_eq!(
+            entity.passenger_role().transporter() == Some(transport),
+            expected["transporter"] == "transport",
+            "{context}: transporter"
         );
         assert_eq!(
             aboard,
             expected["transporter"] == "transport",
-            "{context}: transporter"
+            "{context}: aboard"
         );
         if aboard {
             continue;
@@ -470,7 +531,7 @@ fn compare(row: &Value) {
             "{context}: coordinate"
         );
         assert_eq!(
-            u64::from(entity.on_bridge),
+            u64::from(entity.on_bridge()),
             expected["on_bridge"].as_u64().unwrap(),
             "{context}: OnBridge"
         );
@@ -487,20 +548,20 @@ fn compare(row: &Value) {
             expected["queued"].as_i64().unwrap(),
             "{context}: queued mission"
         );
-        let nav = match entity.navigation.nav_com {
+        let nav = match entity.navigation.nav_com() {
             Some(NavTargetRef::Cell { rx, ry }) => serde_json::json!([rx, ry]),
             None => Value::Null,
             Some(other) => panic!("{context}: NavCom {other:?}"),
         };
         assert_eq!(nav, expected["nav"], "{context}: NavCom");
         assert_eq!(
-            entity.selected,
+            entity.seldom.selection.is_selected(),
             of("select").is_some(),
             "{context}: selected"
         );
         if input["open_topped"] == true {
             assert_eq!(
-                entity.attack_target.is_none(),
+                entity.attack_target.target().is_none(),
                 of("assign_target").is_some(),
                 "{context}: target"
             );
@@ -512,8 +573,8 @@ fn compare(row: &Value) {
                 .entities
                 .get(transport)
                 .unwrap()
-                .weapon_override,
-            None,
+                .current_weapon_number(),
+            0,
             "{context}: the emptying pop hands the gunner's weapon back"
         );
     }
@@ -527,8 +588,8 @@ fn passenger_escape_matches_the_original_rows() {
     let mut failures = Vec::new();
     for row in rows {
         let name = row["input"]["name"].as_str().unwrap().to_string();
-        // RESIDUAL: no IsABomb byte (module doc).
-        if name == "dropped_as_bomb" {
+        // gamemd's bug, which VERA fixes (#2958): see the test below.
+        if name == "crashable" {
             continue;
         }
         if let Err(cause) = std::panic::catch_unwind(|| compare(row)) {
@@ -541,4 +602,54 @@ fn passenger_escape_matches_the_original_rows() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// #2958: gamemd keeps a grounded `Crashable=` transport's passengers aboard
+/// (this row natively leaves cargo at 2) and its UnInit then kills them. VERA
+/// lets them out like any other transport's.
+#[test]
+fn a_grounded_crashable_transport_lets_its_passengers_out() {
+    let corpus = corpus();
+    let row = corpus["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["input"]["name"] == "crashable")
+        .unwrap();
+    let Scene {
+        mut sim,
+        rules,
+        transport,
+        passengers,
+        attacker,
+    } = scene(&row["input"]);
+    crate::sim::movement::answered_process::install();
+    sim.release_dying_unit_passengers(
+        &rules,
+        None,
+        transport,
+        DyingTransport {
+            attacker: Some(attacker),
+            ignore_defenses: false,
+            selected_by_player: false,
+        },
+        &mut crate::sim::world::FrameEffects::default(),
+    );
+    crate::sim::movement::answered_process::finish();
+    let cargo = sim
+        .substrate
+        .entities
+        .get(transport)
+        .unwrap()
+        .passenger_role()
+        .cargo()
+        .unwrap()
+        .count();
+    assert_eq!(cargo, 0, "both passengers left the cargo");
+    for id in passengers {
+        let entity = sim.substrate.entities.get(id).unwrap();
+        assert!(!entity.lifecycle.in_limbo(), "passenger {id} is on the map");
+        assert_eq!(entity.passenger_role().transporter(), None);
+        assert!(!sim.substrate.pending_delete.contains_object(&id));
+    }
 }

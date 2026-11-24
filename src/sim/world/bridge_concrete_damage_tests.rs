@@ -18,17 +18,25 @@ fn export(scene: &HeadlessScenario, phase: &str) {
     };
     let sim = scene.sim();
     let result = json!({
-        "phase": phase, "frame": sim.session.binary_frame,
+        "phase": phase, "frame": sim.session.binary_frame(),
         "navigation": crate::sim::world::bridge_test_evidence::navigation_snapshot(
             sim, phase, (49..=59).flat_map(|y| (84..=90).map(move |x| (x,y))),
         ),
         "entities": sim.entities().values().filter(|e|
-            (84..=90).contains(&e.position.rx) && (49..=59).contains(&e.position.ry)
+            (84..=90).contains(&e.position.rx()) && (49..=59).contains(&e.position.ry())
         ).map(|e| json!({"type":sim.resolve(e.type_ref()),"entity":e})).collect::<Vec<_>>(),
         "rng": {"main":sim.main_rng,"scenario":sim.scenario_rng,"mapgen":sim.mapgen_rng},
     });
     let path = std::path::PathBuf::from(root).with_extension(format!("{phase}.json"));
     serde_json::to_writer_pretty(std::fs::File::create(path).unwrap(), &result).unwrap();
+}
+
+#[test]
+fn retail_starting_mtnk_attack_publishes_concrete_damage_collapse_and_target_cleanup() {
+    if crate::rules::retail_ini_fixture::retail_assets().is_none() {
+        return;
+    }
+    crate::sim::world::bridge_test_evidence::visit_starting_mtnk_concrete_attack(|_, _, _| {});
 }
 
 #[test]
@@ -51,10 +59,7 @@ fn retail_concrete_damage_repair_and_restore_publish_navigation() {
         ));
         for hut in [(85, 58), (89, 51)] {
             assert_eq!(
-                crate::sim::world::bridge_orchestrator::bridge_hut_has_collapsed_span(
-                    scene.sim(),
-                    hut
-                ),
+                crate::sim::world::bridge_orchestrator::bridge_hut_can_repair(scene.sim(), hut),
                 collapsed
             );
         }
@@ -113,10 +118,9 @@ fn retail_concrete_damage_repair_and_restore_publish_navigation() {
 #[test]
 #[ignore = "requires unmodified physical Anytown and retail TEMPERATE assets"]
 fn retail_concrete_hut_damage_matches_native_both_huts_and_three_states() {
-    let native: Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tools/spatial_oracle/anytown_damage/hut_test_vectors.json"
-    )))
+    let native: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/anytown_damage/hut_test_vectors.json",
+    ))
     .unwrap();
     let mut scene = loaded();
     let pristine = scene.sim().resolved_terrain.as_ref().unwrap().clone();
@@ -136,9 +140,9 @@ fn retail_concrete_hut_damage_matches_native_both_huts_and_three_states() {
             damage_ordinary(
                 &mut runtime.simulation,
                 &runtime.resources.rules,
-                Some(&runtime.resources.overlay_registry),
                 (87, 54),
                 crate::sim::bridge_state::ramp_repair::Family::High,
+                &mut crate::sim::world::FrameEffects::default(),
             )
             .unwrap();
         }
@@ -150,7 +154,7 @@ fn retail_concrete_hut_damage_matches_native_both_huts_and_three_states() {
         sim.scenario_rng =
             serde_json::from_value(expected["rng_before"]["scenario"].clone()).unwrap();
         sim.mapgen_rng = serde_json::from_value(expected["rng_before"]["mapgen"].clone()).unwrap();
-        sim.session.binary_frame = 1000;
+        sim.session.set_binary_frame_for_test(1000);
         let before_anims: std::collections::BTreeSet<_> =
             sim.substrate.anims.iter().map(|(id, _)| *id).collect();
         let hut = (
@@ -158,7 +162,10 @@ fn retail_concrete_hut_damage_matches_native_both_huts_and_three_states() {
             case["hut"][1].as_u64().unwrap() as u16,
         );
         assert!(crate::sim::world::bridge_orchestrator::dispatch_bridge_collapse_from_hut_with_overlay_registry(
-            sim, &runtime.resources.rules, hut, Some(&runtime.resources.overlay_registry)
+            sim,
+            &runtime.resources.rules,
+            hut,
+            &mut crate::sim::world::FrameEffects::default(),
         ));
         assert_eq!(
             json!({"main":sim.main_rng,"scenario":sim.scenario_rng,"mapgen":sim.mapgen_rng}),
@@ -170,10 +177,11 @@ fn retail_concrete_hut_damage_matches_native_both_huts_and_three_states() {
             .flat_map(|y| (86..=88).map(move |x| (x, y)))
             .map(|(x, y)| {
                 let c = sim.resolved_terrain.as_ref().unwrap().cell(x, y).unwrap();
-                json!({"coord":[x,y],"overlay":c.bridge_facts.overlay_id,
-                    "land":c.yr_cell_land_type,"level":c.level,"slope":c.slope_type,
+                let live = sim.overlay_grid.as_ref().unwrap().cell(x, y);
+                json!({"coord":[x,y],"overlay":live.overlay_id,
+                    "land":c.land_type,"level":c.level,"slope":c.slope_type,
                     "zone_type":c.zone_type,"tile":c.final_tile_index,"subtile":c.final_sub_tile,
-                    "flags":c.bridge_facts.raw_flags,"state":c.bridge_facts.state_byte})
+                    "flags":c.bridge_facts.raw_flags,"state":live.overlay_data})
             })
             .collect();
         assert_eq!(
@@ -188,11 +196,11 @@ fn retail_concrete_hut_damage_matches_native_both_huts_and_three_states() {
             .iter()
             .filter(|(id, _)| !before_anims.contains(id))
             .map(|(_, anim)| {
-                json!({"type":sim.resolve(anim.type_id),
-                "position":[anim.world_coord.x,anim.world_coord.y,anim.world_coord.z],
-                "delay":anim.runtime.delay_remaining,"flags":anim.draw_flags,
-                "loops":anim.runtime.loop_remaining,"z_adjust":anim.z_adjust,
-                "reverse":u8::from(anim.runtime.constructor_reverse)})
+                json!({"type":sim.resolve(anim.type_id()),
+                "position":[anim.world_coord().x,anim.world_coord().y,anim.world_coord().z],
+                "delay":anim.runtime().delay_remaining,"flags":anim.draw_flags(),
+                "loops":anim.runtime().loop_remaining,"z_adjust":anim.z_adjust(),
+                "reverse":u8::from(anim.runtime().constructor_reverse)})
             })
             .collect();
         assert_eq!(
@@ -215,7 +223,7 @@ fn retail_concrete_collapse_rechecks_an_incoming_drive_head() {
     let runtime = &mut scene.runtime;
     let sim = &mut runtime.simulation;
     let rules = &runtime.resources.rules;
-    let owner = sim.session.current_house.unwrap();
+    let owner = sim.session.current_house().unwrap();
     let owner_name = sim.resolve(owner).to_owned();
     let tank = sim
         .spawn_object_with_overlay_registry(
@@ -225,21 +233,25 @@ fn retail_concrete_collapse_rechecks_an_incoming_drive_head() {
             53,
             0,
             rules,
-            &runtime.resources.overlay_registry,
+            runtime.resources.rules.overlay_registry(),
         )
         .expect("native fixture Road resident");
     let entity = sim.substrate.entities.get_mut(tank).unwrap();
-    assert_eq!(entity.health.current, 300);
+    assert_eq!(entity.health.current(), 300);
     // Supplied retained head matches native north_head_center. Normal spawn
     // owns placement/type/locomotor; this fixture does not claim path production.
-    entity
-        .drive_locomotion
-        .get_or_insert_with(Default::default)
-        .head_to = Some(DriveCoord {
-        x: 87 * 256 + 128,
-        y: 54 * 256 + 128,
-        z: 416,
-    });
+    {
+        let loco = entity.locomotor.as_mut().unwrap();
+        assert!(loco.ensure_installed_track_state());
+        assert!(loco.store_track_head(
+            crate::sim::movement::track_process::TrackFamily::Drive,
+            Some(DriveCoord {
+                x: 87 * 256 + 128,
+                y: 54 * 256 + 128,
+                z: 416,
+            })
+        ));
+    };
     let event = BridgeDamageEvent {
         rx: 87,
         ry: 54,
@@ -248,27 +260,20 @@ fn retail_concrete_collapse_rechecks_an_incoming_drive_head() {
         impact_z_leptons: 416,
         is_ion_cannon: false,
     };
-    let registry = &runtime.resources.overlay_registry;
     assert!(
         !crate::sim::world::bridge_orchestrator::apply_bridge_damage_events_with_overlay_registry(
             sim,
             rules,
             &[event],
-            Some(registry)
+            &mut crate::sim::world::FrameEffects::default(),
         )
     );
     assert_eq!(
-        sim.substrate.entities.get(tank).unwrap().health.current,
+        sim.substrate.entities.get(tank).unwrap().health.current(),
         300
     );
     assert_eq!(
-        sim.resolved_terrain
-            .as_ref()
-            .unwrap()
-            .cell(87, 54)
-            .unwrap()
-            .bridge_facts
-            .overlay_id,
+        sim.overlay_grid.as_ref().unwrap().cell(87, 54).overlay_id,
         Some(220)
     );
     assert!(
@@ -276,7 +281,7 @@ fn retail_concrete_collapse_rechecks_an_incoming_drive_head() {
             sim,
             rules,
             &[event],
-            Some(registry)
+            &mut crate::sim::world::FrameEffects::default(),
         )
     );
     assert_eq!(
@@ -285,7 +290,7 @@ fn retail_concrete_collapse_rechecks_an_incoming_drive_head() {
             .unwrap()
             .cell(87, 54)
             .unwrap()
-            .yr_cell_land_type,
+            .land_type,
         LandType::Water.as_index()
     );
     assert_eq!(
@@ -294,7 +299,7 @@ fn retail_concrete_collapse_rechecks_an_incoming_drive_head() {
             .unwrap()
             .cell(87, 53)
             .unwrap()
-            .yr_cell_land_type,
+            .land_type,
         LandType::Road.as_index()
     );
     // Original487A10 checks the active Drive Is_At_Coord even though the
@@ -311,7 +316,7 @@ fn retail_concrete_collapse_rechecks_an_incoming_drive_head() {
 fn force_fire_scene() -> (HeadlessScenario, u64, String) {
     let mut scene = loaded();
     let runtime = &mut scene.runtime;
-    let owner = runtime.simulation.session.current_house.unwrap();
+    let owner = runtime.simulation.session.current_house().unwrap();
     let owner_name = runtime.simulation.resolve(owner).to_owned();
     let tank = runtime
         .simulation
@@ -322,13 +327,13 @@ fn force_fire_scene() -> (HeadlessScenario, u64, String) {
             50,
             128,
             &runtime.resources.rules,
-            &runtime.resources.overlay_registry,
+            runtime.resources.rules.overlay_registry(),
         )
         .expect("ordinary bank placement");
     export(&scene, "attack_before_command");
     let command = CommandEnvelope::new(
         owner,
-        scene.sim().session.tick + 1,
+        scene.sim().session.tick() + 1,
         Command::ForceAttackCell {
             attacker_id: tank,
             target_rx: 87,
@@ -343,6 +348,7 @@ fn force_fire_scene() -> (HeadlessScenario, u64, String) {
             std::slice::from_ref(&command),
             SIM_TICK_MS,
             crate::sim::world::TickLane::Ordinary,
+            &mut crate::sim::world::FrameEffects::default(),
         )
         .unwrap();
     export(&scene, "attack_command_applied");
@@ -356,7 +362,12 @@ fn retail_force_fire_emits_native_muzzle_from_real_command() {
     let (output, draws) = crate::sim::rng::trace_draws(|| {
         scene
             .runtime
-            .advance_frame(&[], SIM_TICK_MS, crate::sim::world::TickLane::Ordinary)
+            .advance_frame(
+                &[],
+                SIM_TICK_MS,
+                crate::sim::world::TickLane::Ordinary,
+                &mut crate::sim::world::FrameEffects::default(),
+            )
             .unwrap()
     });
     if let Some(root) = std::env::var_os("VERA20K_ANYTOWN_EXPORT") {
@@ -374,7 +385,7 @@ fn retail_force_fire_emits_native_muzzle_from_real_command() {
         (shot.fire_coord.x, shot.fire_coord.y, shot.fire_coord.z),
         (22400, 13077, 516)
     );
-    assert_eq!(scene.sim().session.binary_frame, 2);
+    assert_eq!(scene.sim().session.binary_frame(), 2);
     assert_eq!(
         scene
             .sim()
@@ -388,7 +399,7 @@ fn retail_force_fire_emits_native_muzzle_from_real_command() {
     export(&scene, "attack_first_tick");
     let mut following = Vec::new();
     for _ in 0..10 {
-        let frame = scene.sim().session.binary_frame;
+        let frame = scene.sim().session.binary_frame();
         let before = json!({"main":scene.sim().main_rng,"scenario":scene.sim().scenario_rng,"mapgen":scene.sim().mapgen_rng});
         let (_, draws) = crate::sim::rng::trace_draws(|| {
             scene
@@ -418,10 +429,15 @@ fn retail_force_fire_collapses_concrete_then_engineer_rebuilds_it() {
     // allows the fixed loaded-world stream to reach both admitted hits; the
     // isolated MTNK native packet has a different global caller history.
     for _ in 0..18_000 {
-        let logic_frame = scene.sim().session.binary_frame;
+        let logic_frame = scene.sim().session.binary_frame();
         let output = scene
             .runtime
-            .advance_frame(&[], SIM_TICK_MS, crate::sim::world::TickLane::Ordinary)
+            .advance_frame(
+                &[],
+                SIM_TICK_MS,
+                crate::sim::world::TickLane::Ordinary,
+                &mut crate::sim::world::FrameEffects::default(),
+            )
             .unwrap();
         for shot in output
             .fire_events
@@ -436,12 +452,10 @@ fn retail_force_fire_collapses_concrete_then_engineer_rebuilds_it() {
         }
         let overlay = scene
             .sim()
-            .resolved_terrain
+            .overlay_grid
             .as_ref()
             .unwrap()
             .cell(87, 54)
-            .unwrap()
-            .bridge_facts
             .overlay_id;
         if overlay != prior {
             transitions.push(json!({"completed_logic_frame":logic_frame,"overlay":overlay}));
@@ -479,14 +493,19 @@ fn retail_force_fire_collapses_concrete_then_engineer_rebuilds_it() {
     let source = scene.sim().entities().get(tank).unwrap();
     assert!(source.is_alive());
     assert!(
-        source.attack_target.is_none(),
+        source.attack_target.target().is_none(),
         "native70D4A0 detaches the collapsed Cell target immediately"
     );
     let mut guarding = false;
     for _ in 0..32 {
         let output = scene
             .runtime
-            .advance_frame(&[], SIM_TICK_MS, crate::sim::world::TickLane::Ordinary)
+            .advance_frame(
+                &[],
+                SIM_TICK_MS,
+                crate::sim::world::TickLane::Ordinary,
+                &mut crate::sim::world::FrameEffects::default(),
+            )
             .unwrap();
         assert!(
             !output

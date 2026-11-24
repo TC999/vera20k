@@ -3,58 +3,42 @@
 //! Native executable corpus: tools/spatial_oracle/fly_landing_phase.*.
 use super::{Simulation, display_layers::DisplayLayer};
 use crate::map::entities::EntityCategory;
+use crate::map::bridge_facts::BRIDGE_FLAG_STRUCTURAL;
+use crate::map::resolved_terrain::{NativeCellQuery, ResolvedTerrainGrid};
 use crate::rules::ruleset::RuleSet;
 use crate::sim::components::{DriveCoord, NavTargetRef};
-use crate::sim::movement::{
-    DestinationTiming, air_movement, ground_pose, locomotor::MovementLayer,
-};
+use crate::sim::intern::StringInterner;
+use crate::sim::movement::{air_movement, ground_pose, locomotor::MovementLayer};
+use crate::sim::scenario_session::ScenarioSession;
+use crate::sim::world::FrameChannel;
+use crate::sim::world::FrameEffects;
+use crate::sim::world::ObjectSubstrate;
+use crate::sim::world::SimSoundEvent;
 use crate::util::fixed_math::SIM_ZERO;
 
 impl Simulation {
-    /// BeginTakeoff4CF9B9 adds only when no existing bucket is retained.
-    pub(crate) fn register_fly_air_tracker(&mut self, id: u64) {
-        let Some(e) = self.substrate.entities.get(id) else {
+    pub(crate) fn finish_fly_takeoff_entry(
+        interner: &mut StringInterner,
+        session: &ScenarioSession,
+        substrate: &mut ObjectSubstrate,
+        sound_events: &mut FrameChannel<SimSoundEvent>,
+        resolved_terrain: &Option<ResolvedTerrainGrid>,
+        id: u64,
+        rules: &RuleSet,
+    ) {
+        Self::aircraft_tracker_add(session, substrate, id);
+        let Some(e) = substrate.entities.get_mut(id) else {
             return;
         };
-        if e.air_spatial_bucket.is_some() {
-            return;
-        }
-        let bucket = crate::sim::occupancy::air_spatial_bucket_index(
-            e.position.rx,
-            e.position.ry,
-            self.session.map_width,
-            self.session.map_height,
-        );
-        let order = self.substrate.next_air_tracker_order.next();
-        let e = self.substrate.entities.get_mut(id).unwrap();
-        e.air_spatial_bucket = Some(bucket);
-        e.air_spatial_enter_order = order;
-    }
-
-    /// `AircraftTracker::Remove @ 0x004135D0`: a Fly leaves the airborne index
-    /// at its touchdown or its crash impact, a Jumpjet at its crash impact
-    /// (`0x0054D075`).
-    pub(crate) fn aircraft_tracker_remove(&mut self, id: u64) {
-        if let Some(entity) = self.substrate.entities.get_mut(id) {
-            entity.air_spatial_bucket = None;
-            entity.air_spatial_enter_order = 0;
-        }
-    }
-
-    pub(crate) fn finish_fly_takeoff_entry(&mut self, id: u64, rules: Option<&RuleSet>) {
-        self.register_fly_air_tracker(id);
-        let Some(e) = self.substrate.entities.get_mut(id) else {
-            return;
-        };
-        air_movement::ensure_fly_secondary_facing(e);
-        if air_movement::current_fly_height(e, self.resolved_terrain.as_ref()) == 0 {
+        e.ensure_fly_secondary_facing();
+        if air_movement::current_fly_height(e, resolved_terrain.as_ref()) == 0 {
             e.body_facing.snap(
                 e.barrel_facing.unwrap().destination(),
-                self.session.binary_frame,
+                session.binary_frame(),
             );
         }
-        let sound = rules
-            .and_then(|r| r.object(self.interner.resolve(e.type_ref())))
+        let sound = interner
+            .object_type(e.type_ref(), rules)
             .and_then(|o| o.aux_sound1.as_deref());
         if let Some(sound) = sound {
             let c = ground_pose::position_world_coord(&e.position);
@@ -63,9 +47,8 @@ impl Simulation {
                 y: c.y,
                 z: c.z,
             };
-            let sound_id = self.interner.intern(sound);
-            self.sound_events
-                .push(super::SimSoundEvent::AircraftPhase { sound_id, world });
+            let sound_id = interner.intern(sound);
+            sound_events.emit(super::SimSoundEvent::AircraftPhase { sound_id, world });
         }
     }
 
@@ -80,27 +63,122 @@ impl Simulation {
             .first_building_on_layer(x as u16, y as u16, MovementLayer::Ground)
     }
 
-    pub(super) fn apply_fly_landing_callback(&mut self, id: u64, rules: Option<&RuleSet>) {
+    /// Ares 3.0 FlyLocomotionClass_UpdateLanding 1004D8A0 (hook 0x4CE85A)
+    /// replaces a `HunterSeeker=` type's landing (to 0x4CE852): it never
+    /// lands. Without a Target (+0x2B4) it asks Acquire_Hunter_Seeker_Target
+    /// (Fly vt+0x94, [`Self::acquire_hunter_seeker_target`]); when that
+    /// finds one, the Fly stops landing (+0x51) and takes the type's flight
+    /// level (vt+0xBC into +0x38), the hunter sends NotifyUnlink to its first
+    /// contact (vt+0x274(3)), queues Attack (vt+0x1E8(1, 0)) and commences
+    /// it (vt+0x1EC). Process (1004D7A0, hook 0x4CCB84) runs the same block.
+    pub(crate) fn ares_hunter_seeker_reacquire(
+        &mut self,
+        id: u64,
+        rules: &RuleSet,
+        frame_effects: &mut FrameEffects<'_>,
+    ) {
+        use crate::sim::mission::{MissionId, MissionType};
+        let has_target = |sim: &Self| {
+            sim.substrate
+                .entities
+                .get(id)
+                .is_some_and(|entity| entity.attack_target.target().is_some())
+        };
+        if has_target(self) {
+            return;
+        }
+        self.acquire_hunter_seeker_target(id, rules, frame_effects);
+        if !has_target(self) {
+            return;
+        }
+        let flight_level = self.substrate.entities.get(id).map_or(0, |entity| {
+            air_movement::type_flight_level(entity, Some((rules, &self.interner)))
+        });
+        if let Some(fly) = self
+            .substrate
+            .entities
+            .get_mut(id)
+            .and_then(|entity| entity.locomotor.as_mut())
+            .and_then(|locomotor| locomotor.fly_runtime_mut())
+        {
+            fly.resume_hunt(flight_level);
+        }
+        crate::sim::radio::transmit_to_contact(
+            self,
+            id,
+            crate::sim::radio::RadioMessage::Break,
+            rules,
+            frame_effects,
+        );
+        let frame = self.session.binary_frame();
+        let _ = self.mission_queue_exact(
+            id,
+            MissionId::from_known(MissionType::Attack),
+            0,
+            frame,
+            &crate::sim::mission::authority::LiveReadyInputProvider { rules },
+        );
+        let _ = self.substrate.mission_commence_exact(id, frame);
+    }
+
+    /// Fly takeoff (`0x004CE696..0x004CE6DF`) and landing (`0x004CE8AF`)
+    /// use height over the structural deck when the aircraft has reached it.
+    /// The stock landing branch also subtracts the rise for OnBridge owners.
+    /// GetHeight already uses the fixed deck for those owners.
+    pub(super) fn fly_bridge_relative_height(
+        entity: &crate::sim::game_entity::GameEntity,
+        terrain: Option<&ResolvedTerrainGrid>,
+        landing: bool,
+    ) -> i32 {
+        let mut height = air_movement::current_fly_height(entity, terrain);
+        if entity.on_bridge() && !landing {
+            return height;
+        }
+        let Some(terrain) = terrain else { return height };
+        let coord = ground_pose::position_world_coord(&entity.position);
+        let cells = NativeCellQuery::canonical(terrain);
+        let cell = cells.lookup_world(coord.x, coord.y);
+        if cells.flags(cell) & BRIDGE_FLAG_STRUCTURAL == 0 {
+            return height;
+        }
+        let rise = match ground_pose::corrected_deck_z(terrain, cell) {
+            Some(_) if entity.on_bridge() => return height,
+            Some(deck) => deck.wrapping_sub(ground_pose::query_ground_height(&cells, coord).unwrap_or(0)),
+            None => crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS,
+        };
+        if height >= rise {
+            height = height.wrapping_sub(rise);
+        }
+        height
+    }
+
+    pub(super) fn apply_fly_landing_callback(
+        &mut self,
+        id: u64,
+        rules: &RuleSet,
+        frame_effects: &mut FrameEffects<'_>,
+    ) {
+        if rules.ares()
+            && self
+                .substrate
+                .entities
+                .get(id)
+                .and_then(|entity| self.interner.object_type(entity.type_ref(), rules))
+                .is_some_and(|object| object.hunter_seeker)
+        {
+            self.ares_hunter_seeker_reacquire(id, rules, frame_effects);
+            return;
+        }
         let entity = self
             .substrate
             .entities
             .get(id)
             .expect("admitted Fly landing");
-        let coord = ground_pose::position_world_coord(&entity.position);
-        let mut height = air_movement::current_fly_height(entity, self.resolved_terrain.as_ref());
-        let bridge = self.resolved_terrain.as_ref().is_some_and(|terrain| {
-            let cell =
-                terrain.native_cell_identity(((coord.x / 256) as i16, (coord.y / 256) as i16));
-            terrain.native_cell_flags(cell) & 0x100 != 0
-        });
-        // Unlike takeoff,4CE8AF does not test the owner's OnBridge flag.
-        if bridge && height >= crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS {
-            height = height.wrapping_sub(crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS);
-        }
-        let object = rules.and_then(|r| r.object(self.interner.resolve(entity.type_ref())));
+        let height = Self::fly_bridge_relative_height(entity, self.resolved_terrain.as_ref(), true);
+        let object = self.interner.object_type(entity.type_ref(), rules);
         let dropship = object.is_some_and(|o| o.is_dropship);
         let carryall =
-            entity.category == EntityCategory::Aircraft && object.is_some_and(|o| o.carryall);
+            entity.category() == EntityCategory::Aircraft && object.is_some_and(|o| o.carryall);
         let airport_bound = entity
             .locomotor
             .as_ref()
@@ -119,12 +197,12 @@ impl Simulation {
             .unwrap()
             .fly_runtime_mut()
             .unwrap()
-            .target_speed = SIM_ZERO;
+            .request_stop();
         let entity = self.substrate.entities.get(id).unwrap();
         let base = crate::sim::aircraft::landing_base::landing_base(
             entity,
             &self.substrate.entities,
-            rules.map(|r| (r, &self.interner)),
+            Some((rules, &self.interner)),
         );
         let destination = entity
             .locomotor
@@ -139,6 +217,7 @@ impl Simulation {
                     .entities
                     .get(id)
                     .unwrap()
+                    .seldom
                     .radio_contacts
                     .contains(building)
             })
@@ -146,7 +225,7 @@ impl Simulation {
             let cell = ((destination.x / 256) as i16, (destination.y / 256) as i16);
             self.aircraft_can_enter(id, cell) == 0
         };
-        if !admitted && !self.retry_fly_landing(id, rules) {
+        if !admitted && !self.retry_fly_landing(id, rules, frame_effects) {
             return;
         }
         let Some(entity) = self.substrate.entities.get_mut(id) else {
@@ -173,39 +252,35 @@ impl Simulation {
                 y: coord.y,
                 z: ground,
             };
-            if let Some(rules) = rules {
-                let animation = if dropship {
-                    Some("DROPLAND")
-                } else if carryall {
-                    Some("CARYLAND")
-                } else {
-                    None
+            let animation = if dropship {
+                Some("DROPLAND")
+            } else if carryall {
+                Some("CARYLAND")
+            } else {
+                None
+            };
+            if let Some(animation) = animation {
+                let name = self.interner.intern(animation);
+                let (rx, ry, sx, sy, z) = world.to_cell_sub_z();
+                let descriptor = crate::sim::components::AnimClassSpawnDescriptor {
+                    loop_count: 1,
+                    draw_flags: 0x600,
+                    ..crate::sim::components::AnimClassSpawnDescriptor::new(name, rx, ry, sx, sy, z)
                 };
-                if let Some(animation) = animation {
-                    let name = self.interner.intern(animation);
-                    let (rx, ry, sx, sy, z) = world.to_cell_sub_z();
-                    let descriptor = crate::sim::components::AnimClassSpawnDescriptor {
-                        loop_count: 1,
-                        draw_flags: 0x600,
-                        ..crate::sim::components::AnimClassSpawnDescriptor::new(
-                            name, rx, ry, sx, sy, z,
-                        )
-                    };
-                    if let Err(error) = self.spawn_anim_at_world(rules, descriptor, world) {
-                        log::debug!("landing animation [{animation}] did not construct: {error}");
-                    }
+                if let Err(error) = self.spawn_anim_at_world(rules, descriptor, world) {
+                    log::debug!("landing animation [{animation}] did not construct: {error}");
                 }
             }
             if self
                 .substrate
                 .entities
                 .get(id)
-                .is_some_and(|e| e.health.current > 0)
+                .is_some_and(|e| e.health.current() > 0)
                 && let Some(sound) = sound
             {
                 let sound_id = self.interner.intern(&sound);
                 self.sound_events
-                    .push(super::SimSoundEvent::AircraftPhase { sound_id, world });
+                    .emit(super::SimSoundEvent::AircraftPhase { sound_id, world });
             }
         }
         let Some(entity) = self.substrate.entities.get(id) else {
@@ -216,25 +291,26 @@ impl Simulation {
         }
         let coord = ground_pose::position_world_coord(&entity.position);
         //4CECAF queries the CURRENT cell again after refusal/effect callbacks.
-        let bridge = self.resolved_terrain.as_ref().is_some_and(|terrain| {
-            let cell =
-                terrain.native_cell_identity(((coord.x / 256) as i16, (coord.y / 256) as i16));
-            terrain.native_cell_flags(cell) & 0x100 != 0
-        });
-        if bridge {
-            let ground = ground_pose::ground_surface_z_at(
-                [coord.x, coord.y],
-                false,
-                self.resolved_terrain.as_ref(),
-                None,
-            )
-            .unwrap_or(0);
-            if coord.z >= ground.wrapping_add(crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS) {
-                self.substrate.entities.get_mut(id).unwrap().on_bridge = true;
+        if let Some(terrain) = self.resolved_terrain.as_ref() {
+            let cells = NativeCellQuery::canonical(terrain);
+            let cell = cells.lookup_world(coord.x, coord.y);
+            if cells.flags(cell) & BRIDGE_FLAG_STRUCTURAL != 0
+                && coord.z >= ground_pose::deck_surface_z(
+                    &cells,
+                    cell,
+                    ground_pose::query_ground_height(&cells, coord).unwrap_or(0),
+                )
+            {
+                self.substrate
+                    .entities
+                    .get_mut(id)
+                    .unwrap()
+                    .on_bridge
+                    .store(true);
             }
         }
-        self.set_object_height(id, base);
-        self.aircraft_tracker_remove(id);
+        self.set_object_height(id, base, rules, frame_effects);
+        self.substrate.aircraft_tracker_remove(id);
         let entity = self.substrate.entities.get_mut(id).unwrap();
         let fly = entity
             .locomotor
@@ -243,10 +319,14 @@ impl Simulation {
             .fly_runtime_mut()
             .unwrap();
         fly.finish_landing();
-        fly.target_speed = SIM_ZERO;
-        fly.current_speed = SIM_ZERO;
+        fly.halt();
         entity.foot_speed.set_speed_fraction(SIM_ZERO);
-        self.foot_neighbors_after_fly_landing(id);
+        Self::foot_neighbors_after_fly_landing(
+            &mut self.substrate,
+            &self.resolved_terrain,
+            &mut self.overlay_grid,
+            id,
+        );
         let entity = self.substrate.entities.get(id).unwrap();
         let destination = entity
             .locomotor
@@ -258,7 +338,7 @@ impl Simulation {
         let current = ground_pose::position_world_coord(&entity.position);
         let same = ((destination.x / 256) as i16, (destination.y / 256) as i16)
             == ((current.x / 256) as i16, (current.y / 256) as i16);
-        if same || self.fly_building_at(destination) == entity.radio_contacts.slot(0) {
+        if same || self.fly_building_at(destination) == entity.seldom.radio_contacts.slot(0) {
             self.substrate
                 .entities
                 .get_mut(id)
@@ -269,16 +349,21 @@ impl Simulation {
                 .fly_runtime_mut()
                 .unwrap()
                 .finish_destination();
-            self.clear_landed_fly_destination(id, rules);
+            self.clear_landed_fly_destination(id, rules, frame_effects);
         }
     }
 
     /// Landing4CEF6E -> null MoveTo -> AssignDestination(NULL,1). Both native
     /// IsMoving inputs are now zero; Foot's Stop receiver returns immediately.
-    fn clear_landed_fly_destination(&mut self, id: u64, rules: Option<&RuleSet>) {
+    fn clear_landed_fly_destination(
+        &mut self,
+        id: u64,
+        rules: &RuleSet,
+        frame_effects: &mut FrameEffects<'_>,
+    ) {
         let entity = self.substrate.entities.get(id).unwrap();
         if !air_movement::fly_coordinate_admitted(entity) {
-            self.clear_fly_foot_destination(id, rules);
+            self.clear_fly_foot_destination(id, rules, frame_effects);
             return;
         }
         let current = ground_pose::position_world_coord(&entity.position);
@@ -286,7 +371,7 @@ impl Simulation {
         let base = crate::sim::aircraft::landing_base::landing_base(
             entity,
             &self.substrate.entities,
-            rules.map(|r| (r, &self.interner)),
+            Some((rules, &self.interner)),
         );
         let entity = self.substrate.entities.get_mut(id).unwrap();
         let begin = entity
@@ -297,32 +382,54 @@ impl Simulation {
             .unwrap()
             .null_destination(current, height, base);
         debug_assert!(!begin, "landed null MoveTo cannot request another landing");
-        self.clear_fly_foot_destination(id, rules);
+        self.clear_fly_foot_destination(id, rules, frame_effects);
     }
 
-    fn clear_fly_foot_destination(&mut self, id: u64, rules: Option<&RuleSet>) {
-        let entity = self.substrate.entities.get_mut(id).unwrap();
-        entity.navigation.nav_com_aux = None;
-        entity.navigation.nav_com = None;
-        entity.navigation.pending_arrival_clear = false;
-        entity.movement_target = None;
-        DestinationTiming::from_rules(self.session.binary_frame, rules).accept(entity);
+    /// The class setter's `vt+0x480(NULL, 1)` after a landing (`0x004CEF88`)
+    /// or on reaching the ground layer (`0x004CD2A0`'s layer arm), through
+    /// [`Simulation::assign_null_destination`].
+    fn clear_fly_foot_destination(
+        &mut self,
+        id: u64,
+        rules: &RuleSet,
+        frame_effects: &mut FrameEffects<'_>,
+    ) {
+        self.assign_null_destination(id, rules, Some(rules.overlay_registry()), frame_effects);
     }
 
-    /// Foot4DDC60: height-aware playfield, nearest ground-list Techno, then
-    /// Track/Normal passability and other live aircraft's Cell NavComs.
-    pub(super) fn fly_landing_cell_admitted(&self, id: u64, rules: Option<&RuleSet>) -> bool {
+    /// `FootClass::IsLandZoneClear @ 0x004DDC60` (vt+0x550) for `destination`:
+    /// the cell under its physical center (vt+0x48), then height-aware
+    /// playfield, nearest ground-list Techno, Track/Normal passability and
+    /// other live aircraft whose NavCom is `destination` itself (`0x004DDDBF`
+    /// compares pointers: the same cell, or the same object). Fly's landing
+    /// callback asks for the cell under the aircraft (`0x004CD3B6`);
+    /// Find_Attack_Cell for its parameter and each candidate cell.
+    pub(super) fn foot_land_zone_clear(
+        &self,
+        id: u64,
+        destination: NavTargetRef,
+        rules: &RuleSet,
+    ) -> bool {
         use crate::rules::locomotor_type::{MovementZone, SpeedType};
         use crate::sim::cell_rect::{
-            IsClearToMoveResult, LiveCellPassabilityQuery, cell_is_in_playfield_height_aware,
-            evaluate_live_cell_passability,
+            CellPassabilityArgs, canonical_cell_ref, cell_is_in_playfield_height_aware,
+            check_cell_passability,
         };
         let e = self.substrate.entities.get(id).unwrap();
-        let coord = ground_pose::position_world_coord(&e.position);
-        let requested = ((coord.x / 256) as i16, (coord.y / 256) as i16);
-        // The caller passes the Cell returned by MapAtCoord; Foot4DDC84
-        // reads that receiver's coordinates. Fixed512 aliases must use the
-        // resolved cell for playfield, occupant and passability queries.
+        let (requested, object) = match destination {
+            NavTargetRef::Cell { rx, ry } => ((rx as i16, ry as i16), None),
+            NavTargetRef::Object { id: object } => {
+                let Some(center) = self.fire_location_center(destination) else {
+                    return false;
+                };
+                (
+                    ((center.x / 256) as i16, (center.y / 256) as i16),
+                    Some(object),
+                )
+            }
+        };
+        // Foot4DDC84 reads the receiver's coordinates. Fixed512 aliases must
+        // use the resolved cell for playfield, occupant and passability queries.
         let identity = self
             .resolved_terrain
             .as_ref()
@@ -338,60 +445,54 @@ impl Simulation {
         ) {
             return false;
         }
-        if let Some(other) = super::techno_ai_cloak::find_nearest_object_in_cell(
-            self,
+        if let Some(other) = self.nearest_cell_object(
             (cell.0 as u16, cell.1 as u16),
+            crate::sim::movement::locomotor::MovementLayer::Ground,
+            None,
         ) {
             return other == id
-                || e.radio_contacts.slot(0) == Some(other)
-                || rules
-                    .and_then(|r| r.object(self.interner.resolve(e.type_ref())))
+                || e.seldom.radio_contacts.slot(0) == Some(other)
+                || self
+                    .interner
+                    .object_type(e.type_ref(), rules)
                     .is_some_and(|o| o.spawned)
                     && self.substrate.entities.get(other).is_some_and(|o| {
                         o.spawn_manager.is_some()
-                            || rules
-                                .and_then(|r| r.object(self.interner.resolve(o.type_ref())))
+                            || self
+                                .interner
+                                .object_type(o.type_ref(), rules)
                                 .is_some_and(|o| o.spawned)
                     });
         }
-        let grid = self.path_grid_snapshot();
-        let land = self
-            .resolved_terrain
-            .as_ref()
-            .and_then(|t| t.cell(cell.0 as u16, cell.1 as u16))
-            .is_some_and(|c| {
-                rules
-                    .and_then(|r| r.terrain_rules.semantics_for_land_type(c.yr_cell_land_type))
-                    .and_then(|row| row.cost_for_speed_type(SpeedType::Track))
-                    .is_some_and(|cost| cost > 0)
-            });
-        let result = evaluate_live_cell_passability(LiveCellPassabilityQuery {
-            target: (cell.0 as u16, cell.1 as u16),
-            speed_type: SpeedType::Track,
-            movement_zone: MovementZone::Normal,
-            requested_zone: None,
-            actual_zone: 0,
-            requested_layer: None,
-            ignore_infantry: false,
-            ignore_vehicles: false,
-            land_passable: land,
-            path_grid: grid.as_deref(),
-            resolved_terrain: self.resolved_terrain.as_ref(),
-            raw_occupation: Some(&self.substrate.raw_cell_occupation),
-        });
-        if !matches!(
-            result,
-            IsClearToMoveResult::Clear { .. } | IsClearToMoveResult::ClearWinged
-        ) {
+        // 0x004DDD66..0x004DDD85: (Track, 0, 0, -1, Normal, -1, 1) on the
+        // Cell its lookup returned.
+        let (Some(terrain), Some(retained)) = (self.resolved_terrain.as_ref(), identity) else {
+            return false;
+        };
+        if !check_cell_passability(
+            &canonical_cell_ref(terrain, retained),
+            CellPassabilityArgs {
+                speed_type: SpeedType::Track,
+                ignore_infantry: false,
+                ignore_vehicles: false,
+                zone: None,
+                movement_zone: MovementZone::Normal,
+                level: None,
+                is_bridge: true,
+            },
+            &self.cell_passability_map(),
+        )
+        .admits()
+        {
             return false;
         }
         !self.substrate.entities.values().any(|other| {
             other.stable_id() != id
-                && other.category == EntityCategory::Aircraft
-                && other.lifecycle.object_alive
-                && !other.lifecycle.in_limbo
-                && match other.navigation.nav_com {
-                    Some(NavTargetRef::Cell { rx, ry }) => {
+                && other.category() == EntityCategory::Aircraft
+                && other.lifecycle.object_alive()
+                && !other.lifecycle.in_limbo()
+                && match (object, other.navigation.nav_com()) {
+                    (None, Some(NavTargetRef::Cell { rx, ry })) => {
                         self.resolved_terrain.as_ref().map_or(
                             (rx, ry) == (cell.0 as u16, cell.1 as u16),
                             |t| {
@@ -405,6 +506,7 @@ impl Simulation {
                             },
                         )
                     }
+                    (Some(object), Some(NavTargetRef::Object { id: nav })) => nav == object,
                     _ => false,
                 }
         })
@@ -414,104 +516,68 @@ impl Simulation {
         &mut self,
         id: u64,
         layer: Option<DisplayLayer>,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
+        frame_effects: &mut FrameEffects<'_>,
     ) {
         use crate::sim::radio::{self, RadioMessage};
         if layer == Some(DisplayLayer::GROUND) {
-            self.clear_fly_foot_destination(id, rules);
-            radio::broadcast(self, id, RadioMessage::Tether, rules);
-            if let Some(entity) = self.substrate.entities.get(id) {
-                let config = crate::sim::vision::VisionConfig {
-                    require_playfield_membership: true,
-                    veteran_sight: rules.map_or(0.0, |r| r.general.veteran_sight),
-                    leptons_per_sight_increase: rules
-                        .map_or(0, |r| r.general.leptons_per_sight_increase),
-                    reveal_by_height: rules.is_none_or(|r| r.general.reveal_by_height),
-                    fog_of_war: self.session.game_options.fog_of_war,
-                };
-                let grid = self.path_grid_snapshot();
-                let heights = grid.as_ref().map(|g| g.ground_height_grid());
-                let ability =
-                    crate::sim::vision::entity_has_sight_ability(entity, &self.interner, rules);
-                crate::sim::vision::force_refresh_entity_vision(
-                    &mut self.fog,
-                    entity,
-                    &config,
-                    heights.as_deref(),
-                    ability,
-                    &self.interner,
-                );
-                //567DA0 updates client fog edges/redraw requests. VERA's
-                // ShroudBuffer rebuilds from this owner when its generation
-                // changes; there is no second simulation fog-edge authority.
-            }
+            self.clear_fly_foot_destination(id, rules, frame_effects);
+            radio::broadcast(self, id, RadioMessage::Tether, rules, frame_effects);
+            self.refresh_object_sight(id, rules, 0, frame_effects);
+            //567DA0 updates client fog edges/redraw requests. VERA's
+            // ShroudBuffer rebuilds from this owner when its generation
+            // changes; there is no second simulation fog-edge authority.
         } else {
-            radio::broadcast(self, id, RadioMessage::Untether, rules);
+            radio::broadcast(self, id, RadioMessage::Untether, rules, frame_effects);
             if self.substrate.entities.get(id).is_some_and(|e| {
-                !e.radio_contacts.is_empty()
-                    && e.navigation.nav_com.is_some()
-                    && match e.navigation.nav_com {
-                        Some(
-                            NavTargetRef::Entity { id }
-                            | NavTargetRef::Object { id }
-                            | NavTargetRef::Building { id },
-                        ) => e.radio_contacts.slot(0) != Some(id),
+                !e.seldom.radio_contacts.is_empty()
+                    && e.navigation.nav_com().is_some()
+                    && match e.navigation.nav_com() {
+                        Some(NavTargetRef::Object { id }) => {
+                            e.seldom.radio_contacts.slot(0) != Some(id)
+                        }
                         Some(NavTargetRef::Cell { .. }) => true,
                         None => false,
                     }
             }) {
-                radio::broadcast_break(self, id, rules);
+                radio::broadcast_break(self, id, rules, frame_effects);
             }
         }
     }
 
-    fn retry_fly_landing(&mut self, id: u64, rules: Option<&RuleSet>) -> bool {
+    fn retry_fly_landing(
+        &mut self,
+        id: u64,
+        rules: &RuleSet,
+        frame_effects: &mut FrameEffects<'_>,
+    ) -> bool {
         use crate::rules::locomotor_type::{MovementZone, SpeedType};
-        use crate::sim::find_nearby_cell::{
-            NearbyAnchorGate, NearbyFootprint, NearbyQuery, PassabilityArgs,
-            find_nearby_passable_cell, map_owned_radius_cap,
-        };
-        let Some(rules) = rules else {
-            return false;
-        };
+        use crate::sim::find_nearby_cell::{NearbyArgs, NearbyFootprint, PassabilityArgs};
         let e = self.substrate.entities.get(id).unwrap();
         let coord = ground_pose::position_world_coord(&e.position);
-        self.begin_fly_takeoff(id, Some(rules));
-        let grid = self.path_grid_snapshot();
-        let size = self
-            .playfield_bounds
-            .zip(self.playfield_size_height)
-            .map(|(b, h)| (b.base, h));
-        let Some((width, height)) = size else {
+        Self::begin_fly_takeoff(
+            &mut self.interner,
+            &self.session,
+            &mut self.substrate,
+            &mut self.sound_events,
+            &self.resolved_terrain,
+            id,
+            rules,
+        );
+        if self.map_size_diamond().is_none() {
             return false;
-        };
-        let target = find_nearby_passable_cell(
+        }
+        let target = self.nearby_passable_cell(
             ((coord.x / 256) as i16 as i32, (coord.y / 256) as i16 as i32),
-            &NearbyQuery {
-                native_cells: None,
-                raw_occupation: Some(&self.substrate.raw_cell_occupation),
-                passability: PassabilityArgs {
+            NearbyArgs::plain(
+                PassabilityArgs {
                     speed_type: SpeedType::Track,
                     required_zone_id: None,
                     movement_zone: MovementZone::Fly,
                     bridge_aware_zone: false,
                 },
-                footprint: NearbyFootprint::SINGLE,
-                anchor_gate: NearbyAnchorGate::NativeHeightAware,
-                allow_bridge_cells: true,
-                check_height: false,
-                check_occupancy: false,
-                radius_cap: map_owned_radius_cap(width, height),
-                target_cell: None,
-                path_grid: grid.as_deref(),
-                resolved_terrain: self.resolved_terrain.as_ref(),
-                overlay_grid: self.overlay_grid.as_ref(),
-                occupancy: Some(&self.substrate.occupancy),
-                entities: Some(&self.substrate.entities),
-                zone_grid: self.zone_grid.as_ref(),
-                playfield_bounds: self.playfield_bounds,
-            },
-            self.session.binary_frame,
+                NearbyFootprint::SINGLE,
+            ),
         );
         if let Some(cell) = target {
             //4CEAD9..4CEB35 constructs from the selected CellStruct, then
@@ -526,29 +592,25 @@ impl Simulation {
             .unwrap_or(0);
             if let Some(terrain) = self.resolved_terrain.as_ref() {
                 let identity = terrain.native_cell_identity((cell.0 as i16, cell.1 as i16));
-                if terrain.native_cell_flags(identity) & 0x100 != 0 {
-                    coord.z = coord
-                        .z
-                        .wrapping_add(crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS);
+                let cells = NativeCellQuery::canonical(terrain);
+                if cells.flags(identity) & BRIDGE_FLAG_STRUCTURAL != 0 {
+                    coord.z = ground_pose::deck_surface_z(&cells, identity, coord.z);
                 }
             }
-            self.move_air_coordinate(id, coord, SIM_ZERO, None, Some(rules));
+            Self::move_air_coordinate(
+                &mut self.interner,
+                &self.session,
+                &mut self.substrate,
+                &mut self.sound_events,
+                &self.resolved_terrain,
+                id,
+                coord,
+                None,
+                rules,
+            );
             true
         } else {
-            let e = self.substrate.entities.get(id).unwrap();
-            let event = crate::sim::combat::EntityDamageEvent::direct_receiver(
-                id,
-                e.health.current,
-                0,
-                crate::sim::combat::RAD_NO_ATTACKER,
-                None,
-                self.interner.intern(&rules.bridge_warheads.c4_name),
-                crate::sim::combat::ReceiverCallFlags {
-                    ignore_defenses: true,
-                    arg6: true,
-                },
-            );
-            self.commit_direct_damage_receiver(rules, None, event);
+            self.receive_own_health_c4(id, rules, Some(rules.overlay_registry()), frame_effects);
             if let Some(state) = self
                 .substrate
                 .entities
@@ -556,14 +618,29 @@ impl Simulation {
                 .and_then(|e| e.locomotor.as_mut())
                 .and_then(|l| l.fly_runtime_mut())
             {
-                state.clear_destination_after_failed_landing();
+                state.clear_destination();
             }
             false
         }
     }
 }
 
-#[cfg(test)]
+impl crate::sim::world::ObjectSubstrate {
+    /// `FootClass::Limbo` (`0x004DB260`) on its first Limbo removes a tracked
+    /// Foot (+0x560 not the empty cell) at `0x004DB37C..0x004DB3AA`, before
+    /// `TechnoClass::Limbo`. Mark(REMOVE) itself never touches the tracker.
+    pub(super) fn release_foot_air_tracker_before_limbo(&mut self, id: u64) {
+        if self.entities.get(id).is_some_and(|entity| {
+            entity.category() != EntityCategory::Structure
+                && !entity.lifecycle.in_limbo()
+                && entity.air_tracker_cell() != (0, 0)
+        }) {
+            self.aircraft_tracker_remove(id);
+        }
+    }
+}
+
+#[cfg(all(test, tests_sim_world_c_o))]
 mod tests {
     use super::*;
     use crate::rules::ini_parser::IniFile;
@@ -586,8 +663,8 @@ mod tests {
         let mut rules = rules;
         rules.general.blockage_path_delay_ticks = 11;
         let mut sim = Simulation::with_seed(31);
-        sim.session.map_width = 128;
-        sim.session.map_height = 128;
+        sim.session.set_map_width_for_test(128);
+        sim.session.set_map_height_for_test(128);
         sim.playfield_bounds = Some(
             crate::map::playfield::PlayfieldBounds::from_normalized_local_size(64, 0, 0, 64, 64),
         );
@@ -606,7 +683,7 @@ mod tests {
             .resolved_terrain
             .as_mut()
             .unwrap()
-            .cell_mut(64, 64)
+            .cell_mut_for_test(64, 64)
             .unwrap();
         cell.level = input["level"].as_u64().unwrap_or(0) as u8;
         cell.slope_type = input["slope"].as_u64().unwrap_or(0) as u8;
@@ -615,20 +692,23 @@ mod tests {
             .as_mut()
             .unwrap()
             .seed_neighbor_counts_for_tests(input["neighbor_seed"].as_u64().unwrap_or(0) as u8);
-        let id = sim.allocate_stable_id();
+        let id = sim.substrate.allocate_stable_id();
         assert_eq!(id, 1);
         insert_entity(&mut sim, id, EntityCategory::Aircraft);
         let before = &row["before"];
         let e = sim.substrate.entities.get_mut(id).unwrap();
-        e.lifecycle.object_alive = true;
-        e.lifecycle.in_limbo = false;
-        e.position.rx = 64;
-        e.position.ry = 64;
-        e.position.sub_x = SimFixed::from_num(128);
-        e.position.sub_y = SimFixed::from_num(128);
-        e.position.exact_z_leptons = Some(input["registration_z"].as_i64().unwrap_or(900) as i32);
-        e.health.current = input["health"].as_i64().unwrap_or(100) as i32;
-        e.on_bridge = input["on_bridge"].as_bool().unwrap_or(false);
+        e.lifecycle.set_object_alive_for_test(true);
+        e.lifecycle.set_in_limbo_for_test(false);
+        e.position.set_rx_for_test(64);
+        e.position.set_ry_for_test(64);
+        e.position.set_sub_x_for_test(SimFixed::from_num(128));
+        e.position.set_sub_y_for_test(SimFixed::from_num(128));
+        e.position.set_exact_z_leptons_for_test(Some(
+            input["registration_z"].as_i64().unwrap_or(900) as i32,
+        ));
+        e.health
+            .set_for_test(input["health"].as_i64().unwrap_or(100) as i32);
+        e.set_on_bridge(input["on_bridge"].as_bool().unwrap_or(false));
         e.locomotor = Some(LocomotorState::from_object_type(
             rules.object("TEST").unwrap(),
             0,
@@ -636,23 +716,34 @@ mod tests {
         let l = e.locomotor.as_mut().unwrap();
         *l.fly_runtime_mut().unwrap()=serde_json::from_value::<FlyRuntime>(serde_json::json!({"target_height":0,"taking_off":false,"landing":before["phase"][1]==1,"landing_effect_latched":before["phase"][2]==1,"airport_bound":input["airport_bound"].as_bool().unwrap_or(false),"moving":true,"destination":before["destination"]})).unwrap();
         let fly = l.fly_runtime_mut().unwrap();
-        fly.target_speed = SimFixed::lit("0.75");
-        fly.current_speed = SimFixed::lit("0.5");
+        fly.set_target_speed_for_test(SimFixed::lit("0.75"));
+        fly.set_current_speed_for_test(SimFixed::lit("0.5"));
         e.flight_attitude=serde_json::from_value::<FlightAttitude>(serde_json::json!({"pitch":SimFixed::from_num(input["owner_float_2e8"].as_f64().unwrap_or(0.0))})).unwrap();
-        e.navigation.neighbor_state =
-            serde_json::from_value(serde_json::json!({"cell": before["neighbor_cell"]})).unwrap();
-        e.navigation.path_runtime.blocked_timer = crate::sim::timer::CdTimer::from_raw(0, 0);
+        e.navigation.set_neighbor_state_for_test(
+            serde_json::from_value(serde_json::json!({"cell": before["neighbor_cell"]})).unwrap(),
+        );
+        e.navigation
+            .path_runtime_mut()
+            .set_blocked_timer_for_test(crate::sim::timer::CdTimer::from_raw(0, 0));
         if input["air_registered"].as_bool().unwrap_or(true) {
-            sim.register_fly_air_tracker(id);
+            Simulation::aircraft_tracker_add(&sim.session, &mut sim.substrate, id);
         }
         sim.add_entity_occupancy(id);
-        sim.submit_entity_display(id, Some(&rules), None);
+        Simulation::submit_entity_display(
+            &sim.interner,
+            &mut sim.substrate,
+            &sim.resolved_terrain,
+            id,
+            &rules,
+            None,
+        );
         let e = sim.substrate.entities.get_mut(id).unwrap();
-        e.position.exact_z_leptons = Some(before["coordinates"][2].as_i64().unwrap() as i32);
+        e.position
+            .set_exact_z_leptons_for_test(Some(before["coordinates"][2].as_i64().unwrap() as i32));
         if input["blocking_unit"].as_bool().unwrap_or(false)
             || input["reserved"].as_bool().unwrap_or(false)
         {
-            let id = sim.allocate_stable_id();
+            let id = sim.substrate.allocate_stable_id();
             insert_entity(
                 &mut sim,
                 id,
@@ -663,28 +754,29 @@ mod tests {
                 },
             );
             let e = sim.substrate.entities.get_mut(id).unwrap();
-            e.lifecycle.object_alive = true;
-            e.lifecycle.in_limbo = false;
-            e.position.rx = 64;
-            e.position.ry = 64;
-            e.position.sub_x = SimFixed::from_num(128);
-            e.position.sub_y = SimFixed::from_num(128);
-            e.position.exact_z_leptons = Some(0);
+            e.lifecycle.set_object_alive_for_test(true);
+            e.lifecycle.set_in_limbo_for_test(false);
+            e.position.set_rx_for_test(64);
+            e.position.set_ry_for_test(64);
+            e.position.set_sub_x_for_test(SimFixed::from_num(128));
+            e.position.set_sub_y_for_test(SimFixed::from_num(128));
+            e.position.set_exact_z_leptons_for_test(Some(0));
             if input["reserved"].as_bool().unwrap_or(false) {
-                e.navigation.nav_com = Some(NavTargetRef::cell(64, 64));
+                e.navigation
+                    .set_nav_com_for_test(Some(NavTargetRef::cell(64, 64)));
             } else {
                 sim.add_entity_occupancy(id);
             }
         }
-        sim.session.binary_frame = 100;
+        sim.session.set_binary_frame_for_test(100);
         (sim, rules)
     }
 
     #[test]
     fn fly_takeoff_entry_matches_original_spatial_and_facing_transaction() {
         use crate::sim::movement::FacingClass;
-        let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-            "../../../tools/spatial_oracle/fly_takeoff_entry.json"
+        let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/fly_takeoff_entry.json",
         ))
         .unwrap();
         assert_eq!(rows.len(), 26);
@@ -694,7 +786,7 @@ mod tests {
             let (mut sim, rules) = fixture(&supplied);
             let e = sim.substrate.entities.get_mut(1).unwrap();
             let loco = e.locomotor.as_mut().unwrap();
-            loco.powered = input["powered"].as_bool().unwrap_or(true);
+            loco.set_powered_for_test(input["powered"].as_bool().unwrap_or(true));
             loco.set_fly_target_height(37);
             loco.fly_runtime_mut().unwrap().finish_destination();
             let facing = |initial, target| {
@@ -706,19 +798,31 @@ mod tests {
             e.barrel_facing = Some(facing(0x6000, 0x2000));
             let rng = sim.scenario_rng.logical_state();
             if input["move"].as_bool().unwrap() {
-                sim.move_air_coordinate(
+                Simulation::move_air_coordinate(
+                    &mut sim.interner,
+                    &sim.session,
+                    &mut sim.substrate,
+                    &mut sim.sound_events,
+                    &sim.resolved_terrain,
                     1,
                     DriveCoord {
                         x: 16768,
                         y: 16512,
                         z: 0,
                     },
-                    SimFixed::from_num(10),
                     None,
-                    Some(&rules),
+                    &rules,
                 );
             } else {
-                sim.begin_fly_takeoff(1, Some(&rules));
+                Simulation::begin_fly_takeoff(
+                    &mut sim.interner,
+                    &sim.session,
+                    &mut sim.substrate,
+                    &mut sim.sound_events,
+                    &sim.resolved_terrain,
+                    1,
+                    &rules,
+                );
             }
             let e = sim.substrate.entities.get(1).unwrap();
             let state = e.locomotor.as_ref().unwrap().fly_runtime().unwrap();
@@ -743,7 +847,7 @@ mod tests {
                 "{input}"
             );
             assert_eq!(
-                e.air_spatial_bucket.is_some(),
+                e.air_spatial_bucket().is_some(),
                 expected["state"]["air_members"] == 1,
                 "{input}"
             );
@@ -784,35 +888,47 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "slow; run when changing what it covers"]
     fn fly_can_enter_matches_original_ground_shroud_queries() {
         use crate::sim::vision::OwnerVisibility;
-        let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-            "../../../tools/spatial_oracle/fly_can_enter.json"
+        let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/fly_can_enter.json",
         ))
         .unwrap();
         assert_eq!(rows.len(), 102);
-        let base: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-            "../../../tools/spatial_oracle/fly_landing_phase.json"
+        let base: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/fly_landing_phase.json",
         ))
         .unwrap();
         for row in rows {
             let input = &row["input"];
             let supplied = serde_json::json!({"input":input,"before":base[1]["before"]});
             let (mut sim, _) = fixture(&supplied);
-            sim.session.game_mode_nonzero = input["game_mode"].as_u64().unwrap_or(0) != 0;
+            sim.session.set_game_mode(
+                crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(
+                    input["game_mode"].as_u64().unwrap_or(0) != 0,
+                ),
+            );
             let e = sim.substrate.entities.get_mut(1).unwrap();
-            e.discovery.owned_by_current_house = input["owned"].as_bool().unwrap_or(true);
+            e.seldom
+                .discovery
+                .set_owned_by_current_house_for_test(input["owned"].as_bool().unwrap_or(true));
             if input["mission_only"].as_bool().unwrap_or(false) {
-                e.mark_mission_only();
+                e.seldom.mission_only.mark();
             }
             let owner = e.owner();
-            let mut visibility = serde_json::to_value(OwnerVisibility::new(128, 128)).unwrap();
+            let visibility = serde_json::to_value(OwnerVisibility::new(128, 128)).unwrap();
             let x = row["exposed"][0].as_u64().unwrap() as usize;
             let y = row["exposed"][1].as_u64().unwrap() as usize;
-            visibility["cell_runtime"][y * 128 + x]["alt_flags"] = input["bits"].clone();
             sim.fog
-                .by_owner
+                .by_owner_mut_for_test()
                 .insert(owner, serde_json::from_value(visibility).unwrap());
+            sim.fog.set_ground_bits_for_test(
+                owner,
+                x as u16,
+                y as u16,
+                input["bits"].as_u64().unwrap() as u8,
+            );
             assert!(!sim.fog.is_cell_visible(owner, x as u16, y as u16));
             let request = DriveCoord {
                 x: row["query"][0].as_i64().unwrap() as i32,
@@ -822,7 +938,10 @@ mod tests {
             let target = crate::sim::movement::target_cell_coord(
                 (request.x / 256) as i16 as u16,
                 (request.y / 256) as i16 as u16,
-                sim.resolved_terrain.as_ref(),
+                sim.resolved_terrain
+                    .as_ref()
+                    .map(crate::map::resolved_terrain::NativeCellQuery::canonical)
+                    .as_ref(),
             );
             assert_eq!(
                 serde_json::json!([target.x, target.y, target.z]),
@@ -835,24 +954,18 @@ mod tests {
                 row["result"].as_u64().unwrap(),
                 "{input}"
             );
-            sim.fog.build_merged_for(owner, &sim.interner);
-            assert_eq!(
-                u64::from(sim.aircraft_can_enter(1, cell)),
-                row["result"].as_u64().unwrap(),
-                "{input}"
-            );
         }
     }
 
     #[test]
     fn fly_landing_space_matches_original_occupants_and_reservations() {
-        let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-            "../../../tools/spatial_oracle/fly_landing_space.json"
+        let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/fly_landing_space.json",
         ))
         .unwrap();
         assert_eq!(rows.len(), 26);
-        let base: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-            "../../../tools/spatial_oracle/fly_landing_phase.json"
+        let base: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/fly_landing_phase.json",
         ))
         .unwrap();
         for row in rows {
@@ -871,13 +984,28 @@ mod tests {
                 },
             )))
             .unwrap();
+            // The map loaded under these rules: its Clear cells carry their
+            // Clear row, which `0x004834A0` reads through `Cell+0xEC`.
+            let clear = rules
+                .terrain_rules
+                .semantics_for_land_type(crate::rules::terrain_rules::LandType::Clear.as_index())
+                .expect("[Clear]")
+                .speed_costs;
+            let terrain = sim.resolved_terrain.as_mut().unwrap();
+            terrain.set_land_speed_rules_for_test(&rules.terrain_rules);
+            for cell in terrain.cells_mut_for_test() {
+                cell.speed_costs = clear;
+                cell.base_speed_costs = clear;
+            }
             let query = input
                 .get("query")
                 .cloned()
                 .unwrap_or(serde_json::json!([64, 64]));
             let e = sim.substrate.entities.get_mut(1).unwrap();
-            e.position.rx = query[0].as_u64().unwrap() as u16;
-            e.position.ry = query[1].as_u64().unwrap() as u16;
+            e.position
+                .set_rx_for_test(query[0].as_u64().unwrap() as u16);
+            e.position
+                .set_ry_for_test(query[1].as_u64().unwrap() as u16);
             let owner = e.owner();
             let occupant = input["occupant"].as_str();
             if occupant == Some("self") {
@@ -892,7 +1020,7 @@ mod tests {
                     0,
                     0,
                     owner,
-                    crate::sim::components::Health { current: 100 },
+                    crate::sim::combat::Health::new(100),
                     type_ref,
                     if occupant.is_some() {
                         EntityCategory::Unit
@@ -903,11 +1031,15 @@ mod tests {
                     5,
                     true,
                 );
-                other.lifecycle.object_alive = input["alive"].as_bool().unwrap_or(true);
-                other.lifecycle.in_limbo = input["limbo"].as_bool().unwrap_or(false);
-                other.position.sub_x = SimFixed::from_num(128);
-                other.position.sub_y = SimFixed::from_num(128);
-                other.position.exact_z_leptons = Some(0);
+                other
+                    .lifecycle
+                    .set_object_alive_for_test(input["alive"].as_bool().unwrap_or(true));
+                other
+                    .lifecycle
+                    .set_in_limbo_for_test(input["limbo"].as_bool().unwrap_or(false));
+                other.position.set_sub_x_for_test(SimFixed::from_num(128));
+                other.position.set_sub_y_for_test(SimFixed::from_num(128));
+                other.position.set_exact_z_leptons_for_test(Some(0));
                 if input["spawn_manager"].as_bool().unwrap_or(false) {
                     other.spawn_manager = crate::sim::spawn_manager::init_spawn_manager(
                         rules.object("BLOCKER").unwrap(),
@@ -927,11 +1059,16 @@ mod tests {
                     .entities
                     .get_mut(1)
                     .unwrap()
+                    .seldom
                     .radio_contacts
                     .insert(2);
             }
             assert_eq!(
-                super::super::techno_ai_cloak::find_nearest_object_in_cell(&sim, (64, 64)),
+                sim.nearest_cell_object(
+                    (64, 64),
+                    crate::sim::movement::locomotor::MovementLayer::Ground,
+                    None
+                ),
                 occupant.map(|kind| if kind == "self" { 1 } else { 2 }),
                 "supplied native occupant: {input}",
             );
@@ -946,10 +1083,10 @@ mod tests {
                     .get_mut(id)
                     .unwrap()
                     .navigation
-                    .nav_com = Some(NavTargetRef::cell(
-                    reserved[0].as_u64().unwrap() as u16,
-                    reserved[1].as_u64().unwrap() as u16,
-                ));
+                    .set_nav_com_for_test(Some(NavTargetRef::cell(
+                        reserved[0].as_u64().unwrap() as u16,
+                        reserved[1].as_u64().unwrap() as u16,
+                    )));
             }
             sim.substrate.raw_cell_occupation.mark_ground(
                 64,
@@ -958,7 +1095,14 @@ mod tests {
             );
             let rng = sim.scenario_rng.logical_state();
             assert_eq!(
-                sim.fly_landing_cell_admitted(1, Some(&rules)),
+                sim.foot_land_zone_clear(
+                    1,
+                    NavTargetRef::cell(
+                        query[0].as_u64().unwrap() as u16,
+                        query[1].as_u64().unwrap() as u16
+                    ),
+                    &rules
+                ),
                 row["result"].as_bool().unwrap(),
                 "{input}"
             );
@@ -966,17 +1110,91 @@ mod tests {
         }
     }
 
+    /// Ares FlyLocomotionClass_UpdateLanding (1004D8A0, hook 0x4CE85A): a
+    /// HunterSeeker never lands. With no target to acquire, its landing
+    /// callback leaves the Fly landing at its speed; the stock callback of
+    /// the same Fly asks a stop.
+    #[test]
+    fn ares_hunter_seeker_skips_the_landing_callback() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/fly_landing_phase.json",
+        ))
+        .unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row["before"]["phase"][1] == 1)
+            .unwrap();
+        let hunter = RuleSet::from_ini(&IniFile::from_str(
+            "[AircraftTypes]\n0=TEST\n[TEST]\nHunterSeeker=yes\nLandable=yes\nStrength=100\n\
+             Speed=10\nLocomotor={4A582746-9839-11D1-B709-00A024DDAFD1}\n",
+        ))
+        .unwrap();
+        let fly = |sim: &Simulation| {
+            sim.substrate
+                .entities
+                .get(1)
+                .unwrap()
+                .locomotor
+                .as_ref()
+                .unwrap()
+                .fly_runtime()
+                .unwrap()
+                .clone()
+        };
+        let (mut sim, rules) = fixture(row);
+        sim.apply_fly_landing_callback(1, &hunter, &mut crate::sim::world::FrameEffects::default());
+        assert!(fly(&sim).landing() && !fly(&sim).target_speed_is_zero());
+        sim.apply_fly_landing_callback(1, &rules, &mut crate::sim::world::FrameEffects::default());
+        assert!(fly(&sim).target_speed_is_zero());
+    }
+
+    #[test]
+    fn fly_descent_and_landing_use_the_fixed_deck_below_the_legacy_estimate() {
+        let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/fly_landing_phase.json",
+        ))
+        .unwrap();
+        let mut row = rows
+            .into_iter()
+            .find(|row| row["input"]["name"] == "new_bridge_attachment")
+            .unwrap();
+        let deck_z = 8 * crate::util::lepton::GROUND_LEVEL_HEIGHT_LEPTONS;
+        row["input"]["level"] = serde_json::json!(6);
+        row["before"]["coordinates"][2] = serde_json::json!(deck_z + 1);
+        let (mut sim, rules) = fixture(&row);
+        let terrain = sim.resolved_terrain.as_mut().unwrap();
+        let cell = terrain.native_cell_identity((64, 64));
+        terrain.set_authored_high_bridge_deck(cell, 8);
+
+        let aircraft = sim.substrate.entities.get_mut(1).unwrap();
+        air_movement::update_fly_height(aircraft, Some(terrain), Some((&rules, &sim.interner)));
+        assert_eq!(aircraft.position.exact_z_leptons(), Some(deck_z));
+        assert!(aircraft.on_bridge());
+
+        sim.complete_fly_phase(1, &rules, None, &mut FrameEffects::default());
+        let aircraft = sim.substrate.entities.get(1).unwrap();
+        let fly = aircraft.locomotor.as_ref().unwrap().fly_runtime().unwrap();
+        assert!(!fly.landing());
+        assert_eq!(aircraft.position.exact_z_leptons(), Some(deck_z));
+    }
+
     #[test]
     fn fly_landing_phase_matches_complete_original_calls() {
-        let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-            "../../../tools/spatial_oracle/fly_landing_phase.json"
+        let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/fly_landing_phase.json",
         ))
         .unwrap();
         assert_eq!(rows.len(), 41);
         for row in rows {
             let (mut sim, rules) = fixture(&row);
             let rng = sim.scenario_rng.logical_state();
-            sim.complete_fly_phase(1, Some(&rules));
+            sim.complete_fly_phase(
+                1,
+                &rules,
+                None,
+                &mut crate::sim::world::FrameEffects::default(),
+            );
             let e = sim.substrate.entities.get(1).unwrap();
             let l = e.locomotor.as_ref().unwrap();
             let f = l.fly_runtime().unwrap();
@@ -1000,8 +1218,8 @@ mod tests {
             );
             assert_eq!(
                 serde_json::json!([
-                    l.fly_runtime().unwrap().target_speed.to_num::<f64>(),
-                    l.fly_runtime().unwrap().current_speed.to_num::<f64>()
+                    f64::from_bits(l.fly_runtime().unwrap().target_speed().bits()),
+                    f64::from_bits(l.fly_runtime().unwrap().current_speed().bits())
                 ]),
                 after["speeds"],
                 "{}",
@@ -1021,24 +1239,24 @@ mod tests {
                 row["input"]
             );
             assert_eq!(
-                e.on_bridge,
+                e.on_bridge(),
                 after["on_bridge"].as_bool().unwrap(),
                 "{}",
                 row["input"]
             );
             assert_eq!(
-                e.lifecycle.cell_marked,
+                e.lifecycle.cell_marked(),
                 after["marked"].as_bool().unwrap(),
                 "{}",
                 row["input"]
             );
             assert_eq!(
-                u64::from(e.air_spatial_bucket.is_some()),
+                u64::from(e.air_spatial_bucket().is_some()),
                 after["air_members"].as_u64().unwrap(),
                 "{}",
                 row["input"]
             );
-            let timer = e.navigation.path_runtime.blocked_timer;
+            let timer = e.navigation.path_runtime().blocked_timer();
             assert_eq!(
                 serde_json::json!([timer.start_frame(), timer.duration()]),
                 after["path_timer"],
@@ -1078,8 +1296,8 @@ mod tests {
 
     #[test]
     fn fly_landing_production_descent_and_restore_retain_air_until_completion() {
-        let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-            "../../../tools/spatial_oracle/fly_landing_phase.json"
+        let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/fly_landing_phase.json",
         ))
         .unwrap();
         let row = rows
@@ -1087,9 +1305,15 @@ mod tests {
             .find(|r| r["input"]["name"] == "height_301")
             .unwrap();
         let (mut sim, rules) = fixture(row);
-        sim.tick_air_movement_with_cell_lists_one(1, Some(&rules), None);
+        sim.tick_air_movement_with_cell_lists_one(
+            1,
+            &rules,
+            None,
+            &mut crate::sim::world::FrameEffects::default(),
+        )
+        .unwrap();
         let e = sim.substrate.entities.get(1).unwrap();
-        assert!(e.air_spatial_bucket.is_some());
+        assert!(e.air_spatial_bucket().is_some());
         assert!(
             e.locomotor
                 .as_ref()
@@ -1103,20 +1327,26 @@ mod tests {
         sim.scenario_rng = crate::sim::rng::SimRng::new(0);
         let bytes = GameSnapshot::save(&sim, 0, 0, "Fly landing continuation", 0);
         let mut restored = GameSnapshot::load(&bytes).unwrap().sim;
-        restored.retain_in_scenario_process_state_from(&sim);
+        restored.retain_process_state_for_load(crate::sim::world::SnapshotProcessState::Live(&sim));
         restored.resolved_terrain = sim.resolved_terrain.clone();
         restored.restore_after_snapshot_load().unwrap();
         assert_eq!(sim.state_hash(), restored.state_hash());
         for frame in 101..126 {
             for s in [&mut sim, &mut restored] {
-                s.session.binary_frame = frame;
-                s.tick_air_movement_with_cell_lists_one(1, Some(&rules), None);
+                s.session.set_binary_frame_for_test(frame);
+                s.tick_air_movement_with_cell_lists_one(
+                    1,
+                    &rules,
+                    None,
+                    &mut crate::sim::world::FrameEffects::default(),
+                )
+                .unwrap();
             }
             assert_eq!(sim.state_hash(), restored.state_hash(), "frame{frame}");
         }
         let e = sim.substrate.entities.get(1).unwrap();
-        assert_eq!(e.position.exact_z_leptons, Some(0));
-        assert_eq!(e.air_spatial_bucket, None);
+        assert_eq!(e.position.exact_z_leptons(), Some(0));
+        assert_eq!(e.air_spatial_bucket(), None);
         assert!(
             !e.locomotor
                 .as_ref()

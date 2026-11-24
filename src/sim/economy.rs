@@ -1,231 +1,338 @@
-//! Sole per-house cash balance and economy statistics, owned by `HouseState`.
+//! The house's wallet, owned by `HouseState`: its cash balance (House
+//! `+0x30C`), the spending statistic (`+0x2DC`) and the score (`+0x54E8`).
+//! Every writer goes through the money primitives here, each the one port of
+//! its native function.
 //!
-//! Deposits count purifier buildings and the AI virtual bonus on demand
-//! (`miner_system::effective_purifier_count`).
-//! `IncomeMult` is read per-deposit from the house's country type. Never depends on
-//! render/ui/sidebar/audio/net (sim invariant #1).
-//! The balance and statistics are serialized and hashed. Factory kernels borrow
-//! this value directly; income, repair and other house consumers use the same cash.
+//! Nothing in stock YR fills the House store (`+0x2FC`): GiveTiberium pays
+//! cash, and `Added_To_Game @ 0x00502B83` merges a building's store
+//! (`+0x33C`) that nothing filled either. The `Weeder=` deposit
+//! (`0x004F9700`, called at `0x0073E48E`) writes the separate store
+//! `+0x314`, which is not ported. Raw native Save/Load preserves these
+//! slots, so the empty-store boundary does not extend to arbitrary native
+//! saves. The tools/house_money_oracle.py controls supply an empty store and
+//! a finite native HouseType `IncomeMult`.
+//!
+//! Ares fills those stores (`Refinery.UseStorage`, Ares
+//! `HouseClass_GiveTiberium_Storage @ 10024290`), so the wallet keeps them
+//! (`sim::ares_tiberium_storage::AresTiberiumStorage`), empty unless the
+//! game's money takes its Ares form (`RuleSet::ares_form`). The two arms
+//! that read them are ported for it: Spend_Money's silo drain and
+//! Available_Money's storage value. They run in every game and keep the
+//! empty boundary while the stores are empty.
+//!
+//! `[Basic] FillSilos=` (`Fill_In_Data 0x00684F02..0x00684F7C`) pays through
+//! GiveTiberium at a scenario's start (`sim::scenario_post_map`).
+//!
+//! Never depends on render/ui/audio/net (sim invariant #1). The wallet is
+//! serialized and hashed.
+
+use crate::sim::ares_tiberium_storage::AresTiberiumStorage;
+use crate::util::native_x87::{MaskedX87Chop53 as X87, NativeF32Bits};
 
 /// Per-house wallet and statistics. There is no second house credit balance.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Economy {
-    /// Sole spendable cash balance.
-    pub credits: i32,
-    /// House `+0x2DC`: the running total `HouseClass::Spend_Money` took,
-    /// from the factory's charges and the other spenders
-    /// (`credit_income::spend_money`).
-    pub spent_credits: i32,
-    /// Ore-deposit x5.0 statistics accumulator.
-    pub harvested_credits: i32,
+    /// House `+0x30C`, the cash balance.
+    credits: i32,
+    /// House+1DC: the map's Credits read, scaled by100 before the campaign
+    /// money adjustment. This baseline remains separate from the live wallet.
+    #[serde(default)]
+    scenario_credits: i32,
+    /// House `+0x2DC`: the running total `Spend_Money` took.
+    spent_credits: i32,
+    /// House `+0x54E8`, the score: refinery deposits, kills and captures add
+    /// to it, and the score screen reads it.
+    score: i32,
+    /// The House store (`+0x2FC`) and its buildings' stores, which only
+    /// Ares fills; empty unless the money takes its Ares form.
+    #[serde(default)]
+    storage: AresTiberiumStorage,
 }
 
 impl Economy {
-    /// Accumulate the statistics x5.0 figure for `bales` deposited. Integer `*5`
-    /// because bales are integral (the engine's deposit x5.0 truncates to integer).
-    /// Statistics only — does NOT touch `credits`.
-    pub fn add_harvested(&mut self, bales: i32) {
-        self.harvested_credits = self
-            .harvested_credits
-            .saturating_add(bales.saturating_mul(5));
+    /// A wallet holding `credits`: `HouseClass::Set_Credits_And_Color @
+    /// 0x004FCE00` seeds the balance of a new house. RESIDUAL (invisible): it
+    /// also writes `+0x1DC` (`scenario_credits`), which stays 0 here for
+    /// multiplayer houses; no live multiplayer path reads it.
+    pub(crate) const fn new(credits: i32) -> Self {
+        Self {
+            credits,
+            scenario_credits: 0,
+            spent_credits: 0,
+            score: 0,
+            storage: AresTiberiumStorage::new(),
+        }
     }
 
-    /// Accumulate a PRE-COMPUTED HarvestedCredits figure (already the x5.0 product). The
-    /// OrePurifier-bonus stat term is `trunc(count * 0.25 * amount * 5.0)` computed in ONE
-    /// step (NOT floor-the-bonus-bales-then-x5), so the caller passes the finished value.
-    /// Statistics only — never touches `credits`.
-    pub fn add_harvested_raw(&mut self, harvested: i32) {
-        self.harvested_credits = self.harvested_credits.saturating_add(harvested);
+    /// Ares' tiberium storage (`sim::ares_tiberium_storage`), empty unless
+    /// the money takes its Ares form.
+    pub(crate) fn ares_storage(&self) -> &AresTiberiumStorage {
+        &self.storage
     }
 
-    /// Factory charge: spend up to `amount`, returning the amount paid and
-    /// accumulating its spending statistic. This preserves the existing bounded
-    /// factory operation; the native income module's spending path is distinct.
-    pub fn spend(&mut self, amount: i32) -> i32 {
-        let paid = amount.max(0).min(self.credits.max(0));
-        self.credits -= paid;
-        self.spent_credits = self.spent_credits.saturating_add(paid);
-        paid
+    pub(crate) fn ares_storage_mut(&mut self) -> &mut AresTiberiumStorage {
+        &mut self.storage
     }
 
-    /// Spendable balance.
-    pub fn available(&self) -> i32 {
+    pub const fn credits(&self) -> i32 {
         self.credits
     }
-}
 
-/// Parts-per-million scale for `IncomeMult` (1_000_000 = 1.0×). MUST equal
-/// `rules::ruleset::INCOME_PPM_SCALE` (kept local so this module stays `std`-only).
-pub const INCOME_PPM_SCALE: i64 = 1_000_000;
-
-/// Apply an `IncomeMult` (parts-per-million; `INCOME_PPM_SCALE` = 1.0×) to a non-negative
-/// credit amount, truncating toward zero — matching gamemd's single `ftol` per deposit
-/// call. The `i64` intermediate avoids overflow; the result saturates into `i32`. With
-/// `income_ppm == INCOME_PPM_SCALE` this is the identity (so stock YR, where every country
-/// is 1.0, is hash-neutral).
-pub fn apply_income_mult(amount: i32, income_ppm: i64) -> i32 {
-    let scaled = (amount as i64).saturating_mul(income_ppm) / INCOME_PPM_SCALE;
-    scaled.clamp(i32::MIN as i64, i32::MAX as i64) as i32
-}
-
-/// Per-slot OrePurifier BONUS credits — gamemd's second `Add_Tiberium_Credits` call:
-/// `trunc(base_value × IncomeMult × purifier_count × PurifierBonus)` as ONE truncation.
-/// Both `IncomeMult` (`income_ppm`) and `PurifierBonus` (`bonus_ppm`) are ppm fractions
-/// (`INCOME_PPM_SCALE` = 1.0×) folded inside a single floor — matching gamemd's one `ftol`;
-/// truncating either factor separately first would drift ±1. An i128 intermediate is required
-/// because the two ppm factors overflow i64. `base_value` is the slot's total ore/gem credit
-/// value (Σ bale values). Returns 0 for ≤0 purifiers.
-pub fn purifier_bonus_credits(
-    base_value: i32,
-    purifier_count: i32,
-    bonus_ppm: i64,
-    income_ppm: i64,
-) -> i32 {
-    if purifier_count <= 0 {
-        return 0;
+    pub const fn spent_credits(&self) -> i32 {
+        self.spent_credits
     }
-    const SCALE_SQUARED: i128 = (INCOME_PPM_SCALE as i128) * (INCOME_PPM_SCALE as i128);
-    let v = (base_value as i128)
-        * (purifier_count as i128)
-        * (bonus_ppm as i128)
-        * (income_ppm as i128)
-        / SCALE_SQUARED;
-    v.clamp(i32::MIN as i128, i32::MAX as i128) as i32
-}
 
-/// Per-slot OrePurifier BONUS HarvestedCredits stat: `trunc(purifier_count × PurifierBonus ×
-/// bales × 5.0)` as ONE truncation (`bonus_ppm` is the ppm fraction, `INCOME_PPM_SCALE` =
-/// 1.0×; the `×5` baked in — NOT floor-bonus-bales-then-×5). Statistics only; 0 for ≤0
-/// purifiers.
-pub fn purifier_bonus_harvested(bales: i32, purifier_count: i32, bonus_ppm: i64) -> i32 {
-    if purifier_count <= 0 {
-        return 0;
+    pub const fn score(&self) -> i32 {
+        self.score
     }
-    let v = (bales as i64) * (purifier_count as i64) * bonus_ppm * 5 / INCOME_PPM_SCALE;
-    v.clamp(i32::MIN as i64, i32::MAX as i64) as i32
+
+    /// House ReadScenarioINI500B40 (0x00500BB9..0x00500C57): wrapping
+    /// Credits*100 sets +1DC and the wallet. Apply the option0/2 delta and
+    /// clamp signed values <=0 for admitted campaign players. Native uses
+    /// PlayerControl here; authored lockstep campaigns admit role Houses.
+    /// Later Basic.Player forcing does not rerun this reader. Executed
+    /// controls: input_oracle/campaign_start --houses.
+    pub(crate) fn initialize_scenario_credits(
+        &mut self,
+        raw_credits: i32,
+        campaign_player_difficulty: Option<crate::sim::house_state::HouseDifficulty>,
+        money_delta_easy: i32,
+        money_delta_hard: i32,
+    ) {
+        self.scenario_credits = raw_credits.wrapping_mul(100);
+        self.credits = self.scenario_credits;
+        if let Some(difficulty) = campaign_player_difficulty {
+            self.credits = match difficulty as i32 {
+                0 => self.credits.wrapping_add(money_delta_easy),
+                2 => self.credits.wrapping_add(money_delta_hard),
+                _ => self.credits,
+            }
+            .max(0);
+        }
+    }
+
+    pub const fn scenario_credits(&self) -> i32 {
+        self.scenario_credits
+    }
+
+    /// `HouseClass::Available_Money @ 0x004F6990`: `ftol(storage value *
+    /// IncomeMult + balance)`. For empty storage and finite native IncomeMult,
+    /// this is exactly the retained signed balance for every i32 balance.
+    /// Native saves and a nonfinite income remain outside the represented
+    /// domain; the two consumed oracle controls use empty storage.
+    ///
+    /// When the money takes its Ares form the stored tiberium's value is
+    /// added ([`AresTiberiumStorage::available_money`]). One body serves
+    /// every game: only Ares fills the store, and an empty store leaves the
+    /// balance, as above.
+    pub fn available_money(&self) -> i32 {
+        self.storage.available_money(self.credits)
+    }
+
+    /// `HouseClass::Add_Credits @ 0x004F9950..0x004F9962`: the complete body
+    /// adds the signed argument to House+30C modulo2^32 and writes only that
+    /// balance. No score/spending, timer, RNG, detach or callback side effect.
+    pub fn add_credits(&mut self, amount: i32) {
+        self.credits = self.credits.wrapping_add(amount);
+    }
+
+    /// EvadeClass::Do @0x004C6272..0x004C6285 calls Add_Credits and then
+    /// adds the same signed amount to House+1DC. Score/spending stay unchanged.
+    pub(crate) fn add_campaign_carry_over(&mut self, amount: i32) {
+        self.add_credits(amount);
+        self.scenario_credits = self.scenario_credits.wrapping_add(amount);
+    }
+
+    /// `HouseClass::Spend_Money @ 0x004F9790`. An amount the balance covers
+    /// (signed `<=`) comes off it; otherwise the whole balance, even a
+    /// negative one, is taken and zeroed, and the rest would drain the silos
+    /// (`0x004F97DD..`, empty here). What was taken joins `+0x2DC`.
+    ///
+    /// When the money takes its Ares form that drain finds units
+    /// (`AresTiberiumStorage::drain_for_spend`): the stored units it sells
+    /// join what was taken, and the last unit's excess is the new balance.
+    pub(crate) fn spend_money(&mut self, amount: i32) {
+        let taken = if amount <= self.credits {
+            self.credits = self.credits.wrapping_sub(amount);
+            amount
+        } else {
+            let taken = std::mem::take(&mut self.credits);
+            // Runs in every game: an empty store, which only Ares fills,
+            // drains nothing and leaves the balance at 0.
+            let (drained, change) = self.storage.drain_for_spend(amount.wrapping_sub(taken));
+            self.credits = change;
+            taken.wrapping_add(drained)
+        };
+        self.spent_credits = self.spent_credits.wrapping_add(taken);
+    }
+
+    /// The score's kill and capture awards: `TechnoClass::RecordKill @
+    /// 0x0070300F` and `TechnoClass::ChangeOwner @ 0x007015D0` add to
+    /// `+0x54E8`, wrapping.
+    pub(crate) fn add_score(&mut self, points: i32) {
+        self.score = self.score.wrapping_add(points);
+    }
+
+    /// `HouseClass::Add_Tiberium_Credits @ 0x004F9610` for `amount` units
+    /// of a tiberium: the stock GiveTiberium body, which its callers reach
+    /// through `Simulation::tiberium_gift`. Each operation follows
+    /// 4F9610..4F9664 in native PC53/chop order, with the caller's stored
+    /// float amount and HouseType+148 income.
+    /// The signed per-type Value is read at payment, not summed from cargo.
+    /// Both sums include their prior integer before _ftol's low32 result.
+    pub(crate) fn add_tiberium_credits(
+        &mut self,
+        value: i32,
+        amount: NativeF32Bits,
+        income: NativeF32Bits,
+    ) {
+        let amount = X87::load_f32(amount);
+        self.score = X87::ftol_i32_low_masked(X87::add(
+            X87::mul(amount, X87::load_i32(5)),
+            X87::load_i32(self.score),
+        ));
+        self.credits = X87::ftol_i32_low_masked(X87::add(
+            X87::mul(
+                X87::mul(X87::load_i32(value), X87::load_f32(income)),
+                amount,
+            ),
+            X87::load_i32(self.credits),
+        ));
+    }
+
+    /// A captured or authored balance for a test.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_credits_for_test(&mut self, credits: i32) {
+        self.credits = credits;
+    }
+
+    /// A captured or authored spending statistic for a test.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_spent_for_test(&mut self, spent: i32) {
+        self.spent_credits = spent;
+    }
+
+    /// A captured or authored score for a test.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_score_for_test(&mut self, score: i32) {
+        self.score = score;
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_c_g))]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
-    #[test]
-    fn economy_default_is_zeroed() {
-        let e = Economy::default();
-        assert_eq!((e.credits, e.spent_credits, e.harvested_credits), (0, 0, 0));
+    fn rows(section: &str) -> Vec<Value> {
+        let data: Value =
+            serde_json::from_str(crate::test_fixture::text("tools/house_money_oracle.json"))
+                .unwrap();
+        data[section].as_array().unwrap().clone()
     }
 
-    /// The x5.0 statistics
-    /// accumulator truncates to integer `*5` and never touches credits.
-    #[test]
-    fn economy_add_harvest_truncates_x5() {
-        let mut e = Economy::default();
-        e.add_harvested(7);
-        assert_eq!(e.harvested_credits, 35);
-        assert_eq!(e.credits, 0, "harvested stat must not move credits");
+    fn int(value: &Value) -> i32 {
+        i32::try_from(value.as_i64().unwrap()).unwrap()
     }
 
-    /// Isolated method test: spend deducts up to the balance, returns the paid
-    /// amount, never goes negative, and tracks spent_credits. The silo-drain
-    /// fallback is not implemented by this bounded factory operation.
+    /// Historical oracle supplies already-stored floats from Python pack('f').
+    /// INI reader narrowing is exercised separately through RuleSet.
+    fn supplied_float(value: f64) -> NativeF32Bits {
+        NativeF32Bits::from_bits((value as f32).to_bits())
+    }
+
     #[test]
-    fn economy_spend_caps_at_balance_and_tracks_spent() {
-        let mut e = Economy {
-            credits: 100,
-            ..Economy::default()
+    fn original_raw_tiberium_credit_calls_match_wallet_and_score() {
+        let corpus = crate::test_fixture::json("tools/spatial_oracle/refinery_income.json");
+        let bits = |value: &Value| {
+            NativeF32Bits::from_bits(u32::from_str_radix(value.as_str().unwrap(), 16).unwrap())
         };
-        assert_eq!(e.spend(30), 30);
-        assert_eq!(e.credits, 70);
-        assert_eq!(e.spent_credits, 30);
-        // Over-spend is capped at the balance; never negative.
-        assert_eq!(e.spend(1000), 70);
-        assert_eq!(e.credits, 0);
-        assert_eq!(e.spent_credits, 100);
+        let rows = corpus["primitive_rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 191);
+        for row in rows {
+            let input = &row["input"];
+            let mut wallet = Economy::new(int(&input["balance"]));
+            wallet.set_score_for_test(int(&input["score"]));
+            wallet.set_spent_for_test(7);
+            wallet.add_tiberium_credits(
+                int(&input["values"][input["slot"].as_u64().unwrap() as usize]),
+                bits(&input["amount_bits"]),
+                bits(&input["income_bits"]),
+            );
+            assert_eq!(
+                (wallet.credits(), wallet.score(), wallet.spent_credits()),
+                (
+                    int(&row["output"]["balance"]),
+                    int(&row["output"]["score"]),
+                    int(&row["output"]["spent"]),
+                ),
+                "{}",
+                input["name"]
+            );
+        }
     }
 
-    // ===== P7 — income wiring =====
-
-    /// IncomeMult identity at 1.0× (stock): apply_income_mult is the identity, so stock YR
-    /// (every country 1.0) is hash-neutral.
     #[test]
-    fn apply_income_mult_identity_at_one() {
-        assert_eq!(apply_income_mult(123, INCOME_PPM_SCALE), 123);
-        assert_eq!(apply_income_mult(0, INCOME_PPM_SCALE), 0);
+    fn spend_money_matches_the_original() {
+        for row in rows("spend_money") {
+            let mut wallet = Economy::new(int(&row["balance"]));
+            wallet.set_spent_for_test(int(&row["spent"]));
+            wallet.spend_money(int(&row["amount"]));
+            let expected = &row["expected"];
+            assert_eq!(
+                (wallet.credits(), wallet.spent_credits()),
+                (int(&expected["balance"]), int(&expected["spent"])),
+                "{}",
+                row["name"]
+            );
+        }
     }
 
-    /// IncomeMult truncates toward zero (one ftol), matching gamemd.
     #[test]
-    fn apply_income_mult_truncates_toward_zero() {
-        assert_eq!(apply_income_mult(25, 1_200_000), 30); // 30.0
-        assert_eq!(apply_income_mult(7, 1_200_000), 8); // trunc(8.4)
-        assert_eq!(apply_income_mult(1000, 1_200_000), 1200);
+    fn add_credits_matches_the_original() {
+        for row in rows("add_credits") {
+            let mut wallet = Economy::new(int(&row["balance"]));
+            wallet.add_credits(int(&row["amount"]));
+            assert_eq!(
+                wallet.credits(),
+                int(&row["expected"]["balance"]),
+                "{}",
+                row["name"]
+            );
+        }
     }
 
-    /// The BLOCKER parity case: the purifier bonus is ONE truncation folding IncomeMult
-    /// inside. gem slot_value 50, 3 purifiers @25%, IncomeMult 1.2 -> 45 (gamemd), NOT 44
-    /// (the double-truncation `trunc(1.2 × trunc(50×3×25/100=37)) = 44` the design's first
-    /// draft produced).
     #[test]
-    fn purifier_bonus_credits_single_truncation_not_double() {
-        assert_eq!(purifier_bonus_credits(50, 3, 250_000, 1_200_000), 45);
-        // Sanity: the buggy double-trunc would have been 44.
-        let double_trunc = apply_income_mult((50 * 3 * 25) / 100, 1_200_000);
-        assert_eq!(double_trunc, 44, "documents the bug this guards against");
-        assert_ne!(
-            purifier_bonus_credits(50, 3, 250_000, 1_200_000),
-            double_trunc
-        );
+    fn add_tiberium_credits_matches_the_original() {
+        for row in rows("add_tiberium_credits") {
+            let mut wallet = Economy::new(int(&row["balance"]));
+            wallet.set_score_for_test(int(&row["score"]));
+            let bales = int(&row["bales"]);
+            wallet.add_tiberium_credits(
+                int(&row["value"]),
+                supplied_float(f64::from(bales) * row["scale_ppm"].as_f64().unwrap() / 1e6),
+                supplied_float(row["income_ppm"].as_f64().unwrap() / 1e6),
+            );
+            let expected = &row["expected"];
+            assert_eq!(
+                (wallet.credits(), wallet.score()),
+                (int(&expected["balance"]), int(&expected["score"])),
+                "{}",
+                row["name"]
+            );
+        }
     }
 
-    /// At IncomeMult 1.0 the bonus equals the legacy `slot_value×count×pct/100` (so stock
-    /// is hash-neutral), and 0 purifiers -> 0.
     #[test]
-    fn purifier_bonus_credits_stock_and_zero() {
-        assert_eq!(
-            purifier_bonus_credits(100, 2, 250_000, INCOME_PPM_SCALE),
-            50
-        );
-        assert_eq!(purifier_bonus_credits(100, 0, 250_000, INCOME_PPM_SCALE), 0);
-        assert_eq!(purifier_bonus_credits(100, -1, 250_000, 1_200_000), 0);
-    }
-
-    /// The bonus HarvestedCredits stat is trunc(count × 0.25 × bales × 5) in one step:
-    /// count 1, 1 bale -> trunc(1.25) = 1 (NOT floor(0.25)×5 = 0).
-    #[test]
-    fn purifier_bonus_harvested_single_truncation() {
-        assert_eq!(purifier_bonus_harvested(1, 1, 250_000), 1);
-        assert_eq!(purifier_bonus_harvested(4, 1, 250_000), 5); // trunc(0.25×4×5=5.0)
-        assert_eq!(purifier_bonus_harvested(10, 2, 250_000), 25); // 10×2×0.25×5
-        assert_eq!(purifier_bonus_harvested(10, 0, 250_000), 0);
-    }
-
-    /// add_harvested_raw adds a pre-computed figure without the ×5 (used for the bonus
-    /// stat, which is already the ×5 product); never touches credits.
-    #[test]
-    fn add_harvested_raw_adds_without_x5() {
-        let mut e = Economy::default();
-        e.add_harvested_raw(7);
-        assert_eq!(e.harvested_credits, 7);
-        assert_eq!(e.credits, 0);
-    }
-
-    /// Full-precision ppm flows through the credit fold: PurifierBonus=.333 (333_000 ppm),
-    /// 3 purifiers, base 1000, IncomeMult 1.0 -> trunc(1000 × 3 × 0.333) = 999. The old
-    /// whole-percent path (33% = 330_000) would give trunc(1000×3×0.33) = 990 — a
-    /// player-visible 9-credit gap per deposit. Stock .25 (250_000) stays byte-identical.
-    #[test]
-    fn purifier_bonus_credits_fractional_ppm_beats_whole_percent() {
-        assert_eq!(
-            purifier_bonus_credits(1000, 3, 333_000, INCOME_PPM_SCALE),
-            999
-        );
-        assert_eq!(
-            purifier_bonus_credits(1000, 3, 330_000, INCOME_PPM_SCALE),
-            990
-        );
-        assert_eq!(
-            purifier_bonus_credits(1000, 2, 250_000, INCOME_PPM_SCALE),
-            500
-        );
+    fn available_money_matches_the_original() {
+        for row in rows("available_money") {
+            let wallet = Economy::new(int(&row["balance"]));
+            assert_eq!(
+                wallet.available_money(),
+                int(&row["expected"]),
+                "{}",
+                row["name"]
+            );
+        }
     }
 }

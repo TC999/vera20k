@@ -11,10 +11,10 @@ use super::foot_mission_oracle_tests::{
     signed, xyz,
 };
 use crate::rules::ruleset::RuleSet;
+use crate::sim::combat::Health;
 use crate::sim::combat::fire_error_world::FireSubject;
-use crate::sim::components::Health;
 use crate::sim::game_entity::GameEntity;
-use crate::sim::mission::authority::EntityReadyInputProvider;
+use crate::sim::mission::authority::LiveReadyInputProvider;
 use crate::sim::mission::state::MissionTestFixture;
 use crate::sim::mission::{MissionDispatchTimer, MissionId};
 use crate::sim::movement::ground_pose::position_world_coord;
@@ -99,30 +99,36 @@ fn firing_fixture(case: &Value, rules: &RuleSet) -> SuppliedFootFixture {
         signed(&words[3]),
         signed(&words[4]),
     ));
-    actor.rearm_timer = CdTimer::from_raw(
+    actor.seldom.rearm_timer.set_for_test(CdTimer::from_raw(
         signed(&before["rearm_timer_words"][0]),
         signed(&before["rearm_timer_words"][2]),
-    );
-    actor.health = Health {
-        current: signed(&before["health"]),
-    };
-    actor.lifecycle.in_limbo = before["limbo"] != 0;
-    actor.lifecycle.object_alive = before["alive"] != 0;
+    ));
+    actor.health = Health::new(signed(&before["health"]));
+    actor.lifecycle.set_in_limbo_for_test(before["limbo"] != 0);
+    actor
+        .lifecycle
+        .set_object_alive_for_test(before["alive"] != 0);
     let target_id = fixture.id(&case["input"]["target"]).unwrap();
     let target = fixture.sim.substrate.entities.get_mut(target_id).unwrap();
     let before = &case["target_before"];
     let position = xyz(&before["position"]);
-    target.position.rx = (position[0] / 256) as u16;
-    target.position.ry = (position[1] / 256) as u16;
-    target.position.sub_x = SimFixed::from_num(position[0] % 256);
-    target.position.sub_y = SimFixed::from_num(position[1] % 256);
-    target.position.exact_z_leptons = Some(position[2]);
-    target.on_bridge = before["on_bridge"] != 0;
-    target.health = Health {
-        current: signed(&before["health"]),
-    };
-    target.lifecycle.in_limbo = before["limbo"] != 0;
-    target.lifecycle.object_alive = before["alive"] != 0;
+    target.position.set_rx_for_test((position[0] / 256) as u16);
+    target.position.set_ry_for_test((position[1] / 256) as u16);
+    target
+        .position
+        .set_sub_x_for_test(SimFixed::from_num(position[0] % 256));
+    target
+        .position
+        .set_sub_y_for_test(SimFixed::from_num(position[1] % 256));
+    target
+        .position
+        .set_exact_z_leptons_for_test(Some(position[2]));
+    target.set_on_bridge(before["on_bridge"] != 0);
+    target.health = Health::new(signed(&before["health"]));
+    target.lifecycle.set_in_limbo_for_test(before["limbo"] != 0);
+    target
+        .lifecycle
+        .set_object_alive_for_test(before["alive"] != 0);
     target.mission.apply_test_fixture(MissionTestFixture {
         current: MissionId::from_raw(signed(&before["mission"])),
         suspended: MissionId::NONE,
@@ -144,7 +150,7 @@ fn firing_fixture(case: &Value, rules: &RuleSet) -> SuppliedFootFixture {
         if !pose["supplied_xyz"].is_null() {
             set_recorded_position(actor, &pose["supplied_xyz"]);
         }
-        actor.on_bridge = pose["supplied_on_bridge"] != 0;
+        actor.set_on_bridge(pose["supplied_on_bridge"] != 0);
         let cell = &pose["cell_after"];
         let x = signed(&cell["cell"][0]) as i16;
         let y = signed(&cell["cell"][1]) as i16;
@@ -181,12 +187,12 @@ fn assert_source(fixture: &SuppliedFootFixture, expected: &Value, name: &str) {
         "{name}: physical source XYZ"
     );
     assert_eq!(
-        actor.on_bridge,
+        actor.on_bridge(),
         expected["on_bridge"] != 0,
         "{name}: source layer"
     );
     assert_eq!(
-        actor.infantry.as_ref().unwrap().is_prone,
+        actor.infantry.as_ref().unwrap().is_prone(),
         expected["prone_6db"] != 0,
         "{name}: prone"
     );
@@ -245,7 +251,7 @@ fn assert_source(fixture: &SuppliedFootFixture, expected: &Value, name: &str) {
         "{name}: dispatch clock"
     );
     assert_eq!(
-        actor.attack_target.as_ref().map(|target| target.target),
+        actor.attack_target.target(),
         fixture.target(&expected["target"]),
         "{name}: target"
     );
@@ -255,12 +261,12 @@ fn assert_source(fixture: &SuppliedFootFixture, expected: &Value, name: &str) {
         "{name}: archive"
     );
     assert_eq!(
-        actor.navigation.nav_com,
+        actor.navigation.nav_com(),
         fixture.nav(&expected["nav"]),
         "{name}: NavCom"
     );
     assert_eq!(
-        actor.body_facing_current(fixture.sim.session.binary_frame),
+        actor.body_facing_current(fixture.sim.session.binary_frame()),
         signed(&expected["body_facing_words"][0]) as u16,
         "{name}: primary facing"
     );
@@ -271,8 +277,8 @@ fn assert_source(fixture: &SuppliedFootFixture, expected: &Value, name: &str) {
     );
     assert_eq!(
         (
-            actor.rearm_timer.start_frame(),
-            actor.rearm_timer.duration()
+            actor.seldom.rearm_timer.start_frame(),
+            actor.seldom.rearm_timer.duration()
         ),
         (
             signed(&expected["rearm_timer_words"][0]),
@@ -282,8 +288,8 @@ fn assert_source(fixture: &SuppliedFootFixture, expected: &Value, name: &str) {
     );
     assert_eq!(
         (
-            actor.passive_scan_timer.start_frame as i32,
-            actor.passive_scan_timer.duration as i32
+            actor.passive_scan.timer().start_frame() as i32,
+            actor.passive_scan.timer().duration() as i32
         ),
         (
             signed(&expected["targeting_timer_words"][0]),
@@ -292,17 +298,17 @@ fn assert_source(fixture: &SuppliedFootFixture, expected: &Value, name: &str) {
         "{name}: passive targeting"
     );
     assert_eq!(
-        actor.health.current,
+        actor.health.current(),
         signed(&expected["health"]),
         "{name}: HP"
     );
     assert_eq!(
-        actor.lifecycle.in_limbo,
+        actor.lifecycle.in_limbo(),
         expected["limbo"] != 0,
         "{name}: limbo"
     );
     assert_eq!(
-        actor.lifecycle.object_alive,
+        actor.lifecycle.object_alive(),
         expected["alive"] != 0,
         "{name}: alive"
     );
@@ -317,7 +323,12 @@ fn command_attack(fixture: &mut SuppliedFootFixture, case: &Value, rules: &RuleS
     let target = fixture.target(&case["input"]["target"]);
     fixture
         .sim
-        .assign_target_represented(fixture.actor, target, Some(rules))
+        .assign_target_represented(
+            fixture.actor,
+            target,
+            rules,
+            &mut crate::sim::world::FrameEffects::default(),
+        )
         .unwrap();
     let queue = &case["input"]["attack_queue"];
     fixture
@@ -326,8 +337,8 @@ fn command_attack(fixture: &mut SuppliedFootFixture, case: &Value, rules: &RuleS
             fixture.actor,
             MissionId::from_raw(signed(&queue[0])),
             signed(&queue[1]),
-            fixture.sim.session.binary_frame,
-            &EntityReadyInputProvider,
+            fixture.sim.session.binary_frame(),
+            &LiveReadyInputProvider { rules },
         )
         .unwrap();
     assert_source(
@@ -342,21 +353,21 @@ fn recorded_fire_error(fixture: &SuppliedFootFixture, case: &Value, rules: &Rule
     FireSubject {
         world: &fixture.sim,
         rules,
-        overlay_registry: None,
         fog: None,
         firer: actor,
-        obj: rules
-            .object(fixture.sim.interner.resolve(actor.type_ref()))
+        obj: fixture
+            .sim
+            .interner
+            .object_type(actor.type_ref(), rules)
             .unwrap(),
         target: fixture.target(&case["input"]["target"]),
         weapon_index: 0,
-        garrison: None,
     }
     .fire_error(true) as i32
 }
 
 fn source_ai_visit(sim: &mut Simulation, actor: u64, rules: &RuleSet) {
-    sim.advance_live_object_turn(actor, Some(rules), ObjectAiCtx::default())
+    sim.advance_live_object_turn(actor, rules, &mut ObjectAiCtx::default())
         .unwrap();
 }
 
@@ -433,11 +444,17 @@ fn emission_rules() -> Option<RuleSet> {
 
 fn set_recorded_position(actor: &mut GameEntity, position: &Value) {
     let position = xyz(position);
-    actor.position.rx = (position[0] / 256) as u16;
-    actor.position.ry = (position[1] / 256) as u16;
-    actor.position.sub_x = SimFixed::from_num(position[0] % 256);
-    actor.position.sub_y = SimFixed::from_num(position[1] % 256);
-    actor.position.exact_z_leptons = Some(position[2]);
+    actor.position.set_rx_for_test((position[0] / 256) as u16);
+    actor.position.set_ry_for_test((position[1] / 256) as u16);
+    actor
+        .position
+        .set_sub_x_for_test(SimFixed::from_num(position[0] % 256));
+    actor
+        .position
+        .set_sub_y_for_test(SimFixed::from_num(position[1] % 256));
+    actor
+        .position
+        .set_exact_z_leptons_for_test(Some(position[2]));
 }
 
 fn emission_fixture(case: &Value, rules: &RuleSet) -> SuppliedFootFixture {
@@ -471,18 +488,20 @@ fn emission_fixture(case: &Value, rules: &RuleSet) -> SuppliedFootFixture {
         fixture
             .sim
             .session
-            .game_options
+            .game_options_mut_for_test()
             .apply_in_game_speed(case["input"]["game_speed_index"].as_u64().unwrap() as u8)
     );
     for pose in case["poses"].as_array().unwrap() {
         let id = fixture.id(&pose["actor"]).unwrap();
         let actor = fixture.sim.substrate.entities.get_mut(id).unwrap();
         set_recorded_position(actor, &pose["position"]);
-        actor.on_bridge = case["input"][if id == fixture.actor {
-            "source_on_bridge"
-        } else {
-            "target_on_bridge"
-        }] != 0;
+        actor.set_on_bridge(
+            case["input"][if id == fixture.actor {
+                "source_on_bridge"
+            } else {
+                "target_on_bridge"
+            }] != 0,
+        );
         let cell = &pose["cell_after"];
         let (x, y) = (
             signed(&cell["cell"][0]) as u16,
@@ -550,7 +569,7 @@ fn assert_memberships(sim: &Simulation, expected: &Value, ids: &BTreeMap<String,
         "{name}: ordered live Logic"
     );
     assert_eq!(
-        sim.substrate.pending_delete,
+        sim.substrate.pending_delete.object_ids(),
         recorded_ids(ids, &expected["deferred"]),
         "{name}: ordered deferred finalization"
     );
@@ -572,12 +591,15 @@ fn assert_memberships(sim: &Simulation, expected: &Value, ids: &BTreeMap<String,
         "{name}: physical Bullet vector"
     );
     for (index, layer) in expected["display"].as_array().unwrap().iter().enumerate() {
-        assert_eq!(
-            sim.display_layers()
-                .members(DisplayLayer::from_index(index as u8).unwrap()),
-            recorded_ids(ids, layer),
-            "{name}: ordered Display layer{index}"
-        );
+        let layer_id = DisplayLayer::from_index(index as u8).unwrap();
+        let mut members = sim.display_layers().members(layer_id).to_vec();
+        let mut native = recorded_ids(ids, layer);
+        // VERA keeps Ground as an unordered set (`DisplayLayers::submit`).
+        if layer_id == DisplayLayer::GROUND {
+            members.sort_unstable();
+            native.sort_unstable();
+        }
+        assert_eq!(members, native, "{name}: Display layer{index}");
     }
 }
 
@@ -591,7 +613,7 @@ fn assert_target(fixture: &SuppliedFootFixture, expected: &Value, name: &str) {
         "{name}: target XYZ"
     );
     assert_eq!(
-        target.health.current,
+        target.health.current(),
         signed(&expected["health"]),
         "{name}: MTNK damage"
     );
@@ -606,22 +628,22 @@ fn assert_target(fixture: &SuppliedFootFixture, expected: &Value, name: &str) {
         "{name}: MTNK queue"
     );
     assert_eq!(
-        target.attack_target.as_ref().map(|target| target.target),
+        target.attack_target.target(),
         fixture.target(&expected["target"]),
         "{name}: synchronous MTNK retaliation target"
     );
     assert_eq!(
-        target.on_bridge,
+        target.on_bridge(),
         expected["on_bridge"] != 0,
         "{name}: target layer"
     );
     assert_eq!(
-        target.lifecycle.object_alive,
+        target.lifecycle.object_alive(),
         expected["alive"] != 0,
         "{name}: target alive"
     );
     assert_eq!(
-        target.lifecycle.in_limbo,
+        target.lifecycle.in_limbo(),
         expected["limbo"] != 0,
         "{name}: target limbo"
     );
@@ -651,42 +673,49 @@ fn assert_fired_bullet(
         .get(ids[expected["pointer"].as_str().unwrap()])
         .unwrap();
     assert_eq!(
-        [bullet.position.x, bullet.position.y, bullet.position.z],
+        [
+            bullet.position().x,
+            bullet.position().y,
+            bullet.position().z
+        ],
         xyz(&expected["position"]),
         "{name}: native Bullet launch XYZ"
     );
     assert_eq!(
-        bullet.source_id,
+        bullet.source_id(),
         fixture.id(&expected["owner"]).unwrap(),
         "{name}: Bullet owner"
     );
     assert_eq!(
-        bullet.target,
+        bullet.target(),
         ProjectileTarget::Entity(fixture.id(&expected["target"]).unwrap()),
         "{name}: Bullet target"
     );
     assert_eq!(
-        bullet.payload.base_damage,
+        bullet.payload().base_damage,
         signed(&expected["damage"]),
         "{name}: M60 raw damage"
     );
     assert_eq!(
-        fixture.sim.interner.resolve(bullet.payload.weapon),
+        fixture
+            .sim
+            .interner
+            .resolve(bullet.payload().installed_weapon().unwrap()),
         expected["weapon"]["name"].as_str().unwrap(),
         "{name}: weapon identity"
     );
     assert_eq!(
-        fixture.sim.interner.resolve(bullet.payload.warhead),
+        fixture.sim.interner.resolve(bullet.payload().warhead),
         expected["warhead"]["name"].as_str().unwrap(),
         "{name}: warhead identity"
     );
     assert_eq!(
-        bullet.in_logic_vector,
+        bullet.in_logic_vector(),
         expected["logic_registered"] != 0,
         "{name}: Bullet Logic flag"
     );
     for (actual, expected) in bullet
-        .velocity
+        .velocity()
         .native()
         .iter()
         .zip(expected["velocity_f64_bits"].as_array().unwrap())
@@ -745,22 +774,26 @@ fn assert_recorded_anim_states(
             .get(ids[pointer.as_str().unwrap()])
             .unwrap();
         assert_eq!(
-            fixture.sim.interner.resolve(anim.type_id),
+            fixture.sim.interner.resolve(anim.type_id()),
             constructor["name"].as_str().unwrap(),
             "{name}: Anim type"
         );
         assert_eq!(
-            [anim.world_coord.x, anim.world_coord.y, anim.world_coord.z],
+            [
+                anim.world_coord().x,
+                anim.world_coord().y,
+                anim.world_coord().z
+            ],
             xyz(&expected["location"]),
             "{name}: retained Anim XYZ"
         );
         assert_eq!(
-            anim.draw_flags,
+            anim.draw_flags(),
             expected["draw_flags"].as_u64().unwrap() as u32,
             "{name}: Anim draw flags"
         );
         assert_eq!(
-            anim.z_adjust,
+            anim.z_adjust(),
             signed(&expected["z_adjust"]),
             "{name}: Anim z adjust"
         );
@@ -772,9 +805,9 @@ fn assert_recorded_anim_states(
                 let raw = event["args"][0].as_u64().unwrap();
                 (raw != 0).then(|| fixture.id(&json!(format!("0x{raw:x}"))).unwrap())
             });
-        assert_eq!(anim.owner_entity, owner, "{name}: Anim attachment");
+        assert_eq!(anim.owner_entity(), owner, "{name}: Anim attachment");
         let expected = &expected["runtime"];
-        let runtime = &anim.runtime;
+        let runtime = &anim.runtime();
         for (actual, key) in [
             (runtime.current_frame, "current_frame"),
             (runtime.frame_step, "frame_step"),
@@ -825,7 +858,7 @@ fn original_ground_and_supplied_layer_fire_error_uses_the_live_class_owner() {
         assert_rng(&fixture.sim, &case["rng_initial"], name);
         compared += 1;
     }
-    // Two opposite-layer controls execute only GetFireError. No pursuit,
+    // Two opposite-layer controls execute only GetFireError. No approach,
     // pathfinding or whole-AI refusal result is supplied by the native corpus.
     assert_eq!(compared, 8);
 }
@@ -853,7 +886,10 @@ fn original_completed_prelaunch_ai_visits_match_doing_clock_latch_and_full_rng()
                 assert_eq!(frame["base_fire_entry"]["unexecuted"], true);
                 break;
             }
-            fixture.sim.session.binary_frame = frame["native_frame"].as_u64().unwrap() as u32;
+            fixture
+                .sim
+                .session
+                .set_binary_frame_for_test(frame["native_frame"].as_u64().unwrap() as u32);
             assert_source(&fixture, &frame["before"], name);
             assert_rng(&fixture.sim, &frame["rng_before"], name);
             source_ai_visit(&mut fixture.sim, fixture.actor, &rules);
@@ -882,19 +918,19 @@ fn original_single_listener_expiry_clears_pending_shot_and_shortens_passive_time
         let expiry_after = case["input"]["expiry_after_completed_ai_calls"]
             .as_u64()
             .unwrap() as usize;
-        let mut calls = 0;
-        for frame in case["frames"].as_array().unwrap() {
+        for (calls, frame) in case["frames"].as_array().unwrap().iter().enumerate() {
             if calls == expiry_after {
                 let expiry = &case["expiry"];
-                fixture.sim.session.binary_frame =
-                    expiry["callback_events"][0]["frame"].as_u64().unwrap() as u32;
+                fixture.sim.session.set_binary_frame_for_test(
+                    expiry["callback_events"][0]["frame"].as_u64().unwrap() as u32,
+                );
                 assert_source(&fixture, &expiry["before"], name);
                 assert_rng(&fixture.sim, &expiry["rng_before"], name);
                 let target_id = fixture.id(&case["input"]["target"]).unwrap();
                 let target = fixture.sim.substrate.entities.get(target_id).unwrap();
                 let owner = target.owner();
-                let health = target.health.current;
-                let alive = target.lifecycle.object_alive;
+                let health = target.health.current();
+                let alive = target.lifecycle.object_alive();
                 let xyz = xyz(&case["target_before"]["position"]);
                 // Original direct51AA10(control1), with the expired pointer
                 // STILL alive and registered. Do not substitute UnInit or a
@@ -909,7 +945,8 @@ fn original_single_listener_expiry_clears_pending_shot_and_shortens_passive_time
                     false,
                     Some(owner),
                     PointerExpiryControl::Uninit,
-                    Some(&rules),
+                    &rules,
+                    &mut crate::sim::world::FrameEffects::default(),
                 );
                 assert_source(&fixture, &expiry["after"], name);
                 assert_rng(&fixture.sim, &expiry["rng_after"], name);
@@ -921,19 +958,21 @@ fn original_single_listener_expiry_clears_pending_shot_and_shortens_passive_time
                         .get(target_id)
                         .unwrap()
                         .lifecycle
-                        .object_alive
+                        .object_alive()
                 );
                 assert!(fixture.sim.logic_order().contains(&target_id));
                 compared += 1;
             }
-            fixture.sim.session.binary_frame = frame["native_frame"].as_u64().unwrap() as u32;
+            fixture
+                .sim
+                .session
+                .set_binary_frame_for_test(frame["native_frame"].as_u64().unwrap() as u32);
             assert!(frame["returned"].as_bool().unwrap());
             assert_source(&fixture, &frame["before"], name);
             assert_rng(&fixture.sim, &frame["rng_before"], name);
             source_ai_visit(&mut fixture.sim, fixture.actor, &rules);
             assert_source(&fixture, &frame["after"], name);
             assert_rng(&fixture.sim, &frame["rng_after"], name);
-            calls += 1;
         }
     }
     assert_eq!(compared, 2);
@@ -941,6 +980,11 @@ fn original_single_listener_expiry_clears_pending_shot_and_shortens_passive_time
 
 #[test]
 fn original_whole_ai_shot_dynamic_logic_damage_and_deferred_lifetimes_match_native() {
+    // Stock oracle; Phobos `ROF.RandomDelay` (`0x006FD0B5`) redraws the rearm
+    // jitter.
+    if cfg!(feature = "phobos") {
+        return;
+    }
     let Some(rules) = emission_rules() else {
         return;
     };
@@ -973,7 +1017,10 @@ fn original_whole_ai_shot_dynamic_logic_damage_and_deferred_lifetimes_match_nati
         assert_emission_boundary(&fixture, &case["command"]["after"], &ids, name);
         assert_rng(&fixture.sim, &case["command"]["rng_after"], name);
         for visit in case["ai_visits"].as_array().unwrap() {
-            fixture.sim.session.binary_frame = visit["frame"].as_u64().unwrap() as u32;
+            fixture
+                .sim
+                .session
+                .set_binary_frame_for_test(visit["frame"].as_u64().unwrap() as u32);
             assert_emission_boundary(&fixture, &visit["before"], &ids, name);
             assert_rng(&fixture.sim, &visit["rng_before"], name);
             source_ai_visit(&mut fixture.sim, fixture.actor, &rules);
@@ -1015,7 +1062,8 @@ fn original_whole_ai_shot_dynamic_logic_damage_and_deferred_lifetimes_match_nati
             assert!(!fixture.sim.visit_combat_tail(
                 case["original_actor_prefix"]["count"].as_u64().unwrap() + 1,
                 &rules,
-                None
+                None,
+                &mut crate::sim::world::FrameEffects::default()
             ));
             assert_emission_boundary(&fixture, &suffix["after_pass"], &ids, name);
             let start = suffix["event_range"][0].as_u64().unwrap() as usize;
@@ -1033,8 +1081,16 @@ fn original_whole_ai_shot_dynamic_logic_damage_and_deferred_lifetimes_match_nati
             );
             // The original caller increments A8ED84 before725C70. Object AI
             // and both clocks saw the previous absolute frame throughout.
-            fixture.sim.session.binary_frame += 1;
-            fixture.sim.process_pending_delete_with(Some(&rules), None);
+            fixture
+                .sim
+                .session
+                .set_binary_frame_for_test(fixture.sim.session.binary_frame() + 1);
+            fixture.sim.process_pending_delete_with(
+                &rules,
+                &mut crate::sim::world::FrameEffects::default(),
+                1,
+                false,
+            );
             assert_emission_boundary(&fixture, &suffix["after_drain"], &ids, name);
             assert_rng(&fixture.sim, &suffix["rng_after"], name);
             suffixes += 1;

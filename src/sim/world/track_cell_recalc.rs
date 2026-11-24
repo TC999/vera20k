@@ -7,17 +7,17 @@ use super::{
     Simulation,
     navigation::{self, NavigationCaches},
 };
-use crate::map::overlay_types::OverlayTypeRegistry;
+use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
 
 impl Simulation {
     pub(crate) fn recalculate_track_cell(
         &mut self,
         coord: (u16, u16),
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
     ) {
-        let (Some(rules), Some(registry)) = (rules, registry) else {
+        let Some(registry) = registry else {
             return;
         };
         let Some(index) = self
@@ -47,7 +47,7 @@ impl Simulation {
                                 &self.interner,
                                 rules,
                             )
-                            .contains(&coord)
+                            .any(|cell| cell == coord)
                         })
                 });
         let terrain = self.resolved_terrain.as_mut().unwrap();
@@ -69,9 +69,9 @@ impl Simulation {
             .unwrap()
             .write_finalized_map_cell(coord.0, coord.1, outcome.finalized);
         if let Err(error) = (NavigationCaches {
-            terrain_costs: &mut self.terrain_costs,
             zones: &mut self.zone_grid,
             path: &mut self.path_grid,
+            overlays: self.overlay_grid.as_ref(),
             playfield_bounds: self.playfield_bounds,
         })
         .publish_recalculated_cell_with_presence(terrain, coord, structure_blocked)

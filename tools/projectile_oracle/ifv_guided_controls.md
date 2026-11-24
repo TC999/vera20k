@@ -2,14 +2,14 @@
 
 `ifv_guided_controls.py` executes 31 controls through the original
 `0x4668BD..0x467B7A` Bullet AI body, including reached target getters,
-`HomingTrack(0x5B20F0)`, floor queries and contact branches. The executable hash,
-substitutions and coverage limits are recorded in the companion metadata.
+`HomingTrack(0x5B20F0)`, floor queries and contact branches. The substitutions
+and coverage limits are recorded in the companion metadata.
 
 ```sh
-source /Users/halvor/Documents/vera20k-dev/env.sh
+source ~/Documents/vera20k-dev/env.sh
 PYTHONPATH=. PYTHONDONTWRITEBYTECODE=1 \
 VERA20K_PROJECTILE_RENDER_ASSETS=/tmp/bridge-ifv-assets-1dDM9D/extract \
-/Users/halvor/Documents/vera20k-dev/.venv/bin/python \
+~/Documents/vera20k-dev/.venv/bin/python \
 tools/projectile_oracle/ifv_guided_controls.py --check
 ```
 

@@ -2,17 +2,16 @@
 //! seam. Native/producers excluded: spatial_oracle/foot_archive_expiry.md.
 
 use super::*;
-use crate::sim::components::Health;
+use crate::sim::combat::Health;
 use crate::sim::mission::state::MissionTestFixture;
 use crate::sim::mission::{MissionDispatchTimer, MissionId, MissionType};
 use crate::sim::vision::FogState;
 
 #[test]
 fn native_foot_archive_expiry_matches_all_22_original_class_rows() {
-    let corpus: serde_json::Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tools/spatial_oracle/foot_archive_expiry.json",
-    )))
+    let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/foot_archive_expiry.json",
+    ))
     .unwrap();
     assert_eq!(corpus["schema_version"], 1);
     let rows = corpus["rows"].as_array().unwrap();
@@ -26,12 +25,8 @@ fn native_foot_archive_expiry_matches_all_22_original_class_rows() {
             other => panic!("family {other}"),
         };
         let mut sim = Simulation::new();
-        sim.session.binary_frame = 1000;
-        sim.fog = FogState {
-            width: 8,
-            height: 8,
-            ..FogState::default()
-        };
+        sim.session.set_binary_frame_for_test(1000);
+        sim.fog = FogState::new(8, 8);
         let owner = sim.interner.intern("Receiver");
         let other_owner = sim.interner.intern("Enemy");
         let type_ref = sim.interner.intern("TEST");
@@ -42,7 +37,7 @@ fn native_foot_archive_expiry_matches_all_22_original_class_rows() {
             0,
             0,
             owner,
-            Health { current: 100 },
+            Health::new(100),
             type_ref,
             category,
             0,
@@ -67,9 +62,23 @@ fn native_foot_archive_expiry_matches_all_22_original_class_rows() {
             },
         )));
         if input["target_match"].as_bool().unwrap() {
-            listener.attack_target = Some(crate::sim::combat::AttackTarget::new(2));
+            listener
+                .attack_target
+                .set_for_test(Some(crate::sim::combat::TargetKind::Entity(2)));
         }
         sim.substrate.entities.insert(listener);
+        if input["expired_flags"].as_i64().unwrap() & 1 != 0 {
+            // This native input is a real Techno. Supply its authoritative
+            // store identity; an arbitrary Object ID no longer implies Techno.
+            let mut expired = GameEntity::test_default(2, "TEST", "Enemy", 5, 5);
+            expired.set_type_ref_for_test(type_ref);
+            expired.set_owner_for_test(if input["same_owner"].as_bool().unwrap() {
+                owner
+            } else {
+                other_owner
+            });
+            sim.substrate.entities.insert(expired);
+        }
         if input["sensor"].as_i64().unwrap() != 0 {
             sim.fog.increment_sensor_at(owner, 5, 5);
         }
@@ -91,7 +100,8 @@ fn native_foot_archive_expiry_matches_all_22_original_class_rows() {
             } else {
                 PointerExpiryControl::Uninit
             },
-            None,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            &mut crate::sim::world::FrameEffects::default(),
         );
         let listener = sim.substrate.entities.get(1).unwrap();
         let archive = if row["archive"] == 0 {
@@ -101,11 +111,7 @@ fn native_foot_archive_expiry_matches_all_22_original_class_rows() {
         };
         let target = (row["target"] != 0).then_some(TargetKind::Entity(2));
         assert_eq!(listener.archive_target(), archive, "{input}");
-        assert_eq!(
-            listener.attack_target.as_ref().map(|attack| attack.target),
-            target,
-            "{input}"
-        );
+        assert_eq!(listener.attack_target.target(), target, "{input}");
         assert_eq!(
             sim.scenario_rng.logical_state(),
             rng_before,

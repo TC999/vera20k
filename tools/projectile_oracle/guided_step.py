@@ -5,7 +5,7 @@ import hashlib,json,struct,sys
 from pathlib import Path
 from unicorn import UC_HOOK_CODE
 from unicorn.x86_const import *
-from tools.native_oracle import NATIVE_SHA256,run_checked,finish_vectors,provenance
+from tools.native_oracle import run_checked,finish_vectors,provenance
 from tools.projectile_oracle.bridge_render_inputs import BulletReader,assets_root,lexical
 from tools.spatial_oracle.building_body_rules import RULES,SP,dwords
 
@@ -13,9 +13,11 @@ def i32(u,p):return struct.unpack('<i',u.mem_read(p,4))[0]
 def vec(u,p):
  raw=bytes(u.mem_read(p,24));return dict(value=list(struct.unpack('<3d',raw)),bits=[f'{v:016x}' for v in struct.unpack('<3Q',raw)])
 def xyz(u,p):return list(struct.unpack('<3i',u.mem_read(p,12)))
-def create(construct_bullet=True):
+def create(construct_bullet=True, *, reader=None):
  root=assets_root();art,_=lexical((root/'ARTMD.INI').read_bytes(),{'AAHeatSeeker2','DRAGON','FV'})
- m=BulletReader(art);u=m.u
+ # A composed witness may supply the same reader owner with additional fixed
+ # ART sections. World construction and all original initializers stay here.
+ m=reader if reader is not None else BulletReader(art);u=m.u
  # Verified C initializer table members for Bullet, Cell, and homing helper.
  initializers=[]
  for base,count in ((0x8127f4,13),(0x8129fc,13),(0x813c2c,13)):
@@ -97,7 +99,7 @@ def generate():
   finally:u.hook_del(hook)
   rows.append(dict(name=name,supplied=dict(old=old,velocity=velocity,target_cell=list(target),bridge_cells=[list(c) for c in bridge],level=6,slope=0,source=None,binary_frame=frame,unique_id=identity),candidate=xyz(u,SP+0x24),velocity=vec(u,b+0xe8),mode=i32(u,SP+0x20),impact=u.mem_read(SP+0x18,1)[0],course_locked=bool(u.mem_read(b+0x105,1)[0]),course_frames=i32(u,b+0x108),closing_count=i32(u,b+0x118),closing_accum=struct.unpack('<d',u.mem_read(b+0x120,8))[0],queries=queries,visited=sorted(visited),turns=turns,snapshots=snapshots,arm_timer=[i32(u,b+0xc4),i32(u,b+0xcc)]))
   candidate=m.alloc(12);u.mem_write(candidate,dwords(*rows[-1]['candidate']));rows[-1]['separate_proximity_check_during_arm']=m.invoke(0x4e11f0,b+0xb8,(candidate,))
- return dict(native_sha256=NATIVE_SHA256,scope='Full original ramp, steering and bridge contact before native world commit; supplied in-flight state and mapped flat cells, no launch/damage/render proof',initial=initial,rows=rows)
+ return dict(scope='Full original ramp, steering and bridge contact before native world commit; supplied in-flight state and mapped flat cells, no launch/damage/render proof',initial=initial,rows=rows)
 def metadata():
  return provenance(scope='Original guided ramp, HomingTrack, phase and strict live bridge crossing before world commit',assumptions=[
   'Nineteen supplied incoming-flight rows execute original4668BD..467B7A, full HomingTrack5B20F0 and bridge467032. No arithmetic/steering/contact result is computed by Python. ProximityDetector4E1130/4E11F0 additionally executes the still-armed contact check.',

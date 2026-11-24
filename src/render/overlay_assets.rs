@@ -1,27 +1,12 @@
-//! Render-only overlay asset-name helpers: SHP filename candidates and the
-//! debug/render overlay-name resolution over a rules `OverlayTypeRegistry`.
-//! Split out of `map::overlay_types` (F04); presentation-only — no sim or map
+//! Render-only debug overlay-name resolution over a rules `OverlayTypeRegistry`.
+//! Split out of the overlay type registry (F04); presentation-only — no sim or map
 //! consumer may depend on the env-var debug remaps here.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use crate::rules::overlay_types::OverlayTypeRegistry;
-
-/// Generate candidate SHP filenames for an overlay name.
-///
-/// Returns a list of filenames to try in order, using the theater extension first
-/// (e.g., for temperate: `.tem`), then the generic `.shp` extension.
-/// Both lowercase and original case are tried.
-pub fn overlay_shp_candidates(name: &str, theater_ext: &str) -> Vec<String> {
-    let lower: String = name.to_lowercase();
-    vec![
-        format!("{}.{}", lower, theater_ext),
-        format!("{}.shp", lower),
-        format!("{}.{}", name, theater_ext),
-        format!("{}.shp", name),
-    ]
-}
 
 /// Optional debug remap for problematic resource overlays.
 ///
@@ -51,6 +36,8 @@ fn is_resource_overlay_name(name: &str) -> bool {
 }
 
 fn tiberium_id_offset() -> isize {
+    // A process-wide debug switch, read once from the environment (listed with
+    // the render toggles in tools/telemetry-dashboard/README.md).
     static TIB_ID_OFFSET: OnceLock<isize> = OnceLock::new();
     *TIB_ID_OFFSET.get_or_init(|| {
         std::env::var("RA2_TIB_ID_OFFSET")
@@ -75,10 +62,10 @@ pub fn resolve_overlay_name_for_render(
         let shifted = overlay_id as isize + offset;
         if (0..=u8::MAX as isize).contains(&shifted) {
             let shifted_id = shifted as u8;
-            if let Some(candidate) = reg.name(shifted_id) {
-                if is_resource_overlay_name(candidate) {
-                    resolved_id = shifted_id;
-                }
+            if let Some(candidate) = reg.name(shifted_id)
+                && is_resource_overlay_name(candidate)
+            {
+                resolved_id = shifted_id;
             }
         }
     }
@@ -86,16 +73,45 @@ pub fn resolve_overlay_name_for_render(
         .map(|n| remap_overlay_name_for_debug(n).into_owned())
 }
 
-#[cfg(test)]
+/// The render name of every registered overlay type, keyed by its
+/// `[OverlayTypes]` index. `CellClass::DrawOverlay_Body @ 0x0047F6A0` and
+/// `DrawOverlay_Shadow @ 0x0047F510` take the type straight from
+/// `OverlayTypeClass::Array[Cell+0x44]`, so every identity a cell can hold,
+/// authored or written at runtime, resolves here; nothing is pre-selected.
+pub fn render_overlay_names(reg: &OverlayTypeRegistry) -> BTreeMap<u8, String> {
+    (0..=u8::MAX)
+        .filter_map(|overlay_id| {
+            Some((
+                overlay_id,
+                resolve_overlay_name_for_render(reg, overlay_id)?,
+            ))
+        })
+        .collect()
+}
+
+#[cfg(all(test, tests_render_a_r))]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_shp_candidates() {
-        let names: Vec<String> = overlay_shp_candidates("GEM01", "tem");
-        assert_eq!(names[0], "gem01.tem");
-        assert_eq!(names[1], "gem01.shp");
-        assert_eq!(names[2], "GEM01.tem");
-        assert_eq!(names[3], "GEM01.shp");
+    fn render_overlay_names_cover_every_registered_type() {
+        // No kind or map entry pre-selects an identity: walls, crates, ore
+        // variants and rubble written after load are named like any other.
+        let mut text = String::from("[OverlayTypes]\n");
+        for overlay_id in 0..=0xEFu8 {
+            text.push_str(&format!("{overlay_id}=TYPE{overlay_id}\n"));
+        }
+        let reg = OverlayTypeRegistry::from_ini(
+            &crate::rules::ini_parser::IniFile::from_str(&text),
+            None,
+        );
+
+        let names = render_overlay_names(&reg);
+
+        assert_eq!(names.len(), 0xF0);
+        for (&overlay_id, name) in &names {
+            assert_eq!(Some(name.as_str()), reg.name(overlay_id));
+        }
+        assert!(!names.contains_key(&0xF0), "unregistered index");
     }
 }

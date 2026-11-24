@@ -2,13 +2,13 @@
 //! Foot takes on entering a cell while it chases a Foot TarCom.
 //!
 //! Walk infantry take the whole stop at their completion (`walk_host.rs`). A
-//! unit takes only its `OpenTopped=` arm, from the track terminal's PerCell
-//! (`track_host.rs`); for its InRange arm the pursuit stage's in-range halt
-//! (`world_orders.rs`) stands in, tested each frame.
+//! unit takes it from its locomotor's PerCell (a Drive or Ship track terminal
+//! in `track_host.rs`, Hover's Process, a Jumpjet's touchdown, a Teleport
+//! arrival).
 
 use super::ground_pose;
 use crate::map::entities::EntityCategory;
-use crate::map::overlay_types::OverlayTypeRegistry;
+use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::combat::{self, TargetKind};
 use crate::sim::game_entity::GameEntity;
@@ -41,24 +41,16 @@ impl Simulation {
             return false;
         };
         let reached = (|| {
-            let target = &actor.attack_target.as_ref()?.target;
-            let selected = combat::pursuit_selection(
-                actor,
-                target,
-                &self.substrate.entities,
-                rules,
-                &self.interner,
-                self.resolved_terrain.as_ref(),
-                Some(&self.house_alliances),
-            )?;
-            let TargetKind::Entity(target_id) = *target else {
+            let target = actor.attack_target.target()?;
+            let actor_type = self.object_type(actor.type_ref(), rules)?;
+            let (index, selected) = self.foot_target_weapon(actor, actor_type, target, rules)?;
+            let TargetKind::Entity(target_id) = target else {
                 return None;
             };
             let target_entity = self.substrate.entities.get(target_id)?;
-            if target_entity.category == EntityCategory::Structure {
+            if target_entity.category() == EntityCategory::Structure {
                 return None;
             }
-            let actor_type = self.object_type(actor.type_ref(), rules)?;
             // Foot+4F0 ->4D9FF0->41BDD0->5F65A0 returns actual owner XYZ,
             // independently of its retained locomotor head or destination.
             let xyz = ground_pose::position_world_coord(&target_entity.position);
@@ -71,7 +63,7 @@ impl Simulation {
                 let range = combat::combat_weapon::weapon_range(
                     actor,
                     actor_type,
-                    selected.index,
+                    index,
                     &self.substrate.entities,
                     rules,
                     &self.interner,
@@ -81,20 +73,22 @@ impl Simulation {
             let terrain = self.resolved_terrain.as_ref()?;
             let cell = terrain.native_cell_identity(((xyz.x / 256) as i16, (xyz.y / 256) as i16));
             // Reuse the existing range/source owners with the SAME weapon;
-            // selecting again against a Cell would change the native slot.
+            // selecting again against a Cell would change the native slot. An
+            // empty slot is never in range (0x006F7237), after the lookup.
             combat::in_range::cell_target_in_range(
                 actor,
                 cell,
-                selected.weapon,
+                selected?.weapon,
                 rules,
                 &self.interner,
-                &self.substrate.entities,
                 terrain,
                 &combat::line_of_fire::LineOfFireInputs {
                     overlay_grid: self.overlay_grid.as_ref(),
                     overlay_registry: registry,
-                    alliances: Some(&self.fog.alliances),
+                    alliances: Some(&self.house_alliances),
+                    buildings: Some(combat::line_of_fire::CellBuildings::of(self)),
                 },
+                Some(&self.substrate.entities),
             )
         })()
         .unwrap_or(false);
@@ -105,7 +99,7 @@ impl Simulation {
 /// The range stop's gates after its measurement: Rescue, Area Guard, Attack
 /// or Hunt (`0x004D8916..0x004D8950`) with an empty NavQueue (`+0x598`,
 /// `0x004D8956`).
-pub(crate) fn range_stop_admits(entity: &GameEntity) -> bool {
+fn range_stop_admits(entity: &GameEntity) -> bool {
     [21, 11, 1, 15].contains(&entity.mission.effective().raw())
-        && entity.navigation.nav_queue.is_empty()
+        && entity.navigation.nav_queue().is_empty()
 }

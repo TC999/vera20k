@@ -14,14 +14,15 @@ use super::*;
 use crate::rules::ini_parser::IniFile;
 use crate::sim::house_state::{HouseDifficulty, HouseState};
 use crate::sim::rng::SimRng;
+use crate::sim::superweapon::charge_nearly_full;
 use crate::sim::team_script_vm::{TeamScriptDefinition, TeamTaskForceDefinition};
 use crate::sim::timer::CdTimer;
-use crate::util::native_x87::NativeF64Bits;
+use crate::util::native_x87::{NativeF32Bits, NativeF64Bits};
 use serde_json::Value;
 
 pub(crate) fn rows(section: &str) -> Vec<Value> {
     let oracle: Value =
-        serde_json::from_str(include_str!("../../tools/ai_team_oracle.json")).unwrap();
+        serde_json::from_str(crate::test_fixture::text("tools/ai_team_oracle.json")).unwrap();
     oracle[section].as_array().unwrap().clone()
 }
 
@@ -132,19 +133,20 @@ fn selector_fixture(row: &Value) -> SelectorFixture {
     rules.general.total_ai_team_cap = dwords(&row["cap"]);
     rules.general.maximum_ai_defensive_teams = dwords(&row["max_defense"]);
     let mut sim = Simulation::new();
-    sim.session.game_mode_nonzero = true;
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
     let owner = sim.interner.intern("H0");
     let enemy = sim.interner.intern("H1");
     for name in [owner, enemy] {
         sim.houses
-            .insert(name, HouseState::new(name, 0, None, false, 0, 10));
+            .register(HouseState::new(name, 0, None, false, 0, 10));
     }
-    sim.session.house_order = vec![owner, enemy];
+    sim.houses.reorder_for_test(&[owner, enemy]);
     let house = sim.houses.get_mut(&owner).unwrap();
-    house.difficulty = HouseDifficulty::from_native(dword(&row["difficulty"])).unwrap();
-    house.team_creation.ratio = dword(&row["ratio"]);
-    house.ai_activation.ai_triggers_active = flag(&row["active"]);
-    house.enemy_house = flag(&row["enemy"]).then_some(enemy);
+    house.set_difficulty_for_test(HouseDifficulty::from_native(dword(&row["difficulty"])).unwrap());
+    house.team_creation_mut().ratio = dword(&row["ratio"]);
+    house.set_ai_triggers_active(flag(&row["active"]));
+    house.set_enemy_house_for_test(flag(&row["enemy"]).then_some(enemy));
     let script = sim.interner.intern("SCRIPT");
     let task_force = sim.interner.intern("TASKFORCE");
     sim.team_script_vm.register_script(TeamScriptDefinition {
@@ -189,8 +191,15 @@ fn selector_fixture(row: &Value) -> SelectorFixture {
         teams.push(if team.get("formed").is_some_and(flag) {
             vm.create_team_from_type(team_owner, team_type, &[], created)
         } else {
-            vm.construct_team(team_type, team_owner, true, created)
-                .unwrap()
+            vm.construct_team(
+                team_type,
+                team_owner,
+                TeamLimitScope::PerHouse,
+                created,
+                false,
+                None,
+            )
+            .unwrap()
         });
     }
     let mut triggers = Vec::new();
@@ -249,6 +258,7 @@ fn the_selector_matches_the_original() {
                 answers[slot]
             },
             |_, low, high| draws.draw(low, high),
+            &mut crate::sim::world::FrameEffects::default(),
         );
         let slot_of = |id: InternedId| team_types.iter().position(|&tt| tt == id).unwrap();
         let picked: Vec<usize> = picked.into_iter().map(slot_of).collect();
@@ -347,6 +357,23 @@ fn the_super_weapon_readiness_matches_the_original() {
     }
 }
 
+/// `AIMinorSuperReadyPercent=1e999` reads as a binary32 infinity, so the
+/// threshold `1.0f - percent` is -inf and no finite charge ratio is below
+/// it; `-1e999` makes it +inf, which every finite ratio is below.
+#[test]
+fn an_infinite_ready_percent_loads_as_the_fpu_loads_it() {
+    let percent = |text: &str| {
+        RuleSet::from_ini(&IniFile::from_str(&format!(
+            "[General]\nAIMinorSuperReadyPercent={text}\n"
+        )))
+        .unwrap()
+        .general
+        .ai_minor_super_ready_percent
+    };
+    assert!(!charge_nearly_full(0, 100, percent("1e999")));
+    assert!(charge_nearly_full(100, 100, percent("-1e999")));
+}
+
 fn rng_digest(rng: &SimRng) -> u64 {
     let mut hasher = DefaultHasher::new();
     rng.hash_state(&mut hasher);
@@ -359,20 +386,31 @@ fn the_team_block_matches_the_original() {
         let mut rules = RuleSet::from_ini(&IniFile::from_str("")).unwrap();
         rules.general.team_delays = dwords(&row["delays"]);
         let mut sim = Simulation::new();
-        sim.session.game_mode_nonzero = dword(&row["game_mode"]) != 0;
-        sim.session.binary_frame = dword(&row["frame"]) as u32;
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(
+                dword(&row["game_mode"]) != 0,
+            ),
+        );
+        sim.session
+            .set_binary_frame_for_test(dword(&row["frame"]) as u32);
         let owner = sim.interner.intern("H0");
         let mut house = HouseState::new(owner, 0, None, flag(&row["human"]), 0, 10);
-        house.player_control = flag(&row["control"]);
-        house.multiplay_passive = flag(&row["passive"]);
-        house.difficulty = HouseDifficulty::from_native(dword(&row["difficulty"])).unwrap();
-        house.team_creation.timer =
+        house.set_player_control_for_test(flag(&row["control"]));
+        house.set_multiplay_passive_for_test(flag(&row["passive"]));
+        house.set_difficulty_for_test(
+            HouseDifficulty::from_native(dword(&row["difficulty"])).unwrap(),
+        );
+        house.team_creation_mut().timer =
             CdTimer::from_raw(dword(&row["start"]), dword(&row["duration"]));
-        sim.houses.insert(owner, house);
-        sim.session.house_order = vec![owner];
+        sim.houses.register(house);
         let before = rng_digest(&sim.scenario_rng);
-        update_team_creation(&mut sim, &rules, owner);
-        let timer = sim.houses[&owner].team_creation.timer;
+        update_team_creation(
+            &mut sim,
+            &rules,
+            owner,
+            &mut crate::sim::world::FrameEffects::default(),
+        );
+        let timer = sim.houses[&owner].team_creation().timer;
         assert_eq!(
             vec![timer.start_frame(), timer.duration()],
             dwords(&row["timer"]),
@@ -385,4 +423,79 @@ fn the_team_block_matches_the_original() {
             "team block row {number}: selector"
         );
     }
+}
+
+#[test]
+fn ares_trigger_side_tokens_admit_any_registered_side() {
+    assert!(super::side_admits(0, 3, true), "token 0 is unrestricted");
+    assert!(
+        super::side_admits(4, 3, true),
+        "token 4 selects side index 3"
+    );
+    assert!(!super::side_admits(4, 2, true));
+    assert!(!super::side_admits(1, 3, true));
+    assert!(super::side_admits(3, 2, true));
+}
+
+#[test]
+fn a_command_driven_house_stands_down_from_team_creation() {
+    let rules = RuleSet::from_ini(&IniFile::from_str("")).unwrap();
+    let mut sim = Simulation::new();
+    sim.session.set_game_mode(
+        crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+    );
+    sim.session.set_binary_frame_for_test(100);
+    let owner = sim.interner.intern("H0");
+    let mut house = HouseState::new(owner, 0, None, false, 0, 10);
+    // Expired timer, an ordinary computer house: without the stand-down the
+    // selector's first act is its `RandomRanged(1, 100)` roll.
+    house.team_creation_mut().timer = CdTimer::from_raw(0, 1);
+    house.make_command_driven();
+    sim.houses.register(house);
+    let before = rng_digest(&sim.scenario_rng);
+    update_team_creation(
+        &mut sim,
+        &rules,
+        owner,
+        &mut crate::sim::world::FrameEffects::default(),
+    );
+    assert_eq!(
+        rng_digest(&sim.scenario_rng),
+        before,
+        "the selector never draws for a command-driven house"
+    );
+}
+
+/// A non-finite running weight, which only a damaged save can hold, counts
+/// as weight 0 (FISTP's indefinite low dword) instead of stopping the draw.
+#[test]
+fn a_non_finite_saved_weight_draws_as_zero() {
+    let rules = RuleSet::from_ini(&IniFile::from_str("")).unwrap();
+    let mut sim = Simulation::new();
+    let owner = sim.interner.intern("H0");
+    let [broken, kept, broken_team, kept_team] =
+        ["BROKEN", "KEPT", "BROKENTEAM", "KEPTTEAM"].map(|name| sim.interner.intern(name));
+    let nan = NativeF64Bits::from_bits(f64::NAN.to_bits());
+    sim.team_script_vm
+        .register_ai_trigger(ai_trigger(broken, broken_team, None, nan));
+    sim.team_script_vm.register_ai_trigger(ai_trigger(
+        kept,
+        kept_team,
+        None,
+        NativeF64Bits::from_bits(3.0f64.to_bits()),
+    ));
+    let mut asked = Vec::new();
+    let picked = draw_ai_trigger(
+        &mut sim,
+        &rules,
+        owner,
+        None,
+        false,
+        |_, _, _, _| true,
+        |_, low, high| {
+            asked.push((low, high));
+            high
+        },
+    );
+    assert_eq!((asked, picked), (vec![(1, 3)], vec![kept_team]));
 }

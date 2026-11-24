@@ -2,7 +2,8 @@
 //! Windows locale through GetDateFormatA / GetTimeFormatA, then converts ACP.
 //! Other platforms format the same local time with the user's locale short
 //! date and time (`strftime_l` `%x` / `%X`); the strings follow that
-//! platform's locale data, as the Win32 ones follow Windows'.
+//! platform's locale data, as the Win32 ones follow Windows'. The same local
+//! time gives VERA20K Online's chat lobby its line times (`local_hour_minute`).
 
 #[cfg(windows)]
 #[repr(C)]
@@ -26,7 +27,9 @@ struct NativeSystemTime {
     milliseconds: u16,
 }
 
+#[cfg(any(unix, windows))]
 const WINDOWS_EPOCH_SECONDS: u64 = 11_644_473_600;
+#[cfg(any(unix, windows))]
 const TICKS_PER_SECOND: u64 = 10_000_000;
 
 /// Saved-list 0x005596A0 omits both columns for either sentinel DWORD.
@@ -34,20 +37,29 @@ fn is_sentinel(ticks: u64) -> bool {
     ticks as u32 == u32::MAX || (ticks >> 32) as u32 == u32::MAX
 }
 
-#[cfg(any(windows, unix))]
-pub(crate) fn format_timestamp_parts(unix_secs: u64) -> Option<(String, String)> {
-    let ticks = unix_secs
-        .checked_add(WINDOWS_EPOCH_SECONDS)?
-        .checked_mul(TICKS_PER_SECOND)?;
-    format_file_time_parts(ticks)
-}
-
 /// Format native FILETIME without discarding its epoch or fractional fields.
 #[cfg(windows)]
-pub(crate) fn format_file_time_parts(ticks: u64) -> Option<(String, String)> {
+pub fn format_file_time_parts(ticks: u64) -> Option<(String, String)> {
     if is_sentinel(ticks) {
         return None;
     }
+    format_local_system_time(&local_system_time(ticks)?)
+}
+
+/// A Unix time as the local hour and minute.
+#[cfg(windows)]
+pub fn local_hour_minute(unix_seconds: u64) -> Option<(u8, u8)> {
+    let ticks = unix_seconds
+        .checked_add(WINDOWS_EPOCH_SECONDS)?
+        .checked_mul(TICKS_PER_SECOND)?;
+    let local = local_system_time(ticks)?;
+    Some((local.hour as u8, local.minute as u8))
+}
+
+/// FILETIME ticks as local time: `FileTimeToLocalFileTime`, then
+/// `FileTimeToSystemTime`.
+#[cfg(windows)]
+fn local_system_time(ticks: u64) -> Option<NativeSystemTime> {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn FileTimeToLocalFileTime(
@@ -83,7 +95,7 @@ pub(crate) fn format_file_time_parts(ticks: u64) -> Option<(String, String)> {
             return None;
         }
     }
-    format_local_system_time(&system)
+    Some(system)
 }
 
 #[cfg(windows)]
@@ -154,6 +166,7 @@ struct TimeLocale(libc::locale_t);
 // it, and POSIX allows a locale object to be used from any thread.
 #[cfg(unix)]
 unsafe impl Send for TimeLocale {}
+// SAFETY: as for `Send`: every user only reads the handle.
 #[cfg(unix)]
 unsafe impl Sync for TimeLocale {}
 
@@ -179,46 +192,66 @@ fn time_locale() -> Option<libc::locale_t> {
 
 /// FILETIME ticks as local time in the user's locale short date and time.
 #[cfg(unix)]
-pub(crate) fn format_file_time_parts(ticks: u64) -> Option<(String, String)> {
+pub fn format_file_time_parts(ticks: u64) -> Option<(String, String)> {
     if is_sentinel(ticks) {
         return None;
     }
     let seconds = (ticks / TICKS_PER_SECOND).checked_sub(WINDOWS_EPOCH_SECONDS)?;
-    let seconds = libc::time_t::try_from(seconds).ok()?;
+    let local = local_tm(seconds)?;
     let locale = time_locale()?;
-    // SAFETY: `tm` is plain data that localtime_r fills; strftime_l writes at
-    // most the buffer length and reads the live process locale.
-    unsafe {
-        let mut local: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&seconds, &mut local).is_null() {
-            return None;
-        }
-        let format = |pattern: &std::ffi::CStr| {
-            let mut out = [0u8; 128];
-            let len = libc::strftime_l(
+    let format = |pattern: &std::ffi::CStr| {
+        let mut out = [0u8; 128];
+        // SAFETY: strftime_l writes at most the buffer length and reads the
+        // live process locale.
+        let len = unsafe {
+            libc::strftime_l(
                 out.as_mut_ptr().cast(),
                 out.len(),
                 pattern.as_ptr(),
                 &local,
                 locale,
-            );
-            (len > 0).then(|| String::from_utf8_lossy(&out[..len]).into_owned())
+            )
         };
-        format(c"%x").zip(format(c"%X"))
+        (len > 0).then(|| String::from_utf8_lossy(&out[..len]).into_owned())
+    };
+    format(c"%x").zip(format(c"%X"))
+}
+
+/// A Unix time as the local hour and minute.
+#[cfg(unix)]
+pub fn local_hour_minute(unix_seconds: u64) -> Option<(u8, u8)> {
+    let local = local_tm(unix_seconds)?;
+    Some((local.tm_hour as u8, local.tm_min as u8))
+}
+
+/// Unix seconds as local time (`localtime_r`).
+#[cfg(unix)]
+fn local_tm(seconds: u64) -> Option<libc::tm> {
+    let seconds = libc::time_t::try_from(seconds).ok()?;
+    // SAFETY: `tm` is plain data that localtime_r fills.
+    unsafe {
+        let mut local: libc::tm = std::mem::zeroed();
+        (!libc::localtime_r(&seconds, &mut local).is_null()).then_some(local)
     }
 }
 
-#[cfg(not(any(windows, unix)))]
-pub(crate) fn format_timestamp_parts(_unix_secs: u64) -> Option<(String, String)> {
+#[cfg(all(
+    not(any(windows, unix)),
+    not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))
+))]
+pub fn format_file_time_parts(_ticks: u64) -> Option<(String, String)> {
     None
 }
 
-#[cfg(not(any(windows, unix)))]
-pub(crate) fn format_file_time_parts(_ticks: u64) -> Option<(String, String)> {
+#[cfg(all(
+    not(any(windows, unix)),
+    not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))
+))]
+pub fn local_hour_minute(_unix_seconds: u64) -> Option<(u8, u8)> {
     None
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(test, tests_util, unix))]
 mod unix_tests {
     use super::{TICKS_PER_SECOND, WINDOWS_EPOCH_SECONDS, format_file_time_parts};
 
@@ -233,7 +266,7 @@ mod unix_tests {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, tests_util, windows))]
 mod tests {
     use super::{NativeSystemTime, format_local_system_time};
 
@@ -255,4 +288,24 @@ mod tests {
         assert!(!date.contains("ago"));
         assert!(!time.contains("ago"));
     }
+}
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+pub fn format_file_time_parts(ticks: u64) -> Option<(String, String)> {
+    if is_sentinel(ticks) {
+        return None;
+    }
+    let milliseconds = ticks.checked_div(10_000)?.checked_sub(11_644_473_600_000)?;
+    let date = js_sys::Date::new(&(milliseconds as f64).into());
+    let options = js_sys::Object::new();
+    Some((
+        date.to_locale_date_string("default", &options).into(),
+        date.to_locale_time_string("default").into(),
+    ))
+}
+
+#[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+pub fn local_hour_minute(unix_seconds: u64) -> Option<(u8, u8)> {
+    let date = js_sys::Date::new(&(unix_seconds as f64 * 1000.0).into());
+    Some((date.get_hours() as u8, date.get_minutes() as u8))
 }

@@ -1,8 +1,8 @@
 //! `tools/team_recruit_oracle.py`'s native rows replayed: `Recalc`,
 //! `Calc_Center`'s arithmetic, `Recruit`'s search, `ObjectClass::Distance`,
 //! the action 5 guard timer, action 54's seed cell, `FindOwnBuilding`,
-//! action 53's seed cell, `Quarry_To_Threat` and `Coordinate_Attack`'s frame
-//! test.
+//! `Find_Best_Target_Building`, action 53's seed cell, `Quarry_To_Threat`
+//! and `Coordinate_Attack`'s frame test.
 //!
 //! Each row carries what the original's stubs answered (Can_Add, the weight
 //! and cell tests, the draw); the Rust owner must ask in the same order and
@@ -11,8 +11,8 @@
 use serde_json::Value;
 
 use super::actions::{
-    attack_check_frame, gather_seed_cell, guard_frames, own_building_pick, quarry_mask,
-    regroup_seed_cell,
+    TargetBuilding, attack_check_frame, gather_seed_cell, guard_frames, own_building_pick,
+    regroup_seed_cell, target_building_pick,
 };
 use super::membership::{RecruitCandidate, entry_short, recruit_pick};
 use super::team_ai::{CenterSample, center_of, center_sample};
@@ -20,14 +20,17 @@ use super::*;
 use crate::map::entities::EntityCategory;
 use crate::rules::ini_parser::IniFile;
 use crate::rules::ruleset::RuleSet;
+use crate::sim::combat::quarry_mask;
 use crate::sim::game_entity::GameEntity;
 use crate::sim::world::Simulation;
 use crate::util::fixed_math::SimFixed;
+use crate::util::lepton::lepton_to_cell_packed;
 
 fn rows(section: &str) -> Vec<Value> {
-    let oracle: Value =
-        serde_json::from_str(include_str!("../../../tools/team_recruit_oracle.json")).unwrap();
-    oracle[section].as_array().unwrap().clone()
+    crate::test_fixture::json("tools/team_recruit_oracle.json")[section]
+        .as_array()
+        .unwrap()
+        .clone()
 }
 
 fn int(value: &Value) -> i32 {
@@ -107,7 +110,9 @@ fn recalc_fixture(row: &Value) -> (Simulation, RuleSet, u64) {
     let metadata = vm.team_type_ini.get_mut(&team_type).unwrap();
     metadata.reinforce = flag(&row["reinforce"]);
     metadata.guard_slower = flag(&row["guard_slower"]);
-    let team_id = vm.construct_team(team_type, owner, true, 0).unwrap();
+    let team_id = vm
+        .construct_team(team_type, owner, TeamLimitScope::PerHouse, 0, false, None)
+        .unwrap();
     let team = vm.teams.get_mut(&team_id).unwrap();
     team.members = (1..=index(&row["total"]))
         .map(|id| TeamMember {
@@ -129,7 +134,12 @@ fn recalc_fixture(row: &Value) -> (Simulation, RuleSet, u64) {
 fn recalc_matches_the_original() {
     for (number, row) in rows("recalc").iter().enumerate() {
         let (mut sim, rules, team_id) = recalc_fixture(row);
-        let kept = sim.team_recalc(team_id, &rules);
+        let kept = sim.team_recalc(
+            team_id,
+            &rules,
+            None,
+            &mut crate::sim::world::FrameEffects::default(),
+        );
         assert_eq!(
             kept,
             int(&row["result"]) == 1,
@@ -174,18 +184,41 @@ fn recalc_matches_the_original() {
 fn center_member(id: u64, row: &Value) -> GameEntity {
     let [x, y, _] = xyz(&row["xyz"]);
     let mut entity = GameEntity::test_default(id, "E1", "OWNER", (x >> 8) as u16, (y >> 8) as u16);
-    entity.position.sub_x = SimFixed::from_num(x & 0xFF);
-    entity.position.sub_y = SimFixed::from_num(y & 0xFF);
-    entity.lifecycle.object_alive = flag(&row["active"]);
-    entity.health.current = int(&row["health"]);
-    entity.lifecycle.in_limbo = flag(&row["limbo"]);
-    entity.in_playfield = flag(&row["in_playfield"]);
-    entity.category = if flag(&row["aircraft"]) {
+    entity
+        .position
+        .set_sub_x_for_test(SimFixed::from_num(x & 0xFF));
+    entity
+        .position
+        .set_sub_y_for_test(SimFixed::from_num(y & 0xFF));
+    entity
+        .lifecycle
+        .set_object_alive_for_test(flag(&row["active"]));
+    entity.health.set_for_test(int(&row["health"]));
+    entity.lifecycle.set_in_limbo_for_test(flag(&row["limbo"]));
+    entity.set_in_playfield(flag(&row["in_playfield"]));
+    entity.set_category_for_test(if flag(&row["aircraft"]) {
         EntityCategory::Aircraft
     } else {
         EntityCategory::Infantry
-    };
+    });
     entity
+}
+
+/// Whether these kernels are compared in their Ares form: the thread's
+/// fixture mode, as a fixture's rules built here would answer.
+fn ares_plays() -> bool {
+    crate::rules::ares_switch::ares_way()
+}
+
+/// Ares AbstractClass_Distance2DSquared_1/2 (1005C1A0, hook 0x5F6515;
+/// 1005C240, hook 0x5F6560) clamp a squared distance these original rows wrap.
+fn ares_clamps(points: impl IntoIterator<Item = [i32; 2]>, to: [i32; 2]) -> bool {
+    ares_plays()
+        && points.into_iter().any(|point| {
+            let dx = i64::from(point[0].wrapping_sub(to[0]));
+            let dy = i64::from(point[1].wrapping_sub(to[1]));
+            dx * dx + dy * dy > i64::from(i32::MAX)
+        })
 }
 
 #[test]
@@ -203,12 +236,13 @@ fn calc_center_matches_the_original() {
                     flag(&member["initiated"]),
                     guard_slower && flag(&member["weight"]),
                     int(&member["passengers"]) > 0 && flag(&member["naval"]),
+                    false,
                 )
             })
             .collect();
         let focus = (!row["focus"].is_null()).then(|| xy(&row["focus"]));
         let cell_at = events(row, "cell_at");
-        match center_of(&samples, focus) {
+        match center_of(samples.iter().copied(), focus, ares_plays(), false) {
             None => {
                 assert!(cell_at.is_empty(), "center row {number}: no mean");
                 assert!(row["center"].is_null() && row["closest"].is_null());
@@ -221,6 +255,11 @@ fn calc_center_matches_the_original() {
                 );
                 // The head stands in for a missing closest member.
                 let closest = closest.unwrap_or(0);
+                if focus
+                    .is_some_and(|focus| ares_clamps(samples.iter().map(|sample| sample.xy), focus))
+                {
+                    continue;
+                }
                 assert_eq!(
                     closest,
                     index(&row["closest"]),
@@ -270,9 +309,12 @@ fn recruit_matches_the_original() {
         } else {
             xy(&row["zone"])
         };
+        if ares_clamps(candidates.iter().map(|candidate| candidate.xy), origin) {
+            continue;
+        }
         let mut asked = Vec::new();
         let winner = recruit_pick(
-            &candidates,
+            candidates.iter().copied(),
             origin,
             int(&row["group"]),
             flag(&row["recruiter"]),
@@ -280,6 +322,8 @@ fn recruit_matches_the_original() {
                 asked.push(id);
                 flag(&row["candidates"][id as usize]["can_add"])
             },
+            ares_plays(),
+            false,
         );
         assert_eq!(asked, can_adds, "recruit row {number}: Can_Add calls");
         assert_eq!(winner, added, "recruit row {number}: winner");
@@ -362,10 +406,76 @@ fn find_own_building_matches_the_original() {
             .collect();
         let mode = row["mode"].as_u64().unwrap() as u32;
         assert_eq!(
-            own_building_pick(&buildings, xyz(&row["leader"]), mode),
+            own_building_pick(&buildings, xyz(&row["leader"]), mode, |_| 0),
             row["result"].as_u64(),
             "own building row {number}"
         );
+    }
+}
+
+/// Each row's buildings of the searched type, scored in the original's
+/// order: the pick, the buildings whose threat it read, and the cell of each
+/// read (the building's GetCoords, rounded toward zero) for the unit's house.
+#[test]
+fn target_building_matches_the_original() {
+    for (number, row) in rows("target_building").iter().enumerate() {
+        let enemy = row["enemy"].as_u64();
+        let listed =
+            |key: &str| -> Vec<u64> { row[key].as_array().unwrap().iter().map(index).collect() };
+        let (allies, passive) = (listed("allies"), listed("passive"));
+        let all = row["buildings"].as_array().unwrap();
+        let buildings: Vec<TargetBuilding> = all
+            .iter()
+            .enumerate()
+            .filter(|(_, building)| flag(&building["of_type"]))
+            .map(|(id, building)| {
+                let owner = index(&building["owner"]);
+                TargetBuilding {
+                    id: id as u64,
+                    location: xyz(&building["location"]),
+                    enemy_owned: Some(owner) == enemy,
+                    allied: owner == 0 || allies.contains(&owner),
+                    passive: passive.contains(&owner),
+                }
+            })
+            .collect();
+        let mut read = Vec::new();
+        let result = target_building_pick(
+            &buildings,
+            xyz(&row["unit"]),
+            row["mode"].as_u64().unwrap() as u32,
+            flag(&row["only_enemy"]),
+            |id| {
+                read.push(id);
+                int(&all[id as usize]["threat"])
+            },
+        );
+        assert_eq!(
+            result,
+            row["result"].as_u64(),
+            "target building row {number}"
+        );
+        let threats = events(row, "threat");
+        assert_eq!(
+            read,
+            threats
+                .iter()
+                .map(|event| index(&event[1]))
+                .collect::<Vec<_>>(),
+            "target building row {number}: threat reads"
+        );
+        for event in threats {
+            let coords = xyz(&all[index(&event[1]) as usize]["coords"]);
+            assert_eq!(
+                (
+                    lepton_to_cell_packed(coords[0]),
+                    lepton_to_cell_packed(coords[1])
+                ),
+                (int(&event[2]) as i16, int(&event[3]) as i16),
+                "target building row {number}: threat cell"
+            );
+            assert_eq!(index(&event[4]), 0, "target building row {number}: house");
+        }
     }
 }
 

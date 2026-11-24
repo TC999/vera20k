@@ -8,12 +8,61 @@ import json,struct,sys,hashlib
 from pathlib import Path
 from unicorn import UC_HOOK_CODE
 from unicorn.x86_const import *
-from tools.native_oracle import NATIVE_SHA256,NATIVE_FPCW,RET_MAGIC,run_checked,finish_vectors,provenance
+from tools.native_oracle import NATIVE_FPCW,RET_MAGIC,run_checked,finish_vectors,provenance
 from tools.projectile_oracle.bridge_render_inputs import assets_root,lexical
 from tools.spatial_oracle.building_body_rules import RULES,SP,dwords
 
 from tools.projectile_oracle import guided_step as guided
 i32,xyz,vec=guided.i32,guided.xyz,guided.vec
+
+def bullet_addref_transport(m,address,events):
+ """Verified Bullet IUnknown Windows InterlockedIncrement boundary."""
+ if address!=0x46afe5:return False
+ u=m.u;sp=u.reg_read(UC_X86_REG_ESP);ptr=m.read32(sp);value=(m.read32(ptr)+1)&0xffffffff
+ u.mem_write(ptr,dwords(value));u.reg_write(UC_X86_REG_EAX,value)
+ u.reg_write(UC_X86_REG_ESP,sp+4);u.reg_write(UC_X86_REG_EIP,0x46afeb)
+ events.append(dict(call='KERNEL32.InterlockedIncrement',com_refcount=value))
+ return True
+
+def bullet_activation_transport(m, address, events):
+ """Windows COM activation at the existing Bullet creation call sites.
+
+ Only activation is supplied: registered factory6C5090 and Bullet constructors
+ execute unchanged. Reuse the five COM argument words for the factory ABI.
+ """
+ if address not in (0x46b072, 0x46a564, 0x46a9e2):return False
+ u=m.u;sp=u.reg_read(UC_X86_REG_ESP)
+ assert bytes(u.mem_read(address,6))==bytes.fromhex('ff15fc157e00')
+ clsid,outer,context,iid,ppv=struct.unpack('<5I',u.mem_read(sp,20))
+ assert (clsid,outer,context,iid)==(0x7e96e0,0,7,0x7f7c90)
+ events.append(dict(call='CoCreateInstance activation to original registered factory',clsid_hex=bytes(u.mem_read(clsid,16)).hex(),iid_hex=bytes(u.mem_read(iid,16)).hex()))
+ u.mem_write(sp,dwords(address+6,0,outer,iid,ppv));u.reg_write(UC_X86_REG_EIP,0x6c5090)
+ return True
+
+def bullet_world_admission_transport(m,address,bullet,events):
+ """Supply world admission while retaining original Bullet coordinate fixup.
+
+ Native Unlimbo's prologue saves its ABI state. Admission guards are supplied
+ at5F4ECD; the original5F4F4A..5F4FAE type getter, virtual+6C fixup and
+ SetLocation then execute, including the original+80/+81 admission writes.
+ This corrects the former raw-copy boundary that left the Bullet InLimbo and
+ suppressed its later Conceal/DetachAll cleanup. Post-placement world effects remain the existing
+ supplied boundary, returning through original5F5210. Display calls retain
+ their prior supplied admission. No native coordinate result is computed here.
+ """
+ u=m.u
+ if address==0x5f4ec0:
+  assert u.reg_read(UC_X86_REG_ECX)==bullet
+  assert m.read32(bullet)==0x7e46e4
+  events.append(dict(call=hex(address),supplied_world_admission=True))
+  return True
+ if address in (0x5f4ecd,0x5f4fae) and u.reg_read(UC_X86_REG_ESI)==bullet:
+  u.reg_write(UC_X86_REG_EIP,0x5f4f4a if address==0x5f4ecd else 0x5f5210)
+  return True
+ if address in (0x4a9770,0x4a9720):
+  events.append(dict(call=hex(address),supplied_world_admission=True));m.ret(1,4)
+  return True
+ return False
 
 def prepare():
  m,_,cells,initial=guided.create(False);u=m.u
@@ -59,28 +108,16 @@ def launch(origin=(2688,5248,1030),bridge=True):
   if a in (0x773070,0x46b050,0x6c5090,0x466380,0x410230,0x68bcb0,0x4664c0,0x70bcb0,0x740f80,0x70e140,0x7177c0,0x70d590,0x468670,0x4e1130):visited.add(hex(a))
   if a in (0x65c640,0x65c660,0x65c780,0x65c7e0):raise AssertionError(('unexpected launch RNG',hex(a)))
   if a in (0x7258d0,0x5f65f0,0x466560,0x5f3b80):raise AssertionError(('unexpected launch detach/retirement',hex(a)))
-  if a==0x46b072:
-   sp=u.reg_read(UC_X86_REG_ESP);clsid,outer,context,iid,ppv=struct.unpack('<5I',u.mem_read(sp,20))
-   assert (clsid,outer,context,iid)==(0x7e96e0,0,7,0x7f7c90)
-   events.append(dict(call='CoCreateInstance activation to original registered factory',clsid_hex=bytes(u.mem_read(clsid,16)).hex(),iid_hex=bytes(u.mem_read(iid,16)).hex()))
-   # Native stdcall factory consumes(this,outer,iid,ppv). Reuse the COM arg
-   # stack with explicit native return so resulting ESP equals the COM call.
-   u.mem_write(sp,dwords(0x46b078,0,outer,iid,ppv));u.reg_write(UC_X86_REG_EIP,0x6c5090)
+  if bullet_activation_transport(m,a,events):pass
   elif a==0x46afe5:
    # Verified PE import KERNEL32.InterlockedIncrement. The single-threaded
    # Windows API boundary updates COM refcount only; native Abstract ID remains
    # original410230/68BCB0 and is never assigned by this hook.
-   sp=u.reg_read(UC_X86_REG_ESP);ptr=m.read32(sp);value=(m.read32(ptr)+1)&0xffffffff
-   u.mem_write(ptr,dwords(value));u.reg_write(UC_X86_REG_EAX,value);u.reg_write(UC_X86_REG_ESP,sp+4);u.reg_write(UC_X86_REG_EIP,0x46afeb)
-   events.append(dict(call='KERNEL32.InterlockedIncrement',com_refcount=value))
+   bullet_addref_transport(m,a,events)
   elif a==0x6fe562:bullet.append(u.reg_read(UC_X86_REG_EAX))
   elif a==0x6fe53f:scalars['get_speed']=u.reg_read(UC_X86_REG_EAX)
   elif a==0x6fea52:scalars['launch_amount']=i32(u,SP+0x28)
-  elif a in (0x5f4ec0,0x4a9770,0x4a9720):
-   sp=u.reg_read(UC_X86_REG_ESP)
-   if a==0x5f4ec0:
-    u.mem_write(bullet[0]+0x9c,bytes(u.mem_read(m.read32(sp+4),12)));u.mem_write(bullet[0]+0x90,b'\x01')
-   events.append(dict(call=hex(a),supplied_world_admission=True));m.ret(1,8 if a==0x5f4ec0 else 4)
+  elif bullet_world_admission_transport(m,a,bullet[0] if bullet else 0,events):pass
  h=u.hook_add(UC_HOOK_CODE,observe)
  try:run_checked(u,0x6fe4f2,(0x6ff01a,0x6ff751,0x6ff93c),count=1000000,required_addresses=(0x6c5090,0x466380,0x68bcb0,0x70bcb0,0x740f80,0x468670))
  except Exception:
@@ -88,7 +125,7 @@ def launch(origin=(2688,5248,1030),bridge=True):
  finally:u.hook_del(h)
  assert u.reg_read(UC_X86_REG_EIP)==0x6ff01a,hex(u.reg_read(UC_X86_REG_EIP))
  b=bullet[0]
- result=dict(native_sha256=NATIVE_SHA256,initial=initial,supplied=dict(origin=list(origin),source_heading=0x3fff,source_flags=0,weapon_slot=0,target_cell=[16,20],live_bridge_cell=[10,20] if bridge else None,binary_frame=0),launch=dict(position=xyz(u,b+0x9c),target=target_xyz,velocity=vec(u,b+0xe8),**scalars,maximum_speed=i32(u,b+0x110),pitch=m.read32(SP+0x80)&0xffff,unique_id=i32(u,b+0x10),scenario_id_before=id_before,scenario_id_after=i32(u,scenario+0x214),course_locked=bool(u.mem_read(b+0x105,1)[0]),course_frames=i32(u,b+0x108),detector=dict(first_timer_start=i32(u,b+0xb8),first_timer_duration=i32(u,b+0xc0),arm_start=i32(u,b+0xc4),arm_duration=i32(u,b+0xcc),reference=xyz(u,b+0xd0),distance_watermark=i32(u,b+0xdc)),warhead=m.string(m.read32(b+0x128)+0x24),calls=sorted(visited),supplied_calls=events))
+ result=dict(initial=initial,supplied=dict(origin=list(origin),source_heading=0x3fff,source_flags=0,weapon_slot=0,target_cell=[16,20],live_bridge_cell=[10,20] if bridge else None,binary_frame=0),launch=dict(position=xyz(u,b+0x9c),target=target_xyz,velocity=vec(u,b+0xe8),**scalars,maximum_speed=i32(u,b+0x110),pitch=m.read32(SP+0x80)&0xffff,unique_id=i32(u,b+0x10),scenario_id_before=id_before,scenario_id_after=i32(u,scenario+0x214),course_locked=bool(u.mem_read(b+0x105,1)[0]),course_frames=i32(u,b+0x108),detector=dict(first_timer_start=i32(u,b+0xb8),first_timer_duration=i32(u,b+0xc0),arm_start=i32(u,b+0xc4),arm_duration=i32(u,b+0xcc),reference=xyz(u,b+0xd0),distance_watermark=i32(u,b+0xdc)),warhead=m.string(m.read32(b+0x128)+0x24),calls=sorted(visited),supplied_calls=events))
  return m,b,cells,result
 
 def flight(bridge,origin=(2688,5248,1030),bridge_band=None,changes=()):
@@ -126,7 +163,7 @@ def flight(bridge,origin=(2688,5248,1030),bridge_band=None,changes=()):
 
 def generate():
  band=[(x,20) for x in range(12,16)]
- return dict(native_sha256=NATIVE_SHA256,scope='Physical FV selected empty-Gunner slot and original contiguous FireAt6FE4F2 through native factory/launch, then full Bullet AI and impact resolution to AreaDamage489280 entry; supplied source lifecycle/FLH/placement/Display admission/map cells and flag changes. No AreaDamage effects, native bridge collapse/repair driver or retirement execution.',cases=[flight(True),flight(False),flight(False,origin=(2688,5248,1250),bridge_band=band),flight(False,origin=(2688,5248,1250),bridge_band=band,changes=((16,False),)),flight(False,origin=(2688,5248,1250),bridge_band=band,changes=((16,False),(24,True)))])
+ return dict(scope='Physical FV selected empty-Gunner slot and original contiguous FireAt6FE4F2 through native factory/launch, then full Bullet AI and impact resolution to AreaDamage489280 entry; supplied source lifecycle/FLH/placement/Display admission/map cells and flag changes. No AreaDamage effects, native bridge collapse/repair driver or retirement execution.',cases=[flight(True),flight(False),flight(False,origin=(2688,5248,1250),bridge_band=band),flight(False,origin=(2688,5248,1250),bridge_band=band,changes=((16,False),)),flight(False,origin=(2688,5248,1250),bridge_band=band,changes=((16,False),(24,True)))])
 def metadata():
  out=provenance(scope='Five original FV guided launches and125 full Bullet AI visits through AreaDamage489280 entry',entry_points={'select_weapon':0x6f3330,'set_empty_gunner':0x70dc70,'fireat_launch':0x6fe4f2,'com_factory':0x6c5090,'bullet_ctor':0x466380,'bullet_ai':0x4666e0,'area_damage_entry':0x489280},assumptions=[
   'Physical HoverMissile and AAHeatSeeker2 full type readers and selected partial FV rules fields; source lifecycle, FLH/pose and fixed launch coordinates supplied',

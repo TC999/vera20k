@@ -2,38 +2,85 @@
 //!
 //! This is intentionally separate from `app::loading`: the native GLS splash is
 //! process initialization chrome, not selected-scenario loading presentation.
+//! Any window other than the two sizes gamemd's shell runs at shows it fitted
+//! like the menus, so it lines up with the menu that follows it.
+//!
+//! It also carries VERA20K's own legal notice, which gamemd's splash lacks; see
+//! [`legal_notice`].
 
-use std::time::{Duration, Instant};
+use crate::util::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
+use crate::app::frontend::shell_pass::{TexturedDraw, encode_sprite_pass};
 use crate::assets::asset_manager::AssetManager;
 use crate::assets::csf_file::CsfFile;
-use crate::assets::fnt_file::FntFile;
 use crate::assets::pal_file::Palette;
 use crate::assets::shp_file::ShpFile;
 use crate::render::batch::{BatchRenderer, BatchTexture, SpriteInstance};
+use crate::render::bit_font::BitFont;
 use crate::render::gpu::GpuContext;
 use crate::render::shell_surface_present::ShellSurfacePresenter;
+use crate::render::shell_ui_style_assets::{
+    ShellUiAssetLocator, ShellUiAssetPair, ShellUiAssetResolver, decode_ui_shp, mod_art_candidates,
+    read_client_png,
+};
+use crate::ui::shell::geom::{RectPx, SHELL_BASE_H, SHELL_BASE_W};
 
-// Startup splash art. The `MD` suffix marks the Yuri's Revenge variants
-// (`GLSSMD`/`GLSLMD`/`GLSMD`, in `langmd.mix`); these unsuffixed names are the
-// Red Alert 2 originals, in `ra2.mix -> local.mix`. Both sets exist in a retail
-// install and both are 640x480 / 800x600 single-frame SHPs with a matching
-// palette, so this is a straight substitution.
-//
-// Deliberate presentation choice, not a parity claim -- the project otherwise
-// takes YR over RA2. Restoring the Yuri splash is re-adding the `MD` suffixes.
-//
-// Note the strings drawn over the splash still come from the YR string table,
-// so the trademark line names Yuri's Revenge. Changing that means sourcing the
-// whole UI string table from RA2, which is a much larger change than swapping
-// three asset names.
-const SMALL_SPLASH_SHP: &str = "GLSS.SHP";
-const LARGE_SPLASH_SHP: &str = "GLSL.SHP";
-const SPLASH_PALETTE: &str = "GLS.PAL";
-const MINIMUM_VISIBLE_TIME: Duration = Duration::from_millis(5000);
-const TEXT_COLOR: [u8; 4] = [255, 255, 255, 255];
+use super::shell_layout::window_takes_fitted_shell;
+
+/// One game's startup splash art: its palette, the shape drawn at exactly 640
+/// pixels wide, and the shape drawn at every other width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SplashArt {
+    palette: &'static str,
+    small: &'static str,
+    large: &'static str,
+}
+
+impl SplashArt {
+    fn shape_for_width(self, client_width: u32) -> &'static str {
+        if client_width == 640 {
+            self.small
+        } else {
+            self.large
+        }
+    }
+}
+
+// Native YR 1.11 gamemd.exe, GZF 2026-10-15, VA 0x005312a0
+// (source record D:\ra2mdpost\Init.CPP; called from Init_Game at 0x0052ba60):
+// load GLSMD.PAL, then GLSSMD.SHP at exactly 640 pixels wide or GLSLMD.SHP at
+// every other width. If the optional SHP is unavailable, native still draws
+// its text, presents the surface, and arms the 5-second deadline. The palette
+// gets the shared `raw << 2` conversion (`Palette::from_bytes`) and a
+// ConvertClass, and CC_Draw_Shape SHAPE_NORMAL skips only index 0
+// (`ShpFile::frame_to_rgba`).
+const YR_SPLASH: SplashArt = SplashArt {
+    palette: "GLSMD.PAL",
+    small: "GLSSMD.SHP",
+    large: "GLSLMD.SHP",
+};
+
+/// Default Red Alert 2 splash art: the unsuffixed originals in
+/// `ra2.mix -> local.mix`, the same single-frame 640x480 and 800x600 shapes
+/// with a matching palette, chosen by the same width rule.
+const RA2_SPLASH: SplashArt = SplashArt {
+    palette: "GLS.PAL",
+    small: "GLSS.SHP",
+    large: "GLSL.SHP",
+};
+
+const fn splash_art(yr_original_style: bool) -> SplashArt {
+    if yr_original_style {
+        YR_SPLASH
+    } else {
+        RA2_SPLASH
+    }
+}
+/// How long the splash stays up at least: 6 s, the maintainer's choice.
+const MINIMUM_VISIBLE_TIME: Duration = Duration::from_millis(6000);
+const TEXT_TINT: [f32; 3] = [1.0, 1.0, 1.0];
 
 const COPYRIGHT_KEY: &str = "TXT_COPYRIGHT";
 const COPYRIGHT_FALLBACK: &str = "© 2000, 2001 ELECTRONIC ARTS INC. ALL RIGHTS RESERVED";
@@ -41,12 +88,22 @@ const BRAND_KEY: &str = "GUI:WWBrand";
 const BRAND_FALLBACK: &str = "WESTWOOD STUDIOS\u{99} IS AN ELECTRONIC ARTS\u{99} BRAND";
 const LOADING_KEY: &str = "GUI:LoadingEx";
 const LOADING_FALLBACK: &str = "Loading...";
-const TRADEMARK_TOP_KEY: &str = "GUI:TradeMarkTop";
-const TRADEMARK_TOP_FALLBACK: &str =
-    "Command & Conquer and Yuri's Revenge are trademarks or registered";
-const TRADEMARK_BOTTOM_KEY: &str = "GUI:TradeMarkBottom";
-const TRADEMARK_BOTTOM_FALLBACK: &str =
-    "trademarks of Electronic Arts Inc. in the U.S. and/or other countries.";
+
+/// VERA20K's GPLv3 "Appropriate Legal Notices" (sections 0 and 5(d)): the
+/// copyright, the right to share under the license, no warranty, and where to
+/// read the license and get the source (a release build names its commit;
+/// build.rs), in the language in use. Drawn bottom left. Because the program
+/// shows them, modified versions must keep showing such a notice. The Bink
+/// decoder and the sidebar's xBR scaler, ported from FFmpeg, are under the GPLv3
+/// too, as section 3 of FFmpeg's LGPL 2.1 allows, so FFmpeg's copyright needs no
+/// line of its own here.
+fn legal_notice() -> [String; 3] {
+    [
+        crate::i18n::tr("VERA:LegalCopyright"),
+        crate::i18n::tr("VERA:LegalShare"),
+        crate::i18n::tr_fill("VERA:LegalSource", &[("source", &env!("VERA20K_SOURCE"))]),
+    ]
+}
 
 /// The minimum on-screen hold, anchored at the first successful present.
 ///
@@ -77,8 +134,20 @@ impl VisibleHold {
 
 pub(crate) struct StartupSplashPresentation {
     texture: BatchTexture,
-    instance_buffer: wgpu::Buffer,
+    /// The text, drawn over the art at the window's resolution.
+    lines: Vec<SplashLine>,
+    /// Where the composition sits in the window, and its width there.
+    placement: RectPx,
+    composition_width: u32,
     hold: VisibleHold,
+}
+
+/// One line of splash text with its top-left in composition pixels.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SplashLine {
+    text: String,
+    x: i32,
+    y: i32,
 }
 
 impl StartupSplashPresentation {
@@ -87,43 +156,47 @@ impl StartupSplashPresentation {
         batch: &BatchRenderer,
         assets: &AssetManager,
         csf: Option<&CsfFile>,
-        font: &FntFile,
+        font: &BitFont,
         client_width: u32,
         client_height: u32,
+        yr_original_style: bool,
     ) -> Result<Self> {
         anyhow::ensure!(
             client_width > 0 && client_height > 0,
             "startup splash requires a non-zero client size"
         );
 
-        let rgba = compose_startup_splash(
-            assets,
-            csf,
-            font,
-            client_width as usize,
-            client_height as usize,
-        )?;
-        let texture = batch.create_texture(gpu, &rgba, client_width, client_height);
-        let instance = SpriteInstance {
-            position: [0.0, 0.0],
-            size: [client_width as f32, client_height as f32],
-            uv_origin: [0.0, 0.0],
-            uv_size: [1.0, 1.0],
-            depth: 0.0,
-            tint: [1.0, 1.0, 1.0],
-            alpha: 1.0,
-            ..Default::default()
-        };
-        let (instance_buffer, count) = batch
-            .create_instance_buffer(gpu, &[instance])
-            .context("create startup splash instance buffer")?;
-        debug_assert_eq!(count, 1);
-
+        let ([width, height], placement) = splash_placement(client_width, client_height);
+        let rgba =
+            compose_startup_splash(assets, width as usize, height as usize, yr_original_style)?;
+        let lines = splash_lines(csf, font, width as i32, height as i32);
+        let texture = batch.create_texture(gpu, &rgba, width, height);
         Ok(Self {
             texture,
-            instance_buffer,
+            lines,
+            placement,
+            composition_width: width,
             hold: VisibleHold::default(),
         })
+    }
+
+    /// The text's glyphs at the window's resolution: each line keeps its
+    /// composition position, scaled with the art onto the window.
+    fn text_instances(&self, font: &BitFont) -> Vec<SpriteInstance> {
+        let scale = self.placement.w as f32 / self.composition_width as f32;
+        let mut instances = Vec::new();
+        for line in &self.lines {
+            instances.extend(font.build_text(
+                &line.text,
+                self.placement.x as f32 + line.x as f32 * scale,
+                self.placement.y as f32 + line.y as f32 * scale,
+                scale,
+                0.0,
+                TEXT_TINT,
+                [0.0, 0.0],
+            ));
+        }
+        instances
     }
 
     pub(crate) fn mark_presented(&mut self, now: Instant) {
@@ -135,190 +208,327 @@ impl StartupSplashPresentation {
     }
 }
 
+/// Draw and present the splash, or with `None` the black frame the startup
+/// logo starts from. Returns whether it reached the screen: a surface with no
+/// frame to give this time leaves the hold unarmed for the next redraw.
 pub(crate) fn render_and_present(
     gpu: &GpuContext,
     batch: &BatchRenderer,
     presenter: &ShellSurfacePresenter,
     depth: &wgpu::TextureView,
-    splash: &StartupSplashPresentation,
-) -> Result<()> {
-    batch.update_camera(
-        gpu,
-        gpu.config.width as f32,
-        gpu.config.height as f32,
-        0.0,
-        0.0,
-        1.0,
-        crate::render::batch::DepthAxis::NONE,
-    );
-
-    let output = gpu
-        .surface
-        .get_current_texture()
-        .context("acquire startup splash surface")?;
-    let source_view = presenter.source_render_view();
+    performance_overlay: &crate::app::diagnostics::performance_overlay::PerformanceOverlay,
+    font: &BitFont,
+    splash: Option<&StartupSplashPresentation>,
+) -> Result<bool> {
+    let Some(output) = gpu
+        .acquire_frame()
+        .context("acquire startup splash surface")?
+    else {
+        return Ok(false);
+    };
     let mut encoder = gpu
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Retail Startup Splash"),
         });
-    {
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Retail Startup Splash Composition"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &source_view,
-                resolve_target: None,
-                depth_slice: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                // The shared passthrough batch pipeline declares Depth32Float
-                // even though it compares Always and does not write depth.
-                view: depth,
-                depth_ops: Some(wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(1.0),
-                    store: wgpu::StoreOp::Store,
-                }),
-                stencil_ops: None,
-            }),
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        batch.draw_with_buffer_ui_passthrough(
-            &mut pass,
-            &splash.texture,
-            &splash.instance_buffer,
-            1,
-        );
-    }
+    let draws = splash.map(|splash| {
+        let placement = splash.placement;
+        let art = SpriteInstance {
+            position: [placement.x as f32, placement.y as f32],
+            size: [placement.w as f32, placement.h as f32],
+            uv_size: [1.0, 1.0],
+            tint: [1.0, 1.0, 1.0],
+            alpha: 1.0,
+            ..SpriteInstance::default()
+        };
+        [
+            TexturedDraw {
+                texture: &splash.texture,
+                instances: vec![art],
+            },
+            TexturedDraw {
+                texture: font.atlas(),
+                instances: splash.text_instances(font),
+            },
+        ]
+    });
+    let targets = (&presenter.source_render_view(), depth);
+    let label = "Retail Startup Splash Composition";
+    encode_sprite_pass(
+        gpu,
+        batch,
+        &mut encoder,
+        targets,
+        label,
+        draws.as_ref().map_or(&[], |d| d),
+    );
     presenter.encode_present(&mut encoder, &output.texture);
+    performance_overlay.encode(gpu, batch, &mut encoder, &output.texture, font, None);
+    // The splash presents outside the frame loop, so it uses the shared
+    // frame-output filter too.
+    gpu.encode_color_vision(&mut encoder, &output.texture);
     gpu.queue.submit(std::iter::once(encoder.finish()));
-    output.present();
-    Ok(())
+    output.present(&gpu.queue);
+    Ok(true)
 }
 
+/// The size the splash is composed at and where it sits in the window. The two
+/// windows gamemd's shell runs at keep its 1:1 composition at the window size.
+/// Any other window gets the 800x600 composition scaled the way the menus scale
+/// their page: the largest uniform fit, centred, with the spare width or height
+/// left to the black clear. gamemd itself draws 1:1, centred, at every size.
+fn splash_placement(client_width: u32, client_height: u32) -> ([u32; 2], RectPx) {
+    if window_takes_fitted_shell((client_width, client_height)) {
+        let scale = crate::ui::shell::geom::shell_scale(client_width as i32, client_height as i32);
+        (
+            [SHELL_BASE_W as u32, SHELL_BASE_H as u32],
+            scale.dialog_rect(),
+        )
+    } else {
+        let window = RectPx::new(0, 0, client_width as i32, client_height as i32);
+        ([client_width, client_height], window)
+    }
+}
+
+/// gamemd's splash art for a `client_width` x `client_height` client, centred
+/// 1:1; [`splash_lines`] places its text.
 fn compose_startup_splash(
     assets: &AssetManager,
-    csf: Option<&CsfFile>,
-    font: &FntFile,
     client_width: usize,
     client_height: usize,
+    yr_original_style: bool,
 ) -> Result<Vec<u8>> {
     let mut canvas = vec![0u8; client_width * client_height * 4];
-    for pixel in canvas.chunks_exact_mut(4) {
+    for pixel in canvas.as_chunks_mut::<4>().0 {
         pixel[3] = 255;
     }
-
-    if let (Some(palette_bytes), Some(shp_load)) = (
-        assets.get_ref(SPLASH_PALETTE),
-        assets.load_file_from_mix(splash_shp_for_width(client_width as u32)),
+    if draw_mod_splash(
+        assets,
+        &mut canvas,
+        client_width,
+        client_height,
+        yr_original_style,
     ) {
+        return Ok(canvas);
+    }
+
+    let art = splash_art(yr_original_style);
+    let resolver = ShellUiAssetResolver::new(assets, yr_original_style);
+    let shape_name = art.shape_for_width(client_width as u32);
+    let palette_result = resolver.resolve(splash_asset_pair(art.palette));
+    let shape_result = resolver.resolve(splash_asset_pair(shape_name));
+    if let (Ok(palette_asset), Ok(shape_asset)) = (&palette_result, &shape_result) {
         match (
-            Palette::from_bytes_gamemd_ui(palette_bytes),
-            ShpFile::from_bytes(&shp_load.bytes),
+            Palette::from_bytes(palette_asset.bytes),
+            ShpFile::from_bytes(shape_asset.bytes),
         ) {
             (Ok(palette), Ok(shp)) => {
-                if let Some(frame) = shp.frames.first() {
-                    let frame_rgba = shp
-                        .frame_to_rgba_ui(0, &palette)
-                        .context("decode startup splash SHP frame 0")?;
-                    let origin_x = centered_offset(client_width as i32, shp.width as i32)
-                        + frame.frame_x as i32;
-                    let origin_y = centered_offset(client_height as i32, shp.height as i32)
-                        + frame.frame_y as i32;
-                    blit_rgba_clipped(
-                        &mut canvas,
-                        client_width,
-                        client_height,
-                        &frame_rgba,
-                        frame.frame_width as usize,
-                        frame.frame_height as usize,
-                        origin_x,
-                        origin_y,
-                    );
-                }
+                paint_splash_shape(&mut canvas, client_width, client_height, &shp, &palette)
+                    .context("decode startup splash SHP frame 0")?
             }
-            (Err(err), _) => log::warn!("Could not parse {SPLASH_PALETTE}: {err}"),
+            (Err(err), _) => log::warn!("Could not parse {}: {err}", art.palette),
             (_, Err(err)) => log::warn!(
                 "Could not parse {}: {err}",
-                splash_shp_for_width(client_width as u32)
+                art.shape_for_width(client_width as u32)
             ),
         }
     } else {
-        log::warn!(
-            "Retail startup splash art unavailable (palette={}, shp={}); drawing text over black",
-            SPLASH_PALETTE,
-            splash_shp_for_width(client_width as u32)
-        );
+        if let Err(err) = palette_result {
+            log::warn!(
+                "Retail startup splash palette {} unavailable: {err:#}",
+                art.palette
+            );
+        }
+        if let Err(err) = shape_result {
+            log::warn!("Retail startup splash shape {shape_name} unavailable: {err:#}");
+        }
+        log::warn!("Drawing startup splash text over black without its art");
     }
-
-    let copyright = csf_text(csf, COPYRIGHT_KEY, COPYRIGHT_FALLBACK);
-    let brand = csf_text(csf, BRAND_KEY, BRAND_FALLBACK);
-    let loading = csf_text(csf, LOADING_KEY, LOADING_FALLBACK);
-    let trademark_top = csf_text(csf, TRADEMARK_TOP_KEY, TRADEMARK_TOP_FALLBACK);
-    let trademark_bottom = csf_text(csf, TRADEMARK_BOTTOM_KEY, TRADEMARK_BOTTOM_FALLBACK);
-
-    let first_bottom_y = client_height as i32 - 40;
-    let second_bottom_y = first_bottom_y + 3 + font.cell_height as i32;
-
-    draw_text(
-        &mut canvas,
-        client_width,
-        client_height,
-        font,
-        &copyright,
-        client_width as i32 - font.text_width(&copyright) as i32 - 10,
-        first_bottom_y,
-    );
-    draw_text(
-        &mut canvas,
-        client_width,
-        client_height,
-        font,
-        &brand,
-        client_width as i32 - font.text_width(&brand) as i32 - 10,
-        second_bottom_y,
-    );
-    draw_text(
-        &mut canvas,
-        client_width,
-        client_height,
-        font,
-        &loading,
-        10,
-        10,
-    );
-    draw_text(
-        &mut canvas,
-        client_width,
-        client_height,
-        font,
-        &trademark_top,
-        10,
-        first_bottom_y,
-    );
-    draw_text(
-        &mut canvas,
-        client_width,
-        client_height,
-        font,
-        &trademark_bottom,
-        10,
-        second_bottom_y,
-    );
 
     Ok(canvas)
 }
 
-fn splash_shp_for_width(client_width: u32) -> &'static str {
-    if client_width == 640 {
-        SMALL_SPLASH_SHP
-    } else {
-        LARGE_SPLASH_SHP
+fn splash_asset_pair(name: &str) -> ShellUiAssetPair<'_> {
+    ShellUiAssetPair::new(
+        ShellUiAssetLocator::archive(name, "ra2.mix -> local.mix"),
+        ShellUiAssetLocator::active(name),
+    )
+}
+
+fn paint_splash_shape(
+    canvas: &mut [u8],
+    width: usize,
+    height: usize,
+    shp: &ShpFile,
+    palette: &Palette,
+) -> Result<(), crate::assets::error::AssetError> {
+    if let Some(frame) = shp.frames.first() {
+        blit_rgba_clipped(
+            canvas,
+            width,
+            height,
+            &shp.frame_to_rgba(0, palette)?,
+            frame.frame_width as usize,
+            frame.frame_height as usize,
+            centered_offset(width as i32, shp.width as i32) + i32::from(frame.frame_x),
+            centered_offset(height as i32, shp.height as i32) + i32::from(frame.frame_y),
+        );
     }
+    Ok(())
+}
+
+fn draw_mod_splash(
+    assets: &AssetManager,
+    canvas: &mut [u8],
+    width: usize,
+    height: usize,
+    yr_style: bool,
+) -> bool {
+    if !assets.mod_selected() {
+        return false;
+    }
+    if let Some(path) = assets
+        .client_install()
+        .and_then(|client| client.theme.startup_splash.as_deref())
+        && let Some(image) = read_client_png(path)
+    {
+        paint_fitted_splash(canvas, width, height, image);
+        log::info!("Startup splash uses client artwork {}", path.display());
+        return true;
+    }
+
+    // VERA's fallback style matters when both variants are shipped. Each
+    // SHP always takes the palette of its own native family.
+    for art in [splash_art(yr_style), splash_art(!yr_style)] {
+        let base = ShellUiAssetResolver::new(assets, art == YR_SPLASH);
+        let mod_palette = mod_art_candidates(assets, art.palette).find_map(|asset| {
+            Palette::from_bytes(asset.bytes)
+                .ok()
+                .map(|palette| (palette, asset.source))
+        });
+        let names = if width == 640 {
+            [art.small, art.large]
+        } else {
+            [art.large, art.small]
+        };
+        let decode = |asset: crate::render::shell_ui_style_assets::ShellUiAssetRef<'_>| {
+            let shape = decode_ui_shp(asset.bytes).ok()?;
+            if shape.width == 0 || shape.height == 0 || shape.frames.first()?.pixels.is_empty() {
+                return None;
+            }
+            Some(shape)
+        };
+        let mod_shape = names.into_iter().find_map(|name| {
+            mod_art_candidates(assets, name)
+                .find_map(|asset| decode(asset).map(|shape| (shape, asset.source)))
+        });
+        if mod_palette.is_none() && mod_shape.is_none() {
+            continue;
+        }
+        let palette = mod_palette.or_else(|| {
+            let asset = base.resolve(splash_asset_pair(art.palette)).ok()?;
+            Palette::from_bytes(asset.bytes)
+                .ok()
+                .map(|palette| (palette, asset.source))
+        });
+        let shape = mod_shape.or_else(|| {
+            let asset = base.resolve(splash_asset_pair(names[0])).ok()?;
+            decode(asset).map(|shape| (shape, asset.source))
+        });
+        if let (Some((palette, colors)), Some((shape, source))) = (palette, shape) {
+            // Fit a larger alternate slot without losing its logo or author offsets.
+            let (wide, high) = (u32::from(shape.width), u32::from(shape.height));
+            let mut layer = image::RgbaImage::new(wide, high);
+            if paint_splash_shape(&mut layer, wide as usize, high as usize, &shape, &palette)
+                .is_ok()
+            {
+                paint_fitted_splash(canvas, width, height, layer);
+                log::info!("Startup splash uses {source} with palette from {colors}");
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn paint_fitted_splash(canvas: &mut [u8], width: usize, height: usize, image: image::RgbaImage) {
+    let fit =
+        (width as f64 / f64::from(image.width())).min(height as f64 / f64::from(image.height()));
+    let image = if fit < 1.0 {
+        image::imageops::resize(
+            &image,
+            (f64::from(image.width()) * fit).round().max(1.0) as u32,
+            (f64::from(image.height()) * fit).round().max(1.0) as u32,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        image
+    };
+    blit_rgba_clipped(
+        canvas,
+        width,
+        height,
+        image.as_raw(),
+        image.width() as usize,
+        image.height() as usize,
+        centered_offset(width as i32, image.width() as i32),
+        centered_offset(height as i32, image.height() as i32),
+    );
+}
+
+/// gamemd's splash text (0x005312a0) for a `client_width` x `client_height`
+/// composition, anchored to its corners: the copyright and brand bottom right
+/// and "Loading..." top left. gamemd also draws its trademark lines
+/// (`GUI:TradeMarkTop`, `GUI:TradeMarkBottom`) bottom left; VERA leaves them
+/// out, the maintainer's choice, and puts VERA20K's notice there instead. It
+/// ends on the brand's row and moves up a row at a time while one of its lines
+/// would come within 10 px of EA's line on its row, as long translations and
+/// the 640x480 composition do.
+fn splash_lines(
+    csf: Option<&CsfFile>,
+    font: &BitFont,
+    client_width: i32,
+    client_height: i32,
+) -> Vec<SplashLine> {
+    let copyright = csf_text(csf, COPYRIGHT_KEY, COPYRIGHT_FALLBACK);
+    let brand = csf_text(csf, BRAND_KEY, BRAND_FALLBACK);
+    let loading = csf_text(csf, LOADING_KEY, LOADING_FALLBACK);
+
+    let row = 3 + font.cell_height as i32;
+    let first_bottom_y = client_height - 40;
+    let second_bottom_y = first_bottom_y + row;
+    let width = |text: &str| font.text_width(text) as i32;
+    let right = |text: &str| client_width - width(text) - 10;
+    let line = |text: &str, x: i32, y: i32| SplashLine {
+        text: text.to_owned(),
+        x,
+        y,
+    };
+
+    let ea_lines = [
+        line(&copyright, right(&copyright), first_bottom_y),
+        line(&brand, right(&brand), second_bottom_y),
+    ];
+    let notices = legal_notice();
+    let clear_of_ea_lines = |top: i32| {
+        notices.iter().enumerate().all(|(index, notice)| {
+            let y = top + index as i32 * row;
+            ea_lines
+                .iter()
+                .all(|ea| ea.y != y || 10 + width(notice) + 10 <= ea.x)
+        })
+    };
+    let mut top = second_bottom_y - (notices.len() as i32 - 1) * row;
+    while !clear_of_ea_lines(top) {
+        top -= row;
+    }
+
+    let mut lines = Vec::from(ea_lines);
+    lines.push(line(&loading, 10, 10));
+    for (index, notice) in notices.iter().enumerate() {
+        lines.push(line(notice, 10, top + index as i32 * row));
+    }
+    lines
 }
 
 fn centered_offset(client_extent: i32, art_extent: i32) -> i32 {
@@ -332,7 +542,6 @@ fn csf_text<'a>(csf: Option<&'a CsfFile>, key: &str, fallback: &'a str) -> Strin
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn blit_rgba_clipped(
     destination: &mut [u8],
     destination_width: usize,
@@ -366,64 +575,202 @@ fn blit_rgba_clipped(
     }
 }
 
-fn draw_text(
-    canvas: &mut [u8],
-    canvas_width: usize,
-    canvas_height: usize,
-    font: &FntFile,
-    text: &str,
-    x: i32,
-    y: i32,
-) {
-    let mut cursor_x = x;
-    for ch in text.chars() {
-        let codepoint = ch as u32;
-        if codepoint > u16::MAX as u32 {
-            continue;
-        }
-        let Some(glyph) = font.glyph(codepoint as u16) else {
-            continue;
-        };
-        for glyph_y in 0..font.bitmap_rows as usize {
-            let target_y = y + glyph_y as i32;
-            if !(0..canvas_height as i32).contains(&target_y) {
-                continue;
-            }
-            for glyph_x in 0..glyph.width as usize {
-                let target_x = cursor_x + glyph_x as i32;
-                if !(0..canvas_width as i32).contains(&target_x) {
-                    continue;
-                }
-                let glyph_offset = (glyph_y * glyph.width as usize + glyph_x) * 4;
-                if glyph.rgba.get(glyph_offset + 3).copied().unwrap_or(0) == 0 {
-                    continue;
-                }
-                let canvas_offset = (target_y as usize * canvas_width + target_x as usize) * 4;
-                canvas[canvas_offset..canvas_offset + 4].copy_from_slice(&TEXT_COLOR);
-            }
-        }
-        cursor_x += glyph.width as i32 + 1;
-    }
-}
-
-#[cfg(test)]
+#[cfg(all(test, tests_app_frontend))]
 mod tests {
     use super::*;
+    use crate::assets::asset_manager::MediaArchiveMode;
 
-    fn initialized_empty_csf() -> CsfFile {
-        let mut bytes = Vec::new();
-        for value in [0x4353_4620_u32, 3, 1, 1, 0, 0] {
-            bytes.extend_from_slice(&value.to_le_bytes());
+    #[test]
+    fn supplied_splash_uses_its_own_palette_in_either_style() {
+        use crate::assets::asset_manager::test_support::{TestDirectory, audio_test_install};
+
+        let install = audio_test_install("startup-splash-retail");
+        let mod_dir = TestDirectory::new("startup-splash-mod");
+        let mut shape = [0u8; 33];
+        for offset in [2, 4, 6, 12, 14] {
+            shape[offset] = 1;
         }
-        CsfFile::from_bytes(&bytes).expect("valid initialized CSF header")
+        shape[28] = 32;
+        shape[32] = 1;
+        let mut palette = [0u8; 768];
+        palette[3..6].copy_from_slice(&[63, 0, 63]);
+        mod_dir.write_mix("expandmd98.mix", YR_SPLASH.large, &shape);
+        mod_dir.write_mix("expandmd97.mix", YR_SPLASH.palette, &palette);
+        std::fs::write(mod_dir.path().join(YR_SPLASH.large), b"invalid shape").unwrap();
+        let assets = AssetManager::with_mod(
+            install.path(),
+            Some(mod_dir.path()),
+            MediaArchiveMode::STOCK_DIGITAL,
+        )
+        .unwrap();
+        for yr_style in [false, true] {
+            let canvas = compose_startup_splash(&assets, 800, 600, yr_style).unwrap();
+            let center = (299 * 800 + 399) * 4;
+            assert_eq!(&canvas[center..center + 4], &[252, 0, 252, 255]);
+        }
+    }
+
+    /// VERA20K's notice fills the bottom left down to the brand's row in place
+    /// of gamemd's trademark lines; "Loading..." stays top left.
+    #[test]
+    fn legal_notice_fills_the_bottom_left_down_to_the_brands_row() {
+        let font = crate::render::bit_font::tests::make_test_font(&[], 4);
+        let lines = splash_lines(None, &font, 800, 600);
+        let mut left: Vec<_> = lines
+            .iter()
+            .filter(|line| line.x == 10)
+            .map(|line| (line.text.as_str(), line.y))
+            .collect();
+        left.sort_by_key(|&(_, y)| y);
+
+        let [copyright, share, source] = legal_notice();
+        assert_eq!(
+            left,
+            [
+                (LOADING_FALLBACK, 10),
+                (copyright.as_str(), 540),
+                (share.as_str(), 560),
+                (source.as_str(), 580),
+            ]
+        );
+    }
+
+    /// At 640x480 the share line would run into EA's copyright on its row, so
+    /// the notice moves up until each of its lines keeps 10 px clear of EA's.
+    #[test]
+    fn legal_notice_moves_up_rather_than_run_into_eas_lines() {
+        let font = crate::render::bit_font::tests::make_test_font(&[], 4);
+        let lines = splash_lines(None, &font, 640, 480);
+        let find = |text: &str| lines.iter().find(|line| line.text == text).expect(text);
+
+        let ea_copyright = find(COPYRIGHT_FALLBACK);
+        let [_, share, _] = legal_notice();
+        assert!(find(&share).y < ea_copyright.y);
+        for ea in [ea_copyright, find(BRAND_FALLBACK)] {
+            for notice in lines.iter().filter(|line| line.x == 10 && line.y == ea.y) {
+                let end = notice.x + font.text_width(&notice.text) as i32;
+                assert!(end + 10 <= ea.x, "{} runs into {}", notice.text, ea.text);
+            }
+        }
+    }
+
+    fn compare_composed_splash_to_retail_shape(
+        assets: &AssetManager,
+        art: SplashArt,
+        width: usize,
+        height: usize,
+    ) {
+        let shape_name = art.shape_for_width(width as u32);
+        let yr_original_style = art.palette == YR_SPLASH.palette;
+        let resolver = ShellUiAssetResolver::new(assets, yr_original_style);
+        let palette = Palette::from_bytes(
+            resolver
+                .resolve(ShellUiAssetPair::new(
+                    ShellUiAssetLocator::archive(art.palette, "ra2.mix -> local.mix"),
+                    ShellUiAssetLocator::active(art.palette),
+                ))
+                .expect("retail splash palette")
+                .bytes,
+        )
+        .expect("parse retail splash palette");
+        let shape = ShpFile::from_bytes(
+            resolver
+                .resolve(ShellUiAssetPair::new(
+                    ShellUiAssetLocator::archive(shape_name, "ra2.mix -> local.mix"),
+                    ShellUiAssetLocator::active(shape_name),
+                ))
+                .expect("retail splash shape")
+                .bytes,
+        )
+        .expect("parse retail splash shape");
+        let frame = shape.frames.first().expect("splash frame 0");
+        let frame_rgba = shape
+            .frame_to_rgba(0, &palette)
+            .expect("decode retail splash frame 0");
+        let composed = compose_startup_splash(assets, width, height, yr_original_style)
+            .expect("compose production startup splash");
+
+        let origin_x = centered_offset(width as i32, shape.width as i32) + frame.frame_x as i32;
+        let origin_y = centered_offset(height as i32, shape.height as i32) + frame.frame_y as i32;
+        let mut compared = 0;
+        for y in 80..height.saturating_sub(60) {
+            for x in width / 8..width * 7 / 8 {
+                let source_x = x as i32 - origin_x;
+                let source_y = y as i32 - origin_y;
+                if !(0..frame.frame_width as i32).contains(&source_x)
+                    || !(0..frame.frame_height as i32).contains(&source_y)
+                {
+                    continue;
+                }
+                let source_offset =
+                    (source_y as usize * frame.frame_width as usize + source_x as usize) * 4;
+                if frame_rgba[source_offset + 3] == 0 {
+                    continue;
+                }
+                let destination_offset = (y * width + x) * 4;
+                assert_eq!(
+                    &composed[destination_offset..destination_offset + 4],
+                    &frame_rgba[source_offset..source_offset + 4],
+                    "{shape_name} pixel at ({x}, {y}) differs from production composition"
+                );
+                compared += 1;
+            }
+        }
+        assert!(
+            compared > 10_000,
+            "comparison covered only {compared} pixels"
+        );
     }
 
     #[test]
     fn exact_640_selects_small_every_other_width_selects_large() {
-        assert_eq!(splash_shp_for_width(640), SMALL_SPLASH_SHP);
-        assert_eq!(splash_shp_for_width(639), LARGE_SPLASH_SHP);
-        assert_eq!(splash_shp_for_width(800), LARGE_SPLASH_SHP);
-        assert_eq!(splash_shp_for_width(1920), LARGE_SPLASH_SHP);
+        for yr_original_style in [false, true] {
+            let art = splash_art(yr_original_style);
+            assert_eq!(art.shape_for_width(640), art.small);
+            assert_eq!(art.shape_for_width(639), art.large);
+            assert_eq!(art.shape_for_width(800), art.large);
+            assert_eq!(art.shape_for_width(1920), art.large);
+        }
+        // The unchecked default uses RA2's unsuffixed artwork; the option selects YR.
+        assert_eq!(splash_art(false).large, "GLSL.SHP");
+        assert_eq!(splash_art(true).large, "GLSLMD.SHP");
+    }
+
+    #[test]
+    fn fitted_windows_scale_the_800x600_splash_onto_the_menu_page() {
+        // The two windows gamemd's shell runs at keep its 1:1 composition.
+        for (width, height) in [(800, 600), (640, 480)] {
+            assert_eq!(
+                splash_placement(width, height),
+                (
+                    [width, height],
+                    RectPx::new(0, 0, width as i32, height as i32)
+                )
+            );
+        }
+        // Any other window scales the 800x600 composition to the largest
+        // centred fit, with black bars on the spare sides.
+        assert_eq!(
+            splash_placement(1920, 1080),
+            ([800, 600], RectPx::new(240, 0, 1440, 1080))
+        );
+        assert_eq!(
+            splash_placement(1280, 1024),
+            ([800, 600], RectPx::new(0, 32, 1280, 960))
+        );
+        // That is where the fitted main menu puts its page, so the menu that
+        // follows the splash lines up with it.
+        for (width, height) in [(1920, 1080), (1024, 768), (3024, 1964), (640, 400)] {
+            let menu = crate::ui::shell::geom::fit_window(
+                width,
+                height,
+                crate::ui::main_menu_shell::compute_layout,
+            );
+            assert_eq!(
+                splash_placement(width, height),
+                ([800, 600], menu.scale.dialog_rect())
+            );
+        }
     }
 
     #[test]
@@ -436,19 +783,6 @@ mod tests {
     }
 
     #[test]
-    fn initialized_csf_exposes_missing_label_instead_of_english_fallback() {
-        let csf = initialized_empty_csf();
-        assert_eq!(
-            csf_text(Some(&csf), COPYRIGHT_KEY, COPYRIGHT_FALLBACK),
-            format!("MISSING:'{COPYRIGHT_KEY}'")
-        );
-        assert_eq!(
-            csf_text(None, COPYRIGHT_KEY, COPYRIGHT_FALLBACK),
-            COPYRIGHT_FALLBACK
-        );
-    }
-
-    #[test]
     fn clipped_blit_preserves_black_border_and_skips_transparent_pixels() {
         let mut destination = vec![0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255];
         let source = vec![
@@ -457,6 +791,33 @@ mod tests {
         blit_rgba_clipped(&mut destination, 2, 2, &source, 2, 2, -1, 0);
         assert_eq!(&destination[0..4], &[0, 0, 0, 255]);
         assert_eq!(&destination[8..12], &[100, 110, 120, 255]);
+    }
+
+    #[test]
+    #[ignore = "requires RA2_DIR with installed retail RA2/YR assets"]
+    fn retail_composition_draws_both_looks_and_leaves_missing_small_art_black() {
+        use crate::assets::asset_manager::AssetManager;
+
+        let retail_dir = std::path::PathBuf::from(
+            std::env::var_os("RA2_DIR").expect("set RA2_DIR to the retail RA2/YR install"),
+        );
+        let assets = AssetManager::new(&retail_dir, MediaArchiveMode::STOCK_DIGITAL)
+            .expect("load retail RA2/YR assets");
+
+        compare_composed_splash_to_retail_shape(&assets, YR_SPLASH, 800, 600);
+        // The unchecked default draws RA2's unsuffixed originals the same way.
+        compare_composed_splash_to_retail_shape(&assets, RA2_SPLASH, 800, 600);
+
+        let small_art_available = assets.get_ref(YR_SPLASH.small).is_some();
+        // Without the small art the text still draws, over black.
+        if !small_art_available {
+            let composed = compose_startup_splash(&assets, 640, 480, true)
+                .expect("compose missing-small-art splash");
+            let center = (240 * 640 + 320) * 4;
+            assert_eq!(&composed[center..center + 4], &[0, 0, 0, 255]);
+        } else {
+            compare_composed_splash_to_retail_shape(&assets, YR_SPLASH, 640, 480);
+        }
     }
 
     #[test]
@@ -476,7 +837,7 @@ mod tests {
         assert!(hold.is_active(start));
         assert!(hold.is_active(start + MINIMUM_VISIBLE_TIME - Duration::from_millis(1)));
         // The hold is measured from the present, so initialization work that
-        // runs after it is spent inside the five seconds, not added to them.
+        // runs after it is spent inside the hold, not added to it.
         assert!(!hold.is_active(start + MINIMUM_VISIBLE_TIME));
         assert!(!hold.is_active(start + MINIMUM_VISIBLE_TIME + Duration::from_secs(1)));
     }

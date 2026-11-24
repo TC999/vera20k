@@ -8,7 +8,6 @@ fn tube_hierarchy_restore_prepares_detached_dummy_then_publishes_terminal_fields
         ZonePrecheckExclusions, ZonePrecheckOutcome, zone_precheck_flat,
     };
     let rules = load_fixture_rules();
-    let registry = OverlayTypeRegistry::empty();
     let cells = (0..32)
         .flat_map(|y| {
             (0..32).map(move |x| {
@@ -20,8 +19,8 @@ fn tube_hierarchy_restore_prepares_detached_dummy_then_publishes_terminal_fields
                     c.zone_type = crate::map::resolved_terrain::zone_class::OUTSIDE;
                 }
                 if [(1, 16), (2, 16), (3, 16)].contains(&(x, y)) {
-                    c.yr_cell_land_type = 10;
-                    c.base_yr_cell_land_type = 10;
+                    c.land_type = 10;
+                    c.base_land_type = 10;
                 }
                 c
             })
@@ -60,16 +59,15 @@ fn tube_hierarchy_restore_prepares_detached_dummy_then_publishes_terminal_fields
     assert_eq!(bridges.endpoint_records().len(), 1);
     let make_sim = || {
         let mut sim = load_fixture_simulation(false);
-        sim.overlay_grid = Some(OverlayGrid::new(32, 32));
+        *sim.overlay_grid_mut_for_test() = Some(OverlayGrid::new(32, 32));
         sim.install_resolved_terrain_for_new_map(template.clone());
-        sim.bridge_state = Some(bridges.clone());
+        *sim.bridge_state_mut_for_test() = Some(bridges.clone());
         assert!(sim.rebuild_dynamic_navigation(&rules));
         sim
     };
     let connected = |sim: &Simulation| {
         let h = sim
-            .zone_grid
-            .as_ref()
+            .zone_grid()
             .unwrap()
             .hierarchy_for(MovementZone::Normal)
             .unwrap();
@@ -80,8 +78,10 @@ fn tube_hierarchy_restore_prepares_detached_dummy_then_publishes_terminal_fields
                 l.zone_at(2, 16),
                 l.zone_at(24, 16),
                 MovementZone::Normal,
-                &ZonePrecheckExclusions::default()
-            ),
+                &ZonePrecheckExclusions::default(),
+                None,
+            )
+            .unwrap(),
             ZonePrecheckOutcome::Passed(_)
         )
     };
@@ -102,33 +102,42 @@ fn tube_hierarchy_restore_prepares_detached_dummy_then_publishes_terminal_fields
         current.state_hash(),
     );
     let mut failing = make_sim();
-    let id = failing.allocate_stable_id();
-    let mut entity =
-        crate::sim::game_entity::GameEntity::test_default(id, "MISSING", "AMERICANS", 5, 16);
-    entity.type_ref = failing.interner.intern("MISSING");
-    entity.owner = failing.interner.intern("AMERICANS");
-    entity.move_sound_active = true;
-    failing.substrate.entities.insert(entity);
+    // A malformed presentation owner fails after map/hierarchy preparation.
+    // FootLoad now correctly resets transient audio state, so it cannot be
+    // used as a fabricated late sound-identity failure.
+    let missing_owner = failing.intern("MISSING");
+    let sidebar = crate::sim::snapshot::SavedSidebarOrder::new(
+        missing_owner,
+        std::array::from_fn(|_| Vec::new()),
+    );
+    let failing_bytes = GameSnapshot::save_validated_with_presentation(
+        &failing,
+        LOAD_FIXTURE_MAP_HASH,
+        rules.simulation_config_hash(),
+        "late restore failure",
+        0,
+        &[],
+        &[],
+        Some(&sidebar),
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     // The independent fixture shares the immutable template's dummy; restore
     // the live witness after fixture setup, before testing the transaction.
     live.set_level_slope(-7, 11);
     live.stamp_coord(123, 456);
     live.write_overlay_identity_state(29, 33);
     let failure = PreparedLoad::prepare_candidate(
-        &snapshot_bytes(&failing, &rules),
+        &failing_bytes,
         Some(&current),
         Some(LOAD_FIXTURE_MAP_HASH),
         Some(&rules),
         Some(&template),
-        Some(&registry),
     );
     assert!(
-        matches!(
-            failure,
-            Err(PreparedLoadError::Restore(
-                crate::sim::snapshot::SnapshotRestoreError::ActiveMoveSoundUnresolvable { .. }
-            ))
-        ),
+        matches!(failure, Err(PreparedLoadError::SidebarOrder(_))),
         "must fail after map/hierarchy preparation"
     );
     assert_eq!(
@@ -147,7 +156,6 @@ fn tube_hierarchy_restore_prepares_detached_dummy_then_publishes_terminal_fields
         Some(LOAD_FIXTURE_MAP_HASH),
         Some(&rules),
         Some(&template),
-        Some(&registry),
     )
     .unwrap();
     assert!(
@@ -177,8 +185,5 @@ fn tube_hierarchy_restore_prepares_detached_dummy_then_publishes_terminal_fields
     assert_eq!((live.snapshot(), live.overlay_identity_state()), expected);
     assert_eq!(live.raw_tube_index(), -1);
     assert!(!connected(&runtime.simulation));
-    assert_eq!(
-        runtime.simulation.substrate.base_reservations.dummy_mask(),
-        0
-    );
+    assert_eq!(runtime.simulation.base_reservations().dummy_mask(), 0);
 }

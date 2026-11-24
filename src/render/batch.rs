@@ -2,7 +2,7 @@
 //!
 //! One draw call renders hundreds of sprites, each with its own screen position,
 //! size, and UV coordinates. Essential for terrain tiles (hundreds per viewport).
-//! Bind group 0 = camera uniform (screen size + scroll offset), bind group 1 = texture.
+//! Bind group 0 = camera plus shared tactical A source, bind group 1 = texture.
 //! Instance buffer provides per-sprite data as vertex attributes (step_mode = Instance).
 //!
 //! ## Dependency rules
@@ -14,44 +14,29 @@ use wgpu::util::DeviceExt;
 
 use crate::render::draw_state::DrawState;
 use crate::render::gpu::GpuContext;
+use crate::render::surface_line::SurfaceStroke;
 
 /// WGSL shader for instanced sprite rendering (loaded from batch_shader.wgsl).
 ///
 /// Vertex shader: generates quad from vertex_index, applies per-instance position/size,
 /// and transforms screen-space pixel coordinates to clip space using the camera uniform.
 /// Fragment shader: samples the sprite texture with per-instance UV coordinates.
-const BATCH_SHADER: &str = include_str!("batch_shader.wgsl");
-
-/// Type-16 SpotlightClass zero-blend shader.
-const BUILDING_LIGHT_SHADER: &str = include_str!("building_light.wgsl");
-
-/// `Dst * (mask / 256) + Dst`, preserving destination alpha.
-/// This is destination-dependent fixed-function blending, not alpha blending.
-pub const SPOTLIGHT_ZERO_BLEND: wgpu::BlendState = wgpu::BlendState {
-    color: wgpu::BlendComponent {
-        src_factor: wgpu::BlendFactor::Dst,
-        dst_factor: wgpu::BlendFactor::One,
-        operation: wgpu::BlendOperation::Add,
-    },
-    alpha: wgpu::BlendComponent {
-        src_factor: wgpu::BlendFactor::Zero,
-        dst_factor: wgpu::BlendFactor::One,
-        operation: wgpu::BlendOperation::Add,
-    },
-};
+pub(crate) const BATCH_SHADER: &str = include_str!("batch_shader.wgsl");
 
 /// WGSL shader with per-pixel Z-depth output via @builtin(frag_depth).
 /// Samples a parallel R8 depth atlas to compute per-pixel terrain depth.
-const ZDEPTH_SHADER: &str = include_str!("zdepth_shader.wgsl");
+pub(crate) const ZDEPTH_SHADER: &str = include_str!("zdepth_shader.wgsl");
 
 /// WGSL per-pixel Z-tested SHP shader: native row Z from the gradient table,
 /// optional BUILDNGZ z-shape subtraction, `frag_depth` on the shared axis.
-const ZSPRITE_SHADER: &str = include_str!("zsprite_shader.wgsl");
+pub(crate) const ZSPRITE_SHADER: &str = include_str!("zsprite_shader.wgsl");
+/// The per-pixel shadow counts of a depth-tested edit interval.
+pub(crate) const SHADOW_COUNT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 
 /// WGSL voxel-sprite shader: byte → (palette | house_ramp) → fx pipeline.
 /// Atlas is R8Uint (palette indices); palette + per-house RGB ramp are
 /// sampled via PaletteSet (bind group 2).
-const VOXEL_SPRITE_SHADER: &str = include_str!("sprite_voxel_shader.wgsl");
+pub(crate) const VOXEL_SPRITE_SHADER: &str = include_str!("sprite_voxel_shader.wgsl");
 
 /// Per-sprite instance data uploaded to the GPU each frame.
 ///
@@ -89,134 +74,99 @@ pub struct SpriteInstance {
     pub z_adjust: f32,
     /// Gradient entry (bits 0-7, `native_z::ZGradient`) plus
     /// `native_z::Z_GRADIENT_ZSHAPE_FLAG` when the fragment shader must
-    /// subtract the BUILDNGZ z-shape at `zshape_origin`.
+    /// subtract an optional depth shape at `zshape_origin`. Linear overlay
+    /// shapes also pack their channel/stride; see `pack_overlay_z_gradient`.
     pub z_gradient: u32,
-    /// World-pixel origin of the z-shape canvas (`native_z::zshape_origin`).
+    /// World-pixel origin of the z-shape canvas (`native_z::zshape_origin`),
+    /// or raw overlay origin adjusted for the frame's encoded file offset.
     pub zshape_origin: [f32; 2],
     /// Selected native palette conversion; default preserves precomposed RGBA.
     pub palette_light: crate::render::palette_light::PaletteLight,
+    /// For a palette-indexed SHP atlas page, the palette row its indices
+    /// resolve through, plus one (`ShpSpriteEntry::source_palette`); 0 samples
+    /// an RGBA page. Voxel pages use 0 for the theater/house palette and
+    /// 1 for the native global UNITSNO palette, bypassing house substitution.
+    pub source_palette: u32,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::SPOTLIGHT_ZERO_BLEND;
+/// Number of vertex attributes in SpriteInstance: 7 base, 4 DrawState fields,
+/// 3 native-Z fields (z_adjust, z_gradient, zshape_origin / voxel z_rect), the
+/// PaletteLight and the source palette row: the WebGPU default limit of 16.
+/// A shader that also takes `vertex_index` declares at most 15 of them, or the
+/// WebGL2 fallback cannot link it.
+const INSTANCE_ATTRIBUTE_COUNT: usize = 16;
 
-    #[test]
-    fn spotlight_pipeline_uses_destination_factor_not_alpha() {
-        assert_eq!(
-            SPOTLIGHT_ZERO_BLEND.color.src_factor,
-            wgpu::BlendFactor::Dst
-        );
-        assert_eq!(
-            SPOTLIGHT_ZERO_BLEND.color.dst_factor,
-            wgpu::BlendFactor::One
-        );
-        assert_eq!(
-            SPOTLIGHT_ZERO_BLEND.color.operation,
-            wgpu::BlendOperation::Add
-        );
-        assert_eq!(
-            SPOTLIGHT_ZERO_BLEND.alpha.src_factor,
-            wgpu::BlendFactor::Zero
-        );
-        assert_eq!(
-            SPOTLIGHT_ZERO_BLEND.alpha.dst_factor,
-            wgpu::BlendFactor::One
+macro_rules! instance_attribute {
+    ($location:expr, $format:ident, $($field:tt)+) => {
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::$format,
+            offset: std::mem::offset_of!(SpriteInstance, $($field)+) as u64,
+            shader_location: $location,
+        }
+    };
+}
+
+pub(crate) const SPRITE_INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; INSTANCE_ATTRIBUTE_COUNT] = [
+    instance_attribute!(0, Float32x2, position),
+    instance_attribute!(1, Float32x2, size),
+    instance_attribute!(2, Float32x2, uv_origin),
+    instance_attribute!(3, Float32x2, uv_size),
+    instance_attribute!(4, Float32, depth),
+    instance_attribute!(5, Float32x3, tint),
+    instance_attribute!(6, Float32, alpha),
+    instance_attribute!(7, Uint32, draw_state.remap_row),
+    instance_attribute!(8, Uint32, draw_state.fx_flags),
+    instance_attribute!(9, Float32x4, draw_state.fx_params),
+    instance_attribute!(10, Float32, draw_state.sinking_row),
+    instance_attribute!(11, Float32, z_adjust),
+    instance_attribute!(12, Uint32, z_gradient),
+    instance_attribute!(13, Float32x2, zshape_origin),
+    instance_attribute!(14, Uint32x4, palette_light),
+    instance_attribute!(15, Uint32, source_palette),
+];
+
+/// Size of one SpriteInstance in bytes.
+const INSTANCE_STRIDE: u64 = std::mem::size_of::<SpriteInstance>() as u64;
+
+/// WGSL of the stroke draw ([`BatchRenderer::draw_surface_strokes`]).
+pub(crate) const SURFACE_STROKE_SHADER: &str = include_str!("surface_strokes.wgsl");
+
+/// Pixels of a stroke's walk one instance of the stroke draw covers.
+const STROKE_PIECE_PIXELS: u32 = 64;
+
+/// One instance of the stroke draw: [`STROKE_PIECE_PIXELS`] pixels of
+/// `stroke`'s walk from pixel `first`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub(crate) struct StrokePiece {
+    stroke: SurfaceStroke,
+    first: u32,
+}
+
+const STROKE_PIECE_ATTRIBUTES: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+    0 => Sint32x2, 1 => Sint32x2, 2 => Uint32, 3 => Uint32, 4 => Uint32
+];
+
+/// `strokes` as the stroke draw's instances, in order: a later stroke's
+/// pixels store over an earlier one's.
+pub(crate) fn stroke_pieces(strokes: &[SurfaceStroke], pieces: &mut Vec<StrokePiece>) {
+    pieces.clear();
+    for &stroke in strokes {
+        let count = stroke.pixel_count();
+        pieces.extend(
+            (0..count)
+                .step_by(STROKE_PIECE_PIXELS as usize)
+                .map(|first| StrokePiece { stroke, first }),
         );
     }
 }
-
-/// Number of vertex attributes in SpriteInstance: 7 base + 4 DrawState fields
-/// + 3 native-Z fields (z_adjust, z_gradient, zshape_origin / voxel z_rect).
-const INSTANCE_ATTRIBUTE_COUNT: usize = 15;
-
-pub(crate) const SPRITE_INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; INSTANCE_ATTRIBUTE_COUNT] = [
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32x2,
-        offset: 0,
-        shader_location: 0,
-    },
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32x2,
-        offset: 8,
-        shader_location: 1,
-    },
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32x2,
-        offset: 16,
-        shader_location: 2,
-    },
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32x2,
-        offset: 24,
-        shader_location: 3,
-    },
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32,
-        offset: 32,
-        shader_location: 4,
-    },
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32x3,
-        offset: 36,
-        shader_location: 5,
-    },
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32,
-        offset: 48,
-        shader_location: 6,
-    },
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Uint32,
-        offset: 52,
-        shader_location: 7,
-    },
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Uint32,
-        offset: 56,
-        shader_location: 8,
-    },
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32x4,
-        offset: 60,
-        shader_location: 9,
-    },
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32x4,
-        offset: 76,
-        shader_location: 10,
-    },
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32,
-        offset: 92,
-        shader_location: 11,
-    },
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Uint32,
-        offset: 96,
-        shader_location: 12,
-    },
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32x2,
-        offset: 100,
-        shader_location: 13,
-    },
-    wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Uint32x4,
-        offset: std::mem::offset_of!(SpriteInstance, palette_light) as u64,
-        shader_location: 14,
-    },
-];
-
-/// Size of one SpriteInstance in bytes (4 × vec2f = 32 bytes).
-const INSTANCE_STRIDE: u64 = std::mem::size_of::<SpriteInstance>() as u64;
 
 /// Camera uniform data sent to the GPU vertex shader.
 ///
 /// Allows the shader to convert screen-space pixel coordinates into
 /// normalized clip space, and to apply camera scrolling.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CameraUniform {
     /// Viewport width and height in pixels.
     pub screen_size: [f32; 2],
@@ -234,7 +184,39 @@ pub struct CameraUniform {
     /// Tactical viewport origin in unscaled native row units. Dirty-clip
     /// rebasing cancels the dirty origin (005F4CD9..CED /00437C49..5C).
     pub native_z_origin_y: f32,
-    pub _native_z_pad: f32,
+    /// Rows the Z seed has panned ([`native_z::ZSeed`]): Z rows count from
+    /// the view's top row less this, the world row the seed's
+    /// `DEFAULT_Z` meets. Clips keep the view's own top.
+    ///
+    /// [`native_z::ZSeed`]: super::native_z::ZSeed
+    pub native_z_pan: f32,
+}
+
+impl CameraUniform {
+    /// The view's top world row, the Z buffer's row 0, as the shaders round
+    /// it (WGSL `round` ties to even).
+    pub fn view_top_row(&self) -> i32 {
+        (self.camera_pos[1] + self.native_z_origin_y).round_ties_even() as i32
+    }
+
+    /// The view's world rows `[top, bottom)` for a tactical view
+    /// `view_height` world pixels high (`DrawState::fx_params` w; 0 takes the
+    /// whole target), as the shaders round them (native_z.wgsl `view_rows`).
+    pub fn view_rows(&self, view_height: f32) -> [i32; 2] {
+        let top = self.view_top_row();
+        let height = if view_height > 0.0 {
+            view_height
+        } else {
+            self.screen_size[1] / self.zoom
+        };
+        [top, top.saturating_add(height.round_ties_even() as i32)]
+    }
+
+    /// The world row whose Z is the seed's `DEFAULT_Z`: Z rows count from it
+    /// (`native_z_origin_row` in native_z.wgsl).
+    pub fn native_z_origin_row(&self) -> i32 {
+        self.view_top_row().wrapping_sub(self.native_z_pan as i32)
+    }
 }
 
 /// Legacy normalized world/sort scalar: `1 - (row - origin_y) / world_height`.
@@ -274,6 +256,26 @@ fn create_r8_texture_view_on_device(
     width: u32,
     height: u32,
 ) -> wgpu::TextureView {
+    create_unorm_texture_view_on_device(
+        device,
+        queue,
+        label,
+        bytes,
+        width,
+        height,
+        wgpu::TextureFormat::R8Unorm,
+    )
+}
+
+pub(crate) fn create_unorm_texture_view_on_device(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    label: &str,
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+) -> wgpu::TextureView {
     let texture: wgpu::Texture = device.create_texture_with_data(
         queue,
         &wgpu::TextureDescriptor {
@@ -286,7 +288,7 @@ fn create_r8_texture_view_on_device(
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R8Unorm,
+            format,
             usage: wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         },
@@ -294,6 +296,35 @@ fn create_r8_texture_view_on_device(
         bytes,
     );
     texture.create_view(&Default::default())
+}
+
+/// The sampled colour texture behind a page.
+fn page_texture_on_device(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    rgba_data: &[u8],
+    [width, height]: [u32; 2],
+    format: wgpu::TextureFormat,
+) -> wgpu::Texture {
+    device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("Batch Texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        rgba_data,
+    )
 }
 
 fn source_index_texture_on_device(
@@ -329,11 +360,14 @@ fn source_index_texture_on_device(
 
 /// A GPU texture prepared for batch rendering.
 ///
-/// Created via `BatchRenderer::create_texture()`.
+/// Created via `BatchRenderer::create_texture()`. A clone shares the texture.
+#[derive(Clone)]
 pub struct BatchTexture {
     /// Bind group containing texture view + sampler.
     pub bind_group: wgpu::BindGroup,
     /// Raw texture view — exposed for use by the Z-depth pipeline bind group.
+    /// A palette-indexed SHP atlas page (`create_indexed_page`) has no colour
+    /// texture: this is its R8Uint index view.
     pub view: wgpu::TextureView,
     /// Texture width in pixels.
     pub width: u32,
@@ -342,20 +376,53 @@ pub struct BatchTexture {
 }
 
 /// A reusable GPU instance buffer entry. Tracks the wgpu buffer and its current
-/// capacity (in number of SpriteInstance elements). Grows on demand, never shrinks.
+/// capacity in bytes. Grows on demand, never shrinks.
 struct PooledBuffer {
     /// The GPU buffer. Has VERTEX | COPY_DST usage so we can write_buffer() into it.
     buffer: wgpu::Buffer,
-    /// Maximum number of SpriteInstance elements the buffer can hold.
+    /// Bytes the buffer can hold.
     capacity: usize,
+    /// The bytes last uploaded, so a repeated stream is not uploaded again.
+    contents: Vec<u8>,
+    /// The camera those bytes' positions were uploaded for.
+    camera: [f32; 2],
+    /// Advances when what the stream draws changes.
+    generation: u64,
+}
+
+/// Whether `new`, drawn with `camera`, shows what the instance bytes `old`
+/// showed drawn with `old_camera`: nothing but their positions differs, and
+/// those by the camera's move. Float arithmetic only ever says no.
+fn followed_camera(
+    old: &[u8],
+    old_camera: [f32; 2],
+    new: &[SpriteInstance],
+    camera: [f32; 2],
+) -> bool {
+    old.len() == std::mem::size_of_val(new)
+        && old
+            .chunks_exact(std::mem::size_of::<SpriteInstance>())
+            .zip(new)
+            .all(|(old, new)| {
+                let old: SpriteInstance = bytemuck::pod_read_unaligned(old);
+                let moved = SpriteInstance {
+                    position: [
+                        old.position[0] - old_camera[0] + camera[0],
+                        old.position[1] - old_camera[1] + camera[1],
+                    ],
+                    ..old
+                };
+                bytemuck::bytes_of(&moved) == bytemuck::bytes_of(new)
+            })
 }
 
 /// Pool of named GPU instance buffers that persist across frames.
 ///
 /// Instead of creating and destroying GPU buffers every frame (expensive driver
-/// round-trips), this pool keeps buffers alive and overwrites their contents
-/// with `queue.write_buffer()`. Buffers grow automatically when needed (2x strategy)
-/// but never shrink, avoiding repeated reallocations.
+/// round-trips), this pool keeps buffers alive and overwrites their contents,
+/// with `queue.write_buffer()` or, for a frame's uploads, copies recorded from
+/// reused staging chunks ([`Self::record_uploads`]). Buffers grow automatically
+/// when needed (2x strategy) but never shrink, avoiding repeated reallocations.
 ///
 /// Usage pattern:
 /// 1. Call `upload()` for each named buffer (mutably borrows pool).
@@ -367,11 +434,111 @@ pub struct InstanceBufferPool {
     /// Instance counts for each buffer written this frame.
     /// Stored separately so `get()` can return count without needing the data.
     counts: HashMap<(&'static str, usize), u32>,
+    /// The staging chunks [`Self::record_uploads`] copies from, created on its
+    /// first use. A chunk is reused once the GPU has copied out of it.
+    belt: Option<wgpu::util::StagingBelt>,
+    /// The pieces of the last stroke stream uploaded, kept for its allocation.
+    stroke_pieces: Vec<StrokePiece>,
 }
 
-/// Minimum buffer capacity in elements. Avoids tiny buffers that immediately
-/// need reallocation. 64 instances × 48 bytes = 3 KB — negligible VRAM.
-const MIN_POOL_CAPACITY: usize = 64;
+/// Minimum buffer capacity in bytes, 64 sprite instances' worth (7.5 KiB).
+/// Avoids tiny buffers that immediately need reallocation.
+const MIN_POOL_BYTES: usize = 64 * std::mem::size_of::<SpriteInstance>();
+
+/// Bytes in one staging chunk of recorded uploads: a frame's streams at
+/// 1080p with a few hundred objects fit in one. A larger single upload gets
+/// a chunk of its own size.
+const UPLOAD_CHUNK_BYTES: u64 = 1 << 20;
+
+/// Where an upload's bytes go.
+enum UploadPath<'a> {
+    /// `Queue::write_buffer`, which lands before everything in the next
+    /// submission, and creates a staging buffer for each call.
+    Queue(&'a wgpu::Queue),
+    /// A copy recorded into the encoder from the pool's staging chunks.
+    Recorded(&'a mut wgpu::CommandEncoder),
+}
+
+/// A frame's uploads recorded into one encoder
+/// ([`InstanceBufferPool::record_uploads`]). Dropping it closes the staging
+/// chunks it wrote, to be reused after `encoder`'s submission completes.
+pub(crate) struct RecordedUploads<'a> {
+    pool: &'a mut InstanceBufferPool,
+    device: &'a wgpu::Device,
+    encoder: &'a mut wgpu::CommandEncoder,
+}
+
+impl RecordedUploads<'_> {
+    pub(crate) fn upload(&mut self, key: &'static str, instances: &[SpriteInstance]) {
+        self.upload_page(key, 0, instances);
+    }
+
+    /// Upload a stream whose positions are in the frame of a camera that
+    /// scrolls with them: one that only followed `camera` keeps its
+    /// generation, since it draws the same picture.
+    pub(crate) fn upload_following(
+        &mut self,
+        key: &'static str,
+        instances: &[SpriteInstance],
+        camera: [f32; 2],
+    ) {
+        self.pool.upload_keyed(
+            self.device,
+            UploadPath::Recorded(self.encoder),
+            (key, 0),
+            instances,
+            camera,
+        );
+    }
+
+    /// One page of a stream split per atlas page, read with
+    /// [`InstanceBufferPool::get_page`].
+    pub(crate) fn upload_page(
+        &mut self,
+        key: &'static str,
+        page: usize,
+        instances: &[SpriteInstance],
+    ) {
+        self.pool.upload_keyed(
+            self.device,
+            UploadPath::Recorded(self.encoder),
+            (key, page),
+            instances,
+            [0.0; 2],
+        );
+    }
+
+    /// `strokes` as the stroke draw's instances, read with
+    /// [`InstanceBufferPool::get`] and drawn with
+    /// [`BatchRenderer::draw_surface_strokes`].
+    pub(crate) fn upload_strokes(&mut self, key: &'static str, strokes: &[SurfaceStroke]) {
+        let mut pieces = std::mem::take(&mut self.pool.stroke_pieces);
+        stroke_pieces(strokes, &mut pieces);
+        self.pool.upload_records(
+            self.device,
+            UploadPath::Recorded(self.encoder),
+            (key, 0),
+            &pieces,
+            [0.0; 2],
+            |_, _| false,
+        );
+        self.pool.stroke_pieces = pieces;
+    }
+}
+
+impl Drop for RecordedUploads<'_> {
+    fn drop(&mut self) {
+        if let Some(belt) = self.pool.belt.as_mut() {
+            belt.finish_and_recall_on_submit(self.encoder);
+        }
+    }
+}
+
+impl Default for InstanceBufferPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl InstanceBufferPool {
     /// Create an empty pool. Buffers are allocated lazily on first use.
@@ -379,6 +546,26 @@ impl InstanceBufferPool {
         Self {
             buffers: HashMap::new(),
             counts: HashMap::new(),
+            belt: None,
+            stroke_pieces: Vec::new(),
+        }
+    }
+
+    /// Record uploads into `encoder` as copies out of the pool's reused
+    /// staging chunks: `Queue::write_buffer` creates a staging buffer for
+    /// each call, about half of what a frame's uploads cost. A copy takes
+    /// effect where it sits among `encoder`'s commands, while a queue write
+    /// lands before everything in the next submission, so record the uploads
+    /// before any pass that draws them. `encoder` must then be submitted.
+    pub(crate) fn record_uploads<'a>(
+        &'a mut self,
+        device: &'a wgpu::Device,
+        encoder: &'a mut wgpu::CommandEncoder,
+    ) -> RecordedUploads<'a> {
+        RecordedUploads {
+            pool: self,
+            device,
+            encoder,
         }
     }
 
@@ -403,7 +590,13 @@ impl InstanceBufferPool {
         page: usize,
         instances: &[SpriteInstance],
     ) {
-        self.upload_keyed(&gpu.device, &gpu.queue, (key, page), instances);
+        self.upload_keyed(
+            &gpu.device,
+            UploadPath::Queue(&gpu.queue),
+            (key, page),
+            instances,
+            [0.0; 2],
+        );
     }
 
     pub(crate) fn upload_on_device(
@@ -413,40 +606,118 @@ impl InstanceBufferPool {
         key: &'static str,
         instances: &[SpriteInstance],
     ) {
-        self.upload_keyed(device, queue, (key, 0), instances);
+        self.upload_keyed(
+            device,
+            UploadPath::Queue(queue),
+            (key, 0),
+            instances,
+            [0.0; 2],
+        );
     }
 
     fn upload_keyed(
         &mut self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        path: UploadPath<'_>,
         key: (&'static str, usize),
         instances: &[SpriteInstance],
+        camera: [f32; 2],
     ) {
-        let needed: usize = instances.len();
+        self.upload_records(device, path, key, instances, camera, |old, old_camera| {
+            followed_camera(old, old_camera, instances, camera)
+        });
+    }
+
+    /// Upload `records` into a named buffer. `followed` says whether the
+    /// bytes last uploaded, drawn with the camera they were uploaded for,
+    /// show what `records` show with `camera`; it is asked only when the
+    /// camera differs.
+    fn upload_records<T: bytemuck::Pod>(
+        &mut self,
+        device: &wgpu::Device,
+        path: UploadPath<'_>,
+        key: (&'static str, usize),
+        records: &[T],
+        camera: [f32; 2],
+        followed: impl FnOnce(&[u8], [f32; 2]) -> bool,
+    ) {
+        let needed: usize = records.len();
+        let previous_count = self.counts.insert(key, needed as u32);
         if needed == 0 {
-            self.counts.insert(key, 0);
+            if let Some(entry) = self.buffers.get_mut(&key)
+                && previous_count != Some(0)
+            {
+                entry.generation += 1;
+            }
             return;
         }
 
+        let byte_data: &[u8] = bytemuck::cast_slice(records);
         let entry: &mut PooledBuffer = self.buffers.entry(key).or_insert_with(|| {
-            let cap: usize = needed.max(MIN_POOL_CAPACITY);
+            let cap: usize = byte_data.len().max(MIN_POOL_BYTES);
             PooledBuffer {
                 buffer: Self::alloc_buffer(device, key.0, cap),
                 capacity: cap,
+                contents: Vec::new(),
+                camera,
+                generation: 0,
             }
         });
+        let unchanged = entry.contents == byte_data;
+        let same_picture = previous_count == Some(needed as u32)
+            && if camera == entry.camera {
+                unchanged
+            } else {
+                followed(&entry.contents, entry.camera)
+            };
+        if !same_picture {
+            entry.generation += 1;
+        }
+        entry.camera = camera;
+        if unchanged {
+            return;
+        }
+        entry.contents.clear();
+        entry.contents.extend_from_slice(byte_data);
 
         // Grow if the current buffer is too small.
-        if needed > entry.capacity {
-            let new_cap: usize = (entry.capacity * 2).max(needed);
+        if byte_data.len() > entry.capacity {
+            let new_cap: usize = (entry.capacity * 2).max(byte_data.len());
             entry.buffer = Self::alloc_buffer(device, key.0, new_cap);
             entry.capacity = new_cap;
         }
 
-        let byte_data: &[u8] = bytemuck::cast_slice(instances);
-        queue.write_buffer(&entry.buffer, 0, byte_data);
-        self.counts.insert(key, needed as u32);
+        match path {
+            UploadPath::Queue(queue) => queue.write_buffer(&entry.buffer, 0, byte_data),
+            UploadPath::Recorded(encoder) => {
+                let belt = self.belt.get_or_insert_with(|| {
+                    wgpu::util::StagingBelt::new(device.clone(), UPLOAD_CHUNK_BYTES)
+                });
+                let size = wgpu::BufferSize::new(byte_data.len() as u64).expect("instances");
+                // `StagingBelt::write_buffer` without its panic: a chunk made
+                // on a lost device can't be mapped, and the frame it belongs
+                // to never shows (`GpuContext::device_lost`).
+                let alignment = wgpu::BufferSize::new(wgpu::COPY_BUFFER_ALIGNMENT).expect("4");
+                let slice = belt.allocate(size, alignment);
+                encoder.copy_buffer_to_buffer(
+                    slice.buffer(),
+                    slice.offset(),
+                    &entry.buffer,
+                    0,
+                    size.get(),
+                );
+                if let Ok(mut view) = slice.get_mapped_range_mut() {
+                    view.copy_from_slice(byte_data);
+                }
+            }
+        }
+    }
+
+    /// A number that changes whenever what `key`'s stream draws changes.
+    pub(crate) fn generation(&self, key: &'static str) -> u64 {
+        self.buffers
+            .get(&(key, 0))
+            .map_or(0, |entry| entry.generation)
     }
 
     /// Get a previously uploaded buffer and its instance count.
@@ -467,16 +738,22 @@ impl InstanceBufferPool {
         Some((&entry.buffer, count))
     }
 
-    /// Allocate a GPU buffer with VERTEX + COPY_DST usage for the given capacity.
+    /// Allocate a GPU buffer with VERTEX + COPY_DST usage of `capacity` bytes.
     fn alloc_buffer(device: &wgpu::Device, label: &str, capacity: usize) -> wgpu::Buffer {
-        let byte_size: u64 = (capacity as u64) * (std::mem::size_of::<SpriteInstance>() as u64);
         device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
-            size: byte_size,
+            size: capacity as u64,
             usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         })
     }
+}
+
+/// Exact world and UI uniforms uploaded this frame, owned together.
+#[derive(Clone, Copy)]
+struct UploadedCameras {
+    world: CameraUniform,
+    ui: CameraUniform,
 }
 
 /// Instanced sprite batch renderer.
@@ -500,11 +777,20 @@ pub struct BatchRenderer {
     /// building-body leaves (`0x004958d0` / `0x004990e0`) with the BUILDNGZ
     /// z-shape bound at group 2.
     zsprite_write_pipeline: wgpu::RenderPipeline,
+    /// The same two inside a depth-tested edit interval, read then write:
+    /// each also restarts its pixels' shadow count (`fs_counted`). Absent on
+    /// WebGL2, which has no such interval.
+    zsprite_counted_pipelines: Option<[wgpu::RenderPipeline; 2]>,
     /// Bind group layout for the z-shape texture (group 2 of the zsprite
-    /// pipelines): one `R8Unorm` texture read with `textureLoad`.
+    /// pipelines): one `R8Unorm` texture read with `textureLoad`, and the
+    /// skip table beside it.
     zshape_bind_group_layout: wgpu::BindGroupLayout,
     /// 1x1 neutral z-shape used when no BUILDNGZ.SHA is loaded.
     default_zshape_bind_group: wgpu::BindGroup,
+    /// The skip table (`render::zshape_skips`), written once per picture and
+    /// bound at binding 1 of every z-shape group.
+    zshape_skips: wgpu::Texture,
+    zshape_skips_view: wgpu::TextureView,
     /// Render pipeline with per-pixel Z-depth (frag_depth output, LessEqual
     /// compare like `TMP_TileBlitter`'s `base + zdata <= zbuf`).
     /// Used for terrain tiles with TMP Z-data.
@@ -513,10 +799,12 @@ pub struct BatchRenderer {
     /// depth write OFF. Overlays draw unconditionally over terrain because
     /// tiles without Z-data skip Z-testing entirely.
     overlay_passthrough_pipeline: wgpu::RenderPipeline,
-    /// Destination-factor pipeline for SpotlightClass type-16 zero blending.
-    spotlight_zero_blend_pipeline: wgpu::RenderPipeline,
-    /// Procedurally generated native type-16 mask bank (R8, nearest sampled).
-    spotlight_type16_masks: BatchTexture,
+    /// The same direct store through VERA's smooth client (`fs_shell_smooth`).
+    smooth_chrome_pipeline: wgpu::RenderPipeline,
+    surface_store_pipeline: wgpu::RenderPipeline,
+    /// [`SurfaceStroke`] points (`surface_strokes.wgsl`): depth compare
+    /// Always, no write, the live A for gated strokes.
+    stroke_pipeline: wgpu::RenderPipeline,
     /// Depth-only pipeline: colour target fully masked, depth write ON, Less
     /// compare. Stamps a sprite's opaque silhouette so a later depth-testing
     /// pass can be clipped by it, without disturbing colour compositing order.
@@ -544,20 +832,34 @@ pub struct BatchRenderer {
     /// `unit_atlas_bind_group_layout` (group 1) + `voxel_palette_bind_group_layout`
     /// (group 2). Same vertex layout as the other batch pipelines.
     pub voxel_sprite_pipeline: wgpu::RenderPipeline,
+    voxel_passthrough_pipeline: wgpu::RenderPipeline,
     /// Layout for camera uniform bind group (group 0).
     /// Stored so other pipelines (e.g., fog shader) can reuse the same layout.
     camera_bind_group_layout: wgpu::BindGroupLayout,
     /// Camera uniform buffer (group 0) — world camera with zoom.
     // Exact bytes last written by the camera owner; scissor consumers read
     // this record instead of independently reconstructing scroll/zoom/origin.
-    uploaded_camera: std::sync::RwLock<CameraUniform>,
+    // It is what the two buffers hold, from their creation on, so a write of
+    // the same bytes is skipped. A `Cell`: every shell, loading and match
+    // pass writes the camera through the `&BatchRenderer` it draws with,
+    // beside textures it borrows from the same state; one thread only.
+    uploaded_camera: std::cell::Cell<UploadedCameras>,
     camera_buffer: wgpu::Buffer,
-    /// Camera bind group — world camera with zoom.
+    /// World blitters use the shared A texture for source palette selection.
     camera_bind_group: wgpu::BindGroup,
+    /// Surface stores (lines/brackets) share the camera but do not read A.
+    surface_camera_bind_group: wgpu::BindGroup,
+    /// Derived bind-group cache key. The ShroudBuffer view changes on resize
+    /// or replacement; camera movement updates its existing source uniform.
+    bound_shroud_view: Option<wgpu::TextureView>,
     /// UI camera uniform buffer — always zoom=1.0 for screen-fixed elements.
     ui_camera_buffer: wgpu::Buffer,
     /// UI camera bind group — always zoom=1.0.
     ui_camera_bind_group: wgpu::BindGroup,
+    /// Neutral A, for the camera groups that sample no shroud.
+    neutral_a: (wgpu::TextureView, wgpu::Buffer),
+    /// The colour format every pipeline here draws into.
+    surface_format: wgpu::TextureFormat,
 }
 
 impl BatchRenderer {
@@ -575,7 +877,11 @@ impl BatchRenderer {
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("Batch Shader"),
                 source: wgpu::ShaderSource::Wgsl(
-                    crate::render::tactical_shader::source(BATCH_SHADER).into(),
+                    crate::render::webgl::camera_source(
+                        device,
+                        crate::render::tactical_shader::sprite_source(BATCH_SHADER),
+                    )
+                    .into(),
                 ),
             });
 
@@ -583,16 +889,38 @@ impl BatchRenderer {
         let camera_bind_group_layout: wgpu::BindGroupLayout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Batch Camera BGL"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
             });
 
         // Bind group 1: Texture + sampler.
@@ -641,160 +969,60 @@ impl BatchRenderer {
             _pad: 0.0,
 
             native_z_origin_y: 0.0,
-            _native_z_pad: 0.0,
+            native_z_pan: 0.0,
         };
         let camera_buffer: wgpu::Buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("Camera Uniform"),
-                contents: bytemuck::cast_slice(&[camera_uniform]),
+                contents: &crate::render::webgl::uniform_bytes(
+                    device,
+                    bytemuck::cast_slice(&[camera_uniform]),
+                ),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
 
-        let camera_bind_group: wgpu::BindGroup =
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Camera Bind Group"),
-                layout: &camera_bind_group_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: camera_buffer.as_entire_binding(),
-                }],
-            });
+        let (neutral_a, neutral_a_uniform) =
+            crate::render::shroud_buffer::neutral_gpu_source(device, queue);
+        let surface_camera_bind_group = camera_group(
+            device,
+            &camera_bind_group_layout,
+            &camera_buffer,
+            &neutral_a,
+            &neutral_a_uniform,
+        );
+        let camera_bind_group = surface_camera_bind_group.clone();
 
         // UI camera — identical layout but always zoom=1.0 for screen-fixed elements.
         let ui_camera_buffer: wgpu::Buffer =
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("UI Camera Uniform"),
-                contents: bytemuck::cast_slice(&[camera_uniform]),
+                contents: &crate::render::webgl::uniform_bytes(
+                    device,
+                    bytemuck::cast_slice(&[camera_uniform]),
+                ),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
-        let ui_camera_bind_group: wgpu::BindGroup =
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("UI Camera Bind Group"),
-                layout: &camera_bind_group_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: ui_camera_buffer.as_entire_binding(),
-                }],
-            });
+        let ui_camera_bind_group = camera_group(
+            device,
+            &camera_bind_group_layout,
+            &ui_camera_buffer,
+            &neutral_a,
+            &neutral_a_uniform,
+        );
 
-        // Instance buffer vertex layout (matches SpriteInstance memory layout):
-        //   position(8) + size(8) + uv_origin(8) + uv_size(8) = 32 → loc 0-3
-        //   depth(4) + tint(12) + alpha(4) = 20 → loc 4-6 (offsets 32, 36, 48)
-        //   DrawState::remap_row(4) at offset 52 → loc 7 (Uint32)
-        //   DrawState::fx_flags(4) at offset 56 → loc 8 (Uint32)
-        //   DrawState::fx_params(16) at offset 60 → loc 9 (Float32x4)
-        //   DrawState::effect_tint(16) at offset 76 → loc 10 (Float32x4)
-        //   z_adjust(4) at offset 92 → loc 11 (Float32)
-        //   z_gradient(4) at offset 96 → loc 12 (Uint32)
-        //   zshape_origin(8) at offset 100 → loc 13 (Float32x2)
-        // PaletteLight(16) at offset 108 -> loc 14 (Uint32x4).
-        // Total stride: 124 bytes.
+        // Instance buffer vertex layout: SPRITE_INSTANCE_ATTRIBUTES, one
+        // attribute per SpriteInstance field at its offset_of.
         let instance_attrs = SPRITE_INSTANCE_ATTRIBUTES;
 
         let pipeline_layout: wgpu::PipelineLayout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Batch Pipeline Layout"),
-                bind_group_layouts: &[&camera_bind_group_layout, &texture_bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[
+                    Some(&camera_bind_group_layout),
+                    Some(&texture_bind_group_layout),
+                ],
+                immediate_size: 0,
             });
-
-        let building_light_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("BuildingLight Type-16 Shader"),
-            source: wgpu::ShaderSource::Wgsl(BUILDING_LIGHT_SHADER.into()),
-        });
-        let spotlight_zero_blend_pipeline =
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("BuildingLight Type-16 Zero Blend Pipeline"),
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &building_light_shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[wgpu::VertexBufferLayout {
-                        array_stride: INSTANCE_STRIDE,
-                        step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &instance_attrs,
-                    }],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &building_light_shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: surface_format,
-                        blend: Some(SPOTLIGHT_ZERO_BLEND),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::Always,
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                cache: None,
-            });
-
-        let spotlight_pixels = crate::render::building_light::generate_type16_mask_bank(
-            crate::render::building_light::DEFAULT_SPOTLIGHT_RADIUS,
-        );
-        let spotlight_texture = device.create_texture_with_data(
-            queue,
-            &wgpu::TextureDescriptor {
-                label: Some("BuildingLight Type-16 Mask Bank"),
-                size: wgpu::Extent3d {
-                    width: crate::render::building_light::TYPE16_ATLAS_WIDTH as u32,
-                    height: crate::render::building_light::TYPE16_MASK_HEIGHT as u32,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::R8Unorm,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            },
-            wgpu::util::TextureDataOrder::LayerMajor,
-            &spotlight_pixels,
-        );
-        let spotlight_view = spotlight_texture.create_view(&Default::default());
-        let spotlight_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("BuildingLight Type-16 Nearest Sampler"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-        let spotlight_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("BuildingLight Type-16 Mask Bind Group"),
-            layout: &texture_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&spotlight_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&spotlight_sampler),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(&default_source_indices),
-                },
-            ],
-        });
-        let spotlight_type16_masks = BatchTexture {
-            bind_group: spotlight_bind_group,
-            view: spotlight_view,
-            width: crate::render::building_light::TYPE16_ATLAS_WIDTH as u32,
-            height: crate::render::building_light::TYPE16_MASK_HEIGHT as u32,
-        };
 
         // Overlay pipeline: depth write ON, LessEqual compare.
         // Used for UI/debug passes that intentionally update depth.
@@ -805,11 +1033,11 @@ impl BatchRenderer {
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some("vs_depth"),
-                    buffers: &[wgpu::VertexBufferLayout {
+                    buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: INSTANCE_STRIDE,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &instance_attrs,
-                    }],
+                    })],
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -828,13 +1056,13 @@ impl BatchRenderer {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: true,
-                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
 
@@ -842,23 +1070,23 @@ impl BatchRenderer {
         // Tiles without embedded Z-data (flag 0x02 at cell header byte 36) skip
         // Z-testing entirely. Ore, gems, and terrain objects have no Z-data, so
         // they paint unconditionally over terrain.
-        let overlay_passthrough_pipeline: wgpu::RenderPipeline =
+        let passthrough = |label, fragment| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Batch Pipeline (Overlay Passthrough)"),
+                label: Some(label),
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some("vs_main"),
-                    buffers: &[wgpu::VertexBufferLayout {
+                    buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: INSTANCE_STRIDE,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &instance_attrs,
-                    }],
+                    })],
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: Some("fs_main"),
+                    entry_point: Some(fragment),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: surface_format,
                         blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -872,15 +1100,24 @@ impl BatchRenderer {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::Always,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
-            });
+            })
+        };
+        let overlay_passthrough_pipeline =
+            passthrough("Batch Pipeline (Overlay Passthrough)", "fs_main");
+        let smooth_chrome_pipeline =
+            passthrough("Batch Pipeline (Smooth Chrome)", "fs_shell_smooth");
+        // Surface stores at neutral A (the ground marks).
+        let surface_store_pipeline =
+            passthrough("Batch Pipeline (Surface Stores)", "fs_surface_store");
+        let stroke_pipeline = stroke_pipeline(device, &camera_bind_group_layout, surface_format);
 
         // Building bodies stamp their silhouette here so the post-shroud
         // selection-bracket redraw can be clipped by the art it stands behind.
@@ -895,11 +1132,11 @@ impl BatchRenderer {
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some("vs_depth"),
-                    buffers: &[wgpu::VertexBufferLayout {
+                    buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: INSTANCE_STRIDE,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &instance_attrs,
-                    }],
+                    })],
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -919,13 +1156,13 @@ impl BatchRenderer {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: true,
-                    depth_compare: wgpu::CompareFunction::Less,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
 
@@ -940,11 +1177,11 @@ impl BatchRenderer {
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: Some("vs_depth"),
-                    buffers: &[wgpu::VertexBufferLayout {
+                    buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: INSTANCE_STRIDE,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &instance_attrs,
-                    }],
+                    })],
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -963,13 +1200,13 @@ impl BatchRenderer {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::Less,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Less),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
 
@@ -1012,14 +1249,21 @@ impl BatchRenderer {
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("ZDepth Shader"),
                 source: wgpu::ShaderSource::Wgsl(
-                    crate::render::tactical_shader::source(ZDEPTH_SHADER).into(),
+                    crate::render::webgl::camera_source(
+                        device,
+                        crate::render::tactical_shader::world_source(ZDEPTH_SHADER),
+                    )
+                    .into(),
                 ),
             });
         let zdepth_pipeline_layout: wgpu::PipelineLayout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("ZDepth Pipeline Layout"),
-                bind_group_layouts: &[&camera_bind_group_layout, &zdepth_texture_bind_group_layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[
+                    Some(&camera_bind_group_layout),
+                    Some(&zdepth_texture_bind_group_layout),
+                ],
+                immediate_size: 0,
             });
         let zdepth_pipeline: wgpu::RenderPipeline =
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1028,11 +1272,11 @@ impl BatchRenderer {
                 vertex: wgpu::VertexState {
                     module: &zdepth_shader,
                     entry_point: Some("vs_main"),
-                    buffers: &[wgpu::VertexBufferLayout {
+                    buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: INSTANCE_STRIDE,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &instance_attrs,
-                    }],
+                    })],
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -1051,32 +1295,60 @@ impl BatchRenderer {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: true,
+                    depth_write_enabled: Some(true),
                     // `TMP_TileBlitter @ 0x00547CF0`: `base + zdata <= zbuf`.
-                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
 
-        // Z-shape bind group layout (group 2 of the zsprite pipelines).
+        // Z-shape bind group layout (group 2 of the zsprite pipelines): the
+        // z-shape and the skip table.
         let zshape_bind_group_layout: wgpu::BindGroupLayout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("ZShape BGL"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Uint,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                ],
             });
+        let zshape_skips: wgpu::Texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ZShape skip table"),
+            size: wgpu::Extent3d {
+                width: super::zshape_skips::SKIP_TABLE_ROWS,
+                height: super::zshape_skips::SKIP_TABLE_SLOTS,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let zshape_skips_view: wgpu::TextureView = zshape_skips.create_view(&Default::default());
         let default_zshape_view: wgpu::TextureView = create_r8_texture_view_on_device(
             device,
             queue,
@@ -1089,10 +1361,16 @@ impl BatchRenderer {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Default ZShape BG"),
                 layout: &zshape_bind_group_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&default_zshape_view),
-                }],
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&default_zshape_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&zshape_skips_view),
+                    },
+                ],
             });
 
         // Per-pixel Z-tested SHP pipelines: native row Z + optional z-shape.
@@ -1100,64 +1378,95 @@ impl BatchRenderer {
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("ZSprite Shader"),
                 source: wgpu::ShaderSource::Wgsl(
-                    crate::render::tactical_shader::source(ZSPRITE_SHADER).into(),
+                    crate::render::webgl::camera_source(
+                        device,
+                        crate::render::tactical_shader::sprite_source(ZSPRITE_SHADER),
+                    )
+                    .into(),
                 ),
             });
         let zsprite_pipeline_layout: wgpu::PipelineLayout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("ZSprite Pipeline Layout"),
                 bind_group_layouts: &[
-                    &camera_bind_group_layout,
-                    &texture_bind_group_layout,
-                    &zshape_bind_group_layout,
+                    Some(&camera_bind_group_layout),
+                    Some(&texture_bind_group_layout),
+                    Some(&zshape_bind_group_layout),
                 ],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
-        let make_zsprite_pipeline = |label: &str, depth_write_enabled: bool| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(&zsprite_pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &zsprite_shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[wgpu::VertexBufferLayout {
-                        array_stride: INSTANCE_STRIDE,
-                        step_mode: wgpu::VertexStepMode::Instance,
-                        attributes: &instance_attrs,
-                    }],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &zsprite_shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: surface_format,
-                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled,
-                    // Sprite leaves test `z < zbuf` (strict).
-                    depth_compare: wgpu::CompareFunction::Less,
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                cache: None,
-            })
+        let zsprite_color = wgpu::ColorTargetState {
+            format: surface_format,
+            blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+            write_mask: wgpu::ColorWrites::ALL,
         };
-        let zsprite_read_pipeline: wgpu::RenderPipeline =
-            make_zsprite_pipeline("ZSprite Pipeline (read-only)", false);
-        let zsprite_write_pipeline: wgpu::RenderPipeline =
-            make_zsprite_pipeline("ZSprite Pipeline (read + write)", true);
+        let make_zsprite_pipeline =
+            |label: &str,
+             fragment: &str,
+             targets: &[Option<wgpu::ColorTargetState>],
+             depth_write_enabled: bool| {
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some(label),
+                    layout: Some(&zsprite_pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &zsprite_shader,
+                        entry_point: Some("vs_main"),
+                        buffers: &[Some(wgpu::VertexBufferLayout {
+                            array_stride: INSTANCE_STRIDE,
+                            step_mode: wgpu::VertexStepMode::Instance,
+                            attributes: &instance_attrs,
+                        })],
+                        compilation_options: Default::default(),
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &zsprite_shader,
+                        entry_point: Some(fragment),
+                        targets,
+                        compilation_options: Default::default(),
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        ..Default::default()
+                    },
+                    depth_stencil: Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Depth32Float,
+                        depth_write_enabled: Some(depth_write_enabled),
+                        // Sprite leaves test `z < zbuf` (strict).
+                        depth_compare: Some(wgpu::CompareFunction::Less),
+                        stencil: wgpu::StencilState::default(),
+                        bias: wgpu::DepthBiasState::default(),
+                    }),
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
+                })
+            };
+        let plain_target = [Some(zsprite_color.clone())];
+        let zsprite_read_pipeline: wgpu::RenderPipeline = make_zsprite_pipeline(
+            "ZSprite Pipeline (read-only)",
+            "fs_main",
+            &plain_target,
+            false,
+        );
+        let zsprite_write_pipeline: wgpu::RenderPipeline = make_zsprite_pipeline(
+            "ZSprite Pipeline (read + write)",
+            "fs_write",
+            &plain_target,
+            true,
+        );
+        let zsprite_counted_pipelines = (!crate::render::gpu::webgl_fallback(device)).then(|| {
+            let targets = [
+                Some(zsprite_color.clone()),
+                Some(wgpu::ColorTargetState {
+                    format: SHADOW_COUNT_FORMAT,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                }),
+            ];
+            [("fs_counted", false), ("fs_counted_write", true)].map(|(fragment, write)| {
+                make_zsprite_pipeline("ZSprite Pipeline (counted)", fragment, &targets, write)
+            })
+        });
 
         // Bind group layout for the unit-atlas R8Uint texture (voxel sprite path).
         // Single texture entry, no sampler — sampled via textureLoad with integer coords.
@@ -1223,36 +1532,43 @@ impl BatchRenderer {
             device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("Voxel Sprite Shader"),
                 source: wgpu::ShaderSource::Wgsl(
-                    crate::render::tactical_shader::source(VOXEL_SPRITE_SHADER).into(),
+                    crate::render::webgl::camera_source(
+                        device,
+                        crate::render::tactical_shader::world_source(VOXEL_SPRITE_SHADER),
+                    )
+                    .into(),
                 ),
             });
         let voxel_sprite_pipeline_layout: wgpu::PipelineLayout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Voxel Sprite Pipeline Layout"),
                 bind_group_layouts: &[
-                    &camera_bind_group_layout,
-                    &unit_atlas_bind_group_layout,
-                    &voxel_palette_bind_group_layout,
+                    Some(&camera_bind_group_layout),
+                    Some(&unit_atlas_bind_group_layout),
+                    Some(&voxel_palette_bind_group_layout),
                 ],
-                push_constant_ranges: &[],
+                immediate_size: 0,
             });
-        let voxel_sprite_pipeline: wgpu::RenderPipeline =
+        let voxel_pipeline = |label, depth_compare| {
             device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("Voxel Sprite Pipeline"),
+                label: Some(label),
                 layout: Some(&voxel_sprite_pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &voxel_shader,
                     entry_point: Some("vs_main"),
-                    buffers: &[wgpu::VertexBufferLayout {
+                    buffers: &[Some(wgpu::VertexBufferLayout {
                         array_stride: INSTANCE_STRIDE,
                         step_mode: wgpu::VertexStepMode::Instance,
                         attributes: &instance_attrs,
-                    }],
+                    })],
                     compilation_options: Default::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &voxel_shader,
-                    entry_point: Some("fs_main"),
+                    entry_point: Some(match depth_compare {
+                        wgpu::CompareFunction::Always => "fs_unread",
+                        _ => "fs_main",
+                    }),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: surface_format,
                         blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -1266,26 +1582,36 @@ impl BatchRenderer {
                 },
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: false,
-                    depth_compare: wgpu::CompareFunction::Less,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(depth_compare),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
-            });
+            })
+        };
+
+        let voxel_sprite_pipeline =
+            voxel_pipeline("Voxel Sprite Pipeline", wgpu::CompareFunction::Less);
+        let voxel_passthrough_pipeline =
+            voxel_pipeline("Voxel Color/A Only Pipeline", wgpu::CompareFunction::Always);
 
         Self {
             overlay_pipeline,
             zsprite_read_pipeline,
             zsprite_write_pipeline,
+            zsprite_counted_pipelines,
             zshape_bind_group_layout,
             default_zshape_bind_group,
+            zshape_skips,
+            zshape_skips_view,
             zdepth_pipeline,
             overlay_passthrough_pipeline,
-            spotlight_zero_blend_pipeline,
-            spotlight_type16_masks,
+            smooth_chrome_pipeline,
+            surface_store_pipeline,
+            stroke_pipeline,
             #[cfg(test)]
             depth_stamp_pipeline,
             depth_test_pipeline,
@@ -1295,20 +1621,71 @@ impl BatchRenderer {
             unit_atlas_bind_group_layout,
             voxel_palette_bind_group_layout,
             voxel_sprite_pipeline,
+            voxel_passthrough_pipeline,
             camera_bind_group_layout,
             camera_buffer,
-            uploaded_camera: std::sync::RwLock::new(camera_uniform),
+            uploaded_camera: std::cell::Cell::new(UploadedCameras {
+                world: camera_uniform,
+                ui: ui_camera(camera_uniform),
+            }),
             camera_bind_group,
+            surface_camera_bind_group,
+            bound_shroud_view: None,
             ui_camera_buffer,
             ui_camera_bind_group,
+            neutral_a: (neutral_a, neutral_a_uniform),
+            surface_format,
         }
+    }
+
+    /// The colour format every pipeline here draws into.
+    pub(crate) const fn target_format(&self) -> wgpu::TextureFormat {
+        self.surface_format
+    }
+
+    /// A blank `format` texture that GPU passes draw into and the batch
+    /// pipelines sample with nearest filtering.
+    pub(crate) fn create_render_target_texture(
+        &self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        format: wgpu::TextureFormat,
+    ) -> BatchTexture {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Batch Render Target"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.batch_texture(
+            device,
+            &texture,
+            &self.default_source_indices,
+            width,
+            height,
+        )
     }
 
     /// Create a single-channel R8Uint atlas texture from byte data.
     ///
-    /// Used for voxel sprite atlases where each byte is a palette index
-    /// (post-VPL, pre-house-remap). Sampled in shader via `textureLoad` (no
-    /// filtering, integer coords).
+    /// Tests fill unit atlas pages with it: each byte is a palette index
+    /// (post-VPL, pre-house-remap), sampled in the shader via `textureLoad`
+    /// (no filtering, integer coords). The game's pages start blank
+    /// ([`Self::create_blank_unit_atlas_texture`]) and take each picture when
+    /// it is first drawn.
+    #[cfg(test)]
     pub(crate) fn create_unit_atlas_texture_on_device(
         &self,
         device: &wgpu::Device,
@@ -1342,6 +1719,32 @@ impl BatchRenderer {
         width: u32,
         height: u32,
     ) -> BatchTexture {
+        self.unit_atlas_texture(device, width, height, wgpu::TextureUsages::empty())
+    }
+
+    /// A blank palette-index page the GPU voxel raster draws into
+    /// ([`crate::render::voxel_gpu`]).
+    pub(crate) fn create_unit_page_texture(
+        &self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+    ) -> BatchTexture {
+        self.unit_atlas_texture(
+            device,
+            width,
+            height,
+            wgpu::TextureUsages::RENDER_ATTACHMENT,
+        )
+    }
+
+    fn unit_atlas_texture(
+        &self,
+        device: &wgpu::Device,
+        width: u32,
+        height: u32,
+        usage: wgpu::TextureUsages,
+    ) -> BatchTexture {
         let texture: wgpu::Texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("unit_atlas_r8uint"),
             size: wgpu::Extent3d {
@@ -1353,7 +1756,7 @@ impl BatchRenderer {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::R8Uint,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: usage | wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
 
@@ -1414,64 +1817,92 @@ impl BatchRenderer {
         let source_indices = source_indices
             .as_ref()
             .unwrap_or(&self.default_source_indices);
-        let texture: wgpu::Texture = device.create_texture_with_data(
+        let texture = page_texture_on_device(
+            device,
             queue,
-            &wgpu::TextureDescriptor {
-                label: Some("Batch Texture"),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING,
-                view_formats: &[],
-            },
-            wgpu::util::TextureDataOrder::LayerMajor,
             rgba_data,
+            [width, height],
+            wgpu::TextureFormat::Rgba8UnormSrgb,
         );
         self.batch_texture(device, &texture, source_indices, width, height)
     }
 
-    /// A zeroed RGBA texture and its palette-index companion, both writable
-    /// with `Queue::write_texture`, for atlas pages that receive sprites after
-    /// they are created. The index texture is returned so the owner can write
-    /// it; the bind group only holds a view.
-    pub(crate) fn create_blank_texture_with_indices(
+    /// A page shaders read as encoded colour, the palette bytes as they are,
+    /// so no pixel pays to decode them and encode them back. Only for pages
+    /// their blitters know to be encoded: the tile atlas's terrain draw.
+    pub(crate) fn create_encoded_texture_on_device(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        rgba_data: &[u8],
+        width: u32,
+        height: u32,
+    ) -> BatchTexture {
+        let texture = page_texture_on_device(
+            device,
+            queue,
+            rgba_data,
+            [width, height],
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
+        self.batch_texture(
+            device,
+            &texture,
+            &self.default_source_indices,
+            width,
+            height,
+        )
+    }
+
+    /// A zeroed palette-index page for the SHP atlas, writable with
+    /// `Queue::write_texture`. Its pixels are only the R8 indices: `palette`,
+    /// the atlas's palette rows, takes the colour binding, and each instance's
+    /// `source_palette` selects the row its indices resolve through. The index
+    /// texture is returned so the owner can write it; the page's `view` is its
+    /// view.
+    pub(crate) fn create_indexed_page(
         &self,
         device: &wgpu::Device,
         width: u32,
         height: u32,
+        palette: &wgpu::TextureView,
     ) -> (BatchTexture, wgpu::Texture) {
-        let blank = |label: &str, format: wgpu::TextureFormat| {
-            device.create_texture(&wgpu::TextureDescriptor {
-                label: Some(label),
-                size: wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-                mip_level_count: 1,
-                sample_count: 1,
-                dimension: wgpu::TextureDimension::D2,
-                format,
-                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats: &[],
-            })
-        };
-        let texture = blank("Batch Growth Texture", wgpu::TextureFormat::Rgba8UnormSrgb);
-        let source_indices = blank(
-            "SHP growth source palette indices",
-            wgpu::TextureFormat::R8Uint,
-        );
-        let indices_view = source_indices.create_view(&Default::default());
+        let indices = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("SHP atlas palette indices"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R8Uint,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = indices.create_view(&Default::default());
+        let bind_group = self.source_bind_group(device, palette, &view);
         (
-            self.batch_texture(device, &texture, &indices_view, width, height),
-            source_indices,
+            BatchTexture {
+                bind_group,
+                view,
+                width,
+                height,
+            },
+            indices,
         )
+    }
+
+    /// Keep an indexed page's existing index plane when its shared palette
+    /// row texture grows. The source bind-group constructor remains shared.
+    pub(crate) fn rebind_indexed_palette(
+        &self,
+        device: &wgpu::Device,
+        page: &mut BatchTexture,
+        palette: &wgpu::TextureView,
+    ) {
+        page.bind_group = self.source_bind_group(device, palette, &page.view);
     }
 
     fn batch_texture(
@@ -1483,20 +1914,36 @@ impl BatchRenderer {
         height: u32,
     ) -> BatchTexture {
         let view: wgpu::TextureView = texture.create_view(&Default::default());
+        let bind_group = self.source_bind_group(device, &view, source_indices);
+        BatchTexture {
+            bind_group,
+            view,
+            width,
+            height,
+        }
+    }
+
+    /// A source page's bind group: `color` (an RGBA page, or the SHP atlas's
+    /// palette rows) with a nearest sampler, and the palette-index plane.
+    fn source_bind_group(
+        &self,
+        device: &wgpu::Device,
+        color: &wgpu::TextureView,
+        source_indices: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
         let sampler: wgpu::Sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Batch Sampler (Nearest)"),
             mag_filter: wgpu::FilterMode::Nearest,
             min_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
-
-        let bind_group: wgpu::BindGroup = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Batch Texture BG"),
             layout: &self.texture_bind_group_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&view),
+                    resource: wgpu::BindingResource::TextureView(color),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
@@ -1507,14 +1954,33 @@ impl BatchRenderer {
                     resource: wgpu::BindingResource::TextureView(source_indices),
                 },
             ],
-        });
+        })
+    }
 
-        BatchTexture {
-            bind_group,
-            view,
-            width,
-            height,
+    /// Select the authoritative A source once after its frame rebuild. A
+    /// cached binding is reused until the source view changes (resize/new map)
+    /// or visibility switches to/from sandbox. Its origin/pixels update in place.
+    pub(crate) fn bind_shroud(
+        &mut self,
+        device: &wgpu::Device,
+        source: Option<&crate::render::shroud_buffer::ShroudBuffer>,
+    ) {
+        let source = source.map(|source| source.gpu_source());
+        if self.bound_shroud_view.as_ref() == source.map(|(view, _)| view) {
+            return;
         }
+        self.camera_bind_group = if let Some((view, uniform)) = source {
+            camera_group(
+                device,
+                &self.camera_bind_group_layout,
+                &self.camera_buffer,
+                view,
+                uniform,
+            )
+        } else {
+            self.surface_camera_bind_group.clone()
+        };
+        self.bound_shroud_view = source.map(|(view, _)| view.clone());
     }
 
     /// Update the camera uniform with current viewport size and scroll position.
@@ -1542,7 +2008,6 @@ impl BatchRenderer {
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn update_camera_on_queue(
         &self,
         queue: &wgpu::Queue,
@@ -1575,39 +2040,135 @@ impl BatchRenderer {
             _pad: debug_depth_view,
 
             native_z_origin_y: 0.0,
-            _native_z_pad: 0.0,
+            native_z_pan: 0.0,
         };
         self.write_camera(queue, uniform);
     }
 
     /// Preserve the full tactical viewport origin separately from camera
-    /// scrolling. The argument uses unscaled native rows, not target pixels.
-    pub(crate) fn update_native_z_origin(&self, queue: &wgpu::Queue, origin_y: f32) {
-        let mut uploaded = self.uploaded_camera.write().expect("camera owner lock");
-        uploaded.native_z_origin_y = origin_y;
+    /// scrolling, with the rows the Z seed has panned. The origin uses
+    /// unscaled native rows, not target pixels.
+    pub(crate) fn update_native_z_origin(&self, queue: &wgpu::Queue, origin_y: f32, pan: i32) {
+        let mut uploaded = self.uploaded_camera.get();
+        let fields = [origin_y, pan as f32];
+        // Each queue write costs a staging buffer, and a frame's origin is
+        // usually the one `write_camera` already uploaded.
+        if [uploaded.world, uploaded.ui].iter().all(|camera| {
+            bytemuck::bytes_of(&[camera.native_z_origin_y, camera.native_z_pan])
+                == bytemuck::bytes_of(&fields)
+        }) {
+            return;
+        }
+        for camera in [&mut uploaded.world, &mut uploaded.ui] {
+            [camera.native_z_origin_y, camera.native_z_pan] = fields;
+        }
+        self.uploaded_camera.set(uploaded);
         let offset = std::mem::offset_of!(CameraUniform, native_z_origin_y) as u64;
-        queue.write_buffer(&self.camera_buffer, offset, bytemuck::bytes_of(&origin_y));
-        queue.write_buffer(
-            &self.ui_camera_buffer,
-            offset,
-            bytemuck::bytes_of(&origin_y),
-        );
+        queue.write_buffer(&self.camera_buffer, offset, bytemuck::bytes_of(&fields));
+        queue.write_buffer(&self.ui_camera_buffer, offset, bytemuck::bytes_of(&fields));
     }
 
     pub(crate) fn camera_uniform(&self) -> CameraUniform {
-        *self.uploaded_camera.read().expect("camera owner lock")
+        self.uploaded_camera.get().world
+    }
+
+    /// The UI camera's exact uploaded viewport, independent of world resolution.
+    pub(crate) fn ui_camera_uniform(&self) -> CameraUniform {
+        self.uploaded_camera.get().ui
+    }
+
+    /// Render the world at native texel resolution while UI keeps frame pixels.
+    /// These are distinct GPU buffers; no camera is rewritten between encoded
+    /// passes, since queue writes would otherwise affect every draw this frame.
+    pub(crate) fn set_native_world_resolution(&self, queue: &wgpu::Queue, size: [u32; 2]) {
+        let mut uploaded = self.uploaded_camera.get();
+        uploaded.world.screen_size = size.map(|v| v as f32);
+        uploaded.world.zoom = 1.0;
+        self.uploaded_camera.set(uploaded);
+        queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uploaded.world));
+    }
+
+    /// A UI camera of its own, for drawing the UI into a surface of its own
+    /// (`presentation::sidebar_surface`): its uniform buffer, and its group-0
+    /// bind group, which samples neutral A.
+    pub(crate) fn create_ui_camera(
+        &self,
+        device: &wgpu::Device,
+    ) -> (wgpu::Buffer, wgpu::BindGroup) {
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Surface UI Camera Uniform"),
+            contents: &crate::render::webgl::uniform_bytes(
+                device,
+                bytemuck::bytes_of(&self.ui_camera_uniform()),
+            ),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let group = camera_group(
+            device,
+            &self.camera_bind_group_layout,
+            &buffer,
+            &self.neutral_a.0,
+            &self.neutral_a.1,
+        );
+        (buffer, group)
+    }
+
+    /// A frame-sized world projection for fixed-pixel status sprites after
+    /// wheel resampling. Separate bindings keep E00's live A lookup and 600's
+    /// neutral A; queue writes must not change the native-world camera used
+    /// by already encoded passes. Bind groups retain their uniform buffer.
+    pub(crate) fn create_frame_world_cameras(
+        &self,
+        device: &wgpu::Device,
+        zoom: f32,
+        shroud: Option<&crate::render::shroud_buffer::ShroudBuffer>,
+    ) -> [wgpu::BindGroup; 2] {
+        let uniform = CameraUniform {
+            zoom,
+            ..self.ui_camera_uniform()
+        };
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Frame world projection"),
+            contents: &crate::render::webgl::uniform_bytes(device, bytemuck::bytes_of(&uniform)),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let neutral = camera_group(
+            device,
+            &self.camera_bind_group_layout,
+            &buffer,
+            &self.neutral_a.0,
+            &self.neutral_a.1,
+        );
+        let world = if let Some(shroud) = shroud {
+            let (view, source) = shroud.gpu_source();
+            camera_group(
+                device,
+                &self.camera_bind_group_layout,
+                &buffer,
+                view,
+                source,
+            )
+        } else {
+            neutral.clone()
+        };
+        [world, neutral]
     }
 
     pub(crate) fn write_camera(&self, queue: &wgpu::Queue, uniform: CameraUniform) {
-        let mut uploaded = self.uploaded_camera.write().expect("camera owner lock");
-        *uploaded = uniform;
-        queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&uniform));
-        let ui_uniform = CameraUniform {
-            zoom: 1.0,
-            _pad: 0.0,
-            ..uniform
-        };
-        queue.write_buffer(&self.ui_camera_buffer, 0, bytemuck::bytes_of(&ui_uniform));
+        let mut uploaded = self.uploaded_camera.get();
+        let ui = ui_camera(uniform);
+        // Each queue write costs a staging buffer; a camera that has not
+        // moved is already in its buffer.
+        for (buffer, held, camera) in [
+            (&self.camera_buffer, &mut uploaded.world, uniform),
+            (&self.ui_camera_buffer, &mut uploaded.ui, ui),
+        ] {
+            if bytemuck::bytes_of(held) != bytemuck::bytes_of(&camera) {
+                queue.write_buffer(buffer, 0, bytemuck::bytes_of(&camera));
+                *held = camera;
+            }
+        }
+        self.uploaded_camera.set(uploaded);
     }
 
     /// Create a standalone instance buffer (not stored in the renderer).
@@ -1644,11 +2205,17 @@ impl BatchRenderer {
         buffer: &'a wgpu::Buffer,
         start: u32,
         count: u32,
+        render_z: crate::render::tactical_draw_plan::RenderZPolicy,
     ) {
         if count == 0 {
             return;
         }
-        render_pass.set_pipeline(&self.voxel_sprite_pipeline);
+        let pipeline = if render_z == crate::render::tactical_draw_plan::RenderZPolicy::None {
+            &self.voxel_passthrough_pipeline
+        } else {
+            &self.voxel_sprite_pipeline
+        };
+        render_pass.set_pipeline(pipeline);
         render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
         render_pass.set_bind_group(1, &atlas.bind_group, &[]);
         render_pass.set_bind_group(2, palette_bind_group, &[]);
@@ -1661,9 +2228,17 @@ impl BatchRenderer {
         &self.camera_bind_group
     }
 
+    pub(crate) fn surface_camera_bind_group(&self) -> &wgpu::BindGroup {
+        &self.surface_camera_bind_group
+    }
+
     /// Share the production RGBA/source-index binding layout.
     pub(crate) fn texture_bind_group_layout(&self) -> &wgpu::BindGroupLayout {
         &self.texture_bind_group_layout
+    }
+
+    pub(crate) fn zshape_bind_group_layout(&self) -> &wgpu::BindGroupLayout {
+        &self.zshape_bind_group_layout
     }
 
     /// Access the camera bind group layout so external pipelines can share it.
@@ -1686,16 +2261,19 @@ impl BatchRenderer {
     /// Returns both the raw `wgpu::Texture` (needed for write_texture) and the
     /// `BatchTexture` (needed for draw calls). The texture is created with
     /// `TEXTURE_BINDING | COPY_DST` usage so it can be updated each frame
-    /// without recreating the bind group.
+    /// without recreating the bind group. `filter` samples it when a draw
+    /// scales it: `Nearest` for pixel art, `Linear` for scaled video.
     pub fn create_updatable_texture(
         &self,
-        gpu: &GpuContext,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
         rgba_data: &[u8],
         width: u32,
         height: u32,
+        filter: wgpu::FilterMode,
     ) -> (wgpu::Texture, BatchTexture) {
-        let texture: wgpu::Texture = gpu.device.create_texture_with_data(
-            &gpu.queue,
+        let texture: wgpu::Texture = device.create_texture_with_data(
+            queue,
             &wgpu::TextureDescriptor {
                 label: Some("Updatable Batch Texture"),
                 size: wgpu::Extent3d {
@@ -1715,32 +2293,31 @@ impl BatchRenderer {
         );
 
         let view: wgpu::TextureView = texture.create_view(&Default::default());
-        let sampler: wgpu::Sampler = gpu.device.create_sampler(&wgpu::SamplerDescriptor {
+        let sampler: wgpu::Sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Updatable Batch Sampler"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
+            mag_filter: filter,
+            min_filter: filter,
             ..Default::default()
         });
 
-        let bind_group: wgpu::BindGroup =
-            gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Updatable Batch Texture BG"),
-                layout: &self.texture_bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: wgpu::BindingResource::TextureView(&view),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: wgpu::BindingResource::Sampler(&sampler),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: wgpu::BindingResource::TextureView(&self.default_source_indices),
-                    },
-                ],
-            });
+        let bind_group: wgpu::BindGroup = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Updatable Batch Texture BG"),
+            layout: &self.texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&self.default_source_indices),
+                },
+            ],
+        });
 
         let batch_tex = BatchTexture {
             bind_group,
@@ -1765,7 +2342,7 @@ impl BatchRenderer {
             return;
         }
         render_pass.set_pipeline(&self.overlay_pipeline);
-        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        render_pass.set_bind_group(0, &self.surface_camera_bind_group, &[]);
         render_pass.set_bind_group(1, &texture.bind_group, &[]);
         render_pass.set_vertex_buffer(0, buffer.slice(..));
         render_pass.draw(0..6, 0..count);
@@ -1776,15 +2353,6 @@ impl BatchRenderer {
     /// The color texture view and depth texture view must have identical UV layout
     /// (same atlas dimensions and tile placements) so the shader can sample both
     /// at the same UV coordinates.
-    pub fn create_zdepth_bind_group(
-        &self,
-        gpu: &GpuContext,
-        color_view: &wgpu::TextureView,
-        depth_view: &wgpu::TextureView,
-    ) -> wgpu::BindGroup {
-        self.create_zdepth_bind_group_on_device(&gpu.device, color_view, depth_view)
-    }
-
     pub(crate) fn create_zdepth_bind_group_on_device(
         &self,
         device: &wgpu::Device,
@@ -1817,10 +2385,10 @@ impl BatchRenderer {
         })
     }
 
-    /// Draw instances with the Z-depth pipeline (per-pixel frag_depth, Less compare).
+    /// Draw instances with the TMP Z-depth pipeline (per-pixel depth, LessEqual).
     ///
     /// Used for terrain tiles with TMP Z-data. The bind_group must be created via
-    /// `create_zdepth_bind_group()` with matching color + depth atlas textures.
+    /// `create_zdepth_bind_group_on_device()` with matching color + depth atlas textures.
     pub fn draw_with_buffer_zdepth<'a>(
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
@@ -1828,19 +2396,89 @@ impl BatchRenderer {
         buffer: &'a wgpu::Buffer,
         count: u32,
     ) {
-        if count == 0 {
+        self.draw_zdepth_range(render_pass, bind_group, buffer, 0..count);
+    }
+
+    /// [`Self::draw_with_buffer_zdepth`] for the instances in `range`.
+    pub fn draw_zdepth_range<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        bind_group: &'a wgpu::BindGroup,
+        buffer: &'a wgpu::Buffer,
+        range: std::ops::Range<u32>,
+    ) {
+        if range.is_empty() {
             return;
         }
         render_pass.set_pipeline(&self.zdepth_pipeline);
         render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
         render_pass.set_bind_group(1, bind_group, &[]);
         render_pass.set_vertex_buffer(0, buffer.slice(..));
+        render_pass.draw(0..6, range);
+    }
+
+    /// Direct surface/UI stores with neither A nor Z interaction. Native
+    /// DSurface4C0750/4C0110 lines already resolve their A admission on the CPU;
+    /// their stored color must not be shaded again. World SHP/FX sources use
+    /// `draw_passthrough_range`, whose shared palette resolver reads A.
+    pub fn draw_with_buffer_passthrough<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        texture: &'a BatchTexture,
+        buffer: &'a wgpu::Buffer,
+        count: u32,
+    ) {
+        self.draw_with_buffer_passthrough_range(render_pass, texture, buffer, 0, count);
+    }
+
+    /// A chrome page's direct store. With `smooth`, an enlarged quad draws
+    /// box-filtered with a little of xBR's rounding (`fs_shell_smooth`), for
+    /// VERA's online client; a quad at its own size draws as it would without
+    /// it. Only for RGBA pages.
+    pub(crate) fn draw_chrome<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        texture: &'a BatchTexture,
+        buffer: &'a wgpu::Buffer,
+        count: u32,
+        smooth: bool,
+    ) {
+        if !smooth {
+            self.draw_with_buffer_passthrough(render_pass, texture, buffer, count);
+            return;
+        }
+        if count == 0 {
+            return;
+        }
+        render_pass.set_pipeline(&self.smooth_chrome_pipeline);
+        render_pass.set_bind_group(0, &self.surface_camera_bind_group, &[]);
+        render_pass.set_bind_group(1, &texture.bind_group, &[]);
+        render_pass.set_vertex_buffer(0, buffer.slice(..));
         render_pass.draw(0..6, 0..count);
     }
 
-    /// Draw sprites/overlays with depth test bypassed (Always compare).
-    /// Sprites never interact with the Z-buffer — painted over terrain unconditionally.
-    pub fn draw_with_buffer_passthrough<'a>(
+    /// A contiguous direct-store range, bypassing both A and Z. Health pips
+    /// (native flags600 ->4912B0) share this owner with other surface stores.
+    pub(crate) fn draw_with_buffer_passthrough_range<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        texture: &'a BatchTexture,
+        buffer: &'a wgpu::Buffer,
+        start: u32,
+        count: u32,
+    ) {
+        self.draw_passthrough_range_bound(
+            render_pass,
+            texture,
+            buffer,
+            &self.surface_camera_bind_group,
+            start,
+            count,
+        );
+    }
+
+    /// Direct stores at neutral A, bypassing Z and reading no palette row.
+    pub(crate) fn draw_surface_stores<'a>(
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
         texture: &'a BatchTexture,
@@ -1850,31 +2488,28 @@ impl BatchRenderer {
         if count == 0 {
             return;
         }
-        render_pass.set_pipeline(&self.overlay_passthrough_pipeline);
+        render_pass.set_pipeline(&self.surface_store_pipeline);
         render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
         render_pass.set_bind_group(1, &texture.bind_group, &[]);
         render_pass.set_vertex_buffer(0, buffer.slice(..));
         render_pass.draw(0..6, 0..count);
     }
 
-    /// Draw authoritative child-light mask quads through the native
-    /// destination-dependent zero-blend equation. The current RGBA/BGRA target
-    /// cannot reproduce native RGB565 extraction/repack rounding; that target
-    /// format boundary remains explicit rather than being approximated here.
-    pub fn draw_spotlight_type16<'a>(
+    /// Draw `pieces` [`StrokePiece`]s ([`stroke_pieces`]) in order, a later
+    /// store over an earlier one, with the world camera and its live A.
+    pub(crate) fn draw_surface_strokes<'a>(
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
         buffer: &'a wgpu::Buffer,
-        count: u32,
+        pieces: u32,
     ) {
-        if count == 0 {
+        if pieces == 0 {
             return;
         }
-        render_pass.set_pipeline(&self.spotlight_zero_blend_pipeline);
+        render_pass.set_pipeline(&self.stroke_pipeline);
         render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-        render_pass.set_bind_group(1, &self.spotlight_type16_masks.bind_group, &[]);
         render_pass.set_vertex_buffer(0, buffer.slice(..));
-        render_pass.draw(0..6, 0..count);
+        render_pass.draw(0..STROKE_PIECE_PIXELS, 0..pieces);
     }
 
     /// Draw with depth bypassed AND the UI camera (zoom=1.0, screen-fixed).
@@ -1946,7 +2581,7 @@ impl BatchRenderer {
             return;
         }
         render_pass.set_pipeline(&self.depth_test_pipeline);
-        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+        render_pass.set_bind_group(0, &self.surface_camera_bind_group, &[]);
         render_pass.set_bind_group(1, &texture.bind_group, &[]);
         render_pass.set_vertex_buffer(0, buffer.slice(..));
         render_pass.draw(0..6, 0..count);
@@ -1958,14 +2593,58 @@ impl BatchRenderer {
         gpu: &GpuContext,
         view: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
-        gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        self.create_zshape_bind_group_on_device(&gpu.device, view)
+    }
+
+    pub(crate) fn create_zshape_bind_group_on_device(
+        &self,
+        device: &wgpu::Device,
+        view: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ZShape BG"),
             layout: &self.zshape_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(view),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&self.zshape_skips_view),
+                },
+            ],
         })
+    }
+
+    /// Write this picture's skip table: `rows` holds whole slots of
+    /// `SKIP_TABLE_ROWS` bytes (`ZShapeSkips::upload`). Slots past the ones
+    /// written keep stale rows, which no body of this picture names.
+    pub(crate) fn write_zshape_skips(&self, queue: &wgpu::Queue, rows: &[u8]) {
+        let per_slot = super::zshape_skips::SKIP_TABLE_ROWS;
+        let slots = (rows.len() / per_slot as usize) as u32;
+        if slots == 0 {
+            return;
+        }
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.zshape_skips,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &rows[..(slots * per_slot) as usize],
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(per_slot),
+                rows_per_image: Some(slots),
+            },
+            wgpu::Extent3d {
+                width: per_slot,
+                height: slots,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 
     /// Neutral 1x1 z-shape for draws that carry no BUILDNGZ.
@@ -1988,14 +2667,48 @@ impl BatchRenderer {
         count: u32,
         write: bool,
     ) {
-        if count == 0 {
-            return;
-        }
-        render_pass.set_pipeline(if write {
+        let pipeline = if write {
             &self.zsprite_write_pipeline
         } else {
             &self.zsprite_read_pipeline
-        });
+        };
+        self.draw_zsprites(render_pass, pipeline, texture, zshape, buffer, start, count);
+    }
+
+    /// [`Self::draw_zsprite_range`] of opaque bodies inside a depth-tested
+    /// edit interval, whose pass also has the shadow counts attached.
+    pub(crate) fn draw_zsprite_counted_range(
+        &self,
+        render_pass: &mut wgpu::RenderPass<'_>,
+        texture: &BatchTexture,
+        zshape: &wgpu::BindGroup,
+        buffer: &wgpu::Buffer,
+        start: u32,
+        count: u32,
+        write: bool,
+    ) {
+        let pipelines = self
+            .zsprite_counted_pipelines
+            .as_ref()
+            .expect("depth-tested intervals have counted pipelines");
+        let pipeline = &pipelines[usize::from(write)];
+        self.draw_zsprites(render_pass, pipeline, texture, zshape, buffer, start, count);
+    }
+
+    fn draw_zsprites(
+        &self,
+        render_pass: &mut wgpu::RenderPass<'_>,
+        pipeline: &wgpu::RenderPipeline,
+        texture: &BatchTexture,
+        zshape: &wgpu::BindGroup,
+        buffer: &wgpu::Buffer,
+        start: u32,
+        count: u32,
+    ) {
+        if count == 0 {
+            return;
+        }
+        render_pass.set_pipeline(pipeline);
         render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
         render_pass.set_bind_group(1, &texture.bind_group, &[]);
         render_pass.set_bind_group(2, zshape, &[]);
@@ -2003,8 +2716,10 @@ impl BatchRenderer {
         render_pass.draw(0..6, start..start + count);
     }
 
-    /// Draw a sub-range of sprites with depth test bypassed (Always compare).
-    /// Used for the multi-way merge of Y-sorted VXL + SHP draw groups.
+    /// World SHP/compatibility sources with A lookup and Z bypassed (Always).
+    /// Used by ordinary no-Z sprites, smudges and particle/FX sources. Indexed
+    /// opaque pixels use the native palette LUT; unresolved precomposed/alpha
+    /// branches shade their source only, never an earlier surface store.
     pub fn draw_passthrough_range<'a>(
         &'a self,
         render_pass: &mut wgpu::RenderPass<'a>,
@@ -2013,13 +2728,171 @@ impl BatchRenderer {
         start: u32,
         count: u32,
     ) {
-        if count == 0 {
+        self.draw_passthrough_range_bound(
+            render_pass,
+            texture,
+            buffer,
+            &self.camera_bind_group,
+            start,
+            count,
+        );
+    }
+
+    pub(crate) fn draw_passthrough_range_bound<'a>(
+        &'a self,
+        render_pass: &mut wgpu::RenderPass<'a>,
+        texture: &'a BatchTexture,
+        buffer: &'a wgpu::Buffer,
+        camera: &'a wgpu::BindGroup,
+        start: u32,
+        count: u32,
+    ) {
+        self.draw_passthrough_group(
+            render_pass,
+            &texture.bind_group,
+            buffer,
+            camera,
+            start..start + count,
+        );
+    }
+
+    /// [`Self::draw_passthrough_range_bound`] with a texture's bind group.
+    pub(crate) fn draw_passthrough_group(
+        &self,
+        render_pass: &mut wgpu::RenderPass<'_>,
+        texture: &wgpu::BindGroup,
+        buffer: &wgpu::Buffer,
+        camera: &wgpu::BindGroup,
+        instances: std::ops::Range<u32>,
+    ) {
+        if instances.is_empty() {
             return;
         }
         render_pass.set_pipeline(&self.overlay_passthrough_pipeline);
-        render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-        render_pass.set_bind_group(1, &texture.bind_group, &[]);
+        render_pass.set_bind_group(0, camera, &[]);
+        render_pass.set_bind_group(1, texture, &[]);
         render_pass.set_vertex_buffer(0, buffer.slice(..));
-        render_pass.draw(0..6, start..start + count);
+        render_pass.draw(0..6, instances);
+    }
+}
+
+/// The UI camera for a world camera: zoom 1, and never the debug depth view.
+fn ui_camera(world: CameraUniform) -> CameraUniform {
+    CameraUniform {
+        zoom: 1.0,
+        _pad: 0.0,
+        ..world
+    }
+}
+
+/// The stroke draw: one point per walked pixel, stored over what is there
+/// without reading or writing Z, as the batch's surface stores are.
+fn stroke_pipeline(
+    device: &wgpu::Device,
+    camera_layout: &wgpu::BindGroupLayout,
+    format: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("Surface strokes"),
+        source: wgpu::ShaderSource::Wgsl(
+            crate::render::webgl::camera_source(
+                device,
+                crate::render::tactical_shader::world_source(SURFACE_STROKE_SHADER),
+            )
+            .into(),
+        ),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("Surface strokes"),
+        bind_group_layouts: &[Some(camera_layout)],
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("Surface strokes (7BA610/4C0750)"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_stroke"),
+            buffers: &[Some(wgpu::VertexBufferLayout {
+                array_stride: std::mem::size_of::<StrokePiece>() as u64,
+                step_mode: wgpu::VertexStepMode::Instance,
+                attributes: &STROKE_PIECE_ATTRIBUTES,
+            })],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_stroke"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::PointList,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(wgpu::CompareFunction::Always),
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
+
+fn camera_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    camera: &wgpu::Buffer,
+    a: &wgpu::TextureView,
+    source: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Camera and tactical A source"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(a),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: source.as_entire_binding(),
+            },
+        ],
+    })
+}
+
+#[cfg(all(test, tests_render_a_r))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_stream_only_following_its_camera_shows_the_same_picture() {
+        let quad = |x, y, alpha| SpriteInstance {
+            position: [x, y],
+            alpha,
+            ..Default::default()
+        };
+        let old = [quad(110.0, 20.0, 1.0)];
+        let old_bytes = bytemuck::cast_slice(&old);
+        let followed =
+            |new: &[SpriteInstance]| followed_camera(old_bytes, [100.0, 0.0], new, [125.0, -3.0]);
+        assert!(followed(&[quad(135.0, 17.0, 1.0)]));
+        // It stayed where it was, so the camera's move shifted it on screen.
+        assert!(!followed(&[quad(110.0, 20.0, 1.0)]));
+        assert!(!followed(&[quad(135.0, 17.0, 0.5)]));
+        assert!(!followed(&[]));
     }
 }

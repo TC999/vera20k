@@ -4,7 +4,7 @@
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct Input {
+pub struct Input {
     pub current: i32,
     pub strength: i32,
     yellow_bits: String,
@@ -22,7 +22,7 @@ impl Input {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct Output {
+pub struct Output {
     pub navigation_category: u8,
     pub occupied_body_frames: Vec<BodyFrame>,
     pub garrison_red: bool,
@@ -39,14 +39,14 @@ pub(crate) struct Output {
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct BodyFrame {
+pub struct BodyFrame {
     pub occupants: u32,
     pub tech_level: i32,
     pub frame: u16,
 }
 
 #[derive(Debug, Deserialize)]
-pub(crate) struct Row {
+pub struct Row {
     pub input: Input,
     pub output: Output,
 }
@@ -55,13 +55,13 @@ pub(crate) fn decode(bits: &str) -> f64 {
     f64::from_bits(u64::from_str_radix(bits, 16).expect("native f64 bits"))
 }
 
-pub(crate) fn rows() -> Vec<Row> {
+pub fn rows() -> Vec<Row> {
     #[derive(Deserialize)]
     struct Corpus {
         rows: Vec<Row>,
     }
-    let corpus: Corpus = serde_json::from_str(include_str!(
-        "../../tools/spatial_oracle/health_ratio_predicates.json"
+    let corpus: Corpus = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/health_ratio_predicates.json",
     ))
     .expect("original health ratio caller corpus");
     assert_eq!(corpus.rows.len(), 103);

@@ -6,11 +6,11 @@
 //! Compare all represented outputs, the retained Foot+68A byte and full
 //! Scenario RNG, excluding only native timer padding.
 use super::tests::fixture_with_rules;
-use crate::map::overlay_types::OverlayTypeRegistry;
+use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::cloak_disguise::CloakRuntime;
 use crate::sim::combat::TargetKind;
-use crate::sim::components::{DriveCoord, MovementTarget, NavTargetRef};
+use crate::sim::components::{DriveCoord, NavTargetRef};
 use crate::sim::mission::{MissionDispatchTimer, MissionId, state::MissionTestFixture};
 use crate::sim::movement::fresh_oracle_seam::{self, FreshCallRecord, SuppliedPath};
 use crate::sim::movement::locomotor::MovementLayer;
@@ -24,13 +24,15 @@ use serde_json::{Value, json};
 const CELL: u64 = 0x2000_0000;
 const OTHER: u64 = 0x2002_1000;
 const ATTACK_CELL: u64 = 0x2001_9400;
-const EXTRA: &str = "[ENGINEER]\nMovementZone=Infantry\n\
+// Original walk_prehead_response.py initializes Rules+628 to10, independently
+// of the obstacle's cloak component. Exercise the live production Rules reader.
+const EXTRA: &str = "[General]\nCloakingStages=10\n[ENGINEER]\nMovementZone=Infantry\n\
     [VehicleTypes]\n0=OBSTACLE\n[OBSTACLE]\nStrength=100\nSpeed=4\n\
     CloakingSpeed=4\nLocomotor={4A582741-9839-11D1-B709-00A024DDAFD1}\n";
 
 fn corpus() -> Vec<Value> {
-    serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/walk_prehead_response.json"
+    serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/walk_prehead_response.json",
     ))
     .unwrap()
 }
@@ -69,8 +71,8 @@ fn fixture(row: &Value) -> (Simulation, RuleSet, OverlayTypeRegistry, u64, Optio
     rules.general.scold_sound = None;
     let owner = sim.interner.intern("Americans");
     let mut house = crate::sim::house_state::HouseState::new(owner, 0, None, false, 0, 0);
-    house.player_control = true;
-    sim.houses.insert(owner, house);
+    house.set_player_control_for_test(true);
+    sim.houses.register(house);
     let id = sim
         .spawn_object("ENGINEER", "Americans", 9, 10, 0, &rules)
         .unwrap();
@@ -97,16 +99,15 @@ fn fixture(row: &Value) -> (Simulation, RuleSet, OverlayTypeRegistry, u64, Optio
     // map-node row is cluster0->1, except zone_rejected's candidate cluster1->2.
     let terrain = sim.resolved_terrain.as_mut().unwrap();
     for (x, y) in [(9, 10), (10, 10), (11, 10)] {
-        let cell = terrain.cell_mut(x, y).unwrap();
+        let cell = terrain.cell_mut_for_test(x, y).unwrap();
         cell.level = 2;
         cell.slope_type = 1;
     }
-    terrain.cell_mut(9, 10).unwrap().yr_cell_land_type =
+    terrain.cell_mut_for_test(9, 10).unwrap().land_type =
         input["current_land"].as_u64().unwrap_or(0) as u8;
-    let candidate = terrain.cell_mut(10, 10).unwrap();
+    let candidate = terrain.cell_mut_for_test(10, 10).unwrap();
     candidate.level = input["candidate_level"].as_i64().unwrap_or(2) as u8;
     candidate.bridge_facts.raw_flags = input["candidate_flags"].as_u64().unwrap_or(0) as u32;
-    candidate.bridge_facts.overlay_id = input.get("wall").map(|_| 0);
     if input["current_missing"] == true {
         let allocated: Vec<(u16, u16)> = (0..33)
             .flat_map(|y| (0..33).map(move |x| (x, y)))
@@ -118,17 +119,25 @@ fn fixture(row: &Value) -> (Simulation, RuleSet, OverlayTypeRegistry, u64, Optio
             .shared_cell_dummy()
             .test_set_land_type(input["dummy_land"].as_i64().unwrap() as i32);
     }
-    let base = sim.zone_grid.as_mut().unwrap().base_topology_mut();
-    base.native_bridge_source_size = Some((8, 8));
-    base.zone_ids.fill(0);
-    for row in &mut base.raw_zone_ids_by_row {
+    let base = sim.zone_grid.as_mut().unwrap().base_topology_mut_for_test();
+    base.set_native_bridge_source_size_for_test(Some((8, 8)));
+    base.zone_ids_mut_for_test().fill(0);
+    for row in base.raw_zone_ids_by_row_mut_for_test() {
         *row = vec![1, 2];
     }
     if input["zone_rejected"] == true {
-        base.zone_ids[10 * 33 + 10] = 1;
+        base.zone_ids_mut_for_test()[10 * 33 + 10] = 1;
     }
     if input["target_zone_rejected"] == true {
-        base.zone_ids[10 * 33 + 11] = 1;
+        base.zone_ids_mut_for_test()[10 * 33 + 11] = 1;
+    }
+    // The wall stands in OverlayGrid alone, as one built in play does; the
+    // Override reads the live Cell+0x44 (75BAF3).
+    if input.get("wall").is_some() {
+        sim.overlay_grid
+            .as_mut()
+            .unwrap()
+            .place_overlay(10, 10, 0, 0);
     }
     let current = input.get("current").map(coord).unwrap_or(DriveCoord {
         x: 2496,
@@ -136,16 +145,20 @@ fn fixture(row: &Value) -> (Simulation, RuleSet, OverlayTypeRegistry, u64, Optio
         z: 260,
     });
     let e = sim.substrate.entities.get_mut(id).unwrap();
-    e.position.rx = (current.x / 256) as u16;
-    e.position.ry = (current.y / 256) as u16;
-    e.position.sub_x = SimFixed::from_num(current.x % 256);
-    e.position.sub_y = SimFixed::from_num(current.y % 256);
-    e.position.exact_z_leptons = Some(current.z);
-    e.on_bridge = false;
-    e.in_playfield = input["in_playfield"].as_bool().unwrap_or(false);
-    e.lifecycle.object_alive = true;
-    e.lifecycle.cell_marked = true;
-    e.dock_entered_with = input["tethered"].as_bool().unwrap_or(false).then_some(999);
+    e.position.set_rx_for_test((current.x / 256) as u16);
+    e.position.set_ry_for_test((current.y / 256) as u16);
+    e.position
+        .set_sub_x_for_test(SimFixed::from_num(current.x % 256));
+    e.position
+        .set_sub_y_for_test(SimFixed::from_num(current.y % 256));
+    e.position.set_exact_z_leptons_for_test(Some(current.z));
+    e.set_on_bridge(false);
+    e.set_in_playfield(input["in_playfield"].as_bool().unwrap_or(false));
+    e.lifecycle.set_object_alive_for_test(true);
+    e.lifecycle.set_cell_marked_for_test(true);
+    e.seldom
+        .tether
+        .set_for_test(input["tethered"].as_bool().unwrap_or(false).then_some(999));
     e.mission.apply_test_fixture(MissionTestFixture {
         current: MissionId::from_raw(before["mission"].as_i64().unwrap() as i32),
         queued: MissionId::from_raw(before["queued_mission"].as_i64().unwrap() as i32),
@@ -170,41 +183,35 @@ fn fixture(row: &Value) -> (Simulation, RuleSet, OverlayTypeRegistry, u64, Optio
     }
     loco.set_step_head(None);
     e.foot_speed.set_speed_fraction(SIM_ZERO);
-    e.navigation.nav_com = Some(NavTargetRef::Cell { rx: 10, ry: 10 });
-    e.navigation.suspended_nav_com = None;
-    e.attack_target =
-        (input["attack_target"] == true).then_some(crate::sim::combat::AttackTarget {
-            target: TargetKind::Cell(11, 10),
-        });
-    e.suspended_attack_target = None;
-    e.navigation.path_replay.directions = vec![2, 3, 4, 5];
-    e.navigation.path_replay.cursor = 0;
-    e.navigation.path_replay.reference_cell =
-        Some(input.get("path_reference").map_or((9, 8), |p| {
+    e.navigation
+        .set_nav_com_for_test(Some(NavTargetRef::Cell { rx: 10, ry: 10 }));
+    e.navigation.set_suspended_nav_com_for_test(None);
+    e.attack_target
+        .set_for_test((input["attack_target"] == true).then_some(TargetKind::Cell(11, 10)));
+    e.seldom.suspended_attack_target.set_for_test(None);
+    e.navigation
+        .path_replay_mut()
+        .set_directions_for_test(vec![2, 3, 4, 5]);
+    e.navigation.path_replay_mut().set_cursor_for_test(0);
+    e.navigation
+        .path_replay_mut()
+        .set_reference_cell_for_test(Some(input.get("path_reference").map_or((9, 8), |p| {
             (p[0].as_i64().unwrap() as i16, p[1].as_i64().unwrap() as i16)
-        }));
-    let p = &mut e.navigation.path_runtime;
-    p.movement_timer = CdTimer::from_raw(
+        })));
+    let p = e.navigation.path_runtime_mut();
+    p.set_movement_timer_for_test(CdTimer::from_raw(
         before["movement_timer"][0].as_i64().unwrap() as i32,
         before["movement_timer"][2].as_i64().unwrap() as i32,
-    );
-    p.blocked_timer = CdTimer::from_raw(
+    ));
+    p.set_blocked_timer_for_test(CdTimer::from_raw(
         before["blockage_timer"][0].as_i64().unwrap() as i32,
         before["blockage_timer"][2].as_i64().unwrap() as i32,
-    );
-    p.path_blocked = before["blocked"] == 1;
-    p.retries_left = before["retries"].as_i64().unwrap() as u32;
+    ));
+    p.set_path_blocked_for_test(before["blocked"] == 1);
+    p.set_retries_left_for_test(before["retries"].as_i64().unwrap() as u32);
     p.set_scold_latch_for_test(before["flag68a"].as_u64().unwrap() as u8);
-    e.movement_target = Some(MovementTarget {
-        path: vec![(9, 10), (10, 10), (11, 11), (11, 12), (10, 13)],
-        path_layers: vec![MovementLayer::Ground; 5],
-        next_index: 1,
-        final_goal: Some((10, 10)),
-        adapter_route: false,
-        ..Default::default()
-    });
     if input["radio"] == true {
-        e.radio_contacts.insert(999);
+        e.seldom.radio_contacts.insert(999);
     }
     sim.substrate.occupancy = OccupancyGrid::new();
     sim.substrate.occupancy.add(
@@ -223,20 +230,23 @@ fn fixture(row: &Value) -> (Simulation, RuleSet, OverlayTypeRegistry, u64, Optio
     );
     if let Some(other) = other {
         let e = sim.substrate.entities.get_mut(other).unwrap();
-        e.position.sub_x = SimFixed::from_num(current.x % 256);
-        e.position.sub_y = SimFixed::from_num(current.y % 256);
-        e.position.exact_z_leptons = Some(current.z);
-        e.lifecycle.object_alive = input["obstacle_alive"].as_bool().unwrap_or(true);
-        e.lifecycle.cell_marked = true;
-        e.on_bridge = input["obstacle_deck"] == true;
-        let mut cloak = CloakRuntime::new(0, 10);
-        cloak.state = input["cloak"].as_i64().unwrap_or(0) as i32;
-        e.cloak = Some(cloak);
+        e.position
+            .set_sub_x_for_test(SimFixed::from_num(current.x % 256));
+        e.position
+            .set_sub_y_for_test(SimFixed::from_num(current.y % 256));
+        e.position.set_exact_z_leptons_for_test(Some(current.z));
+        e.lifecycle
+            .set_object_alive_for_test(input["obstacle_alive"].as_bool().unwrap_or(true));
+        e.lifecycle.set_cell_marked_for_test(true);
+        e.set_on_bridge(input["obstacle_deck"] == true);
+        let mut cloak = CloakRuntime::new(0);
+        cloak.set_state_for_test(input["cloak"].as_i64().unwrap_or(0) as i32);
+        e.cloak = Some(Box::new(cloak));
         sim.substrate.occupancy.add(
             10,
             10,
             other,
-            if e.on_bridge {
+            if e.on_bridge() {
                 MovementLayer::Bridge
             } else {
                 MovementLayer::Ground
@@ -245,7 +255,8 @@ fn fixture(row: &Value) -> (Simulation, RuleSet, OverlayTypeRegistry, u64, Optio
             CellListInsertion::PrependNonBuilding,
         );
     }
-    sim.session.binary_frame = input["frame"].as_u64().unwrap_or(100) as u32;
+    sim.session
+        .set_binary_frame_for_test(input["frame"].as_u64().unwrap_or(100) as u32);
     sim.scenario_rng = SimRng::new(input["seed"].as_u64().unwrap_or(31));
     (sim, rules, registry, id, other)
 }
@@ -268,15 +279,15 @@ fn compare(sim: &Simulation, id: u64, other: Option<u64>, expected: &Value, row:
         Some(NavTargetRef::Cell { rx: 10, ry: 10 }) => CELL,
         other => panic!("unexpected NavCom {other:?}"),
     };
-    let q = &e.navigation.path_replay;
+    let q = e.navigation.path_replay();
     let words: Vec<i32> = (0..4)
         .map(|i| {
-            q.directions
-                .get(usize::from(q.cursor) + i)
+            q.directions()
+                .get(usize::from(q.cursor()) + i)
                 .map_or(-1, |&w| if w == u8::MAX { -1 } else { i32::from(w) })
         })
         .collect();
-    let p = &e.navigation.path_runtime;
+    let p = e.navigation.path_runtime();
     for (key, actual) in [
         (
             "doing",
@@ -294,21 +305,24 @@ fn compare(sim: &Simulation, id: u64, other: Option<u64>, expected: &Value, row:
             "speed",
             json!(e.foot_speed.applied_fraction().to_num::<f64>()),
         ),
-        ("blocked", json!(u8::from(p.path_blocked))),
-        ("retries", json!(p.retries_left as i32)),
+        ("blocked", json!(u8::from(p.path_blocked()))),
+        ("retries", json!(p.retries_left() as i32)),
         ("flag68a", json!(p.scold_latch_raw())),
-        ("nav", json!(nav(e.navigation.nav_com))),
+        ("nav", json!(nav(e.navigation.nav_com()))),
         (
             "target",
-            json!(native_target(
-                e.attack_target.as_ref().map(|a| a.target),
-                other
-            )),
+            json!(native_target(e.attack_target.target(), other)),
         ),
-        ("suspended_nav", json!(nav(e.navigation.suspended_nav_com))),
+        (
+            "suspended_nav",
+            json!(nav(e.navigation.suspended_nav_com())),
+        ),
         (
             "suspended_target",
-            json!(native_target(e.suspended_attack_target, other)),
+            json!(native_target(
+                e.seldom.suspended_attack_target.target(),
+                other
+            )),
         ),
         ("mission", json!(e.mission.current().raw())),
         ("queued_mission", json!(e.mission.queued().raw())),
@@ -318,8 +332,8 @@ fn compare(sim: &Simulation, id: u64, other: Option<u64>, expected: &Value, row:
         assert_eq!(actual, expected[key], "{key}: {}", row["input"]);
     }
     for (key, timer) in [
-        ("movement_timer", p.movement_timer),
-        ("blockage_timer", p.blocked_timer),
+        ("movement_timer", p.movement_timer()),
+        ("blockage_timer", p.blocked_timer()),
     ] {
         assert_eq!(
             [timer.start_frame(), timer.duration()],
@@ -341,15 +355,23 @@ fn compare(sim: &Simulation, id: u64, other: Option<u64>, expected: &Value, row:
             row["input"]
         );
     }
-    let cloak = other.map(|other| sim.substrate.entities.get(other).unwrap().cloak.unwrap());
+    let cloak = other.map(|other| {
+        *sim.substrate
+            .entities
+            .get(other)
+            .unwrap()
+            .cloak
+            .clone()
+            .unwrap()
+    });
     let logical = cloak.map_or([0; 6], |c| {
         [
-            c.state,
-            c.depth as i32,
-            c.step_timer.timer.start_frame(),
-            c.step_timer.timer.duration(),
-            c.step_timer.speed,
-            c.step_delta,
+            c.state(),
+            c.depth() as i32,
+            c.step_timer().timer().start_frame(),
+            c.step_timer().timer().duration(),
+            c.step_timer().speed(),
+            c.step_delta(),
         ]
     });
     let expected_cloak: Vec<i32> = [0, 1, 3, 5, 6, 7]
@@ -480,14 +502,18 @@ fn ordinary_and_recursive_walk_responses_match_original_decoder() {
         let result = result.and_then(|retry| {
             if input["continue_recursive"] == true {
                 let request = retry.ok_or("missing recursive Walk request")?;
-                let found =
-                    sim.run_walk_path_request(&request, None, Some(&rules), Some(&registry))?;
+                let found = sim.run_walk_path_request(
+                    &request,
+                    &rules,
+                    Some(&registry),
+                    &mut crate::sim::world::FrameEffects::default(),
+                )?;
                 if found {
                     let again = sim.run_walk_admission_request(
                         request.into_walk_admission_for_test(),
-                        None,
-                        Some(&rules),
+                        &rules,
                         Some(&registry),
+                        &mut crate::sim::world::FrameEffects::default(),
                     )?;
                     assert!(again.is_none(), "recursive refusal recursed twice: {input}");
                 }
@@ -515,8 +541,8 @@ fn exhausted_walk_retry_emits_native_retained_scold_request() {
     // with the native0/1/255 guard controls and valid MenuScold binding. This
     // checks production Walk reaches the sound owner before clearing its byte;
     // sound_dispatch separately checks the centred registered-Voc consumer.
-    let native: Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/foot_scold_latch.json"
+    let native: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/foot_scold_latch.json",
     ))
     .unwrap();
     let row = corpus()
@@ -538,7 +564,7 @@ fn exhausted_walk_retry_emits_native_retained_scold_request() {
             .get_mut(id)
             .unwrap()
             .navigation
-            .path_runtime
+            .path_runtime_mut()
             .set_scold_latch_for_test(guard["supplied_byte"].as_u64().unwrap() as u8);
         let current = crate::sim::movement::ground_pose::position_world_coord(
             &sim.substrate.entities.get(id).unwrap().position,
@@ -558,7 +584,12 @@ fn exhausted_walk_retry_emits_native_retained_scold_request() {
             )
             .unwrap()
             .unwrap();
-        let result = sim.run_walk_path_request(&request, None, Some(&rules), Some(&registry));
+        let result = sim.run_walk_path_request(
+            &request,
+            &rules,
+            Some(&registry),
+            &mut crate::sim::world::FrameEffects::default(),
+        );
         let (_, unused) = fresh_oracle_seam::finish();
         assert!(!result.unwrap());
         assert_eq!(unused, 0);
@@ -569,7 +600,7 @@ fn exhausted_walk_retry_emits_native_retained_scold_request() {
                     .get(id)
                     .unwrap()
                     .navigation
-                    .path_runtime
+                    .path_runtime()
                     .scold_latch_raw()
             ),
             guard["final_byte"]
@@ -579,7 +610,7 @@ fn exhausted_walk_retry_emits_native_retained_scold_request() {
             .iter()
             .filter_map(|event| match event {
                 crate::sim::world::SimSoundEvent::VocCentered { sound_id } => {
-                    Some(sound_id.as_str())
+                    Some(sound_id.name_in(&rules))
                 }
                 _ => None,
             })

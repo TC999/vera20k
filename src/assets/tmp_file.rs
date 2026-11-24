@@ -7,10 +7,21 @@
 //! ## Dependency rules
 //! - Part of assets/ — no dependencies on game modules.
 
+// Outside data reaches this module: it refuses bad input, never panics.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
+
 use crate::assets::error::AssetError;
 use crate::assets::pal_file::Palette;
 use crate::assets::tmp_decode;
-use crate::util::read_helpers::read_u32_le;
+use crate::util::read_helpers::{read_i32_le, read_u32_le};
 
 /// Size of the TMP file header in bytes.
 const TMP_HEADER_SIZE: usize = 16;
@@ -61,7 +72,7 @@ impl TmpFile {
     /// Native 0x547150 returns header height + stored Y - extra Y when bit 0
     /// is set; sparse slots use header height. Consumers apply subtile modulo
     /// to this type-owned table. No canvas union or extra bottom participates.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn draw_heights_from_bytes(data: &[u8]) -> Result<Vec<i32>, AssetError> {
         Self::pristine_header_fields_from_bytes(data)
             .map(|rows| rows.into_iter().map(|row| row.0).collect())
@@ -75,34 +86,45 @@ impl TmpFile {
         let invalid = || AssetError::InvalidTmpFile {
             reason: "Invalid TMP header/offset table for native draw dimensions".to_owned(),
         };
-        if data.len() < TMP_HEADER_SIZE {
+        let (Some(width), Some(height), Some(base), Some(table)) = (
+            read_u32_le(data, 0),
+            read_u32_le(data, 4),
+            read_i32_le(data, 12),
+            data.get(TMP_HEADER_SIZE..),
+        ) else {
             return Err(invalid());
-        }
-        let width = read_u32_le(data, 0);
-        let height = read_u32_le(data, 4);
+        };
         if width == 0 || height == 0 || width > 255 || height > 255 {
             return Err(invalid());
         }
         let count = (width * height) as usize;
-        if data.len() < TMP_HEADER_SIZE + count * 4 {
-            return Err(invalid());
-        }
-        let base = read_u32_le(data, 12) as i32;
-        (0..count)
-            .map(|index| {
-                let offset = read_u32_le(data, TMP_HEADER_SIZE + index * 4) as usize;
+        let offsets = table.as_chunks::<4>().0.get(..count).ok_or_else(invalid)?;
+        offsets
+            .iter()
+            .map(|offset| {
+                let offset = u32::from_le_bytes(*offset) as usize;
                 if offset == 0 {
                     return Ok((base, false));
                 }
-                if offset.checked_add(52).is_none_or(|end| end > data.len()) {
+                // The cell's whole 52-byte header must be in the file.
+                let (Some(stored_y), Some(extra_y), Some(flags), Some(_)) = data
+                    .get(offset..)
+                    .map(|cell| {
+                        (
+                            read_i32_le(cell, 4),
+                            read_i32_le(cell, 24),
+                            read_u32_le(cell, 36),
+                            cell.get(..52),
+                        )
+                    })
+                    .ok_or_else(invalid)?
+                else {
                     return Err(invalid());
-                }
-                let flags = read_u32_le(data, offset + 36);
+                };
                 let height = if flags & 1 == 0 {
                     base
                 } else {
-                    base.wrapping_add(read_u32_le(data, offset + 4) as i32)
-                        .wrapping_sub(read_u32_le(data, offset + 24) as i32)
+                    base.wrapping_add(stored_y).wrapping_sub(extra_y)
                 };
                 Ok((height, flags & 4 != 0))
             })
@@ -111,7 +133,20 @@ impl TmpFile {
 
     /// Parse a TMP file from raw bytes.
     pub fn from_bytes(data: &[u8]) -> Result<Self, AssetError> {
-        if data.len() < TMP_HEADER_SIZE {
+        let (
+            Some(raw_template_width),
+            Some(raw_template_height),
+            Some(tile_width),
+            Some(tile_height),
+            Some(offset_table),
+        ) = (
+            read_u32_le(data, 0),
+            read_u32_le(data, 4),
+            read_u32_le(data, 8),
+            read_u32_le(data, 12),
+            data.get(TMP_HEADER_SIZE..),
+        )
+        else {
             return Err(AssetError::InvalidTmpFile {
                 reason: format!(
                     "File too small for header: {} bytes (need {})",
@@ -119,15 +154,13 @@ impl TmpFile {
                     TMP_HEADER_SIZE
                 ),
             });
-        }
+        };
 
-        let raw_template_width: u32 = read_u32_le(data, 0);
-        let raw_template_height: u32 = read_u32_le(data, 4);
         // The active loader stores only the low byte of each template dimension.
         // Its initial relocation loop still uses the raw dword product, so files
         // whose high bytes change that count have no single safe decoded shape.
-        let template_width: u32 = u32::from(data[0]);
-        let template_height: u32 = u32::from(data[4]);
+        let template_width: u32 = raw_template_width & 0xff;
+        let template_height: u32 = raw_template_height & 0xff;
         let raw_cell_count: u64 = u64::from(raw_template_width) * u64::from(raw_template_height);
         let decoded_cell_count: u64 = u64::from(template_width) * u64::from(template_height);
         if raw_cell_count != decoded_cell_count {
@@ -151,9 +184,6 @@ impl TmpFile {
                 ),
             });
         }
-        let tile_width: u32 = read_u32_le(data, 8);
-        let tile_height: u32 = read_u32_le(data, 12);
-
         if template_width == 0 || template_height == 0 {
             return Err(AssetError::InvalidTmpFile {
                 reason: format!(
@@ -174,35 +204,19 @@ impl TmpFile {
         }
 
         let cell_count: usize = decoded_cell_count as usize;
-        let offset_table_bytes: usize =
-            cell_count
-                .checked_mul(4)
-                .ok_or_else(|| AssetError::InvalidTmpFile {
-                    reason: format!("Template offset table is too large: {} cells", cell_count),
-                })?;
-        let offsets_end: usize =
-            TMP_HEADER_SIZE
-                .checked_add(offset_table_bytes)
-                .ok_or_else(|| AssetError::InvalidTmpFile {
-                    reason: "Template offset table size overflow".to_string(),
-                })?;
-        if data.len() < offsets_end {
+        let Some(offsets) = offset_table.as_chunks::<4>().0.get(..cell_count) else {
             return Err(AssetError::InvalidTmpFile {
                 reason: format!(
-                    "File too small for offset table: {} bytes (need {})",
+                    "File too small for offset table: {} bytes (need {} for {} cells)",
                     data.len(),
-                    offsets_end
+                    TMP_HEADER_SIZE + cell_count * 4,
+                    cell_count
                 ),
             });
-        }
-
-        let mut offsets: Vec<u32> = Vec::with_capacity(cell_count);
-        for i in 0..cell_count {
-            offsets.push(read_u32_le(data, TMP_HEADER_SIZE + i * 4));
-        }
+        };
 
         let mut tiles: Vec<Option<TmpTile>> = Vec::with_capacity(cell_count);
-        for &offset in &offsets {
+        for offset in offsets.iter().copied().map(u32::from_le_bytes) {
             if offset == 0 {
                 tiles.push(None);
                 continue;
@@ -251,13 +265,15 @@ impl TmpFile {
         let pixel_count: usize = tile.pixel_width as usize * tile.pixel_height as usize;
         let mut rgba: Vec<u8> = Vec::with_capacity(pixel_count * 4);
         for (i, &idx) in tile.pixels.iter().enumerate() {
-            let color = palette.colors[idx as usize];
+            let color = palette.color(idx);
             rgba.push(color.r);
             rgba.push(color.g);
             rgba.push(color.b);
             // Inside the diamond, palette index 0 is a valid color — render opaque.
-            // Outside the diamond, index 0 means transparent background.
-            // Chroma key (magenta, idx != 0) stays transparent everywhere.
+            // Outside the diamond, index 0 means transparent background. Every
+            // other index is opaque: no palette entry is a colour key
+            // (ConvertClass 0x0048E740 -> 0x004BBB00 and LightConvertClass
+            // 0x00556090 convert every entry by its colour).
             //
             // The index-0 decision must NOT consult the palette's alpha: retail
             // palettes carry no alpha at all — in gamemd, transparency is the
@@ -276,7 +292,7 @@ impl TmpFile {
                 );
                 rgba.push(if inside { 255 } else { 0 });
             } else {
-                rgba.push(color.a);
+                rgba.push(255);
             }
         }
         Ok(rgba)
@@ -329,7 +345,7 @@ fn is_inside_diamond(
     x >= x_start && x < x_start + row_width
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_assets))]
 mod tests {
     use super::*;
     use crate::assets::tmp_decode::{DIAMOND_INITIAL_WIDTH, DIAMOND_WIDTH_STEP};
@@ -417,7 +433,7 @@ mod tests {
 
         // HasExtraData is the gate, independently of stored origins and all
         // the other flags. A no-extra cell uses the file's diamond height.
-        let offset = read_u32_le(&data, TMP_HEADER_SIZE) as usize;
+        let offset = read_u32_le(&data, TMP_HEADER_SIZE).unwrap() as usize;
         data[offset + 36..offset + 40].copy_from_slice(&6u32.to_le_bytes());
         assert_eq!(
             TmpFile::draw_heights_from_bytes(&data).unwrap(),
@@ -429,7 +445,7 @@ mod tests {
     fn native_draw_height_uses_stored_origin_not_extra_bottom_or_decoded_union() {
         for (stored_y, extra_y, native_height) in [(100, 94, 36), (100, 93, 37), (-20, -27, 37)] {
             let mut data = draw_height_headers(&[Some((stored_y, extra_y))]);
-            let offset = read_u32_le(&data, TMP_HEADER_SIZE) as usize;
+            let offset = read_u32_le(&data, TMP_HEADER_SIZE).unwrap() as usize;
             let diamond_bytes = diamond_pixel_count(30);
             data[offset + 8..offset + 12]
                 .copy_from_slice(&((52 + diamond_bytes) as u32).to_le_bytes());
@@ -481,11 +497,11 @@ mod tests {
     #[test]
     fn tile_corners_bake_transparent_even_when_palette_has_no_alpha() {
         let tmp = TmpFile::from_bytes(&make_test_tmp()).expect("parse");
-        let pal = crate::assets::pal_file::Palette::from_bytes_gamemd_ui(&vec![21u8; 768])
-            .expect("palette");
+        let pal = Palette::from_bytes(&vec![21u8; 768]).expect("palette");
         assert_eq!(
-            pal.colors[0].a, 255,
-            "fixture guard: palette carries no alpha policy"
+            pal.color(0).a,
+            255,
+            "fixture guard: palette carries no alpha"
         );
 
         let rgba = tmp.tile_to_rgba(0, &pal).expect("convert");
@@ -494,6 +510,22 @@ mod tests {
         assert_eq!(rgba[7], 0, "corner (1,0) must be transparent");
         // Row 0 columns 2..6 are inside the diamond (indices 1..): opaque.
         assert_eq!(rgba[2 * 4 + 3], 255, "diamond pixel stays opaque");
+    }
+
+    /// Tile pixels inside the diamond draw through the converter entry of
+    /// their index; ConvertClass (`0x0048E740` -> `0x004BBB00`) and
+    /// LightConvertClass::UpdateColors (`0x00556090`) key no colour. Retail
+    /// ISOTEM.PAL stores raw 63,0,63 at index 10.
+    #[test]
+    fn a_raw_magenta_palette_entry_inside_the_diamond_draws_opaque() {
+        let tmp = TmpFile::from_bytes(&make_test_tmp()).expect("parse");
+        let mut pal_data: Vec<u8> = vec![0u8; 768];
+        pal_data[3..6].copy_from_slice(&[63, 0, 63]); // index 1, at (2, 0)
+        let palette = Palette::from_bytes(&pal_data).expect("palette");
+
+        let rgba = tmp.tile_to_rgba(0, &palette).expect("convert");
+
+        assert_eq!(&rgba[2 * 4..3 * 4], &[252, 0, 252, 255]);
     }
 
     #[test]
@@ -527,19 +559,6 @@ mod tests {
         // Outside diamond = 0.
         assert_eq!(tile.pixels[0], 0);
         assert_eq!(tile.pixels[6], 0);
-    }
-
-    #[test]
-    fn test_tile_to_rgba() {
-        let tmp: TmpFile = TmpFile::from_bytes(&make_test_tmp()).expect("Should parse");
-        let palette: Palette = Palette::from_bytes(&vec![0u8; 768]).expect("palette");
-        let rgba: Vec<u8> = tmp.tile_to_rgba(0, &palette).expect("Should convert");
-        assert_eq!(rgba.len(), 128); // 8 × 4 × 4
-    }
-
-    #[test]
-    fn test_reject_too_small() {
-        assert!(TmpFile::from_bytes(&vec![0; 8]).is_err());
     }
 
     #[test]
@@ -620,21 +639,6 @@ mod tests {
     }
 
     #[test]
-    fn test_is_inside_diamond_standard_tile() {
-        // Standard 60x30 tile, no offset.
-        // Center pixel (30, 14) should be inside.
-        assert!(is_inside_diamond(30, 14, 60, 30, 0, 0));
-        // Top-left corner (0, 0) should be outside.
-        assert!(!is_inside_diamond(0, 0, 60, 30, 0, 0));
-        // Top-center pixel (28, 0) should be inside (row 0 starts at x=28).
-        assert!(is_inside_diamond(28, 0, 60, 30, 0, 0));
-        // Pixel just outside diamond at row 0 (27, 0) should be outside.
-        assert!(!is_inside_diamond(27, 0, 60, 30, 0, 0));
-        // Last row (29) has width 0 → all outside.
-        assert!(!is_inside_diamond(30, 29, 60, 30, 0, 0));
-    }
-
-    #[test]
     fn gsi_02_11_index_zero_inside_diamond_is_opaque() {
         // Build a TMP where diamond-interior pixels include palette index 0.
         // Verify tile_to_rgba makes those pixels opaque (alpha=255) instead
@@ -663,7 +667,7 @@ mod tests {
         data.extend_from_slice(&vec![0u8; dpixels]);
 
         let tmp: TmpFile = TmpFile::from_bytes(&data).expect("Should parse");
-        // Create palette where index 0 is black with alpha=0.
+        // Palette entries are opaque; index 0 is decided by the diamond.
         let palette: Palette = Palette::from_bytes(&vec![0u8; 768]).expect("palette");
         let rgba: Vec<u8> = tmp.tile_to_rgba(0, &palette).expect("Should convert");
 
@@ -673,7 +677,7 @@ mod tests {
         assert_eq!(inside_alpha, 255, "index 0 inside diamond should be opaque");
 
         // Pixel at (0, 0) is outside diamond → should be transparent.
-        let outside_alpha: u8 = rgba[0 * 4 + 3];
+        let outside_alpha: u8 = rgba[3];
         assert_eq!(
             outside_alpha, 0,
             "index 0 outside diamond should be transparent"

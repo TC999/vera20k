@@ -38,12 +38,15 @@
 //! the defense key. The map answers themselves are the owners'
 //! (`sim::cell_rect`, `sim::build_site`).
 //!
-//! RESIDUAL: a `CloakGenerator=` type keys cells by their 3D distance from the
-//! house's base coordinate instead (`0x00506329..0x0050640D`). No retail
-//! BuildingType sets the key (`ai_base_building_tests.rs` checks the retail
-//! rules), so every type takes the ordinary key.
+//! A `CloakGenerator=` type keys cells by their 3D distance from the house's
+//! base coordinate instead (`0x00506329..0x0050640D`, [`SiteKey::InnerBase`]).
+//! Under Ares, `[BuildingType] AIInnerBase=` decides that in place of
+//! `CloakGenerator=` (HouseClass_FindPlaceToBuild_Evaluate, Ares.dll
+//! 10023860, hook 0x506306). RESIDUAL (a game read the stock way): the
+//! inner-base key is not taken, so a `CloakGenerator=` type takes the
+//! ordinary key. No retail BuildingType sets the key
+//! (`ai_base_building_tests.rs` checks the retail rules).
 
-use crate::map::overlay_types::OverlayTypeRegistry;
 use crate::rules::object_type::ObjectType;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::ai_base_defense::CoverageGrid;
@@ -53,7 +56,8 @@ use crate::sim::cell_rect::{
 };
 use crate::sim::intern::InternedId;
 use crate::sim::world::Simulation;
-use crate::util::direction_tables::{CELL_DELTAS, dir_from_facing16, facing16_from_delta};
+use crate::util::direction::DIRECTION_DELTAS;
+use crate::util::direction_tables::{dir_from_facing16, facing16_from_delta};
 
 /// `0x00A8EF78`, built on first use (`0x0050670E..0x00506807`): per direction
 /// away from the base, the step from the offset corner onto the first site.
@@ -107,6 +111,11 @@ pub(crate) enum SiteKey<'a> {
         grid: &'a CoverageGrid,
         argument: i32,
     },
+    /// The inner-base key (`0x00506329..0x0050640D`), which an inner-base
+    /// type takes in place of the caller's key, with the GetCoords (Cell
+    /// vt+0x48) of the house's base-or-starting cell (`0x0050DEF0`), or
+    /// NullCoord for the empty cell.
+    InnerBase { base: [i32; 3] },
 }
 
 impl SiteKey<'_> {
@@ -114,6 +123,7 @@ impl SiteKey<'_> {
         match self {
             Self::Ordinary => ordinary_key(index, cell, center),
             Self::Defense { grid, argument } => grid.key(index, cell, center, argument),
+            Self::InnerBase { base } => inner_base_key(index, cell, base),
         }
     }
 }
@@ -135,8 +145,8 @@ pub(crate) struct SiteSearch<'a> {
     pub height: i32,
     /// `ProtectWithWall=` (`+0x1765`) or `WantsExtraSpace=` (`+0x1578`).
     pub extra_border: bool,
-    /// `GameMode` (`0x00A8B238`) is not a campaign.
-    pub game_mode_nonzero: bool,
+    /// Require a nearby reservation owned by the house placing the building.
+    pub requires_reservation_proximity: bool,
     pub key: SiteKey<'a>,
 }
 
@@ -148,7 +158,6 @@ pub(crate) fn find_base_building_site(
     owner: InternedId,
     ty: &ObjectType,
     key: SiteKey,
-    registry: Option<&OverlayTypeRegistry>,
 ) -> (i16, i16) {
     if ty.naval {
         return crate::sim::naval_base_placement::find_naval_base_placement(sim, rules, owner)
@@ -157,33 +166,51 @@ pub(crate) fn find_base_building_site(
     let Some(house) = sim.houses.get(&owner) else {
         return (0, 0);
     };
-    let mut world = SimSiteWorld::new(sim, rules, owner, ty, registry);
+    let mut world = SimSiteWorld::new(sim, rules, owner, ty);
     let perimeter: Vec<(i16, i16)> = house
-        .base_reservation
-        .perimeter_cells
+        .base_reservation()
+        .perimeter_cells()
         .iter()
         .map(|&packed| unpack_base_plan_cell(packed))
         .collect();
     let (width, height) = foundation_size(ty);
+    // Ares 3.0 10023860 (hook 0x506306): `AIInnerBase.Get(CloakGenerator)`
+    // replaces the `CloakGenerator=` test.
+    let key = if rules.ares_form() && ty.building_type_ext().ai_inner_base(ty.cloak_generator) {
+        let origin = house.base_origin();
+        let base = if origin == (0, 0) {
+            [0, 0, 0]
+        } else {
+            let cells = sim
+                .resolved_terrain
+                .as_ref()
+                .map(crate::map::resolved_terrain::NativeCellQuery::canonical);
+            let coord = crate::sim::movement::target_cell_coord(origin.0, origin.1, cells.as_ref());
+            [coord.x, coord.y, coord.z]
+        };
+        SiteKey::InnerBase { base }
+    } else {
+        key
+    };
     ordinary_site(
         &mut world,
         &SiteSearch {
-            center: signed(house.base_plan_center),
+            center: signed(house.base_plan_center()),
             origin: signed(house.base_origin()),
             perimeter: &perimeter,
             spacing: rules.ai_base_spacing,
             width,
             height,
             extra_border: ty.protect_with_wall || ty.wants_extra_space,
-            game_mode_nonzero: sim.session.game_mode_nonzero,
+            requires_reservation_proximity: sim.session.rule_policy().uses_managed_ai_base(),
             key,
         },
     )
 }
 
-/// `HouseClass @ 0x0050B760`: in a campaign always; otherwise whether a base
-/// reservation of house `owner` lies within `AIBaseSpacing=` of the foundation
-/// of `ty` at `cell`.
+/// `HouseClass @ 0x0050B760`: when the admitted rules require it, check for an
+/// `owner` reservation within `AIBaseSpacing=` of the foundation of `ty` at
+/// `cell`. Stock campaign rules accept the site without a reservation.
 pub(crate) fn reserved_near(
     sim: &Simulation,
     rules: &RuleSet,
@@ -191,10 +218,10 @@ pub(crate) fn reserved_near(
     ty: &ObjectType,
     cell: (i16, i16),
 ) -> bool {
-    if !sim.session.game_mode_nonzero {
+    if !sim.session.rule_policy().uses_managed_ai_base() {
         return true;
     }
-    let mut world = SimSiteWorld::new(sim, rules, owner, ty, None);
+    let mut world = SimSiteWorld::new(sim, rules, owner, ty);
     let (width, height) = foundation_size(ty);
     reserved_near_in(&mut world, rules.ai_base_spacing, width, height, cell, true)
 }
@@ -218,7 +245,7 @@ pub(crate) fn ordinary_site(world: &mut impl SiteWorld, search: &SiteSearch) -> 
     for &(_, cell) in &cells {
         // `0x0050656C..0x005065E0`.
         let mut into_base = (0_i16, 0_i16);
-        for (dx, dy) in CELL_DELTAS {
+        for (dx, dy) in DIRECTION_DELTAS {
             let (dx, dy) = (dx as i16, dy as i16);
             if world.reserved((cell.0.wrapping_add(dx), cell.1.wrapping_add(dy))) {
                 into_base = (into_base.0.wrapping_add(dx), into_base.1.wrapping_add(dy));
@@ -251,7 +278,7 @@ pub(crate) fn ordinary_site(world: &mut impl SiteWorld, search: &SiteSearch) -> 
                     .wrapping_add(FIRST_STEP[away].1),
             );
             if phase == 1 {
-                let (dx, dy) = CELL_DELTAS[(away + 4) & 7];
+                let (dx, dy) = DIRECTION_DELTAS[(away + 4) & 7];
                 site = (
                     site.0.wrapping_add(dx as i16),
                     site.1.wrapping_add(dy as i16),
@@ -281,9 +308,9 @@ pub(crate) fn reserved_near_in(
     width: i32,
     height: i32,
     cell: (i16, i16),
-    game_mode_nonzero: bool,
+    requires_reservation_proximity: bool,
 ) -> bool {
-    if !game_mode_nonzero {
+    if !requires_reservation_proximity {
         return true;
     }
     let (x, y) = (i32::from(cell.0), i32::from(cell.1));
@@ -313,6 +340,16 @@ fn ordinary_key(index: i32, cell: (i16, i16), center: (i16, i16)) -> i32 {
     let dx = (i32::from(cell.0) - i32::from(center.0)).abs();
     let dy = (i32::from(cell.1) - i32::from(center.1)).abs();
     index.wrapping_add(dx.max(dy).wrapping_mul(1000))
+}
+
+/// The inner-base key (`0x00506329..0x0050640D`): `index + 1000 * d`, `d` the
+/// distance from the centre of `cell` at height 0 to `base`, its deltas
+/// summed `(dy² + dz²) + dx²` through `Sqrt_Approx` and `Math__ftol`.
+fn inner_base_key(index: i32, cell: (i16, i16), base: [i32; 3]) -> i32 {
+    let dx = base[0].wrapping_sub(i32::from(cell.0) * 256 + 128);
+    let dy = base[1].wrapping_sub(i32::from(cell.1) * 256 + 128);
+    let distance = crate::util::native_x87::sqrt_approx_length([dy, base[2], dx]);
+    index.wrapping_add(distance.wrapping_mul(1000))
 }
 
 /// `0x005065E6..0x0050664C`: the eight-way direction (`DirStruct` of
@@ -349,7 +386,7 @@ fn site_admits(
             search.width,
             search.height,
             site,
-            search.game_mode_nonzero,
+            search.requires_reservation_proximity,
         )
 }
 
@@ -362,24 +399,16 @@ struct SimSiteWorld<'a> {
     owner: InternedId,
     house_index: Option<i32>,
     ty: &'a ObjectType,
-    registry: Option<&'a OverlayTypeRegistry>,
 }
 
 impl<'a> SimSiteWorld<'a> {
-    fn new(
-        sim: &'a Simulation,
-        rules: &'a RuleSet,
-        owner: InternedId,
-        ty: &'a ObjectType,
-        registry: Option<&'a OverlayTypeRegistry>,
-    ) -> Self {
+    fn new(sim: &'a Simulation, rules: &'a RuleSet, owner: InternedId, ty: &'a ObjectType) -> Self {
         Self {
             sim,
             rules,
             owner,
             house_index: sim.base_reservation_house_index(owner),
             ty,
-            registry,
         }
     }
 }
@@ -418,11 +447,10 @@ impl SiteWorld for SimSiteWorld<'_> {
             reservation_arg: house_index,
             reservations: Some(&sim.substrate.base_reservations),
             occupancy: Some(&sim.substrate.occupancy),
-            entities: Some(&sim.substrate.entities),
-            terrain_object_cells: Some(&sim.production.terrain_object_cells),
+            terrain_object_cells: Some(sim.terrain_objects.cell_index()),
             resolved_terrain: sim.resolved_terrain.as_ref(),
             overlay_grid: sim.overlay_grid.as_ref(),
-            playfield_bounds: sim.playfield_bounds,
+            playfield_bounds: sim.playfield_bounds(),
         })
     }
 
@@ -430,17 +458,19 @@ impl SiteWorld for SimSiteWorld<'_> {
         crate::sim::build_site::can_place_building_at(
             self.sim,
             self.rules,
-            self.registry,
+            Some(self.rules.overlay_registry()),
             self.ty,
             site,
             Some(self.owner),
+            None,
+            None,
         )
     }
 }
 
 /// `BuildingTypeClass::Width @ 0x0045EC90` and `Height(0) @ 0x0045ECA0`.
 pub(crate) fn foundation_size(ty: &ObjectType) -> (i32, i32) {
-    let (width, height) = crate::rules::foundation::foundation_dimensions(&ty.foundation);
+    let (width, height) = ty.foundation.dimensions();
     (i32::from(width), i32::from(height))
 }
 
@@ -449,6 +479,6 @@ fn signed(cell: (u16, u16)) -> (i16, i16) {
     (cell.0 as i16, cell.1 as i16)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 #[path = "ai_base_site_tests.rs"]
 mod tests;

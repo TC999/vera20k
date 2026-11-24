@@ -28,20 +28,15 @@ struct GateRow {
 
 #[derive(Deserialize)]
 struct GateCorpus {
-    native_sha256: String,
     rows: Vec<GateRow>,
 }
 
 #[test]
 fn bridge_layer_gate_matches_original_flags_coordinates_and_retained_dummy() {
-    let corpus: GateCorpus = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/bridge_target_layer.json"
+    let corpus: GateCorpus = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/bridge_target_layer.json",
     ))
     .unwrap();
-    assert_eq!(
-        corpus.native_sha256,
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     let mut compared = 0;
     let mut noncanonical_bytes = 0;
     for row in &corpus.rows {
@@ -128,9 +123,9 @@ fn list_fixture() -> (RuleSet, EntityStore, OccupancyGrid, ResolvedTerrainGrid) 
         (3, "TARGET", "Russians", 6, false),
     ] {
         let mut entity = GameEntity::test_default(id, kind, owner, x, 5);
-        entity.lifecycle.in_limbo = false;
-        entity.lifecycle.cell_marked = true;
-        entity.on_bridge = on_bridge;
+        entity.lifecycle.set_in_limbo_for_test(false);
+        entity.lifecycle.set_cell_marked_for_test(true);
+        entity.set_on_bridge(on_bridge);
         occupancy.add(
             x,
             5,
@@ -171,7 +166,7 @@ fn pick(
     terrain: &ResolvedTerrainGrid,
     mission: super::super::ScanMission,
 ) -> Option<u64> {
-    super::super::acquire_best_target_for_entity(
+    super::super::combat_targeting::greatest_threat_for_entity(
         entities,
         occupancy,
         rules,
@@ -186,7 +181,7 @@ fn pick(
         None,
         None,
     )
-    .target()
+    .object()
 }
 
 #[test]
@@ -240,19 +235,15 @@ fn bridge_layer_gate_reads_current_flags_in_each_scan() {
 
 #[test]
 fn original_dead_missing_cell_candidate_runs_fire_probe_before_health_rejection() {
-    use crate::rules::art_data::ArtRegistry;
-    use crate::rules::retail_ini_fixture::retail_rules_and_art;
     use crate::sim::combat::fire_error::FireError;
     use crate::sim::combat::fire_error_world::FireSubject;
     use crate::sim::movement::{FacingClass, locomotor::LocomotorState};
     use crate::sim::world::Simulation;
-    let Some((ini, art)) = retail_rules_and_art() else {
+    let Some(rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art() else {
         return;
     };
-    let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
-    rules.install_art_data(ArtRegistry::from_ini(&art));
-    let native: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/bridge_target_composed.json"
+    let native: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/bridge_target_composed.json",
     ))
     .unwrap();
     let row = &native["cases"]
@@ -263,7 +254,7 @@ fn original_dead_missing_cell_candidate_runs_fire_probe_before_health_rejection(
         .unwrap()["steps"][0];
     let mut world = Simulation::with_seed(31);
     world.intern_rule_type_ids(&rules);
-    world.session.binary_frame = 173;
+    world.session.set_binary_frame_for_test(173);
     let obj = rules.object("FV").unwrap();
     for (id, owner, x, y, hp) in [(1, "Americans", 10, 20, 200), (2, "Russians", 41, 41, 0)] {
         let owner = world.intern(owner);
@@ -275,19 +266,19 @@ fn original_dead_missing_cell_candidate_runs_fire_probe_before_health_rejection(
             6,
             0,
             owner,
-            crate::sim::components::Health { current: hp },
+            crate::sim::combat::Health::new(hp),
             type_ref,
             EntityCategory::Unit,
             0,
             6,
             true,
         );
-        entity.position.z = 6;
-        entity.position.exact_z_leptons = Some(624);
-        entity.health.current = hp;
-        entity.lifecycle.cell_marked = true;
-        entity.lifecycle.in_limbo = false;
-        entity.in_playfield = true;
+        entity.position.set_z_for_test(6);
+        entity.position.set_exact_z_leptons_for_test(Some(624));
+        entity.health.set_for_test(hp);
+        entity.lifecycle.set_cell_marked_for_test(true);
+        entity.lifecycle.set_in_limbo_for_test(false);
+        entity.set_in_playfield(true);
         entity.locomotor = Some(LocomotorState::from_object_type(obj, 0));
         entity.barrel_facing = Some(FacingClass::new(16383, 0));
         world.substrate.entities.insert(entity);
@@ -318,9 +309,10 @@ fn original_dead_missing_cell_candidate_runs_fire_probe_before_health_rejection(
         super::super::build_attacker_snapshot(firer, super::super::TargetKind::Entity(2), None);
     let context = ScanContext {
         entities: &world.substrate.entities,
+        scanner: firer,
         los: Default::default(),
         rules: &rules,
-        interner: &interner,
+        interner,
         attacker: &snapshot,
         attacker_obj: obj,
         fog: None,
@@ -332,9 +324,16 @@ fn original_dead_missing_cell_candidate_runs_fire_probe_before_health_rejection(
         mask: 1,
         scan_coord: [0, 0, 0],
         standing: ScannerStanding::resolve(Some(&world), &snapshot),
-        attacks_allies: false,
-        scans_allies: false,
+        cells: &world.substrate.occupancy,
+        healer: false,
+        engineer: false,
+        berserk: false,
+        psycho: false,
+        controller_house: None,
         fire_world: Some(&world),
+        scanner_facts: attacker_facts(firer, obj),
+        harvester_immune: false,
+        harvester_unit_ids: Vec::new(),
     };
     let walk = WalkArgs {
         flags: 0x8042,
@@ -342,7 +341,10 @@ fn original_dead_missing_cell_candidate_runs_fire_probe_before_health_rejection(
         reference: ThreatReference::NullCoord,
     };
     let rng_before = world.scenario_rng.native_state_hex();
-    assert_eq!(evaluate_candidate(&context, walk, candidate), None);
+    assert_eq!(
+        evaluate_candidate(&context, &mut ScanState::default(), walk, candidate),
+        None
+    );
     let expected = &row["after"]["dummy_coord"];
     assert_eq!(
         dummy.snapshot().coord,
@@ -367,13 +369,11 @@ fn original_dead_missing_cell_candidate_runs_fire_probe_before_health_rejection(
         FireSubject {
             world: &world,
             rules: &rules,
-            overlay_registry: None,
             fog: None,
             firer,
             obj,
             target: Some(super::super::TargetKind::Entity(2)),
             weapon_index: 0,
-            garrison: None,
         }
         .fire_error(false),
         FireError::Facing

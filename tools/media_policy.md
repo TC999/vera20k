@@ -25,7 +25,7 @@ Reproduce focused checks with the indexed build owner:
 ```sh
 python -m tools.cargo_run -- test -p vera20k --lib app::frontend::startup_options::
 python -m tools.cargo_run -- test -p vera20k --lib app::frontend::launch::
-python -m tools.cargo_run -- test -p vera20k --lib assets::asset_manager::
+python -m tools.cargo_run -- test -p vera20k-core --lib assets::asset_manager::
 python -m tools.cargo_run -- test -p vera20k --lib app::loading::pump::tests::absent_and_lost_loading_managers_preserve_media_policy
 ```
 
@@ -35,5 +35,5 @@ Capture validation uses [map observation](map_observation.md), comparing the
 same profile with ordinary and mixed-case `-Cd` output paths. Headless and asset
 CLI runs use the preserved release binaries, including `-Cd` in path arguments.
 
-[Recorded validation](media_policy.validation.json) bounds the preserved builds,
+Recorded validation (`tools/media_policy.validation.json`, in git at 1b1a8b43e) bounds the preserved builds,
 source inventory, Rust checks and production comparisons.

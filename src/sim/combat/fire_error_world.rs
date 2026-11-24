@@ -4,8 +4,6 @@
 //! RESIDUAL questions VERA cannot answer natively, each fixed to the value its
 //! missing producer would leave (trigger, effect and frequency are on the
 //! owning row in `fire_error.rs`):
-//! - `target_layer` answers the ground layer: VERA has no locomotor layer, so
-//!   T39 never fires (a Foot target taking off or landing below two levels).
 //! - `deploy_cell_ok` answers true: `CellClass 0x00487C10` is not ported, and
 //!   only U4's dormant DeployToFire reads it.
 //! - `locomotor_can_fire` answers OK: only the Tunnel locomotor, unused in
@@ -21,37 +19,111 @@ use crate::map::cell_index::NativeCellIdentity;
 use crate::map::entities::EntityCategory;
 use crate::map::resolved_terrain::{NativeCellQuery, ResolvedTerrainGrid};
 use crate::rules::object_type::ObjectType;
-use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
 use crate::rules::weapon_type::WeaponType;
 use crate::sim::game_entity::GameEntity;
 use crate::sim::movement::ground_pose::{
     object_center_xy, position_world_coord, query_object_cell,
 };
-use crate::sim::vision::FogState;
+use crate::sim::terrain_object::TerrainObjectState;
+use crate::sim::touch_log::live_read_check_enabled;
+use crate::sim::vision::FireFog;
 use crate::sim::world::Simulation;
 
 /// One firer, target and weapon slot, as GetFireError sees them.
 pub(crate) struct FireSubject<'a> {
     pub world: &'a Simulation,
     pub rules: &'a RuleSet,
-    pub overlay_registry: Option<&'a OverlayTypeRegistry>,
-    pub fog: Option<&'a FogState>,
+    pub fog: Option<FireFog<'a>>,
     pub firer: &'a GameEntity,
     pub obj: &'a ObjectType,
     pub target: Option<TargetKind>,
     pub weapon_index: i32,
-    /// A garrisoned building's GetWeapon (`0x004526F0`) answers its firing
-    /// occupant's weapon ([`combat_weapon::occupant_weapon`]) for every slot,
-    /// with the garrison range.
-    pub garrison: Option<(&'a WeaponType, crate::util::fixed_math::SimFixed)>,
 }
 
-impl FireSubject<'_> {
+/// The firer's half of [`FireFacts`] ([`FireSubject::firer_part`]): what
+/// GetFireError reads of the firer and its type, with the ids of the links
+/// it compares with the target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FirerPart {
+    ares: bool,
+    class: FirerClass,
+    frame: i32,
+    /// Every link to the target unset: [`Self::facts`] sets them.
+    firer: FirerFacts,
+    firer_type: FirerTypeFacts,
+    /// The transport the firer rides, when it resolves.
+    transport: Option<u64>,
+    drain_target: Option<u64>,
+    locomotor_target: Option<u64>,
+    /// The warp target, when a temporal link is held.
+    temporal_target: Option<Option<u64>>,
+}
+
+impl FirerPart {
+    /// The facts against `target`, with the target's half.
+    fn facts(
+        &self,
+        target: Option<TargetKind>,
+        weapon_index: i32,
+        target_facts: TargetFacts,
+        target_type: TargetTypeFacts,
+    ) -> FireFacts {
+        let target_id = match target {
+            Some(TargetKind::Entity(id)) => Some(id),
+            _ => None,
+        };
+        let link = |to: Option<u64>| match to {
+            None => Link::None,
+            Some(id) if Some(id) == target_id => Link::Target,
+            Some(_) => Link::Other,
+        };
+        let mut firer = self.firer;
+        if self.transport.is_some() && self.transport == target_id {
+            firer.transporter = Transporter::Target;
+        }
+        firer.drain_target = link(self.drain_target);
+        firer.locomotor_target = link(self.locomotor_target);
+        firer.temporal = self.temporal_target.map(link);
+        FireFacts {
+            ares: self.ares,
+            class: self.class,
+            frame: self.frame,
+            weapon_index,
+            firer,
+            firer_type: self.firer_type,
+            target: target_facts,
+            target_type,
+        }
+    }
+}
+
+/// A subject's target object and its type ([`FireSubject::resolve_target`]).
+#[derive(Clone, Copy)]
+struct ResolvedTarget<'a> {
+    entity: Option<&'a GameEntity>,
+    obj: Option<&'a ObjectType>,
+    terrain: Option<&'a TerrainObjectState>,
+}
+
+impl<'a> FireSubject<'a> {
     /// GetFireError for this subject.
     pub(crate) fn fire_error(&self, check_range: bool) -> FireError {
-        let facts = self.facts();
-        super::fire_error::get_fire_error(&facts, &mut WorldQuery::new(self), check_range)
+        self.fire_error_with(&self.firer_part(), check_range)
+    }
+
+    /// [`Self::fire_error`] with the firer's half of the facts already read
+    /// ([`Self::firer_part`]): a target scan reads it once for all its
+    /// candidates, since nothing a scan does changes the firer.
+    pub(crate) fn fire_error_with(&self, firer: &FirerPart, check_range: bool) -> FireError {
+        debug_assert!(
+            !live_read_check_enabled() || *firer == self.firer_part(),
+            "the firer part of {} went stale",
+            self.firer.stable_id()
+        );
+        let mut query = WorldQuery::new(self);
+        let facts = self.facts(firer, query.target);
+        super::fire_error::get_fire_error(&facts, &mut query, check_range)
     }
 
     /// `CanFireAt @ 0x006F77B0`: InRange (vt+0x3A8) with the subject's weapon.
@@ -60,23 +132,34 @@ impl FireSubject<'_> {
     }
 
     /// `GetWeaponDamageValue(-1) @ 0x006F3970` through this subject's
-    /// GetWeapon, so a garrison reads its occupant's weapon.
+    /// GetWeapon, so an occupied building reads its occupant's weapon.
     pub(crate) fn weapon_damage_value(&self) -> i32 {
-        super::fire_error::weapon_value(&self.facts(), &mut WorldQuery::new(self))
+        let mut query = WorldQuery::new(self);
+        let facts = self.facts(&self.firer_part(), query.target);
+        super::fire_error::weapon_value(&facts, &mut query)
     }
 
-    fn target_entity(&self) -> Option<&GameEntity> {
-        match self.target {
+    /// The target object and its type, resolved once per question.
+    fn resolve_target(&self) -> ResolvedTarget<'a> {
+        let entity = match self.target {
             Some(TargetKind::Entity(id)) => self.world.substrate.entities.get(id),
             _ => None,
+        };
+        let terrain = match self.target {
+            Some(TargetKind::Entity(id)) if entity.is_none() => {
+                self.world.terrain_objects.objects().get(&id)
+            }
+            _ => None,
+        };
+        ResolvedTarget {
+            entity,
+            terrain,
+            obj: entity.and_then(|target| {
+                self.world
+                    .interner
+                    .object_type(target.type_ref(), self.rules)
+            }),
         }
-    }
-
-    fn target_obj(&self) -> Option<&ObjectType> {
-        self.target_entity().and_then(|target| {
-            self.rules
-                .object(self.world.interner.resolve(target.type_ref()))
-        })
     }
 
     fn terrain(&self) -> Option<&ResolvedTerrainGrid> {
@@ -84,36 +167,31 @@ impl FireSubject<'_> {
     }
 
     fn frame(&self) -> u32 {
-        self.world.session.binary_frame
+        self.world.session.binary_frame()
     }
 
     fn speed_rules(&self) -> crate::sim::movement::SpeedRules<'_> {
-        crate::sim::movement::SpeedRules::new(
+        crate::sim::movement::SpeedRules::new(self.rules, &self.world.interner, &self.world.houses)
+    }
+
+    /// GetWeapon (vt+0x3F8) at an index ([`combat_weapon::get_weapon`]): an
+    /// occupied building's firing occupant's weapon for every slot, else the
+    /// rank-selected slot.
+    pub(crate) fn weapon_at(&self, index: i32) -> Option<&'a WeaponType> {
+        combat_weapon::get_weapon(
+            self.firer,
+            self.obj,
+            index,
+            &self.world.substrate.entities,
             self.rules,
             &self.world.interner,
-            &self.world.type_handles,
         )
     }
 
-    /// GetWeapon (vt+0x3F8) at an index: a garrison's occupant weapon for
-    /// every slot (`0x004526F0`), else the rank-selected slot.
-    pub(crate) fn weapon_at(&self, index: i32) -> Option<&WeaponType> {
-        if let Some((weapon, _)) = self.garrison {
-            return (index >= 0).then_some(weapon);
-        }
-        combat_weapon::weapon_for_index(self.obj, self.firer.veterancy(), index)
-            .and_then(|(weapon_id, _)| self.rules.weapon(weapon_id))
-    }
-
-    fn weapon_facts(&self, weapon: &WeaponType) -> WeaponFacts {
-        let warhead = combat_weapon::warhead_of(self.rules, weapon);
-        let projectile = weapon
-            .projectile
-            .as_deref()
-            .and_then(|id| self.rules.projectile(id));
-        let armor = self
-            .target_obj()
-            .map(|target| super::armor_index(&target.armor));
+    fn weapon_facts(&self, weapon: &WeaponType, target_obj: Option<&ObjectType>) -> WeaponFacts {
+        let warhead = self.rules.weapon_warhead(weapon);
+        let projectile = self.rules.weapon_projectile(weapon);
+        let armor = target_obj.map(ObjectType::armor_id);
         WeaponFacts {
             damage: weapon.damage,
             ambient_damage: weapon.ambient_damage,
@@ -139,11 +217,15 @@ impl FireSubject<'_> {
                 is_locomotor: warhead.is_locomotor,
                 psychedelic: warhead.psychedelic,
                 bomb_disarm: warhead.bomb_disarm,
-                verses_zero: armor.is_some_and(|armor| {
-                    warhead
-                        .verses_f64
-                        .get(armor)
-                        .is_some_and(|verses| *verses == 0.0 || verses.is_nan())
+                #[cfg(feature = "phobos")]
+                airstrike: warhead.airstrike,
+                #[cfg(feature = "phobos")]
+                airstrike_targets: warhead.airstrike_targets,
+                armor_rejects_fire: armor.is_some_and(|armor| {
+                    // Ares 3.0 hook100542A0 admits ForceFire OR nonzero
+                    // multiplier; this is the shared GetFireError gate, not
+                    // a new Ctrl-only input rule.
+                    !warhead.interaction(armor).can_fire()
                 }),
             }),
             // A weapon naming no projectile section reads the reader's
@@ -164,94 +246,128 @@ impl FireSubject<'_> {
         }
     }
 
-    fn facts(&self) -> FireFacts {
+    /// The firer's half of the facts, which reads nothing of the target: the
+    /// links GetFireError compares with the target keep their ids.
+    pub(crate) fn firer_part(&self) -> FirerPart {
         let firer = self.firer;
         let obj = self.obj;
         let frame = self.frame();
-        let class = match firer.category {
+        let class = match firer.category() {
             EntityCategory::Unit => FirerClass::Unit,
             EntityCategory::Infantry => FirerClass::Infantry,
             EntityCategory::Aircraft => FirerClass::Aircraft,
             EntityCategory::Structure => FirerClass::Building,
         };
-        let target_id = match self.target {
-            Some(TargetKind::Entity(id)) => Some(id),
-            _ => None,
-        };
-        let link = |to: Option<u64>| match to {
-            None => Link::None,
-            Some(id) if Some(id) == target_id => Link::Target,
-            Some(_) => Link::Other,
-        };
+        // T9 (`0x006FC13F`) compares the target with the firer's `+0x11C`
+        // without testing `+0x82`; T32/T33 test `+0x82` themselves
+        // (`0x006FC57D`, `0x006FC5C7`). A garrison occupant or cargo rider
+        // stores no Transporter (vera20k#3838).
         let transport = firer
-            .passenger_role
-            .inside_transport_id()
-            .and_then(|id| self.world.substrate.entities.get(id))
-            .map(|transport| {
-                (
-                    transport,
-                    self.rules
-                        .object(self.world.interner.resolve(transport.type_ref())),
-                )
-            });
-        // U5 reads the `+0x418` tether byte that radio `0x18` sets, whose
-        // stand-in is the dock-entered projection (VERA owns no exact tether
-        // byte, `radio/receive.rs`), and `RadioLinks[0]`.
+            .passenger_role()
+            .transporter()
+            .and_then(|id| self.world.substrate.entities.get(id));
+        // U5 reads the `+0x418` tether latch (`radio::tether`) and
+        // `RadioLinks[0]`.
         let radio_link = firer
+            .seldom
             .radio_contacts
             .slot(0)
             .and_then(|id| self.world.substrate.entities.get(id));
         let firer_facts = FirerFacts {
-            enslaved: firer.slave.owner().is_some(),
+            enslaved: firer.seldom.slave.owner().is_some(),
             warped_out: firer.is_warped_out(),
             warping_in: firer.is_warping_in(),
-            on_bridge: firer.on_bridge,
+            robot_offline: firer.deactivated.is_offline(),
+            weapons_disabled: self.rules.ares()
+                && firer.seldom.ares.ares_disable_weapons.start_frame()
+                    != crate::sim::timer::PAUSED_START_FRAME
+                && firer
+                    .seldom
+                    .ares
+                    .ares_disable_weapons
+                    .remaining(frame as i32)
+                    > 0,
+            emp_remaining: firer.emp_remaining(),
+            death_frame_counter: firer.unit_death_counter.get(),
+            on_bridge: firer.on_bridge(),
             z: self.terrain().map_or(0, |terrain| {
                 crate::sim::movement::ground_pose::object_world_z_leptons(firer, Some(terrain))
             }),
-            berserk: firer.berserk.active,
+            berserk: firer.berserk.is_active(),
             falling: firer.is_falling_down(),
             sinking: firer.sinking.is_active(),
-            in_open_transport: firer.passenger_role.in_open_transport(),
+            in_open_transport: firer.passenger_role().in_open_transport(),
+            // The transport being the target (T9) is [`FirerPart::facts`]'s.
             transporter: match transport {
                 None => Transporter::None,
-                Some((transport, _)) if Some(transport.stable_id()) == target_id => {
-                    Transporter::Target
-                }
-                Some((transport, _)) if transport.is_warped_out() => Transporter::WarpedOut,
-                Some((transport, _)) if transport.passenger_role.is_inside_transport() => {
+                Some(transport) if transport.is_warped_out() => Transporter::WarpedOut,
+                Some(transport) if transport.passenger_role().transporter().is_some() => {
                     Transporter::Nested
                 }
                 Some(_) => Transporter::Plain,
             },
-            wave_live: self
-                .world
-                .active_wave_links
-                .contains_key(&firer.stable_id()),
-            // `+0x308`: the damage-spark system, armed and expired on
-            // `session.tick` by `techno_ai`'s common post step (`0` none,
-            // `u64::MAX` held).
-            spark_particles_live: self.world.session.tick < firer.damage_particle_live_until,
+            transporter_gunner_open_topped: self.rules.ares()
+                && transport.is_some_and(|transport| {
+                    self.world
+                        .object_type(transport.type_ref(), self.rules)
+                        .is_some_and(|object| object.gunner && object.open_topped)
+                }),
+            transporter_cloaked: self.rules.ares()
+                && transport.is_some_and(|transport| {
+                    transport
+                        .cloak
+                        .as_ref()
+                        .is_some_and(|cloak| cloak.state() != 0)
+                }),
+            wave_live: self.world.active_wave_id(firer.stable_id()).is_some(),
+            // FireError reads the actual Techno+304 Fire pointer.
+            fire_particles_live: firer.seldom.fire_particle_system.system().is_some(),
+            // FireError6FC6D5/6FC9C7 reads the actual Techno+308 pointer.
+            spark_particles_live: firer.seldom.spark_particle_system.system().is_some(),
+            // FireError reads the actual Techno+314 Railgun pointer too.
+            railgun_particles_live: firer.seldom.railgun_particle_system.system().is_some(),
             // T45: the object's own rearm countdown (`+0x2EC`).
             rearming: firer
+                .seldom
                 .rearm_timer
-                .remaining(self.world.session.binary_frame as i32)
+                .remaining(self.world.session.binary_frame() as i32)
                 != 0,
-            ammo: firer.aircraft_ammo.as_ref().map_or(-1, |ammo| ammo.current),
-            cloak_state: firer.cloak.as_ref().map_or(0, |cloak| cloak.state),
+            ammo: firer.ammo().map_or(-1, |ammo| ammo.current()),
+            firing_frame: firer.unit_firing_counter.get(),
+            cloak_state: firer.cloak.as_ref().map_or(0, |cloak| cloak.state()),
             current_weapon: combat_weapon::attacker_facts(firer, obj).current_weapon_number,
-            draining_me: firer.draining_me.is_some(),
-            drain_target: link(firer.drain_target),
-            temporal: firer
-                .temporal
-                .has_link()
-                .then(|| link(firer.temporal.warp_target())),
+            draining_me: firer.drain.draining_me().is_some(),
+            // [`FirerPart::facts`] links these to the target.
+            drain_target: Link::None,
+            locomotor_target: Link::None,
+            temporal: None,
+            temporal_gunner_weapon: self.rules.ares()
+                && obj.turret_count > 0
+                && !obj.is_gattling
+                && {
+                    let entities = &self.world.substrate.entities;
+                    let interner = &self.world.interner;
+                    let slot = combat_weapon::what_weapon_should_i_use(
+                        self.rules,
+                        obj,
+                        &combat_weapon::attacker_facts(firer, obj),
+                        None,
+                        |slot| {
+                            combat_weapon::get_weapon(
+                                firer, obj, slot, entities, self.rules, interner,
+                            )
+                        },
+                    );
+                    combat_weapon::get_weapon(firer, obj, slot, entities, self.rules, interner)
+                        .and_then(|weapon| self.rules.weapon_warhead(weapon))
+                        .is_some_and(|warhead| warhead.temporal)
+                },
             owner_is_human: crate::sim::house_state::house_state_for_owner_id(
                 &self.world.houses,
                 firer.owner(),
             )
-            .is_some_and(|house| house.is_human),
-            paralyzed: firer.is_paralyzed(frame),
+            .is_some_and(|house| house.is_human()),
+            paralyzed: firer.parasite.is_paralyzed(frame),
             spawns: firer.spawn_manager.as_ref().map(|manager| SpawnCounts {
                 not_regenerating: manager.count_alive_spawns() as i32,
                 launched_missiles: manager.count_launched_missiles(
@@ -267,13 +383,14 @@ impl FireSubject<'_> {
                 .map_or(firer.body_facing_current(frame), |facing| {
                     facing.current(frame)
                 }),
-            navcom: firer.navigation.nav_com.is_some(),
+            magnetron_lifted: firer.lift.swap_active(),
+            navcom: firer.navigation.nav_com().is_some(),
             moving_faster_than_tenth: firer.foot_speed.above_tenth(),
-            deploying: unit_deploying(firer),
-            tethered: firer.dock_entered_with.is_some(),
+            deploying: firer.unit_deploying(),
+            tethered: firer.seldom.tether.partner().is_some(),
             radio_link: match radio_link {
                 None => RadioLink::None,
-                Some(contact) if contact.category == EntityCategory::Structure => {
+                Some(contact) if contact.category() == EntityCategory::Structure => {
                     RadioLink::Building
                 }
                 Some(_) => RadioLink::Other,
@@ -281,19 +398,21 @@ impl FireSubject<'_> {
             // `+0x6AF` as it stood before this frame's `Facing_Update`: Unit AI
             // runs `Fire_At_Target @ 0x007365E1` first, and VERA commits the
             // new latch in `apply_unit_facing` after the fire phase.
-            turret_rotation_latch: firer.turret_rotation_latch,
+            turret_rotation_latch: firer.turret_rotation_latch.is_set(),
             sequence: firer
                 .mission_leaf
                 .as_infantry()
                 .map_or(-1, |leaf| leaf.doing()),
-            effective_mission: if firer.building_up.is_some() {
-                0x12
-            } else {
-                firer.mission.effective().raw()
-            },
-            delayed_fire_counter: firer
-                .pending_building_fire
-                .map_or(0, |pending| pending.remaining_ticks),
+            effective_mission: firer.mission.effective().raw(),
+            delayed_fire_counter: firer.building.pending_building_fire.remaining_ticks(),
+            building_has_turret: class == FirerClass::Building
+                && firer
+                    .building_upgrades()
+                    .has_turret(obj, self.rules, &self.world.interner),
+            prism_breaks_support: self.rules.ares()
+                && self
+                    .world
+                    .ares_prism_breaks_support(firer.stable_id(), self.rules),
             ..FirerFacts::default()
         };
         let firer_type = FirerTypeFacts {
@@ -310,11 +429,39 @@ impl FireSubject<'_> {
             organic: obj.organic,
             jumpjet_turn: obj.jumpjet_turn,
             can_be_occupied: obj.can_be_occupied,
-            can_occupy_fire: obj.can_occupy_fire,
+            // `+0x157C`, or RA2 Mode's answer: original RA2 has no
+            // CanOccupyFire, and a manned CanBeOccupied building fires its
+            // own gun, where B1 would otherwise answer ILLEGAL forever.
+            can_occupy_fire: obj.occupants_fire(),
             emp_pulse_cannon: obj.emp_pulse_cannon,
             turret_anim_is_voxel: obj.turret_anim_is_voxel,
             ..FirerTypeFacts::default()
         };
+        FirerPart {
+            ares: self.rules.ares(),
+            class,
+            frame: frame as i32,
+            firer: firer_facts,
+            firer_type,
+            transport: transport.map(GameEntity::stable_id),
+            drain_target: firer.drain.target(),
+            locomotor_target: firer.lift.target(),
+            temporal_target: firer
+                .temporal
+                .has_link()
+                .then(|| firer.temporal.warp_target()),
+        }
+    }
+
+    /// This subject's facts, both halves read now.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn whole_facts(&self) -> FireFacts {
+        self.facts(&self.firer_part(), self.resolve_target())
+    }
+
+    /// GetFireError's facts: the firer's half and the resolved target's.
+    fn facts(&self, firer: &FirerPart, resolved: ResolvedTarget<'_>) -> FireFacts {
+        let frame = self.frame();
         let (target, target_type) = match self.target {
             None => (TargetFacts::default(), TargetTypeFacts::default()),
             Some(TargetKind::Cell(..)) => (
@@ -330,19 +477,22 @@ impl FireSubject<'_> {
                 },
                 TargetTypeFacts::default(),
             ),
-            Some(TargetKind::Entity(_)) => match (self.target_entity(), self.target_obj()) {
+            Some(TargetKind::Entity(_)) => match (resolved.entity, resolved.obj) {
                 (Some(entity), Some(target_obj)) => (
                     TargetFacts {
-                        kind: match entity.category {
+                        kind: match entity.category() {
                             EntityCategory::Unit => FireTargetKind::Unit,
                             EntityCategory::Infantry => FireTargetKind::Infantry,
                             EntityCategory::Aircraft => FireTargetKind::Aircraft,
                             EntityCategory::Structure => FireTargetKind::Building,
                         },
                         bomb: entity.bomb.is_some(),
-                        in_limbo: entity.lifecycle.in_limbo,
+                        bomb_fixed: self.rules.ares()
+                            && entity.bomb.is_some()
+                            && !self.world.bomb_detachable(entity.stable_id(), self.rules),
+                        in_limbo: entity.lifecycle.in_limbo(),
                         sinking: entity.sinking.is_active(),
-                        on_bridge: entity.on_bridge,
+                        on_bridge: entity.on_bridge(),
                         z: self.terrain().map_or(0, |terrain| {
                             crate::sim::movement::ground_pose::object_world_z_leptons(
                                 entity,
@@ -354,12 +504,15 @@ impl FireSubject<'_> {
                             entity.invulnerability.as_ref(),
                             frame,
                         ),
-                        draining_me: entity.draining_me.is_some(),
+                        draining_me: entity.drain.draining_me().is_some(),
                         warped_out: entity.is_warped_out(),
-                        bunkered: entity.bunker_link.installed_in().is_some(),
-                        health: entity.health.current,
-                        parasite_lock_until: entity.parasite_launch_lock as i32,
-                        deploying: unit_deploying(entity),
+                        chrono_warp_latch: entity.chrono_warp_latch(),
+                        bunkered: entity.bunker.link().installed_in().is_some(),
+                        // T18 reads the target's `+0x418` tether latch.
+                        tethered: entity.seldom.tether.partner().is_some(),
+                        health: entity.health,
+                        parasite_lock_until: entity.parasite.launch_lock() as i32,
+                        deploying: entity.unit_deploying(),
                         ..TargetFacts::default()
                     },
                     TargetTypeFacts {
@@ -367,29 +520,52 @@ impl FireSubject<'_> {
                         drainable: target_obj.drainable,
                         berserk_friendly: target_obj.berserk_friendly,
                         unnatural: target_obj.unnatural,
-                        immune_to_psionics: target_obj.immune_to_psionics,
+                        // Ares TechnoClass_CanFire_PsionicsImmune (10049EF0,
+                        // hook 0x6FC417): the rank's PSIONICSIMMUNE joins the
+                        // type flag and `ImmuneToBerserk` overrides both.
+                        immune_to_psionics: if self.rules.ares() {
+                            target_obj.techno_combat().combat().immune_to_berserk(
+                                target_obj.immune_to_psionics
+                                    || target_obj.promotion_abilities().is_some_and(|abilities| {
+                                        abilities.psionics_immune(entity.veterancy.raw())
+                                    }),
+                            )
+                        } else {
+                            target_obj.immune_to_psionics
+                        },
                         spawned: target_obj.spawned,
                         balloon_hover: target_obj.balloon_hover,
                         jumpjet: target_obj.jumpjet,
                         organic: target_obj.organic,
                         is_simple_deployer: target_obj.is_simple_deployer,
                         non_vehicle: target_obj.non_vehicle,
-                        building_vehicle: false,
+                        is_1x1_with_undeploy: target_obj.is_1x1_with_undeploy(),
+                        #[cfg(feature = "phobos")]
+                        allow_airstrike: target_obj.allow_airstrike,
+                        #[cfg(feature = "phobos")]
+                        can_c4: target_obj.can_c4,
                     },
                 ),
-                // A target without a type is no techno the tests can read.
+                // GetFireError6FC177 preserves the original Object receiver
+                // but derives EBP only from Techno bit0. Terrain enters the
+                // common coordinate/range path and skips Techno-only facts.
+                _ if resolved.terrain.is_some() => {
+                    let terrain = resolved.terrain.unwrap();
+                    (
+                        TargetFacts {
+                            kind: FireTargetKind::Object,
+                            in_limbo: !terrain.is_live(),
+                            z: terrain.world_coord().z,
+                            health: super::Health::new(terrain.health()),
+                            ..TargetFacts::default()
+                        },
+                        TargetTypeFacts::default(),
+                    )
+                }
                 _ => (TargetFacts::default(), TargetTypeFacts::default()),
             },
         };
-        FireFacts {
-            class,
-            frame: frame as i32,
-            weapon_index: self.weapon_index,
-            firer: firer_facts,
-            firer_type,
-            target,
-            target_type,
-        }
+        firer.facts(self.target, self.weapon_index, target, target_type)
     }
 
     /// The target's coordinates in leptons (a building's foundation center).
@@ -401,59 +577,15 @@ impl FireSubject<'_> {
         crate::util::fixed_math::SimFixed,
         crate::util::fixed_math::SimFixed,
     )> {
-        match self.target? {
-            TargetKind::Entity(_) => self.target_entity().map(super::target_coords),
-            TargetKind::Cell(rx, ry) => Some(super::cell_center_coords(rx, ry)),
-        }
+        super::resolve_target_coords(&self.target?, self.world)
     }
 
     /// Native receives an already resolved Cell pointer. TargetKind stores the
     /// coordinate used to resolve it; recover allocation identity without an
     /// extra lookup before GetFireError's first native map query at 0x006FC197.
     fn cell_target_identity(&self) -> Option<NativeCellIdentity> {
-        let TargetKind::Cell(rx, ry) = self.target? else {
-            return None;
-        };
-        let terrain = self.terrain()?;
-        let cell = terrain
-            .native_fixed_cell_index(rx as i16, ry as i16)
-            .map_or(NativeCellIdentity::Dummy, NativeCellIdentity::Real);
-        Some(cell)
+        self.target?.cell_identity(self.terrain()?)
     }
-}
-
-/// A garrisoned building's GetWeapon (`0x004526F0` through `IsOccupied`
-/// `0x00458DD0`): its firing occupant's weapon for every index and target
-/// ([`combat_weapon::occupant_weapon`]), with the garrison fire range (half
-/// the foundation plus `OccupyWeaponRange`).
-pub(crate) fn garrison_weapon<'r>(
-    world: &Simulation,
-    rules: &'r RuleSet,
-    building: &GameEntity,
-    obj: &ObjectType,
-) -> Option<(&'r WeaponType, crate::util::fixed_math::SimFixed)> {
-    if !obj.can_be_occupied || !obj.can_occupy_fire {
-        return None;
-    }
-    let cargo = building
-        .passenger_role
-        .cargo()
-        .filter(|cargo| !cargo.is_empty())?;
-    let occupant = world
-        .substrate
-        .entities
-        .get(cargo.passengers[cargo.garrison_fire_index as usize % cargo.count() as usize])?;
-    let weapon = rules
-        .object(world.interner.resolve(occupant.type_ref()))
-        .and_then(|occupant_obj| {
-            combat_weapon::occupant_weapon(rules, occupant_obj, occupant.veterancy())
-        })?;
-    let (width, height) = crate::sim::production::foundation_dimensions(&obj.foundation);
-    let cells = i32::from(width.min(height) / 2) + rules.garrison_rules.occupy_weapon_range;
-    Some((
-        weapon,
-        crate::util::fixed_math::SimFixed::from_num(cells.max(1)),
-    ))
 }
 
 /// The owners' answers, asked by [`super::fire_error::get_fire_error`].
@@ -463,6 +595,8 @@ struct WorldQuery<'s, 'a> {
     /// EDI at 0x006FC19C, retained until the sensor call at 0x006FC26F. A later
     /// lookup may stamp this same Dummy; never resolve the target again.
     target_center_cell: Option<NativeCellIdentity>,
+    /// The subject's target, resolved once for all the questions.
+    target: ResolvedTarget<'a>,
 }
 
 impl<'s, 'a> WorldQuery<'s, 'a> {
@@ -471,6 +605,7 @@ impl<'s, 'a> WorldQuery<'s, 'a> {
             subject,
             cells: subject.terrain().map(NativeCellQuery::canonical),
             target_center_cell: None,
+            target: subject.resolve_target(),
         }
     }
 }
@@ -482,11 +617,15 @@ impl FireQuery for WorldQuery<'_, '_> {
         };
         let xy = match self.subject.target {
             Some(TargetKind::Entity(_)) => {
-                let Some(target) = self.subject.target_entity() else {
+                if let Some(target) = self.target.entity {
+                    let [x, y] = object_center_xy(target);
+                    (x, y)
+                } else if let Some(target) = self.target.terrain {
+                    let point = target.world_coord();
+                    (point.x, point.y)
+                } else {
                     return;
-                };
-                let [x, y] = object_center_xy(target);
-                (x, y)
+                }
             }
             Some(TargetKind::Cell(..)) => {
                 let Some(cell) = self.subject.cell_target_identity() else {
@@ -494,19 +633,68 @@ impl FireQuery for WorldQuery<'_, '_> {
                 };
                 // Cell 0x00486840 reads the receiver's *current* packed coordinate;
                 // a retained Dummy is not the originally requested coordinate.
-                let (x, y) = cells.coord(cell);
-                (i32::from(x) * 256 + 128, i32::from(y) * 256 + 128)
+                let [x, y] = crate::sim::cell_kernel::native_cell_own_xy(cell, cells);
+                (x, y)
             }
             None => return,
         };
         self.target_center_cell = Some(cells.lookup_world(xy.0, xy.1));
     }
 
+    fn weapon_ammo_cost(&mut self, index: i32) -> i32 {
+        self.subject
+            .weapon_at(index)
+            .map_or(1, WeaponType::ammo_cost)
+    }
+
     fn weapon(&mut self, index: i32) -> Option<WeaponFacts> {
         let subject = self.subject;
         subject
             .weapon_at(index)
-            .map(|weapon| subject.weapon_facts(weapon))
+            .map(|weapon| subject.weapon_facts(weapon, self.target.obj))
+    }
+
+    /// Phobos `TechnoClass_CanFire` (`0x6FC339`): the cell arm gates the firer
+    /// with `AttachEffect.CheckOnFirer`, and the techno arm asks the target's
+    /// (or, with the same key, the firer's) effects.
+    fn attach_effect_gate(&mut self, weapon_index: i32) -> bool {
+        #[cfg(feature = "phobos")]
+        {
+            let subject = self.subject;
+            let Some(weapon) = subject.weapon_at(weapon_index) else {
+                return true;
+            };
+            if !weapon.has_attach_effect_gates() {
+                return true;
+            }
+            let firer = Some(subject.firer);
+            if weapon.attach_effect_check_on_firer
+                && !subject.world.weapon_attach_effects_allow(
+                    weapon,
+                    Some(subject.firer),
+                    firer,
+                    subject.rules,
+                )
+            {
+                return false;
+            }
+            if let Some(target) = self.target.entity
+                && !subject.world.weapon_attach_effects_allow(
+                    weapon,
+                    Some(target),
+                    firer,
+                    subject.rules,
+                )
+            {
+                return false;
+            }
+            true
+        }
+        #[cfg(not(feature = "phobos"))]
+        {
+            let _ = weapon_index;
+            true
+        }
     }
 
     fn in_range(&mut self) -> bool {
@@ -517,31 +705,10 @@ impl FireQuery for WorldQuery<'_, '_> {
         let Some(weapon) = subject.weapon_at(subject.weapon_index) else {
             return false;
         };
-        let Some((rx, ry, sub_x, sub_y)) = subject.target_point() else {
+        if subject.target_point().is_none() {
             return false;
-        };
-        let firer = subject.firer;
-        let flat = |range: crate::util::fixed_math::SimFixed| {
-            super::is_within_range_leptons(
-                super::lepton_distance_sq_raw(
-                    firer.position.rx,
-                    firer.position.ry,
-                    firer.position.sub_x,
-                    firer.position.sub_y,
-                    rx,
-                    ry,
-                    sub_x,
-                    sub_y,
-                ),
-                range,
-            )
-        };
-        // RESIDUAL (line of fire): a garrison shot measures flat distance with
-        // the garrison range and never runs InRange's wall/cliff walk; the
-        // override-aware range chain (M8) is recorded at the old range gate.
-        if let Some((_, range)) = subject.garrison {
-            return flat(range);
         }
+        let firer = subject.firer;
         match subject.terrain() {
             // GetFireError6FCCEE calls InRange with its original target. A Cell
             // retains its Cell+48/+50 geometry through the existing range
@@ -556,13 +723,14 @@ impl FireQuery for WorldQuery<'_, '_> {
                     weapon,
                     subject.rules,
                     &subject.world.interner,
-                    &subject.world.substrate.entities,
                     terrain,
                     &line_of_fire::LineOfFireInputs {
                         overlay_grid: subject.world.overlay_grid.as_ref(),
-                        overlay_registry: subject.overlay_registry,
-                        alliances: subject.fog.map(|fog| &fog.alliances),
+                        overlay_registry: Some(subject.rules.overlay_registry()),
+                        alliances: subject.fog.map(|fog| fog.alliances),
+                        buildings: Some(line_of_fire::CellBuildings::of(subject.world)),
                     },
+                    Some(&subject.world.substrate.entities),
                 )
                 .unwrap_or(false)
             }
@@ -570,7 +738,7 @@ impl FireQuery for WorldQuery<'_, '_> {
                 firer,
                 &target,
                 weapon,
-                &subject.world.substrate.entities,
+                subject.world,
                 terrain,
                 (subject.rules, &subject.world.interner),
             )
@@ -582,24 +750,46 @@ impl FireQuery for WorldQuery<'_, '_> {
                     weapon,
                     subject.rules,
                     &subject.world.interner,
-                    &subject.world.substrate.entities,
+                    subject.world,
                     terrain,
                     &line_of_fire::LineOfFireInputs {
                         overlay_grid: subject.world.overlay_grid.as_ref(),
-                        overlay_registry: subject.overlay_registry,
-                        alliances: subject.fog.map(|fog| &fog.alliances),
+                        overlay_registry: Some(subject.rules.overlay_registry()),
+                        alliances: subject.fog.map(|fog| fog.alliances),
+                        buildings: Some(line_of_fire::CellBuildings::of(subject.world)),
                     },
                 )
             }),
-            None => flat(weapon.range),
+            None => {
+                let target = match self.target.entity {
+                    Some(entity) => in_range::MaplessTarget::Techno(entity),
+                    None => match crate::sim::movement::ground_pose::target_get_coords(
+                        target,
+                        subject.world,
+                        None,
+                    ) {
+                        Some(point) => in_range::MaplessTarget::Point(point),
+                        None => return false,
+                    },
+                };
+                in_range::mapless_in_range(
+                    firer,
+                    target,
+                    weapon,
+                    subject.rules,
+                    &subject.world.interner,
+                    Some(&subject.world.substrate.entities),
+                )
+            }
         }
     }
 
     fn naval_selector(&mut self) -> i32 {
         let subject = self.subject;
-        let facts = subject
-            .target_entity()
-            .zip(subject.target_obj())
+        let facts = self
+            .target
+            .entity
+            .zip(self.target.obj)
             .map(|(entity, obj)| {
                 combat_weapon::techno_target_facts(
                     entity,
@@ -609,63 +799,66 @@ impl FireQuery for WorldQuery<'_, '_> {
                     subject.rules,
                     &subject.world.interner,
                 )
+            })
+            .or_else(|| {
+                self.target
+                    .terrain
+                    .map(|_| combat_weapon::TargetFacts::Terrain)
             });
         combat_weapon::select_naval_targeting_weapon(subject.obj, facts.as_ref())
     }
 
-    /// `TechnoClass::GetVisualState @ 0x00703860` as T17 asks it (`0x006FC25B`:
-    /// the sensor argument set, the firer's house). `+0x41A`, whose writer is
-    /// unidentified, is held clear; the map editor never runs.
+    /// T17 calls the shared703860 owner with `(1, firerHouse)` at6FC25B.
+    /// This explicit sensor query deliberately has no alliance/owned shortcut.
     fn visual_state(&mut self) -> i32 {
         let subject = self.subject;
-        let (Some(target), Some(obj)) = (subject.target_entity(), subject.target_obj()) else {
+        let (Some(target), Some(obj)) = (self.target.entity, self.target.obj) else {
             return 0;
         };
-        let building = target.category == EntityCategory::Structure;
-        // `+0xC9A`: `Invisible=`, which a BuildingType's `InvisibleInGame=`
-        // also sets (`0x00460E09`).
-        if obj.invisible || (building && obj.invisible_in_game) {
-            return 5;
-        }
-        let Some(cloak) = target.cloak.as_ref() else {
-            return 0;
-        };
-        if cloak.state == 0 || building {
-            return 0;
-        }
-        if cloak.state == 2 {
-            // The firer's house senses the target's Location cell.
-            let sensed = subject.fog.is_some_and(|fog| {
-                fog.has_sensor_for_house(
-                    subject.firer.owner(),
-                    target.position.rx,
-                    target.position.ry,
-                )
-            });
-            return if sensed { 3 } else { 5 };
-        }
-        i32::from(cloak.transition_visual_state())
+        let invisible = obj.invisible
+            || target.category() == EntityCategory::Structure && obj.invisible_in_game;
+        let sensed = subject.fog.is_some_and(|fog| {
+            fog.has_sensor_for_house(
+                subject.firer.owner(),
+                target.position.rx(),
+                target.position.ry(),
+            )
+        });
+        i32::from(target.visual_character(
+            obj.cloaking_stages(subject.rules.general.cloaking_stages),
+            invisible,
+            subject.world.shared_owned_by_current_house(target),
+            crate::sim::cloak_disguise::VisualCharacterQuery::sensor(true, sensed, false),
+        ))
     }
 
     fn high_flying(&mut self) -> bool {
         // CellClass vt+0x54 (`0x00410530`) is constant false.
-        self.subject.target_entity().is_some_and(|target| {
+        if let Some(target) = self.target.entity {
             crate::sim::movement::air_movement::is_high_flying(
                 target,
                 self.subject.terrain(),
                 Some((self.subject.rules, &self.subject.world.interner)),
             )
-        })
+        } else {
+            self.target
+                .terrain
+                .is_some_and(|target| target.is_high_flying_in_query(self.cells.as_ref()))
+        }
     }
 
     fn low_flying(&mut self) -> bool {
-        self.subject.target_entity().is_some_and(|target| {
+        if let Some(target) = self.target.entity {
             crate::sim::movement::air_movement::is_low_flying(
                 target,
                 self.subject.terrain(),
                 Some((self.subject.rules, &self.subject.world.interner)),
             )
-        })
+        } else {
+            self.target
+                .terrain
+                .is_some_and(|target| target.is_low_flying_in_query(self.cells.as_ref()))
+        }
     }
 
     fn firer_high_flying(&mut self) -> bool {
@@ -676,14 +869,36 @@ impl FireQuery for WorldQuery<'_, '_> {
         )
     }
 
+    /// T39 asks only a Foot target: its vt+0x78 ([`entity_layer`]).
+    ///
+    /// [`entity_layer`]: crate::sim::world::entity_layer
     fn target_layer(&mut self) -> i32 {
-        2
+        let Some(target) = self.target.entity else {
+            return i32::from(crate::sim::world::display_layers::DisplayLayer::GROUND.index());
+        };
+        i32::from(
+            crate::sim::world::entity_layer(
+                target,
+                self.subject.terrain(),
+                Some((self.subject.rules, &self.subject.world.interner)),
+            )
+            .index(),
+        )
     }
 
     fn target_cell(&mut self) -> Option<CellFacts> {
-        let target = self.subject.target_entity()?;
         let cells = self.cells.as_ref()?;
-        let cell = query_object_cell(cells, position_world_coord(&target.position));
+        let point = if let Some(target) = self.target.entity {
+            position_world_coord(&target.position)
+        } else {
+            let point = self.target.terrain?.world_coord();
+            crate::sim::components::DriveCoord {
+                x: point.x,
+                y: point.y,
+                z: point.z,
+            }
+        };
+        let cell = query_object_cell(cells, point);
         Some(CellFacts {
             land_type: cells.land_type(cell),
             flags: cells.flags(cell),
@@ -735,8 +950,8 @@ impl FireQuery for WorldQuery<'_, '_> {
     fn allied(&mut self) -> bool {
         // T17 `0x006FC289..0x006FC296`: the target's house asks.
         let subject = self.subject;
-        subject
-            .target_entity()
+        self.target
+            .entity
             .is_some_and(|target| self.house_allied(target.owner(), subject.firer.owner()))
     }
 
@@ -749,9 +964,9 @@ impl FireQuery for WorldQuery<'_, '_> {
     fn can_infect(&mut self) -> bool {
         let subject = self.subject;
         // CanInfect(NULL) refuses a target that is not a Foot.
-        subject
-            .target_entity()
-            .zip(subject.target_obj())
+        self.target
+            .entity
+            .zip(self.target.obj)
             .is_some_and(|(target, target_obj)| {
                 combat_weapon::ParasiteVictimFacts::of(target, target_obj, subject.terrain())
                     .admits(subject.obj.naval)
@@ -782,25 +997,38 @@ impl FireQuery for WorldQuery<'_, '_> {
     }
 
     fn locomotor_moving(&mut self) -> bool {
-        crate::sim::movement::ready_producer::is_moving_now_for(
+        crate::sim::movement::motion_query::is_moving_now(
             self.subject.firer,
-            Some(self.subject.speed_rules()),
+            self.subject.speed_rules(),
             self.subject.frame(),
         )
     }
 
     fn target_locomotor_moving(&mut self) -> bool {
-        self.subject.target_entity().is_some_and(|target| {
-            crate::sim::movement::ready_producer::is_moving_now_for(
+        self.target.entity.is_some_and(|target| {
+            crate::sim::movement::motion_query::is_moving_now(
                 target,
-                Some(self.subject.speed_rules()),
+                self.subject.speed_rules(),
                 self.subject.frame(),
             )
         })
     }
 
+    /// Every retail locomotor answers Ok; Tunnel's (`0x0072A1C0`) answers
+    /// FIRE_MOVING while its State is set.
     fn locomotor_can_fire(&mut self) -> FireError {
-        FireError::Ok
+        let digging = self
+            .subject
+            .firer
+            .locomotor
+            .as_ref()
+            .and_then(|locomotor| locomotor.tunnel_runtime())
+            .is_some_and(crate::sim::movement::tunnel_movement::TunnelRuntime::blocks_fire);
+        if digging {
+            FireError::Moving
+        } else {
+            FireError::Ok
+        }
     }
 
     fn jumpjet_locomotor(&mut self) -> bool {
@@ -809,7 +1037,7 @@ impl FireQuery for WorldQuery<'_, '_> {
             .locomotor
             .as_ref()
             .is_some_and(|locomotor| {
-                locomotor.kind == crate::rules::locomotor_type::LocomotorKind::Jumpjet
+                locomotor.active_kind() == crate::rules::locomotor_type::LocomotorKind::Jumpjet
             })
     }
 
@@ -825,12 +1053,10 @@ impl FireQuery for WorldQuery<'_, '_> {
         self.direction()
     }
 
+    /// Building vt+0x408 (`0x004581F0`), the occupant count that
+    /// `BuildingClass::GetFireError` (`0x00447F10`) reads.
     fn occupants(&mut self) -> i32 {
-        self.subject
-            .firer
-            .passenger_role
-            .cargo()
-            .map_or(0, |cargo| cargo.count() as i32)
+        self.subject.firer.passenger_role().occupants().count()
     }
 
     fn operational(&mut self) -> bool {
@@ -849,7 +1075,7 @@ impl WorldQuery<'_, '_> {
         other: crate::sim::intern::InternedId,
     ) -> bool {
         combat_weapon::is_ally_by_object(
-            self.subject.fog.map(|fog| &fog.alliances),
+            self.subject.fog.map(|fog| fog.alliances),
             &self.subject.world.interner,
             asker,
             other,
@@ -858,10 +1084,11 @@ impl WorldQuery<'_, '_> {
 
     /// DirectionToTarget from the firer's position to the target's point; a
     /// building's is vt+0x4E8 ([`super::fire_coord::building_direction_to`]).
+    /// The base is `ObjectClass::DirectionToTarget` (`0x005F3DB0`).
     fn direction(&self) -> u16 {
         let subject = self.subject;
         let firer = subject.firer;
-        if firer.category == EntityCategory::Structure {
+        if firer.category() == EntityCategory::Structure {
             return subject.target.map_or(0, |target| {
                 super::fire_coord::building_direction_to(
                     subject.world,
@@ -874,10 +1101,10 @@ impl WorldQuery<'_, '_> {
         }
         subject.target_point().map_or(0, |(rx, ry, sub_x, sub_y)| {
             crate::sim::movement::turret::facing_toward_lepton(
-                firer.position.rx,
-                firer.position.ry,
-                firer.position.sub_x,
-                firer.position.sub_y,
+                firer.position.rx(),
+                firer.position.ry(),
+                firer.position.sub_x(),
+                firer.position.sub_y(),
                 rx,
                 ry,
                 sub_x,
@@ -887,18 +1114,77 @@ impl WorldQuery<'_, '_> {
     }
 }
 
-/// `0x00746DB0`: a Unit deploying or undeploying (`+0x6E1`/`+0x6E2`).
-fn unit_deploying(entity: &GameEntity) -> bool {
-    entity.category == EntityCategory::Unit
-        && matches!(
-            entity.deploy_state,
-            Some(
-                crate::sim::deploy::DeployPhase::Deploying { .. }
-                    | crate::sim::deploy::DeployPhase::Undeploying { .. }
-            )
-        )
-}
-
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_d_z))]
 #[path = "fire_error_world_tests.rs"]
 mod tests;
+
+#[cfg(all(test, tests_sim_combat_d_z))]
+mod terrain_target_tests {
+    use super::*;
+
+    #[test]
+    fn retail_tree_uses_object_weapon_and_fire_range_without_techno_facts() {
+        let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+            return;
+        };
+        let rules = &retail.rules;
+        let mut world = crate::sim::arena_fixture::rival_arena(rules, 31);
+        let firer_id = world
+            .spawn_object("MTNK", "Americans", 8, 10, 0, rules)
+            .expect("retail MTNK");
+        assert_eq!(
+            crate::sim::terrain_spawn::construct_terrain_objects(
+                &mut world,
+                &[crate::map::overlay::TerrainObject {
+                    rx: 10,
+                    ry: 10,
+                    name: "TREE01".into()
+                }],
+                rules,
+                false,
+            ),
+            1
+        );
+        let tree_id = world.terrain_objects.cell_index()[&(10, 10)];
+        let tree = &world.terrain_objects.objects()[&tree_id];
+        let target = TargetKind::Entity(tree_id);
+        let firer = world.substrate.entities.get(firer_id).unwrap();
+        let obj = world.interner.object_type(firer.type_ref(), rules).unwrap();
+        let before_rng = world.rng_state();
+        let (index, weapon) = combat_weapon::select_weapon_against(
+            rules,
+            firer,
+            obj,
+            &combat_weapon::attacker_facts(firer, obj),
+            Some(&target),
+            &world,
+            &world.interner,
+            world.resolved_terrain.as_ref(),
+            Some(&world.house_alliances),
+        )
+        .expect("a live Terrain Object is a selection target");
+        assert_eq!(weapon.unwrap().weapon_id, "105mm");
+        let subject = FireSubject {
+            world: &world,
+            rules,
+            fog: None,
+            firer,
+            obj,
+            target: Some(target),
+            weapon_index: index,
+        };
+        let facts = subject.whole_facts();
+        assert_eq!(facts.target.kind, FireTargetKind::Object);
+        assert_eq!(facts.target.health.current(), tree.health());
+        assert_eq!(
+            subject.target_point(),
+            super::super::resolve_target_coords(&target, &world)
+        );
+        assert!(
+            subject.in_range(),
+            "the original Object coordinate reaches the shared cannon range gate"
+        );
+        assert_ne!(subject.fire_error(false), FireError::Illegal);
+        assert_eq!(world.rng_state(), before_rng);
+    }
+}

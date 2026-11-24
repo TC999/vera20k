@@ -1,6 +1,5 @@
 {
   "schema_version": 1,
-  "native_sha256": "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c",
   "unicorn_binding": "2.1.4",
   "unicorn_core": [
     2,
@@ -50,11 +49,6 @@
     "drive_constructor": "0x004AF540",
     "ship_constructor": "0x0069EC50"
   },
-  "source_normalized_lf_sha256": {
-    "foot_navigation_coordinate.py": "fd43b2ee4f41a56d1a07503bf8831c9a0cdba7cc5c6bc5b0266e37152d4c0352",
-    "locomotor_at_coord.py": "11ed52b31577d264c8bc4a7acffb8e85a6b0e7d3e32c5bd74f92492368dcf1dc",
-    "map_queries.py": "f1c798f50bf8a69ebe53c6d0e2327ce395ad99ba5c7017e74e353757770f4305",
-    "native_oracle.py": "79dac1057d97e706f106a26145f00fa220d92c172b5173876c60fed22c17530c"
-  },
-  "payload_sha256": "950ce3a835d08f8a84172656744ee64f421e4e618c99dd18fcec06322684700a"
+  "payload_sha256": "67276816c9a524b5bfde5389b589d629554234f8bb86602d40e36331c0541a25",
+  "replay_command": "python -m tools.spatial_oracle.foot_navigation_coordinate --bridge-layers"
 }

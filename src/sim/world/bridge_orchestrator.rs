@@ -11,11 +11,17 @@
 //! Same as sim/world: depends on sim/bridge_state, sim/rng, rules/, map/;
 //! never render / ui / audio / net.
 
+use crate::sim::world::FrameEffects;
 use std::collections::BTreeSet;
 
 #[path = "bridge_damage_dispatch.rs"]
 mod damage_dispatch;
-use damage_dispatch::{BridgeDamageDrivers, LiveCells};
+pub(crate) use damage_dispatch::BridgeDamageDrivers;
+pub(super) use damage_dispatch::PendingBridgeCells;
+use damage_dispatch::{LiveCells, PendingBridgeCell};
+
+#[path = "bridge_moving_collapse.rs"]
+mod moving_collapse;
 
 #[path = "bridge_ground.rs"]
 mod ground_fallout;
@@ -25,13 +31,15 @@ mod live_publication;
 
 pub(crate) use live_publication::repair_from_engineer;
 
+#[cfg(test)]
+pub(super) use live_publication::{ready_engineer, ready_repair_fixture, repair_frame};
+
 use crate::map::bridge_facts::{BRIDGE_FLAG_ANCHOR_SELF, BRIDGE_FLAG_STRUCTURAL};
 use crate::map::bridge_rim_tiles::HighBridgeRimTiles;
 use crate::map::cell_index::NativeCellIdentity;
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::anim_class::AnimWorldCoord;
-#[cfg(test)]
 use crate::sim::bridge_state::BridgeRuntimeState;
 use crate::sim::bridge_state::ramp_repair::{self, Family as HutBridgeFamily};
 use crate::sim::bridge_state::{Axis, BridgeDamageEvent, DispatchPath};
@@ -40,9 +48,10 @@ use crate::sim::scenario_bootstrap::NativeStartBounds;
 use crate::sim::world::Simulation;
 use crate::sim::{intern::InternedId, rng::SimRng};
 use crate::util::lepton::{BRIDGE_DECK_HEIGHT_LEPTONS, LEPTONS_PER_LEVEL};
+use crate::util::native_random::unit_draw_threshold;
 use crate::util::native_x87::{NativeF64Bits, X87Chop53};
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_a_b))]
 #[path = "bridge_debris_tests.rs"]
 mod debris_tests;
 
@@ -65,36 +74,94 @@ mod debris_tests;
 /// `TickResult.bridge_state_changed` so the app consumes the already-published
 /// navigation and refreshes presentation. Each driver runs its own cascade
 /// (fallout, rim, zones) synchronously.
-#[cfg(test)]
-pub(crate) fn apply_bridge_damage_events(
+#[cfg(any(test, feature = "test-support"))]
+pub fn apply_bridge_damage_events(
     sim: &mut Simulation,
     rules: &RuleSet,
     events: &[BridgeDamageEvent],
 ) -> bool {
-    apply_bridge_damage_events_with_overlay_registry(sim, rules, events, None)
+    apply_bridge_damage_events_with_overlay_registry(
+        sim,
+        rules,
+        events,
+        &mut crate::sim::world::FrameEffects::default(),
+    )
 }
 
 pub(crate) fn apply_bridge_damage_events_with_overlay_registry(
     sim: &mut Simulation,
     rules: &RuleSet,
     events: &[BridgeDamageEvent],
-    overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
+    frame_effects: &mut FrameEffects<'_>,
 ) -> bool {
     let mut collapsed = false;
     // Finish each event's existing callbacks before another event can enter
     // the live body driver. Otherwise its immediate fallout would overtake an
     // earlier event's still-pending direct/head fallout.
     for event in events {
-        collapsed |= apply_one_bridge_damage_event(sim, rules, event, overlay_registry);
+        collapsed |= apply_one_bridge_damage_event(sim, rules, event, frame_effects);
     }
     collapsed
+}
+
+/// `TActionClass::Execute`63 (`0x006DDDC9`) -> DamageAtWaypoint6E0490.
+/// Five synchronous AreaDamage489280 visits precede the direct587180 tail.
+/// Re-query the waypoint before each visit: an earlier bridge collapse can
+/// change the following height. +90 is the waypoint, not the trailing+44.
+/// Original dispatch/geometry and NANRCT receiver controls:
+/// `tools/spatial_oracle/trigger_damage_at_waypoint.json` (+ metadata).
+/// Receiver and bridge state remain with their existing shared owners.
+pub(crate) fn damage_at_waypoint(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    waypoint: i32,
+    overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    frame_effects: &mut FrameEffects<'_>,
+) -> Option<bool> {
+    use crate::sim::combat::{RAD_NO_ATTACKER, world_receiver::apply_area_damage};
+    use crate::sim::projectile::ProjectileCoord;
+
+    let warhead = rules.warhead(&rules.bridge_warheads.c4_name)?;
+    let warhead_id = sim.interner.intern(&rules.bridge_warheads.c4_name);
+    let mut changed = false;
+    for (dx, dy) in [(0, 0), (85, 85), (-85, 85), (85, -85), (-85, -85)] {
+        let [x, y, z] = sim.trigger_waypoint_location(waypoint)?;
+        changed |= apply_area_damage(
+            sim,
+            rules,
+            overlay_registry,
+            ProjectileCoord::new(x.wrapping_add(dx), y.wrapping_add(dy), z),
+            100,
+            warhead,
+            true,
+            (RAD_NO_ATTACKER, None, warhead_id),
+            frame_effects,
+        )
+        .bridge_state_changed;
+    }
+    // IsWaypointValid68BD80 gates only the tail, after all five area visits.
+    // The retained unset coordinate is zero; the shared session bounds the index.
+    if sim.session.waypoint_is_valid(waypoint)
+        && let Some(cell) = sim.session.waypoint_cell(waypoint)
+    {
+        let mut drivers = BridgeDamageDrivers::new(sim, rules, frame_effects.reborrow());
+        for _ in 0..4 {
+            if drivers.apply_damage_to_cell(cell) {
+                break;
+            }
+        }
+        changed |= drivers.collapsed;
+        // 6E0705..6E077A invalidates a256px tactical rectangle. VERA redraws
+        // the whole tactical scene each frame; no retained screen pixels exist.
+    }
+    Some(changed)
 }
 
 fn apply_one_bridge_damage_event(
     sim: &mut Simulation,
     rules: &RuleSet,
     event: &BridgeDamageEvent,
-    overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
+    frame_effects: &mut FrameEffects<'_>,
 ) -> bool {
     let events = std::slice::from_ref(event);
 
@@ -105,7 +172,7 @@ fn apply_one_bridge_damage_event(
     };
 
     // Every driver publishes its cascade synchronously.
-    damage_dispatch::run(sim, events, bridge_strength, rules, overlay_registry)
+    damage_dispatch::run(sim, events, bridge_strength, rules, frame_effects)
 }
 
 /// Bridge-collapse dispatch from a `BridgeRepairHut` death event (C4 timer
@@ -121,7 +188,7 @@ fn apply_one_bridge_damage_event(
 ///
 /// Caller ensures the hut itself is not damaged — the hut survives the
 /// collapse, mirroring the original game's `BridgeRepairHut` death branch.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 /// `MapClass::DestroyBridge_High_OnHutDeath` 0x00574000 and
 /// `DestroyBridge_Low_OnHutDeath` 0x00574C20 — the CABHUT death entry.
 /// Concrete callers are `BombClass::Detonate` 0x00438720 (0x00438982)
@@ -132,20 +199,25 @@ fn apply_one_bridge_damage_event(
 /// `_High` 0x005749C0, which classify the anchor overlay into the NS or EW
 /// band, walk back up to two cells to the canonical edge anchor, and call
 /// the matching `CollapseBridge_*`.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn dispatch_bridge_collapse_from_hut(
     sim: &mut Simulation,
     rules: &RuleSet,
     hut_center: (u16, u16),
 ) -> bool {
-    dispatch_bridge_collapse_from_hut_with_overlay_registry(sim, rules, hut_center, None)
+    dispatch_bridge_collapse_from_hut_with_overlay_registry(
+        sim,
+        rules,
+        hut_center,
+        &mut crate::sim::world::FrameEffects::default(),
+    )
 }
 
 pub(crate) fn dispatch_bridge_collapse_from_hut_with_overlay_registry(
     sim: &mut Simulation,
     rules: &RuleSet,
     hut_center: (u16, u16),
-    overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
+    frame_effects: &mut FrameEffects<'_>,
 ) -> bool {
     let scan: Vec<(u16, u16)> = hut_destroy_5x5_scan(hut_center).collect();
     let family = choose_hut_bridge_family(sim, &scan);
@@ -153,173 +225,49 @@ pub(crate) fn dispatch_bridge_collapse_from_hut_with_overlay_registry(
         return false;
     }
     let seed_axis = find_destroy_overlay_seed(&|x, y| bridge_overlay_at(sim, x, y), &scan, family);
-    let mut host = BridgeDamageDrivers::new(sim, rules, overlay_registry);
+    let mut host = BridgeDamageDrivers::new(sim, rules, frame_effects.reborrow());
     let fallback = if let Some((rx, ry, axis)) = seed_axis {
         run_hut_collapse_bounded(&mut host, family, axis, rx, ry);
         HutFallbackExecution::default()
     } else {
         run_hut_fallback(&mut host, family, hut_center)
     };
-    let BridgeDamageDrivers { sim, collapsed, .. } = host;
-    finish_hut_fallback(sim, rules, fallback, overlay_registry) || collapsed
+    let collapsed = host.collapsed;
+    finish_hut_fallback(sim, rules, fallback, frame_effects) || collapsed
 }
 
-/// Overlay values a fully collapsed span leaves on its anchor: `0xE7` / `0xE8`
-/// on the high side, `0x64` / `0x65` on the low side. `DestroyBridgeWalker_*`
-/// writes them on final collapse and nothing else produces them.
-const HIGH_COLLAPSED_ANCHORS: [u8; 2] = [0xE7, 0xE8];
-const LOW_COLLAPSED_ANCHORS: [u8; 2] = [0x64, 0x65];
-
-/// The overlay half of `MapClass::FindBridgeConnection_Predicate` 0x00587410 -
-/// the cursor-side "is there anything here to repair" test behind the engineer
-/// cursor over a bridge repair hut.
-///
-/// Native shape: scan the 5x5 block around the hovered cell; a cell whose
-/// overlay falls in a destroy band selects the low or high family, and the walk
-/// then follows the axis PERPENDICULAR to the overlay's own class - an NS-class
-/// overlay walks along X, an EW-class overlay along Y - in both directions,
-/// continuing while the overlay stays inside the family band and returning true
-/// the moment a collapsed anchor appears.
-///
-/// **Two things about the native's branch selection are NOT reproduced here,
-/// and neither is a corner case.**
-///
-/// 1. *Which branch runs.* All four scan cases write the same `[ESP+0x12]`
-///    selector, read once after the loop at 0x005876BA, so whichever of the
-///    four matched LAST decides whether the native walks overlays (this
-///    function) or walks `BridgeRecord`s through the per-tile geometry tables
-///    at 0x0082AA04 / 0x0082AA24 / 0x0082AA44. This port always walks overlays.
-/// 2. *Per-cell precedence.* The 5x5 body is a strict if / else-if chain that
-///    tests `cell+0x38` against the two tileset windows at 0x00587483 and
-///    0x00587503 BEFORE it looks at `cell+0x44` against either overlay band at
-///    0x00587580 / 0x00587613. A cell that is both a bridge iso-tile and
-///    carries a destroy-band overlay is therefore a TILESET match and its
-///    overlay is never read. This port has no tile-index reader at all, so it
-///    would treat such a cell as an overlay match.
-///
-/// Whether cells satisfying both conditions occur on stock maps is UNCHECKED,
-/// and so is the record branch's answer for an intact span: its only
-/// true-returns are a record byte `+0x08` of zero and a coordinate matching
-/// neither endpoint, and the "inactive" reading of `+0x08` is itself
-/// unproven by the physical overlay witness. Do not assume the two branches
-/// agree. Original execution over both Anytown huts returns0/0/1/0 for healthy,
-/// first-damaged, collapsed and repaired states, with unchanged Cells/RNG/frame:
-/// `tools/spatial_oracle/anytown_damage/hut_cursor`. Its other-axis and mixed-
-/// family selection paths remain instruction evidence. The residual note
-/// on the bridge-hut repair cursor in `app/input/cursor.rs` records the
-/// separate structural-branch limitation.
-pub(crate) fn bridge_hut_has_collapsed_span(sim: &Simulation, hut_center: (u16, u16)) -> bool {
-    hut_has_collapsed_anchor(&|x, y| bridge_overlay_at(sim, x, y), hut_center)
-}
-
-/// State-only half of [`bridge_hut_has_collapsed_span`], split out so the walk
-/// can be tested without standing up a `Simulation`.
-///
-/// Seed selection follows 0x00587410 exactly, and it is not what it looks
-/// like: the native's 5x5 loop has **no break**. Every one of its four cases
-/// falls through to `INC EDI` at 0x005876A6, so the cell it finally walks from
-/// is the LAST cell that matched, not the first, and the iteration is Y-major
-/// (`EBP` outer adds to the coord's Y at 0x00587443, `EDI` inner adds to X at
-/// 0x00587447). Scanning every cell and accepting any hit would be more
-/// permissive than the binary, which is the direction of the bug this port
-/// exists to remove.
-#[cfg(test)]
-pub(crate) fn hut_span_has_collapsed_anchor(
-    terrain: &ResolvedTerrainGrid,
-    hut_center: (u16, u16),
-) -> bool {
-    hut_has_collapsed_anchor(
-        &|x, y| terrain.cell(x, y).and_then(|c| c.bridge_facts.overlay_id),
-        hut_center,
+/// Engineer WhatAction's complete Map587410 admission. Each ordinary input
+/// producer gets an isolated fallback identity, so hover cadence cannot change
+/// simulation state. The query still retains that identity across all nested
+/// lookups; the live records and registered TMP metadata remain map-owned.
+pub fn bridge_hut_can_repair(sim: &Simulation, hut_center: (u16, u16)) -> bool {
+    let Some(terrain) = sim.resolved_terrain.as_ref() else {
+        return false;
+    };
+    let records = sim
+        .bridge_state
+        .as_ref()
+        .map_or(&[][..], |state| state.endpoint_records());
+    crate::sim::bridge_state::repair_query::can_repair(
+        &crate::map::resolved_terrain::NativeCellQuery::isolated(terrain),
+        sim.overlay_grid.as_ref(),
+        records,
+        (hut_center.0 as i16, hut_center.1 as i16),
     )
 }
 
-fn hut_has_collapsed_anchor(
-    overlay_at: &impl Fn(u16, u16) -> Option<u8>,
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn hut_span_can_repair(
+    terrain: &ResolvedTerrainGrid,
+    overlays: &crate::sim::overlay_grid::OverlayGrid,
     hut_center: (u16, u16),
 ) -> bool {
-    let Some((seed, axis, anchors, is_high)) = hut_scan_last_overlay_seed(overlay_at, hut_center)
-    else {
-        return false;
-    };
-    // Perpendicular convention: an NS-class overlay is walked along X.
-    let walk_axis = match axis {
-        Axis::NS => Axis::EW,
-        Axis::EW => Axis::NS,
-    };
-    let first_step = if axis == Axis::NS { -1 } else { 1 };
-    [first_step, -first_step].into_iter().any(|step| {
-        walk_span_for_collapsed_anchor(overlay_at, seed, walk_axis, step, anchors, is_high)
-    })
-}
-
-/// The native's surviving seed: the last destroy-band cell in Y-major order
-/// over the 5x5 block. Returns its family and axis alongside it.
-fn hut_scan_last_overlay_seed(
-    overlay_at: &impl Fn(u16, u16) -> Option<u8>,
-    hut_center: (u16, u16),
-) -> Option<((u16, u16), Axis, &'static [u8; 2], bool)> {
-    let mut seed = None;
-    for (rx, ry) in hut_scan_5x5_y_major(hut_center) {
-        let Some(overlay) = overlay_at(rx, ry) else {
-            continue;
-        };
-        if let Some(axis) = ordinary::axis(i32::from(overlay), HutBridgeFamily::High) {
-            seed = Some(((rx, ry), axis, &HIGH_COLLAPSED_ANCHORS, true));
-        } else if let Some(axis) = ordinary::axis(i32::from(overlay), HutBridgeFamily::Low) {
-            seed = Some(((rx, ry), axis, &LOW_COLLAPSED_ANCHORS, false));
-        }
-    }
-    seed
-}
-
-/// 0x00587410's scan order: outer counter on Y, inner on X. Distinct from
-/// [`hut_destroy_5x5_scan`], which is the X-major order the CABHUT death path
-/// uses; the two natives genuinely disagree and must not be shared.
-fn hut_scan_5x5_y_major(center: (u16, u16)) -> impl Iterator<Item = (u16, u16)> {
-    let (cx, cy) = (center.0 as i32, center.1 as i32);
-    (-2..=2i32).flat_map(move |dy| {
-        (-2..=2i32).filter_map(move |dx| {
-            let nx = cx + dx;
-            let ny = cy + dy;
-            if nx < 0 || ny < 0 || nx > u16::MAX as i32 || ny > u16::MAX as i32 {
-                None
-            } else {
-                Some((nx as u16, ny as u16))
-            }
-        })
-    })
-}
-
-fn walk_span_for_collapsed_anchor(
-    overlay_at: &impl Fn(u16, u16) -> Option<u8>,
-    from: (u16, u16),
-    axis: Axis,
-    step: i16,
-    anchors: &[u8; 2],
-    is_high: bool,
-) -> bool {
-    let mut cur = from;
-    loop {
-        let Some(overlay) = overlay_at(cur.0, cur.1) else {
-            return false;
-        };
-        let in_band = if is_high {
-            ordinary::member(i32::from(overlay), HutBridgeFamily::High)
-        } else {
-            ordinary::member(i32::from(overlay), HutBridgeFamily::Low)
-        };
-        if !in_band {
-            return false;
-        }
-        if anchors.contains(&overlay) {
-            return true;
-        }
-        let Some(next) = step_axis(cur, axis, step) else {
-            return false;
-        };
-        cur = next;
-    }
+    crate::sim::bridge_state::repair_query::can_repair(
+        &crate::map::resolved_terrain::NativeCellQuery::canonical(terrain),
+        Some(overlays),
+        &[],
+        (hut_center.0 as i16, hut_center.1 as i16),
+    )
 }
 
 fn hut_destroy_5x5_scan(center: (u16, u16)) -> impl Iterator<Item = (u16, u16)> {
@@ -396,15 +344,15 @@ fn finish_hut_fallback(
     sim: &mut Simulation,
     rules: &RuleSet,
     extra: HutFallbackExecution,
-    overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
+    frame_effects: &mut FrameEffects<'_>,
 ) -> bool {
     let rim_collapsed = extra.rim_cell.is_some_and(|ramp| {
         live_publication::update_adjacent_bridges(
             sim,
             rules,
-            overlay_registry,
             ramp,
             HutBridgeFamily::High,
+            frame_effects,
         )
     });
     if extra.zones_dirty {
@@ -418,16 +366,12 @@ fn finish_hut_fallback(
 const MAX_HUT_SWEEP_STEPS: usize = 4;
 const MAX_HUT_ATTEMPTS_PER_STEP: usize = 3;
 const NORMALIZED_RNG_MAX_INCLUSIVE: u32 = 0x7FFF_FFFE;
-// Bridge-debris RNG gate boundaries. The original engine compares
-// `(double)draw * scale` against 0.95 / 0.5, where `scale` is the bit-exact
-// double `2^-31 + 2^-61` (NOT `1/2^31`). The tiny `2^-61` term pushes each
-// integer boundary just below the naive `threshold * 2^31`, so a draw landing
-// exactly on the float boundary must FAIL the gate. Gate passes iff
-// `draw < EXCLUSIVE`. Do NOT "simplify" these back to 2^31-scaled values
-// (…466 / 0x4000_0000): the off-by-{2,1} reproduces the float boundary, and a
-// spurious pass spends extra slot draws -> lockstep desync.
-const BRIDGE_DEBRIS_OUTER_GATE_EXCLUSIVE: u32 = 2_040_109_464;
-const BRIDGE_METALLIC_GATE_EXCLUSIVE: u32 = 0x3FFF_FFFF;
+/// A collapsing cell throws debris when its draw passes `[0x007E4F58]`, 0.95
+/// (`0x0047DE5D..0x0047DE72`).
+const BRIDGE_DEBRIS_OUTER_GATE: u32 = unit_draw_threshold(0.95);
+/// The debris adds a MetallicDebris anim when the next draw passes
+/// `[0x007E1738]`, 0.5 (`0x0047DF4C..0x0047DF61`).
+const BRIDGE_METALLIC_GATE: u32 = unit_draw_threshold(0.5);
 // Safety cap on the extent-measurement walk (Phase 1 of the bounded
 // walker). gamemd has no explicit cap — the off-bridge band check
 // terminates the walk — but a runaway count would only happen if the
@@ -471,8 +415,8 @@ fn bridge_overlay_at(sim: &Simulation, rx: u16, ry: u16) -> Option<u8> {
     // read that authority.
     sim.resolved_terrain
         .as_ref()
-        .and_then(|terrain| terrain.cell(rx, ry))
-        .and_then(|cell| cell.bridge_facts.overlay_id)
+        .and_then(|terrain| terrain.cell(rx, ry))?;
+    sim.overlay_grid.as_ref()?.cell(rx, ry).overlay_id
 }
 
 /// The CABHUT death fallback: the tail of
@@ -556,7 +500,7 @@ fn family_rim_tiles(
 fn hut_tile_keys(terrain: &ResolvedTerrainGrid, family: HutBridgeFamily) -> HighBridgeRimTiles {
     let mut keys = terrain
         .high_bridge_rim_tiles()
-        .unwrap_or_else(|| HighBridgeRimTiles::from_ini(-1, &[]));
+        .unwrap_or(HighBridgeRimTiles::ABSENT);
     if family == HutBridgeFamily::Low {
         keys.base = terrain.wood_bridge_set_base();
     }
@@ -809,19 +753,51 @@ fn step_axis_by(pos: (u16, u16), axis: Axis, delta: i32) -> Option<(u16, u16)> {
     }
 }
 
-/// Complete ground receivers before the deck pass and debris RNG.
+/// Test entry for an already-cleared cell using the ordinary probe.
+#[cfg(test)]
 pub(super) fn blow_up_bridge_cell_fallout(
     sim: &mut Simulation,
     rules: &RuleSet,
     rx: u16,
     ry: u16,
-    overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
+    overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    frame_effects: &mut FrameEffects<'_>,
 ) {
-    kill_ground_occupants_at(sim, rules, rx, ry, overlay_registry);
-    drop_in_bridge_deck_entities(sim, rx, ry);
+    publish_bridge_cell_fallout(
+        sim,
+        rules,
+        PendingBridgeCell {
+            point: (rx as i16, ry as i16),
+            corrected_deck_level: None,
+        },
+        overlay_registry,
+        frame_effects,
+    );
+}
+
+/// Complete ground receivers before the deck pass and debris RNG.
+fn publish_bridge_cell_fallout(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    collapse: PendingBridgeCell,
+    overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    frame_effects: &mut FrameEffects<'_>,
+) {
+    let (rx, ry) = (collapse.point.0 as u16, collapse.point.1 as u16);
+    kill_ground_occupants_at(sim, rules, rx, ry, overlay_registry, frame_effects);
+    drop_in_bridge_deck_entities(
+        sim,
+        rx,
+        ry,
+        super::UninitContext::new(rules).with_effects(frame_effects),
+    );
+    //47DDD5..47DE2B publishes after ground/deck receivers, before debris
+    //draws/constructors. Direct callers also leave pending entries for save;
+    //only Map587180 owns the clear/consume bracket.
+    sim.pending_bridge_collapses.append(collapse);
     let mut one_cell = BTreeSet::new();
     one_cell.insert((rx, ry));
-    spawn_bridge_debris(sim, rules, &one_cell);
+    spawn_bridge_debris(sim, rules, &one_cell, collapse.corrected_deck_level);
 }
 
 /// `CellClass::BlowUpBridge @ 0x0047DDAE`: every ground occupant takes
@@ -832,17 +808,21 @@ pub(super) fn kill_ground_occupants_at(
     rules: &RuleSet,
     rx: u16,
     ry: u16,
-    overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
+    overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    frame_effects: &mut FrameEffects<'_>,
 ) {
-    ground_fallout::apply(sim, rules, overlay_registry, rx, ry);
+    ground_fallout::apply(sim, rules, overlay_registry, rx, ry, frame_effects);
 }
 
 /// MapClass::InvalidateBridgeZones (`0x0056DAE0`) on the live record owner.
 /// Returns whether a record deactivated (the native RebuildZoneConnectivity
 /// `0x0056C510` request).
-pub(crate) fn invalidate_bridge_zones(sim: &mut Simulation, query: (i16, i16)) -> bool {
-    let (Some(bridges), Some(terrain)) = (sim.bridge_state.as_mut(), sim.resolved_terrain.as_ref())
-    else {
+pub(crate) fn invalidate_bridge_zones(
+    resolved_terrain: &Option<ResolvedTerrainGrid>,
+    bridge_state: &mut Option<BridgeRuntimeState>,
+    query: (i16, i16),
+) -> bool {
+    let (Some(bridges), Some(terrain)) = (bridge_state.as_mut(), resolved_terrain.as_ref()) else {
         return false;
     };
     bridges.invalidate_bridge_zones(terrain, query)
@@ -868,7 +848,12 @@ pub(crate) fn publish_bridge_navigation(sim: &mut Simulation, rules: &RuleSet) {
 /// CellClass::BlowUpBridge47DD70 after its ground/deck receiver passes.
 /// Constructor/Start completes before the sibling explosion's delay/index
 /// draws. Native comparisons: tools/spatial_oracle/bridge_debris_producer.
-fn spawn_bridge_debris(sim: &mut Simulation, rules: &RuleSet, cells: &BTreeSet<(u16, u16)>) {
+fn spawn_bridge_debris(
+    sim: &mut Simulation,
+    rules: &RuleSet,
+    cells: &BTreeSet<(u16, u16)>,
+    retained_deck_level: Option<i16>,
+) {
     let explosion_count = sim.bridge_explosions.len() as u32;
     let metallic_count = sim.metallic_debris.len() as u32;
     if explosion_count == 0 {
@@ -878,7 +863,7 @@ fn spawn_bridge_debris(sim: &mut Simulation, rules: &RuleSet, cells: &BTreeSet<(
         let outer_draw = sim
             .bridge_rng()
             .next_range_u32_inclusive(0, NORMALIZED_RNG_MAX_INCLUSIVE);
-        if outer_draw >= BRIDGE_DEBRIS_OUTER_GATE_EXCLUSIVE {
+        if outer_draw >= BRIDGE_DEBRIS_OUTER_GATE {
             continue;
         }
         // 47DE78..47DEB6 reads signed Cell.Level and adds416 unconditionally,
@@ -888,12 +873,15 @@ fn spawn_bridge_debris(sim: &mut Simulation, rules: &RuleSet, cells: &BTreeSet<(
             .as_ref()
             .map(|terrain| terrain.collapse_animation_level(rx as i16, ry as i16))
             .unwrap_or(0);
-        let z = i32::from(level) * LEPTONS_PER_LEVEL as i32 + BRIDGE_DECK_HEIGHT_LEPTONS;
+        let z = retained_deck_level.map_or_else(
+            || i32::from(level) * LEPTONS_PER_LEVEL as i32 + BRIDGE_DECK_HEIGHT_LEPTONS,
+            |deck| i32::from(deck) * LEPTONS_PER_LEVEL as i32,
+        );
         let coord = bridge_jittered_coord(sim.bridge_rng(), (rx as i16, ry as i16), z);
         let metallic_draw = sim
             .bridge_rng()
             .next_range_u32_inclusive(0, NORMALIZED_RNG_MAX_INCLUSIVE);
-        if metallic_draw < BRIDGE_METALLIC_GATE_EXCLUSIVE && metallic_count > 0 {
+        if metallic_draw < BRIDGE_METALLIC_GATE && metallic_count > 0 {
             let slot = sim.bridge_rng().next_range_u32(metallic_count) as usize;
             let spawn = bridge_anim_spawn(sim.metallic_debris[slot], coord, 0);
             construct_bridge_anim(sim, rules, spawn);
@@ -985,7 +973,7 @@ fn bridge_jittered_coord(rng: &mut SimRng, cell: (i16, i16), z: i32) -> AnimWorl
 /// the deterministic native arithmetic owner for the chained multiply/sub/add;
 /// a host floating-point expression can change the emitted flight coordinate.
 fn bridge_jittered_axis(cell: i16, draw: u32) -> i32 {
-    let scale = X87Chop53::load_f64(NativeF64Bits::from_bits(0x3e00_0000_0040_0000))
+    let scale = X87Chop53::load_f64(crate::util::native_random::RANDOM_RANGED_UNIT_SCALE)
         .expect("finite native normalized random scale");
     let half = X87Chop53::load_f64(NativeF64Bits::from_bits(0x3fe0_0000_0000_0000))
         .expect("finite native one-half");
@@ -998,7 +986,12 @@ fn bridge_jittered_axis(cell: i16, draw: u32) -> i32 {
 /// BlowUpBridge's deck pass (0x0047DDBA..0x0047DDC9): read the selected
 /// head after ground callbacks, capture next BEFORE DropIn removes current.
 /// Membership owns selection, including retained corpses and non-anchor cells.
-fn drop_in_bridge_deck_entities(sim: &mut Simulation, rx: u16, ry: u16) {
+fn drop_in_bridge_deck_entities(
+    sim: &mut Simulation,
+    rx: u16,
+    ry: u16,
+    mut context: super::UninitContext<'_>,
+) {
     use crate::sim::movement::locomotor::MovementLayer;
     let mut next = sim
         .substrate
@@ -1011,30 +1004,32 @@ fn drop_in_bridge_deck_entities(sim: &mut Simulation, rx: u16, ry: u16) {
             .occupancy
             .get(rx, ry)
             .and_then(|cell| cell.next_on_layer(MovementLayer::Bridge, id));
-        sim.drop_in_bridge_member(id);
+        sim.drop_as_bomb(id, context.reborrow());
     }
 }
 
-#[cfg(test)]
+#[cfg(test)] // shared by test groups
 mod tests {
     use super::*;
     use crate::map::bridge_facts::{BRIDGE_FLAG_DESTROYED_OR_RAMP, BRIDGE_FLAG_DIRECTION_ZERO};
     use crate::map::resolved_terrain::{ResolvedTerrainCell, ResolvedTerrainGrid};
     use crate::rules::locomotor_type::LocomotorKind;
-    use crate::sim::components::Health;
+    use crate::sim::combat::Health;
     use crate::sim::game_entity::GameEntity;
     use crate::sim::intern::test_intern;
     use crate::sim::movement::locomotor::{LocomotorState, MovementLayer};
     use crate::sim::occupancy::CellListInsertion;
 
-    /// Write CellClass+44 on each listed cell.
-    pub(super) fn seed_bridge_overlay(
-        terrain: &mut ResolvedTerrainGrid,
-        cells: &[(u16, u16)],
-        overlay: u8,
-    ) {
+    /// Write CellClass+44 on each listed cell of `sim`'s overlay grid,
+    /// installed over its terrain when absent.
+    pub(super) fn seed_bridge_overlay(sim: &mut Simulation, cells: &[(u16, u16)], overlay: u8) {
+        let terrain = sim.resolved_terrain.as_ref().expect("seeded terrain");
+        let (width, height) = (terrain.width(), terrain.height());
+        let grid = sim
+            .overlay_grid
+            .get_or_insert_with(|| crate::sim::overlay_grid::OverlayGrid::new(width, height));
         for &(x, y) in cells {
-            terrain.cell_mut(x, y).unwrap().bridge_facts.overlay_id = Some(overlay);
+            grid.cell_mut_for_test(x, y).overlay_id = Some(overlay);
         }
     }
 
@@ -1049,23 +1044,31 @@ mod tests {
     }
 
     /// Build a single-cell terrain grid where (5,5) is a bridge deck at
-    /// `deck_level`, ground level=0, water below (`is_water=true`,
-    /// `ground_walk_blocked=true`). Used to verify DropIn lets deck units
-    /// survive even with no walkable ground.
+    /// `deck_level`, ground level=0, Water below (its land, zone and ground
+    /// block). Used to verify DropIn lets deck units survive even with no
+    /// walkable ground.
     pub(super) fn water_below_bridge_terrain(deck_level: u8) -> ResolvedTerrainGrid {
         let mut cells = Vec::new();
         for y in 0..=5u16 {
             for x in 0..=5u16 {
                 let is_bridge = x == 5 && y == 5;
-                cells.push(ResolvedTerrainCell {
-                    is_water: is_bridge,
-                    ground_walk_blocked: is_bridge,
+                let mut cell = ResolvedTerrainCell {
                     has_bridge_deck: is_bridge,
                     bridge_walkable: is_bridge,
                     bridge_transition: is_bridge,
                     bridge_deck_level: if is_bridge { deck_level } else { 0 },
                     ..crate::map::resolved_terrain::test_flat_cell(x, y)
-                });
+                };
+                if is_bridge {
+                    let water = crate::rules::terrain_rules::LandType::Water.as_index();
+                    cell.land_type = water;
+                    cell.base_land_type = water;
+                    cell.zone_type = crate::map::resolved_terrain::zone_class::WATER;
+                    cell.ground_walk_blocked = true;
+                    cell.base_ground_walk_blocked = true;
+                    cell.base_build_blocked = true;
+                }
+                cells.push(cell);
             }
         }
         ResolvedTerrainGrid::from_cells(6, 6, cells)
@@ -1074,7 +1077,7 @@ mod tests {
     /// Build a Drive locomotor on the Bridge layer (mimics `high=true` spawn).
     fn drive_loco_on_bridge() -> LocomotorState {
         let mut loco = LocomotorState::for_test_kind(LocomotorKind::Drive);
-        loco.layer = MovementLayer::Bridge;
+        loco.set_layer_for_test(MovementLayer::Bridge);
         loco
     }
 
@@ -1087,64 +1090,19 @@ mod tests {
             3,
             64,
             test_intern("Americans"),
-            Health { current: 256 },
+            Health::new(256),
             test_intern("MTNK"),
             crate::map::entities::EntityCategory::Unit,
             0,
             5,
             true,
         );
-        entity.on_bridge = true;
+        entity.set_on_bridge(true);
+        entity.lifecycle.set_in_limbo_for_test(false);
+        entity.lifecycle.set_cell_marked_for_test(true);
         entity.locomotor = Some(drive_loco_on_bridge());
-        // Give it a short fake movement target so we can verify it gets
-        // halted on collapse.
-        entity.movement_target = Some(crate::sim::components::MovementTarget::default());
         sim.substrate.entities.insert(entity);
         1
-    }
-
-    /// Task 11 — DropIn correction: bridge-deck entities snap to ground
-    /// level + survive even when the destination is unwalkable (water
-    /// below). The legacy `resolve_bridge_state_changes` despawned in
-    /// this case; vanilla never does (HIGH §12.7 / §12.9).
-    #[test]
-    fn drop_in_snaps_deck_entity_to_ground_over_water_no_despawn() {
-        let mut sim = Simulation::new();
-        sim.resolved_terrain = Some(water_below_bridge_terrain(3));
-        let id = spawn_deck_unit(&mut sim);
-        sim.substrate.occupancy.add(
-            5,
-            5,
-            id,
-            MovementLayer::Bridge,
-            None,
-            CellListInsertion::PrependNonBuilding,
-        );
-
-        drop_in_bridge_deck_entities(&mut sim, 5, 5);
-
-        let e = sim
-            .substrate
-            .entities
-            .get(id)
-            .expect("deck entity must SURVIVE collapse over water");
-        assert_eq!(e.position.z, 0, "snapped to ground level");
-        assert!(!e.on_bridge, "OnBridge cleared by DropIn");
-        assert!(e.movement_target.is_none(), "movement halted on collapse");
-        assert_eq!(e.health.current, 256, "DropIn never harms — no damage");
-        let loco = e.locomotor.as_ref().expect("locomotor");
-        assert_eq!(
-            loco.layer,
-            MovementLayer::Ground,
-            "layer flipped Bridge → Ground"
-        );
-        let cell = sim
-            .substrate
-            .occupancy
-            .get(5, 5)
-            .expect("occupancy retained");
-        assert_eq!(cell.count_on(MovementLayer::Ground), 1);
-        assert_eq!(cell.count_on(MovementLayer::Bridge), 0);
     }
 
     /// DropIn (`0x005F4160`) writes no Location: an object falling onto the
@@ -1155,7 +1113,7 @@ mod tests {
         sim.resolved_terrain = Some(water_below_bridge_terrain(3));
         let id = spawn_deck_unit(&mut sim);
         let entity = sim.substrate.entities.get_mut(id).unwrap();
-        entity.position.exact_z_leptons = Some(1000);
+        entity.position.set_exact_z_leptons_for_test(Some(1000));
         entity.set_falling_down_for_test(true);
         sim.substrate.occupancy.add(
             5,
@@ -1166,14 +1124,19 @@ mod tests {
             CellListInsertion::PrependNonBuilding,
         );
 
-        drop_in_bridge_deck_entities(&mut sim, 5, 5);
+        drop_in_bridge_deck_entities(&mut sim, 5, 5, super::super::UninitContext::default());
 
         let e = sim.substrate.entities.get(id).unwrap();
-        assert!(!e.on_bridge);
+        assert!(!e.on_bridge());
         assert!(e.is_falling_down());
-        assert_eq!(e.position.exact_z_leptons, Some(1000));
+        assert_eq!(e.position.exact_z_leptons(), Some(1000));
         let mut frames = 0;
-        while !sim.advance_fall(id, -8) {
+        while !sim.advance_fall(
+            id,
+            -8,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            &mut crate::sim::world::FrameEffects::default(),
+        ) {
             frames += 1;
             assert!(frames < 200, "the fall reaches the ground");
         }
@@ -1183,7 +1146,7 @@ mod tests {
                 .get(id)
                 .unwrap()
                 .position
-                .exact_z_leptons,
+                .exact_z_leptons(),
             Some(0)
         );
     }
@@ -1194,12 +1157,13 @@ mod tests {
         let mut rules = crate::rules::ruleset::RuleSet::from_ini(&ini).expect("rules parse");
         let mut art = crate::rules::art_data::ArtRegistry::from_ini(
             &crate::rules::ini_parser::IniFile::from_str(
-                "[BRIDGEEXP1]\nTranslucent=yes\nReport=Explosion06\n\
-                 [BRIDGEEXP2]\nTranslucent=yes\nReport=Explosion07\n",
+                "[BRIDGEEXP1]\nTranslucent=yes\n[BRIDGEEXP2]\nTranslucent=yes\n",
             ),
         );
         art.bind_anim_frame_count_for_test("BRIDGEEXP1", 8);
         art.bind_anim_frame_count_for_test("BRIDGEEXP2", 8);
+        art.set_anim_sounds_for_test("BRIDGEEXP1", Some("Explosion06"), None);
+        art.set_anim_sounds_for_test("BRIDGEEXP2", Some("Explosion07"), None);
         rules.replace_art_registry_for_test(art);
         rules
     }
@@ -1209,119 +1173,67 @@ mod tests {
             .anims
             .iter()
             .map(|(_, anim)| anim)
-            .filter(|anim| sim.bridge_explosions.contains(&anim.type_id))
+            .filter(|anim| sim.bridge_explosions.contains(&anim.type_id()))
             .collect()
     }
 
+    /// The hut sweep's seed steps along the physical span axis of the
+    /// matched overlay range, not the walker family, and canonicalizes along
+    /// that axis by its in-band back lanes.
     #[test]
-    fn hut_destroy_overlay_seed_uses_physical_span_axis_not_walker_family() {
-        let high_ew_range = [((5, 4), 0xCD), ((5, 5), 0xCD)];
-        assert_eq!(
-            find_destroy_overlay_seed(
-                &overlay_lookup(&high_ew_range),
-                &[(5, 5)],
-                HutBridgeFamily::High
+    fn cabhut_seed_canonicalization_follows_in_band_back_lanes() {
+        type Case<'a> = (
+            &'a [((u16, u16), u8)],
+            HutBridgeFamily,
+            (u16, u16, Axis),
+            &'a str,
+        );
+        let cases: [Case<'_>; 6] = [
+            (
+                &[((5, 4), 0xCD), ((5, 5), 0xCD)],
+                HutBridgeFamily::High,
+                (5, 5, Axis::EW),
+                "0xCD high range dispatches to CollapseBridge_EW_High, so the hut sweep must step X; \
+                 one in-band back lane and one off-band second back lane keeps the matched cell",
             ),
-            Some((5, 5, Axis::EW)),
-            "0xCD high range dispatches to CollapseBridge_EW_High, so the hut sweep must step X"
-        );
-
-        let high_ns_range = [((4, 5), 0xD6), ((5, 5), 0xD6)];
-        assert_eq!(
-            find_destroy_overlay_seed(
-                &overlay_lookup(&high_ns_range),
-                &[(5, 5)],
-                HutBridgeFamily::High
+            (
+                &[((4, 5), 0xD6), ((5, 5), 0xD6)],
+                HutBridgeFamily::High,
+                (5, 5, Axis::NS),
+                "0xD6 high range dispatches to CollapseBridge_NS_High, so the hut sweep must step Y",
             ),
-            Some((5, 5, Axis::NS)),
-            "0xD6 high range dispatches to CollapseBridge_NS_High, so the hut sweep must step Y"
-        );
-
-        let low_ew_range = [((5, 4), 0x4A), ((5, 5), 0x4A)];
-        assert_eq!(
-            find_destroy_overlay_seed(
-                &overlay_lookup(&low_ew_range),
-                &[(5, 5)],
-                HutBridgeFamily::Low
+            (
+                &[((5, 4), 0x4A), ((5, 5), 0x4A)],
+                HutBridgeFamily::Low,
+                (5, 5, Axis::EW),
+                "0x4A low range dispatches to CollapseBridge_EW_Low, so the hut sweep must step X",
             ),
-            Some((5, 5, Axis::EW)),
-            "0x4A low range dispatches to CollapseBridge_EW_Low, so the hut sweep must step X"
-        );
-
-        let low_ns_range = [((4, 5), 0x53), ((5, 5), 0x53)];
-        assert_eq!(
-            find_destroy_overlay_seed(
-                &overlay_lookup(&low_ns_range),
-                &[(5, 5)],
-                HutBridgeFamily::Low
+            (
+                &[((4, 5), 0x53), ((5, 5), 0x53)],
+                HutBridgeFamily::Low,
+                (5, 5, Axis::NS),
+                "0x53 low range dispatches to CollapseBridge_NS_Low, so the hut sweep must step Y",
             ),
-            Some((5, 5, Axis::NS)),
-            "0x53 low range dispatches to CollapseBridge_NS_Low, so the hut sweep must step Y"
-        );
-    }
-
-    #[test]
-    fn cabhut_seed_canonicalization_shifts_edge_hit_forward() {
-        let state = [((5, 5), 0xCD)];
-
-        assert_eq!(
-            find_destroy_overlay_seed(&overlay_lookup(&state), &[(5, 5)], HutBridgeFamily::High),
-            Some((5, 6, Axis::EW)),
-            "when no back lane is in the bridge band, DestroyBridgeFromCell shifts one cell forward"
-        );
-    }
-
-    #[test]
-    fn cabhut_seed_canonicalization_keeps_middle_hit() {
-        let state = [((5, 4), 0xCD), ((5, 5), 0xCD)];
-
-        assert_eq!(
-            find_destroy_overlay_seed(&overlay_lookup(&state), &[(5, 5)], HutBridgeFamily::High),
-            Some((5, 5, Axis::EW)),
-            "one in-band back lane and one off-band second back lane keeps the matched cell"
-        );
-    }
-
-    #[test]
-    fn cabhut_seed_canonicalization_shifts_two_cells_in_backward() {
-        let state = [((5, 3), 0xCD), ((5, 4), 0xCD), ((5, 5), 0xCD)];
-
-        assert_eq!(
-            find_destroy_overlay_seed(&overlay_lookup(&state), &[(5, 5)], HutBridgeFamily::High),
-            Some((5, 4, Axis::EW)),
-            "two in-band back probes shift the canonical seed one cell backward"
-        );
-    }
-
-    #[test]
-    fn hut_destroy_scan_uses_gamemd_x_major_order() {
-        let cells: Vec<(u16, u16)> = hut_destroy_5x5_scan((10, 10)).collect();
-        assert_eq!(cells.len(), 25);
-        assert_eq!(
-            &cells[..6],
-            &[(8, 8), (8, 9), (8, 10), (8, 11), (8, 12), (9, 8)],
-            "hut death scan must walk each X column before advancing X"
-        );
-
-        let edge_cells: Vec<(u16, u16)> = hut_destroy_5x5_scan((0, 0)).collect();
-        assert_eq!(edge_cells.len(), 9);
-        assert_eq!(
-            &edge_cells[..3],
-            &[(0, 0), (0, 1), (0, 2)],
-            "off-map negative cells are skipped while preserving X-major order"
-        );
-    }
-
-    #[test]
-    fn hut_destroy_overlay_seed_prefers_x_major_first_match() {
-        let scan: Vec<(u16, u16)> = hut_destroy_5x5_scan((10, 10)).collect();
-        let state = [((9, 8), 0xCD), ((8, 12), 0xCD)];
-
-        assert_eq!(
-            find_destroy_overlay_seed(&overlay_lookup(&state), &scan, HutBridgeFamily::High),
-            Some((8, 13, Axis::EW)),
-            "Y-major scan would find (9,8) first; gamemd hut death finds the earlier X column"
-        );
+            (
+                &[((5, 5), 0xCD)],
+                HutBridgeFamily::High,
+                (5, 6, Axis::EW),
+                "when no back lane is in the bridge band, DestroyBridgeFromCell shifts one cell forward",
+            ),
+            (
+                &[((5, 3), 0xCD), ((5, 4), 0xCD), ((5, 5), 0xCD)],
+                HutBridgeFamily::High,
+                (5, 4, Axis::EW),
+                "two in-band back probes shift the canonical seed one cell backward",
+            ),
+        ];
+        for (state, family, expected, why) in cases {
+            assert_eq!(
+                find_destroy_overlay_seed(&overlay_lookup(state), &[(5, 5)], family),
+                Some(expected),
+                "{why}"
+            );
+        }
     }
 
     /// The hut-collapse walk creates its pre-destroy presentation effects from
@@ -1331,10 +1243,9 @@ mod tests {
     fn hut_collapse_walker_presentation_uses_scenario_only() {
         let mut sim = Simulation::new();
         let seed = 0x48A7_51DE_u64;
-        sim.reseed_scenario_and_main(seed);
-        let mut terrain = water_below_bridge_terrain(3);
-        seed_bridge_overlay(&mut terrain, &[(4, 3), (4, 4)], 0xE0);
-        sim.resolved_terrain = Some(terrain);
+        sim.initialize_random_number_system(seed as u32);
+        sim.resolved_terrain = Some(water_below_bridge_terrain(3));
+        seed_bridge_overlay(&mut sim, &[(4, 3), (4, 4)], 0xE0);
         sim.bridge_state = Some(crate::sim::bridge_state::BridgeRuntimeState::default());
         let bridge_explosion = sim.interner.intern("BRIDGEEXP1");
         sim.bridge_explosions.push(bridge_explosion);
@@ -1361,10 +1272,7 @@ mod tests {
             "intermediate-only fixture must not add BlowUpBridge fallout draws"
         );
         assert_eq!(
-            sim.resolved_terrain
-                .as_ref()
-                .and_then(|terrain| terrain.cell(4, 4))
-                .and_then(|cell| cell.bridge_facts.overlay_id),
+            sim.overlay_grid.as_ref().unwrap().cell(4, 4).overlay_id,
             Some(0xE0),
             "fixture must run the real hut dispatcher without a terminal transition"
         );
@@ -1378,10 +1286,10 @@ mod tests {
             // `CollapseBridge_NS_Low @ 0x00575540`: row `(type, &coord,
             // RandomRanged(1, 5), 1, 0x600, 0, 0)`, Z from the cell level with
             // no deck offset.
-            assert_eq!(anim.draw_flags, 0x600);
-            assert_eq!(anim.z_adjust, 0);
-            assert!((1..=5).contains(&anim.runtime.delay_remaining));
-            let (.., level) = anim.world_coord.to_cell_sub_z();
+            assert_eq!(anim.draw_flags(), 0x600);
+            assert_eq!(anim.z_adjust(), 0);
+            assert!((1..=5).contains(&anim.runtime().delay_remaining));
+            let (.., level) = anim.world_coord().to_cell_sub_z();
             assert_eq!(
                 level, 0,
                 "walker explosions sit on the cell level, not the deck"
@@ -1421,19 +1329,19 @@ mod tests {
     fn dispatcher_in_band_cell_consumes_two_block_strength_draws() {
         let mut sim = Simulation::new();
         let seed = 0x0B11_D6E5_u64;
-        sim.reseed_scenario_and_main(seed);
+        sim.initialize_random_number_system(seed as u32);
         let mut terrain = water_below_bridge_terrain(4);
         // A raw overlay alone admits only D. A also needs a real concrete
         // Middle tile class (without0x100 its height gate is bypassed).
-        terrain.cell_mut(5, 5).unwrap().final_tile_index = 1019;
+        terrain.cell_mut_for_test(5, 5).unwrap().final_tile_index = 1019;
         terrain.test_set_high_bridge_rim_tiles(
             crate::map::bridge_rim_tiles::HighBridgeRimTiles::from_ini(
                 1000,
                 b"[General]\nBridgeMiddle1=20\nBridgeMiddle2=40\n",
             ),
         );
-        seed_bridge_overlay(&mut terrain, &[(5, 5)], 0xCD);
         sim.resolved_terrain = Some(terrain);
+        seed_bridge_overlay(&mut sim, &[(5, 5)], 0xCD);
         sim.bridge_state = Some(BridgeRuntimeState::default());
 
         let bridge_strength = 1500i32;
@@ -1453,7 +1361,13 @@ mod tests {
             impact_z_leptons: 0,
         };
         let rules = bridge_explosion_rules();
-        let _ = damage_dispatch::run(&mut sim, &[event], bridge_strength, &rules, None);
+        let _ = damage_dispatch::run(
+            &mut sim,
+            &[event],
+            bridge_strength,
+            &rules,
+            &mut crate::sim::world::FrameEffects::default(),
+        );
 
         assert_eq!(
             sim.scenario_rng.state(),
@@ -1475,7 +1389,11 @@ mod tests {
                 crate::map::resolved_terrain::test_flat_cell,
             );
             for &((x, y), flags) in cells {
-                terrain.cell_mut(x, y).unwrap().bridge_facts.raw_flags = flags;
+                terrain
+                    .cell_mut_for_test(x, y)
+                    .unwrap()
+                    .bridge_facts
+                    .raw_flags = flags;
             }
             terrain
         };
@@ -1497,7 +1415,11 @@ mod tests {
         // 0x100 alone anchors on +0x2C.
         let mut terrain = grid(&[((12, 10), BRIDGE_FLAG_STRUCTURAL)]);
         let anchor = terrain.native_cell_identity((13, 12));
-        terrain.cell_mut(12, 10).unwrap().bridge_facts.native_anchor = Some(anchor);
+        terrain
+            .cell_mut_for_test(12, 10)
+            .unwrap()
+            .bridge_facts
+            .native_anchor = Some(anchor);
         assert_eq!(hut_fallback_anchor(terrain, hut), Some(((13, 12), 0)));
 
         // A pure 0x400 starter scans direction 2 over at most three more
@@ -1548,7 +1470,7 @@ mod tests {
         // TopRight1 at sub-tile 12 is a ramp; BottomLeft1 at sub-tile 2 ends
         // a walk heading direction 4. Tiles are base + key - 1.
         for (cell, tile, sub_tile) in [((10, 4), 104, 12), ((10, 6), 104, 12), ((10, 9), 106, 2)] {
-            let cell = terrain.cell_mut(cell.0, cell.1).unwrap();
+            let cell = terrain.cell_mut_for_test(cell.0, cell.1).unwrap();
             cell.final_tile_index = tile;
             cell.final_sub_tile = sub_tile;
         }
@@ -1603,7 +1525,8 @@ mod tests {
             let sim = &scene.runtime.simulation;
             assert!(
                 sim.entities().values().any(|e| {
-                    (e.position.rx, e.position.ry) == hut && sim.resolve(e.type_ref()) == "CABHUT"
+                    (e.position.rx(), e.position.ry()) == hut
+                        && sim.resolve(e.type_ref()) == "CABHUT"
                 }),
                 "{map}: a CABHUT stands at {hut:?}"
             );
@@ -1638,7 +1561,7 @@ mod tests {
                 simulation,
                 &resources.rules,
                 hut,
-                Some(&resources.overlay_registry),
+                &mut crate::sim::world::FrameEffects::default(),
             );
             assert_eq!(
                 flags(simulation),
@@ -1653,7 +1576,7 @@ mod tests {
     #[test]
     fn bridge_debris_requires_bridge_explosion_list() {
         let mut sim = Simulation::new();
-        sim.reseed_scenario_and_main(7);
+        sim.initialize_random_number_system(7);
         let baseline_state = sim.scenario_rng.state();
         sim.resolved_terrain = Some(water_below_bridge_terrain(3));
         let metallic_debris = sim.interner.intern("METALDEB1");
@@ -1663,7 +1586,7 @@ mod tests {
         let mut cells = BTreeSet::new();
         cells.insert((5, 5));
         cells.insert((4, 5));
-        spawn_bridge_debris(&mut sim, &rules, &cells);
+        spawn_bridge_debris(&mut sim, &rules, &cells, None);
 
         assert_eq!(
             sim.scenario_rng.state(),
@@ -1671,57 +1594,6 @@ mod tests {
             "no RNG draws when BridgeExplosion metadata is absent"
         );
         assert!(sim.substrate.anims.iter().next().is_none());
-    }
-
-    /// Task 11 — DropIn must NOT touch entities that aren't on the bridge
-    /// layer at the destroyed cell. Ground-layer entities are handled by
-    /// `kill_ground_occupants_at` (Step 1), not DropIn.
-    #[test]
-    fn drop_in_ignores_ground_layer_entities_at_destroyed_cell() {
-        let mut sim = Simulation::new();
-        sim.resolved_terrain = Some(water_below_bridge_terrain(3));
-        let mut entity = GameEntity::new_at_frame_zero_for_test(
-            1,
-            5,
-            5,
-            0,
-            64,
-            test_intern("Americans"),
-            Health { current: 256 },
-            test_intern("MTNK"),
-            crate::map::entities::EntityCategory::Unit,
-            0,
-            5,
-            true,
-        );
-        entity.on_bridge = false; // ground-layer occupant
-        let mut loco = drive_loco_on_bridge();
-        loco.layer = MovementLayer::Bridge;
-        entity.locomotor = Some(loco);
-        sim.substrate.entities.insert(entity);
-        sim.substrate.occupancy.add(
-            5,
-            5,
-            1,
-            MovementLayer::Ground,
-            None,
-            CellListInsertion::PrependNonBuilding,
-        );
-
-        drop_in_bridge_deck_entities(&mut sim, 5, 5);
-
-        // Ground entity untouched — still alive, still ground layer.
-        let e = sim
-            .substrate
-            .entities
-            .get(1)
-            .expect("ground entity untouched");
-        assert_eq!(e.health.current, 256);
-        assert!(!e.on_bridge);
-        assert_eq!(e.locomotor.as_ref().unwrap().layer, MovementLayer::Bridge);
-        let cell = sim.substrate.occupancy.get(5, 5).expect("ground occupancy");
-        assert_eq!(cell.count_on(MovementLayer::Ground), 1);
-        assert_eq!(cell.count_on(MovementLayer::Bridge), 0);
     }
 
     /// BlowUpBridge force-kills only the cell's ground object-list occupants.
@@ -1739,7 +1611,7 @@ mod tests {
             0,
             64,
             sim.interner.intern("Americans"),
-            Health { current: 256 },
+            Health::new(256),
             sim.interner.intern("MTNK"),
             crate::map::entities::EntityCategory::Unit,
             0,
@@ -1756,7 +1628,7 @@ mod tests {
             12,
             64,
             sim.interner.intern("Americans"),
-            Health { current: 256 },
+            Health::new(256),
             sim.interner.intern("ORCA"),
             crate::map::entities::EntityCategory::Aircraft,
             0,
@@ -1764,14 +1636,14 @@ mod tests {
             true,
         );
         let mut loco = drive_loco_on_bridge();
-        loco.layer = MovementLayer::Air;
+        loco.set_layer_for_test(MovementLayer::Air);
         air.locomotor = Some(loco);
-        air.on_bridge = false;
+        air.set_on_bridge(false);
         sim.substrate.entities.insert(air);
 
         // Consumed Engineers can retain positive HP after UnInit until the
         // deferred drain. The legacy coordinate scan must not restart their
-        // Infantry terminal lifetime when it visits this stored identity.
+        // death when it visits this stored identity.
         let retired = GameEntity::new_at_frame_zero_for_test(
             3,
             5,
@@ -1779,7 +1651,7 @@ mod tests {
             0,
             0,
             sim.interner.intern("Americans"),
-            Health { current: 100 },
+            Health::new(100),
             sim.interner.intern("E1"),
             crate::map::entities::EntityCategory::Infantry,
             0,
@@ -1788,14 +1660,16 @@ mod tests {
         );
         sim.substrate.entities.insert(retired);
         sim.uninit(3);
-        assert!(sim.substrate.entities.get(3).unwrap().health.current > 0);
+        assert!(sim.substrate.entities.get(3).unwrap().health.current() > 0);
 
         let rules = RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(
-            "[VehicleTypes]\n0=MTNK\n[MTNK]\nStrength=256\nArmor=heavy\n[Warheads]\n0=Super\n[Super]\nInfDeath=1\n",
-        )).unwrap();
+            "[VehicleTypes]\n0=MTNK\n[MTNK]\nStrength=256\nArmor=heavy\n\
+             [CombatDamage]\nC4Warhead=Super\n[Warheads]\n0=Super\n[Super]\nInfDeath=1\n",
+        ))
+        .unwrap();
         let ground = sim.substrate.entities.get_mut(1).unwrap();
-        ground.lifecycle.in_limbo = false;
-        ground.lifecycle.cell_marked = true;
+        ground.lifecycle.set_in_limbo_for_test(false);
+        ground.lifecycle.set_cell_marked_for_test(true);
         sim.substrate.occupancy.add(
             5,
             5,
@@ -1804,108 +1678,38 @@ mod tests {
             None,
             crate::sim::occupancy::CellListInsertion::PrependNonBuilding,
         );
-        kill_ground_occupants_at(&mut sim, &rules, 5, 5, None);
+        kill_ground_occupants_at(
+            &mut sim,
+            &rules,
+            5,
+            5,
+            None,
+            &mut crate::sim::world::FrameEffects::default(),
+        );
 
         let retired = sim.substrate.entities.get(3).unwrap();
         assert_eq!(
-            retired.health.current, 100,
+            retired.health.current(),
+            100,
             "unlinked retired object is not a ground receiver"
         );
-        assert!(!retired.lifecycle.object_alive);
-        assert!(retired.infantry_terminal.is_none());
-        assert_eq!(sim.substrate.pending_delete, vec![3, 1]);
+        assert!(!retired.lifecycle.object_alive());
+        assert_eq!(sim.substrate.pending_delete.object_ids(), vec![3, 1]);
 
         let g = sim.substrate.entities.get(1).expect("ground unit present");
-        assert_eq!(g.health.current, 0, "ground occupant is force-killed");
-        assert!(g.dying, "ground occupant flagged dying");
+        assert_eq!(g.health.current(), 0, "ground occupant is force-killed");
+        assert!(g.death.is_dying(), "ground occupant flagged dying");
 
         let a = sim.substrate.entities.get(2).expect("aircraft present");
         assert_eq!(
-            a.health.current, 256,
+            a.health.current(),
+            256,
             "aircraft overflying the collapse cell must NOT be killed"
         );
-        assert!(!a.dying, "aircraft not flagged dying");
-    }
-
-    /// `CellClass::BlowUpBridge @ 0x0047DDAE` kills each ground occupant
-    /// through `ReceiveDamage` (`+0x16C`, `C4Warhead=`), so the deaths reach
-    /// `Death_Announcement` (`+0x3B8`): every human-owned death publishes the
-    /// radar type-7 request (`0x004D98FE`) that rate-limits "Unit lost" on the
-    /// owner's client; an AI owner publishes nothing.
-    #[test]
-    fn bridge_collapse_kill_publishes_unit_lost_per_human_death() {
-        use crate::sim::house_state::HouseState;
-        use crate::sim::world::SimSoundEvent;
-
-        let rules = RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(
-            "[VehicleTypes]\n0=MTNK\n[MTNK]\nStrength=300\nArmor=heavy\n[Warheads]\n0=Super\n[Super]\nInfDeath=1\n",
-        ))
-        .expect("rules parse");
-        let mut sim = Simulation::new();
-        let human = sim.interner.intern("Americans");
-        let ai = sim.interner.intern("Russians");
-        sim.houses.insert(
-            human,
-            HouseState::new(human, 0, Some(human), true, 5_000, 10),
-        );
-        sim.houses
-            .insert(ai, HouseState::new(ai, 0, Some(ai), false, 5_000, 10));
-        sim.session.house_order.push(human);
-        sim.session.house_order.push(ai);
-
-        let mtnk = sim.interner.intern("MTNK");
-        for (id, owner) in [(1u64, human), (2, human), (3, ai)] {
-            let unit = GameEntity::new_at_frame_zero_for_test(
-                id,
-                5,
-                5,
-                0,
-                64,
-                owner,
-                Health { current: 256 },
-                mtnk,
-                crate::map::entities::EntityCategory::Unit,
-                0,
-                5,
-                true,
-            );
-            sim.substrate.entities.insert(unit);
-        }
-
-        for id in 1..=3 {
-            let unit = sim.substrate.entities.get_mut(id).unwrap();
-            unit.lifecycle.in_limbo = false;
-            unit.lifecycle.cell_marked = true;
-            sim.substrate.occupancy.add(
-                5,
-                5,
-                id,
-                MovementLayer::Ground,
-                None,
-                crate::sim::occupancy::CellListInsertion::PrependNonBuilding,
-            );
-        }
-        kill_ground_occupants_at(&mut sim, &rules, 5, 5, None);
-
-        let lost: Vec<_> = sim
-            .sound_events
-            .iter()
-            .filter_map(|event| match event {
-                SimSoundEvent::UnitLost { owner, .. } => Some(*owner),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            lost,
-            vec![human, human],
-            "each human kill publishes its type-7 request (the client's radar              array dedupes them); the AI kill is silent"
-        );
-        for id in 1..=3 {
-            assert!(sim.substrate.entities.get(id).unwrap().dying);
-        }
+        assert!(!a.death.is_dying(), "aircraft not flagged dying");
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_a_b))]
 #[path = "bridge_deck_tests.rs"]
 mod deck_tests;

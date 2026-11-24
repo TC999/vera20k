@@ -31,9 +31,28 @@
 //! - Compressed entries decode through `assets::ima_adpcm`, the crate's single
 //!   IMA ADPCM implementation, mirroring the single decoder in `gamemd.exe`.
 
+// Outside data reaches this module: it refuses bad input, never panics.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::util::read_helpers::read_u32_le;
+
 const IDX_HEADER_SIZE: usize = 12;
 /// V1 entries are 32 bytes, V2 entries are 36 bytes (extra chunk_size field).
 const IDX_ENTRY_SIZE_V1: usize = 32;
+
+#[cfg(all(test, tests_assets))]
+#[path = "audio_bag_native_tests.rs"]
+mod native_tests;
 const IDX_ENTRY_SIZE_V2: usize = 36;
 
 const FLAG_STEREO: u32 = 0x01;
@@ -87,10 +106,21 @@ pub struct BagAudio {
 
 /// Parsed audio.idx index with the .bag data, providing name-based lookup.
 pub struct AudioIndex {
+    /// See [`Self::id`].
+    id: u64,
     /// Entries sorted by name (uppercase) for binary search.
     entries: Vec<AudioBagEntry>,
-    /// The raw .bag file data.
-    bag_data: Vec<u8>,
+    /// Backing files, retained independently: offsets stay relative to their BAG.
+    bag_data: Vec<Vec<u8>>,
+    /// Parallel to entries; constructed by parsing or the sole merge owner below.
+    entry_bags: Vec<usize>,
+    layout: IndexLayout,
+}
+
+#[derive(Clone, Copy)]
+enum IndexLayout {
+    Stock,
+    Ares,
 }
 
 impl AudioIndex {
@@ -98,65 +128,74 @@ impl AudioIndex {
     ///
     /// Returns `None` if the idx is malformed or has an unsupported version.
     pub fn from_idx_bag(idx_data: &[u8], bag_data: Vec<u8>) -> Option<Self> {
-        if idx_data.len() < IDX_HEADER_SIZE {
+        Self::parse(idx_data, bag_data, IndexLayout::Stock)
+    }
+
+    /// Installed Ares AudioBag::Open1005AA00, selected by Audio_Load4011C0.
+    /// See tools/rules_oracle/ares_audio_bags.md and its executed controls.
+    pub(crate) fn from_ares_idx_bag(idx_data: &[u8], bag_data: Vec<u8>) -> Option<Self> {
+        Self::parse(idx_data, bag_data, IndexLayout::Ares)
+    }
+
+    fn parse(idx_data: &[u8], bag_data: Vec<u8>, layout: IndexLayout) -> Option<Self> {
+        let (Some(first_word), Some(version), Some(entry_count), Some(table)) = (
+            read_u32_le(idx_data, 0),
+            read_u32_le(idx_data, 4),
+            read_u32_le(idx_data, 8),
+            idx_data.get(IDX_HEADER_SIZE..),
+        ) else {
             log::warn!("AudioIndex: idx too short ({} bytes)", idx_data.len());
             return None;
-        }
-
-        let version = u32::from_le_bytes([idx_data[4], idx_data[5], idx_data[6], idx_data[7]]);
-        let entry_size = match version {
-            1 => IDX_ENTRY_SIZE_V1,
-            2 => IDX_ENTRY_SIZE_V2,
-            _ => {
-                log::warn!(
-                    "AudioIndex: unsupported version {} (expected 1 or 2)",
-                    version
-                );
-                return None;
-            }
+        };
+        let entry_count = entry_count as usize;
+        let entry_size = match layout {
+            IndexLayout::Stock => match version {
+                1 => IDX_ENTRY_SIZE_V1,
+                2 => IDX_ENTRY_SIZE_V2,
+                _ => {
+                    log::warn!("AudioIndex: unsupported version {version} (expected 1 or 2)");
+                    return None;
+                }
+            },
+            // 1005AB3C tests DWORD0, not the version at DWORD1. This installed
+            // reader accepts other version tags and rejects ordinary 32-byte
+            // GABA/version1 files. Preserve it without weakening stock parsing.
+            IndexLayout::Ares if first_word == 1 => IDX_ENTRY_SIZE_V1,
+            IndexLayout::Ares => IDX_ENTRY_SIZE_V2,
         };
 
-        let entry_count =
-            u32::from_le_bytes([idx_data[8], idx_data[9], idx_data[10], idx_data[11]]) as usize;
-
-        let expected_size = IDX_HEADER_SIZE + entry_count * entry_size;
-        if idx_data.len() < expected_size {
+        let Some(table) = entry_count
+            .checked_mul(entry_size)
+            .and_then(|table_size| table.get(..table_size))
+        else {
             log::warn!(
-                "AudioIndex: truncated idx ({} bytes, need {} for {} entries)",
+                "AudioIndex: truncated idx ({} bytes for {} entries of {})",
                 idx_data.len(),
-                expected_size,
-                entry_count
+                entry_count,
+                entry_size
             );
             return None;
-        }
+        };
 
-        let mut entries = Vec::with_capacity(entry_count);
-        for i in 0..entry_count {
-            let base = IDX_HEADER_SIZE + i * entry_size;
-            let name_bytes = &idx_data[base..base + 16];
-            let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(16);
-            let name = String::from_utf8_lossy(&name_bytes[..name_end]).to_ascii_uppercase();
-
-            let offset = read_u32_le(idx_data, base + 16);
-            let size = read_u32_le(idx_data, base + 20);
-            let sample_rate = read_u32_le(idx_data, base + 24);
-            let flags = read_u32_le(idx_data, base + 28);
-            // V2 entries have chunk_size at +0x20 (IMA ADPCM block alignment).
-            let chunk_size = if entry_size >= IDX_ENTRY_SIZE_V2 {
-                read_u32_le(idx_data, base + 32)
-            } else {
-                0
-            };
-
-            entries.push(AudioBagEntry {
-                name,
-                offset,
-                size,
-                sample_rate,
-                flags,
-                chunk_size,
-            });
-        }
+        let mut entries = table
+            .chunks_exact(entry_size)
+            .map(|entry| {
+                let (name_bytes, fields) = entry.split_first_chunk::<16>()?;
+                let name_end = name_bytes.iter().position(|&b| b == 0).unwrap_or(16);
+                let name =
+                    String::from_utf8_lossy(name_bytes.get(..name_end)?).to_ascii_uppercase();
+                Some(AudioBagEntry {
+                    name,
+                    offset: read_u32_le(fields, 0)?,
+                    size: read_u32_le(fields, 4)?,
+                    sample_rate: read_u32_le(fields, 8)?,
+                    flags: read_u32_le(fields, 12)?,
+                    // V2 entries have chunk_size at +0x20 (IMA ADPCM block
+                    // alignment); a V1 entry ends before it.
+                    chunk_size: read_u32_le(fields, 16).unwrap_or(0),
+                })
+            })
+            .collect::<Option<Vec<AudioBagEntry>>>()?;
 
         // Sort by name for binary search (matches original engine behavior).
         entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -166,58 +205,105 @@ impl AudioIndex {
             entries.len(),
             bag_data.len()
         );
-        Some(Self { entries, bag_data })
+        Some(Self {
+            id: next_index_id(),
+            entries,
+            bag_data: vec![bag_data],
+            entry_bags: vec![0; entry_count],
+            layout,
+        })
+    }
+
+    /// AudioLuggage::Create1005A170: later case-insensitive names replace the
+    /// entire entry AND its file. This owns both the index and backing mapping;
+    /// callers cannot mutate either independently. No offset rebasing/concatenation.
+    pub(crate) fn merge_ares(bags: impl IntoIterator<Item = Self>) -> Self {
+        let mut files = Vec::new();
+        let mut winners = std::collections::BTreeMap::new();
+        for bag in bags {
+            let first_file = files.len();
+            files.extend(bag.bag_data);
+            for (entry, file) in bag.entries.into_iter().zip(bag.entry_bags) {
+                winners.insert(entry.name.clone(), (entry, first_file + file));
+            }
+        }
+        let (entries, entry_bags) = winners.into_values().unzip();
+        Self {
+            id: next_index_id(),
+            entries,
+            entry_bags,
+            bag_data: files,
+            layout: IndexLayout::Ares,
+        }
     }
 
     /// Look up a sound by name (case-insensitive).
     ///
-    /// Tries exact name first, then with `.aud` extension appended (some idx files
-    /// store entries with the extension, some without).
+    /// Stock lookup retains its `.aud` extension conveniences; an Ares catalog
+    /// uses the installed original exact case-insensitive FindSampleIndex.
     /// Returns the entry metadata and a slice of the raw audio data from the .bag.
     pub fn get(&self, name: &str) -> Option<(&AudioBagEntry, &[u8])> {
+        // Ares keeps original FindSampleIndex4015C0; no extension aliases.
+        if matches!(self.layout, IndexLayout::Ares) {
+            return self.get_exact(name);
+        }
         // Try exact name first.
         if let Some(result) = self.get_exact(name) {
             return Some(result);
         }
         // Try with .aud extension (entries may include the extension).
-        if !name.contains('.') {
-            if let Some(result) = self.get_exact(&format!("{}.aud", name)) {
-                return Some(result);
-            }
+        if !name.contains('.')
+            && let Some(result) = self.get_exact(&format!("{}.aud", name))
+        {
+            return Some(result);
         }
         // Try stripping .aud extension (caller may include it but index doesn't).
         if let Some(stem) = name
             .strip_suffix(".aud")
             .or_else(|| name.strip_suffix(".AUD"))
+            && let Some(result) = self.get_exact(stem)
         {
-            if let Some(result) = self.get_exact(stem) {
-                return Some(result);
-            }
+            return Some(result);
         }
         None
     }
 
+    /// `AudioIndex::FindSampleIndex @ 0x004015C0`: `bsearch` of the name table
+    /// with `_stricmp` (`0x007C8D20`), which `0x004013B1..0x004013BA` sorted
+    /// with the same comparator, so a name is found exactly when it equals an
+    /// entry case-insensitively. No extension aliases; the bag is not read.
+    pub fn find_sample_index(&self, name: &str) -> Option<usize> {
+        let upper = name.to_ascii_uppercase();
+        self.entries
+            .binary_search_by(|e| e.name.as_str().cmp(&upper))
+            .ok()
+    }
+
     /// Exact binary search by uppercase name.
     fn get_exact(&self, name: &str) -> Option<(&AudioBagEntry, &[u8])> {
-        let upper = name.to_ascii_uppercase();
-        let idx = self
-            .entries
-            .binary_search_by(|e| e.name.as_str().cmp(&upper))
-            .ok()?;
+        let idx = self.find_sample_index(name)?;
         let entry = &self.entries[idx];
         let start = entry.offset as usize;
-        let end = start + entry.size as usize;
-        if end > self.bag_data.len() {
+        let end = start.checked_add(entry.size as usize)?;
+        let bag = &self.bag_data[self.entry_bags[idx]];
+        if end > bag.len() {
             log::warn!(
                 "AudioIndex: entry '{}' overflows bag (offset={}, size={}, bag_len={})",
                 name,
                 entry.offset,
                 entry.size,
-                self.bag_data.len()
+                bag.len()
             );
             return None;
         }
-        Some((entry, &self.bag_data[start..end]))
+        Some((entry, &bag[start..end]))
+    }
+
+    /// A number no other index in the process has, starting at 1. A cache of
+    /// samples decoded from an index keys on it, so it never plays one
+    /// index's sample for another's name.
+    pub fn id(&self) -> u64 {
+        self.id
     }
 
     /// Number of indexed entries.
@@ -249,6 +335,12 @@ impl AudioIndex {
     }
 }
 
+/// The next [`AudioIndex::id`].
+fn next_index_id() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Decode raw audio data from a .bag entry based on its format flags.
 ///
 /// Supports raw PCM (8-bit unsigned, 16-bit signed) and IMA ADPCM with
@@ -264,14 +356,14 @@ pub fn decode_bag_audio(entry: &AudioBagEntry, data: &[u8]) -> Option<BagAudio> 
         // `FUN_00409C40 @ 0x00409C40` then wires the one block decoder,
         // `IMA_ADPCM__DecodeBlock @ 0x0040AA70`.
         super::ima_adpcm::decode_blocks(data, entry.channels(), entry.chunk_size)
-    } else if entry.is_16bit() {
-        // Raw 16-bit signed PCM (little-endian).
-        data.chunks_exact(2)
-            .map(|c| i16::from_le_bytes([c[0], c[1]]))
-            .collect()
     } else {
-        // Raw 8-bit unsigned PCM → convert to 16-bit signed.
-        data.iter().map(|&b| ((b as i16) - 128) * 256).collect()
+        // Raw PCM, 16-bit signed little-endian or 8-bit unsigned, through the
+        // one PCM converter the WAV reader also uses.
+        let bits = if entry.is_16bit() { 16 } else { 8 };
+        let mut cursor = super::wav_file::WavPcmCursor::pcm(bits)?;
+        let mut samples = Vec::with_capacity(data.len());
+        while cursor.decode_next(data, &mut samples) {}
+        samples
     };
 
     Some(BagAudio {
@@ -281,26 +373,14 @@ pub fn decode_bag_audio(entry: &AudioBagEntry, data: &[u8]) -> Option<BagAudio> 
     })
 }
 
-/// Read a little-endian u32 from a byte slice at the given offset.
-fn read_u32_le(data: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([
-        data[offset],
-        data[offset + 1],
-        data[offset + 2],
-        data[offset + 3],
-    ])
-}
-
-#[cfg(test)]
-pub(crate) mod tests {
-    use super::*;
-
-    /// Build a minimal valid idx with the given entries.
-    pub(crate) fn build_idx(entries: &[(&str, u32, u32, u32, u32)]) -> Vec<u8> {
+/// Index fixtures, shared with client tests through `test-support`.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    /// Build the retail GABA/version2 layout, accepted by stock and Ares.
+    pub fn build_idx(entries: &[(&str, u32, u32, u32, u32)]) -> Vec<u8> {
         let mut idx = Vec::new();
-        // Header: magic(0) + version(1) + count
-        idx.extend_from_slice(&0u32.to_le_bytes()); // magic
-        idx.extend_from_slice(&1u32.to_le_bytes()); // version
+        idx.extend_from_slice(&0x41424147u32.to_le_bytes()); // GABA
+        idx.extend_from_slice(&2u32.to_le_bytes()); // version
         idx.extend_from_slice(&(entries.len() as u32).to_le_bytes()); // count
         for &(name, offset, size, rate, flags) in entries {
             let mut name_buf = [0u8; 16];
@@ -312,31 +392,22 @@ pub(crate) mod tests {
             idx.extend_from_slice(&size.to_le_bytes());
             idx.extend_from_slice(&rate.to_le_bytes());
             idx.extend_from_slice(&flags.to_le_bytes());
+            idx.extend_from_slice(&0u32.to_le_bytes()); // chunk size
         }
         idx
     }
+}
 
-    #[test]
-    fn test_parse_valid_idx() {
-        let idx = build_idx(&[
-            ("testsound", 0, 4, 22050, 0x04), // 16-bit PCM, offset 0, 4 bytes
-        ]);
-        let bag = vec![0x00, 0x40, 0x00, 0x40]; // two 16-bit samples: 16384, 16384
-        let index = AudioIndex::from_idx_bag(&idx, bag).expect("should parse");
-        assert_eq!(index.len(), 1);
-    }
+#[cfg(all(test, tests_assets))]
+mod tests {
+    use super::test_support::build_idx;
+    use super::*;
 
     #[test]
     fn test_bad_version() {
         let mut idx = build_idx(&[]);
         // Overwrite version to 99 (unsupported — v1 and v2 are valid).
         idx[4..8].copy_from_slice(&99u32.to_le_bytes());
-        assert!(AudioIndex::from_idx_bag(&idx, vec![]).is_none());
-    }
-
-    #[test]
-    fn test_truncated_idx() {
-        let idx = vec![0u8; 8]; // too short for header
         assert!(AudioIndex::from_idx_bag(&idx, vec![]).is_none());
     }
 
@@ -400,25 +471,12 @@ pub(crate) mod tests {
         assert!(index.get("overflow").is_none());
     }
 
-    #[test]
-    fn test_empty_data_returns_none() {
-        let entry = AudioBagEntry {
-            name: "EMPTY".into(),
-            offset: 0,
-            size: 0,
-            sample_rate: 22050,
-            flags: 0,
-            chunk_size: 0,
-        };
-        assert!(decode_bag_audio(&entry, &[]).is_none());
-    }
-
     // ---------------------------------------------------------------------
     // Retail v2 index bytes.
     //
     // Every retail sound is looked up through a version-2 `audio.idx` with the
-    // 36-byte stride, yet nothing here exercised that stride: the builder above
-    // emits version 1. The bytes below are copied verbatim from the retail
+    // 36-byte stride; the shared fixture writer also emits that stride. These
+    // bytes are copied verbatim from the retail
     // `audio.idx` inside `langmd.mix -> audiomd.mix` (2,285 entries), so the
     // stride, field offsets, flag bits and `chunk_size` are pinned against the
     // shipped file rather than against our own writer.
@@ -544,19 +602,5 @@ pub(crate) mod tests {
             audio.samples_i16,
             crate::assets::ima_adpcm::decode_blocks(ABIRJ01A_TAIL_BLOCK, 1, 512)
         );
-    }
-
-    #[test]
-    fn test_multiple_entries_sorted() {
-        let idx = build_idx(&[
-            ("zebra", 0, 2, 22050, 0x00),
-            ("alpha", 2, 2, 22050, 0x00),
-            ("middle", 4, 2, 22050, 0x00),
-        ]);
-        let bag = vec![128; 6];
-        let index = AudioIndex::from_idx_bag(&idx, bag).expect("should parse");
-        assert!(index.get("alpha").is_some());
-        assert!(index.get("middle").is_some());
-        assert!(index.get("zebra").is_some());
     }
 }

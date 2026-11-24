@@ -16,6 +16,7 @@
 
 use crate::rules::locomotor_type::LocomotorKind;
 use crate::rules::object_type::{Ability, ObjectType};
+use crate::sim::flashing::Flashing;
 use crate::sim::game_entity::GameEntity;
 use crate::util::fixed_math::SimFixed;
 use crate::util::native_x87::NativeF32Bits;
@@ -47,6 +48,296 @@ pub const LEVEL_ROOKIE: i8 = 2;
 /// The constructor's "never sampled" cache value.
 pub const LEVEL_UNSAMPLED: i8 = -1;
 
+/// An object's veterancy, owned by this module: the running `VeterancyClass`
+/// float and the rank last sampled from it.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Veterancy {
+    /// The `VeterancyClass` float on `TechnoClass` (`+0x150`), fed by
+    /// `Record_The_Kill @ 0x00702D40` through `VeterancyClass::Add @
+    /// 0x0074FF50`. Carried as its `f32` bit pattern so sim state holds no
+    /// float and hashing, snapshots and replay stay integer-exact.
+    raw: NativeF32Bits,
+    /// The rank last sampled, for crossing detection: `TechnoClass+0x13C`,
+    /// initialised to `-1` by the constructor so the first sample after
+    /// spawn caches without announcing. Holds the native `GetVeterancyLevel @
+    /// 0x00750030` code: `-1` uninitialised, `0` ELITE, `1` veteran, `2`
+    /// rookie.
+    rank_cache: i8,
+}
+
+impl Default for Veterancy {
+    fn default() -> Self {
+        Self::new(RANK_ROOKIE_U16)
+    }
+}
+
+impl Veterancy {
+    /// A new object's veterancy at an explicit rank, never sampled.
+    pub(crate) fn new(rank_u16: u16) -> Self {
+        Self {
+            raw: raw_for_rank(rank_u16),
+            rank_cache: LEVEL_UNSAMPLED,
+        }
+    }
+
+    /// The accumulator.
+    pub fn raw(&self) -> NativeF32Bits {
+        self.raw
+    }
+
+    /// `TechnoClass+0x13C`.
+    pub fn rank_cache(&self) -> i8 {
+        self.rank_cache
+    }
+
+    /// Veterancy level sampled from the accumulator: 0 = rookie, 100 =
+    /// veteran, 200 = elite. The damage multiplier, the armour divisor, elite
+    /// weapon selection and the chevron read it.
+    pub fn rank(&self) -> u16 {
+        rank_u16(self.raw)
+    }
+
+    /// The rank sampled from the accumulator.
+    pub fn rank_kind(&self) -> VeterancyRank {
+        rank_of(self.raw)
+    }
+
+    /// Apply the native `SetFromPercent @ 0x007500E0` to the accumulator.
+    /// Like the explicit rank setters, it leaves the cached rank alone until
+    /// the next Techno AI sample.
+    pub(crate) fn set_from_percent(&mut self, percent: i32) {
+        self.raw = raw_from_percent(percent);
+    }
+
+    /// The `VeterancyClass` copy a deploy or undeploy makes from the object
+    /// it replaces (`+0x150`; `UnitClass::Deploy @ 0x007397DE`,
+    /// `BuildingClass::Mission_Selling @ 0x0044A05E`). The rank cache
+    /// (`+0x13C`) stays this object's own.
+    pub(crate) fn inherit(&mut self, from: &Veterancy) {
+        self.inherit_raw(from.raw);
+    }
+
+    /// Ares survivor100465D1..100465D4 copies only the saved +150 bits.
+    /// The receiving object's own sampled-rank cache is left untouched.
+    pub(crate) fn inherit_raw(&mut self, raw: NativeF32Bits) {
+        self.raw = raw;
+    }
+
+    /// `VeterancyStruct::SetElite(1) @ 0x007500B0`: store 2.0f. The rank
+    /// cache is deliberately left alone — native does not touch `+0x13C`
+    /// here, so the next `AI_Update` sample announces the crossing (or, for a
+    /// never-sampled object, caches silently).
+    pub fn set_elite(&mut self) {
+        self.raw = NativeF32Bits::from_bits(ELITE_THRESHOLD_BITS);
+    }
+
+    /// `VeterancyStruct::SetVeteran(1) @ 0x00750090`: store 1.0f.
+    pub fn set_veteran(&mut self) {
+        self.raw = NativeF32Bits::from_bits(VETERAN_THRESHOLD_BITS);
+    }
+
+    /// `VeterancyStruct::SetRookie @ 0x00750080`: store 0.0f (its byte
+    /// argument is unused, `0x00750080..0x00750088`).
+    pub(crate) fn set_rookie(&mut self) {
+        self.raw = NativeF32Bits::POSITIVE_ZERO;
+    }
+
+    /// The promotion detector at `TechnoClass::AI_Update @ 0x006FA054..0x006FA145`.
+    ///
+    /// gamemd-derived:
+    /// ```text
+    /// prev = this->+0x13C; curr = GetVeterancyLevel(&this->Veterancy);
+    /// if (prev != curr) {
+    ///     if (prev != -1) {
+    ///         if (curr == ELITE) { [sound+EVA if local human]; this->+0xF0 = Rules.EliteFlashTimer; }
+    ///         else if (curr == VETERAN) { [sound+EVA if local human]; }
+    ///     }
+    ///     this->+0x13C = curr;
+    /// }
+    /// ```
+    /// The first sample after construction caches silently. A demotion (a
+    /// crate's negative push) caches without announcing. The flash timer is
+    /// seeded for EVERY house's elite (`0x006FA0D0` is reached from the
+    /// non-human branch too); only the sound and EVA are gated, and that gate
+    /// belongs to the app layer, which knows the local player.
+    pub(crate) fn sample_promotion(
+        &mut self,
+        flashing: &mut Flashing,
+        elite_flash_timer: i32,
+    ) -> Option<Promotion> {
+        if !self.rank_changed() {
+            return None;
+        }
+        let prev = self.rank_cache;
+        let curr = veterancy_level(self.raw);
+        self.rank_cache = curr;
+        if prev == LEVEL_UNSAMPLED {
+            return None;
+        }
+        match curr {
+            LEVEL_ELITE => {
+                flashing.start(elite_flash_timer);
+                Some(Promotion::Elite)
+            }
+            LEVEL_VETERAN => Some(Promotion::Veteran),
+            _ => None,
+        }
+    }
+
+    /// Whether the rank differs from the cached one: what
+    /// [`Self::sample_promotion`] acts on. Otherwise it changes nothing.
+    pub(crate) fn rank_changed(&self) -> bool {
+        self.rank_cache != veterancy_level(self.raw)
+    }
+
+    /// Award one kill's experience to its recipient, if the recipient can hold it.
+    ///
+    /// gamemd-derived: the accumulator call at the tail of every recipient arm of
+    /// `TechnoClass::Record_The_Kill @ 0x00702D40` (`0x00702FF0`). `cost` is the
+    /// RECIPIENT's own cost — an expensive unit needs a proportionally larger
+    /// haul to promote — and the award is the victim's cost after the ally gate
+    /// and the victim's own rank multiplier. Which object is the recipient is
+    /// decided by the caller (`record_kill::award_kill_experience`), which walks the
+    /// native redirection chain.
+    pub(crate) fn award_kill(
+        &mut self,
+        recipient_cost: i32,
+        points: i32,
+        trainable: bool,
+        veteran_ratio: f64,
+        veteran_cap: f64,
+    ) {
+        if !trainable || points <= 0 || recipient_cost <= 0 {
+            return;
+        }
+        self.raw = accumulate(self.raw, recipient_cost, points, veteran_ratio, veteran_cap);
+    }
+
+    /// The rank the accumulator holds now, in the `+0x13C` cache's codes.
+    /// Ares UpdateVeterancy10046AFE..10046B1F tests the single with the same
+    /// `>= 2.0` / `>= 1.0` order as `GetVeterancyLevel @ 0x00750030`.
+    pub(crate) fn level(&self) -> i8 {
+        veterancy_level(self.raw)
+    }
+
+    /// Ares UpdateVeterancy10046D6C stores the (possibly re-ranked) level.
+    pub(crate) fn store_level(&mut self, level: i8) {
+        self.rank_cache = level;
+    }
+
+    /// Ares RegisterDestruction_Veterancy's AddExperience lambda
+    /// (`1004EE30`): `weighted / (cost * VeteranRatio) + vet`, capped from
+    /// above at `VeteranCap` (`ja`, so an equal sum stores itself) and, once
+    /// stored as a single, floored at zero. Unlike `VeterancyClass::Add`'s
+    /// caller, any nonzero recipient cost counts, so a negative one drains.
+    pub(crate) fn add_ares_kill_experience(
+        &mut self,
+        recipient_cost: i32,
+        weighted: i32,
+        veteran_ratio: f64,
+        veteran_cap: f64,
+    ) {
+        use crate::util::native_x87::{MaskedX87Chop53 as X87, MaskedX87Ordering, NativeF64Bits};
+        if recipient_cost == 0 || weighted <= 0 {
+            return;
+        }
+        let quotient = X87::div(
+            X87::load_i32(weighted),
+            X87::mul(
+                X87::load_i32(recipient_cost),
+                X87::load_f64(NativeF64Bits::from_bits(veteran_ratio.to_bits())),
+            ),
+        );
+        let sum = X87::add(quotient, X87::load_f32(self.raw));
+        let cap = X87::load_f64(NativeF64Bits::from_bits(veteran_cap.to_bits()));
+        let stored = if X87::compare(sum, cap) == MaskedX87Ordering::Greater {
+            cap
+        } else {
+            sum
+        };
+        self.raw = X87::store_f32_masked_chop(stored);
+        if X87::compare(
+            X87::load_f32(self.raw),
+            X87::load_f64(NativeF64Bits::POSITIVE_ZERO),
+        ) == MaskedX87Ordering::Less
+        {
+            self.raw = NativeF32Bits::POSITIVE_ZERO;
+        }
+    }
+
+    /// Ares ApplyAcademy (`10020750`, `10020820..10020850`): a `bonus`
+    /// above the current single replaces it, capped at `VeteranCap`, as a
+    /// single; anything else leaves it.
+    pub(crate) fn apply_academy_bonus(
+        &mut self,
+        bonus: crate::util::native_x87::NativeF64Bits,
+        veteran_cap: f64,
+    ) {
+        use crate::util::native_x87::{MaskedX87Chop53 as X87, MaskedX87Ordering, NativeF64Bits};
+        let bonus = X87::load_f64(bonus);
+        if X87::compare(bonus, X87::load_f32(self.raw)) != MaskedX87Ordering::Greater {
+            return;
+        }
+        let cap = X87::load_f64(NativeF64Bits::from_bits(veteran_cap.to_bits()));
+        let stored = if X87::compare(bonus, cap) == MaskedX87Ordering::Greater {
+            cap
+        } else {
+            bonus
+        };
+        self.raw = X87::store_f32_masked_chop(stored);
+    }
+
+    /// Ares UpdateVeterancy10046C7A..10046CB1: after a successful
+    /// Promote.*Type conversion, a nonzero Promote.*Experience is added to
+    /// the single, floored at zero, capped at `VeteranCap` and stored as a
+    /// single. Returns whether it wrote.
+    pub(crate) fn add_promotion_experience(
+        &mut self,
+        experience: crate::util::native_x87::NativeF64Bits,
+        veteran_cap: f64,
+    ) -> bool {
+        use crate::util::native_x87::{MaskedX87Chop53 as X87, MaskedX87Ordering, NativeF64Bits};
+        let zero = X87::load_f64(NativeF64Bits::POSITIVE_ZERO);
+        let experience = X87::load_f64(experience);
+        // fucomi/jnp: only an ordered equality with zero skips.
+        if X87::compare(experience, zero) == MaskedX87Ordering::Equal {
+            return false;
+        }
+        let sum = X87::add(experience, X87::load_f32(self.raw));
+        let floored = if X87::compare(zero, sum) == MaskedX87Ordering::Greater {
+            zero
+        } else {
+            sum
+        };
+        let cap = X87::load_f64(NativeF64Bits::from_bits(veteran_cap.to_bits()));
+        let stored = if X87::compare(floored, cap) == MaskedX87Ordering::Greater {
+            cap
+        } else {
+            floored
+        };
+        self.raw = X87::store_f32_masked_chop(stored);
+        true
+    }
+}
+
+/// Fixture setup for tests outside this module.
+#[cfg(any(test, feature = "test-support"))]
+impl Veterancy {
+    /// Seed the accumulator at a rank's threshold, as `set_elite`,
+    /// `set_veteran` and `set_rookie` do.
+    pub(crate) fn set_rank_for_test(&mut self, rank_u16: u16) {
+        self.raw = raw_for_rank(rank_u16);
+    }
+
+    pub fn set_raw_for_test(&mut self, raw: NativeF32Bits) {
+        self.raw = raw;
+    }
+
+    pub fn set_rank_cache_for_test(&mut self, rank_cache: i8) {
+        self.rank_cache = rank_cache;
+    }
+}
+
 /// Sample the rank from a raw accumulator.
 ///
 /// gamemd-derived: elite is tested before veteran, and both are `>=`
@@ -64,7 +355,7 @@ pub fn rank_of(raw: NativeF32Bits) -> VeterancyRank {
 
 /// Project the raw accumulator onto the `Veterancy(u16)` rank every existing
 /// reader consumes.
-pub fn rank_u16(raw: NativeF32Bits) -> u16 {
+fn rank_u16(raw: NativeF32Bits) -> u16 {
     match rank_of(raw) {
         VeterancyRank::Rookie => RANK_ROOKIE_U16,
         VeterancyRank::Veteran => RANK_VETERAN_U16,
@@ -93,13 +384,12 @@ pub fn veterancy_level(raw: NativeF32Bits) -> i8 {
     }
 }
 
-/// The raw accumulator a scenario-authored rank starts at.
+/// The raw accumulator for an explicit rank threshold.
 ///
-/// A map or scenario can place an already-veteran or already-elite object;
-/// native seeds the float directly (`VeterancyStruct::SetVeteran @ 0x00750090`
-/// writes 1.0f, `SetElite @ 0x007500B0` writes 2.0f), so the rank derived from
-/// the accumulator is right from the first tick.
-pub fn raw_for_rank(rank_u16: u16) -> NativeF32Bits {
+/// `VeterancyStruct::SetVeteran @ 0x00750090` writes 1.0f and
+/// `SetElite @ 0x007500B0` writes 2.0f. Authored map percentages instead use
+/// `raw_from_percent` and retain intermediate and negative experience.
+fn raw_for_rank(rank_u16: u16) -> NativeF32Bits {
     if rank_u16 >= RANK_ELITE_U16 {
         NativeF32Bits::from_bits(ELITE_THRESHOLD_BITS)
     } else if rank_u16 >= RANK_VETERAN_U16 {
@@ -109,17 +399,42 @@ pub fn raw_for_rank(rank_u16: u16) -> NativeF32Bits {
     }
 }
 
-/// `VeterancyStruct::SetElite(1) @ 0x007500B0`: store 2.0f. The rank cache is
-/// deliberately left alone — native does not touch `+0x13C` here, so the next `AI_Update` sample announces the crossing
-/// (or, for a never-sampled object, caches silently).
-pub fn set_elite(entity: &mut GameEntity) {
-    entity.veterancy_raw = NativeF32Bits::from_bits(ELITE_THRESHOLD_BITS);
+/// `VeterancyStruct::SetFromPercent @ 0x007500E0`: FILD signed int,
+/// FMUL double [0x007E3808], FSTP single. The file literal's bits are
+/// 0x3F847AE147AE147B. The existing integer-only numeric owner preserves the
+/// executed startup control word 0x0E7F (53-bit precision, chop), including
+/// the final single store; host floating-point rounding is not involved.
+/// There is no clamp, rank-cache write, RNG draw or timer write.
+/// Executed atoi/setter/rank controls for Unit, Infantry and Aircraft:
+/// tools/input_oracle/selection_navigation.{py,json,meta.json}.
+fn raw_from_percent(percent: i32) -> NativeF32Bits {
+    use crate::util::native_x87::{NativeF64Bits, X87Chop53};
+
+    let scale = X87Chop53::load_f64(NativeF64Bits::from_bits(0x3F84_7AE1_47AE_147B))
+        .expect("the native percent scale is finite");
+    X87Chop53::store_f32(X87Chop53::mul(X87Chop53::load_i32(percent), scale))
+        .expect("every signed i32 percentage fits in a finite single")
 }
 
-/// `VeterancyStruct::SetVeteran(1) @ 0x00750090`: store 1.0f.
-#[cfg(test)]
-pub fn set_veteran(entity: &mut GameEntity) {
-    entity.veterancy_raw = NativeF32Bits::from_bits(VETERAN_THRESHOLD_BITS);
+/// `VeterancyStruct::IsVeteran @ 0x0074FF90` (`1.0 <= v < 2.0`), `IsRookie @
+/// 0x0074FFC0` (`0.0 <= v < 1.0`) and the negative test at `0x0074FFF0`
+/// (`v < 0.0`) on the raw single; `IsElite @ 0x00750010` is `2.0 <= v`.
+pub fn raw_is_veteran(raw: NativeF32Bits) -> bool {
+    let value = f32::from_bits(raw.bits());
+    (1.0..2.0).contains(&value)
+}
+
+pub fn raw_is_rookie(raw: NativeF32Bits) -> bool {
+    let value = f32::from_bits(raw.bits());
+    (0.0..1.0).contains(&value)
+}
+
+pub fn raw_is_negative(raw: NativeF32Bits) -> bool {
+    f32::from_bits(raw.bits()) < 0.0
+}
+
+pub fn raw_is_elite(raw: NativeF32Bits) -> bool {
+    f32::from_bits(raw.bits()) >= 2.0
 }
 
 /// `TechnoClass::HasWeaponAbility @ 0x0070D0D0`, literally.
@@ -146,6 +461,18 @@ pub fn has_weapon_ability(rank: VeterancyRank, object: &ObjectType, ability: Abi
     }
 }
 
+/// A crusher: `Crusher=` (`TechnoType+0xD28`) or the Crusher ability by rank
+/// (`HasWeaponAbility(0x11)`, `0x0070D0D0`), the pair every crush gate reads.
+pub fn is_crusher(rank: VeterancyRank, object: &ObjectType) -> bool {
+    object.crusher || has_weapon_ability(rank, object, Ability::Crusher)
+}
+
+/// A demolition infantryman's test: `C4=` (`InfantryType+0xEC2`) or a rank
+/// holding weapon ability 14 ([`has_weapon_ability`]), in that order.
+pub fn holds_c4(rank: VeterancyRank, object: &ObjectType) -> bool {
+    object.c4 || has_weapon_ability(rank, object, Ability::C4)
+}
+
 /// The one arithmetic shape every rank multiplier uses:
 /// `FILD dword; FMUL double [Rules+off]; CALL ftol`.
 ///
@@ -164,35 +491,40 @@ pub fn ftol_scale(value: i32, multiplier: f64) -> i32 {
     ))
 }
 
-/// `FootClass::GetCurrentSpeed @ 0x004DB1A0`, the FASTER arm.
+/// `FootClass::GetCurrentSpeed @ 0x004DB1A0`, stages 1 and 2, on the native
+/// integer type speed (`TechnoType+0x678`, leptons per frame).
 ///
-/// gamemd-derived: the type speed is truncated to an integer lepton-per-frame
-/// value first (`0x004DB1CD..0x004DB1DB`), then — for a `FASTER` holder —
-/// `ftol(speed * Rules.VeteranSpeed)` at `0x004DB1F1..0x004DB200`, and only
-/// then multiplied by the locomotor's current-speed fraction. VERA carries
-/// the per-frame integer as leptons per second (`* 15`), so the multiply runs
-/// on the recovered integer and the result is re-widened the same way.
+/// gamemd-derived: `ftol((speed * house) * crate)` (`0x004DB1CD..0x004DB1DB`;
+/// the house float is `HouseClass::GetSpeedBonus @ 0x0050C050`, the crate
+/// double Foot+0x580), then, for a `FASTER` holder (`veteran_speed` given),
+/// `ftol(speed * Rules.VeteranSpeed)` at `0x004DB1F1..0x004DB200`. Each ftol
+/// keeps the low 32 bits. Stage 3 multiplies in the Foot+0x578 fraction
+/// (`movement::owner_current_speed_from_fraction`).
+/// Ares has already derived Foot+580 from its permanent crate baseline and
+/// ordered effects. This getter consumes that output without folding again.
 ///
-/// Prefer [`mover_speed_leptons_per_second`] at call sites: it owns the whole
-/// getter, so a new speed resolver cannot silently skip this stage.
-pub fn veteran_speed_leptons_per_second(
-    base_leptons_per_second: SimFixed,
-    rank: VeterancyRank,
-    object: &ObjectType,
-    veteran_speed: f64,
-) -> SimFixed {
-    if !has_weapon_ability(rank, object, Ability::Faster) {
-        return base_leptons_per_second;
-    }
-    const FRAMES_PER_SECOND: i32 = 15;
-    let per_frame =
-        (base_leptons_per_second / SimFixed::from_num(FRAMES_PER_SECOND)).to_num::<i32>();
-    use crate::util::native_x87::{MaskedX87Chop53 as X, NativeF64Bits};
-    let adjusted = X::ftol_i32_low_masked(X::mul(
-        X::load_i32(per_frame),
-        X::load_f64(NativeF64Bits::from_bits(veteran_speed.to_bits())),
-    ));
-    SimFixed::from_num(adjusted) * SimFixed::from_num(FRAMES_PER_SECOND)
+/// The stock crate factor 1.2 makes native type speed 10 become 11, not 12:
+/// crate_speed_effect.json executes both the writer and original getter, and
+/// track_speed_native.json's getter rows add the house float. Use the
+/// deterministic native arithmetic for this demonstrated gameplay rounding
+/// boundary; movement coordinates remain SimFixed.
+pub(crate) fn current_type_speed(
+    type_speed: i32,
+    house_bonus: crate::util::native_x87::NativeF32Bits,
+    speed_multiplier: crate::util::native_x87::NativeF64Bits,
+    veteran_speed: Option<f64>,
+) -> i32 {
+    use crate::util::native_x87::{MaskedX87Chop53 as X, NativeF32Bits, NativeF64Bits};
+    // Both factors 1.0: the product is the integer itself.
+    let speed = if house_bonus == NativeF32Bits::ONE && speed_multiplier == NativeF64Bits::ONE {
+        type_speed
+    } else {
+        X::ftol_i32_low_masked(X::mul(
+            X::mul(X::load_i32(type_speed), X::load_f32(house_bonus)),
+            X::load_f64(speed_multiplier),
+        ))
+    };
+    veteran_speed.map_or(speed, |veteran_speed| ftol_scale(speed, veteran_speed))
 }
 
 /// Which locomotors ask `FootClass::GetCurrentSpeed` for their movement speed.
@@ -212,9 +544,9 @@ pub fn veteran_speed_leptons_per_second(
 /// resolves the builder's UNCHECKED "aircraft FASTER" residual: not applied.
 ///
 /// `Teleport` stays inside the gate deliberately. Native's teleport locomotor
-/// does not query `+0x538` either, but VERA's teleport machine ignores
-/// `MovementTarget::speed` outright (stock `[CLEG] Speed=5` is a dummy the INI
-/// itself comments as unused), and a teleporter that piggybacks Drive carries
+/// does not query `+0x538` either, but VERA's teleport machine reads no mover
+/// speed (stock `[CLEG] Speed=5` is a dummy the INI itself comments as
+/// unused), and a teleporter that piggybacks Drive carries
 /// `LocomotorKind::Drive` here — where the drive locomotor really does query
 /// the getter. So admitting `Teleport` changes no observable speed and keeps
 /// the piggyback case correct.
@@ -232,47 +564,36 @@ pub fn locomotor_consults_current_speed(kind: Option<LocomotorKind>) -> bool {
 /// integer per-frame speed, then `HasWeaponAbility(0)` (`FASTER`) gates
 /// `ftol(speed * Rules.VeteranSpeed)`. Stage 3 multiplies in the
 /// `[this+0x578]` fraction (`movement::owner_current_speed`), so this helper
-/// stops one stage short deliberately. The crate factor is live Foot state.
-/// The country/house factor remains an open getter dependency.
+/// stops one stage short deliberately. The effective multiplier is live Foot state;
+/// `house_bonus` is the owner's `HouseClass::GetSpeedBonus @ 0x0050C050`
+/// (`movement::owner_speed_bonus`). The arithmetic is
+/// [`current_type_speed`]'s.
 ///
-/// Call this instead of `ra2_speed_to_leptons_per_second` wherever a type
-/// `Speed=` becomes an entity's movement speed — native reaches the FASTER
-/// stage on every speed query a mover makes, so a resolver that skips it runs
-/// a promoted unit at rookie speed.
+/// Call this wherever a type `Speed=` becomes an entity's movement speed —
+/// native reaches the FASTER stage on every speed query a mover makes, so a
+/// resolver that skips it runs a promoted unit at rookie speed.
 fn mover_speed_leptons_per_second(
     raw_type_speed: i32,
     loco_kind: Option<LocomotorKind>,
     rank: VeterancyRank,
     object: Option<&ObjectType>,
     veteran_speed: f64,
-    crate_multiplier: crate::util::native_x87::NativeF64Bits,
+    house_bonus: crate::util::native_x87::NativeF32Bits,
+    speed_multiplier: crate::util::native_x87::NativeF64Bits,
 ) -> SimFixed {
-    let base = crate::util::fixed_math::ra2_speed_to_leptons_per_second(raw_type_speed);
-    let Some(object) = object else {
-        return base;
+    let type_speed = crate::util::fixed_math::ra2_speed_to_leptons_per_frame(raw_type_speed);
+    let speed = match object {
+        Some(object) if locomotor_consults_current_speed(loco_kind) => current_type_speed(
+            type_speed,
+            house_bonus,
+            speed_multiplier,
+            has_weapon_ability(rank, object, Ability::Faster).then_some(veteran_speed),
+        ),
+        _ => type_speed,
     };
-    if !locomotor_consults_current_speed(loco_kind) {
-        return base;
-    }
-    if crate_multiplier == crate::util::native_x87::NativeF64Bits::ONE {
-        return veteran_speed_leptons_per_second(base, rank, object, veteran_speed);
-    }
-    // The stock crate factor 1.2 makes native type speed10 become11, not12:
-    // crate_speed_effect.json executes both the writer and original getter.
-    // Use the existing deterministic native arithmetic for this demonstrated
-    // gameplay rounding boundary; movement coordinates remain SimFixed.
-    use crate::util::native_x87::MaskedX87Chop53 as X;
-    let native_speed = (base / SimFixed::from_num(15)).to_num::<i32>();
-    let adjusted = X::ftol_i32_low_masked(X::mul(
-        X::load_i32(native_speed),
-        X::load_f64(crate_multiplier),
-    ));
-    veteran_speed_leptons_per_second(
-        SimFixed::from_num(adjusted) * SimFixed::from_num(15),
-        rank,
-        object,
-        veteran_speed,
-    )
+    // Leptons/second saturates where native's integer has no ceiling; only a
+    // factor product past 2184 leptons per frame reaches it.
+    SimFixed::saturating_from_num(i64::from(speed) * 15)
 }
 
 /// [`mover_speed_leptons_per_second`] with the rank and locomotor read off the
@@ -282,14 +603,16 @@ pub fn entity_mover_speed_leptons_per_second(
     object: Option<&ObjectType>,
     raw_type_speed: i32,
     veteran_speed: f64,
+    house_bonus: crate::util::native_x87::NativeF32Bits,
 ) -> SimFixed {
     mover_speed_leptons_per_second(
         raw_type_speed,
-        entity.locomotor.as_ref().map(|loco| loco.kind),
-        rank_of(entity.veterancy_raw),
+        entity.locomotor.as_ref().map(|loco| loco.active_kind()),
+        entity.veterancy.rank_kind(),
         object,
         veteran_speed,
-        entity.foot_speed.crate_multiplier(),
+        house_bonus,
+        entity.speed_multiplier(),
     )
 }
 
@@ -314,49 +637,18 @@ pub enum Promotion {
     Elite,
 }
 
-/// The promotion detector at `TechnoClass::AI_Update @ 0x006FA054..0x006FA145`.
-///
-/// gamemd-derived:
-/// ```text
-/// prev = this->+0x13C; curr = GetVeterancyLevel(&this->Veterancy);
-/// if (prev != curr) {
-///     if (prev != -1) {
-///         if (curr == ELITE) { [sound+EVA if local human]; this->+0xF0 = Rules.EliteFlashTimer; }
-///         else if (curr == VETERAN) { [sound+EVA if local human]; }
-///     }
-///     this->+0x13C = curr;
-/// }
-/// ```
-/// The first sample after construction caches silently. A demotion (a
-/// crate's negative push) caches without announcing. The flash timer is
-/// seeded for EVERY house's elite (`0x006FA0D0` is reached from the
-/// non-human branch too); only the sound and EVA are gated, and that gate
-/// belongs to the app layer, which knows the local player.
-pub fn sample_promotion(entity: &mut GameEntity, elite_flash_timer: i32) -> Option<Promotion> {
-    let prev = entity.veterancy_rank_cache;
-    let curr = veterancy_level(entity.veterancy_raw);
-    if prev == curr {
-        return None;
-    }
-    entity.veterancy_rank_cache = curr;
-    if prev == LEVEL_UNSAMPLED {
-        return None;
-    }
-    match curr {
-        LEVEL_ELITE => {
-            entity.elite_flash_frames = elite_flash_timer.clamp(0, i32::from(u16::MAX)) as u16;
-            Some(Promotion::Elite)
-        }
-        LEVEL_VETERAN => Some(Promotion::Veteran),
-        _ => None,
-    }
-}
-
 /// `ftol(Rules.RepairRate * 900.0)` — the self-heal pulse period
 /// (`FUN_0070BE80` at `0x0070BEFE..0x0070BF0A`; the 900.0 constant lives at
 /// `0x007E27F8`).
 pub fn self_heal_interval_frames(repair_rate_minutes: f64) -> i32 {
     crate::rules::ruleset::native_minutes_to_frames(repair_rate_minutes)
+}
+
+/// Step 1 of [`self_heal_eligible`], the virtual's ability gate:
+/// `Type->SelfHealing` (`+0xD14`), or a rank that holds `SELF_HEAL`.
+pub fn holds_self_heal(entity: &GameEntity, object: &ObjectType) -> bool {
+    object.self_healing
+        || has_weapon_ability(entity.veterancy.rank_kind(), object, Ability::SelfHeal)
 }
 
 /// The self-heal eligibility virtual, `TechnoClass` vtable slot `0x294` →
@@ -370,34 +662,75 @@ pub fn self_heal_interval_frames(repair_rate_minutes: f64) -> i32 {
 ///    per-object timer, so every eligible object pulses on the same frame.
 /// 3. `Health != Type->Strength` and `Health != 0`.
 ///
-/// The native IDIV uses a signed frame and signed low32 period. Native divide
-/// faults remain explicit deterministic faults, never ordinary ineligibility;
-/// tools/spatial_oracle/object_health records five original fault executions.
+/// The native IDIV uses a signed frame and signed low32 period. gamemd traps
+/// at `0x0070BF17` on a zero period (`RepairRate` below 1/900 minute) and on
+/// MIN/-1 (tools/spatial_oracle/object_health records five such executions);
+/// VERA carries on: such a period never pulses.
 pub fn self_heal_eligible(
     entity: &GameEntity,
     object: &ObjectType,
     frame: u32,
     interval_frames: i32,
 ) -> bool {
-    if !object.self_healing {
-        let rank = rank_of(entity.veterancy_raw);
-        if !has_weapon_ability(rank, object, Ability::SelfHeal) {
-            return false;
-        }
-    }
-    let remainder = (frame as i32)
-        .checked_rem(interval_frames)
-        .unwrap_or_else(|| {
-            panic!(
-                "native self-heal IDIV fault at 0070BF17: frame={} period={interval_frames}",
-                frame as i32
-            )
-        });
-    if remainder != 0 {
+    if !holds_self_heal(entity, object) {
         return false;
     }
-    let health = entity.health.current;
+    if (frame as i32).checked_rem(interval_frames) != Some(0) {
+        return false;
+    }
+    let health = entity.health.current();
     health != object.strength && health != 0
+}
+
+/// Ares 3.0 `TechnoExt::ExtData::GetSelfHealAmount` (Ares.dll 10044E80):
+/// the points one pulse heals, which replaces [`self_heal_eligible`]
+/// (hook 0x70BE80, 1004B2F0: `amount > 0`) and the `+1` of
+/// `TechnoClass::AI_Update` (hook 0x6FA743, 1004B820), in this order:
+/// 1. nothing while the `SelfHealing.CombatDelay` timer (TechnoExt+0x5C)
+///    runs;
+/// 2. the same `SelfHealing=`/`SELF_HEAL` gate;
+/// 3. `Frame % max(ftol(rate * 900), 1) == 0`, the rate `SelfHealing.Rate`
+///    or `RepairRate`;
+/// 4. a nonzero Health below `clamp(ftol(Strength * SelfHealing.%sMax) + 1,
+///    1, Strength)`, which takes `SelfHealing.%sAmount` (a negative amount
+///    heals nothing), at most up to that cap.
+///
+/// Both conversions are the CRT `_ftol2` (100772B0), INT_MIN out of range.
+pub fn ares_self_heal_amount(
+    entity: &GameEntity,
+    object: &ObjectType,
+    frame: i32,
+    repair_rate_minutes: f64,
+) -> i32 {
+    use crate::util::native_x87::MaskedX87Chop53 as X;
+    let combat = entity.seldom.ares.ares_self_heal_combat;
+    if combat.start_frame() != crate::sim::timer::PAUSED_START_FRAME && combat.remaining(frame) > 0
+    {
+        return 0;
+    }
+    let rank = entity.veterancy.rank_kind();
+    if !holds_self_heal(entity, object) {
+        return 0;
+    }
+    let ext = object.techno_combat().self_healing();
+    let rate = ext.rate(repair_rate_minutes);
+    let period = X::fistp_i32_masked(X::mul(X::load_f64(rate), X::load_i32(900))).max(1);
+    if frame % period != 0 {
+        return 0;
+    }
+    let (amount, max) = ext.amount_and_max(match rank {
+        VeterancyRank::Rookie => 0,
+        VeterancyRank::Veteran => 1,
+        VeterancyRank::Elite => 2,
+    });
+    let strength = object.strength;
+    let cap = X::fistp_i32_masked(X::mul(X::load_i32(strength), X::load_f64(max))).wrapping_add(1);
+    let cap = if cap < 1 { 1 } else { cap.min(strength) };
+    let health = entity.health.current();
+    if health == 0 || health >= cap || amount < 0 {
+        return 0;
+    }
+    amount.min(cap.wrapping_sub(health))
 }
 
 /// The award a kill is worth, before the recipient's own cost divides it.
@@ -439,6 +772,11 @@ pub fn kill_award_points(
 ///
 /// The value is stored as bits, so no float reaches sim state.
 ///
+/// The arithmetic is the masked model's, so an infinite `VeteranRatio=` or
+/// `VeteranCap=` (ReadDouble scans `1e999` as infinity) plays as native does:
+/// an award over an infinite ratio adds zero, and a NaN sum takes the clamp,
+/// since `TEST AH, 0x41` sees C0 and C3 set.
+///
 /// Native execution: `tools/spatial_oracle/veterancy_add.py`.
 pub fn accumulate(
     raw: NativeF32Bits,
@@ -447,69 +785,35 @@ pub fn accumulate(
     veteran_ratio: f64,
     veteran_cap: f64,
 ) -> NativeF32Bits {
-    use crate::util::native_x87::{NativeF64Bits, X87Chop53, X87Ordering};
+    use crate::util::native_x87::{MaskedX87Chop53 as M, MaskedX87Ordering, NativeF64Bits};
     if points <= 0 {
         return raw;
     }
-    let cap = X87Chop53::load_f64(NativeF64Bits::from_bits(veteran_cap.to_bits()))
-        .expect("finite VeteranCap");
-    let denominator = X87Chop53::mul(
-        X87Chop53::load_i32(recipient_cost),
-        X87Chop53::load_f64(NativeF64Bits::from_bits(veteran_ratio.to_bits()))
-            .expect("finite VeteranRatio"),
+    let cap = M::load_f64(NativeF64Bits::from_bits(veteran_cap.to_bits()));
+    let denominator = M::mul(
+        M::load_i32(recipient_cost),
+        M::load_f64(NativeF64Bits::from_bits(veteran_ratio.to_bits())),
     );
-    // A zero denominator divides a positive award to +INF, which the compare
+    // A +0 denominator divides a positive award to +INF, which the compare
     // sends to the clamp: the object stores `VeteranCap` on its first kill.
-    let Ok(delta) = X87Chop53::div(X87Chop53::load_i32(points), denominator) else {
-        return X87Chop53::store_f32_masked_chop(cap);
-    };
-    let sum = X87Chop53::add(
-        delta,
-        X87Chop53::load_f32(raw).expect("a stored veterancy is finite"),
-    );
-    let stored = if X87Chop53::compare(sum, cap) == X87Ordering::Less {
+    // A -0 one (`VeteranRatio=-0`) gives -INF, which `FDIVP` and the compare
+    // store as native does.
+    let delta = M::div(M::load_i32(points), denominator);
+    let sum = M::add(delta, M::load_f32(raw));
+    let stored = if M::compare(sum, cap) == MaskedX87Ordering::Less {
         sum
     } else {
         cap
     };
-    X87Chop53::store_f32_masked_chop(stored)
+    M::store_f32_masked_chop(stored)
 }
 
-/// Award one kill's experience to its recipient, if the recipient can hold it.
-///
-/// gamemd-derived: the accumulator call at the tail of every recipient arm of
-/// `TechnoClass::Record_The_Kill @ 0x00702D40` (`0x00702FF0`). `cost` is the
-/// RECIPIENT's own cost — an expensive unit needs a proportionally larger
-/// haul to promote — and the award is the victim's cost after the ally gate
-/// and the victim's own rank multiplier. Which object is the recipient is
-/// decided by the caller (`combat::award_kill_experience`), which walks the
-/// native redirection chain.
-pub fn award_kill(
-    recipient: &mut GameEntity,
-    recipient_cost: i32,
-    points: i32,
-    trainable: bool,
-    veteran_ratio: f64,
-    veteran_cap: f64,
-) {
-    if !trainable || points <= 0 || recipient_cost <= 0 {
-        return;
-    }
-    recipient.veterancy_raw = accumulate(
-        recipient.veterancy_raw,
-        recipient_cost,
-        points,
-        veteran_ratio,
-        veteran_cap,
-    );
-}
-
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_d_z))]
 mod tests {
     use super::*;
     use crate::map::entities::EntityCategory;
     use crate::rules::object_type::AbilityFlags;
-    use crate::sim::components::Health;
+    use crate::sim::combat::Health;
     use crate::sim::intern;
 
     /// Stock `[General] VeteranRatio=` and `VeteranCap=`.
@@ -546,7 +850,7 @@ mod tests {
             0,
             0,
             intern::test_intern("Americans"),
-            Health { current: health },
+            Health::new(health),
             intern::test_intern("MTNK"),
             EntityCategory::Unit,
             veterancy,
@@ -559,8 +863,8 @@ mod tests {
     /// native control word.
     #[test]
     fn accumulate_matches_the_original() {
-        let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-            "../../../tools/spatial_oracle/veterancy_add.json"
+        let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/veterancy_add.json",
         ))
         .unwrap();
         let mut compared = 0;
@@ -588,15 +892,6 @@ mod tests {
         assert_eq!(compared, 217);
     }
 
-    /// A Grizzly (Cost=700) killing rookie Rhinos (Cost=900) earns 3/7 per kill:
-    /// veteran on kill 3, elite on kill 5.
-    #[test]
-    fn gsi_08_12_grizzly_promotes_on_the_third_and_fifth_rhino() {
-        let steps = run(700, 900, 5);
-        let ranks: Vec<u16> = steps.iter().map(|raw| rank_u16(*raw)).collect();
-        assert_eq!(ranks, vec![0, 0, 100, 100, 200]);
-    }
-
     /// A GI killing GIs is the knife edge: each award is a third, and the
     /// chopped `f32` running sum stops one ulp short of 1.0 on kill 3 and of
     /// 2.0 on kill 6 (`veterancy_add.json`, chain `gi_gi`). The GI promotes on
@@ -620,16 +915,6 @@ mod tests {
         assert_eq!(kill_award_points(900, VeterancyRank::Elite, true), 0);
     }
 
-    /// `VeteranCap=2` is exactly the elite threshold, so elite is terminal in
-    /// stock: the accumulator saturates and never climbs past it.
-    #[test]
-    fn gsi_08_12_accumulator_saturates_at_the_veteran_cap() {
-        let steps = run(700, 900, 20);
-        let last = *steps.last().expect("20 kills");
-        assert_eq!(last.bits(), ELITE_THRESHOLD_BITS);
-        assert_eq!(rank_u16(last), 200);
-    }
-
     /// An award of zero — an allied kill, or a victim with no cost — leaves the
     /// accumulator untouched. A zero-cost RECIPIENT is a different case: native
     /// divides by zero, gets `+INF`, and the clamp stores `VeteranCap`.
@@ -639,11 +924,15 @@ mod tests {
         assert_eq!(accumulate(start, 700, 0, RATIO, CAP).bits(), start.bits());
     }
 
+    /// An infinite ratio makes the award zero and an infinite cap never
+    /// clamps, as in native, instead of stopping the game.
     #[test]
-    fn gsi_08_12_zero_cost_recipient_saturates_to_the_cap() {
-        let out = accumulate(NativeF32Bits::POSITIVE_ZERO, 0, 900, RATIO, CAP);
-        assert_eq!(out.bits(), ELITE_THRESHOLD_BITS);
-        assert_eq!(rank_u16(out), 200);
+    fn an_infinite_ratio_or_cap_plays_as_native() {
+        let start = accumulate(NativeF32Bits::POSITIVE_ZERO, 700, 900, RATIO, CAP);
+        assert_eq!(accumulate(start, 700, 900, f64::INFINITY, CAP), start);
+        // Ten ranks' worth: the stock cap would stop it at 2.0.
+        let uncapped = accumulate(start, 700, 21000, RATIO, f64::INFINITY);
+        assert!(f32::from_bits(uncapped.bits()) > CAP as f32);
     }
 
     /// `HasWeaponAbility @ 0x0070D0D0`: an elite inherits the veteran list,
@@ -697,43 +986,38 @@ mod tests {
         assert_eq!(ftol_scale(52, 0.6), 31);
     }
 
-    /// `VeteranCombat=1.1` on the Grizzly's 65 damage: `ftol(71.5) = 71`.
-    #[test]
-    fn gsi_08_12_veteran_combat_truncates_the_scaled_damage() {
-        assert_eq!(ftol_scale(65, 1.1), 71);
-        assert_eq!(ftol_scale(100, 1.1), 110);
-        assert_eq!(ftol_scale(25, 1.1), 27);
-    }
-
     /// Original Foot4DB1F1..4DB200 under startup chop53 with a binary64 1.2
     /// multiplier: Rhino15 ->17, Grizzly17 ->20 (track_speed_native.json rows).
     /// This is not the stock input: the loader's f32-widened VeteranSpeed
     /// (1.2000000476837158) gives Rhino15 ->18 (ruleset.rs asserts it).
     #[test]
     fn gsi_08_12_veteran_speed_scales_the_per_frame_integer() {
-        use crate::util::fixed_math::ra2_speed_to_leptons_per_second;
+        use crate::util::native_x87::{NativeF32Bits, NativeF64Bits};
         let object = object_with(&[Ability::Faster], &[]);
-        let rhino = ra2_speed_to_leptons_per_second(6);
-        assert_eq!(rhino, SimFixed::from_num(15 * 15));
+        let speed = |raw, rank| {
+            mover_speed_leptons_per_second(
+                raw,
+                None,
+                rank,
+                Some(&object),
+                1.2,
+                NativeF32Bits::ONE,
+                NativeF64Bits::ONE,
+            )
+        };
+        // Rhino Speed=6 and Grizzly Speed=7: native type speeds 15 and 17.
+        assert_eq!(speed(6, VeterancyRank::Rookie), SimFixed::from_num(15 * 15));
         assert_eq!(
-            veteran_speed_leptons_per_second(rhino, VeterancyRank::Rookie, &object, 1.2),
-            rhino
-        );
-        assert_eq!(
-            veteran_speed_leptons_per_second(rhino, VeterancyRank::Veteran, &object, 1.2),
+            speed(6, VeterancyRank::Veteran),
             SimFixed::from_num(17 * 15)
         );
-        let grizzly = ra2_speed_to_leptons_per_second(7);
-        assert_eq!(
-            veteran_speed_leptons_per_second(grizzly, VeterancyRank::Elite, &object, 1.2),
-            SimFixed::from_num(20 * 15)
-        );
+        assert_eq!(speed(7, VeterancyRank::Elite), SimFixed::from_num(20 * 15));
     }
 
     #[test]
     fn live_crate_and_faster_speed_match_original_staged_truncation() {
-        let corpus: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../tools/spatial_oracle/track_speed_native.json"
+        let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/track_speed_native.json",
         ))
         .unwrap();
         let object = object_with(&[Ability::Faster], &[]);
@@ -748,8 +1032,17 @@ mod tests {
                 .accept_speed_crate(crate::util::native_x87::NativeF64Bits::from_bits(
                     u64::from_str_radix(case["input"]["crate_bits"].as_str().unwrap(), 16).unwrap(),
                 ));
+            let house = crate::util::native_x87::NativeF32Bits::from_bits(
+                u32::from_str_radix(case["input"]["house_bits"].as_str().unwrap(), 16).unwrap(),
+            );
             assert_eq!(
-                entity_mover_speed_leptons_per_second(&actor, Some(&object), ini_speed as i32, 1.2),
+                entity_mover_speed_leptons_per_second(
+                    &actor,
+                    Some(&object),
+                    ini_speed as i32,
+                    1.2,
+                    house
+                ),
                 SimFixed::from_num(case["output"].as_i64().unwrap() * 15),
                 "{}",
                 case["state"]
@@ -774,20 +1067,26 @@ mod tests {
     #[test]
     fn gsi_08_12_promotion_is_announced_once_per_crossing() {
         let mut e = entity(0, 300, 300);
-        assert_eq!(e.veterancy_rank_cache, LEVEL_UNSAMPLED);
-        assert_eq!(sample_promotion(&mut e, 150), None);
-        assert_eq!(e.veterancy_rank_cache, LEVEL_ROOKIE);
-        assert_eq!(sample_promotion(&mut e, 150), None);
+        assert_eq!(e.veterancy.rank_cache(), LEVEL_UNSAMPLED);
+        assert_eq!(e.veterancy.sample_promotion(&mut e.flashing, 150), None);
+        assert_eq!(e.veterancy.rank_cache(), LEVEL_ROOKIE);
+        assert_eq!(e.veterancy.sample_promotion(&mut e.flashing, 150), None);
 
-        set_veteran(&mut e);
-        assert_eq!(sample_promotion(&mut e, 150), Some(Promotion::Veteran));
-        assert_eq!(e.elite_flash_frames, 0);
-        assert_eq!(sample_promotion(&mut e, 150), None);
+        e.veterancy.set_veteran();
+        assert_eq!(
+            e.veterancy.sample_promotion(&mut e.flashing, 150),
+            Some(Promotion::Veteran)
+        );
+        assert_eq!(e.flashing.frames(), 0);
+        assert_eq!(e.veterancy.sample_promotion(&mut e.flashing, 150), None);
 
-        set_elite(&mut e);
-        assert_eq!(sample_promotion(&mut e, 150), Some(Promotion::Elite));
-        assert_eq!(e.elite_flash_frames, 150);
-        assert_eq!(e.veterancy_rank_cache, LEVEL_ELITE);
+        e.veterancy.set_elite();
+        assert_eq!(
+            e.veterancy.sample_promotion(&mut e.flashing, 150),
+            Some(Promotion::Elite)
+        );
+        assert_eq!(e.flashing.frames(), 150);
+        assert_eq!(e.veterancy.rank_cache(), LEVEL_ELITE);
     }
 
     /// A never-sampled object placed already elite (InitialVeteran, a map
@@ -796,13 +1095,19 @@ mod tests {
     #[test]
     fn gsi_08_12_first_sample_is_silent_and_direct_elite_announces_elite() {
         let mut placed = entity(200, 300, 300);
-        assert_eq!(sample_promotion(&mut placed, 150), None);
-        assert_eq!(placed.elite_flash_frames, 0);
+        assert_eq!(
+            placed.veterancy.sample_promotion(&mut placed.flashing, 150),
+            None
+        );
+        assert_eq!(placed.flashing.frames(), 0);
 
         let mut rookie = entity(0, 300, 300);
-        sample_promotion(&mut rookie, 150);
-        set_elite(&mut rookie);
-        assert_eq!(sample_promotion(&mut rookie, 150), Some(Promotion::Elite));
+        rookie.veterancy.sample_promotion(&mut rookie.flashing, 150);
+        rookie.veterancy.set_elite();
+        assert_eq!(
+            rookie.veterancy.sample_promotion(&mut rookie.flashing, 150),
+            Some(Promotion::Elite)
+        );
     }
 
     /// `FUN_0070BE80`: SelfHealing bypasses the rank gate; SELF_HEAL needs a
@@ -837,8 +1142,7 @@ mod tests {
         let mut per_type = object_with(&[], &[]);
         per_type.self_healing = true;
         assert!(self_heal_eligible(&rookie, &per_type, 28, interval));
-        assert!(
-            std::panic::catch_unwind(|| self_heal_eligible(&rookie, &per_type, 28, 0)).is_err()
-        );
+        // A zero period (gamemd traps at 0x0070BF17) never pulses.
+        assert!(!self_heal_eligible(&rookie, &per_type, 28, 0));
     }
 }

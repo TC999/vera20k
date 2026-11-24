@@ -15,11 +15,93 @@ use crate::sim::world::Simulation;
 use crate::util::fixed_math::SimFixed;
 use serde_json::Value;
 
+/// The original fragment stops BEFORE PerCell, so compare the complete Rust
+/// caller with a still-distant destination: its post-PerCell suffix must not
+/// overwrite the head-dependent result. Real boarding tests cover concealment.
+#[test]
+fn completed_path_head_speed_matches_original_pre_percell_gate() {
+    let rows: Vec<Value> = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/foot_speed_owner.walk_arrival.json",
+    ))
+    .unwrap();
+    assert_eq!(rows.len(), 12);
+    let rules = RuleSet::from_ini(&IniFile::from_str(
+        "[InfantryTypes]\n0=E1\n[E1]\nStrength=125\nSpeed=4\n\
+         Locomotor={4A582744-9839-11d1-B709-00A024DDAFD1}\n",
+    ))
+    .unwrap();
+    let mut compared = 0;
+    for row in rows {
+        let path_head = row["input"]["path_head"].as_i64().unwrap();
+        // -2 is a native corrupt-head diagnostic, not a valid Rust direction.
+        if path_head == -2 {
+            assert_eq!(row["output"]["setter_called"], false);
+            continue;
+        }
+        let fraction = |value: &Value| {
+            SimFixed::from_num(f64::from_bits(
+                u64::from_str_radix(value.as_str().unwrap(), 16).unwrap(),
+            ))
+        };
+        let mut sim = Simulation::new();
+        sim.install_resolved_terrain_for_new_map(
+            crate::map::resolved_terrain::test_flat_ground_grid(16),
+        );
+        let id = sim
+            .spawn_object("E1", "Americans", 6, 5, 0, &rules)
+            .unwrap();
+        let head = DriveCoord {
+            x: 6 * 256 + 192,
+            y: 5 * 256 + 64,
+            z: 0,
+        };
+        let actor = sim.substrate.entities.get_mut(id).unwrap();
+        actor
+            .navigation
+            .set_nav_com_for_test(Some(NavTargetRef::cell(10, 10)));
+        actor
+            .navigation
+            .set_path_replay_for_test(FootPathQueue::for_test(
+                if path_head == -1 {
+                    vec![2]
+                } else {
+                    vec![2, path_head as u8]
+                },
+                0,
+                Some((5, 5)),
+            ));
+        actor
+            .foot_speed
+            .set_speed_fraction(fraction(&row["input"]["requested_bits"]));
+        let loco = actor.locomotor.as_mut().unwrap();
+        loco.set_walk_destination(Some(DriveCoord::cell(10, 10, 0)));
+        loco.set_step_head(Some(head));
+        sim.run_completed_walk_step(
+            id,
+            head,
+            &rules,
+            None,
+            &mut crate::sim::world::FrameEffects::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            sim.substrate
+                .entities
+                .get(id)
+                .unwrap()
+                .foot_speed
+                .applied_fraction(),
+            fraction(&row["output"]["after_bits"]),
+            "native head {path_head}: {row}"
+        );
+        compared += 1;
+    }
+    assert_eq!(compared, 9);
+}
+
 #[test]
 fn completed_corner_keeps_heading_until_next_head_is_accepted() {
-    use crate::map::resolved_terrain::ResolvedTerrainGrid;
-    use crate::sim::components::MovementTarget;
-    use crate::sim::movement::{FacingClass, ground_pose, locomotor::MovementLayer, walk_head};
+    use crate::sim::movement::{FacingClass, ground_pose, walk_head};
 
     let rules = RuleSet::from_ini(&IniFile::from_str(
         "[InfantryTypes]\n0=E1\n[E1]\nStrength=125\nSpeed=4\n\
@@ -27,15 +109,10 @@ fn completed_corner_keeps_heading_until_next_head_is_accepted() {
     ))
     .unwrap();
     let mut sim = Simulation::new();
-    sim.install_resolved_terrain_for_new_map(ResolvedTerrainGrid::from_cells(
+    // The completed-head corridor starts with an admitted walker. Its
+    // ordinary Unlimbo therefore needs the native Clear/Foot speed row.
+    sim.install_resolved_terrain_for_new_map(crate::map::resolved_terrain::test_flat_ground_grid(
         16,
-        16,
-        (0..16)
-            .flat_map(|y| {
-                (0..16)
-                    .map(move |x| crate::sim::world::common_raw_test_terrain_cell(x, y, 0, false))
-            })
-            .collect(),
     ));
     let id = sim
         .spawn_object("E1", "Americans", 6, 5, 0, &rules)
@@ -47,34 +124,32 @@ fn completed_corner_keeps_heading_until_next_head_is_accepted() {
     };
     let body = FacingClass::new(0x3FFF, 0);
     let actor = sim.substrate.entities.get_mut(id).unwrap();
-    actor.position.sub_x = SimFixed::from_num(184);
-    actor.position.sub_y = SimFixed::from_num(64);
+    actor.position.set_sub_x_for_test(SimFixed::from_num(184));
+    actor.position.set_sub_y_for_test(SimFixed::from_num(64));
     actor.body_facing = body;
-    actor.navigation.nav_com = Some(NavTargetRef::cell(6, 6));
-    actor.navigation.path_replay = FootPathQueue {
-        directions: vec![2, 4],
-        cursor: 0,
-        reference_cell: Some((5, 5)),
-    };
-    actor.movement_target = Some(MovementTarget {
-        path: vec![(5, 5), (6, 5), (6, 6)],
-        path_layers: vec![MovementLayer::Ground; 3],
-        next_index: 1,
-        final_goal: Some((6, 6)),
-        ..Default::default()
-    });
+    actor
+        .navigation
+        .set_nav_com_for_test(Some(NavTargetRef::cell(6, 6)));
+    actor
+        .navigation
+        .set_path_replay_for_test(FootPathQueue::for_test(vec![2, 4], 0, Some((5, 5))));
     let loco = actor.locomotor.as_mut().unwrap();
     loco.set_walk_destination(Some(DriveCoord::cell(6, 6, 0)));
     loco.set_step_head(Some(head));
 
     // Exercise real world completion, including Mark/PerCell and navigation.
     // Original75BD70..75BF82 has no movement-turn call;75BC97 owns the next one.
-    sim.run_completed_walk_step(id, head, Some(&rules), None)
-        .unwrap();
+    sim.run_completed_walk_step(
+        id,
+        head,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default(),
+    )
+    .unwrap();
     let actor = sim.substrate.entities.get(id).unwrap();
     assert_eq!(ground_pose::position_world_coord(&actor.position), head);
-    assert_eq!(actor.movement_target.as_ref().unwrap().next_index, 2);
-    assert_eq!(actor.navigation.path_replay.remaining_directions(), &[4]);
+    assert_eq!(actor.navigation.path_replay().remaining_directions(), &[4]);
     assert_eq!(actor.locomotor.as_ref().unwrap().step_head(), None);
     assert_eq!(
         actor.body_facing, body,
@@ -134,8 +209,8 @@ fn retained(value: &Value) -> Option<DriveCoord> {
 
 #[test]
 fn post_percell_completion_matches_original_setter_refusal_and_stop_order() {
-    let rows: Vec<Value> = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/walk_completion.json"
+    let rows: Vec<Value> = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/walk_completion.json",
     ))
     .unwrap();
     assert_eq!(rows.len(), 42);
@@ -147,21 +222,32 @@ fn post_percell_completion_matches_original_setter_refusal_and_stop_order() {
         ))
         .unwrap();
         rules.general.blockage_path_delay_ticks = i32_value(&input["blockage"]);
-        sim.session.binary_frame = input["frame"].as_u64().unwrap() as u32;
+        sim.session
+            .set_binary_frame_for_test(input["frame"].as_u64().unwrap() as u32);
         let mut actor = GameEntity::test_default(1, "E1", "Americans", 16, 15);
-        actor.category = EntityCategory::Infantry;
+        actor.set_category_for_test(EntityCategory::Infantry);
         actor.locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Walk));
-        actor.lifecycle.object_alive = input["alive"] == 1;
-        actor.lifecycle.in_limbo = input["limbo"] == 1;
+        actor
+            .lifecycle
+            .set_object_alive_for_test(input["alive"] == 1);
+        actor.lifecycle.set_in_limbo_for_test(input["limbo"] == 1);
         actor.set_falling_down_for_test(input["falling"].as_u64().unwrap() != 0);
         // Keep signed/aliased full XYZ in the existing physical coordinate owner.
         // The query must compare the native truncated low16 cell words.
         let current = coord(&input["current"]);
-        actor.position.rx = (current.x / 256).clamp(0, i32::from(u16::MAX)) as u16;
-        actor.position.ry = (current.y / 256).clamp(0, i32::from(u16::MAX)) as u16;
-        actor.position.sub_x = SimFixed::from_num(current.x - i32::from(actor.position.rx) * 256);
-        actor.position.sub_y = SimFixed::from_num(current.y - i32::from(actor.position.ry) * 256);
-        actor.position.exact_z_leptons = Some(current.z);
+        actor
+            .position
+            .set_rx_for_test((current.x / 256).clamp(0, i32::from(u16::MAX)) as u16);
+        actor
+            .position
+            .set_ry_for_test((current.y / 256).clamp(0, i32::from(u16::MAX)) as u16);
+        actor.position.set_sub_x_for_test(SimFixed::from_num(
+            current.x - i32::from(actor.position.rx()) * 256,
+        ));
+        actor.position.set_sub_y_for_test(SimFixed::from_num(
+            current.y - i32::from(actor.position.ry()) * 256,
+        ));
+        actor.position.set_exact_z_leptons_for_test(Some(current.z));
         assert_eq!(
             crate::sim::movement::ground_pose::position_world_coord(&actor.position),
             current
@@ -178,44 +264,53 @@ fn post_percell_completion_matches_original_setter_refusal_and_stop_order() {
         });
         actor.mission_leaf = MissionLeafState::infantry_raw_for_test(0, i32_value(&input["doing"]));
         if input["contact"] == 1 {
-            actor.radio_contacts.insert(2);
+            actor.seldom.radio_contacts.insert(2);
         }
         let loco = actor.locomotor.as_mut().unwrap();
         loco.set_walk_destination(Some(coord(&input["destination"])));
         // The corpus enters after PerCell with supplied class bytes still set,
         // including the null-destination contrast and replacement-head rows.
-        if let LocomotorRuntimePayload::Walk(state) = &mut loco.runtime_payload {
-            state.head = retained(&input["head"]);
-            state.moving = true;
-            state.animation_moving = true;
+        if let LocomotorRuntimePayload::Walk(state) = loco.runtime_payload_mut() {
+            state.set_head_for_test(retained(&input["head"]));
+            state.set_moving_for_test(true);
+            state.set_animation_moving_for_test(true);
         }
-        actor.navigation.nav_com = Some(NavTargetRef::Entity { id: 2 });
-        actor.navigation.nav_com_aux = Some(NavTargetRef::Entity { id: 123 });
-        actor.navigation.nav_queue = vec![NavTargetRef::cell(20, 15), NavTargetRef::cell(21, 15)];
-        actor.navigation.path_replay = FootPathQueue {
-            directions: vec![2, 3, 4, 5],
-            cursor: 0,
-            reference_cell: Some((9, 8)),
-        };
-        actor.navigation.path_runtime.start_movement(50, 5);
-        actor.navigation.path_runtime.start_blocked(40, 6);
-        actor.navigation.path_runtime.retries_left = input["retries"].as_u64().unwrap() as u32;
-        actor.navigation.path_runtime.set_scold_latch_for_test(255);
+        actor
+            .navigation
+            .set_nav_com_for_test(Some(NavTargetRef::Object { id: 2 }));
+        actor
+            .navigation
+            .set_nav_com_aux_for_test(Some(NavTargetRef::Object { id: 123 }));
+        actor
+            .navigation
+            .set_nav_queue_for_test(vec![NavTargetRef::cell(20, 15), NavTargetRef::cell(21, 15)]);
+        actor
+            .navigation
+            .set_path_replay_for_test(FootPathQueue::for_test(vec![2, 3, 4, 5], 0, Some((9, 8))));
+        actor.navigation.path_runtime_mut().start_movement(50, 5);
+        actor.navigation.path_runtime_mut().start_blocked(40, 6);
+        actor
+            .navigation
+            .path_runtime_mut()
+            .set_retries_left_for_test(input["retries"].as_u64().unwrap() as u32);
+        actor
+            .navigation
+            .path_runtime_mut()
+            .set_scold_latch_for_test(255);
         actor.foot_speed.set_speed_fraction(SimFixed::lit("0.75"));
         let owner = actor.owner();
-        sim.houses.insert(
-            owner,
-            HouseState::new(owner, 0, None, input["human"] == 1, 0, 0),
-        );
+        sim.houses
+            .register(HouseState::new(owner, 0, None, input["human"] == 1, 0, 0));
         sim.substrate.entities.insert(actor);
 
-        sim.finish_walk_navigation(1, Some(&rules)).unwrap();
+        sim.finish_walk_navigation(1, &rules, &mut crate::sim::world::FrameEffects::default())
+            .unwrap();
 
         let actor = sim.substrate.entities.get(1).unwrap();
         // This existing native corpus ends before final Mark(PUT). Neither
         // the null setter nor WalkStop owns the later75BF77 byte clear.
         assert_eq!(
-            actor.navigation.path_runtime.scold_latch_raw(),
+            actor.navigation.path_runtime().scold_latch_raw(),
             255,
             "{input}"
         );
@@ -233,12 +328,12 @@ fn post_percell_completion_matches_original_setter_refusal_and_stop_order() {
             "{input}"
         );
         assert_eq!(
-            actor.navigation.nav_com.is_some(),
+            actor.navigation.nav_com().is_some(),
             row["nav"].as_bool().unwrap(),
             "{input}"
         );
         assert_eq!(
-            actor.navigation.nav_com_aux.is_some(),
+            actor.navigation.nav_com_aux().is_some(),
             row["aux"] != 0,
             "{input}"
         );
@@ -250,22 +345,22 @@ fn post_percell_completion_matches_original_setter_refusal_and_stop_order() {
             .map(|value| value.as_u64().unwrap() as u8)
             .collect::<Vec<_>>();
         assert_eq!(
-            actor.navigation.path_replay.remaining_directions(),
+            actor.navigation.path_replay().remaining_directions(),
             expected_queue,
             "{input}"
         );
         assert_eq!(
-            actor.navigation.nav_queue.len() as u64,
+            actor.navigation.nav_queue().len() as u64,
             row["nav_queue_count"].as_u64().unwrap(),
             "{input}"
         );
         for (timer, expected) in [
             (
-                actor.navigation.path_runtime.movement_timer,
+                actor.navigation.path_runtime().movement_timer(),
                 &row["movement_timer"],
             ),
             (
-                actor.navigation.path_runtime.blocked_timer,
+                actor.navigation.path_runtime().blocked_timer(),
                 &row["blocked_timer"],
             ),
         ] {
@@ -278,7 +373,7 @@ fn post_percell_completion_matches_original_setter_refusal_and_stop_order() {
             );
         }
         assert_eq!(
-            actor.navigation.path_runtime.retries_left as u64,
+            actor.navigation.path_runtime().retries_left() as u64,
             row["retries"].as_u64().unwrap(),
             "{input}"
         );
@@ -292,8 +387,8 @@ fn post_percell_completion_matches_original_setter_refusal_and_stop_order() {
 
 #[test]
 fn paid_walk_world_scold_tails_match_original_boundaries() {
-    let corpus: Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/foot_scold_latch.json"
+    let corpus: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/foot_scold_latch.json",
     ))
     .unwrap();
     let mut checked = 0;
@@ -309,17 +404,23 @@ fn paid_walk_world_scold_tails_match_original_boundaries() {
         ) {
             continue;
         }
+        let mut actor = GameEntity::test_default(1, "E1", "Americans", 9, 10);
+        // After the actor interns its owner, whom the arrival's sight
+        // border resolves.
         let mut sim = Simulation::new();
         sim.interner = crate::sim::intern::test_interner();
-        let mut actor = GameEntity::test_default(1, "E1", "Americans", 9, 10);
-        actor.category = EntityCategory::Infantry;
+        actor.set_category_for_test(EntityCategory::Infantry);
         actor.locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Walk));
         actor
             .navigation
-            .path_runtime
+            .path_runtime_mut()
             .set_scold_latch_for_test(row["supplied_byte"].as_u64().unwrap() as u8);
-        actor.lifecycle.object_alive = case != "dead_post_percell";
-        actor.lifecycle.in_limbo = case == "limbo_post_percell";
+        actor
+            .lifecycle
+            .set_object_alive_for_test(case != "dead_post_percell");
+        actor
+            .lifecycle
+            .set_in_limbo_for_test(case == "limbo_post_percell");
         actor.set_falling_down_for_test(case == "falling_post_percell");
         let head = DriveCoord::cell(10, 10, 0);
         actor.locomotor.as_mut().unwrap().set_step_head(Some(head));
@@ -328,14 +429,39 @@ fn paid_walk_world_scold_tails_match_original_boundaries() {
             "arrival_mark" => {
                 // The native golden supplies the final Mark callback. Here
                 // the real completion owner runs Mark/PerCell through it.
-                sim.run_completed_walk_step(1, head, None, None).unwrap();
-                assert!(sim.substrate.entities.get(1).unwrap().lifecycle.cell_marked);
+                sim.run_completed_walk_step(
+                    1,
+                    head,
+                    crate::rules::ruleset::RuleSet::empty_for_test(),
+                    None,
+                    &mut crate::sim::world::FrameEffects::default(),
+                )
+                .unwrap();
+                assert!(
+                    sim.substrate
+                        .entities
+                        .get(1)
+                        .unwrap()
+                        .lifecycle
+                        .cell_marked()
+                );
             }
-            "common_return" => sim.run_walk_boundary(1, head, None, None),
+            "common_return" => sim.run_walk_boundary(
+                1,
+                head,
+                crate::rules::ruleset::RuleSet::empty_for_test(),
+                None,
+                &mut crate::sim::world::FrameEffects::default(),
+            ),
             _ => {
                 // Supplied post-PerCell liveness is the native corpus boundary;
                 // these rows do not claim to execute a death/limbo producer.
-                sim.finish_walk_navigation(1, None).unwrap();
+                sim.finish_walk_navigation(
+                    1,
+                    crate::rules::ruleset::RuleSet::empty_for_test(),
+                    &mut crate::sim::world::FrameEffects::default(),
+                )
+                .unwrap();
             }
         }
         assert_eq!(
@@ -345,7 +471,7 @@ fn paid_walk_world_scold_tails_match_original_boundaries() {
                     .get(1)
                     .unwrap()
                     .navigation
-                    .path_runtime
+                    .path_runtime()
                     .scold_latch_raw()
             ),
             row["final_byte"].as_u64().unwrap(),

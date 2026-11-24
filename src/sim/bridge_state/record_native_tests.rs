@@ -3,8 +3,8 @@
 
 #[test]
 fn native_bridge_records_match_original_executable() {
-    let corpus: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/bridge_records.json"
+    let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/bridge_records.json",
     ))
     .unwrap();
     let cases = corpus["cases"].as_array().unwrap();
@@ -44,7 +44,7 @@ fn native_bridge_records_match_original_executable() {
                     cell.final_tile_index = int(row, 2);
                     cell.final_sub_tile = int(row, 3) as u8;
                     cell.bridge_facts.raw_flags = int(row, 4) as u32;
-                    cell.yr_cell_land_type = int(row, 5) as u8;
+                    cell.land_type = int(row, 5) as u8;
                     let ordinal = int(row, 6);
                     cell.tube_index = (ordinal >= 0).then_some(TubeId(ordinal as u16));
                 }

@@ -1,9 +1,7 @@
 # House statistics through sinking saves
 
 `naval_house_stats.py` executes the original concrete House save and load,
-not merely a raw-memory-copy surrogate. The original binary is pinned by
-`tools.native_oracle` to SHA-256
-`1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c`.
+not merely a raw-memory-copy surrogate.
 
 From the VERA20k repository root, with the native Python environment and retail
 executable configured, run:
@@ -69,3 +67,17 @@ The packet establishes persistence of native state. It does not establish a new
 equivalence proof for Rust's existing aggregate kill/built representation or its
 split of the native score into harvested credits and kill points. Those owners
 should retain their existing values across save/load instead of resetting them.
+
+## Local display name through House storage
+
+The additional `name_cases` use the same full House stream and swizzle fixture.
+Original ordinary scenario/local-player writer `0x688092..0x6880AD` receives the
+supplied UTF-16 string in EBX and destination House in EBP. Its bounded copy takes
+21 code units, then writes a terminator at `House+0x16052`: the 42-byte field at
+`+0x1602A` carries at most 20 displayed code units on this route. ASCII,
+non-ASCII and overlong controls record the original written bytes directly.
+
+Full Save `0x504080`/Abstract Save `0x410320` and Load `0x503040`/Abstract Load
+`0x410380` preserve those bytes. The no-init constructor `0x4F5190` also retains
+the inline name. All three RNG states stay unchanged. The fixture does not
+execute every House INI/name writer or claim complete scenario-load coverage.

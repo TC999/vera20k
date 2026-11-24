@@ -12,8 +12,12 @@ use crate::assets::mix_archive::MixArchive;
 use crate::assets::mix_hash::mix_hash;
 use crate::assets::pal_file::Palette;
 use crate::assets::shp_file::ShpFile;
-use crate::render::batch::{BatchRenderer, BatchTexture};
+use crate::render::batch::{BatchRenderer, BatchTexture, SpriteInstance};
 use crate::render::gpu::GpuContext;
+use crate::render::shell_ui_style_assets::{
+    ShellUiAssetRef, base_art_candidates, decode_ui_shp, mod_art_candidates, ui_art_candidates,
+};
+use crate::render::sidebar_smoothing::{self, SidebarPieces, SmoothCopy};
 
 #[path = "sidebar_chrome_command_bar.rs"]
 mod command_bar;
@@ -22,14 +26,26 @@ pub use command_bar::CommandBarArt;
 #[path = "sidebar_chrome_in_game_shell.rs"]
 mod in_game_shell;
 pub use in_game_shell::InGameShellArt;
+#[path = "sidebar_chrome_layout_art.rs"]
+mod layout_art;
+pub use layout_art::LayoutArt;
+#[path = "sidebar_chrome_observer.rs"]
+mod observer_art;
+pub use observer_art::ObserverArt;
 
 #[cfg(test)]
-pub(crate) fn packed_command_bar_fixture(assets: &AssetManager, theme: SidebarTheme) -> (CommandBarArt<SidebarChromeEntry>, Vec<u8>, [u32; 2]) {
+pub(crate) fn packed_command_bar_fixture(
+    assets: &AssetManager,
+    theme: SidebarTheme,
+) -> (CommandBarArt<SidebarChromeEntry>, Vec<u8>, [u32; 2]) {
     let route = SidebarSideRoute::for_theme(assets, theme);
     let palette = decode_sidebar_palette(route.resolve("SIDEBAR.PAL").unwrap().bytes).unwrap();
     let rendered = command_bar::load(route, &palette);
     let width = rendered.entries().map(|entry| entry.width).max().unwrap();
-    let height = rendered.entries().map(|entry| entry.height + CHROME_PADDING).sum();
+    let height = rendered
+        .entries()
+        .map(|entry| entry.height + CHROME_PADDING)
+        .sum();
     let mut rgba = vec![0; (width * height * 4) as usize];
     let mut y = 0;
     let packed = rendered.map(|entry| {
@@ -54,6 +70,9 @@ const UNKNOWN_TOP_HOUSING_ID: i32 = 0x7AEBAE6Bu32 as i32;
 const UNKNOWN_MID_PANEL_ID: i32 = 0xB0259C24u32 as i32;
 const ALLIED_SIDE_ARCHIVE_ORDER: &[&str] = &["sidec01md.mix", "sidec01.mix", "sidenc01.mix"];
 const SIDE_TWO_ARCHIVE_ORDER: &[&str] = &["sidec02md.mix", "sidec02.mix", "sidenc02.mix"];
+// SidebarClass::LoadSHPs 6A5840 loads SIDE1..3, ADDON, GCLOCK2 and the button
+// shapes (FreeSHPs 6A5BF0 frees them). Its observer backgrounds and flags are
+// not side art; `observer_art` finds them.
 const GENERIC_SIDEBAR_SHP_NAMES: &[&str] = &[
     "side1.shp",
     "side2.shp",
@@ -77,7 +96,7 @@ const GENERIC_SIDEBAR_SHP_NAMES: &[&str] = &[
     "gclock2.shp",
 ];
 
-pub use crate::sidebar::SidebarTheme;
+pub use crate::ui::sidebar::SidebarTheme;
 
 /// One logical sidebar input and the archive selected by the existing resolver.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +146,7 @@ impl ResolvedSidebarChrome<'_> {
 struct SidebarSideRoute<'a> {
     asset_manager: &'a AssetManager,
     archive_names: &'static [&'static str],
+    registered_group: bool,
 }
 
 impl<'a> SidebarSideRoute<'a> {
@@ -138,20 +158,74 @@ impl<'a> SidebarSideRoute<'a> {
         Self {
             asset_manager,
             archive_names,
+            registered_group: false,
+        }
+    }
+
+    fn for_registered_group(asset_manager: &'a AssetManager) -> Self {
+        Self {
+            asset_manager,
+            archive_names: &[],
+            registered_group: true,
         }
     }
 
     fn resolve(&self, asset_name: &str) -> Option<ResolvedSidebarAsset<'a>> {
-        resolve_sidebar_asset_in_order(
-            self.archive_names.iter().filter_map(|&archive_name| {
-                self.asset_manager
-                    .archive(archive_name)
-                    .map(|archive| (archive_name, archive))
-            }),
-            asset_name,
-        )
+        if self.registered_group {
+            // The selected Side MIX group is registered by AssetManager.
+            // Loose/earlier expansion overrides keep CCFile first-match order.
+            let selected = self.asset_manager.resolve_ref(asset_name)?;
+            return Some(ResolvedSidebarAsset {
+                archive_name: selected.source_archive,
+                bytes: selected.bytes,
+            });
+        }
+        resolve_sidebar_asset_in_order(self.side_archives(), asset_name)
     }
 
+    fn side_archives(&self) -> impl Iterator<Item = (&'static str, &'a MixArchive)> {
+        self.archive_names.iter().filter_map(|&archive_name| {
+            self.asset_manager
+                .archive(archive_name)
+                .map(|archive| (archive_name, archive))
+        })
+    }
+
+    fn decode<T>(
+        &self,
+        asset_name: &str,
+        mut decode: impl FnMut(ShellUiAssetRef<'a>) -> Option<T>,
+    ) -> Option<T> {
+        if self.registered_group {
+            return ui_art_candidates(self.asset_manager, asset_name).find_map(decode);
+        }
+        if self.asset_manager.mod_dir().is_none() {
+            let selected = self.resolve(asset_name)?;
+            return decode(ShellUiAssetRef {
+                bytes: selected.bytes,
+                source: selected.archive_name,
+            });
+        }
+        // An inactive Side MIX is catalogued off the ordinary file search.
+        // Use its own side's ordered chain after loose and registered mod art.
+        mod_art_candidates(self.asset_manager, asset_name)
+            .find_map(&mut decode)
+            .or_else(|| {
+                self.side_archives().find_map(|(source, archive)| {
+                    let bytes = archive.get_by_name(asset_name)?;
+                    decode(ShellUiAssetRef { bytes, source })
+                })
+            })
+    }
+
+    fn render(&self, name: &str, palette: &Palette, frame: usize) -> Option<RenderedChromeEntry> {
+        self.decode(name, |asset| {
+            let shp = parse_sidebar_shape(self.asset_manager, asset.bytes)?;
+            render_shp(&shp, palette, frame)
+        })
+    }
+
+    #[cfg(test)]
     fn resolve_generic_shp(&self, shp_name: &str) -> Option<ResolvedSidebarAsset<'a>> {
         if !is_generic_sidebar_shp_name(shp_name) {
             return None;
@@ -162,7 +236,7 @@ impl<'a> SidebarSideRoute<'a> {
 
 #[derive(Clone, Copy)]
 struct ResolvedSidebarAsset<'a> {
-    archive_name: &'static str,
+    archive_name: &'a str,
     bytes: &'a [u8],
 }
 
@@ -194,6 +268,22 @@ pub struct SidebarChromeEntry {
     pub pixel_size: [f32; 2],
 }
 
+impl SidebarChromeEntry {
+    /// Source columns `x..x + w` as a piece of their own; all of them are
+    /// this piece unchanged.
+    pub fn columns(self, x: f32, w: f32) -> Self {
+        if x == 0.0 && w == self.pixel_size[0] {
+            return self;
+        }
+        let per_pixel = self.uv_size[0] / self.pixel_size[0];
+        Self {
+            uv_origin: [self.uv_origin[0] + x * per_pixel, self.uv_origin[1]],
+            uv_size: [w * per_pixel, self.uv_size[1]],
+            pixel_size: [w, self.pixel_size[1]],
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SidebarChromeExtraEntry {
     pub id: i32,
@@ -202,12 +292,66 @@ pub struct SidebarChromeExtraEntry {
     pub entry: SidebarChromeEntry,
 }
 
+pub(crate) struct SidebarDarkenMask {
+    pub texture: BatchTexture,
+    pub frame_origin: [f32; 2],
+}
+
+impl SidebarDarkenMask {
+    pub(crate) fn from_bytes(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        batch: &BatchRenderer,
+        bytes: &[u8],
+        palette: &Palette,
+    ) -> Option<Self> {
+        let shp = ShpFile::from_bytes(bytes).ok()?;
+        let frame = shp.frames.first()?;
+        let width = u32::from(frame.frame_width);
+        let height = u32::from(frame.frame_height);
+        if width == 0 || height == 0 {
+            return None;
+        }
+        // Unavailable496250 uses indices alone; flash4963F0 uses this same
+        // frame with the sidebar's ordinary N=1 palette conversion.
+        let rgba = shp.frame_to_rgba(0, palette).ok()?;
+        Some(Self {
+            texture: batch.create_texture_on_device(
+                device,
+                queue,
+                &rgba,
+                width,
+                height,
+                Some(&frame.pixels),
+            ),
+            frame_origin: [f32::from(frame.frame_x), f32::from(frame.frame_y)],
+        })
+    }
+
+    pub(crate) fn load(
+        gpu: &GpuContext,
+        batch: &BatchRenderer,
+        assets: &AssetManager,
+        palette: &Palette,
+    ) -> Option<Self> {
+        // SidebarClass::One_Time 6A5000 (6A500B..6A5018): literal DARKEN.SHP
+        // through LoadFileFromMIX, not the side-only generic chrome resolver.
+        let source = assets.load_file_from_mix("DARKEN.SHP")?;
+        log::info!("Sidebar DARKEN.SHP resolved from {}", source.source_archive);
+        Self::from_bytes(&gpu.device, &gpu.queue, batch, &source.bytes, palette)
+    }
+}
+
 /// All sidebar chrome art for one faction theme, packed into a single texture.
 pub struct SidebarChromeAtlas {
     source_identity: SidebarChromeAtlasIdentity,
     pub texture: BatchTexture,
     pub command_bar: CommandBarArt<SidebarChromeEntry>,
     pub in_game_shell: InGameShellArt<SidebarChromeEntry>,
+    /// The pictures of the buttons the layout file adds (`Art=`).
+    pub layout_art: LayoutArt<SidebarChromeEntry>,
+    /// The observer strip's backgrounds and flags.
+    pub observer_art: ObserverArt<SidebarChromeEntry>,
     pub top_strip_left: Option<SidebarChromeEntry>,
     pub top_strip_sidebar: Option<SidebarChromeEntry>,
     pub top_strip_thin: Option<SidebarChromeEntry>,
@@ -230,14 +374,15 @@ pub struct SidebarChromeAtlas {
     pub tabs: Option<SidebarChromeEntry>,
     /// Tab buttons: per-tab × 5-frame SHP state table.
     /// Outer index: tab number (0..=3). Inner index: SHP frame (0..=4).
-    /// Frame meanings (from SBGadgetClass::Draw, gamemd 0x0069DEB0):
-    ///   0 = idle, 1 = active-tab, 2 = disabled, 3 = pressed-idle, 4 = pressed-active.
+    /// Frame meanings (`ShapeButtonClass::Draw @ 0x0069DEB0`):
+    ///   0 = idle, 1 = active-tab, 2 = disabled, 3 = flash-idle, 4 = flash-active.
     pub tab_frames: [[Option<SidebarChromeEntry>; 5]; 4],
     pub side2: SidebarChromeEntry,
     pub side3: SidebarChromeEntry,
-    /// Repair button — 5-frame SHP state table (same convention as `tab_frames`).
+    /// Repair button — same frame convention as `tab_frames`; it never
+    /// flashes, and retail art has only frames 0 (off) and 1 (on).
     pub repair_frames: [Option<SidebarChromeEntry>; 5],
-    /// Sell button — 5-frame SHP state table (same convention as `tab_frames`).
+    /// Sell button — same as `repair_frames`.
     pub sell_frames: [Option<SidebarChromeEntry>; 5],
     /// Strip scroll-up (R-UP.SHP, −page) — 3-frame convention:
     /// 0 = idle, 1 = pressed, 2 = disabled. Missing frames fall back to
@@ -256,43 +401,248 @@ pub struct SidebarChromeAtlas {
     /// Each entry maps a frame index to UV coordinates in gclock_texture.
     pub gclock_texture: Option<BatchTexture>,
     pub gclock_frames: Vec<SidebarChromeEntry>,
+    /// Global DARKEN.SHP source, converted with this side's ordinary N=1
+    /// palette (SidebarLoadSHPs6A588C). Its resolver is LoadFileFromMIX.
+    pub(crate) darken: Option<SidebarDarkenMask>,
+    /// The pieces the sidebar's column and command bar draw, kept for VERA's
+    /// smooth sidebar (`render::sidebar_smoothing`).
+    sidebar_pieces: SidebarPieces,
+    /// Their copy at the sidebar's draw scale while it is on.
+    smooth: Option<SmoothCopy>,
 }
 
 impl SidebarChromeAtlas {
     pub fn source_identity(&self) -> &SidebarChromeAtlasIdentity {
         &self.source_identity
     }
+
+    /// Follow the smooth sidebar's scale; None draws the atlas's own pixels.
+    pub fn set_smooth_scale(
+        &mut self,
+        gpu: &GpuContext,
+        batch: &BatchRenderer,
+        scale: Option<u32>,
+    ) {
+        let source = self.sidebar_pieces.source();
+        sidebar_smoothing::follow_scale(&mut self.smooth, source, scale, gpu, batch);
+    }
+
+    /// The smooth copy of the sidebar's pieces, when there is one.
+    pub fn smooth_texture(&self) -> Option<&BatchTexture> {
+        self.smooth.as_ref().and_then(SmoothCopy::texture)
+    }
+
+    /// Point `instances`, drawn from this atlas by the sidebar's column or
+    /// command bar, at the same pixels of the smooth copy, and say whether
+    /// they were. They stay on the atlas when there is no copy, or one draws
+    /// a piece it lacks.
+    pub fn retarget_to_smooth(&self, instances: &mut [SpriteInstance]) -> bool {
+        self.smooth_texture().is_some() && self.sidebar_pieces.retarget(instances)
+    }
 }
 
+/// The selected side is a runtime index, not another hardcoded faction enum.
+/// Retail keeps its three prebuilt themes; Ares prepares the current scenario's
+/// selected group through the same atlas builder and resolver.
 pub struct SidebarChromeSet {
-    pub allied: Option<SidebarChromeAtlas>,
-    pub soviet: Option<SidebarChromeAtlas>,
-    pub yuri: Option<SidebarChromeAtlas>,
+    atlases: Vec<(i32, SidebarChromeAtlas)>,
+    /// Stock themes whose art the archives lack, so that
+    /// [`SidebarChromeSet::ensure_side`] asks for each once.
+    missing: Vec<SidebarTheme>,
+    /// Whether [`build_sidebar_chrome_set`]'s Ares arm built it (the scenario
+    /// side's registered Side MIX group) rather than its stock arm (the stock
+    /// themes, built as sides draw them). Resolution follows the arm that
+    /// built the set.
+    ares: bool,
 }
 
 impl SidebarChromeSet {
+    /// Whether the Ares arm built this set; see [`sidebar_theme_for_side`].
+    pub fn ares(&self) -> bool {
+        self.ares
+    }
+
     pub fn for_theme(&self, theme: SidebarTheme) -> Option<&SidebarChromeAtlas> {
         self.resolve_theme(theme).map(|resolved| resolved.atlas)
     }
 
-    /// Resolve the atlas through the production fallback order while retaining
-    /// both the requested and actual theme identities.
-    pub fn resolve_theme(
-        &self,
-        requested_theme: SidebarTheme,
-    ) -> Option<ResolvedSidebarChrome<'_>> {
-        let (actual_theme, atlas) = select_sidebar_theme(
-            requested_theme,
-            self.allied.as_ref(),
-            self.soviet.as_ref(),
-            self.yuri.as_ref(),
-        )?;
+    pub fn resolve_theme(&self, theme: SidebarTheme) -> Option<ResolvedSidebarChrome<'_>> {
+        self.resolve_side(stock_theme_side(theme))
+    }
+
+    pub fn resolve_side(&self, side_index: i32) -> Option<ResolvedSidebarChrome<'_>> {
+        let (actual_theme, index) = self.resolve_index(side_index)?;
         Some(ResolvedSidebarChrome {
-            requested_theme,
+            requested_theme: sidebar_theme_for_side(side_index, self.ares),
             actual_theme,
-            atlas,
+            atlas: &self.atlases[index].1,
         })
     }
+
+    /// The theme and the place in `atlases` of the atlas `side_index` draws.
+    fn resolve_index(&self, side_index: i32) -> Option<(SidebarTheme, usize)> {
+        let position = |side| self.atlases.iter().position(|(s, _)| *s == side);
+        let resolved = if self.ares {
+            let index = position(side_index)?;
+            (self.atlases[index].1.source_identity.atlas_theme, index)
+        } else {
+            let (allied, soviet, yuri) = (position(0), position(1), position(2));
+            let (theme, &index) = select_sidebar_theme(
+                sidebar_theme_for_side(side_index, self.ares),
+                allied.as_ref(),
+                soviet.as_ref(),
+                yuri.as_ref(),
+            )?;
+            (theme, index)
+        };
+        Some(resolved)
+    }
+
+    /// Build the atlas `side_index` draws when the set lacks it: the side's
+    /// theme, else the first of its fallbacks the archives hold
+    /// ([`theme_fallbacks`]). A stock match builds the local player's side at
+    /// load and another side here, on the frame a change of local house first
+    /// draws it, instead of all three at load: each is a 25 MiB texture, and
+    /// a shared-memory chip's few hundred MiB hold the whole match. The Ares
+    /// arm built its one side at load and builds nothing here.
+    pub fn ensure_side(
+        &mut self,
+        side_index: i32,
+        gpu: &GpuContext,
+        batch: &BatchRenderer,
+        asset_manager: &AssetManager,
+    ) {
+        if self.ares {
+            return;
+        }
+        let requested = sidebar_theme_for_side(side_index, false);
+        while let Some(theme) = next_theme_to_build(
+            requested,
+            |theme| {
+                self.atlases
+                    .iter()
+                    .any(|(side, _)| *side == stock_theme_side(theme))
+            },
+            &self.missing,
+        ) {
+            let (archive, yuri) = stock_theme_source(theme);
+            match build_theme_atlas(
+                gpu,
+                batch,
+                asset_manager,
+                theme,
+                archive,
+                SidebarArtNames::for_yuri(yuri),
+                false,
+            ) {
+                Some(atlas) => self.atlases.push((stock_theme_side(theme), atlas)),
+                None => self.missing.push(theme),
+            }
+        }
+    }
+
+    /// Follow the smooth sidebar's scale with the atlas `side_index` draws;
+    /// the others drop their copies.
+    pub fn set_smooth_scale(
+        &mut self,
+        side_index: i32,
+        gpu: &GpuContext,
+        batch: &BatchRenderer,
+        scale: Option<u32>,
+    ) {
+        let current = self.resolve_index(side_index).map(|(_, index)| index);
+        for (index, (_, atlas)) in self.atlases.iter_mut().enumerate() {
+            let scale = scale.filter(|_| current == Some(index));
+            atlas.set_smooth_scale(gpu, batch, scale);
+        }
+    }
+}
+
+/// A file as Full_Init finds it once `InitSideMixFiles` (`0x00534FA0`, from
+/// `0x0068781F`) has mounted the side's MIX group at the tail of the search
+/// list: the ordinary search first, then the group. Side 2 reads side 1's
+/// group (`0x00534FB1`). Stock VERA keeps every side's group off the ordinary
+/// search and reads it by side, so a file only the group carries, such as
+/// PBEACON.SHP, is found here.
+pub(crate) fn side_mix_file<'a>(
+    asset_manager: &'a AssetManager,
+    side_index: i32,
+    ares: bool,
+    name: &str,
+) -> Option<&'a [u8]> {
+    if let Some(bytes) = asset_manager.get_ref(name) {
+        return Some(bytes);
+    }
+    let route = if ares {
+        SidebarSideRoute::for_registered_group(asset_manager)
+    } else {
+        SidebarSideRoute::for_theme(asset_manager, sidebar_theme_for_side(side_index, false))
+    };
+    route.resolve(name).map(|resolved| resolved.bytes)
+}
+
+/// Sidebar geometry6A5090 is side-zero versus nonzero. The Yuri label keeps
+/// existing stock provenance; with `ares`, the arm of
+/// [`build_sidebar_chrome_set`] that drew the side's own Side MIX group
+/// ([`SidebarChromeSet::ares`]), an extra side uses the same nonzero geometry,
+/// independently of its MIX index and Yuri filename switch. The stock sidebar
+/// draws an extra side as Allied.
+pub(crate) fn sidebar_theme_for_side(side_index: i32, ares: bool) -> SidebarTheme {
+    match side_index {
+        0 => SidebarTheme::Allied,
+        1 => SidebarTheme::Soviet,
+        2 => SidebarTheme::Yuri,
+        _ if ares => SidebarTheme::Soviet,
+        _ => SidebarTheme::Allied,
+    }
+}
+
+/// The themes `theme` draws, in order: its own art, else an earlier side's.
+/// gamemd's side 2 reads side 1's group (`0x00534FB1`), and a game whose
+/// archives lack that falls back to Allied.
+const fn theme_fallbacks(theme: SidebarTheme) -> &'static [SidebarTheme] {
+    match theme {
+        SidebarTheme::Allied => &[SidebarTheme::Allied],
+        SidebarTheme::Soviet => &[SidebarTheme::Soviet, SidebarTheme::Allied],
+        SidebarTheme::Yuri => &[
+            SidebarTheme::Yuri,
+            SidebarTheme::Soviet,
+            SidebarTheme::Allied,
+        ],
+    }
+}
+
+/// The stock archive and Yuri filename switch `theme` is built from, as
+/// `InitSideMixFiles` (`0x00534FA0`) mounts them.
+const fn stock_theme_source(theme: SidebarTheme) -> (&'static str, bool) {
+    match theme {
+        SidebarTheme::Allied => ("sidec01.mix", false),
+        SidebarTheme::Soviet => ("sidec02.mix", false),
+        SidebarTheme::Yuri => ("sidec02md.mix", true),
+    }
+}
+
+/// The stock side index that draws `theme` ([`sidebar_theme_for_side`]).
+const fn stock_theme_side(theme: SidebarTheme) -> i32 {
+    match theme {
+        SidebarTheme::Allied => 0,
+        SidebarTheme::Soviet => 1,
+        SidebarTheme::Yuri => 2,
+    }
+}
+
+/// The theme [`SidebarChromeSet::ensure_side`] builds next for `requested`:
+/// the first of its themes ([`theme_fallbacks`]) that is not `missing`,
+/// unless that one is `built`, in which case nothing is left to build.
+fn next_theme_to_build(
+    requested: SidebarTheme,
+    built: impl Fn(SidebarTheme) -> bool,
+    missing: &[SidebarTheme],
+) -> Option<SidebarTheme> {
+    let theme = *theme_fallbacks(requested)
+        .iter()
+        .find(|theme| !missing.contains(theme))?;
+    (!built(theme)).then_some(theme)
 }
 
 pub(crate) fn select_sidebar_theme<'a, T>(
@@ -301,71 +651,130 @@ pub(crate) fn select_sidebar_theme<'a, T>(
     soviet: Option<&'a T>,
     yuri: Option<&'a T>,
 ) -> Option<(SidebarTheme, &'a T)> {
-    match requested_theme {
-        SidebarTheme::Allied => allied.map(|atlas| (SidebarTheme::Allied, atlas)),
-        SidebarTheme::Soviet => soviet
-            .map(|atlas| (SidebarTheme::Soviet, atlas))
-            .or_else(|| allied.map(|atlas| (SidebarTheme::Allied, atlas))),
-        SidebarTheme::Yuri => yuri
-            .map(|atlas| (SidebarTheme::Yuri, atlas))
-            .or_else(|| soviet.map(|atlas| (SidebarTheme::Soviet, atlas)))
-            .or_else(|| allied.map(|atlas| (SidebarTheme::Allied, atlas))),
+    theme_fallbacks(requested_theme).iter().find_map(|&theme| {
+        match theme {
+            SidebarTheme::Allied => allied,
+            SidebarTheme::Soviet => soviet,
+            SidebarTheme::Yuri => yuri,
+        }
+        .map(|atlas| (theme, atlas))
+    })
+}
+
+/// Ares1002EAA0/1002FA60/1002FA70 consume one independent filename
+/// switch, not the actual side index or the selected MIX number.
+#[derive(Clone, Copy)]
+struct SidebarArtNames {
+    radar_palette: &'static str,
+    radar: &'static str,
+    background_palette: &'static str,
+    backgrounds: (&'static str, &'static str, &'static str),
+}
+
+impl SidebarArtNames {
+    const fn for_yuri(yuri: bool) -> Self {
+        if yuri {
+            Self {
+                radar_palette: "radaryuri.pal",
+                radar: "radary.shp",
+                background_palette: "UIBKGDY.PAL",
+                backgrounds: ("bkgdlgy.shp", "bkgdmdy.shp", "bkgdsmy.shp"),
+            }
+        } else {
+            Self {
+                radar_palette: "sidebar.pal",
+                radar: "radar.shp",
+                background_palette: "UIBKGD.PAL",
+                backgrounds: ("bkgdlg.shp", "bkgdmd.shp", "bkgdsm.shp"),
+            }
+        }
     }
 }
 
+/// The scenario side's retained Side sidebar configuration (its MIX index and
+/// Yuri filename switch) when Ares plays in the game (`RuleSet::ares`), which
+/// selects the side's MIX group (Ares1002FA00). A side without one draws the
+/// stock sidebar: a game whose Rules were not read the Ares way has no Side
+/// extensions.
+pub(crate) fn ares_sidebar_config(
+    rules: &crate::rules::ruleset::RuleSet,
+    side_index: i32,
+) -> Option<(i32, bool)> {
+    let side = crate::rules::ruleset::SideIdx(u8::try_from(side_index).ok()?);
+    if !rules.ares() {
+        return None;
+    }
+    Some((
+        rules.side_sidebar_mix_file_index(side)?,
+        rules.side_sidebar_yuri_file_names(side)?,
+    ))
+}
+
+/// The match's sidebar chrome: the scenario side's own Side MIX group when
+/// Ares plays in the game (`side_index`), else the stock theme of the side
+/// the local player's house draws (`local_side`,
+/// `sidebar_render::project_sidebar_side`), with another side's built on the
+/// frame that first draws it ([`SidebarChromeSet::ensure_side`]). `None` when
+/// the archives hold no sidebar art at all.
 pub fn build_sidebar_chrome_set(
     gpu: &GpuContext,
     batch: &BatchRenderer,
-    asset_manager: &AssetManager,
-) -> Option<SidebarChromeSet> {
-    let allied = build_theme_atlas(
-        gpu,
-        batch,
-        asset_manager,
-        SidebarTheme::Allied,
-        "sidec01.mix",
-        "sidebar.pal",
-        "radar.shp",
-        Some(("bkgdlg.shp", "bkgdmd.shp", "bkgdsm.shp")),
-    );
-    let soviet = build_theme_atlas(
-        gpu,
-        batch,
-        asset_manager,
-        SidebarTheme::Soviet,
-        "sidec02.mix",
-        "sidebar.pal",
-        "radar.shp",
-        Some(("bkgdlg.shp", "bkgdmd.shp", "bkgdsm.shp")),
-    );
-    let yuri = build_theme_atlas(
-        gpu,
-        batch,
-        asset_manager,
-        SidebarTheme::Yuri,
-        "sidec02md.mix",
-        "radaryuri.pal",
-        "radary.shp",
-        Some(("bkgdlgy.shp", "bkgdmdy.shp", "bkgdsmy.shp")),
-    );
-
-    if allied.is_none() && soviet.is_none() && yuri.is_none() {
-        return None;
+    asset_manager: &mut AssetManager,
+    rules: &crate::rules::ruleset::RuleSet,
+    side_index: i32,
+    local_side: i32,
+) -> Result<Option<SidebarChromeSet>, crate::assets::error::AssetError> {
+    if let Some((mix_index, yuri_names)) = ares_sidebar_config(rules, side_index) {
+        if !asset_manager.activate_sidebar_archives(mix_index)? {
+            // Full_Init687824 and saved Load67E766 abort when534FA0 fails.
+            return Err(crate::assets::error::AssetError::ParseError {
+                format: "sidebar".into(),
+                detail: format!(
+                    "side {side_index}: sidebar MIX initialization failed for index {mix_index}"
+                ),
+            });
+        }
+        let base = format!("sidec{mix_index:02}.mix");
+        let md = format!("sidec{mix_index:02}md.mix");
+        let primary = if asset_manager.archive(&md).is_some() {
+            &md
+        } else {
+            &base
+        };
+        let atlas = build_theme_atlas(
+            gpu,
+            batch,
+            asset_manager,
+            sidebar_theme_for_side(side_index, true),
+            primary,
+            SidebarArtNames::for_yuri(yuri_names),
+            true,
+        )
+        .ok_or_else(|| crate::assets::error::AssetError::AssetNotFound {
+            name: format!("required sidebar shapes or palettes for side {side_index} in {primary}"),
+        })?;
+        return Ok(Some(SidebarChromeSet {
+            atlases: vec![(side_index, atlas)],
+            missing: Vec::new(),
+            ares: true,
+        }));
     }
-
-    Some(SidebarChromeSet {
-        allied,
-        soviet,
-        yuri,
-    })
+    let mut set = SidebarChromeSet {
+        atlases: Vec::new(),
+        missing: Vec::new(),
+        ares: false,
+    };
+    set.ensure_side(local_side, gpu, batch, asset_manager);
+    Ok((!set.atlases.is_empty()).then_some(set))
 }
 
 struct CpuGclockAtlas {
     rgba: Vec<u8>,
+    indices: Vec<u8>,
     width: u32,
     height: u32,
     frames: Vec<SidebarChromeEntry>,
-    source_archive: &'static str,
+    source_archive: String,
 }
 
 /// Resolve all GCLOCK2 frames from the active side stack and pack them into a
@@ -374,16 +783,17 @@ fn build_gclock_cpu_atlas(
     route: SidebarSideRoute<'_>,
     palette: &Palette,
 ) -> Option<CpuGclockAtlas> {
-    let resolved = route.resolve_generic_shp("GCLOCK2.SHP")?;
-    build_gclock_cpu_atlas_from_bytes(resolved.bytes, palette, resolved.archive_name)
+    route.decode("GCLOCK2.SHP", |asset| {
+        let shp = parse_sidebar_shape(route.asset_manager, asset.bytes)?;
+        build_gclock_cpu_atlas_from_shape(&shp, palette, asset.source)
+    })
 }
 
-fn build_gclock_cpu_atlas_from_bytes(
-    shp_bytes: &[u8],
+fn build_gclock_cpu_atlas_from_shape(
+    shp: &ShpFile,
     palette: &Palette,
-    source_archive: &'static str,
+    source_archive: &str,
 ) -> Option<CpuGclockAtlas> {
-    let shp = ShpFile::from_bytes(shp_bytes).ok()?;
     let frame_count = shp.frames.len();
     if frame_count == 0 {
         return None;
@@ -391,29 +801,25 @@ fn build_gclock_cpu_atlas_from_bytes(
 
     let frame_w = shp.width as u32;
     let frame_h = shp.height as u32;
-    let mut rendered_frames: Vec<Vec<u8>> = Vec::with_capacity(frame_count);
+    let mut rendered_frames: Vec<RenderedChromeEntry> = Vec::with_capacity(frame_count);
     for i in 0..frame_count {
         // Use render_shp() to composite onto the full canvas, handling frame_x/frame_y
         // offsets and sub-canvas frame sizes correctly.
-        let mut entry = render_shp(&shp, palette, i)?;
-        // Set alpha = 128 for non-transparent pixels (gamemd flag 0x004 = 50% translucent).
-        for pixel in entry.rgba.chunks_exact_mut(4) {
-            if pixel[3] > 0 {
-                pixel[3] = 128;
-            }
-        }
-        rendered_frames.push(entry.rgba);
+        // Retain original indices: compressed 4963F0 skips source zero,
+        // including when its palette colour would otherwise be opaque black.
+        rendered_frames.push(render_shp(shp, palette, i)?);
     }
 
     // Pack into a grid texture. 8 columns keeps it roughly square for typical 54-frame SHPs.
     let cols = 8u32.min(frame_count as u32);
-    let rows = (frame_count as u32 + cols - 1) / cols;
+    let rows = (frame_count as u32).div_ceil(cols);
     let tex_w = cols * frame_w;
     let tex_h = rows * frame_h;
     let mut atlas_rgba = vec![0u8; (tex_w * tex_h * 4) as usize];
+    let mut atlas_indices = vec![0u8; (tex_w * tex_h) as usize];
 
     let mut entries = Vec::with_capacity(frame_count);
-    for (i, frame_rgba) in rendered_frames.iter().enumerate() {
+    for (i, frame) in rendered_frames.iter().enumerate() {
         let col = (i as u32) % cols;
         let row = (i as u32) / cols;
         let dst_x = col * frame_w;
@@ -423,9 +829,11 @@ fn build_gclock_cpu_atlas_from_bytes(
             let src_start = (y * frame_w * 4) as usize;
             let dst_start = (((dst_y + y) * tex_w + dst_x) * 4) as usize;
             let len = (frame_w * 4) as usize;
-            if src_start + len <= frame_rgba.len() && dst_start + len <= atlas_rgba.len() {
+            if src_start + len <= frame.rgba.len() && dst_start + len <= atlas_rgba.len() {
                 atlas_rgba[dst_start..dst_start + len]
-                    .copy_from_slice(&frame_rgba[src_start..src_start + len]);
+                    .copy_from_slice(&frame.rgba[src_start..src_start + len]);
+                atlas_indices[dst_start / 4..(dst_start + len) / 4]
+                    .copy_from_slice(&frame.indices[src_start / 4..(src_start + len) / 4]);
             }
         }
 
@@ -448,10 +856,11 @@ fn build_gclock_cpu_atlas_from_bytes(
 
     Some(CpuGclockAtlas {
         rgba: atlas_rgba,
+        indices: atlas_indices,
         width: tex_w,
         height: tex_h,
         frames: entries,
-        source_archive,
+        source_archive: source_archive.to_owned(),
     })
 }
 
@@ -469,57 +878,83 @@ fn build_gclock_texture(
         atlas.width,
         atlas.height
     );
-    let texture = batch.create_texture(gpu, &atlas.rgba, atlas.width, atlas.height);
+    let texture = batch.create_texture_with_indices(
+        gpu,
+        &atlas.rgba,
+        atlas.width,
+        atlas.height,
+        Some(&atlas.indices),
+    );
     Some((texture, atlas.frames))
 }
 
-// Original72ADE0 expands six-bit PAL; ordinary Convert48E740->4BBB00 N=1
-// stores exact R5G6B5. Precompose once through the enrolled retail output
-// profile; the shared RGBA shader must not apply LightConvert row lighting.
+// Original72ADE0 expands six-bit PAL (the one palette conversion); ordinary
+// Convert48E740->4BBB00 N=1 stores exact R5G6B5. Precompose once through the
+// enrolled retail output profile; the shared RGBA shader must not apply
+// LightConvert row lighting.
 fn decode_sidebar_palette(bytes: &[u8]) -> Result<Palette, crate::assets::error::AssetError> {
-    let mut palette = Palette::from_bytes_gamemd_ui(bytes)?;
-    for color in &mut palette.colors {
-        let [r, g, b, a] = crate::render::native_surface_format::ACTIVE_RETAIL_RGB565_PRESENTATION
+    let palette = Palette::from_bytes(bytes)?;
+    Ok(Palette::from_rgb(|index| {
+        let color = palette.color(index);
+        let [r, g, b, _] = crate::render::native_surface_format::ACTIVE_RETAIL_RGB565_PRESENTATION
             .quantize_rgba8([color.r, color.g, color.b, color.a]);
-        *color = crate::assets::pal_file::Color { r, g, b, a };
-    }
-    Ok(palette)
+        [r, g, b]
+    }))
 }
 
-fn resolve_theme_palette_with_source(
-    asset_manager: &AssetManager,
-    mix: &MixArchive,
-    mix_name: &str,
-    palette_name: &str,
-) -> Option<(Palette, String)> {
-    if let Some(bytes) = mix.get_by_name(palette_name) {
-        if let Ok(palette) = decode_sidebar_palette(bytes) {
-            return Some((palette, mix_name.to_string()));
+/// Radar and dialog art have their own theme palettes and a primary Side MIX.
+/// The Ares arm uses the currently registered Side group for both inputs.
+#[derive(Clone, Copy)]
+struct SidebarThemeRoute<'a> {
+    assets: &'a AssetManager,
+    mix: &'a MixArchive,
+    mix_name: &'a str,
+    ares: bool,
+}
+
+impl<'a> SidebarThemeRoute<'a> {
+    fn decode<T>(
+        self,
+        name: &str,
+        mut decode: impl FnMut(&[u8]) -> Option<T>,
+    ) -> Option<(T, &'a str)> {
+        let mut read = |asset: ShellUiAssetRef<'a>| Some((decode(asset.bytes)?, asset.source));
+        if self.ares {
+            // Palette72ADE0 reads from current MIX lookup5B4430, so the
+            // newly registered Side group can provide its suffixed palettes.
+            return ui_art_candidates(self.assets, name).find_map(read);
         }
+        mod_art_candidates(self.assets, name)
+            .find_map(&mut read)
+            .or_else(|| {
+                read(ShellUiAssetRef {
+                    bytes: self.mix.get_by_name(name)?,
+                    source: self.mix_name,
+                })
+            })
+            .or_else(|| base_art_candidates(self.assets, name).find_map(read))
     }
 
-    let (bytes, source_archive) = asset_manager.get_with_source_ref(palette_name)?;
-    decode_sidebar_palette(bytes)
-        .ok()
-        .map(|palette| (palette, source_archive.to_string()))
-}
+    fn palette(self, name: &str) -> Option<(Palette, &'a str)> {
+        self.decode(name, |bytes| decode_sidebar_palette(bytes).ok())
+    }
 
-fn theme_asset_identity(
-    asset_manager: &AssetManager,
-    mix: &MixArchive,
-    mix_name: &str,
-    logical_name: &str,
-) -> SidebarChromeAssetIdentity {
-    let source_archive = if mix.get_by_name(logical_name).is_some() {
-        Some(mix_name.to_string())
-    } else {
-        asset_manager
-            .get_with_source_ref(logical_name)
-            .map(|(_, archive_name)| archive_name.to_string())
-    };
-    SidebarChromeAssetIdentity {
-        logical_name: logical_name.to_string(),
-        source_archive,
+    fn shape(self, name: &str, frame: usize) -> Option<(ShpFile, &'a str)> {
+        self.decode(name, |bytes| {
+            let shape = parse_sidebar_shape(self.assets, bytes)?;
+            shape.frames.get(frame)?;
+            Some(shape)
+        })
+    }
+
+    fn render(
+        self,
+        name: &str,
+        palette: &Palette,
+        frame: usize,
+    ) -> Option<(RenderedChromeEntry, &'a str)> {
+        let (shape, source) = self.shape(name, frame)?;
+        Some((render_shp(&shape, palette, frame)?, source))
     }
 }
 
@@ -529,22 +964,37 @@ fn build_theme_atlas(
     asset_manager: &AssetManager,
     theme: SidebarTheme,
     mix_name: &str,
-    palette_name: &str,
-    radar_name: &str,
-    background_names: Option<(&str, &str, &str)>,
+    names: SidebarArtNames,
+    ares: bool,
 ) -> Option<SidebarChromeAtlas> {
+    let palette_name = names.radar_palette;
+    let radar_name = names.radar;
+    let background_names = Some(names.backgrounds);
     let mix = asset_manager.archive(mix_name)?;
-    let (theme_palette, theme_palette_source_archive) =
-        resolve_theme_palette_with_source(asset_manager, &mix, mix_name, palette_name)?;
-    let side_route = SidebarSideRoute::for_theme(asset_manager, theme);
+    let theme_route = SidebarThemeRoute {
+        assets: asset_manager,
+        mix,
+        mix_name,
+        ares,
+    };
+    let (theme_palette, theme_palette_source_archive) = theme_route.palette(palette_name)?;
+    let side_route = if ares {
+        SidebarSideRoute::for_registered_group(asset_manager)
+    } else {
+        SidebarSideRoute::for_theme(asset_manager, theme)
+    };
     let generic_palette_name = "SIDEBAR.PAL";
-    let generic_palette_source = side_route.resolve(generic_palette_name)?;
-    let generic_palette = decode_sidebar_palette(generic_palette_source.bytes).ok()?;
+    let (generic_palette, generic_palette_source) = side_route
+        .decode(generic_palette_name, |asset| {
+            Some((decode_sidebar_palette(asset.bytes).ok()?, asset.source))
+        })?;
     let command_bar_art = command_bar::load(side_route, &generic_palette);
     let in_game_shell_art = in_game_shell::load(side_route, &generic_palette);
+    let layout_art_rendered = layout_art::load(side_route, &generic_palette);
+    let observer_art_rendered = observer_art::load(theme_route);
     log::debug!(
         "{theme:?} generic sidebar palette resolved from {}",
-        generic_palette_source.archive_name
+        generic_palette_source
     );
     // For sidebar inspection/fidelity work, decode every sidebar-side MIX SHP
     // with the theme's main sidebar palette so unknown pieces are comparable
@@ -552,32 +1002,36 @@ fn build_theme_atlas(
     let tabs_palette = theme_palette.clone();
 
     // Required pieces — without these, skip the theme entirely.
-    let radar = render_entry(
-        asset_manager,
-        &mix,
-        radar_name,
-        &theme_palette,
-        RADAR_DEFAULT_FRAME,
-    )?;
-    let radar_identity = theme_asset_identity(asset_manager, &mix, mix_name, radar_name);
+    let (radar_shape, radar_source) = theme_route.shape(radar_name, RADAR_DEFAULT_FRAME)?;
+    let radar = render_shp(&radar_shape, &theme_palette, RADAR_DEFAULT_FRAME)?;
+    let radar_identity = SidebarChromeAssetIdentity {
+        logical_name: radar_name.to_owned(),
+        source_archive: Some(radar_source.to_owned()),
+    };
 
     // Pre-render all radar.shp frames for the opening/closing animation.
     let (radar_frames, radar_frame_size, radar_content_insets) =
-        render_all_radar_frames(asset_manager, &mix, radar_name, &theme_palette);
+        render_all_radar_frames(&radar_shape, &theme_palette);
+    // Residual: with no side1 shape gamemd loads SIDEGDI1..3.SHP in place of
+    // all three (0x006ABD47..0x006ABD7E; a missing side2 or side3 alone has no
+    // fallback). No retail archive holds them, so only a mod that ships them
+    // but not side1.shp would see them; VERA skips the theme.
     let side1 = render_side_entry(side_route, "side1.shp", &generic_palette, 0)?;
     let side2 = render_side_entry(side_route, "side2.shp", &generic_palette, 0)?;
     let side3 = render_side_entry(side_route, "side3.shp", &generic_palette, 0)?;
 
     // Optional pieces — gracefully degrade if missing.
-    let tabs = render_entry(asset_manager, &mix, "tabs.shp", &tabs_palette, 0);
+    let tabs = theme_route
+        .render("tabs.shp", &tabs_palette, 0)
+        .map(|(art, _)| art);
 
     // Tab buttons: 4 tabs × 5 frames each. Missing frames in retail fall
     // back to None; the renderer skips that frame's draw if not present.
-    // Frame 0 = idle, 1 = active-tab, 2 = disabled, 3 = pressed-idle,
-    // 4 = pressed-active. See SIDEBAR_REPAIR_SELL_BUTTON §5.
+    // Frame 0 = idle, 1 = active-tab, 2 = disabled, 3 = flash-idle,
+    // 4 = flash-active (`ui::sidebar::gadget_flash::shape_button_frame`).
     let mut tab_frame_entries: [[Option<RenderedChromeEntry>; 5]; 4] = Default::default();
-    for tab in 0..4 {
-        for frame in 0..5 {
+    for (tab, tab_entries) in tab_frame_entries.iter_mut().enumerate() {
+        for (frame, slot) in tab_entries.iter_mut().enumerate() {
             let entry = render_side_entry(
                 side_route,
                 &format!("tab0{tab}.shp"),
@@ -589,28 +1043,30 @@ fn build_theme_atlas(
                     "tab0{tab}.shp frame {frame} missing in MIX — gadget state {frame} will fall back to idle"
                 );
             }
-            tab_frame_entries[tab][frame] = entry;
+            *slot = entry;
         }
     }
 
     let mut repair_frame_entries: [Option<RenderedChromeEntry>; 5] = Default::default();
-    for frame in 0..5 {
+    for (frame, slot) in repair_frame_entries.iter_mut().enumerate() {
         let entry = render_side_entry(side_route, "repair.shp", &generic_palette, frame);
         if entry.is_none() && frame > 0 {
             log::warn!("repair.shp frame {frame} missing in MIX");
         }
-        repair_frame_entries[frame] = entry;
+        *slot = entry;
     }
 
     let mut sell_frame_entries: [Option<RenderedChromeEntry>; 5] = Default::default();
-    for frame in 0..5 {
+    for (frame, slot) in sell_frame_entries.iter_mut().enumerate() {
         let entry = render_side_entry(side_route, "sell.shp", &generic_palette, frame);
         if entry.is_none() && frame > 0 {
             log::warn!("sell.shp frame {frame} missing in MIX");
         }
-        sell_frame_entries[frame] = entry;
+        *slot = entry;
     }
 
+    // `RadarClass::FreeButtonShapes @ 0x00652D90` frees both shapes again
+    // before Init_For_House reloads them; dropping this table does the same.
     // 652E90 + 653010: both top controls use the generic SIDEBAR.PAL
     // converter (87F6CC), including Yuri. Native mask5, plain toggle kind0.
     let top_button_entries: [[Option<RenderedChromeEntry>; 2]; 2] = ["diplobtn.shp", "optbtn.shp"]
@@ -639,47 +1095,47 @@ fn build_theme_atlas(
     if scroll_down_entries[0].is_none() {
         log::warn!("r-dn.shp missing in MIX — strip scroll-down button will not render");
     }
-    let power = render_entry(asset_manager, &mix, "power.shp", &theme_palette, 0);
+    let power = theme_route
+        .render("power.shp", &theme_palette, 0)
+        .map(|(art, _)| art);
     // 63FB20 uses the actual SHP frame/canvas; transparent samples keep
     // their skipped-store meaning and the renderer advances by 3 pixels.
     let powerp_rendered: Vec<RenderedChromeEntry> = (0..5)
         .filter_map(|i| render_side_entry(side_route, "powerp.shp", &generic_palette, i))
         .collect();
-    let top_strip_left = render_entry_by_id(&mix, TOP_STRIP_LEFT_ID, &tabs_palette, 0);
+    let top_strip_left = render_entry_by_id(mix, TOP_STRIP_LEFT_ID, &tabs_palette, 0);
     let top_strip_sidebar = render_side_entry(side_route, "top.shp", &generic_palette, 0);
     let top_strip_thin = render_side_entry(side_route, "credits.shp", &generic_palette, 0);
     let unknown_top_housing = render_side_entry(side_route, "addon.shp", &generic_palette, 0);
-    let unknown_mid_panel = render_entry_by_id(&mix, UNKNOWN_MID_PANEL_ID, &theme_palette, 0);
-    let ([background_large, background_medium, background_small], background_palette) =
-        background_names
-            .and_then(|names| in_game_shell::load_backgrounds(asset_manager, &mix, mix_name, theme, names))
-            .map(|(entries, identity)| (entries, Some(identity)))
-            .unwrap_or(([None, None, None], None));
-    let background_identities = background_names.map(|(large, medium, small)| {
-        [
-            theme_asset_identity(asset_manager, &mix, mix_name, large),
-            theme_asset_identity(asset_manager, &mix, mix_name, medium),
-            theme_asset_identity(asset_manager, &mix, mix_name, small),
-        ]
-    });
+    let unknown_mid_panel = render_entry_by_id(mix, UNKNOWN_MID_PANEL_ID, &theme_palette, 0);
+    let (
+        [background_large, background_medium, background_small],
+        background_identities,
+        background_palette,
+    ) = background_names
+        .and_then(|backgrounds| {
+            in_game_shell::load_backgrounds(theme_route, backgrounds, names.background_palette)
+        })
+        .map(|(entries, identities, palette)| (entries, Some(identities), Some(palette)))
+        .unwrap_or(([None, None, None], None, None));
     let source_identity = SidebarChromeAtlasIdentity {
         atlas_theme: theme,
         parent_archive: mix_name.to_string(),
         radar: radar_identity,
         theme_palette: SidebarChromeAssetIdentity {
             logical_name: palette_name.to_string(),
-            source_archive: Some(theme_palette_source_archive),
+            source_archive: Some(theme_palette_source_archive.to_owned()),
         },
         generic_palette: SidebarChromeAssetIdentity {
             logical_name: generic_palette_name.to_string(),
-            source_archive: Some(generic_palette_source.archive_name.to_string()),
+            source_archive: Some(generic_palette_source.to_owned()),
         },
         backgrounds: background_identities,
         background_palette,
     };
     let excluded_extra_ids = known_loose_piece_ids(radar_name);
     let extra_rendered = collect_extra_entries(
-        &mix,
+        mix,
         &theme_palette,
         &tabs_palette,
         background_names,
@@ -703,6 +1159,8 @@ fn build_theme_atlas(
     let mut all_entries: Vec<&RenderedChromeEntry> = vec![&radar, &side1, &side2, &side3];
     all_entries.extend(command_bar_art.entries());
     all_entries.extend(in_game_shell_art.entries());
+    all_entries.extend(layout_art_rendered.entries());
+    all_entries.extend(observer_art_rendered.entries());
     if let Some(ref top) = top_strip_left {
         all_entries.push(top);
     }
@@ -730,22 +1188,14 @@ fn build_theme_atlas(
     if let Some(ref t) = tabs {
         all_entries.push(t);
     }
-    for tab in 0..4 {
-        for frame in 0..5 {
-            if let Some(ref entry) = tab_frame_entries[tab][frame] {
-                all_entries.push(entry);
-            }
-        }
+    for entry in tab_frame_entries.iter().flatten().flatten() {
+        all_entries.push(entry);
     }
-    for frame in 0..5 {
-        if let Some(ref entry) = repair_frame_entries[frame] {
-            all_entries.push(entry);
-        }
+    for entry in repair_frame_entries.iter().flatten() {
+        all_entries.push(entry);
     }
-    for frame in 0..5 {
-        if let Some(ref entry) = sell_frame_entries[frame] {
-            all_entries.push(entry);
-        }
+    for entry in sell_frame_entries.iter().flatten() {
+        all_entries.push(entry);
     }
     for entry in top_button_entries.iter().flatten().flatten() {
         all_entries.push(entry);
@@ -779,6 +1229,16 @@ fn build_theme_atlas(
         uv
     });
     let in_game_shell = in_game_shell_art.map(|entry| {
+        let uv = blit_entry(&mut rgba, atlas_width, atlas_height, y, entry);
+        y += entry.height + CHROME_PADDING;
+        uv
+    });
+    let layout_art = layout_art_rendered.map(|entry| {
+        let uv = blit_entry(&mut rgba, atlas_width, atlas_height, y, entry);
+        y += entry.height + CHROME_PADDING;
+        uv
+    });
+    let observer_art = observer_art_rendered.map(|entry| {
         let uv = blit_entry(&mut rgba, atlas_width, atlas_height, y, entry);
         y += entry.height + CHROME_PADDING;
         uv
@@ -870,7 +1330,7 @@ fn build_theme_atlas(
     let top_button_frames = top_button_entries.each_ref().map(|frames| {
         frames.each_ref().map(|entry| {
             entry.as_ref().map(|entry| {
-                let uv = blit_entry(&mut rgba, atlas_width, atlas_height, y, &entry);
+                let uv = blit_entry(&mut rgba, atlas_width, atlas_height, y, entry);
                 y += entry.height + CHROME_PADDING;
                 uv
             })
@@ -940,18 +1400,68 @@ fn build_theme_atlas(
         side3.width,
         side3.height,
     );
-    for tab in 0..4 {
-        if let Some(ref entry) = tab_frame_entries[tab][0] {
+    for (tab, tab_entries) in tab_frame_entries.iter().enumerate() {
+        if let Some(ref entry) = tab_entries[0] {
             log::info!("  tab0{} (5 frames): {}x{}", tab, entry.width, entry.height);
         }
     }
 
     let texture = batch.create_texture(gpu, &rgba, atlas_width, atlas_height);
+    // VERA's smooth sidebar scales what the column and the command bar draw:
+    // every piece but the pause menu's panel, buttons and backgrounds, and
+    // the extras nothing draws.
+    let sidebar_pieces: Vec<[u32; 4]> = command_bar
+        .entries()
+        .copied()
+        .chain(layout_art.entries().copied())
+        .chain(observer_art.entries().copied())
+        .chain(
+            [
+                top_strip_left_uv,
+                top_strip_sidebar_uv,
+                top_strip_thin_uv,
+                unknown_top_housing_uv,
+                unknown_mid_panel_uv,
+                Some(radar_uv),
+                Some(side1_uv),
+                tabs_uv,
+                Some(side2_uv),
+                Some(side3_uv),
+                power_uv,
+            ]
+            .into_iter()
+            .flatten(),
+        )
+        .chain(tab_frames_packed.iter().flatten().flatten().copied())
+        .chain(repair_frames_packed.iter().flatten().copied())
+        .chain(sell_frames_packed.iter().flatten().copied())
+        .chain(top_button_frames.iter().flatten().flatten().copied())
+        .chain(scroll_up_frames_packed.iter().flatten().copied())
+        .chain(scroll_down_frames_packed.iter().flatten().copied())
+        .chain(powerp_uvs.iter().flatten().copied())
+        .map(|entry| {
+            [
+                (entry.uv_origin[0] * atlas_width as f32).round() as u32,
+                (entry.uv_origin[1] * atlas_height as f32).round() as u32,
+                entry.pixel_size[0] as u32,
+                entry.pixel_size[1] as u32,
+            ]
+        })
+        .collect();
+    let sidebar_pieces = SidebarPieces::gather(
+        &rgba,
+        [atlas_width, atlas_height],
+        &sidebar_pieces,
+        CHROME_PADDING,
+        gpu.device.limits().max_texture_dimension_2d,
+    );
     Some(SidebarChromeAtlas {
         source_identity,
         texture,
         command_bar,
         in_game_shell,
+        layout_art,
+        observer_art,
         top_strip_left: top_strip_left_uv,
         top_strip_sidebar: top_strip_sidebar_uv,
         top_strip_thin: top_strip_thin_uv,
@@ -979,11 +1489,15 @@ fn build_theme_atlas(
         extra_entries,
         gclock_texture,
         gclock_frames,
+        darken: SidebarDarkenMask::load(gpu, batch, asset_manager, &generic_palette),
+        sidebar_pieces,
+        smooth: None,
     })
 }
 
 struct RenderedChromeEntry {
     rgba: Vec<u8>,
+    indices: Vec<u8>,
     width: u32,
     height: u32,
 }
@@ -1056,23 +1570,7 @@ fn collect_extra_entries(
 /// Pre-render all frames of radar.shp to RGBA buffers for animation.
 /// Returns (Vec of RGBA buffers, [width, height], content insets).
 /// Content insets come from the native fixed radar aperture.
-fn render_all_radar_frames(
-    asset_manager: &AssetManager,
-    mix: &MixArchive,
-    radar_name: &str,
-    palette: &Palette,
-) -> (Vec<Vec<u8>>, [u32; 2], [u32; 4]) {
-    let shp_bytes = match mix
-        .get_by_name(radar_name)
-        .or_else(|| asset_manager.get_ref(radar_name))
-    {
-        Some(b) => b,
-        None => return (Vec::new(), [0, 0], [0; 4]),
-    };
-    let shp = match ShpFile::from_bytes(shp_bytes) {
-        Ok(s) => s,
-        Err(_) => return (Vec::new(), [0, 0], [0; 4]),
-    };
+fn render_all_radar_frames(shp: &ShpFile, palette: &Palette) -> (Vec<Vec<u8>>, [u32; 2], [u32; 4]) {
     let frame_count: usize = shp.frames.len();
     let canvas_w: u32 = shp.width as u32;
     let canvas_h: u32 = shp.height as u32;
@@ -1082,7 +1580,7 @@ fn render_all_radar_frames(
     let content_insets = [16, 1, 12, 1];
     let frames: Vec<Vec<u8>> = (0..frame_count)
         .map(|i| {
-            render_shp(&shp, palette, i)
+            render_shp(shp, palette, i)
                 .map(|entry| entry.rgba)
                 .unwrap_or_else(|| vec![0u8; (canvas_w * canvas_h * 4) as usize])
         })
@@ -1115,53 +1613,51 @@ fn render_shp(shp: &ShpFile, palette: &Palette, frame_index: usize) -> Option<Re
     if canvas_w == fw && canvas_h == fh && fx == 0 && fy == 0 {
         return Some(RenderedChromeEntry {
             rgba: frame_rgba,
+            indices: frame.pixels.clone(),
             width: canvas_w,
             height: canvas_h,
         });
     }
     let mut canvas = vec![0u8; (canvas_w * canvas_h * 4) as usize];
+    let mut indices = vec![0u8; (canvas_w * canvas_h) as usize];
     for row in 0..fh {
         let src_off = (row * fw * 4) as usize;
         let dst_off = (((fy + row) * canvas_w + fx) * 4) as usize;
         let len = (fw * 4) as usize;
         if src_off + len <= frame_rgba.len() && dst_off + len <= canvas.len() {
             canvas[dst_off..dst_off + len].copy_from_slice(&frame_rgba[src_off..src_off + len]);
+            indices[dst_off / 4..(dst_off + len) / 4]
+                .copy_from_slice(&frame.pixels[src_off / 4..(src_off + len) / 4]);
         }
     }
     Some(RenderedChromeEntry {
         rgba: canvas,
+        indices,
         width: canvas_w,
         height: canvas_h,
     })
 }
 
-/// Resolve a binary-proven generic sidebar role only through the active side
-/// archive chain. There is deliberately no global cross-side fallback.
+/// Resolve the known generic sidebar roles through mod art and the active
+/// side archive chain.
 fn render_side_entry(
     route: SidebarSideRoute<'_>,
     shp_name: &str,
     palette: &Palette,
     frame_index: usize,
 ) -> Option<RenderedChromeEntry> {
-    let resolved = route.resolve_generic_shp(shp_name)?;
-    let shp = ShpFile::from_bytes(resolved.bytes).ok()?;
-    render_shp(&shp, palette, frame_index)
+    if !is_generic_sidebar_shp_name(shp_name) {
+        return None;
+    }
+    route.render(shp_name, palette, frame_index)
 }
 
-/// Preserve the existing theme-specific direct lookup domain for radar,
-/// backgrounds, unverified pieces, and extras.
-fn render_entry(
-    asset_manager: &AssetManager,
-    mix: &MixArchive,
-    shp_name: &str,
-    palette: &Palette,
-    frame_index: usize,
-) -> Option<RenderedChromeEntry> {
-    let shp_bytes = mix
-        .get_by_name(shp_name)
-        .or_else(|| asset_manager.get_ref(shp_name))?;
-    let shp = ShpFile::from_bytes(shp_bytes).ok()?;
-    render_shp(&shp, palette, frame_index)
+fn parse_sidebar_shape(assets: &AssetManager, bytes: &[u8]) -> Option<ShpFile> {
+    if assets.mod_dir().is_some() {
+        decode_ui_shp(bytes).ok()
+    } else {
+        ShpFile::from_bytes(bytes).ok()
+    }
 }
 
 fn render_entry_by_id(
@@ -1206,13 +1702,62 @@ fn blit_entry(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_render_s_z))]
 #[path = "sidebar_chrome_tests.rs"]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_render_s_z))]
 mod provenance_tests {
-    use super::{SidebarTheme, select_sidebar_theme};
+    use super::{SidebarTheme, next_theme_to_build, select_sidebar_theme};
+
+    #[test]
+    fn ares_sidebar_filename_switch_matches_native_independent_side_controls() {
+        let corpus = crate::test_fixture::json("tools/rules_oracle/ares_side_sidebar.json");
+        for row in corpus["selector"]["rows"].as_array().unwrap() {
+            let flag = row["input"]["yuri_file_names"].as_bool().unwrap();
+            let names = super::SidebarArtNames::for_yuri(flag);
+            let expected = &corpus["filename_sets"][if flag { "yuri" } else { "plain" }];
+            assert_eq!(names.radar.to_ascii_uppercase(), expected["radar"]);
+            assert_eq!(
+                names.radar_palette.to_ascii_uppercase(),
+                expected["radar_palette"]
+            );
+            assert_eq!(
+                names.background_palette.to_ascii_uppercase(),
+                expected["background_palette"]
+            );
+            for (actual, expected) in [
+                names.backgrounds.0,
+                names.backgrounds.1,
+                names.backgrounds.2,
+            ]
+            .iter()
+            .zip(expected["backgrounds"].as_array().unwrap())
+            {
+                assert_eq!(actual.to_ascii_uppercase(), expected.as_str().unwrap());
+            }
+        }
+    }
+
+    /// A stock set builds the side's own theme first, then the fallbacks the
+    /// archives hold, one at a time, and nothing once the drawn one exists.
+    #[test]
+    fn a_side_builds_its_theme_then_the_fallbacks_it_lacks() {
+        use SidebarTheme::{Allied, Soviet, Yuri};
+        let built = |themes: &'static [SidebarTheme]| move |theme| themes.contains(&theme);
+        assert_eq!(next_theme_to_build(Yuri, built(&[]), &[]), Some(Yuri));
+        assert_eq!(next_theme_to_build(Yuri, built(&[Allied]), &[]), Some(Yuri));
+        assert_eq!(next_theme_to_build(Yuri, built(&[]), &[Yuri]), Some(Soviet));
+        assert_eq!(next_theme_to_build(Yuri, built(&[Soviet]), &[Yuri]), None);
+        assert_eq!(
+            next_theme_to_build(Allied, built(&[Soviet, Yuri]), &[]),
+            Some(Allied)
+        );
+        assert_eq!(
+            next_theme_to_build(Soviet, built(&[]), &[Soviet, Allied]),
+            None
+        );
+    }
 
     #[test]
     fn atlas_resolution_reports_actual_fallback_without_changing_order() {

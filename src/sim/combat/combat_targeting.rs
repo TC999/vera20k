@@ -25,24 +25,25 @@
 //! an air target uses its Secondary weapon in place — it does not auto-deploy.
 //! This matches the original's behavior: deploy is a player-driven command,
 //! never triggered by AI target acquisition. Verified by grepping every writer
-//! of `deploy_state` — only the player command handler and the deploy tick
+//! of class deployment state — only the deployment owners
 //! advance set it.
 //!
 //! ## Dependency rules
 //! - Part of sim/ — depends on rules/ (RuleSet) and sim/components.
-//! - sim/ NEVER depends on render/, ui/, sidebar/, audio/, net/.
+//! - sim/ NEVER depends on render/, ui/, audio/, net/.
 
+use super::TargetKind;
 use super::combat_weapon::{
     attacker_facts, is_ally_by_object, techno_target_facts, what_weapon_should_i_use,
 };
-use super::threat_range::ScanMission;
+use super::threat_range::{self, ScanMission};
 use crate::map::entities::EntityCategory;
-use crate::map::houses::HouseAllianceMap;
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::rules::object_type::ObjectType;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::entity_store::EntityStore;
 use crate::sim::game_entity::GameEntity;
+use crate::sim::house_diplomacy::HouseAlliances;
 use crate::sim::intern::{InternedId, StringInterner};
 use crate::sim::vision::FogState;
 use crate::util::fixed_math::SimFixed;
@@ -50,25 +51,20 @@ use crate::util::native_x87::{
     MaskedX87Chop53 as X87Chop53, MaskedX87Ordering as X87Ordering, MaskedX87Value,
 };
 
-/// Snapshot of garrison state for a garrisoned building attacker.
-/// Extracted during Phase 1 to avoid borrow conflicts in Phase 2.
-#[derive(Clone)]
+/// The fire state of an occupied building attacker
+/// ([`super::combat_weapon::is_occupied`]), read in Phase 1. Its weapon is
+/// GetWeapon's, read live ([`super::combat_weapon::get_weapon`]).
+#[derive(Clone, Copy)]
 pub(crate) struct GarrisonSnapshot {
-    /// Type ID of the occupant that will fire this tick.
-    pub occupant_type_id: InternedId,
-    /// Veterancy of the firing occupant (for elite weapon selection).
-    pub occupant_veterancy: u16,
-    /// Current round-robin fire index.
-    pub fire_index: u8,
-    /// Total occupant count (for ROF division).
-    pub occupant_count: u8,
-    /// Half foundation size: `min(width, height) / 2` (for range formula).
-    pub half_foundation: u16,
+    /// `+0x69C`, the firing occupant's index: the shot's muzzle port.
+    pub fire_index: i32,
+    /// The occupant count (`+0x694`), GetROF's divisor.
+    pub occupant_count: i32,
 }
 
 /// Snapshot of an attacker's state for target scanning.
 /// Extracted to avoid borrow conflicts during entity iteration.
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub(crate) struct AttackerSnapshot {
     pub stable_id: u64,
     pub owner: InternedId,
@@ -76,7 +72,7 @@ pub(crate) struct AttackerSnapshot {
     /// What the attacker is firing at — entity ID or cell coord.
     /// Cell targets skip friendly-fire checks (the player explicitly chose
     /// this cell).
-    pub target: super::TargetKind,
+    pub target: TargetKind,
     pub pos_rx: u16,
     pub pos_ry: u16,
     pub pos_z: u8,
@@ -85,18 +81,10 @@ pub(crate) struct AttackerSnapshot {
     pub sub_y: SimFixed,
     pub type_id: InternedId,
     pub veterancy: u16,
-    /// Read-only native Infantry Doing identity; never a generic animation projection.
-    pub infantry_doing: Option<i32>,
-    pub is_fully_deployed: bool,
-    pub has_movement: bool,
     pub barrel_facing: Option<crate::sim::movement::FacingClass>,
     /// Body FacingClass (`+0x388`), including infantry fire-start snaps and
     /// vehicle turns. Facing gates and emission read its full 16-bit value.
     pub hull_facing: crate::sim::movement::FacingClass,
-    /// Weapon-selection override (the Gunner-IFV slot).
-    pub weapon_override: Option<super::combat_weapon::WeaponOverride>,
-    /// `TechnoClass+0x82` InOpenToppedTransport.
-    pub in_open_transport: bool,
     /// Garrison state — present only for garrisoned buildings (IsOccupied).
     pub garrison: Option<GarrisonSnapshot>,
     /// The threat mask this scan's CALLER pushed — `Greatest_Threat`'s second
@@ -104,14 +92,22 @@ pub(crate) struct AttackerSnapshot {
     /// (Area Guard reaches roughly twice as far as plain Guard) and, for mask
     /// 0, the scan topology itself.
     pub scan_mission: ScanMission,
-    /// The FireAt a building's Update asked for this frame
-    /// (`FireRequests::buildings`): its GetFireError already answered OK, and
-    /// a building fires no shot without it.
+    /// Call-local arguments of a building's synchronous FireAt. Its caller
+    /// already admitted GetFireError; no deferred queue retains the shot.
     pub building_shot: Option<super::BuildingShot>,
 }
 
-/// Acquire the best currently valid target for one attacker entity.
-/// Reports the target and whether the concrete dispatch reached Foot.
+/// `attacker_id`'s `Greatest_Threat` through its `+0x3C4` override, the one
+/// port every scan asks: `TechnoClass::Retaliate_And_Scan @ 0x00709820`
+/// (vt+0x39C for every class, Aircraft included) and the direct `+0x3C4`
+/// calls (team script actions, Mission_Rescue, the aircraft's own
+/// Mission_Hunt and others). Neither `Greatest_Threat` nor the Foot override
+/// (`0x004D9920`) tests ammo or `Is_Armed`. A caller that wants an armed
+/// scanner asks `CanAcquireTarget @ 0x007091D0` first (the passive gate, Foot
+/// Mission_AreaGuard at `0x004D6ED9`), whose `Is_Armed` has no ammo term;
+/// Foot Mission_Hunt (`0x004D5392`) and Arrival_Target_Handler scan without
+/// it, and Aircraft Mission_Hunt (`0x00414A80`) checks its own ammo. Reports
+/// the target and whether the concrete dispatch reached Foot.
 ///
 /// `terrain` is threaded through for the 3D InRange check; when `None`
 /// (headless tests, no map loaded), the range check falls back to the
@@ -135,66 +131,6 @@ pub(crate) struct AttackerSnapshot {
 ///
 /// `zone_grid` is `MapClass`'s per-movement-zone connectivity, which mask 0 uses
 /// to refuse candidates its own movement zone cannot reach.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn acquire_best_target_for_entity(
-    entities: &EntityStore,
-    occupancy: &crate::sim::occupancy::OccupancyGrid,
-    rules: &RuleSet,
-    interner: &StringInterner,
-    attacker_id: u64,
-    fog: Option<&FogState>,
-    terrain: Option<&ResolvedTerrainGrid>,
-    require_playfield_membership: bool,
-    mask: ScanMission,
-    zone_grid: Option<&crate::sim::pathfinding::zone_map::ZoneGrid>,
-    los: super::line_of_fire::LineOfFireInputs<'_>,
-    fire_world: Option<&crate::sim::world::Simulation>,
-    scan_coord: Option<[i32; 3]>,
-) -> super::greatest_threat::ThreatScanOutcome {
-    let Some(entity) = entities.get(attacker_id) else {
-        return super::greatest_threat::ThreatScanOutcome::default();
-    };
-    // Aircraft with 0 ammo should not acquire new targets — need to reload.
-    if let Some(ref ammo) = entity.aircraft_ammo {
-        if ammo.current == 0 {
-            return super::greatest_threat::ThreatScanOutcome::default();
-        }
-    }
-    let Some(obj) = rules.object(interner.resolve(entity.type_ref())) else {
-        return super::greatest_threat::ThreatScanOutcome::default();
-    };
-    // Native `TechnoClass::Greatest_Threat @ 0x006F8DF0` has no weapon
-    // early-out of its own; the armed requirement sits upstream in
-    // `TechnoClass::CanAcquireTarget @ 0x007091D0`, whose last term is
-    // `Is_Armed` (vtable `+0x2AC`). This is the same predicate, kept here
-    // because VERA's acquisition entry is also reached from the order and
-    // deployed-reacquire paths. It must NOT read `Primary=`: a `TurretCount>0`
-    // type never parses that key (`TechnoTypeClass::ReadINI @ 0x007128B2`), so
-    // `[SREF]` and `[YAGGUN]` were classified unarmed and could never acquire.
-    if !super::combat_weapon::is_armed(entity, obj) {
-        return super::greatest_threat::ThreatScanOutcome::default();
-    }
-    greatest_threat_for_entity(
-        entities,
-        occupancy,
-        rules,
-        interner,
-        attacker_id,
-        fog,
-        terrain,
-        require_playfield_membership,
-        mask,
-        zone_grid,
-        los,
-        fire_world,
-        scan_coord,
-    )
-}
-
-/// `attacker_id`'s `Greatest_Threat` through its `+0x3C4` override, without
-/// the passive block's gates: team script action 0 calls the override
-/// directly (`0x006ED15E`).
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn greatest_threat_for_entity(
     entities: &EntityStore,
     occupancy: &crate::sim::occupancy::OccupancyGrid,
@@ -213,15 +149,15 @@ pub(crate) fn greatest_threat_for_entity(
     let Some(entity) = entities.get(attacker_id) else {
         return super::greatest_threat::ThreatScanOutcome::default();
     };
-    let Some(obj) = rules.object(interner.resolve(entity.type_ref())) else {
+    let Some(obj) = interner.object_type(entity.type_ref(), rules) else {
         return super::greatest_threat::ThreatScanOutcome::default();
     };
     // Dummy target: no current target when acquiring fresh.
     let snapshot = AttackerSnapshot {
         scan_mission: mask,
-        ..super::build_attacker_snapshot(entity, super::TargetKind::Entity(0), None)
+        ..build_attacker_snapshot(entity, TargetKind::Entity(0), None)
     };
-    acquire_best_target(
+    super::greatest_threat::greatest_threat(
         entities,
         occupancy,
         rules,
@@ -229,62 +165,6 @@ pub(crate) fn greatest_threat_for_entity(
         &snapshot,
         obj,
         fog,
-        None,
-        terrain,
-        require_playfield_membership,
-        zone_grid,
-        los,
-        fire_world,
-        scan_coord,
-    )
-}
-
-/// `TechnoClass::Greatest_Threat @ 0x006F8DF0` — pick the best hostile target
-/// for one attacker snapshot. Returns the winning candidate's stable entity id.
-///
-/// The walk, the per-cell single-candidate rule, the gate ladder and the
-/// weighted score all live in [`super::greatest_threat`]; this is the adapter
-/// the acquisition and retarget call sites already speak to.
-///
-/// `scan_range_override`: when `Some`, replaces the mission-derived radius with
-/// a hard cutoff. Used by garrisoned buildings whose scan range is derived from
-/// foundation size + OccupyWeaponRange.
-///
-/// This replaces VERA's own `(distance², threat_class, stable_id)` nearest-first
-/// key, which had no native counterpart: gamemd scores each candidate and keeps
-/// the maximum, walking outward one cell ring at a time and stopping early once
-/// something has been found. The consequences a player sees are that value now
-/// beats proximity — a Grizzly on Guard shoots the engineer walking past instead
-/// of the wall segment beside it, because the wall is refused outright and the
-/// engineer scores highest — and that a base defence with several attackers in
-/// reach commits to the one in the innermost band rather than the nearest by
-/// Euclidean distance.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn acquire_best_target(
-    entities: &EntityStore,
-    occupancy: &crate::sim::occupancy::OccupancyGrid,
-    rules: &RuleSet,
-    interner: &StringInterner,
-    attacker: &AttackerSnapshot,
-    attacker_obj: &ObjectType,
-    fog: Option<&FogState>,
-    scan_range_override: Option<SimFixed>,
-    terrain: Option<&ResolvedTerrainGrid>,
-    require_playfield_membership: bool,
-    zone_grid: Option<&crate::sim::pathfinding::zone_map::ZoneGrid>,
-    los: super::line_of_fire::LineOfFireInputs<'_>,
-    fire_world: Option<&crate::sim::world::Simulation>,
-    scan_coord: Option<[i32; 3]>,
-) -> super::greatest_threat::ThreatScanOutcome {
-    super::greatest_threat::greatest_threat(
-        entities,
-        occupancy,
-        rules,
-        interner,
-        attacker,
-        attacker_obj,
-        fog,
-        scan_range_override,
         terrain,
         require_playfield_membership,
         zone_grid,
@@ -317,11 +197,11 @@ pub(crate) fn calculate_ai_threat_score(
     rules: &RuleSet,
     interner: &StringInterner,
     terrain: Option<&ResolvedTerrainGrid>,
-    alliances: Option<&HouseAllianceMap>,
+    alliances: Option<&HouseAlliances>,
     scorer_enemy_house: Option<crate::sim::intern::InternedId>,
 ) -> Option<MaskedX87Value> {
     let scorer = entities.get(scorer_id)?;
-    let scorer_type = rules.object(interner.resolve(scorer.type_ref()))?;
+    let scorer_type = interner.object_type(scorer.type_ref(), rules)?;
     let coefficients = super::greatest_threat::ThreatCoefficients::resolve(
         rules,
         scorer_type,
@@ -373,6 +253,16 @@ pub(crate) fn retaliation_weapon_index(
         victim_type,
         &attacker_facts(victim, victim_type),
         Some(&source_as_target),
+        |index| {
+            super::combat_weapon::get_weapon(
+                victim,
+                victim_type,
+                index,
+                &world.substrate.entities,
+                rules,
+                &world.interner,
+            )
+        },
     )
 }
 
@@ -395,49 +285,46 @@ pub(crate) fn should_retaliate(
     // The receiver asks only in its surviving arms; a victim the represented
     // lifecycle already retired cannot be one.
     if !victim.is_alive()
-        || victim.dying
-        || !victim.lifecycle.object_alive
-        || victim.lifecycle.in_limbo
+        || victim.death.is_dying()
+        || !victim.lifecycle.object_alive()
+        || victim.lifecycle.in_limbo()
     {
         return false;
     }
     let (Some(victim_type), Some(source_type)) = (
-        rules.object(interner.resolve(victim.type_ref())),
-        rules.object(interner.resolve(source.type_ref())),
+        interner.object_type(victim.type_ref(), rules),
+        interner.object_type(source.type_ref(), rules),
     ) else {
         return false;
     };
     let house = world.houses.get(&victim.owner());
     let human =
-        house.is_some_and(|house| house.is_controlled_by_human(world.session.game_mode_nonzero));
+        house.is_some_and(|house| house.is_controlled_by_human(world.session.rule_policy()));
     // `0x007087DD` CanRetaliate; `0x007087EB` a slave (SlaveOwner `+0x2DC`);
     // `0x007087F9` a slaver (SlaveManager `+0x2D8`). A slave freed by its
     // master's death (`0x006B0B73`) retaliates again.
+    // Ares7087EB ->1004B2D0 refuses a driverless victim before the slave gates.
+    if rules.ares() && victim.driver_killed() {
+        return false;
+    }
     if !victim_type.can_retaliate
-        || victim.slave.owner().is_some()
+        || victim.seldom.slave.owner().is_some()
         || victim.slave_manager.is_some()
     {
         return false;
     }
     // `0x00708807..0x0070881F`: draining (`+0x1CC`) for a house that is not
     // human (`House+0x1EC`).
-    if victim.drain_target.is_some() && !house.is_some_and(|house| house.is_human) {
+    if victim.drain.target().is_some() && !house.is_some_and(|house| house.is_human()) {
         return false;
     }
     // `0x0070882F` a full CaptureManager (being controlled is no gate);
     // `0x0070883C` a SpawnManager; `0x0070884A` a human's object that already
     // has a Target; `0x00708867` the mission's `Retaliate=`.
-    if victim
-        .capture_manager
-        .as_ref()
-        .is_some_and(|manager| manager.is_full())
+    if world.capture_manager_is_full(victim.stable_id(), rules)
         || victim.spawn_manager.is_some()
-        || (human && victim.attack_target.is_some())
-        || victim
-            .mission
-            .current()
-            .known()
-            .and_then(|mission| rules.mission_control.entry(mission))
+        || (human && victim.attack_target.target().is_some())
+        || crate::sim::mission::control::current_control(rules, &victim.mission)
             .is_some_and(|entry| !entry.retaliate)
     {
         return false;
@@ -451,8 +338,7 @@ pub(crate) fn should_retaliate(
         source.owner(),
     );
     if allied
-        || crate::sim::cloak_disguise::object_disguised_to(
-            source,
+        || source.is_disguised_to(
             victim.owner(),
             Some(&world.fog),
             Some(&world.house_alliances),
@@ -467,18 +353,24 @@ pub(crate) fn should_retaliate(
     let mut subject = super::fire_error_world::FireSubject {
         world,
         rules,
-        overlay_registry: None,
-        fog: Some(&world.fog),
+        fog: Some(world.fog.fire_view(&world.house_alliances)),
         firer: victim,
         obj: victim_type,
-        target: Some(super::TargetKind::Entity(source_id)),
+        target: Some(TargetKind::Entity(source_id)),
         weapon_index: 0,
-        garrison: super::fire_error_world::garrison_weapon(world, rules, victim, victim_type),
     };
     // `0x007088A7` GetWeaponDamageValue(-1) > 0 (a healer never retaliates);
     // `0x007088BC` Is_Armed (`BuildingClass::Is_Armed @ 0x00458DB0` answers
     // true for an occupied building).
-    if subject.weapon_damage_value() <= 0 || !super::combat_weapon::is_armed(victim, victim_type) {
+    if subject.weapon_damage_value() <= 0
+        || !super::combat_weapon::is_armed(
+            victim,
+            victim_type,
+            &world.substrate.entities,
+            rules,
+            interner,
+        )
+    {
         return false;
     }
     // `0x007088CA..0x007088FF`: SelectWeapon(source), then GetFireError
@@ -494,10 +386,10 @@ pub(crate) fn should_retaliate(
     if human {
         // `0x00708905..0x007089A5`: a human's C4 infantryman, or a rank that
         // holds C4, leaves a building source alone.
-        if source.category == EntityCategory::Structure
-            && ((victim.category == EntityCategory::Infantry && victim_type.c4)
+        if source.category() == EntityCategory::Structure
+            && ((victim.category() == EntityCategory::Infantry && victim_type.c4)
                 || super::veterancy::has_weapon_ability(
-                    super::veterancy::rank_from_u16(victim.veterancy()),
+                    victim.veterancy.rank_kind(),
                     victim_type,
                     Ability::C4,
                 ))
@@ -506,7 +398,7 @@ pub(crate) fn should_retaliate(
         }
         // `0x007089AF..0x007089E2`: a human's unit that deploys into an
         // `Artillary=` building (none in retail).
-        if victim.category == EntityCategory::Unit
+        if victim.category() == EntityCategory::Unit
             && victim_type
                 .deploys_into
                 .as_deref()
@@ -521,14 +413,14 @@ pub(crate) fn should_retaliate(
         const AREA_GUARD: i32 = 0x0B;
         const PATROL: i32 = 0x19;
         if !rules.general.player_return_fire
-            && victim.category != EntityCategory::Structure
+            && victim.category() != EntityCategory::Structure
             && !matches!(victim.mission.current().raw(), GUARD | AREA_GUARD | PATROL)
         {
             return false;
         }
     }
     // `0x00708A2C..0x00708A54`: a member of a `Suicide=` team.
-    if victim.category != EntityCategory::Structure
+    if victim.category() != EntityCategory::Structure
         && world
             .team_script_vm
             .member_team_type(victim_id)
@@ -542,10 +434,9 @@ pub(crate) fn should_retaliate(
     let victim_enemy = world
         .houses
         .get(&victim.owner())
-        .and_then(|house| house.enemy_house);
+        .and_then(|house| house.enemy_house());
     if !human
-        && let Some(super::TargetKind::Entity(current_id)) =
-            victim.attack_target.as_ref().map(|target| target.target)
+        && let Some(TargetKind::Entity(current_id)) = victim.attack_target.target()
         && let (Some(current_score), Some(source_score)) = (
             calculate_ai_threat_score(
                 entities,
@@ -573,7 +464,7 @@ pub(crate) fn should_retaliate(
         return false;
     }
     // `0x00708AAA..0x00708AC3`: a Foot never turns on the parasite eating it.
-    if victim.parasite_eating_me == Some(source_id) {
+    if victim.parasite.eater() == Some(source_id) {
         return false;
     }
     // `0x00708AC5..0x00708B09`: the selected weapon's Verses against the
@@ -582,128 +473,12 @@ pub(crate) fn should_retaliate(
     // warhead skips the test and retaliates (`0x00708AD4`, `0x00708ADE`).
     subject
         .weapon_at(subject.weapon_index)
-        .and_then(|weapon| super::combat_weapon::warhead_of(rules, weapon))
+        .and_then(|weapon| rules.weapon_warhead(weapon))
         .is_none_or(|warhead| {
-            warhead.verses_f64[super::armor_index(&source_type.armor)] > f64::from(0.01_f32)
+            // Ares 3.0 hook100543E0 replaces only this original threshold
+            // with the independently retained Retaliate flag.
+            warhead.interaction(source_type.armor_id()).can_retaliate()
         })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::rules::ini_parser::IniFile;
-    use crate::sim::intern::test_interner;
-
-    /// Stock key shape for the two `TurretCount>0` types that carry NO live
-    /// `Primary=`, copied from retail `ini/rulesmd.ini`:
-    ///
-    /// ```text
-    /// [SREF]    ; Primary=Comet          <- commented out by Westwood
-    ///           ; ElitePrimary=SuperComet
-    ///           TurretCount=4  WeaponCount=1  Weapon1=Comet
-    /// [YAGGUN]  (no Primary=, no Secondary= anywhere in the section)
-    ///           IsGattling=yes  TurretCount=1  WeaponCount=6  Weapon1=AGGattling ...
-    /// ```
-    ///
-    /// `TechnoTypeClass::ReadINI @ 0x007128B2` branches on `TurretCount > 0`
-    /// and jumps past the `Primary=` block, so those keys are never read for
-    /// either type and `obj.primary`/`obj.secondary` stay `None`.
-    fn gunner_rules() -> RuleSet {
-        RuleSet::from_ini(&IniFile::from_str(
-            "[VehicleTypes]\n0=SREF\n1=HTNK\n\
-             [BuildingTypes]\n0=YAGGUN\n\
-             [WeaponTypes]\n0=Comet\n1=AGGattling\n\
-             [SREF]\nStrength=300\nArmor=heavy\nCost=1200\n\
-             TurretCount=4\nWeaponCount=1\nWeapon1=Comet\nEliteWeapon1=Comet\n\
-             [YAGGUN]\nStrength=810\nArmor=steel\nCost=1000\n\
-             IsGattling=yes\nTurretCount=1\nWeaponCount=6\nWeapon1=AGGattling\n\
-             [HTNK]\nStrength=400\nArmor=heavy\nCost=900\nPrimary=Comet\n\
-             [Comet]\nDamage=100\nROF=110\nRange=6\nWarhead=WH\n\
-             [AGGattling]\nDamage=15\nROF=10\nRange=6\nWarhead=WH\n\
-             [WH]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
-        ))
-        .expect("gunner fixture")
-    }
-
-    /// GSI-08.02 regression: the Prism Tank and the Gattling Cannon must read
-    /// as armed. `TechnoClass::Is_Armed @ 0x00701120` resolves ONE slot through
-    /// `GetCurrentWeapon @ 0x0070E1A0`, which for a `TurretCount>0` type is
-    /// `GetWeapon(CurrentWeaponNumber)`.
-    ///
-    /// This also pins the storage fact the whole crate now depends on:
-    /// `Weapon1=` writes the same `TechnoTypeClass+0x898` field that `Primary=`
-    /// does (`TechnoTypeClass::ReadINI`, cursor `0x007128D6 LEA EDI,[EBP+0xA94]`
-    /// storing at `0x0071294A MOV [EDI-0x1FC],EAX`, and `0xA94-0x1FC = 0x898`),
-    /// so `obj.primary` reads as the native field for these two types even
-    /// though neither section authors a live `Primary=` key.
-    #[test]
-    fn gsi_08_02_stock_sref_and_yaggun_are_armed_through_weapon_one() {
-        let rules = gunner_rules();
-        let sref_obj = rules.object("SREF").expect("SREF");
-        let yaggun_obj = rules.object("YAGGUN").expect("YAGGUN");
-
-        // Same storage: `Weapon1=` lands in the `Primary` field, `Weapon2=` in
-        // `Secondary`. SREF stops at `WeaponCount=1`, so its slot 1 is empty.
-        assert_eq!(sref_obj.primary.as_deref(), Some("Comet"));
-        assert_eq!(sref_obj.secondary, None);
-        assert_eq!(yaggun_obj.primary.as_deref(), Some("AGGattling"));
-
-        let mut sref = GameEntity::test_default(1, "SREF", "Americans", 5, 5);
-        sref.category = EntityCategory::Unit;
-        let mut yaggun = GameEntity::test_default(2, "YAGGUN", "YuriCountry", 9, 9);
-        yaggun.category = EntityCategory::Structure;
-
-        assert!(super::super::combat_weapon::is_armed(&sref, sref_obj));
-        assert!(super::super::combat_weapon::is_armed(&yaggun, yaggun_obj));
-    }
-
-    /// The gate this file owns: a Prism Tank must get past
-    /// `acquire_best_target_for_entity`'s armed check and pick the enemy tank
-    /// next to it. Against the old predicate — which read the raw
-    /// `Primary=`/`Secondary=` INI keys instead of the weapon-array fields they
-    /// name — this returns `None`, and a Prism Tank on Guard never opened fire
-    /// on anything that walked past.
-    #[test]
-    fn gsi_08_02_sref_acquires_a_target_through_the_armed_gate() {
-        let rules = gunner_rules();
-        let mut entities = EntityStore::new();
-
-        let mut sref = GameEntity::test_default(1, "SREF", "Americans", 5, 5);
-        sref.category = EntityCategory::Unit;
-        sref.lifecycle.in_limbo = false;
-        sref.lifecycle.cell_marked = true;
-        entities.insert(sref);
-
-        let mut enemy = GameEntity::test_default(2, "HTNK", "Russians", 6, 5);
-        enemy.category = EntityCategory::Unit;
-        enemy.lifecycle.in_limbo = false;
-        enemy.lifecycle.cell_marked = true;
-        entities.insert(enemy);
-
-        // Snapshot the thread-local test interner only after `test_default`
-        // has interned both owners and both type names.
-        let interner = test_interner();
-
-        assert_eq!(
-            acquire_best_target_for_entity(
-                &entities,
-                &crate::sim::occupancy::OccupancyGrid::rebuild(&entities),
-                &rules,
-                &interner,
-                1,
-                None,
-                None,
-                false,
-                ScanMission::Guard,
-                None,
-                crate::sim::combat::line_of_fire::LineOfFireInputs::default(),
-                None,
-                None,
-            )
-            .target(),
-            Some(2)
-        );
-    }
 }
 
 /// Original708A8E stores the old score;708A9F..A8 refuses on C0.
@@ -713,4 +488,35 @@ pub(super) fn retaliation_score_refuses(current: MaskedX87Value, attacker: Maske
         X87Chop53::compare(attacker, current),
         X87Ordering::Less | X87Ordering::Unordered
     )
+}
+
+/// Build the per-attacker fire snapshot from current entity state. PURE READ —
+/// the caller has already decremented cooldown/burst-delay for this tick and
+/// read any garrison's fire state. Single source of the snapshot field-reads so
+/// non-Unit class hosts and the Unit live Fire→Facing host use the same
+/// field reads.
+pub(crate) fn build_attacker_snapshot(
+    entity: &GameEntity,
+    target: TargetKind,
+    garrison: Option<GarrisonSnapshot>,
+) -> AttackerSnapshot {
+    AttackerSnapshot {
+        stable_id: entity.stable_id(),
+        owner: entity.owner(),
+        category: entity.category(),
+        target,
+        pos_rx: entity.position.rx(),
+        pos_ry: entity.position.ry(),
+        pos_z: entity.position.z(),
+        pos_exact_z_leptons: entity.position.exact_z_leptons(),
+        sub_x: entity.position.sub_x(),
+        sub_y: entity.position.sub_y(),
+        type_id: entity.type_ref(),
+        veterancy: entity.veterancy.rank(),
+        barrel_facing: entity.barrel_facing,
+        hull_facing: entity.body_facing,
+        garrison,
+        scan_mission: threat_range::scan_mission_for(entity),
+        building_shot: None,
+    }
 }

@@ -1,7 +1,8 @@
-//! Pure native-compatible tactical point consumer.
+//! Pure native-compatible tactical point preparation.
 //!
-//! This module consumes externally produced u16 A/Z words and runtime display
-//! values. It never substitutes the R8 shroud texture or floating scene depth.
+//! ParticleDraw62D02C's A and Z admission, its A modulation and its RGB565
+//! store run on the GPU at the retained Display slot
+//! (`terrain_surface_lines.wgsl`, mode 6).
 
 use glam::{IVec2, IVec3};
 use thiserror::Error;
@@ -11,7 +12,6 @@ use crate::util::native_x87::{NativeF64Bits, NativeX87Error, X87Chop53, X87Value
 pub use super::native_surface_format::DirectDrawPixelFormat;
 
 const PARTICLE_Z_BIAS: i32 = 0x32;
-const A_PASSTHROUGH_THRESHOLD: u16 = 127;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SparkDrawGates {
@@ -29,28 +29,6 @@ pub struct SparkPointCommand {
     pub damage: i32,
     pub gates: SparkDrawGates,
     pub draw_ordinal: u64,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct WordPlane<'a> {
-    pub words: &'a [u16],
-    pub width: usize,
-    pub height: usize,
-    pub pitch_words: usize,
-    pub row_origin: i32,
-}
-
-impl WordPlane<'_> {
-    pub fn sample(self, x: i32, screen_y: i32) -> Option<u16> {
-        let row = screen_y.checked_sub(self.row_origin)?;
-        let x = usize::try_from(x).ok()?;
-        let row = usize::try_from(row).ok()?;
-        if x >= self.width || row >= self.height || self.pitch_words < self.width {
-            return None;
-        }
-        let index = row.checked_mul(self.pitch_words)?.checked_add(x)?;
-        self.words.get(index).copied()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,10 +50,9 @@ impl TacticalRect {
     }
 }
 
+/// Native logical-screen projection inputs, independent of CPU/GPU plane storage.
 #[derive(Debug, Clone, Copy)]
-pub struct TacticalCompatFrame<'a> {
-    pub a_plane: WordPlane<'a>,
-    pub z_plane: WordPlane<'a>,
+pub struct TacticalPointViewport {
     pub clip: TacticalRect,
     pub tactical_offset_x: i32,
     pub tactical_offset_y: i32,
@@ -83,7 +60,21 @@ pub struct TacticalCompatFrame<'a> {
     pub adjust_for_z_multiplier: NativeF64Bits,
     pub z_origin_term: i16,
     pub z_bottom_term: i16,
-    pub pixel_format: DirectDrawPixelFormat,
+}
+
+/// ParticleDraw62D02C's pure presentation inputs. A and Z are tested during
+/// ordered GPU replay, after this frame's shroud composition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PreparedSparkPoint {
+    pub screen: IVec2,
+    pub candidate_z: i32,
+    pub rgb: [i32; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SparkPointPreparation {
+    Rejected(PointRejectReason),
+    Ready { point: PreparedSparkPoint },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,114 +83,66 @@ pub enum PointRejectReason {
     ExtraAnimations,
     Fog,
     OutsideClip,
-    AZero,
-    ZTest,
     InvalidColorIndex,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PackedPointWrite {
-    pub screen: IVec2,
-    pub packed_value: u16,
-    pub byte_width: u8,
-    pub draw_ordinal: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PointResolution {
-    Rejected(PointRejectReason),
-    Write(PackedPointWrite),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum TacticalCompatError {
-    #[error("native-compatible A word is unavailable at ({x},{y})")]
-    MissingAWord { x: i32, y: i32 },
-    #[error("native-compatible Z word is unavailable at ({x},{y})")]
-    MissingZWord { x: i32, y: i32 },
     #[error(transparent)]
     NativeX87(#[from] NativeX87Error),
 }
 
-#[cfg(test)]
-pub fn resolve_spark_point(
+fn gate_rejection(command: SparkPointCommand) -> Option<PointRejectReason> {
+    if !command.gates.performance_passed && command.damage == 0 {
+        Some(PointRejectReason::Performance)
+    } else if !command.gates.extra_animations_enabled {
+        Some(PointRejectReason::ExtraAnimations)
+    } else if !command.gates.fog_passed {
+        Some(PointRejectReason::Fog)
+    } else {
+        None
+    }
+}
+
+/// Shared ParticleDraw62CEC0 numeric preparation. Interpolation is pure and
+/// precedes the GPU's live A and Z tests for valid produced Spark color states.
+pub(crate) fn prepare_spark_point(
     command: SparkPointCommand,
     color_list: &[[u8; 3]],
-    frame: TacticalCompatFrame<'_>,
-) -> Result<PointResolution, TacticalCompatError> {
-    if !command.gates.performance_passed && command.damage == 0 {
-        return Ok(PointResolution::Rejected(PointRejectReason::Performance));
+    viewport: TacticalPointViewport,
+) -> Result<SparkPointPreparation, TacticalCompatError> {
+    if let Some(reason) = gate_rejection(command) {
+        return Ok(SparkPointPreparation::Rejected(reason));
     }
-    if !command.gates.extra_animations_enabled {
-        return Ok(PointResolution::Rejected(
-            PointRejectReason::ExtraAnimations,
+    let screen = project_spark_point(command.world, viewport)?;
+    if !viewport.clip.contains(screen) {
+        return Ok(SparkPointPreparation::Rejected(
+            PointRejectReason::OutsideClip,
         ));
     }
-    if !command.gates.fog_passed {
-        return Ok(PointResolution::Rejected(PointRejectReason::Fog));
-    }
-
-    let screen = project_spark_point(command.world, frame)?;
-    if !frame.clip.contains(screen) {
-        return Ok(PointResolution::Rejected(PointRejectReason::OutsideClip));
-    }
-
-    let a_word =
-        frame
-            .a_plane
-            .sample(screen.x, screen.y)
-            .ok_or(TacticalCompatError::MissingAWord {
-                x: screen.x,
-                y: screen.y,
-            })?;
-    if a_word == 0 {
-        return Ok(PointResolution::Rejected(PointRejectReason::AZero));
-    }
-
-    let z_word =
-        frame
-            .z_plane
-            .sample(screen.x, screen.y)
-            .ok_or(TacticalCompatError::MissingZWord {
-                x: screen.x,
-                y: screen.y,
-            })?;
-    let adjust_for_z = adjust_for_z(command.world.z, frame.adjust_for_z_multiplier)?;
-    let candidate = z_candidate(
-        frame.z_origin_term,
-        frame.z_bottom_term,
+    let candidate_z = z_candidate(
+        viewport.z_origin_term,
+        viewport.z_bottom_term,
         screen.y,
-        adjust_for_z,
+        adjust_for_z(command.world.z, viewport.adjust_for_z_multiplier)?,
     );
-    if !z_passes(candidate, z_word) {
-        return Ok(PointResolution::Rejected(PointRejectReason::ZTest));
-    }
-
     let Some((current, next)) = select_color_pair(command, color_list) else {
-        return Ok(PointResolution::Rejected(
+        return Ok(SparkPointPreparation::Rejected(
             PointRejectReason::InvalidColorIndex,
         ));
     };
-    let interpolated = interpolate_rgb(current, next, command.color_accumulator)?;
-    let modulated = modulate_rgb(interpolated, a_word);
-    let packed_value = pack_rgb(modulated, frame.pixel_format);
-    let byte_width = if frame.pixel_format.destination_bytes_per_pixel == 2 {
-        2
-    } else {
-        1
-    };
-
-    Ok(PointResolution::Write(PackedPointWrite {
-        screen,
-        packed_value,
-        byte_width,
-        draw_ordinal: command.draw_ordinal,
-    }))
+    Ok(SparkPointPreparation::Ready {
+        point: PreparedSparkPoint {
+            screen,
+            candidate_z,
+            rgb: interpolate_rgb(current, next, command.color_accumulator)?,
+        },
+    })
 }
 
 pub fn project_spark_point(
     world: IVec3,
-    frame: TacticalCompatFrame<'_>,
+    frame: TacticalPointViewport,
 ) -> Result<IVec2, TacticalCompatError> {
     let (planar_x, planar_y) = project_native_planar(world.x, world.y);
     let z_adjustment = adjust_for_z(world.z, frame.adjust_for_z_multiplier)?;
@@ -243,11 +186,6 @@ pub fn z_candidate(origin_term: i16, bottom_term: i16, screen_y: i32, adjust_for
         .wrapping_sub(PARTICLE_Z_BIAS)
 }
 
-pub const fn z_passes(candidate: i32, stored: u16) -> bool {
-    candidate < stored as i32
-}
-
-#[cfg(test)]
 fn select_color_pair(
     command: SparkPointCommand,
     color_list: &[[u8; 3]],
@@ -293,18 +231,6 @@ fn interpolate_channel(
     Ok(X87Chop53::ftol_i64(X87Chop53::add(next_term, current_term))? as i32)
 }
 
-pub fn modulate_rgb(rgb: [i32; 3], a_word: u16) -> [i32; 3] {
-    if a_word >= A_PASSTHROUGH_THRESHOLD {
-        return rgb;
-    }
-    let a = a_word as i32;
-    [
-        rgb[0].wrapping_mul(a) >> 7,
-        rgb[1].wrapping_mul(a) >> 7,
-        rgb[2].wrapping_mul(a) >> 7,
-    ]
-}
-
 pub fn pack_rgb(rgb: [i32; 3], format: DirectDrawPixelFormat) -> u16 {
     pack_channel(rgb[0], format.red_loss, format.red_shift)
         | pack_channel(rgb[1], format.green_loss, format.green_shift)
@@ -316,35 +242,14 @@ fn pack_channel(channel: i32, loss: u32, shift: u32) -> u16 {
     (reduced.wrapping_shl(shift & 31) as u32 & 0xffff) as u16
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_render_s_z))]
 mod tests {
     use super::*;
 
     const ZERO_MULTIPLIER: NativeF64Bits = NativeF64Bits::POSITIVE_ZERO;
-    const SYNTHETIC_565: DirectDrawPixelFormat = DirectDrawPixelFormat {
-        red_loss: 3,
-        red_shift: 11,
-        green_loss: 2,
-        green_shift: 5,
-        blue_loss: 3,
-        blue_shift: 0,
-        destination_bytes_per_pixel: 2,
-    };
 
-    fn plane(words: &[u16], width: usize, height: usize) -> WordPlane<'_> {
-        WordPlane {
-            words,
-            width,
-            height,
-            pitch_words: width,
-            row_origin: 0,
-        }
-    }
-
-    fn frame<'a>(a_words: &'a [u16], z_words: &'a [u16]) -> TacticalCompatFrame<'a> {
-        TacticalCompatFrame {
-            a_plane: plane(a_words, 64, 64),
-            z_plane: plane(z_words, 64, 64),
+    fn viewport() -> TacticalPointViewport {
+        TacticalPointViewport {
             clip: TacticalRect {
                 left: 0,
                 top: 0,
@@ -357,7 +262,6 @@ mod tests {
             adjust_for_z_multiplier: ZERO_MULTIPLIER,
             z_origin_term: 0,
             z_bottom_term: 100,
-            pixel_format: SYNTHETIC_565,
         }
     }
 
@@ -378,33 +282,13 @@ mod tests {
     }
 
     #[test]
-    fn verified_rgb565_and_rgb555_layouts_pack_expected_masks() {
-        use crate::render::native_surface_format::{RGB555, RGB565};
-
-        assert_eq!(pack_rgb([255, 255, 255], RGB565), 0xffff);
-        assert_eq!(pack_rgb([255, 0, 0], RGB565), 0xf800);
-        assert_eq!(pack_rgb([0, 255, 0], RGB565), 0x07e0);
-        assert_eq!(pack_rgb([0, 0, 255], RGB565), 0x001f);
-        assert_eq!(pack_rgb([255, 255, 0], RGB565), 0xffe0);
-
-        assert_eq!(pack_rgb([255, 255, 255], RGB555), 0x7fff);
-        assert_eq!(pack_rgb([255, 0, 0], RGB555), 0x7c00);
-        assert_eq!(pack_rgb([0, 255, 0], RGB555), 0x03e0);
-        assert_eq!(pack_rgb([0, 0, 255], RGB555), 0x001f);
-        assert_eq!(pack_rgb([255, 255, 0], RGB555), 0x7fe0);
-    }
-
-    #[test]
     fn projection_matches_verified_signed_fixtures() {
-        let a = vec![127; 64 * 64];
-        let z = vec![u16::MAX; 64 * 64];
-        let frame = frame(&a, &z);
         assert_eq!(
-            project_spark_point(IVec3::new(256, 0, 0), frame).unwrap(),
+            project_spark_point(IVec3::new(256, 0, 0), viewport()).unwrap(),
             IVec2::new(30, 15),
         );
         assert_eq!(
-            project_spark_point(IVec3::new(-1, 0, 0), frame).unwrap(),
+            project_spark_point(IVec3::new(-1, 0, 0), viewport()).unwrap(),
             IVec2::new(0, 0),
         );
     }
@@ -425,58 +309,23 @@ mod tests {
 
     #[test]
     fn projection_preserves_native_wrap_before_each_half_term() {
-        let a = vec![127; 64 * 64];
-        let z = vec![u16::MAX; 64 * 64];
-        let frame = frame(&a, &z);
         assert_eq!(
-            project_spark_point(IVec3::new(50_000_000, 0, 0), frame).unwrap(),
+            project_spark_point(IVec3::new(50_000_000, 0, 0), viewport()).unwrap(),
             IVec2::new(-2_529_233, 2_929_687),
         );
         assert_eq!(
-            project_spark_point(IVec3::new(i32::MAX, 1, 0), frame).unwrap(),
+            project_spark_point(IVec3::new(i32::MAX, 1, 0), viewport()).unwrap(),
             IVec2::ZERO,
         );
     }
 
     #[test]
-    fn clip_is_inclusive_left_top_and_exclusive_right_bottom() {
-        let clip = TacticalRect {
-            left: 10,
-            top: 20,
-            width: 4,
-            height: 3,
-        };
-        assert!(clip.contains(IVec2::new(10, 20)));
-        assert!(clip.contains(IVec2::new(13, 22)));
-        assert!(!clip.contains(IVec2::new(14, 22)));
-        assert!(!clip.contains(IVec2::new(13, 23)));
-        assert!(!clip.contains(IVec2::new(9, 20)));
-        assert!(!clip.contains(IVec2::new(10, 19)));
-    }
-
-    #[test]
-    fn complete_a_word_threshold_domain_matches_native_discontinuity() {
-        let rgb = [80, 255, 255];
-        assert_eq!(modulate_rgb(rgb, 1), [0, 1, 1]);
-        assert_eq!(modulate_rgb(rgb, 126), [78, 251, 251]);
-        assert_eq!(modulate_rgb(rgb, 127), rgb);
-        assert_eq!(modulate_rgb(rgb, 128), rgb);
-        assert_eq!(modulate_rgb(rgb, 65_535), rgb);
-        assert_eq!(modulate_rgb([-1, -128, 255], 1), [-1, -1, 1]);
-    }
-
-    #[test]
-    fn z_uses_wrapped_u16_base_and_strict_signed_comparison() {
+    fn z_candidate_uses_wrapped_u16_base() {
         let candidate = z_candidate(i16::MAX, i16::MAX, -10, 0);
         let expected_base = (i32::from(i16::MAX)
             .wrapping_add(i32::from(i16::MAX))
             .wrapping_sub(-10) as u16) as i32;
         assert_eq!(candidate, expected_base - 50);
-        assert!(!z_passes(100, 99));
-        assert!(!z_passes(100, 100));
-        assert!(z_passes(100, 101));
-        assert!(z_passes(-1, 0));
-        assert!(!z_passes(65_536, u16::MAX));
     }
 
     #[test]
@@ -511,44 +360,7 @@ mod tests {
     }
 
     #[test]
-    fn resolver_reads_a_then_z_and_preserves_z_and_ordinal() {
-        let mut a = vec![127; 64 * 64];
-        let mut z = vec![u16::MAX; 64 * 64];
-        let point = IVec2::new(30, 15);
-        let index = point.y as usize * 64 + point.x as usize;
-        a[index] = 127;
-        z[index] = u16::MAX;
-        let z_before = z.clone();
-        let colors = [[0, 128, 255], [255, 255, 255]];
-        let result =
-            resolve_spark_point(command(IVec3::new(256, 0, 0)), &colors, frame(&a, &z)).unwrap();
-        assert_eq!(
-            result,
-            PointResolution::Write(PackedPointWrite {
-                screen: point,
-                packed_value: 0x57ff,
-                byte_width: 2,
-                draw_ordinal: 42,
-            }),
-        );
-        assert_eq!(z, z_before);
-    }
-
-    #[test]
-    fn zero_a_rejects_before_color_and_no_runtime_default_is_needed() {
-        let a = vec![0; 64 * 64];
-        let z = vec![u16::MAX; 64 * 64];
-        let invalid_colors: [[u8; 3]; 0] = [];
-        assert_eq!(
-            resolve_spark_point(command(IVec3::ZERO), &invalid_colors, frame(&a, &z)).unwrap(),
-            PointResolution::Rejected(PointRejectReason::AZero),
-        );
-    }
-
-    #[test]
     fn gate_order_and_damage_override_are_explicit() {
-        let a = vec![127; 64 * 64];
-        let z = vec![u16::MAX; 64 * 64];
         let colors = [[0, 0, 0], [255, 255, 255]];
         let base = command(IVec3::ZERO);
 
@@ -560,8 +372,8 @@ mod tests {
             ..base
         };
         assert_eq!(
-            resolve_spark_point(performance, &colors, frame(&a, &z)).unwrap(),
-            PointResolution::Rejected(PointRejectReason::Performance),
+            prepare_spark_point(performance, &colors, viewport()).unwrap(),
+            SparkPointPreparation::Rejected(PointRejectReason::Performance),
         );
 
         let detail = SparkPointCommand {
@@ -574,26 +386,12 @@ mod tests {
             ..base
         };
         assert_eq!(
-            resolve_spark_point(detail, &colors, frame(&a, &z)).unwrap(),
-            PointResolution::Rejected(PointRejectReason::ExtraAnimations),
+            prepare_spark_point(detail, &colors, viewport()).unwrap(),
+            SparkPointPreparation::Rejected(PointRejectReason::ExtraAnimations),
         );
     }
-
-    #[test]
-    fn non_two_byte_destination_contract_keeps_only_one_output_byte() {
-        let mut format = SYNTHETIC_565;
-        format.destination_bytes_per_pixel = 4;
-        let a = vec![127; 64 * 64];
-        let z = vec![u16::MAX; 64 * 64];
-        let colors = [[0, 0, 0], [255, 255, 255]];
-        let mut frame = frame(&a, &z);
-        frame.pixel_format = format;
-        let PointResolution::Write(write) =
-            resolve_spark_point(command(IVec3::ZERO), &colors, frame).unwrap()
-        else {
-            panic!("passing point must resolve to a write");
-        };
-        assert_eq!(write.byte_width, 1);
-        assert_eq!(write.packed_value as u8, 0xff);
-    }
 }
+
+#[cfg(test)] // shared by test groups
+#[path = "tactical_compat_welding_tests.rs"]
+pub(crate) mod welding_tests;

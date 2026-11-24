@@ -26,6 +26,12 @@
 //! `0x3FC25E5374344960`; the shared native-x87 substrate owns that value and
 //! the 53-bit, truncate-toward-zero operation order.
 //!
+//! Buildings take that native conversion on every terrain level, as gamemd
+//! draws them. The `[graphics] high_terrain_building_lift` option aligns them
+//! to the terrain's 15px levels from level 15 up instead; one switch,
+//! [`building_terrain_correction`], serves their live, attached animation,
+//! placement, bracket and fogged drawing paths.
+//!
 //! ### What this replaced
 //!
 //! Until this landed the lift was applied in two layers — the air movement pass
@@ -55,20 +61,86 @@
 //! - Part of render/ — reads sim/ state read-only and writes none of it.
 //! - sim/ NEVER depends on render/, so nothing here may be called from sim/.
 
-use crate::sim::game_entity::GameEntity;
+use crate::map::entities::EntityCategory;
+use crate::sim::components::Position;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-fn adjust_for_z_lift_px(leptons: i32) -> f32 {
-    crate::util::native_x87::adjust_for_z_standard(leptons) as f32
+/// What placing an object on the screen reads of it: a live object, or its
+/// record in the presentation frame (`app::presentation::frame`).
+pub trait Placed {
+    fn placed_position(&self) -> &Position;
+    fn placed_category(&self) -> EntityCategory;
 }
 
-/// Total upward screen lift for an entity, in pixels.
+impl Placed for crate::sim::game_entity::GameEntity {
+    fn placed_position(&self) -> &Position {
+        &self.position
+    }
+
+    fn placed_category(&self) -> EntityCategory {
+        self.category()
+    }
+}
+
+/// `[graphics] high_terrain_building_lift`, set once at startup from the
+/// loaded config ([`set_high_terrain_building_lift`]). Presentation only:
+/// the simulation never reads it. A copy of the config option in a global
+/// because its readers, [`building_terrain_correction`]'s callers (the
+/// building, overlay, fogged, placement-preview and selection-bracket draws
+/// and this module's own placed-object offsets), are handed entities and
+/// cells, not the config; an atomic because a `static` must be `Sync`.
+static HIGH_TERRAIN_BUILDING_LIFT: AtomicBool = AtomicBool::new(false);
+
+/// Installs the player's `high_terrain_building_lift` choice.
+pub(crate) fn set_high_terrain_building_lift(on: bool) {
+    HIGH_TERRAIN_BUILDING_LIFT.store(on, Ordering::Relaxed);
+}
+
+/// Extra upward shift of a building on terrain `level`, in pixels: 0 as
+/// gamemd draws it, or [`vera_building_terrain_lift`] when the player turns
+/// on `high_terrain_building_lift`.
+pub(crate) fn building_terrain_correction(level: i32) -> i32 {
+    if HIGH_TERRAIN_BUILDING_LIFT.load(Ordering::Relaxed) {
+        vera_building_terrain_lift(level)
+    } else {
+        0
+    }
+}
+
+/// VERA-only: how far a building on terrain `level` sits below its tile row.
+/// gamemd lifts a building by Tactical::AdjustForZ @ 0x006D20E0 alone
+/// (BuildingClass draw `0x0043D83E`, `0x0043E900`; FoggedObject `0x004D1E5B`).
+/// Its scale agrees with 15px terrain levels through level 14 but gives 538px
+/// instead of 540px at level 36, so from level 15 up the body sits 1-2 px
+/// lower and the tiles' depth hides that sliver. Exact-Z offsets and the
+/// simulation are unchanged either way.
+fn vera_building_terrain_lift(level: i32) -> i32 {
+    if !(15..=i32::from(i8::MAX)).contains(&level) {
+        return 0;
+    }
+    level * crate::render::native_z::HEIGHT_LEVEL_PX
+        - crate::util::native_x87::adjust_for_z_standard(
+            level * crate::util::lepton::GROUND_LEVEL_HEIGHT_LEPTONS,
+        )
+}
+
+fn entity_terrain_correction(entity: &(impl Placed + ?Sized)) -> i32 {
+    if entity.placed_category() == EntityCategory::Structure {
+        building_terrain_correction(i32::from(entity.placed_position().z() as i8))
+    } else {
+        0
+    }
+}
+
+/// Upward screen lift of an entity's exact Location Z, in pixels.
 ///
 /// Positive lifts the entity toward the top of the screen (screen Y decreases).
 ///
-/// An exact object coordinate is total world Z and therefore replaces every
-/// decomposed height source below, including the coarse terrain level.
+/// The exact Z is total world Z, the terrain level included. An object
+/// without one already projects its stored level; only the optional
+/// high-terrain building correction is added here.
 ///
-/// The height term reproduces gamemd's `AdjustForZ` exactly, quantisation
+/// The native height term reproduces gamemd's `AdjustForZ` exactly, quantisation
 /// included: the startup scale, the 728-lepton correction, and the `+ 0.5`
 /// truncate that rounds it to a whole pixel. The engine's own
 /// blitter is integer-pixel, so a climbing aircraft steps a pixel at a time
@@ -78,13 +150,16 @@ fn adjust_for_z_lift_px(leptons: i32) -> f32 {
 /// delegates to virtual `GetCoords`; the InfantryClass receiver reaches
 /// `ObjectClass__GetCoords` at `0x005F65A0`, which copies exact XYZ and adds no
 /// walking sine bob. Grounded objects therefore have zero additional lift.
-pub fn height_lift_px(entity: &GameEntity) -> f32 {
-    if let Some(exact_z_leptons) = entity.position.exact_z_leptons {
-        return adjust_for_z_lift_px(exact_z_leptons);
-    }
-    adjust_for_z_lift_px(crate::sim::movement::ground_pose::object_altitude_leptons(
-        entity,
-    ))
+pub fn height_lift_px(entity: &(impl Placed + ?Sized)) -> f32 {
+    let z = entity.placed_position().exact_z_leptons().unwrap_or(0);
+    // Standard AdjustForZ(0) is exactly 0, including its +0.5/chop. This
+    // common ground-level case need not enter the x87 evaluator.
+    let lift = if z == 0 {
+        0
+    } else {
+        crate::util::native_x87::adjust_for_z_standard(z)
+    };
+    (lift + entity_terrain_correction(entity)) as f32
 }
 
 /// Where this entity is drawn, in world-space screen pixels.
@@ -95,30 +170,83 @@ pub fn height_lift_px(entity: &GameEntity) -> f32 {
 ///
 /// A building's *art* is the single exception, and it is a strict addition on
 /// top of this answer rather than a second one: see [`building_art_anchor`].
-pub fn screen_position(entity: &GameEntity) -> (f32, f32) {
-    let (sx, sy) = if entity.position.exact_z_leptons.is_some() {
-        z_free_screen_position(&entity.position)
+pub fn screen_position(entity: &(impl Placed + ?Sized)) -> (f32, f32) {
+    let (sx, sy) = if entity.placed_position().exact_z_leptons().is_some() {
+        z_free_screen_position(entity.placed_position())
     } else {
-        ground_screen_position(&entity.position)
+        ground_screen_position(entity.placed_position())
     };
     (sx, sy - height_lift_px(entity))
 }
 
-/// The whole upward lift [`screen_position`] draws `entity` with, in pixels:
-/// `AdjustForZ` of its exact Location Z, or of its stored level plus
-/// [`height_lift_px`]. A draw that cancels its lift for depth or per-pixel Z
-/// cancels this, as the building draw's `NormalZAdjust - AdjustForZ(Z)` seed
-/// does (`BuildingClass_DrawBody`).
-pub fn screen_lift_px(entity: &GameEntity) -> i32 {
-    match entity.position.exact_z_leptons {
-        Some(z) => crate::util::native_x87::adjust_for_z_standard(z),
-        None => {
-            crate::util::native_x87::adjust_for_z_standard(
-                i32::from(entity.position.z as i8)
-                    * crate::util::lepton::GROUND_LEVEL_HEIGHT_LEPTONS,
-            ) + height_lift_px(entity) as i32
-        }
+/// [`screen_position`] of `entity`'s coordinate moved `distance` leptons along
+/// `facing`, at the same Z: the full-direction step Walk and Fly take
+/// ([`crate::util::native_trig::facing_step_world_xy`]), then the same
+/// projection.
+pub fn facing_step_screen_position(
+    entity: &(impl Placed + ?Sized),
+    facing: u16,
+    distance: i32,
+) -> (f32, f32) {
+    let location = crate::sim::movement::ground_pose::position_world_xy(entity.placed_position());
+    let [x, y] = crate::util::native_trig::facing_step_world_xy(location, facing, distance);
+    let z = entity
+        .placed_position()
+        .exact_z_leptons()
+        .unwrap_or_else(|| {
+            i32::from(entity.placed_position().z() as i8)
+                * crate::util::lepton::GROUND_LEVEL_HEIGHT_LEPTONS
+        });
+    let (sx, sy) = crate::util::lepton::absolute_leptons_to_screen(x, y, z);
+    (sx, sy - entity_terrain_correction(entity) as f32)
+}
+
+/// Fly Draw_Point4CF830 returns X0 and this screen-row delta. It is separate
+/// from physical XYZ projection; Aircraft414613 and Foot4DAF6D each add it.
+///
+/// `no_wobbles` is the value original 4CF8B1 branches on. Retail reads
+/// `TechnoType+C95` (`IsDropship`) there; a Phobos build feeds the resolved
+/// `FlyNoWobbles` value instead, so the flag and not the type field decides.
+pub(crate) fn fly_draw_point_y(
+    frame: u32,
+    no_wobbles: bool,
+    taking_off: bool,
+    landing: bool,
+    height: i32,
+    landing_base: i32,
+) -> i32 {
+    if no_wobbles || taking_off || landing || height <= landing_base {
+        return 0;
     }
+    use crate::util::native_x87::{NativeF64Bits, X87Chop53 as X};
+    //4CF8D8 uses signed IDIV20; the qword argument store precedes table sine.
+    let angle = X::mul(
+        X::load_i32((frame as i32) % 20),
+        X::load_f64(NativeF64Bits::from_bits(0x3fd4_1b2f_769c_f0e0)).unwrap(),
+    );
+    let angle = X::load_f64(X::store_f64(angle).unwrap()).unwrap();
+    let sine = crate::util::retail_trig::TrigTable::embedded().sin_from_table(angle);
+    let scaled = X::mul(
+        sine,
+        X::load_f64(NativeF64Bits::from_bits(0x3ff8_0000_0000_0000)).unwrap(),
+    );
+    X::ftol_i32_low_masked(X::add(scaled, X::load_f64(NativeF64Bits::HALF).unwrap()))
+}
+
+/// The whole upward lift [`screen_position`] draws `entity` with, in pixels:
+/// `AdjustForZ` of its exact Location Z, or of its stored level. A draw that
+/// cancels its lift for depth or per-pixel Z
+/// cancels this, including the high-terrain correction, as the building
+/// draw's `NormalZAdjust - AdjustForZ(Z)` seed does (`BuildingClass_DrawBody`).
+pub fn screen_lift_px(entity: &(impl Placed + ?Sized)) -> i32 {
+    let native = match entity.placed_position().exact_z_leptons() {
+        Some(z) => crate::util::native_x87::adjust_for_z_standard(z),
+        None => crate::util::native_x87::adjust_for_z_standard(
+            i32::from(entity.placed_position().z() as i8)
+                * crate::util::lepton::GROUND_LEVEL_HEIGHT_LEPTONS,
+        ),
+    };
+    native + entity_terrain_correction(entity)
 }
 
 /// How far up a building's art sits from the entity anchor, in screen pixels.
@@ -149,8 +277,8 @@ pub const BUILDING_ART_LIFT_PX: f32 = crate::map::terrain::TILE_HEIGHT / 2.0;
 
 /// A building's art anchor, given its plain entity anchor.
 ///
-/// One owner for [`BUILDING_ART_LIFT_PX`] so the placement ghost and the
-/// building it previews cannot drift apart.
+/// One owner for [`BUILDING_ART_LIFT_PX`] so every draw of a building's art
+/// lands on the same point.
 pub fn building_art_anchor(sx: f32, sy: f32) -> (f32, f32) {
     (sx, sy - BUILDING_ART_LIFT_PX)
 }
@@ -161,11 +289,11 @@ pub fn building_art_anchor(sx: f32, sy: f32) -> (f32, f32) {
 /// on the entity itself, and for entities that have no height state at all.
 pub fn ground_screen_position(position: &crate::sim::components::Position) -> (f32, f32) {
     crate::util::lepton::lepton_to_screen(
-        position.rx,
-        position.ry,
-        position.sub_x,
-        position.sub_y,
-        position.z,
+        position.rx(),
+        position.ry(),
+        position.sub_x(),
+        position.sub_y(),
+        position.z(),
     )
 }
 
@@ -177,413 +305,98 @@ pub fn ground_screen_position(position: &crate::sim::components::Position) -> (f
 /// adding [`height_lift_px`] back to the drawn row.
 fn z_free_screen_position(position: &crate::sim::components::Position) -> (f32, f32) {
     crate::util::lepton::lepton_to_screen(
-        position.rx,
-        position.ry,
-        position.sub_x,
-        position.sub_y,
+        position.rx(),
+        position.ry(),
+        position.sub_x(),
+        position.sub_y(),
         0,
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_render_a_r))]
 mod tests {
     use super::*;
     use crate::map::entities::EntityCategory;
-    use crate::rules::locomotor_type::LocomotorKind;
-    use crate::sim::movement::locomotor::LocomotorState;
-    use crate::sim::movement::locomotor::MovementLayer;
-    use crate::util::fixed_math::SimFixed;
+    use crate::sim::game_entity::GameEntity;
 
-    fn air_unit(kind: LocomotorKind, altitude: i32) -> GameEntity {
-        let mut entity = GameEntity::test_default(1, "BEAG", "Americans", 5, 5);
-        entity.category = EntityCategory::Aircraft;
-        let mut loco = LocomotorState::for_test_kind(kind);
-        loco.layer = MovementLayer::Air;
-        loco.altitude = SimFixed::from_num(altitude);
-        entity.locomotor = Some(loco);
-        entity
-    }
-
-    /// The whole reason this half-tile keeps going wrong, pinned on one cell.
-    ///
-    /// Three layers share cell (10, 4) at ground level, and gamemd puts them in
-    /// exactly this relation:
-    ///
-    /// ```text
-    ///   layer                    row              relative to the tile box top
-    ///   terrain tile / overlay   box top-left     (0, 0)
-    ///   unit / infantry / anim   diamond centre   (+30, +15)
-    ///   building art             box top edge     (+30,   0)
-    /// ```
-    ///
-    /// A unit stands in the *middle* of its tile; a building's art starts on the
-    /// same row the tile art does. Get either wrong and every unit on the map is
-    /// drawn half a tile off the ground it walks on — which is what this pins
-    /// against. The absolute numbers carry VERA's constant world-row bias (see
-    /// `util::lepton::WORLD_ROW_BIAS_PX`); the *relation* is what matters and is
-    /// what a player sees.
+    /// gamemd lifts a building by AdjustForZ alone on every terrain level
+    /// (`0x0043D83E`), which from level 15 up leaves its art below its tile
+    /// row; `high_terrain_building_lift` closes that gap.
     #[test]
-    fn the_three_world_layers_sit_where_gamemd_puts_them() {
-        use crate::map::terrain::{self, TILE_HEIGHT, TILE_WIDTH};
-
-        const RX: u16 = 10;
-        const RY: u16 = 4;
-
-        let (box_x, box_y) = terrain::iso_to_screen(RX, RY, 0);
-        assert_eq!((box_x, box_y), (150.0, 225.0), "tile bounding-box top-left");
-
-        let unit = GameEntity::test_default(1, "MTNK", "Americans", RX, RY);
-        let (unit_x, unit_y) = screen_position(&unit);
-        assert_eq!(
-            (unit_x - box_x, unit_y - box_y),
-            (TILE_WIDTH / 2.0, TILE_HEIGHT / 2.0),
-            "a unit stands on its cell's diamond centre, not the box top"
+    fn high_terrain_building_takes_the_native_lift_unless_lifted() {
+        let mut building = GameEntity::test_default_of_category(
+            1,
+            "GASPYSAT",
+            "Neutral",
+            189,
+            258,
+            EntityCategory::Structure,
         );
-
-        let (art_x, art_y) = building_art_anchor(unit_x, unit_y);
-        assert_eq!(
-            (art_x - box_x, art_y - box_y),
-            (TILE_WIDTH / 2.0, 0.0),
-            "a building's art anchor drops back onto the tile row — and the \
-             half-cell shift is Y-only, so X must not move"
-        );
-        assert_eq!(art_x, unit_x, "the building shift has no X term");
-    }
-
-    #[test]
-    fn a_grounded_unit_draws_at_its_projection() {
-        let entity = GameEntity::test_default(1, "MTNK", "Americans", 5, 5);
-        assert_eq!(
-            screen_position(&entity),
-            ground_screen_position(&entity.position),
-            "nothing is holding this unit up, so nothing may lift it"
-        );
-    }
-
-    /// The whole point of the module: one owner, so the lift cannot be applied
-    /// twice. At YR's stock `FlightLevel=1500`, the native multiplier lifts a
-    /// cruising aircraft by 216px, including the threshold correction.
-    #[test]
-    fn adjust_for_z_cruising_aircraft_sits_at_gamemds_height() {
-        let entity = air_unit(LocomotorKind::Fly, 1500);
-        let (_, ground_sy) = ground_screen_position(&entity.position);
-        let (_, sy) = screen_position(&entity);
-        assert_eq!(ground_sy - sy, 216.0);
-    }
-
-    /// Every kind of height goes through one scale. A parachute and an aircraft
-    /// at the same altitude must be drawn at the same place — before this they
-    /// differed by a factor of two.
-    #[test]
-    fn every_height_source_uses_the_same_scale() {
-        use crate::sim::entity_store::EntityStore;
-        use crate::sim::movement::parachute_descent::begin_parachute_descent;
-
-        let aircraft = air_unit(LocomotorKind::Fly, 400);
-
-        let mut entities = EntityStore::default();
-        let mut infantry = GameEntity::test_default(1, "E1", "Americans", 5, 5);
-        infantry.category = EntityCategory::Infantry;
-        entities.insert(infantry);
-        assert!(begin_parachute_descent(&mut entities, 1, 400));
-
-        assert_eq!(
-            height_lift_px(&aircraft),
-            height_lift_px(entities.get(1).expect("entity")),
-        );
-    }
-
-    /// The extra pixel above the threshold is gamemd's, not ours: one lepton
-    /// either side of 728 must differ by more than the scale alone accounts for.
-    #[test]
-    fn adjust_for_z_extra_pixel_switches_on_at_the_threshold() {
-        let below = height_lift_px(&air_unit(LocomotorKind::Fly, 727));
-        let at = height_lift_px(&air_unit(LocomotorKind::Fly, 728));
-        assert_eq!(below, 104.0, "trunc(727 * k + 0.5)");
-        assert_eq!(at, 105.0, "trunc(728 * k + 1 + 0.5) — the threshold fires");
-    }
-
-    #[test]
-    fn adjust_for_z_exact_signed_z_ignores_coarse_level_and_locomotor_altitude() {
-        let mut entity = air_unit(LocomotorKind::Fly, 1500);
-        entity.position.z = 9;
-        entity.position.exact_z_leptons = Some(-400);
-
-        let z_free = z_free_screen_position(&entity.position);
-        let drawn = screen_position(&entity);
-        assert_eq!(height_lift_px(&entity), -56.0);
-        assert_eq!(drawn, (z_free.0, z_free.1 + 56.0));
-        assert_eq!(drawn.1 + height_lift_px(&entity), z_free.1);
-    }
-
-    #[test]
-    fn gsi_04_15_exact_z_threshold_bonus_starts_at_728() {
-        let mut entity = GameEntity::test_default(1, "MTNK", "Americans", 5, 5);
-        entity.position.exact_z_leptons = Some(727);
-        assert_eq!(height_lift_px(&entity), 104.0);
-
-        entity.position.exact_z_leptons = Some(728);
-        assert_eq!(height_lift_px(&entity), 105.0);
-    }
-
-    #[test]
-    fn gsi_13_02_building_lift_and_adjust_for_z_remain_separate_exact_steps() {
-        let mut entity = GameEntity::test_default(1, "GAPOWR", "Americans", 5, 5);
-        entity.category = EntityCategory::Structure;
-        entity.position.exact_z_leptons = Some(728);
-
-        let z_free = z_free_screen_position(&entity.position);
-        let drawn = screen_position(&entity);
-        assert_eq!(drawn, (z_free.0, z_free.1 - 105.0));
-        assert_eq!(
-            building_art_anchor(drawn.0, drawn.1),
-            (drawn.0, drawn.1 - 15.0),
-        );
-    }
-
-    #[test]
-    fn height_does_not_move_an_entity_sideways() {
-        let entity = air_unit(LocomotorKind::Jumpjet, 900);
-        assert_eq!(
-            screen_position(&entity).0,
-            ground_screen_position(&entity.position).0,
-            "the lift is vertical only"
-        );
-    }
-
-    /// A ground locomotor's altitude is not a height source. Only the air layer
-    /// lifts, which is what keeps a deployed or docked unit on the floor.
-    #[test]
-    fn a_ground_layer_locomotor_never_lifts() {
-        let mut entity = air_unit(LocomotorKind::Drive, 1500);
-        entity.category = EntityCategory::Unit;
-        if let Some(loco) = entity.locomotor.as_mut() {
-            loco.layer = MovementLayer::Ground;
+        for (level, exact_z) in [(14, Some(1456)), (36, Some(3744)), (36, None)] {
+            building.position.set_z_for_test(level);
+            building.position.set_exact_z_leptons_for_test(exact_z);
+            let (x, y) = screen_position(&building);
+            let lift = screen_lift_px(&building);
+            assert_eq!(
+                lift,
+                crate::util::native_x87::adjust_for_z_standard(
+                    i32::from(level) * crate::util::lepton::GROUND_LEVEL_HEIGHT_LEPTONS
+                )
+            );
+            assert_eq!(
+                y + lift as f32,
+                z_free_screen_position(&building.position).1
+            );
+            let lifted = y - vera_building_terrain_lift(i32::from(level)) as f32;
+            let (tile_x, tile_y) = crate::map::terrain::iso_to_screen(189, 258, level);
+            assert_eq!(building_art_anchor(x, lifted), (tile_x + 30.0, tile_y));
         }
-        assert_eq!(
-            screen_position(&entity),
-            ground_screen_position(&entity.position),
-        );
-    }
-
-    /// A falling object is drawn at its Location Z, whatever altitude its
-    /// locomotor holds.
-    #[test]
-    fn a_falling_object_is_drawn_at_its_location_z() {
-        use crate::sim::entity_store::EntityStore;
-        use crate::sim::movement::parachute_descent::begin_parachute_descent;
-
-        let mut entities = EntityStore::default();
-        let mut entity = air_unit(LocomotorKind::Jumpjet, 1500);
-        entity.category = EntityCategory::Infantry;
-        entities.insert(entity);
-        assert!(begin_parachute_descent(&mut entities, 1, 400));
-        let entity = entities.get(1).expect("entity");
-
-        let (_, ground_sy) = ground_screen_position(&entity.position);
-        let (_, sy) = screen_position(&entity);
-        // The fall's 400 leptons, not the locomotor's 1500, and below the
-        // extra-pixel threshold.
-        assert_eq!(
-            ground_sy - sy,
-            57.0,
-            "the Location Z must be the only height source"
-        );
     }
 
     #[test]
-    fn gsi_13_02_grounded_infantry_anchor_is_its_ground_position() {
-        let mut entity = GameEntity::test_default(1, "E1", "Americans", 5, 5);
-        entity.category = EntityCategory::Infantry;
-        entity.locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Walk));
-        // ObjectClass::GetCoords returns exact XYZ.
-        assert_eq!(
-            screen_position(&entity),
-            ground_screen_position(&entity.position)
-        );
-    }
-
-    /// The slice's exit criterion, and the thing that keeps it from growing
-    /// back: no file under `sim/` may assign a screen coordinate. Screen
-    /// placement is derived here, so a write over there is by definition a
-    /// second owner — which is how the height lift came to be applied twice.
-    ///
-    /// Deliberately NOT asserted: that `sim/` holds no `f32` at all. Legacy
-    /// locomotor phase state may remain without becoming a render-coordinate
-    /// offset; removing that state is outside this projection slice.
-    #[test]
-    fn sim_writes_no_screen_coordinates() {
-        fn walk(dir: &std::path::Path, out: &mut Vec<(String, usize, String)>) {
-            for entry in std::fs::read_dir(dir).expect("readable") {
-                let path = entry.expect("entry").path();
-                if path.is_dir() {
-                    walk(&path, out);
-                } else if path.extension().is_some_and(|e| e == "rs") {
-                    let text = std::fs::read_to_string(&path).expect("utf-8 source");
-                    for (i, line) in text.lines().enumerate() {
-                        if is_screen_coord_write(line) {
-                            out.push((path.display().to_string(), i + 1, line.trim().to_string()));
-                        }
-                    }
-                }
-            }
+    fn fly_draw_point_matches_original_signed_frames_and_phase_gates() {
+        let ordinary = [0, 0, 1, 1, 1, 2, 1, 1, 1, 0, 0, 0, 0, 0, 0, -1, 0, 0, 0, 0];
+        for (frame, expected) in ordinary.into_iter().enumerate() {
+            assert_eq!(
+                fly_draw_point_y(frame as u32, false, false, false, 60, 0),
+                expected
+            );
         }
-
-        let sim = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/sim");
-        let mut writes = Vec::new();
-        walk(&sim, &mut writes);
-        assert!(
-            writes.is_empty(),
-            "sim/ must not assign screen coordinates — that is \
-             render::locomotor_visual's job. Found:\n{}",
-            writes
-                .iter()
-                .map(|(f, l, t)| format!("  {f}:{l}: {t}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-    }
-
-    #[test]
-    fn the_guard_recognises_a_write_when_it_sees_one() {
-        // Guards that can never fire are worse than no guard, so exercise the
-        // matcher against the shapes the old code actually used.
-        for line in [
-            "entity.position.screen_x = sx;",
-            "self.screen_y = sy;",
-            "entity.position.screen_y -= bob;",
-            "        e.position.screen_x  =  nx;",
+        // Original IDIV/table/ftol controls; negative peaks are asymmetric.
+        for (frame, expected) in [
+            (-1, 0),
+            (-5, 0),
+            (-15, 1),
+            (-19, 0),
+            (-20, 0),
+            (i32::MIN, 0),
+            (i32::MIN + 1, 0),
+            (i32::MAX, 1),
+            (0, 0),
         ] {
-            assert!(is_screen_coord_write(line), "missed: {line}");
+            assert_eq!(
+                fly_draw_point_y(frame as u32, false, false, false, 1500, 0),
+                expected
+            );
         }
-        for line in [
-            "pub screen_x: f32,",
-            "screen_x: position.screen_x + dx,",
-            "if a.screen_y == b.screen_y {",
-            "let dx = screen_x - start_x;",
-            "pub fn begin_drag(&mut self, screen_x: f32, screen_y: f32) {",
+        for (no_wobbles, takeoff, landing, height, base, expected) in [
+            (true, false, false, 1500, 0, 0),
+            (false, true, false, 1500, 0, 0),
+            (false, false, true, 1500, 0, 0),
+            (false, false, false, 0, 0, 0),
+            (false, false, false, 100, 100, 0),
+            (false, false, false, 99, 100, 0),
+            (false, false, false, 101, 100, 2),
         ] {
-            assert!(!is_screen_coord_write(line), "false hit: {line}");
+            assert_eq!(
+                fly_draw_point_y(5, no_wobbles, takeoff, landing, height, base),
+                expected
+            );
         }
     }
 
-    /// An assignment to a `screen_x`/`screen_y` binding — plain `=` or any
-    /// compound operator. A comparison is not a write, and neither is a
-    /// `screen_x:` field declaration, struct initialiser or parameter.
-    fn is_screen_coord_write(line: &str) -> bool {
-        for name in ["screen_x", "screen_y"] {
-            let mut from = 0;
-            while let Some(at) = line[from..].find(name) {
-                let after = from + at + name.len();
-                let rest = line[after..].trim_start();
-                let op = rest.trim_start_matches(['+', '-', '*', '/']);
-                if op.starts_with('=') && !op.starts_with("==") {
-                    return true;
-                }
-                from = after;
-            }
-        }
-        false
-    }
-
-    #[test]
-    fn a_vehicle_never_bobs() {
-        let mut entity = GameEntity::test_default(1, "MTNK", "Americans", 5, 5);
-        entity.category = EntityCategory::Unit;
-        entity.locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Drive));
-        assert_eq!(height_lift_px(&entity), 0.0);
-    }
     // -- F14 boundary tests: sim-side callers moved here so `sim/` never
     // names `crate::render`. Coverage preserved verbatim. --
-    use crate::map::terrain;
-    use crate::sim::components::{Health, MovementTarget};
-    use crate::sim::entity_store::EntityStore;
-    use crate::sim::intern::test_interner;
-    use crate::sim::movement::tick_movement;
-    use crate::util::fixed_math::SIM_ZERO;
-
-    #[test]
-    fn test_screen_coords_computed() {
-        let e = GameEntity::new_at_frame_zero_for_test(
-            1,
-            30,
-            40,
-            2, // z=2 for elevation
-            0,
-            crate::sim::intern::test_intern("Americans"),
-            Health { current: 100 },
-            crate::sim::intern::test_intern("HTNK"),
-            EntityCategory::Unit,
-            0,
-            5,
-            true,
-        );
-        // An entity is drawn on its cell's diamond centre, half a tile east and
-        // half a tile south of that cell's tile corner.
-        let (corner_sx, corner_sy) = terrain::iso_to_screen(30, 40, 2);
-        let (sx, sy) = crate::render::locomotor_visual::screen_position(&e);
-        assert!((sx - (corner_sx + terrain::TILE_WIDTH / 2.0)).abs() < 0.01);
-        assert!((sy - (corner_sy + terrain::TILE_HEIGHT / 2.0)).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_tick_movement_updates_screen_position() {
-        let mut entities = EntityStore::new();
-
-        let path: Vec<(u16, u16)> = vec![(5, 5), (6, 5)];
-        let mut e = GameEntity::test_default(1, "HTNK", "Americans", 5, 5);
-        e.movement_target = Some(MovementTarget {
-            path,
-            path_layers: vec![MovementLayer::Ground; 2],
-            next_index: 1,
-            speed: SimFixed::from_num(1280), // 5 cells/sec in leptons.
-            move_dir_x: SimFixed::from_num(256),
-            move_dir_y: SIM_ZERO,
-            move_dir_len: SimFixed::from_num(256),
-            ..Default::default()
-        });
-        e.body_facing.snap(0x4000, 0);
-        entities.insert(e);
-
-        let mut lifecycle_requests = Vec::new();
-        for _ in 0..3 {
-            tick_movement(&mut entities, &mut test_interner(), &mut lifecycle_requests);
-        }
-
-        let entity = entities.get(1).expect("entity exists");
-        // After moving, the unit is drawn on cell (6, 5)'s diamond centre — half a
-        // tile east and half a tile south of that cell's tile corner.
-        let (corner_sx, corner_sy): (f32, f32) = terrain::iso_to_screen(6, 5, 0);
-        let (sx, sy) = crate::render::locomotor_visual::screen_position(entity);
-        assert!((sx - (corner_sx + terrain::TILE_WIDTH / 2.0)).abs() < 1.0);
-        assert!((sy - (corner_sy + terrain::TILE_HEIGHT / 2.0)).abs() < 1.0);
-    }
-
-    /// The spawn-path variant with explicit constants (moved from the sim
-    /// spawn test): a unit at cell (30, 40, z=0) projects to
-    ///   x = 30*(30-40) = -300,  y = 15*(30+40) + 15 + 15 = 1080
-    /// (the trailing +15s are VERA's constant world-row bias and the
-    /// half-tile drop from the tile row down to the diamond centre).
-    #[test]
-    fn spawned_unit_projects_to_diamond_centre_constants() {
-        let e = GameEntity::new_at_frame_zero_for_test(
-            1,
-            30,
-            40,
-            0,
-            64,
-            crate::sim::intern::test_intern("Americans"),
-            Health { current: 100 },
-            crate::sim::intern::test_intern("HTNK"),
-            EntityCategory::Unit,
-            0,
-            5,
-            true,
-        );
-        let (sx, sy) = screen_position(&e);
-        assert!((sx - (-300.0)).abs() < 0.1);
-        assert!((sy - 1080.0).abs() < 0.1);
-    }
 
     /// A draw that cancels its lift cancels what [`screen_position`] applied:
     /// the drawn row plus [`screen_lift_px`] is the Z-free row, for a building
@@ -591,10 +404,16 @@ mod tests {
     #[test]
     fn the_cancelled_lift_is_the_drawn_lift() {
         let building = |exact_z: Option<i32>, level: u8| {
-            let mut entity = GameEntity::test_default(1, "GAPOWR", "Americans", 5, 5);
-            entity.category = EntityCategory::Structure;
-            entity.position.exact_z_leptons = exact_z;
-            entity.position.z = level;
+            let mut entity = GameEntity::test_default_of_category(
+                1,
+                "GAPOWR",
+                "Americans",
+                5,
+                5,
+                EntityCategory::Structure,
+            );
+            entity.position.set_exact_z_leptons_for_test(exact_z);
+            entity.position.set_z_for_test(level);
             entity
         };
         for entity in [building(Some(52), 0), building(None, 2)] {

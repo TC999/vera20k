@@ -9,8 +9,8 @@ use crate::sim::world::Simulation;
 use serde_json::Value;
 
 fn aim_cases() -> Vec<Value> {
-    let corpus: Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/bridge_damage_admission.json"
+    let corpus: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/bridge_damage_admission.json",
     ))
     .unwrap();
     corpus["aim_cases"].as_array().unwrap().clone()
@@ -27,7 +27,7 @@ fn expected_coord(row: &Value, key: &str) -> ProjectileCoord {
 
 #[test]
 fn cell_launch_aim_matches_original_fireat_and_bullet_fire() {
-    let entities = EntityStore::new();
+    let world = Simulation::new();
     for row in aim_cases() {
         let input = &row["input"];
         let mut cells = (0..32)
@@ -39,7 +39,7 @@ fn cell_launch_aim_matches_original_fireat_and_bullet_fire() {
         cell.bridge_facts.raw_flags = input["flags"].as_u64().unwrap() as u32;
         // Derived walkability is deliberately absent: native reads raw 0x100.
         let terrain = ResolvedTerrainGrid::from_cells(32, 32, cells);
-        let z = attack_world_z_leptons(TargetKind::Cell(10, 20), &entities, Some(&terrain));
+        let z = attack_world_z_leptons(TargetKind::Cell(10, 20), &world, Some(&terrain));
         let expected = expected_coord(&row, "fireat_aim");
         assert_eq!(z, expected.z, "FireAt {input}");
         assert_eq!(
@@ -52,18 +52,10 @@ fn cell_launch_aim_matches_original_fireat_and_bullet_fire() {
 
 #[test]
 fn retail_grizzly_forcefire_freezes_the_native_cell_aim() {
-    let Some(ini) = crate::rules::retail_ini_fixture::retail_ini("rulesmd.ini") else {
+    let Some(rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art() else {
         return;
     };
-    let Some(art) = crate::rules::retail_ini_fixture::retail_ini("artmd.ini") else {
-        return;
-    };
-    let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).expect("retail rules");
-    rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
-    assert_eq!(
-        rules.object("MTNK").unwrap().primary.as_deref(),
-        Some("105mm")
-    );
+    assert_eq!(rules.object("MTNK").unwrap().primary(), Some("105mm"));
     assert_eq!(
         rules.weapon("105mm").unwrap().projectile.as_deref(),
         Some("Cannon")
@@ -76,25 +68,27 @@ fn retail_grizzly_forcefire_freezes_the_native_cell_aim() {
     }) {
         let mut sim = Simulation::new();
         let owner = sim.interner.intern("Americans");
-        sim.houses.insert(
-            owner,
-            crate::sim::house_state::HouseState::new(owner, 0, None, true, 0, 10),
-        );
-        sim.session.house_order.push(owner);
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                owner, 0, None, true, 0, 10,
+            ));
         let grid = crate::sim::arena_fixture::flat_arena(&mut sim, &rules);
         let terrain = sim.resolved_terrain.as_mut().unwrap();
         for (x, y) in [(10, 16), (10, 20)] {
-            terrain.cell_mut(x, y).unwrap().level = 2;
+            terrain.cell_mut_for_test(x, y).unwrap().level = 2;
         }
-        terrain.cell_mut(10, 20).unwrap().bridge_facts.raw_flags =
-            row["input"]["flags"].as_u64().unwrap() as u32;
+        terrain
+            .cell_mut_for_test(10, 20)
+            .unwrap()
+            .bridge_facts
+            .raw_flags = row["input"]["flags"].as_u64().unwrap() as u32;
         let grizzly = sim
             .spawn_object("MTNK", "Americans", 10, 16, 128, &rules)
             .expect("retail Grizzly");
         sim.resolve_type_handles(&rules);
         sim.queue_command(CommandEnvelope::new(
             owner,
-            sim.session.tick + 1,
+            sim.session.tick() + 1,
             Command::ForceAttackCell {
                 attacker_id: grizzly,
                 target_rx: 10,
@@ -106,13 +100,18 @@ fn retail_grizzly_forcefire_freezes_the_native_cell_aim() {
         for _ in 0..200 {
             let commands = sim.take_due_commands();
             sim.advance_tick(&commands, Some(&rules), Some(&grid), None, 67);
-            if let Some((_, shell)) = sim.projectiles.iter().find(|(_, p)| p.source_id == grizzly) {
+            if let Some((_, shell)) = sim
+                .projectiles
+                .iter()
+                .find(|(_, p)| p.source_id() == grizzly)
+            {
                 assert_eq!(
-                    shell.launch_target, expected,
+                    shell.launch_target(),
+                    expected,
                     "retail shot {}",
                     row["input"]
                 );
-                assert_eq!(shell.last_target_position, expected);
+                assert_eq!(shell.last_target_position(), expected);
                 launched = true;
                 break;
             }

@@ -11,8 +11,8 @@ fn coord(v: &Value) -> ProjectileCoord {
 
 #[test]
 fn native_line_trail_ring_fades_on_each_composite_and_detaches_before_retirement() {
-    let fixture: Value = serde_json::from_str(include_str!(
-        "../../../tools/projectile_oracle/line_trail.json"
+    let fixture: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/projectile_oracle/line_trail.json",
     ))
     .unwrap();
     for row in fixture["rows"].as_array().unwrap() {
@@ -33,7 +33,7 @@ fn native_line_trail_ring_fades_on_each_composite_and_detaches_before_retirement
             if visit == 40 {
                 runtime.detach(7);
             }
-            runtime.composite(|_| Some(last));
+            runtime.composite(|_| Some(last), |_, _| true);
             assert_eq!(
                 runtime.trails.len(),
                 step["registry_count"].as_u64().unwrap() as usize,
@@ -70,8 +70,8 @@ fn native_line_trail_ring_fades_on_each_composite_and_detaches_before_retirement
 
 #[test]
 fn native_line_trail_save_load_drops_ring_and_does_not_reconstruct_from_live_owner() {
-    let fixture: Value = serde_json::from_str(include_str!(
-        "../../../tools/projectile_oracle/line_trail.json"
+    let fixture: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/projectile_oracle/line_trail.json",
     ))
     .unwrap();
     for row in fixture["persistence"].as_array().unwrap() {
@@ -79,11 +79,11 @@ fn native_line_trail_save_load_drops_ring_and_does_not_reconstruct_from_live_own
         assert_eq!(row["postload_registry_count"], 0);
         let mut runtime = LineTrails::default();
         runtime.attach(7, [216, 216, 255], 16, 2);
-        runtime.composite(|_| Some(ProjectileCoord::new(256, 256, 0)));
+        runtime.composite(|_| Some(ProjectileCoord::new(256, 256, 0)), |_, _| true);
         runtime.clear_on_load();
         assert!(
             runtime
-                .composite(|_| Some(ProjectileCoord::new(384, 256, 104)))
+                .composite(|_| Some(ProjectileCoord::new(384, 256, 104)), |_, _| true)
                 .is_empty()
         );
         assert!(runtime.trails.is_empty());
@@ -92,8 +92,8 @@ fn native_line_trail_save_load_drops_ring_and_does_not_reconstruct_from_live_own
 
 #[test]
 fn native_line_trail_registry_emits_reverse_attached_order() {
-    let fixture: Value = serde_json::from_str(include_str!(
-        "../../../tools/projectile_oracle/line_trail.json"
+    let fixture: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/projectile_oracle/line_trail.json",
     ))
     .unwrap();
     for row in fixture["ordered_pixel_cases"].as_array().unwrap() {
@@ -109,14 +109,17 @@ fn native_line_trail_registry_emits_reverse_attached_order() {
                 2,
             );
         }
-        assert!(runtime.composite(|_| Some(origin)).is_empty());
-        let actual = runtime.composite(|_| {
-            Some(ProjectileCoord::new(
-                origin.x + delta.x,
-                origin.y + delta.y,
-                origin.z + delta.z,
-            ))
-        });
+        assert!(runtime.composite(|_| Some(origin), |_, _| true).is_empty());
+        let actual = runtime.composite(
+            |_| {
+                Some(ProjectileCoord::new(
+                    origin.x + delta.x,
+                    origin.y + delta.y,
+                    origin.z + delta.z,
+                ))
+            },
+            |_, _| true,
+        );
         let expected = row["draw_calls"].as_array().unwrap();
         assert_eq!(actual.len(), expected.len());
         for (actual, expected) in actual.iter().zip(expected) {
@@ -130,4 +133,27 @@ fn native_line_trail_registry_emits_reverse_attached_order() {
             );
         }
     }
+}
+
+#[test]
+fn concealed_trails_keep_sampling_the_owner_and_resume_with_the_same_history() {
+    let mut shown = LineTrails::default();
+    let mut hidden = LineTrails::default();
+    shown.attach(7, [216, 216, 255], 16, 2);
+    hidden.attach(7, [216, 216, 255], 16, 2);
+    for coord in [
+        ProjectileCoord::new(256, 256, 0),
+        ProjectileCoord::new(384, 256, 104),
+    ] {
+        shown.composite(|_| Some(coord), |_, _| true);
+        assert!(hidden.composite(|_| Some(coord), |_, _| false).is_empty());
+        assert_eq!(hidden.trails[0].owner, Some(7));
+        assert!(hidden.attached.contains_key(&7));
+        assert_eq!(hidden.trails[0].samples, shown.trails[0].samples);
+    }
+    let next = ProjectileCoord::new(512, 256, 0);
+    shown.composite(|_| Some(next), |_, _| true);
+    assert!(!hidden.composite(|_| Some(next), |_, _| true).is_empty());
+    assert_eq!(hidden.trails[0].samples, shown.trails[0].samples);
+    assert_eq!(hidden.segments.len(), shown.segments.len());
 }

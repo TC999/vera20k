@@ -2,6 +2,7 @@
 //! are explicit destination/palette boundaries, not retail-reader evidence.
 use super::*;
 use crate::render::batch::SpriteInstance;
+use crate::render::terrain_draw_gpu_tests::seed_depth;
 
 fn upload_color(gpu: &Gpu, color: &wgpu::Texture, bytes: &[u8]) {
     gpu.queue.write_texture(
@@ -21,98 +22,11 @@ fn upload_color(gpu: &Gpu, color: &wgpu::Texture, bytes: &[u8]) {
     );
 }
 
-/// Prepare arbitrary native destination Z words, without passing through any
-/// renderer admission logic under test. This shader only writes fixture data.
-fn seed_depth(
-    gpu: &Gpu,
-    encoder: &mut wgpu::CommandEncoder,
-    depth: &wgpu::TextureView,
-    words: &[u16],
-) {
-    let literals = words
-        .iter()
-        .map(|&word| format!("{:?}", crate::render::native_z::stored_depth(word)))
-        .collect::<Vec<_>>()
-        .join(",");
-    let shader = gpu.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-        label: Some("Original destination depth fixture upload"),
-        source: wgpu::ShaderSource::Wgsl(format!(
-            "@vertex fn vs(@builtin(vertex_index) i:u32)->@builtin(position) vec4f {{ let p=array<vec2f,3>(vec2f(-1.,-1.),vec2f(3.,-1.),vec2f(-1.,3.)); return vec4f(p[i],0.,1.); }} @fragment fn fs(@builtin(position) p:vec4f)->@builtin(frag_depth) f32 {{ let words=array<f32,{}>({literals}); return words[u32(p.x)]; }}", words.len()
-        ).into()),
-    });
-    let pipeline = gpu
-        .device
-        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Original destination depth fixture upload"),
-            layout: None,
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs"),
-                targets: &[],
-                compilation_options: Default::default(),
-            }),
-            primitive: Default::default(),
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: true,
-                depth_compare: wgpu::CompareFunction::Always,
-                stencil: Default::default(),
-                bias: Default::default(),
-            }),
-            multisample: Default::default(),
-            multiview: None,
-            cache: None,
-        });
-    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: Some("Original destination depth fixture upload"),
-        color_attachments: &[],
-        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-            view: depth,
-            depth_ops: Some(wgpu::Operations {
-                load: wgpu::LoadOp::Clear(1.0),
-                store: wgpu::StoreOp::Store,
-            }),
-            stencil_ops: None,
-        }),
-        timestamp_writes: None,
-        occlusion_query_set: None,
-    });
-    pass.set_pipeline(&pipeline);
-    pass.draw(0..3, 0..1);
-}
-
-fn force_scratch_rows(gpu: &Gpu, terrain: &mut TerrainDrawRenderer, width: u32, rows: u32) {
-    // Exercise the production capacity-band path without allocating an 8K
-    // target. This replaces only derived scratch with a smaller valid binding.
-    let scratch = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Bounded storage band fixture"),
-        size: u64::from(width * rows) * 8,
-        usage: wgpu::BufferUsages::STORAGE,
-        mapped_at_creation: false,
-    });
-    let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("Bounded storage band fixture"),
-        layout: &terrain.read_only_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: scratch.as_entire_binding(),
-        }],
-    });
-    let targets = terrain.targets.as_mut().unwrap();
-    targets.read_only = group;
-    targets.read_only_rows = rows;
-}
-
 #[test]
-#[ignore = "requires GPU; ordered native Bullet leaf sequences, reused indices and bounded storage bands"]
+#[ignore = "requires GPU; ordered native Bullet leaf sequences and reused indices"]
 fn ordered_reduction_matches_original_sequence_prefixes() {
     let gpu = Gpu::new();
+    let webgl = crate::render::gpu::webgl_fallback(&gpu.device);
     let native = native();
     let cases = native["sequence_cases"].as_array().unwrap();
     assert_eq!(cases.len(), 13);
@@ -130,7 +44,7 @@ fn ordered_reduction_matches_original_sequence_prefixes() {
         let batch = BatchRenderer::new_with_device(&gpu.device, &gpu.queue, format);
         let mut terrain = TerrainDrawRenderer::new(&gpu.device, &gpu.queue, format, &batch);
         // Reusing the owner across different attachment heights also exercises
-        // target/bind-group replacement, then one-row scratch reuse at height3.
+        // target/bind-group replacement.
         for height in [1, 3] {
             let size = [4, height];
             batch.write_camera(&gpu.queue, camera(size));
@@ -139,9 +53,6 @@ fn ordered_reduction_matches_original_sequence_prefixes() {
             let depth = gpu.target(size, wgpu::TextureFormat::Depth32Float);
             let dv = depth.create_view(&Default::default());
             terrain.prepare(&gpu.device, &color, &dv, batch.camera_uniform());
-            if height == 3 {
-                force_scratch_rows(&gpu, &mut terrain, 4, 1);
-            }
             for case in cases {
                 let steps = case["steps"].as_array().unwrap();
                 let old_words = case["initial_colors"]
@@ -240,7 +151,7 @@ fn ordered_reduction_matches_original_sequence_prefixes() {
                         usage: wgpu::BufferUsages::VERTEX,
                     });
                 for prefix in 1..=steps.len() {
-                    // All prefixes at height1; one full span for forced bands.
+                    // All prefixes at height1; one full span at height3.
                     if height != 1 && prefix != steps.len() {
                         continue;
                     }
@@ -261,7 +172,15 @@ fn ordered_reduction_matches_original_sequence_prefixes() {
                         commands[..prefix * height as usize].iter().copied(),
                         [0, 0, 4, height],
                     );
-                    assert_eq!(stats.passes, 4 * height as usize);
+                    let shadows = commands[..prefix * height as usize]
+                        .iter()
+                        .any(|command| command.piece == TerrainPiece::Shadow);
+                    let passes = match (webgl, shadows) {
+                        (true, _) => 4,
+                        (false, true) => 3,
+                        (false, false) => 1,
+                    };
+                    assert_eq!(stats.passes, passes);
                     assert_eq!(stats.waves, 1);
                     assert_eq!(stats.tile_dependencies, 0);
                     let reads = [
@@ -364,7 +283,8 @@ fn ordered_reduction_preserves_noop_bytes_and_chunk_continuation() {
         // Last body is exactly ordinal65535, followed by a new chunk shadow.
         // The independent exhaustive original-leaf corpus supplies the red
         // destination's shadow transition across this implementation chunk.
-        let words = include_bytes!("../../tools/projectile_oracle/bridge_render_pixels.rgb565.bin");
+        let words =
+            crate::test_fixture::bytes("tools/projectile_oracle/bridge_render_pixels.rgb565.bin");
         let expected = u16::from_le_bytes(words[0xf800 * 2..0xf800 * 2 + 2].try_into().unwrap());
         let mut encoder = gpu.device.create_command_encoder(&Default::default());
         clear(
@@ -385,7 +305,16 @@ fn ordered_reduction_preserves_noop_bytes_and_chunk_continuation() {
             commands,
             [0, 0, 1, 1],
         );
-        assert_eq!((stats.pieces, stats.waves, stats.passes), (65536, 2, 8));
+        // Only WebGL2's reduction chunks command ordinals.
+        let intervals = if crate::render::gpu::webgl_fallback(&gpu.device) {
+            (2, 8)
+        } else {
+            (1, 3)
+        };
+        assert_eq!(
+            (stats.pieces, (stats.waves, stats.passes)),
+            (65536, intervals)
+        );
         let reads = [
             gpu.read(&mut encoder, &color),
             gpu.read(&mut encoder, &depth),
@@ -401,7 +330,8 @@ fn ordered_reduction_preserves_noop_bytes_and_chunk_continuation() {
 
 #[test]
 fn original_exhaustive_shadow_transition_is_zero_after_six_applications() {
-    let words = include_bytes!("../../tools/projectile_oracle/bridge_render_pixels.rgb565.bin");
+    let words =
+        crate::test_fixture::bytes("tools/projectile_oracle/bridge_render_pixels.rgb565.bin");
     for start in 0..=u16::MAX {
         let mut word = start;
         for _ in 0..6 {

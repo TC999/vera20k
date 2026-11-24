@@ -7,7 +7,7 @@ BulletType constructor46BBC0 and full reader46BEE0, including ObjectType5F92D0,
 integer/bool/string readers, Animation FindOrAllocate428B80 and the original SHP
 filename/header consumer. It supplies no VERA-derived scalar expectations.
 
-The binary SHA-256 and Unicorn versions are in
+The Unicorn versions are in
 [the sidecar](bridge_render_art_state.meta.json); exact results and file hashes
 are in [the corpus](bridge_render_art_state.json). The inherited physical asset
 provenance and extraction instructions are in [bridge_render_inputs.md](bridge_render_inputs.md).
@@ -104,7 +104,7 @@ The Rust checks are in:
   the fixed-ART processing constructor before their other-family merge.
 
 Native regeneration and independent `--check` pass. On the canonical focused
-candidate recorded in [the chain receipt](../../docs/research/bridge-projectile-render.md),
+candidate recorded in the chain receipt,
 all three retained ART tests pass, including39 registered production types out
 of54 physically referenced native types. The atlas group passes6 with its actual
 retail-archive test ignored; all40 full native shape cases pass in both GPU
@@ -135,7 +135,7 @@ python tools/projectile_oracle/bridge_render_art_state.py --check
 ```
 
 The development extraction is `/tmp/bridge-projectile-input-assets`; the shared
-native-oracle Python is `/Users/halvor/Documents/vera20k-dev/.venv/bin/python`.
+native-oracle Python is `~/Documents/vera20k-dev/.venv/bin/python`.
 Root independently reproduced the check in
 `/tmp/bridge-projectile-root-native-art-check.log`. The original input/draw
 corpus fingerprints are unchanged by this separate extended witness.

@@ -2,199 +2,61 @@
 //! Active owner55FC80, resourceD5, common static6153E0 and trackbar61D950.
 //! At the main menu D5 is a family page: its heading, status line and
 //! monitor are the shared family statics, and its column slides in and out
-//! (`0x006071E0`).
+//! (`0x006071E0`). Every control paints from the dialog's tree.
 
-use super::{chrome::*, controls::*, *};
+use super::gui_paint::{ButtonArt, GuiPaint, GuiStyle, paint_gui_styled};
+use super::{chrome::*, *};
 use crate::app::AppState;
 use crate::render::batch::SpriteInstance;
-use crate::render::shell_text::{self, ShellAlign, ShellTextDraw, TextRect};
+use crate::render::shell_text::{self, TextRect};
 use crate::render::shell_text_reveal::PathAReveal;
-use crate::ui::main_menu_dialogs::options::shell::{LauncherLabelAlign, LauncherOptionsLayout};
-use crate::ui::main_menu_dialogs::options::{LauncherTrackbarId, OptionsDialogState};
-use crate::ui::shell::geom::RectPx;
-use std::time::Instant;
+use crate::ui::main_menu_dialogs::options::OptionsDialogState;
+use crate::ui::main_menu_dialogs::options::shell::{Control, LauncherOptionsLayout};
+use crate::ui::shell::geom::{RectPx, ShellAlign, ShellScale};
+use crate::util::time::Instant;
 
-fn text_draw(
-    font: &BitFont,
-    text: &str,
-    rect: RectPx,
-    align: ShellAlign,
-    rgb: [f32; 3],
-) -> ShellTextDraw {
-    shell_text::draw_in_rect(
-        font,
-        text,
-        TextRect {
-            x: rect.x,
-            y: rect.y,
-            w: rect.w.max(0) as u32,
-            h: rect.h.max(0) as u32,
-        },
-        rgb,
-        align,
-        [0.0, 0.0],
-        SHELL_CONTROL_TEXT_DEPTH,
-    )
+/// The page's controls and its open list, painted from the dialog's tree
+/// (synced to its layout by the caller). The page's own buttons are drawn as
+/// Sound Options' Play and Stop are (609FC7..609FE2/60A330): owner-draw type
+/// 3, MNBTTN centred on the control. With `column` the right-hand column's
+/// buttons paint on the panel's art, the page that shows lit (612B70
+/// record+C5, SDBTNANM 3); without, a slide or the in-game menu draws them.
+/// Captions under `covered` are left out: a box draws all its art before its
+/// text, so that text would otherwise show through the list.
+pub(crate) fn paint_page(
+    state: &AppState,
+    dialog: &OptionsDialogState,
+    scale: ShellScale,
+    column: bool,
+    covered: &[RectPx],
+) -> GuiPaint {
+    let (gui, panel) = dialog.shell_gui();
+    let art = |id| match dialog.shell_control(id)? {
+        Control::Button(button) if button.on_page() => Some(ButtonArt::ModalSqueezed),
+        Control::Button(_) if column => Some(ButtonArt::Panel),
+        _ => None,
+    };
+    let style = GuiStyle {
+        art_of: Some(&art),
+        ..Default::default()
+    };
+    paint_gui_styled(state, gui, panel, scale, covered, style)
 }
 
-/// The left-side controls, and the right-panel buttons unless a slide draws
-/// the column in their place.
-fn build_controls(
-    atlas: &SkirmishShellChromeAtlas,
+/// Options' controls on another box's art: VERA's Esc menu shows a few of
+/// them. They paint in submission order, after the box and its buttons.
+pub(crate) fn paint_options_settings(
+    draw: &mut crate::render::shell_paint::ModalDraw,
+    state: &AppState,
     layout: &LauncherOptionsLayout,
-    dialog: &OptionsDialogState,
-    buttons: bool,
-) -> Vec<SpriteInstance> {
-    let mut out = Vec::new();
-    let chrome = atlas.control_chrome();
-    for (id, rect) in layout.trackbars {
-        paint_control(
-            &mut out,
-            &chrome,
-            ControlPaint::Trackbar {
-                rect,
-                thumb_left: dialog.shell_trackbar_thumb_left(id, rect.w),
-                plaque: id.plaque_reserve() > 0,
-            },
-        );
-    }
-    for (id, rect) in layout.checkboxes {
-        paint_control(
-            &mut out,
-            &chrome,
-            ControlPaint::Checkbox {
-                rect,
-                checked: dialog.shell_checkbox_checked(id),
-            },
-        );
-    }
-    paint_control(
-        &mut out,
-        &chrome,
-        ControlPaint::Combo {
-            rect: layout.resolution,
-            swatch: None,
-            open: dialog.shell_popup(layout).is_some(),
-            disabled: false,
-        },
-    );
-    for (id, rect) in layout.buttons.into_iter().filter(|_| buttons) {
-        push_right_panel_button_shp(
-            &mut out,
-            atlas,
-            rect,
-            dialog.shell_button_pressed(id),
-            false,
-            SHELL_CONTROL_DEPTH,
-        );
-    }
-    out
-}
-
-fn build_text(
-    font: &BitFont,
-    layout: &LauncherOptionsLayout,
-    dialog: &OptionsDialogState,
-    title: Option<crate::ui::shell::static_reveal::Kind1RevealWindow>,
-    buttons: bool,
-) -> Vec<ShellTextDraw> {
-    let mut out = Vec::new();
-    for label in dialog.shell_labels(layout) {
-        let align = match label.align {
-            LauncherLabelAlign::Left => ShellAlign::NONE,
-            LauncherLabelAlign::Center => ShellAlign::H_CENTER,
-            LauncherLabelAlign::Right => ShellAlign::H_RIGHT,
-        };
-        if label.title {
-            if let Some(window) = title {
-                out.push(shell_text::draw_in_rect_path_a(
-                    font,
-                    label.text,
-                    TextRect {
-                        x: label.rect.x,
-                        y: label.rect.y,
-                        w: label.rect.w as u32,
-                        h: label.rect.h as u32,
-                    },
-                    align,
-                    [0.0, 0.0],
-                    SHELL_CONTROL_TEXT_DEPTH,
-                    PathAReveal {
-                        count: window.count,
-                        range: window.range,
-                        base_rgb: [255, 255, 0],
-                        highlight_rgb: [255, 255, 255],
-                    },
-                ));
-            }
-        } else {
-            out.push(text_draw(
-                font,
-                label.text,
-                label.rect,
-                align,
-                SHELL_LABEL_TEXT_RGB,
-            ));
-        }
-    }
-    for (id, rect) in layout.checkboxes {
-        out.push(text_draw(
-            font,
-            dialog.shell_checkbox_label(id),
-            RectPx::new(rect.x + 26, rect.y, rect.w - 26, rect.h),
-            ShellAlign::V_CENTER,
-            SHELL_LABEL_TEXT_RGB,
-        ));
-    }
-    for (id, rect) in layout.trackbars {
-        if matches!(
-            id,
-            LauncherTrackbarId::Score | LauncherTrackbarId::Sound | LauncherTrackbarId::Voice
-        ) {
-            out.push(text_draw(
-                font,
-                &dialog.trackbar_position(id).to_string(),
-                crate::ui::shell::trackbar::value_text_rect(rect),
-                ShellAlign::H_CENTER | ShellAlign::V_CENTER,
-                if dialog.launcher_audio_available() {
-                    SHELL_LABEL_TEXT_RGB
-                } else {
-                    SHELL_DISABLED_TEXT_RGB_FROM_PACKED_0000009F
-                },
-            ));
-        }
-    }
-    out.push(text_draw(
-        font,
-        dialog.shell_selected_resolution_text(),
-        RectPx::new(
-            layout.resolution.x + 3,
-            layout.resolution.y,
-            layout.resolution.w - 23,
-            layout.resolution.h,
-        ),
-        ShellAlign::V_CENTER,
-        SHELL_LABEL_TEXT_RGB,
-    ));
-    for (id, rect) in layout.buttons.into_iter().filter(|_| buttons) {
-        let pressed = dialog.shell_button_pressed(id);
-        // 612B70 type1: ordinary press retains AC18A4 foreground; the text
-        // rectangle changes at61358D..6135CD, independently of SHP geometry.
-        let native_text = button_text_rect(rect, pressed);
-        out.push(text_draw(
-            font,
-            dialog.shell_button_label(id),
-            RectPx::new(
-                native_text.x,
-                native_text.y,
-                native_text.w as i32,
-                native_text.h as i32,
-            ),
-            ShellAlign::H_CENTER | ShellAlign::V_CENTER,
-            button_label_color(),
-        ));
-    }
-    out
+    settings: &OptionsDialogState,
+) {
+    let list = settings.shell_popup_rect();
+    let page = paint_page(state, settings, layout.scale, false, list.as_slice());
+    draw.sprites.extend(page.controls);
+    draw.text.extend(page.texts);
+    draw.sprites.extend(page.popup);
+    draw.text.extend(page.popup_texts);
 }
 
 /// Shared mode1 launcher frame,60CF00 default background and621E90 composition.
@@ -203,16 +65,26 @@ pub(super) fn launcher_background_instances(
     atlas: &SkirmishShellChromeAtlas,
     width: u32,
     height: u32,
+    scale: ShellScale,
 ) -> Vec<SpriteInstance> {
-    let common = compute_layout(width, height);
+    let common = crate::ui::skirmish_shell::compute_layout_on(scale, width, height);
     let mut out = Vec::new();
-    let background = if width == 640 {
-        atlas.generic_background_640_mnscrns_shell
-    } else {
-        atlas.generic_background_large_mnscrnl_shell
-    };
-    if let Some(background) = background {
-        push_entry_native(&mut out, background, 0, 0, SHELL_PARENT_BACKGROUND_DEPTH);
+    if let Some(background) = super::modals::generic_shell_background_entry(atlas, &common) {
+        if scale.is_unscaled() {
+            push_entry_native(&mut out, background, 0, 0, SHELL_PARENT_BACKGROUND_DEPTH);
+        } else {
+            // A scaled page grows the MNSCRN canvas with its dialog, as the
+            // family menu pages do.
+            let dialog = scale.dialog_rect();
+            push_entry_grown(
+                &mut out,
+                background,
+                dialog.x,
+                dialog.y,
+                scale,
+                SHELL_PARENT_BACKGROUND_DEPTH,
+            );
+        }
     }
     push_right_panel_base_instances(&mut out, atlas, &common, false);
     push_lower_strip_instance(&mut out, atlas, &common);
@@ -226,8 +98,17 @@ pub(crate) fn render_launcher_options(
 ) -> anyhow::Result<()> {
     use crate::app::frontend::shell_transition::ShellSlideKind;
     let now = Instant::now();
-    let layout =
-        LauncherOptionsLayout::new(state.render_width() as i32, state.render_height() as i32);
+    let category = state
+        .frontend
+        .options_dialog
+        .as_ref()
+        .expect("launcher active")
+        .category();
+    let layout = crate::app::frontend::shell_layout::launcher_options_layout(state, category);
+    if let Some(dialog) = state.frontend.options_dialog.as_mut() {
+        dialog.shell_sync(&layout);
+    }
+    let scale = layout.scale;
     // The teardown slide starts with a full dialog repaint (`0x00622C4F`) and
     // pumps no messages until it ends: every child stays blank. The entry
     // slide suppresses the heading, status line, monitor and column buttons
@@ -259,7 +140,7 @@ pub(crate) fn render_launcher_options(
             .options_dialog
             .as_ref()
             .and_then(|dialog| dialog.shell_status_help())
-            .map(|key| crate::app::frontend::shell_pass::resolve_csf(state, key).into_owned())
+            .map(|key| state.csf_text(key))
             .unwrap_or_default();
         let status = crate::app::frontend::menu_page_render::paint_shell_status_line(
             state,
@@ -279,200 +160,106 @@ pub(crate) fn render_launcher_options(
         .as_ref()
         .expect("launcher atlas");
     let mut instances =
-        launcher_background_instances(atlas, state.render_width(), state.render_height());
+        launcher_background_instances(atlas, state.render_width(), state.render_height(), scale);
     if let Some(frame) = monitor_frame.and_then(|frame| atlas.launcher_warning_frames.get(frame)) {
-        push_flag_entry_native_clipped_centered(
+        push_flag_entry_clipped_centered(
             &mut instances,
             *frame,
             layout.warning,
+            scale,
             SHELL_CONTROL_DEPTH,
         );
     }
+    let font = &state.renderer.bit_font;
     let mut texts = Vec::new();
     if let Some(wave) = wave.as_ref() {
+        let common = crate::ui::skirmish_shell::compute_layout_on(
+            scale,
+            state.render_width(),
+            state.render_height(),
+        );
         push_slide_column(
             &mut instances,
             atlas,
-            &compute_layout(state.render_width(), state.render_height()),
+            &common,
             &wave.button_draws(),
             SHELL_CONTROL_DEPTH,
         );
     }
-    if !leaving {
-        instances.extend(build_controls(atlas, &layout, dialog, !sliding));
-        texts = build_text(&state.renderer.bit_font, &layout, dialog, title, !sliding);
-    }
-    texts.extend(crate::render::shell_paint::paint_labels(
-        &state.renderer.bit_font,
-        &status_label.into_iter().collect::<Vec<_>>(),
-    ));
-    let mut popup_instances = Vec::new();
-    let mut popup_text = Vec::new();
-    if let Some(popup) = dialog.shell_popup(&layout).filter(|_| !leaving) {
-        push_solid_rect_px(
-            &mut popup_instances,
-            atlas.white_pixel,
-            popup.rect,
-            SHELL_DROPDOWN_BG_RGB_PENDING_COMBODROPWIN_SOURCE_CAPTURE,
-            SHELL_DROPDOWN_DEPTH,
-        );
-        for (i, row) in dialog
-            .shell_resolution_rows()
-            .iter()
-            .enumerate()
-            .skip(popup.first_row)
-            .take(popup.visible_rows)
-        {
-            let rect = RectPx::new(
-                popup.content.x,
-                popup.content.y + (i - popup.first_row) as i32 * popup.row_height,
-                popup.content.w,
-                popup.row_height,
-            );
-            if popup.hovered.or(popup.selected) == Some(i) {
-                push_solid_rect_px(
-                    &mut popup_instances,
-                    atlas.white_pixel,
-                    rect,
-                    OWNERDRAW_SELECTED_RGB_FROM_DAT_00AC4604_PACKED_000000FF,
-                    SHELL_DROPDOWN_DEPTH,
-                );
-            }
-            popup_text.push(text_draw(
-                &state.renderer.bit_font,
-                &row.label,
-                RectPx::new(rect.x + 3, rect.y, rect.w - 6, rect.h),
-                ShellAlign::V_CENTER,
-                SHELL_LABEL_TEXT_RGB,
-            ));
-        }
-        if let (Some(scrollbar), Some(thumb)) = (popup.scrollbar, popup.thumb) {
-            paint_control(
-                &mut popup_instances,
-                &atlas.control_chrome(),
-                ControlPaint::ScrollBar {
-                    scrollbar,
-                    thumb,
-                    pressed_part: None,
-                },
-            );
-        }
-        push_ownerdraw_two_pixel_bevel_frame_px(
-            &mut popup_instances,
-            atlas.white_pixel,
-            popup.rect,
-            SHELL_DROPDOWN_DEPTH,
-        );
-    }
-    state.renderer.batch_renderer.update_camera(
-        &state.renderer.gpu,
-        state.render_width() as f32,
-        state.render_height() as f32,
-        0.0,
-        0.0,
-        1.0,
-        crate::render::batch::DepthAxis::NONE,
-    );
-    let batch = &state.renderer.batch_renderer;
-    let gpu = &state.renderer.gpu;
-    let chrome_buffer = batch.create_instance_buffer(gpu, &instances);
-    let text_buffers: Vec<_> = texts
-        .iter()
-        .map(|d| batch.create_instance_buffer(gpu, &d.instances))
-        .collect();
-    let popup_buffer = batch.create_instance_buffer(gpu, &popup_instances);
-    let popup_text_buffers: Vec<_> = popup_text
-        .iter()
-        .map(|d| batch.create_instance_buffer(gpu, &d.instances))
-        .collect();
-    let cursor: Vec<_> =
-        crate::app::frontend::shell_pass::software_cursor(state, SHELL_CURSOR_DEPTH)
-            .map(|(_, instance)| instance)
-            .into_iter()
-            .collect();
-    let cursor_buffer = batch.create_instance_buffer(gpu, &cursor);
-    let cursor_texture = state
-        .match_state
-        .match_presentation
-        .software_cursor
-        .as_ref()
-        .and_then(|c| c.get(crate::app::types::CursorId::Default))
-        .and_then(|s| s.frames.first())
-        .map(|f| &f.texture);
-    let color = state.renderer.shell_surface_presenter.source_render_view();
-    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        label: Some("Launcher Options D5"),
-        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-            view: &color,
-            depth_slice: None,
-            resolve_target: None,
-            ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(crate::app::types::CLEAR_COLOR),
-                store: wgpu::StoreOp::Store,
+    if let Some(window) = title {
+        texts.push(shell_text::draw_in_rect_path_a_scaled(
+            font,
+            dialog.shell_title_text(),
+            TextRect {
+                x: layout.title.x,
+                y: layout.title.y,
+                w: layout.title.w as u32,
+                h: layout.title.h as u32,
             },
-        })],
-        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-            view: &state.renderer.depth_view,
-            depth_ops: Some(wgpu::Operations {
-                load: wgpu::LoadOp::Clear(1.0),
-                store: wgpu::StoreOp::Store,
-            }),
-            stencil_ops: None,
-        }),
-        timestamp_writes: None,
-        occlusion_query_set: None,
-    });
-    if let Some((buffer, count)) = &chrome_buffer {
-        batch.draw_with_buffer_passthrough(&mut pass, &atlas.texture, buffer, *count);
+            ShellAlign::H_CENTER | ShellAlign::PANEL_FACE,
+            [0.0, 0.0],
+            SHELL_CONTROL_TEXT_DEPTH,
+            PathAReveal {
+                count: window.count,
+                range: window.range,
+                base_rgb: [255, 255, 0],
+                highlight_rgb: [255, 255, 255],
+            },
+            scale.factor(),
+        ));
     }
-    for (draw, buffer) in texts.iter().zip(&text_buffers) {
-        if let Some((buffer, count)) = buffer {
-            if draw.scissor.w == 0 || draw.scissor.h == 0 {
-                continue;
-            }
-            pass.set_scissor_rect(
-                draw.scissor.x,
-                draw.scissor.y,
-                draw.scissor.w,
-                draw.scissor.h,
-            );
-            batch.draw_with_buffer_passthrough(
-                &mut pass,
-                state.renderer.bit_font.atlas(),
-                buffer,
-                *count,
-            );
-        }
-    }
-    pass.set_scissor_rect(0, 0, state.render_width(), state.render_height());
-    if let Some((buffer, count)) = &popup_buffer {
-        batch.draw_with_buffer_passthrough(&mut pass, &atlas.texture, buffer, *count);
-    }
-    for (draw, buffer) in popup_text.iter().zip(&popup_text_buffers) {
-        if let Some((buffer, count)) = buffer {
-            pass.set_scissor_rect(
-                draw.scissor.x,
-                draw.scissor.y,
-                draw.scissor.w,
-                draw.scissor.h,
-            );
-            batch.draw_with_buffer_passthrough(
-                &mut pass,
-                state.renderer.bit_font.atlas(),
-                buffer,
-                *count,
-            );
-        }
-    }
-    pass.set_scissor_rect(0, 0, state.render_width(), state.render_height());
-    if let (Some((buffer, count)), Some(texture)) = (&cursor_buffer, cursor_texture) {
-        batch.draw_with_buffer_passthrough(&mut pass, texture, buffer, *count);
-    }
-    drop(pass);
-    state
-        .renderer
-        .shell_surface_presenter
-        .encode_present(encoder, destination);
+    let page = (!leaving).then(|| paint_page(state, dialog, scale, !sliding, &[]));
+    let page = page.unwrap_or_default();
+    instances.extend(page.controls);
+    texts.extend(page.texts);
+    texts.extend(crate::render::shell_paint::paint_labels_scaled(
+        font,
+        &status_label.into_iter().collect::<Vec<_>>(),
+        scale.factor(),
+    ));
+    super::in_game_shell::render_shell_frame(
+        state,
+        encoder,
+        destination,
+        super::in_game_shell::InGameShellFrame {
+            art: instances,
+            controls: Vec::new(),
+            texts,
+            label: "Launcher Options D5",
+        },
+        super::in_game_shell::ShellFrameArt::Launcher,
+        super::in_game_shell::ShellFrameOverlay {
+            controls: page.popup,
+            texts: page.popup_texts,
+            ..Default::default()
+        },
+        super::in_game_shell::ShellFrameCursor::Visible,
+    )?;
     state.platform.window.request_redraw();
     Ok(())
+}
+
+#[cfg(all(test, tests_app_frontend))]
+mod tests {
+    use crate::ui::main_menu_dialogs::options::{Zoom, zoom_label};
+
+    #[test]
+    fn zoom_rows_name_the_battle_size() {
+        let hd = (1920, 1080);
+        let rows: Vec<_> = Zoom::choices(hd.0, hd.1)
+            .into_iter()
+            .map(|zoom| zoom_label(zoom, hd, false))
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                "Auto (1920x1080)",
+                "100% (1920x1080)",
+                "150% (1280x720)",
+                "200% (960x540)"
+            ]
+        );
+        // The original 4:3 shape trims the width.
+        assert_eq!(zoom_label(Zoom::Percent(150), hd, true), "150% (960x720)");
+    }
 }

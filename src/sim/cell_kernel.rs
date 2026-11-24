@@ -3,28 +3,18 @@
 //! These helpers intentionally keep floor, deck, coordinate lookup, and object-list
 //! selection separate: YR composes them at their individual call sites.
 
-use crate::util::fixed_math::isqrt_i64;
-#[cfg(test)]
+use crate::map::cell_index::NativeCellIdentity;
+use crate::map::resolved_terrain::NativeCellQuery;
+
+use crate::map::resolved_terrain::ResolvedTerrainGrid;
+#[cfg(any(test, feature = "test-support"))]
 use crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS;
-use crate::util::lepton::{
-    GROUND_LEVEL_HEIGHT_LEPTONS, UnsupportedGroundSlope, ground_height_leptons,
-};
+use crate::util::lepton::{GROUND_LEVEL_HEIGHT_LEPTONS, ground_height_leptons};
 
 pub const LEPTONS_PER_CELL: i32 = crate::util::lepton::LEPTONS_PER_CELL_I32;
 pub const CELL_CENTER_LEPTONS: i32 = crate::util::lepton::CELL_CENTER_LEPTON_I32;
 pub const INFANTRY_OCCUPATION_VEHICLE_BIT: u8 = 0x20;
 pub const INFANTRY_OCCUPATION_OBJECT_BIT: u8 = 0x40;
-/// Native-ordered (x, y, z) sub-cell lepton offsets, slots 0..4. Same values
-/// as `util::lepton::SUBCELL_*` (the SimFixed pairs); kept as a separate
-/// integer table because this is the native ordering + Z shape the kernel
-/// indexes by slot. Change both or neither.
-pub const INFANTRY_SUBCELL_OFFSETS: [(i32, i32, i32); 5] = [
-    (128, 128, 0),
-    (64, 64, 0),
-    (192, 64, 0),
-    (64, 192, 0),
-    (192, 192, 0),
-];
 
 const INFANTRY_SEQUENCE: [[u8; 4]; 5] = [
     [1, 2, 3, 4],
@@ -35,6 +25,125 @@ const INFANTRY_SEQUENCE: [[u8; 4]; 5] = [
 ];
 const INFANTRY_ALTERNATE_SEQUENCE: [[u8; 4]; 4] =
     [[1, 2, 3, 4], [2, 3, 4, 1], [3, 4, 1, 2], [4, 1, 2, 3]];
+
+/// Native480510's overlay prefix returns here or continues through the
+/// corresponding Building/Gate object-list arm. Direction is read only by
+/// those continuations; the supported overlay-only queries need no direction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WallConnectionStep {
+    Return(bool),
+    GdiBuildings,
+    NodBuildings,
+}
+
+/// `CellClass::IsWallConnectableInDirection @ 0x00480510..0x00480622`.
+/// Source: original caller/body reads in the authored-fence comparison
+/// (`tools/spatial_oracle/anytown_damage/authored_fence.json`). Stored and
+/// requested identities retain native signed width; -1 means no overlay/type.
+///
+/// The literals are OverlayTypes declaration indices, not INI key numbers:
+/// stock2/26/243 are GAWALL/NAWALL/GAFWLL; CAKRMW is240. This is not the
+/// Wall=yes set (sandbags and fences do not pass the negative-type query).
+/// The physical ordered registry readers, rather than key-minus-one, own IDs.
+///
+/// All negative-type LOS/Bullet/bounce/Spark callers and CAFNCB203 cleanup
+/// resolve in this prefix. The distinct Building/Gate continuations stay
+/// explicit rather than pretending this is a whole-function port.
+///
+/// `overlays` is the OverlayType array a game read the Ares way (`ares`, the
+/// caller's `rules.ares_form()`) tests instead of the three literals; `None`
+/// (a caller or fixture without one) keeps them. Only the `requested == -1`
+/// query reads either.
+pub(crate) fn wall_connection_step(
+    stored: i32,
+    requested: i32,
+    overlays: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    ares: bool,
+) -> WallConnectionStep {
+    if stored != -1 && stored == requested {
+        WallConnectionStep::Return(true)
+    } else if requested == -1 {
+        WallConnectionStep::Return(any_wall_overlay(stored, overlays, ares))
+    } else {
+        match requested {
+            0 | 2 => WallConnectionStep::GdiBuildings,
+            26 => WallConnectionStep::NodBuildings,
+            _ => WallConnectionStep::Return(false),
+        }
+    }
+}
+
+/// The `requested == -1` arm of [`wall_connection_step`]: whether `stored`
+/// is a wall.
+fn any_wall_overlay(
+    stored: i32,
+    overlays: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    ares: bool,
+) -> bool {
+    // Ares 3.0 CellClass_AttachesToNeighbourOverlay 10015740 (hook
+    // 0x480534): a nonnegative index whose OverlayType is `Wall=yes`
+    // (0x480549), so sandbags, fences and the Kremlin wall count too;
+    // anything else continues at 0x480552, which answers false for -1.
+    if ares && let Some(overlays) = overlays {
+        return u8::try_from(stored)
+            .ok()
+            .and_then(|id| overlays.flags(id))
+            .is_some_and(|flags| flags.wall);
+    }
+    matches!(stored, 2 | 26 | 243)
+}
+
+/// Cell4848B0: direction of a cliff entered from `previous_world_xy`.
+/// The receiver was selected separately by the caller. Original table81CD4C,
+/// ordered canonical lookups and asymmetric corner returns are consumed by
+/// tools/spatial_oracle/bounce_cliff.{json,md}.
+///
+/// Ordinary TIRE motion crosses neighboring cells. Native indexes beyond this
+/// nine-dword table for larger raw displacements; those unrelated image bytes
+/// are outside the represented domain and produce no reflection here.
+pub(crate) fn cliff_face_direction(
+    cells: &NativeCellQuery<'_>,
+    receiver: NativeCellIdentity,
+    previous_world_xy: (i32, i32),
+) -> Option<u8> {
+    let previous = cells.lookup_world(previous_world_xy.0, previous_world_xy.1);
+    let (x, y) = cells.coord(previous);
+    // Read the receiver after that lookup: both identities may be the Dummy.
+    let (receiver_x, receiver_y) = cells.coord(receiver);
+    let dx = i32::from(receiver_x) - i32::from(x);
+    let dy = i32::from(receiver_y) - i32::from(y);
+    const DIRECTIONS: [i8; 9] = [7, 0, 1, 6, -1, 2, 5, 4, 3];
+    let table_index = dx + 3 * dy + 4;
+    let Some(&direction) = usize::try_from(table_index)
+        .ok()
+        .and_then(|index| DIRECTIONS.get(index))
+    else {
+        log::warn!("Cell4848B0 displacement ({dx},{dy}) exceeds the native neighbor table");
+        return None;
+    };
+    let direction = u8::try_from(direction).ok()?;
+    if dx == 0 || dy == 0 {
+        return Some(direction);
+    }
+
+    let (side_x, side_y) = if dx == dy { (dx, dy) } else { (dy, dx) };
+    let side_a = ((i32::from(x) + side_x) as i16, y);
+    let side_b = (x, (i32::from(y) + side_y) as i16);
+    let raised_side = |coord| {
+        // Each test independently reselects the previous world Cell BEFORE
+        // selecting its side. A missing side can stamp the retained Dummy.
+        let previous = cells.lookup_world(previous_world_xy.0, previous_world_xy.1);
+        let threshold = i32::from(cells.ground_fields(previous).0 as i8) + 2;
+        let side = cells.lookup(coord);
+        i32::from(cells.ground_fields(side).0 as i8) >= threshold
+    };
+    match (raised_side(side_a), raised_side(side_b)) {
+        (true, false) => Some(direction.wrapping_sub(1) & 7),
+        // Native484A62 increments without &7; NW can return8.
+        (false, true) => Some(direction + 1),
+        _ => Some(direction),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorldCoordinate {
@@ -49,13 +158,99 @@ pub struct CellCoordinate {
     pub y: i32,
 }
 
+/// Packed `CellStruct` words, sign-extended as CellStruct-to-Coord642740
+/// reads them.
+impl From<(i16, i16)> for CellCoordinate {
+    fn from((x, y): (i16, i16)) -> Self {
+        Self {
+            x: i32::from(x),
+            y: i32::from(y),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CellQueryPoint {
     pub x: i32,
     pub y: i32,
 }
 
-/// YR `CellClass::GetCellCoords`: center the cell and keep its terrain floor.
+impl crate::sim::world::Simulation {
+    /// `MapClass::operator[](CoordStruct)` (`0x00565730`) for a world XY,
+    /// which truncates toward zero and wraps by row: the real cell, or `None`
+    /// for the shared dummy cell off the map, which holds no object. Without
+    /// resolved terrain, the truncated cell.
+    pub(crate) fn map_coord_cell(
+        resolved_terrain: &Option<ResolvedTerrainGrid>,
+        x: i32,
+        y: i32,
+    ) -> Option<(u16, u16)> {
+        let (rx, ry) = match resolved_terrain.as_ref() {
+            Some(terrain) => {
+                let cells = NativeCellQuery::canonical(terrain);
+                let cell = cells.lookup_world(x, y);
+                let NativeCellIdentity::Real(_) = cell else {
+                    return None;
+                };
+                cells.coord(cell)
+            }
+            None => (
+                crate::util::lepton::lepton_to_cell_packed(x),
+                crate::util::lepton::lepton_to_cell_packed(y),
+            ),
+        };
+        Some((u16::try_from(rx).ok()?, u16::try_from(ry).ok()?))
+    }
+
+    /// `CellClass::Find_Nearest_Object 0x47C3D0` with the (0,0) sub-point over
+    /// `layer`'s list of `cell`: ranked by each object's vt+0x48 coordinate (a
+    /// building's centre), the first in list order on a tie.
+    pub(crate) fn nearest_cell_object(
+        &self,
+        cell: (u16, u16),
+        layer: crate::sim::movement::locomotor::MovementLayer,
+        exclude: Option<u64>,
+    ) -> Option<u64> {
+        self.nearest_cell_object_from(
+            cell,
+            crate::sim::cell_kernel::CellQueryPoint { x: 0, y: 0 },
+            layer,
+            exclude,
+        )
+    }
+
+    /// [`Self::nearest_cell_object`] from the caller's sub-point `point`.
+    pub(crate) fn nearest_cell_object_from(
+        &self,
+        cell: (u16, u16),
+        point: crate::sim::cell_kernel::CellQueryPoint,
+        layer: crate::sim::movement::locomotor::MovementLayer,
+        exclude: Option<u64>,
+    ) -> Option<u64> {
+        crate::sim::cell_kernel::nearest_eligible_in_order(
+            point,
+            self.substrate
+                .occupancy
+                .get(cell.0, cell.1)
+                .into_iter()
+                .flat_map(|list| list.iter_layer(layer))
+                .filter_map(|entry| self.substrate.entities.get(entry.entity_id))
+                .filter(|entity| Some(entity.stable_id()) != exclude)
+                .map(|entity| {
+                    let [x, y] = crate::sim::movement::ground_pose::object_center_xy(entity);
+                    (
+                        entity.stable_id(),
+                        true,
+                        crate::sim::cell_kernel::CellQueryPoint { x, y },
+                    )
+                }),
+        )
+    }
+}
+
+/// Shared cell-center arithmetic, including CellStruct-to-Coord642740.
+/// That caller sign-extends the packed cell words before entering here.
+/// Other callers retain their supplied cell width and height.
 pub fn cell_center(cell: CellCoordinate, floor_z: i32) -> WorldCoordinate {
     WorldCoordinate {
         x: cell
@@ -70,9 +265,103 @@ pub fn cell_center(cell: CellCoordinate, floor_z: i32) -> WorldCoordinate {
     }
 }
 
+/// `CellClass::GetCoords` 0x00486840 — a cell's own world point is its centre
+/// (`MapCoord * 0x100 + 0x80` on both axes) with Z from
+/// `CellClass::ComputeGroundHeightAtCoord` 0x0047B3A0. **No bridge-deck term:**
+/// the deck offset belongs to whoever is standing on the deck, and
+/// `TechnoClass::CanFireAt` adds it separately from the object's own OnBridge
+/// byte at 0x006F7887.
+pub(crate) fn native_cell_own_coords(
+    cell: NativeCellIdentity,
+    cells: &NativeCellQuery<'_>,
+) -> Option<(i64, i64, i64)> {
+    let (x, y) = cells.coord(cell);
+    let (level, slope) = cells.ground_fields(cell);
+    let coord = cell_own_coords(i32::from(x), i32::from(y), level, slope)?;
+    Some((i64::from(coord.x), i64::from(coord.y), i64::from(coord.z)))
+}
+
+impl crate::sim::cell_rect::CellRef<'_> {
+    /// Cell486840/480A30: the receiver's signed packed center and current
+    /// ground height, without a bridge-deck rise. A retained Dummy is read now;
+    /// later map lookups can change its coordinate without changing identity.
+    pub fn center_coordinate(&self) -> Option<crate::sim::components::DriveCoord> {
+        let (x, y, level, slope) = self.packed_ground();
+        cell_own_coords(x, y, level, slope)
+    }
+
+    /// [`Self::center_coordinate`], at Z 0 for a slope byte past the native
+    /// 21-record table (21 and up), where native reads past the table. Every
+    /// read of a cell looked up by coordinate takes this policy.
+    pub(crate) fn get_coords(&self) -> crate::sim::components::DriveCoord {
+        let (x, y, level, slope) = self.packed_ground();
+        cell_own_coords(x, y, level, slope).unwrap_or_else(|| {
+            let point = cell_center(CellCoordinate { x, y }, 0);
+            crate::sim::components::DriveCoord {
+                x: point.x,
+                y: point.y,
+                z: point.z,
+            }
+        })
+    }
+
+    /// The signed packed coordinate, level and slope GetCoords reads.
+    fn packed_ground(&self) -> (i32, i32, u8, u8) {
+        match self {
+            Self::Real(cell) => (
+                i32::from(cell.rx as i16),
+                i32::from(cell.ry as i16),
+                cell.level,
+                cell.slope_type,
+            ),
+            Self::Dummy { cell } => {
+                let value = cell.snapshot();
+                (
+                    value.coord.0,
+                    value.coord.1,
+                    value.level as u8,
+                    value.slope_type,
+                )
+            }
+        }
+    }
+}
+
+fn cell_own_coords(
+    x: i32,
+    y: i32,
+    level: u8,
+    slope: u8,
+) -> Option<crate::sim::components::DriveCoord> {
+    let point = cell_center(CellCoordinate { x, y }, 0);
+    Some(crate::sim::components::DriveCoord {
+        x: point.x,
+        y: point.y,
+        z: ground_height_leptons(level, slope, point.x, point.y).ok()?,
+    })
+}
+
+/// The XY of [`native_cell_own_coords`]: the centre of the cell's current
+/// packed coordinate, which a Dummy holds from its last stamp. It needs no
+/// supported slope.
+pub(crate) fn native_cell_own_xy(
+    cell: NativeCellIdentity,
+    cells: &NativeCellQuery<'_>,
+) -> [i32; 2] {
+    let (x, y) = cells.coord(cell);
+    let point = cell_center(
+        CellCoordinate {
+            x: i32::from(x),
+            y: i32::from(y),
+        },
+        0,
+    );
+    [point.x, point.y]
+}
+
 /// Native invalid-cell coordinates are process-global sentinels. At the Rust map
 /// boundary, represent that unproven raw value as `None` rather than manufacture it.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn checked_cell_from_world(
     world_x: i32,
     world_y: i32,
@@ -87,19 +376,8 @@ pub fn checked_cell_from_world(
     Some((x as u16, y as u16))
 }
 
-/// YR `CellClass::ComputeGroundHeightAtCoord @ 0x0047B3A0`; bridge height is
-/// deliberately not included.
-pub fn cell_floor_height(
-    level: u8,
-    slope_index: u8,
-    world_x: i32,
-    world_y: i32,
-) -> Result<i32, UnsupportedGroundSlope> {
-    ground_height_leptons(level, slope_index, world_x, world_y)
-}
-
 /// Apply the high-bridge deck only when a caller has already selected that layer.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn selected_cell_surface_height(floor_z: i32, deck_selected: bool) -> i32 {
     if deck_selected {
         floor_z.wrapping_add(BRIDGE_DECK_HEIGHT_LEPTONS)
@@ -109,9 +387,8 @@ pub fn selected_cell_surface_height(floor_z: i32, deck_selected: bool) -> i32 {
 }
 
 /// Alternate-list threshold: signed cell level plus four bridge levels,
-/// independent of the floor kernel. There is no
-/// `MapClass::PickInfantrySublocation` in this program — the name this
-/// comment used to carry was invented.
+/// independent of the floor kernel. `0x004ACA10`'s deck test
+/// ([`crate::sim::movement::bump_crush::pick_infantry_sublocation`]).
 pub fn selects_infantry_bridge_layer(has_high_bridge: bool, level: u8, input_z: i32) -> bool {
     let deck_z = i32::from(level as i8)
         .wrapping_add(4)
@@ -123,49 +400,26 @@ pub fn selects_infantry_bridge_layer(has_high_bridge: bool, level: u8, input_z: 
 /// square and sum them in x87, then Sqrt_Approx 0x4CAC40 and the truncating
 /// Math_ftol 0x7C5F00. Low-byte extraction and list admission belong to callers.
 pub(crate) fn native_xy_distance(dx: i32, dy: i32) -> i32 {
-    native_distance([dx, dy])
+    crate::util::native_x87::sqrt_approx_length([dx, dy])
 }
 
 /// `FootClass::Find_Path` head 0x4D39F3..0x4D3A2B: the actor's `+0x48`
 /// coordinate minus the target cell centre (x, y and z), each `FILD`ed, then
 /// `(dz*dz + dy*dy) + dx*dx`, `Sqrt_Approx` and the truncating `Math_ftol`.
 pub(crate) fn native_xyz_distance(dx: i32, dy: i32, dz: i32) -> i32 {
-    native_distance([dz, dy, dx])
+    crate::util::native_x87::sqrt_approx_length([dz, dy, dx])
 }
 
-/// `CoordStruct::Distance3D` 0x0041C380 over a signed delta: `(x*x + y*y)
-/// + z*z` in x87, `Sqrt_Approx` 0x4CAC40 and the truncating `Math_ftol`.
-pub(crate) fn native_coord_distance(dx: i32, dy: i32, dz: i32) -> i32 {
-    native_distance([dx, dy, dz])
-}
-
-/// Shared x87 shape: squares are accumulated in the given order, each square
-/// added to the running sum before the next component.
-fn native_distance(components: impl IntoIterator<Item = i32>) -> i32 {
-    use crate::util::native_x87::{X87Chop53, sqrt_approx_f32};
-    let mut components = components.into_iter().map(X87Chop53::load_i32);
-    let first = components.next().expect("at least one distance component");
-    let squared = components.fold(X87Chop53::mul(first, first), |sum, component| {
-        X87Chop53::add(sum, X87Chop53::mul(component, component))
-    });
-    let Ok(root_bits) = sqrt_approx_f32(squared) else {
-        return i32::MAX;
-    };
-    let Ok(root) = X87Chop53::load_f32(root_bits) else {
-        return i32::MAX;
-    };
-    X87Chop53::ftol_i64(root).map_or(i32::MAX, |distance| distance as i32)
-}
-
-/// `FindTechnoNearestTo` scoring after the caller has applied linked-list order,
-/// active bit, and excluded-object gates. Equal distances retain the first entry.
+/// Cell47C3D0 scoring after the caller supplies linked-list order, Techno
+/// identity (+14 bit0) and excluded-object gates. The native identity byte
+/// does not test health or limbo. Equal distances retain the first entry.
 pub fn nearest_eligible_in_order<T>(
     input: CellQueryPoint,
     candidates: impl IntoIterator<Item = (T, bool, CellQueryPoint)>,
 ) -> Option<T> {
     let mut winner: Option<(i32, T)> = None;
-    for (candidate, active, coordinate) in candidates {
-        if !active {
+    for (candidate, eligible, coordinate) in candidates {
+        if !eligible {
             continue;
         }
         let candidate_x = coordinate.x & 0xff;
@@ -183,13 +437,17 @@ pub fn nearest_eligible_in_order<T>(
 }
 
 /// `CellClass::PlaceInfantryInCell` @ `0x00481180` preference. Low bytes are
-/// intentional. (There is no `CellClass::FindInfantrySubposition`.)
+/// intentional. (There is no `CellClass::FindInfantrySubposition`.) The
+/// centre test is `dx² + dy²` through `Sqrt_Approx` and `Math::ftol`
+/// (`0x004811C6..0x004811EC`).
 pub fn infantry_preferred_spot(point: CellQueryPoint) -> u8 {
     let x = point.x & 0xff;
     let y = point.y & 0xff;
-    let dx = i64::from(x - CELL_CENTER_LEPTONS);
-    let dy = i64::from(y - CELL_CENTER_LEPTONS);
-    if isqrt_i64(dx * dx + dy * dy) < 60 {
+    if crate::util::native_x87::sqrt_approx_length([
+        x - CELL_CENTER_LEPTONS,
+        y - CELL_CENTER_LEPTONS,
+    ]) < 60
+    {
         return 0;
     }
     let bits = u8::from(x > CELL_CENTER_LEPTONS) | (u8::from(y > CELL_CENTER_LEPTONS) << 1);
@@ -237,23 +495,60 @@ pub fn select_infantry_subcell(
         .find(|spot| *spot >= 2 && occupied_mask & (1 << spot) == 0)
 }
 
-pub fn infantry_subcell_offset(spot: u8) -> (i32, i32, i32) {
-    INFANTRY_SUBCELL_OFFSETS
-        .get(usize::from(spot))
-        .copied()
-        .unwrap_or(INFANTRY_SUBCELL_OFFSETS[0])
-}
-
-#[cfg(test)]
+#[cfg(all(test, tests_sim_c_g))]
 mod tests {
     use super::*;
 
     #[test]
+    fn wall_overlay_prefix_matches_original_cell_queries() {
+        let native =
+            crate::test_fixture::json("tools/spatial_oracle/anytown_damage/authored_fence.json");
+        for case in native["cases"].as_array().unwrap() {
+            let controls = &case["query_controls"];
+            assert_eq!(controls["rng_before"], controls["rng_after"]);
+            for row in controls["rows"].as_array().unwrap() {
+                let stored = i32::try_from(row["stored"].as_i64().unwrap()).unwrap();
+                let requested = i32::try_from(row["requested"].as_i64().unwrap()).unwrap();
+                assert_eq!(
+                    wall_connection_step(stored, requested, None, false),
+                    WallConnectionStep::Return(row["returned_low_byte"].as_u64().unwrap() != 0),
+                    "original480510 query {row}"
+                );
+                assert_eq!(row["rng_unchanged"], true);
+            }
+        }
+    }
+
+    /// Ares 10015740 (hook 0x480534): the any-wall query answers the
+    /// OverlayType's `Wall=` for any index, not the three stock literals.
+    #[test]
+    fn ares_any_wall_query_reads_the_overlay_wall_flag() {
+        let overlays = crate::rules::overlay_types::OverlayTypeRegistry::from_ini(
+            &crate::rules::ini_parser::IniFile::from_str(
+                "[OverlayTypes]\n0=GASAND\n1=CYCL\n2=GAWALL\n\
+                 [GASAND]\nWall=yes\n[CYCL]\n[GAWALL]\n",
+            ),
+            None,
+        );
+        let any_wall = |stored| wall_connection_step(stored, -1, Some(&overlays), true);
+        assert_eq!(any_wall(0), WallConnectionStep::Return(true));
+        assert_eq!(any_wall(1), WallConnectionStep::Return(false));
+        // GAWALL's index without `Wall=yes` is no wall here.
+        assert_eq!(any_wall(2), WallConnectionStep::Return(false));
+        assert_eq!(any_wall(-1), WallConnectionStep::Return(false));
+        // A requested type still takes the stock arms.
+        assert_eq!(
+            wall_connection_step(0, 2, Some(&overlays), true),
+            WallConnectionStep::GdiBuildings
+        );
+    }
+
+    #[test]
     fn yr_cell_floor_and_coordinate_vectors() {
-        assert_eq!(cell_floor_height(0xff, 0, 0, 0), Ok(-103));
-        assert_eq!(cell_floor_height(0, 1, 255, 0), Ok(103));
-        assert_eq!(cell_floor_height(0, 13, 255, 255), Ok(207));
-        assert_eq!(cell_floor_height(0, 20, 255, 255), Ok(52));
+        assert_eq!(ground_height_leptons(0xff, 0, 0, 0), Ok(-103));
+        assert_eq!(ground_height_leptons(0, 1, 255, 0), Ok(103));
+        assert_eq!(ground_height_leptons(0, 13, 255, 255), Ok(207));
+        assert_eq!(ground_height_leptons(0, 20, 255, 255), Ok(52));
         assert_eq!(checked_cell_from_world(-1, 255, 2, 2), Some((0, 0)));
         assert_eq!(checked_cell_from_world(-257, 0, 2, 2), None);
         assert_eq!(
@@ -325,6 +620,23 @@ mod tests {
             4
         );
         assert_eq!(infantry_preferred_spot(CellQueryPoint { x: 68, y: 68 }), 0);
+        let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/sqrt_approx_distances.json",
+        ))
+        .unwrap();
+        // PlaceInfantryInCell 0x00481180..0x00481212 executed on each row's
+        // coordinate (tools/spatial_oracle/sqrt_approx_distances.py).
+        let rows = corpus["infantry"].as_array().unwrap();
+        for row in rows {
+            let [x, y, _]: [i32; 3] = serde_json::from_value(row["coord"].clone()).unwrap();
+            assert_eq!(
+                i64::from(infantry_preferred_spot(CellQueryPoint { x, y })),
+                row["expected"].as_i64().unwrap(),
+                "{}",
+                row["name"]
+            );
+        }
+        assert_eq!(rows.len(), 8);
         assert_eq!(select_infantry_subcell(0, 0, false, Some(0)), Some(2));
         assert_eq!(select_infantry_subcell(2, 1 << 2, false, None), Some(4));
         assert_eq!(
@@ -354,6 +666,5 @@ mod tests {
             false,
             false,
         ));
-        assert_eq!(infantry_subcell_offset(3), (64, 192, 0));
     }
 }

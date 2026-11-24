@@ -14,14 +14,15 @@
 //! terrain changes (building placement/destruction, bridge destruction).
 //!
 //! ## Dependency rules
-//! - Part of sim/ — depends on sim/pathfinding, sim/terrain_cost, sim/locomotor.
-//! - sim/ NEVER depends on render/, ui/, sidebar/, audio/, net/.
+//! - Part of sim/ — depends on sim/pathfinding, sim/locomotor.
+//! - sim/ NEVER depends on render/, ui/, audio/, net/.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use super::PathGrid;
 use super::zone_build;
-use super::zone_hierarchy::ZoneHierarchy;
+use super::zone_hierarchy::{ZONE_PRECHECK_LEVELS, ZoneHierarchy, ZoneLevelGraph};
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::rules::locomotor_type::MovementZone;
 use crate::rules::terrain_rules::LandType;
@@ -37,7 +38,10 @@ pub(crate) enum ZoneQueryCell {
 }
 
 impl ZoneQueryCell {
-    fn coord(self, cells: &crate::map::resolved_terrain::NativeCellQuery<'_>) -> (i16, i16) {
+    pub(crate) fn coord(
+        self,
+        cells: &crate::map::resolved_terrain::NativeCellQuery<'_>,
+    ) -> (i16, i16) {
         match self {
             Self::Copied(coord) => coord,
             Self::Retained(cell) => cells.coord(cell),
@@ -49,7 +53,22 @@ impl ZoneQueryCell {
 mod bridge_repair_zones;
 
 /// Zone ID: 0 = impassable/unassigned, 1+ = valid zone.
-pub type ZoneId = u16;
+// In-memory IDs can address a large hierarchy. Native word interpretation
+// remains selected by each map; snapshot layout versions describe this storage.
+pub type ZoneId = u32;
+
+pub(crate) fn raw_zone_invalid(grid: crate::map::cell_index::CellGrid) -> ZoneId {
+    if grid.is_extended() {
+        ZoneId::MAX
+    } else {
+        u32::from(u16::MAX)
+    }
+}
+
+/// Per-cell bridge-layer redirect: the ground cell whose zone a bridge-layer
+/// query reads, or `None` where the cell has no bridge layer. One table serves
+/// every movement row that uses bridges, so the rows share it.
+pub(crate) type BridgeRedirect = Arc<[Option<(u16, u16)>]>;
 
 /// Sentinel for impassable or unassigned cells.
 pub const ZONE_INVALID: ZoneId = 0;
@@ -59,22 +78,31 @@ pub const ZONE_INVALID: ZoneId = 0;
 pub struct ZoneMap {
     /// Zone ID per cell, indexed by `y * width + x`. ZONE_INVALID = impassable.
     ///
-    /// TODO(RE): RA2/YR does not store zone IDs directly per cell. Each cell carries
-    /// a nodeIndex, and each MovementZone has its own zoneIdByNodeIndex table.
+    /// Compatibility projection of native retained node indices and each
+    /// MovementZone's zoneIdByNodeIndex row. ZoneGrid owns those retained inputs
+    /// and rebuilds this projection at navigation publication boundaries.
     zone_ids: Vec<ZoneId>,
     /// Per-cell bridge redirect: for bridge cells, the ground endpoint cell
     /// whose zone ID should be returned for bridge-layer queries.
     /// None = no bridges on map. Mirrors gamemd.exe GetZoneID redirect (0x0056d230).
-    bridge_redirect: Option<Vec<Option<(u16, u16)>>>,
-    pub width: u16,
-    pub height: u16,
+    bridge_redirect: Option<BridgeRedirect>,
+    width: u16,
+    height: u16,
 }
 
 impl ZoneMap {
+    pub const fn width(&self) -> u16 {
+        self.width
+    }
+
+    pub const fn height(&self) -> u16 {
+        self.height
+    }
+
     /// Construct a ZoneMap from pre-computed arrays.
     pub(crate) fn new(
         zone_ids: Vec<ZoneId>,
-        bridge_redirect: Option<Vec<Option<(u16, u16)>>>,
+        bridge_redirect: Option<BridgeRedirect>,
         width: u16,
         height: u16,
     ) -> Self {
@@ -88,19 +116,19 @@ impl ZoneMap {
 
     /// Highest assigned zone ID. Native-derived maps reserve label 1, so this
     /// can be greater than the number of publicly passable components.
-    #[cfg(test)]
-    pub(crate) fn zone_count(&self) -> u16 {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn zone_count(&self) -> ZoneId {
         self.zone_ids.iter().copied().max().unwrap_or(ZONE_INVALID)
     }
 
     /// The ground-layer zone ID array (test fixtures only).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn zone_ids_slice(&self) -> &[ZoneId] {
         &self.zone_ids
     }
 
     /// Mutable ground-layer zone IDs (test fixtures only).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn zone_ids_mut(&mut self) -> &mut Vec<ZoneId> {
         &mut self.zone_ids
     }
@@ -108,11 +136,9 @@ impl ZoneMap {
     /// Look up the zone ID for a cell at the given layer in the reduced
     /// PathGrid zone labels, not native GetZoneID (that is
     /// [`ZoneGrid::get_zone_id_native`]). The bridge layer reads a redirect
-    /// table built at zone rebuild, not the live cells. RESIDUAL (#904):
-    /// `ZoneGrid::can_reach` (miner routing, zone_search, move-order
-    /// recovery) still answers through it. Trigger: a structural cell with no
-    /// matching high record, or an inactive deck. Effect: its answer can
-    /// differ from GetZoneID's. Frequency: bridge cells only.
+    /// table built at zone rebuild, not the live cells. Only a search without
+    /// blocker counts reads it, through [`ZoneGrid::can_reach`]; Foot routing,
+    /// miners and move orders answer through `can_reach_native`.
     ///
     /// For bridge-layer queries on a structural cell, returns the ground zone
     /// selected by the matching high-bridge record. Nonstructural cells a high
@@ -147,7 +173,7 @@ impl ZoneMap {
     }
 
     /// Replace the bridge redirect table.
-    pub(crate) fn set_bridge_redirect(&mut self, redirect: Option<Vec<Option<(u16, u16)>>>) {
+    pub(crate) fn set_bridge_redirect(&mut self, redirect: Option<BridgeRedirect>) {
         self.bridge_redirect = redirect;
     }
 }
@@ -159,6 +185,12 @@ pub struct ZoneGrid {
     maps: BTreeMap<MovementZone, ZoneMap>,
     /// The gamemd-style route-selection hierarchy shared by all rows.
     hierarchy: ZoneHierarchy,
+    /// Derived digest of this owner's retained navigation history. Mutable
+    /// entry points invalidate it before returning any writable borrow.
+    navigation_history_hash: crate::util::sync::OnceLock<u64>,
+    /// Deserialization restores the saved base plane/rows first. Native
+    /// LoadContent67E8CD rebuilds the hierarchy only after Cell/object load.
+    pending_native_load: bool,
     /// Cell-owned reduced classes, shared base clusters, and the retained raw
     /// per-row cluster mappings used by exact one-cell repair.
     base_topology: zone_build::BaseZoneTopology,
@@ -166,14 +198,238 @@ pub struct ZoneGrid {
     /// hierarchy snapshot; record-only changes invalidate cached connectivity.
     bridge_records: Vec<crate::sim::bridge_state::BridgeEndpointRecord>,
     native_bridge_source_size: Option<(i32, i32)>,
-    pub width: u16,
-    pub height: u16,
+    /// `Some(signed_levels)` while `base_topology` and `maps` are exactly what
+    /// [`Self::rebuild_base_connectivity_preserving_hierarchy`] last produced
+    /// with that terrain-deformation flag: no write has touched them since.
+    /// The base rebuild reads only the retained classes, levels, that flag,
+    /// the bridge records and the fixed sizes, so a rebuild with the same
+    /// flag and records would produce them again and is skipped. Not saved.
+    rebuilt_unchanged: Option<bool>,
+    width: u16,
+    height: u16,
+}
+
+/// Native Mouse Save5BE727..767 / Load5BE355..3A7 retain Map+68's
+/// classbyte,heightbyte,baseIDshort plane and all13 raw movement rows. The
+/// hierarchy, compatibility projections and digest are rebuilt, not saved.
+#[derive(serde::Deserialize)]
+struct RetainedZoneGrid {
+    width: u16,
+    height: u16,
+    base_topology: zone_build::BaseZoneTopology,
+}
+
+impl serde::Serialize for ZoneGrid {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(serde::Serialize)]
+        struct RetainedZoneGridRef<'a> {
+            width: u16,
+            height: u16,
+            base_topology: &'a zone_build::BaseZoneTopology,
+        }
+        RetainedZoneGridRef {
+            width: self.width,
+            height: self.height,
+            base_topology: &self.base_topology,
+        }
+        .serialize(serializer)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ZoneGrid {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let retained = RetainedZoneGrid::deserialize(deserializer)?;
+        let base = retained.base_topology;
+        // A traced placeholder skips the plane checks and the row projection.
+        let maps = if crate::util::save_codec::layout::describing() {
+            BTreeMap::new()
+        } else {
+            let count = usize::from(retained.width) * usize::from(retained.height);
+            if base.movement_classes.len() != count
+                || base.levels.len() != count
+                || base.zone_ids.len() != count
+            {
+                return Err(serde::de::Error::custom(
+                    "saved navigation plane dimensions differ",
+                ));
+            }
+            let labels = base.raw_zone_ids_by_row[0].len();
+            if labels == 0
+                || base
+                    .raw_zone_ids_by_row
+                    .iter()
+                    .any(|row| row.len() != labels)
+                || base.zone_ids.iter().any(|id| *id as usize >= labels)
+            {
+                return Err(serde::de::Error::custom(
+                    "saved navigation raw rows do not cover base IDs",
+                ));
+            }
+            MovementZone::all_ground()
+                .iter()
+                .map(|&movement| {
+                    (
+                        movement,
+                        zone_build::build_zone_map_from_base_topology(
+                            &base,
+                            movement,
+                            retained.width,
+                            retained.height,
+                        ),
+                    )
+                })
+                .collect()
+        };
+        let native_bridge_source_size = base.native_bridge_source_size;
+        let empty = || super::zone_hierarchy::ZoneLevelGraph::new(0);
+        Ok(Self {
+            maps,
+            hierarchy: ZoneHierarchy::new(empty(), empty(), empty()),
+            navigation_history_hash: crate::util::sync::OnceLock::new(),
+            pending_native_load: true,
+            base_topology: base,
+            bridge_records: Vec::new(),
+            native_bridge_source_size,
+            rebuilt_unchanged: None,
+            width: retained.width,
+            height: retained.height,
+        })
+    }
 }
 
 impl ZoneGrid {
+    pub const fn width(&self) -> u16 {
+        self.width
+    }
+
+    pub const fn height(&self) -> u16 {
+        self.height
+    }
+
+    pub(crate) fn is_native_load_pending(&self) -> bool {
+        self.pending_native_load
+    }
+
+    pub(crate) fn saved_hierarchy(&self) -> &[ZoneLevelGraph; ZONE_PRECHECK_LEVELS] {
+        self.hierarchy.saved_levels()
+    }
+
+    pub(crate) fn restore_saved_hierarchy(
+        &mut self,
+        levels: [ZoneLevelGraph; ZONE_PRECHECK_LEVELS],
+    ) -> Result<(), &'static str> {
+        let hierarchy = ZoneHierarchy::from_saved_levels(
+            levels,
+            (self.width, self.height),
+            self.native_bridge_source_size,
+        )?;
+        self.replace_hierarchy(hierarchy);
+        Ok(())
+    }
+
+    /// Original LoadContent67E8CD ->581F50 rebuilds levels2,1,0 from the
+    /// loaded Map+68 plane and raw movement rows. It does not call56C510 to
+    /// renumber base connectivity from current terrain. Executable retained
+    /// Save/Load and physical rebuild controls: anytown_navigation_restore.
+    pub(crate) fn finish_native_load(
+        &mut self,
+        path: &PathGrid,
+        terrain: &ResolvedTerrainGrid,
+        records: &[crate::sim::bridge_state::BridgeEndpointRecord],
+        bounds: Option<crate::map::playfield::PlayfieldBounds>,
+    ) -> Result<(), String> {
+        if terrain.width() != self.width || terrain.height() != self.height {
+            return Err("saved navigation dimensions differ from the bound map".into());
+        }
+        self.invalidate_navigation_history();
+        self.rebuilt_unchanged = None;
+        self.maps = Self::project_movement_rows(
+            &self.base_topology,
+            path,
+            terrain,
+            records,
+            self.width,
+            self.height,
+        );
+        self.hierarchy = zone_build::hierarchy::build_zone_hierarchy_with_query(
+            &self.base_topology,
+            Some(terrain),
+            records,
+            self.width,
+            self.height,
+            &mut |x, y| {
+                crate::sim::cell_rect::cell_is_in_playfield_height_aware(
+                    (x, y),
+                    bounds,
+                    Some(terrain),
+                )
+            },
+        );
+        self.bridge_records = records.to_vec();
+        self.pending_native_load = false;
+        Ok(())
+    }
+
+    /// Read-only contribution of the retained native navigation state.
+    /// Local56CB90/586990 updates preserve IDs, raw movement rows and ordered
+    /// hierarchy history. These facts affect live queries and future repairs,
+    /// so equal current terrain does not justify excluding them from the
+    /// lockstep hash. Ordinary load intentionally rebuilds the hierarchy at
+    /// LoadContent67E8CD; this method does not change save/load policy.
+    pub(crate) fn fold_navigation_history(&self, hasher: &mut impl std::hash::Hasher) {
+        use std::hash::Hash;
+        // Dimensions remain public read fields. Fold them outside the digest
+        // so an existing dimension assignment cannot leave a stale cache.
+        self.width.hash(hasher);
+        self.height.hash(hasher);
+        self.navigation_history_hash
+            .get_or_init(|| self.compute_navigation_history_hash())
+            .hash(hasher);
+    }
+
+    fn invalidate_navigation_history(&mut self) {
+        self.navigation_history_hash.take();
+    }
+
+    fn compute_navigation_history_hash(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        fn fold_slice<T: Hash>(values: &[T], hasher: &mut impl Hasher) {
+            (values.len() as u64).hash(hasher);
+            for value in values {
+                value.hash(hasher);
+            }
+        }
+
+        let mut hasher = crate::util::state_hasher::StateHasher::new();
+        self.base_topology
+            .native_bridge_source_size
+            .hash(&mut hasher);
+        self.native_bridge_source_size.hash(&mut hasher);
+        fold_slice(&self.bridge_records, &mut hasher);
+        fold_slice(&self.base_topology.movement_classes, &mut hasher);
+        fold_slice(&self.base_topology.levels, &mut hasher);
+        fold_slice(&self.base_topology.zone_ids, &mut hasher);
+        for row in &self.base_topology.raw_zone_ids_by_row {
+            fold_slice(row, &mut hasher);
+        }
+        (self.maps.len() as u64).hash(&mut hasher);
+        for (movement_zone, map) in &self.maps {
+            (movement_zone.matrix_row().expect("concrete movement row") as u32).hash(&mut hasher);
+            map.width.hash(&mut hasher);
+            map.height.hash(&mut hasher);
+            fold_slice(&map.zone_ids, &mut hasher);
+            map.bridge_redirect.is_some().hash(&mut hasher);
+            if let Some(redirect) = &map.bridge_redirect {
+                fold_slice(redirect, &mut hasher);
+            }
+        }
+        self.hierarchy.fold_history_hash(&mut hasher);
+        hasher.finish()
+    }
+
     /// Build zone maps from resolved terrain with no playfield bounds and no
     /// native Map Size receipt.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn build_with_terrain(
         path_grid: &PathGrid,
         terrain: &ResolvedTerrainGrid,
@@ -191,7 +447,7 @@ impl ZoneGrid {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn build_with_native_bridge_geometry(
         path_grid: &PathGrid,
         terrain: &ResolvedTerrainGrid,
@@ -274,7 +530,7 @@ impl ZoneGrid {
             native_bridge_source_size,
         );
         let hierarchy = if let Some(query) = query {
-            zone_build::build_zone_hierarchy_with_query(
+            zone_build::hierarchy::build_zone_hierarchy_with_query(
                 &base_topology,
                 Some(terrain),
                 bridge_records,
@@ -283,7 +539,7 @@ impl ZoneGrid {
                 &mut |x, y| query(x, y),
             )
         } else {
-            zone_build::build_zone_hierarchy(
+            zone_build::hierarchy::build_zone_hierarchy(
                 &base_topology,
                 Some(terrain),
                 bridge_records,
@@ -302,9 +558,12 @@ impl ZoneGrid {
         ZoneGrid {
             maps,
             hierarchy,
+            navigation_history_hash: crate::util::sync::OnceLock::new(),
+            pending_native_load: false,
             base_topology,
             bridge_records: bridge_records.to_vec(),
             native_bridge_source_size,
+            rebuilt_unchanged: None,
             width,
             height,
         }
@@ -320,23 +579,26 @@ impl ZoneGrid {
         width: u16,
         height: u16,
     ) -> BTreeMap<MovementZone, ZoneMap> {
-        MovementZone::all_ground()
-            .iter()
-            .map(|&mz| {
-                let mut zone_map =
-                    zone_build::build_zone_map_from_base_topology(base, mz, width, height);
-                if mz.can_use_bridges() {
-                    zone_map.set_bridge_redirect(zone_build::build_bridge_redirect(
-                        path_grid,
-                        Some(terrain),
-                        bridge_records,
-                        width,
-                        height,
-                    ));
-                }
-                (mz, zone_map)
-            })
-            .collect()
+        // The redirect reads only the terrain and the bridge records, so one
+        // table serves every row that uses bridges. The rows project
+        // independently; `parallel::map` keeps them in row order.
+        let redirect = zone_build::build_bridge_redirect(
+            path_grid,
+            Some(terrain),
+            bridge_records,
+            width,
+            height,
+        );
+        let rows = MovementZone::all_ground();
+        let maps = crate::sim::parallel::map(rows, |&mz| {
+            let mut zone_map =
+                zone_build::build_zone_map_from_base_topology(base, mz, width, height);
+            if mz.can_use_bridges() {
+                zone_map.set_bridge_redirect(redirect.clone());
+            }
+            zone_map
+        });
+        rows.iter().copied().zip(maps).collect()
     }
 
     pub(crate) fn bridge_inputs_match(
@@ -353,8 +615,10 @@ impl ZoneGrid {
     }
 
     /// Mutable access to one row's zone map (test fixtures only).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn map_mut(&mut self, mz: MovementZone) -> Option<&mut ZoneMap> {
+        self.invalidate_navigation_history();
+        self.rebuilt_unchanged = None;
         self.maps.get_mut(&mz)
     }
 
@@ -407,7 +671,7 @@ impl ZoneGrid {
     /// raw row value `0xFFFF`. Otherwise it projects the cell's own base
     /// cluster through the movement row. It reads the current native cell
     /// identity and flags rather than a cache.
-    pub(crate) fn get_zone_id_native(
+    pub fn get_zone_id_native(
         &self,
         terrain: &ResolvedTerrainGrid,
         coord: (u16, u16),
@@ -486,12 +750,11 @@ impl ZoneGrid {
                     }
                     // Constructor dummy tile65535 is outside both high sets
                     // in all six hash-bound retail theaters (bridge report).
-                    if let CellRef::Real(exit) = current {
-                        if terrain.high_bridge_tile_offset(exit).is_some()
-                            && exit.yr_cell_land_type != LandType::Rock.as_index()
-                        {
-                            selected = record.endpoint_b;
-                        }
+                    if let CellRef::Real(exit) = current
+                        && terrain.high_bridge_tile_offset(exit).is_some()
+                        && exit.land_type != LandType::Rock.as_index()
+                    {
+                        selected = record.endpoint_b;
                     }
                 }
             }
@@ -507,7 +770,6 @@ impl ZoneGrid {
     /// raw zone queries in that order. A missing topology is unavailable input,
     /// not a negative native predicate. Raw WORDFFFF and DWORDFFFFFFFF remain
     /// distinct. See walk_move_admission and walk_failed_path native corpora.
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn can_reach_native(
         &self,
         cells: &crate::map::resolved_terrain::NativeCellQuery<'_>,
@@ -588,12 +850,131 @@ impl ZoneGrid {
     }
 
     /// Get the shared route-selection hierarchy when this movement row exists.
-    pub(crate) fn hierarchy_for(&self, mz: MovementZone) -> Option<&ZoneHierarchy> {
+    pub fn hierarchy_for(&self, mz: MovementZone) -> Option<&ZoneHierarchy> {
         self.maps.contains_key(&mz).then_some(&self.hierarchy)
     }
 
     pub(crate) fn bridge_records(&self) -> &[crate::sim::bridge_state::BridgeEndpointRecord] {
         &self.bridge_records
+    }
+
+    /// Map 583820: find a structural bridge's exit cell in one hierarchy
+    /// zone. EstimateZoneCost uses this for its two bridge-distance terms.
+    /// Original instructions and bounded controls are retained alongside
+    /// tools/spatial_oracle/fv_cell_attack/zone_cost.json.
+    pub(crate) fn bridge_cell_for_hierarchy_zone(
+        &self,
+        terrain: &ResolvedTerrainGrid,
+        original: (u16, u16),
+        level: usize,
+        zone: ZoneId,
+        bounds: Option<crate::map::playfield::PlayfieldBounds>,
+    ) -> Result<(u16, u16), String> {
+        use crate::sim::cell_rect::{
+            CellRef, cell_is_in_playfield_height_aware, get_cellclass_fallback,
+        };
+        use crate::util::direction::DIRECTION_DELTAS;
+
+        let lookup = |coord: (u16, u16)| {
+            get_cellclass_fallback(
+                Some(terrain),
+                i32::from(coord.0 as i16),
+                i32::from(coord.1 as i16),
+            )
+        };
+        let coord = |cell: &CellRef<'_>| match cell {
+            CellRef::Real(cell) => (cell.rx, cell.ry),
+            CellRef::Dummy { cell } => {
+                let xy = cell.snapshot().coord;
+                (xy.0 as u16, xy.1 as u16)
+            }
+        };
+        let flags = |cell: &CellRef<'_>| match cell {
+            CellRef::Real(cell) => cell.bridge_facts.raw_flags,
+            CellRef::Dummy { cell } => cell.retained_bridge_flags(),
+        };
+        let is_exit = |cell: &CellRef<'_>| {
+            matches!(cell, CellRef::Real(cell)
+                if terrain.high_bridge_tile_offset(cell).is_some()
+                && cell.land_type != LandType::Rock.as_index())
+        };
+        let step = |xy: (u16, u16), direction: usize| {
+            let delta = DIRECTION_DELTAS[direction];
+            (
+                xy.0.wrapping_add(delta.0 as u16),
+                xy.1.wrapping_add(delta.1 as u16),
+            )
+        };
+        let mut positive = lookup(original);
+        if flags(&positive) & 0x100 == 0 {
+            return Ok(coord(&positive));
+        }
+        let direction = if flags(&positive) & 0x800 != 0 { 2 } else { 4 };
+        let mut negative = positive.clone();
+        let mut positive_exit = (0, 0);
+        let mut negative_exit = (0, 0);
+        let mut visited = std::collections::BTreeSet::new();
+        loop {
+            let state = (
+                coord(&positive),
+                matches!(positive, CellRef::Dummy { .. }),
+                coord(&negative),
+                matches!(negative, CellRef::Dummy { .. }),
+            );
+            if !visited.insert(state) {
+                return Err("cyclic583820 bridge exit walk".into());
+            }
+            if flags(&positive) & 0x100 != 0 {
+                positive = lookup(step(coord(&positive), direction));
+                if flags(&positive) & 0x100 == 0 && is_exit(&positive) {
+                    positive_exit = coord(&positive);
+                }
+            }
+            if flags(&negative) & 0x100 != 0 {
+                negative = lookup(step(coord(&negative), (direction + 4) & 7));
+                if flags(&negative) & 0x100 == 0 && is_exit(&negative) {
+                    negative_exit = coord(&negative);
+                }
+            }
+            if flags(&positive) & 0x100 == 0 && flags(&negative) & 0x100 == 0 {
+                break;
+            }
+        }
+        // 583972..583AA0 probes six copied coordinates, including offsets
+        // from the (0,0) sentinel. Each mode-1 bounds query executes in order.
+        for candidate in [
+            positive_exit,
+            step(positive_exit, (direction + 2) & 7),
+            step(positive_exit, (direction + 6) & 7),
+            negative_exit,
+            step(negative_exit, (direction + 2) & 7),
+            step(negative_exit, (direction + 6) & 7),
+        ] {
+            if bounds.is_some_and(|bounds| {
+                !cell_is_in_playfield_height_aware(
+                    (i32::from(candidate.0 as i16), i32::from(candidate.1 as i16)),
+                    Some(bounds),
+                    Some(terrain),
+                )
+            }) {
+                continue;
+            }
+            let found = self
+                .hierarchy_zone_at_native(level, candidate)
+                .ok_or("583820 requires the native hierarchy node")?;
+            // The native load sign-extends the stored short, whereas its
+            // requested zone argument is the zero-extended path identifier.
+            if if crate::map::cell_index::CellGrid::for_extent(self.width, self.height)
+                .is_extended()
+            {
+                found == zone
+            } else {
+                i64::from(found as i16) == i64::from(zone)
+            } {
+                return Ok(candidate);
+            }
+        }
+        Ok((0, 0))
     }
 
     pub(crate) fn movement_classes_match(&self, terrain: &ResolvedTerrainGrid) -> bool {
@@ -612,6 +993,24 @@ impl ZoneGrid {
     /// without assigning a zone or rebuilding hierarchy. Mutation owners that
     /// have a later native repair callback use this to make the new class/height
     /// visible to earlier ordered neighbor repairs.
+    /// Whether the cell's retained class and level already match `terrain`;
+    /// a shared copy (docs/sim-thread.md) is then left shared.
+    pub(crate) fn base_cell_attributes_current(
+        &self,
+        terrain: &ResolvedTerrainGrid,
+        x: u16,
+        y: u16,
+    ) -> bool {
+        if x >= self.width || y >= self.height {
+            return false;
+        }
+        let index = y as usize * self.width as usize + x as usize;
+        self.base_topology.movement_classes.get(index)
+            == Some(&zone_build::movement_class_for_cell(terrain, x, y))
+            && self.base_topology.levels.get(index)
+                == Some(&terrain.cell(x, y).map_or(0, |cell| cell.level))
+    }
+
     pub(crate) fn refresh_base_cell_attributes_at(
         &mut self,
         terrain: &ResolvedTerrainGrid,
@@ -621,17 +1020,24 @@ impl ZoneGrid {
         if x >= self.width || y >= self.height {
             return false;
         }
+        if self.base_cell_attributes_current(terrain, x, y) {
+            return true;
+        }
         let index = y as usize * self.width as usize + x as usize;
+        let class = zone_build::movement_class_for_cell(terrain, x, y);
+        let level = terrain.cell(x, y).map_or(0, |cell| cell.level);
+        self.invalidate_navigation_history();
+        self.rebuilt_unchanged = None;
         let base = &mut self.base_topology;
         let Some(slot) = base.movement_classes.get_mut(index) else {
             return false;
         };
-        *slot = zone_build::movement_class_for_cell(terrain, x, y);
-        base.levels[index] = terrain.cell(x, y).map_or(0, |cell| cell.level);
+        *slot = class;
+        base.levels[index] = level;
         true
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn base_movement_class_at(&self, x: u16, y: u16) -> Option<u8> {
         if x >= self.width || y >= self.height {
             return None;
@@ -642,14 +1048,28 @@ impl ZoneGrid {
             .copied()
     }
 
-    pub(crate) fn base_topology_mut(&mut self) -> &mut zone_build::BaseZoneTopology {
+    pub(super) fn base_topology_mut(&mut self) -> &mut zone_build::BaseZoneTopology {
+        self.invalidate_navigation_history();
+        self.rebuilt_unchanged = None;
         &mut self.base_topology
+    }
+
+    /// Read-only view of the retained base topology.
+    pub(super) fn base_topology(&self) -> &zone_build::BaseZoneTopology {
+        &self.base_topology
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn base_topology_mut_for_test(&mut self) -> &mut zone_build::BaseZoneTopology {
+        self.base_topology_mut()
     }
 
     /// Supplied raw Map+18 row premise in native query fixtures. This does
     /// not claim to reproduce the topology producer or its cluster numbering.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn test_supply_uniform_raw_zone_rows(&mut self, zone: ZoneId) {
+        self.invalidate_navigation_history();
+        self.rebuilt_unchanged = None;
         for row in &mut self.base_topology.raw_zone_ids_by_row {
             row.fill(zone);
         }
@@ -661,12 +1081,15 @@ impl ZoneGrid {
     pub(crate) fn base_and_hierarchy_mut(
         &mut self,
     ) -> (&zone_build::BaseZoneTopology, &mut ZoneHierarchy) {
+        self.invalidate_navigation_history();
         (&self.base_topology, &mut self.hierarchy)
     }
 
     /// Project one adopted base cluster through the retained raw 13-row maps.
     /// No topology, count, adjacency, or unrelated cell is rewritten.
     pub(crate) fn project_adopted_base_cell(&mut self, cell_index: usize) {
+        self.invalidate_navigation_history();
+        self.rebuilt_unchanged = None;
         let Some(&cluster) = self.base_topology.zone_ids.get(cell_index) else {
             return;
         };
@@ -675,10 +1098,19 @@ impl ZoneGrid {
             let raw = self.base_topology.raw_zone_ids_by_row[row]
                 .get(cluster as usize)
                 .copied()
-                .unwrap_or(u16::MAX);
-            let projected = (raw > 1 && raw != u16::MAX)
-                .then_some(raw)
-                .unwrap_or(ZONE_INVALID);
+                .unwrap_or(raw_zone_invalid(
+                    crate::map::cell_index::CellGrid::for_extent(self.width, self.height),
+                ));
+            let projected = if raw > 1
+                && raw
+                    != raw_zone_invalid(crate::map::cell_index::CellGrid::for_extent(
+                        self.width,
+                        self.height,
+                    )) {
+                raw
+            } else {
+                ZONE_INVALID
+            };
             if let Some(map) = self.maps.get_mut(&movement_zone) {
                 map.set_ground_zone_at_index(cell_index, projected);
             }
@@ -686,6 +1118,7 @@ impl ZoneGrid {
     }
 
     pub(crate) fn replace_hierarchy(&mut self, hierarchy: ZoneHierarchy) {
+        self.invalidate_navigation_history();
         self.hierarchy = hierarchy;
     }
 
@@ -697,9 +1130,34 @@ impl ZoneGrid {
         resolved_terrain: &ResolvedTerrainGrid,
         bridge_records: &[crate::sim::bridge_state::BridgeEndpointRecord],
     ) {
+        self.invalidate_navigation_history();
+        let signed_levels = resolved_terrain.terrain_deformation();
+        if self.rebuilt_unchanged == Some(signed_levels)
+            && self.bridge_records.as_slice() == bridge_records
+        {
+            // Nothing the base pass reads has changed since it last ran, and
+            // nothing has written its products: running it again would give
+            // the same base topology and rows. Only the rows' bridge redirect
+            // also reads the terrain, so it is projected again as
+            // `project_movement_rows` does.
+            let redirect = zone_build::build_bridge_redirect(
+                path_grid,
+                Some(resolved_terrain),
+                bridge_records,
+                self.width,
+                self.height,
+            );
+            for (movement_zone, zone_map) in &mut self.maps {
+                if movement_zone.can_use_bridges() {
+                    zone_map.set_bridge_redirect(redirect.clone());
+                }
+            }
+            return;
+        }
         let base_topology = zone_build::rebuild_base_zone_topology(
             self.base_topology.movement_classes.clone(),
             self.base_topology.levels.clone(),
+            signed_levels,
             bridge_records,
             self.width,
             self.height,
@@ -715,11 +1173,13 @@ impl ZoneGrid {
         );
         self.base_topology = base_topology;
         self.bridge_records = bridge_records.to_vec();
+        self.rebuilt_unchanged = Some(signed_levels);
     }
 
     /// Replace the one shared route-selection hierarchy (test fixtures only).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_hierarchy(&mut self, hierarchy: ZoneHierarchy) {
+        self.invalidate_navigation_history();
         self.hierarchy = hierarchy;
     }
 
@@ -768,13 +1228,15 @@ pub(crate) fn cell_is_in_native_map_diamond(
     map_size_width: i32,
     map_size_height: i32,
 ) -> bool {
-    let x = coord.0 as i16 as i32;
-    let y = coord.1 as i16 as i32;
-    let sum = x.wrapping_add(y);
-    map_size_width < sum
-        && x.wrapping_sub(y) < map_size_width
-        && y.wrapping_sub(x) < map_size_width
-        && sum <= map_size_width.wrapping_add(map_size_height.wrapping_mul(2))
+    crate::map::playfield::size_diamond_contains(
+        map_size_width,
+        map_size_height,
+        (coord.0 as i16, coord.1 as i16),
+    )
 }
 
 // Tests are declared in zone/mod.rs (zone_map_tests.rs).
+
+#[cfg(all(test, any(tests_sim_pathfinding, tests_sim_movement)))]
+#[path = "zone_history_hash_tests.rs"]
+mod history_hash_tests;

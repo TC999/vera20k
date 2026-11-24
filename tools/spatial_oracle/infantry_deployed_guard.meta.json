@@ -1,6 +1,5 @@
 {
   "schema_version": 1,
-  "native_sha256": "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c",
   "unicorn_binding": "2.1.4",
   "unicorn_core": [
     2,
@@ -267,10 +266,6 @@
       "sha256": "e38c30dc682e5648e14d56ba7251de9b7cf4ee59bb89a2e4926377b660e85345"
     }
   ],
-  "source_normalized_lf_sha256": {
-    "generator": "4a7aea6358cd78ccc298eb4d065e0a94c40a02b05ef4d4d9e8487184ce5f3bee",
-    "native_oracle": "79dac1057d97e706f106a26145f00fa220d92c172b5173876c60fed22c17530c",
-    "map_queries": "f1c798f50bf8a69ebe53c6d0e2327ce395ad99ba5c7017e74e353757770f4305"
-  },
-  "payload_sha256": "92d14ccb42f845f1ea9d3ab88f6b6b9e9b947edafd505ea61f0b972704bcf1f9"
+  "payload_sha256": "92d14ccb42f845f1ea9d3ab88f6b6b9e9b947edafd505ea61f0b972704bcf1f9",
+  "replay_command": "python -m tools.spatial_oracle.infantry_deploy_action --deployed-guard"
 }

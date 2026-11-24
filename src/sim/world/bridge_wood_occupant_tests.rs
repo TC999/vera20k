@@ -6,7 +6,7 @@
 //! movement, outer area-strength admission or whole-world scheduling parity is claimed.
 use super::*;
 use crate::headless_scenario::HeadlessScenario;
-use crate::sim::combat::{AttackTarget, TargetKind};
+use crate::sim::combat::TargetKind;
 use crate::sim::components::DriveCoord;
 use crate::sim::mission::state::MissionTestFixture;
 use crate::sim::mission::{MissionDispatchTimer, MissionId};
@@ -61,7 +61,7 @@ impl OrdinaryBridgeHost for Observed<'_, '_> {
             .terrain()
             .cell(coord.0 as u16, coord.1 as u16)
             .expect("physical bridge cell")
-            .yr_cell_land_type;
+            .land_type;
         self.events.push(json!({"kind":"occupants","coord":coord,
             "mode_byte":mode,"land":land}));
         OrdinaryBridgeHost::occupants(&mut self.inner, cell, mode)
@@ -82,7 +82,7 @@ impl OrdinaryDamageHost for Observed<'_, '_> {
 
 fn spawn(scene: &mut HeadlessScenario, point: (u16, u16)) -> u64 {
     let runtime = &mut scene.runtime;
-    let owner = runtime.simulation.session.current_house.unwrap();
+    let owner = runtime.simulation.session.current_house().unwrap();
     let owner_name = runtime.simulation.resolve(owner).to_owned();
     runtime
         .simulation
@@ -93,7 +93,7 @@ fn spawn(scene: &mut HeadlessScenario, point: (u16, u16)) -> u64 {
             point.1,
             0,
             &runtime.resources.rules,
-            &runtime.resources.overlay_registry,
+            runtime.resources.rules.overlay_registry(),
         )
         .expect("retail MTNK on repaired Road")
 }
@@ -114,8 +114,8 @@ fn prime(scene: &mut HeadlessScenario, input: &Value, initial: &Value, rng: &Val
         sim.remove_entity_occupancy(primary);
         sim.remove_entity_occupancy(second);
         let entity = sim.substrate.entities.get_mut(second).unwrap();
-        entity.position.rx = current.0;
-        entity.position.ry = current.1;
+        entity.position.set_rx_for_test(current.0);
+        entity.position.set_ry_for_test(current.1);
         sim.add_entity_occupancy(second);
         sim.add_entity_occupancy(primary);
         actors.push(second);
@@ -123,11 +123,13 @@ fn prime(scene: &mut HeadlessScenario, input: &Value, initial: &Value, rng: &Val
     let sim = &mut scene.runtime.simulation;
     for &id in &actors {
         let actor = sim.substrate.entities.get_mut(id).unwrap();
-        actor.on_bridge = false;
-        actor.rearm_timer = CdTimer::from_raw(0, 0);
-        actor.movement_target = None;
-        actor.navigation.nav_com = None;
-        actor.navigation.suspended_nav_com = None;
+        actor.set_on_bridge(false);
+        actor
+            .seldom
+            .rearm_timer
+            .set_for_test(CdTimer::from_raw(0, 0));
+        actor.navigation.set_nav_com_for_test(None);
+        actor.navigation.set_suspended_nav_com_for_test(None);
         actor.mission.apply_test_fixture(MissionTestFixture {
             current: MissionId::from_raw(initial["mission"].as_i64().unwrap() as i32),
             suspended: MissionId::from_raw(if id == primary {
@@ -142,41 +144,61 @@ fn prime(scene: &mut HeadlessScenario, input: &Value, initial: &Value, rng: &Val
             ai_counter: 0,
             dispatch_timer: MissionDispatchTimer::at_frame(0),
         });
-        actor.attack_target = (id == primary && input["target_impact"] == true)
-            .then(|| AttackTarget::for_cell(115, 59));
-        actor.suspended_attack_target = (id == primary)
-            .then(|| input.get("restore_target"))
-            .flatten()
-            .map(|point| {
-                TargetKind::Cell(
-                    point[0].as_u64().unwrap() as u16,
-                    point[1].as_u64().unwrap() as u16,
-                )
-            });
+        actor.attack_target.set_for_test(
+            (id == primary && input["target_impact"] == true).then(|| TargetKind::Cell(115, 59)),
+        );
+        actor.seldom.suspended_attack_target.set_for_test(
+            (id == primary)
+                .then(|| input.get("restore_target"))
+                .flatten()
+                .map(|point| {
+                    TargetKind::Cell(
+                        point[0].as_u64().unwrap() as u16,
+                        point[1].as_u64().unwrap() as u16,
+                    )
+                }),
+        );
         // Spawn installs the active Drive locomotor; its external class state
         // is lazy (locomotor_owner/AtCoord interpret None as constructor state).
         // Use the existing Stop_Moving owner to materialize that default before
         // supplying the native packet's head/fraction. No movement tick runs.
         assert!(crate::sim::movement::track_stop_moving(actor));
-        let drive = actor
-            .drive_locomotion
-            .as_mut()
-            .expect("retail Drive locomotor");
-        drive.destination = None;
-        drive.head_to = input.get("head_cell").map(|p| {
-            DriveCoord::cell(
-                p[0].as_u64().unwrap() as u16,
-                p[1].as_u64().unwrap() as u16,
-                208,
+        let drive = actor.locomotor.as_mut().unwrap();
+        assert!(drive.store_track_destination(
+            crate::sim::movement::track_process::TrackFamily::Drive,
+            None
+        ));
+        assert!(drive.store_track_head(
+            crate::sim::movement::track_process::TrackFamily::Drive,
+            input.get("head_cell").map(|p| {
+                DriveCoord::cell(
+                    p[0].as_u64().unwrap() as u16,
+                    p[1].as_u64().unwrap() as u16,
+                    208,
+                )
+            })
+        ));
+        assert!(
+            drive.store_track_valid(
+                crate::sim::movement::track_process::TrackFamily::Drive,
+                drive
+                    .track_head(crate::sim::movement::track_process::TrackFamily::Drive)
+                    .is_some()
             )
-        });
-        drive.track_valid = drive.head_to.is_some();
-        drive.target_speed_fraction = SimFixed::from_num(initial["fraction"].as_f64().unwrap());
+        );
+        assert!(drive.store_track_target_fraction(
+            crate::sim::movement::track_process::TrackFamily::Drive,
+            SimFixed::from_num(initial["fraction"].as_f64().unwrap())
+        ));
     }
     // The joined native constructors receive frame 1000 and GameSpeed 4 at
     // their supplied boundary (0x00A8EB60); normalized Anim rates depend on it.
-    sim.session.binary_frame = 1000;
-    assert!(sim.session.game_options.apply_in_game_speed(4));
+    sim.session.set_binary_frame_for_test(1000);
+    assert!(
+        sim.session
+            .game_options_mut_for_test()
+            .apply_in_game_speed(4)
+    );
     sim.main_rng = serde_json::from_value(rng.clone()).unwrap();
     sim.scenario_rng = serde_json::from_value(rng.clone()).unwrap();
     sim.mapgen_rng = serde_json::from_value(rng.clone()).unwrap();
@@ -207,42 +229,44 @@ fn snapshot(
     other_active_units: i32,
 ) -> Value {
     let actor = sim.substrate.entities.get(actors[0]).unwrap();
-    let owner = actor.owner;
+    let owner = actor.owner();
     let second = actors.get(1).map(|&id| {
         let member = sim.substrate.entities.get(id).unwrap();
-        json!({"health":member.health.current,"alive":u8::from(member.lifecycle.object_alive),
-            "limbo":u8::from(member.lifecycle.in_limbo),"marked":u8::from(member.lifecycle.cell_marked),
+        json!({"health":member.health.current(),"alive":u8::from(member.lifecycle.object_alive()),
+            "limbo":u8::from(member.lifecycle.in_limbo()),"marked":u8::from(member.lifecycle.cell_marked()),
             "object_next":object_name(sim.next_cell_object(CellObjectMember::Entity(id)),actors),
-            "target":target_name(member.attack_target.as_ref().map(|target| &target.target))})
+            "target":target_name(member.attack_target.target().as_ref())})
     });
-    let current = (actor.position.rx, actor.position.ry);
+    let current = (actor.position.rx(), actor.position.ry());
     let terrain = sim.resolved_terrain.as_ref().unwrap();
     let xyz = position_world_coord(&actor.position);
     let head = actor
-        .drive_locomotion
+        .locomotor
         .as_ref()
+        .and_then(|l| l.selected_drive_runtime())
+        .and_then(|r| r.retained())
         .unwrap()
-        .head_to
+        .head_to()
         .map_or([0; 3], |head| [head.x, head.y, head.z]);
     json!({
-        "second":second,"health":actor.health.current,"alive":u8::from(actor.lifecycle.object_alive),
-        "marked":u8::from(actor.lifecycle.cell_marked),"limbo":u8::from(actor.lifecycle.in_limbo),
-        "on_bridge":u8::from(actor.on_bridge),"sink":u8::from(actor.sinking.is_active()),
+        "second":second,"health":actor.health.current(),"alive":u8::from(actor.lifecycle.object_alive()),
+        "marked":u8::from(actor.lifecycle.cell_marked()),"limbo":u8::from(actor.lifecycle.in_limbo()),
+        "on_bridge":u8::from(actor.on_bridge()),"sink":u8::from(actor.sinking.is_active()),
         "ground_head":object_name(sim.cell_objects(current,MovementLayer::Ground).next(),actors),
         "object_next":object_name(sim.next_cell_object(CellObjectMember::Entity(actors[0])),actors),
-        "deferred_count":actors.iter().filter(|id| sim.substrate.pending_delete.contains(id)).count(),
-        "owner_losses":sim.houses[&owner].stats.units_lost-initial_losses,
+        "deferred_count":actors.iter().filter(|id| sim.substrate.pending_delete.contains_object(id)).count(),
+        "owner_losses":sim.houses[&owner].stats().units_lost()-initial_losses,
         // Native House+5574 counts on-map units. EntityStore's type index
         // counts stored objects, including these retained dead receivers.
-        "owner_active_units":sim.houses[&owner].tracking.active_for_test().0-other_active_units,
-        "current_land":terrain.cell(current.0,current.1).unwrap().yr_cell_land_type,
-        "impact_land":terrain.cell(115,59).unwrap().yr_cell_land_type,
-        "target":target_name(actor.attack_target.as_ref().map(|target| &target.target)),
+        "owner_active_units":sim.houses[&owner].tracking().active_for_test().0-other_active_units,
+        "current_land":terrain.cell(current.0,current.1).unwrap().land_type,
+        "impact_land":terrain.cell(115,59).unwrap().land_type,
+        "target":target_name(actor.attack_target.target().as_ref()),
         "mission":actor.mission.current().raw(),"suspended":actor.mission.suspended().raw(),
-        "suspended_target":target_name(actor.suspended_attack_target.as_ref()),
-        "nav":if actor.navigation.nav_com.is_none(){"null"}else{"unexpected nav"},
+        "suspended_target":target_name(actor.seldom.suspended_attack_target.target().as_ref()),
+        "nav":if actor.navigation.nav_com().is_none(){"null"}else{"unexpected nav"},
         "head":head,"xyz":[xyz.x,xyz.y,xyz.z],
-        "timer":[actor.rearm_timer.start_frame(),0,actor.rearm_timer.duration()],
+        "timer":[actor.seldom.rearm_timer.start_frame(),0,actor.seldom.rearm_timer.duration()],
     })
 }
 
@@ -264,10 +288,12 @@ fn assert_state(
                     .entities
                     .get(actors[0])
                     .unwrap()
-                    .drive_locomotion
+                    .locomotor
                     .as_ref()
+                    .and_then(|l| l.selected_drive_runtime())
+                    .and_then(|r| r.retained())
                     .unwrap()
-                    .target_speed_fraction,
+                    .target_speed_fraction(),
                 SimFixed::from_num(expected.as_f64().unwrap()),
                 "{context}: Drive+50"
             );
@@ -359,13 +385,13 @@ impl EffectBoundary {
             "{context}: admitted Anims {boundary}"
         );
         for (&(id, anim), expected) in anims.iter().zip(native) {
-            let runtime = &anim.runtime;
+            let runtime = &anim.runtime();
             let actual = json!({
-                "object":names[id], "anim_type":sim.resolve(anim.type_id),
-                "location":[anim.world_coord.x,anim.world_coord.y,anim.world_coord.z],
-                "native_id_offset":(anim.native_unique_id as u32).wrapping_sub(self.native_id_cursor) as i32,
-                "draw_flags":anim.draw_flags, "z_adjust":anim.z_adjust,
-                "is_bouncing":u8::from(anim.bounce.is_some()),
+                "object":names[id], "anim_type":sim.resolve(anim.type_id()),
+                "location":[anim.world_coord().x,anim.world_coord().y,anim.world_coord().z],
+                "native_id_offset":(anim.native_unique_id() as u32).wrapping_sub(self.native_id_cursor) as i32,
+                "draw_flags":anim.draw_flags(), "z_adjust":anim.z_adjust(),
+                "is_bouncing":u8::from(anim.bounce().is_some()),
                 "runtime":{
                     "current_frame":runtime.current_frame,"frame_step":runtime.frame_step,
                     "delay_remaining":runtime.delay_remaining,"rate_reload":runtime.rate_reload,
@@ -382,12 +408,14 @@ impl EffectBoundary {
                     names[id]
                 );
             }
-            if let Some(bounce) = &anim.bounce {
+            if let Some(bounce) = &anim.bounce() {
                 let actual = json!({
-                    "elasticity_bits":bounce.elasticity.bits(),"gravity_bits":bounce.gravity.bits(),
-                    "clamp_bits":bounce.angular_velocity_magnitude.bits(),
-                    "position_bits":bounce.position.map(|v| v.bits()),
-                    "velocity_bits":bounce.velocity.map(|v| v.bits())
+                    "elasticity_bits":bounce.elasticity().bits(),"gravity_bits":bounce.gravity().bits(),
+                    "clamp_bits":bounce.angular_velocity_magnitude().bits(),
+                    "position_bits":bounce.position().map(|v| v.bits()),
+                    "velocity_bits":bounce.velocity().map(|v| v.bits()),
+                    "orientation_bits":bounce.orientation().map(|v| v.bits()),
+                    "rotation_bits":bounce.rotation().map(|v| v.bits())
                 });
                 for (key, value) in actual.as_object().unwrap() {
                     assert_eq!(
@@ -396,9 +424,6 @@ impl EffectBoundary {
                         names[id]
                     );
                 }
-                // Quaternion bytes stay native evidence. BounceState owns
-                // axis/angle for presentation; this comparison covers its
-                // complete gameplay position/velocity fields and RNG draws.
             }
         }
     }
@@ -432,8 +457,13 @@ fn assert_span(sim: &Simulation, native: &Value, context: &str) {
             json!([
                 x,
                 y,
-                cell.bridge_facts.overlay_id.map_or(-1, i32::from),
-                cell.yr_cell_land_type
+                sim.overlay_grid
+                    .as_ref()
+                    .unwrap()
+                    .cell(x, y)
+                    .overlay_id
+                    .map_or(-1, i32::from),
+                cell.land_type
             ]),
             *row,
             "{context}: raw cell {x},{y}"
@@ -448,10 +478,9 @@ fn assert_span(sim: &Simulation, native: &Value, context: &str) {
 #[test]
 #[ignore = "requires physical Shrapnel and retail SNOW assets"]
 fn retail_wood_occupants_match_native_list_lifetime_detach_and_rng() {
-    let corpus: Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tools/spatial_oracle/shrapnel_damage/occupants_joined_test_vectors.json"
-    )))
+    let corpus: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/shrapnel_damage/occupants_joined_test_vectors.json",
+    ))
     .unwrap();
     assert_eq!(corpus["cases"].as_array().unwrap().len(), 7);
     for case in corpus["cases"].as_array().unwrap() {
@@ -466,9 +495,9 @@ fn retail_wood_occupants_match_native_list_lifetime_detach_and_rng() {
         );
         let sim = scene.sim();
         let actor = sim.substrate.entities.get(actors[0]).unwrap();
-        let initial_losses = sim.houses[&actor.owner].stats.units_lost;
+        let initial_losses = sim.houses[&actor.owner()].stats().units_lost();
         let other_active_units =
-            sim.houses[&actor.owner].tracking.active_for_test().0 - actors.len() as i32;
+            sim.houses[&actor.owner()].tracking().active_for_test().0 - actors.len() as i32;
         let effects = EffectBoundary::capture(sim);
         for stage in case["stages"].as_array().unwrap() {
             let context = format!("{name}/{}", stage["stage"].as_str().unwrap());
@@ -485,9 +514,9 @@ fn retail_wood_occupants_match_native_list_lifetime_detach_and_rng() {
             let sim = &mut runtime.simulation;
             sim.clear_lifecycle_test_events_for_test();
             let mut live = LivePublication {
+                frame_effects: crate::sim::world::FrameEffects::default(),
                 sim,
                 rules: &runtime.resources.rules,
-                registry: Some(&runtime.resources.overlay_registry),
                 collapsed: false,
             };
             let mut host = Observed {
@@ -508,7 +537,8 @@ fn retail_wood_occupants_match_native_list_lifetime_detach_and_rng() {
                 host.inner.live.sim.stop_all_targeting_cell(
                     115,
                     59,
-                    Some(&runtime.resources.rules),
+                    &runtime.resources.rules,
+                    &mut crate::sim::world::FrameEffects::default(),
                 );
             }
             assert_eq!(
@@ -565,10 +595,9 @@ fn retail_wood_occupants_match_native_list_lifetime_detach_and_rng() {
 #[test]
 #[ignore = "requires physical Shrapnel and retail SNOW assets"]
 fn retail_wood_hut_collapse_matches_native_live_occupants_and_animation_order() {
-    let corpus: Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tools/spatial_oracle/shrapnel_damage/hut_joined_test_vectors.json"
-    )))
+    let corpus: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/shrapnel_damage/hut_joined_test_vectors.json",
+    ))
     .unwrap();
     assert_eq!(corpus["cases"].as_array().unwrap().len(), 2);
     for case in corpus["cases"].as_array().unwrap() {
@@ -583,9 +612,9 @@ fn retail_wood_hut_collapse_matches_native_live_occupants_and_animation_order() 
             &corpus["rng_seed0"],
         );
         let sim = scene.sim();
-        let owner = sim.substrate.entities.get(actors[0]).unwrap().owner;
-        let initial_losses = sim.houses[&owner].stats.units_lost;
-        let other_units = sim.houses[&owner].tracking.active_for_test().0 - actors.len() as i32;
+        let owner = sim.substrate.entities.get(actors[0]).unwrap().owner();
+        let initial_losses = sim.houses[&owner].stats().units_lost();
+        let other_units = sim.houses[&owner].tracking().active_for_test().0 - actors.len() as i32;
         let effects = EffectBoundary::capture(sim);
         assert_state(
             sim,
@@ -605,8 +634,11 @@ fn retail_wood_hut_collapse_matches_native_live_occupants_and_animation_order() 
         // Already-admitted Map574C20 boundary. Original Bomb/Building prefix
         // and later AnimAI are separate consumers, not supplied return values.
         assert!(crate::sim::world::bridge_orchestrator::dispatch_bridge_collapse_from_hut_with_overlay_registry(
-            &mut runtime.simulation, &runtime.resources.rules, hut,
-            Some(&runtime.resources.overlay_registry)));
+            &mut runtime.simulation,
+            &runtime.resources.rules,
+            hut,
+            &mut crate::sim::world::FrameEffects::default(),
+        ));
         let sim = &runtime.simulation;
         assert_state(
             sim,

@@ -9,15 +9,10 @@ use super::*;
 fn retail_middle_perpendicular_live_tiles_match_original_sequences() {
     let retail = std::env::var("RA2_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            crate::util::config::GameConfig::load()
-                .unwrap()
-                .paths
-                .ra2_dir
-        });
+        .unwrap_or_else(|_| crate::test_fixture::game_config().unwrap().paths.ra2_dir);
     let map = std::env::var("VERA20K_C3Y03MD_MAP").unwrap_or_else(|_| "c3y03md.map".into());
-    let corpus: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/bridge_middle_tiles.json"
+    let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/bridge_middle_tiles.json",
     ))
     .unwrap();
     let cases = corpus["cases"].as_array().unwrap();
@@ -48,9 +43,9 @@ fn retail_middle_perpendicular_live_tiles_match_original_sequences() {
                 _ => unreachable!(),
             };
             let mut live = LivePublication {
+                frame_effects: crate::sim::world::FrameEffects::default(),
                 sim: &mut runtime.simulation,
                 rules: &runtime.resources.rules,
-                registry: Some(&runtime.resources.overlay_registry),
                 collapsed: false,
             };
             live.perpendicular(
@@ -71,6 +66,7 @@ fn retail_middle_perpendicular_live_tiles_match_original_sequences() {
                 let after = &change["after"];
                 let p = coord(&after["coord"]);
                 let cell = live.terrain().cell(p.0, p.1).unwrap();
+                let overlay = live.sim.overlay_grid.as_ref().unwrap().cell(p.0, p.1);
                 let context = format!("{axis:?}/{phase:?}/{p:?}");
                 assert_eq!(
                     cell.final_tile_index,
@@ -83,12 +79,12 @@ fn retail_middle_perpendicular_live_tiles_match_original_sequences() {
                     "{context}"
                 );
                 assert_eq!(
-                    cell.bridge_facts.state_byte,
+                    overlay.overlay_data,
                     after["state"].as_u64().unwrap() as u8,
                     "{context}"
                 );
                 assert_eq!(
-                    cell.bridge_facts.overlay_id.map_or(-1, i32::from),
+                    overlay.overlay_id.map_or(-1, i32::from),
                     after["overlay"].as_i64().unwrap() as i32,
                     "{context}"
                 );
@@ -111,7 +107,7 @@ fn retail_middle_perpendicular_live_tiles_match_original_sequences() {
                         "{context}"
                     );
                     assert_eq!(
-                        cell.yr_cell_land_type,
+                        cell.land_type,
                         after["land"].as_u64().unwrap() as u8,
                         "{context}"
                     );
@@ -128,7 +124,7 @@ fn retail_middle_perpendicular_live_tiles_match_original_sequences() {
                 );
             }
             let mut restored = initial.clone();
-            for (&p, state) in &live.sim.dynamic_terrain_cells {
+            for (&p, state) in live.sim.dynamic_terrain_cells.iter() {
                 assert!(restored.apply_dynamic_cell_state(p.0, p.1, state));
                 assert_eq!(
                     DynamicTerrainCellState::capture(restored.cell(p.0, p.1).unwrap()),

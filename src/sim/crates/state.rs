@@ -4,8 +4,10 @@
 //! pair is the sole emptiness discriminator; accepted ghosts retain the same
 //! coordinate/timer state as visible crates.
 
+use crate::sim::rng::SimRng;
 use crate::sim::timer::CdTimer;
-use crate::util::native_x87::{NativeF64Bits, X87Chop53};
+use crate::util::native_random::minutes_timer_frames;
+use crate::util::native_x87::NativeF64Bits;
 
 pub(crate) const CRATE_SLOT_CAPACITY: usize = 256;
 
@@ -57,21 +59,31 @@ impl Default for CrateAuthority {
 }
 
 impl CrateAuthority {
-    pub(crate) fn first_empty_index(&self) -> Option<usize> {
+    /// Map no-init565190 follows MouseLoad's raw read and empties every slot,
+    /// including ghosts, without pausing/rebasing any of its three timer words.
+    pub(in crate::sim) fn reset_coordinates_after_user_load(&mut self) {
+        for slot in &mut self.slots {
+            slot.cell_x = 0;
+            slot.cell_y = 0;
+        }
+    }
+
+    pub(super) fn first_empty_index(&self) -> Option<usize> {
         self.slots.iter().position(|slot| slot.is_empty())
     }
 
-    pub(crate) fn slots(&self) -> &[CrateSlot; CRATE_SLOT_CAPACITY] {
+    pub fn slots(&self) -> &[CrateSlot; CRATE_SLOT_CAPACITY] {
         &self.slots
     }
 
-    pub(crate) fn slot_mut(&mut self, index: usize) -> &mut CrateSlot {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn slot_mut_for_test(&mut self, index: usize) -> &mut CrateSlot {
         &mut self.slots[index]
     }
 
     /// Accepted coordinates in native ascending slot order. Negative packed
     /// values are malformed snapshot state and cannot name a Rust grid cell.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn occupied_cells(&self) -> impl Iterator<Item = (u16, u16)> + '_ {
         self.slots.iter().filter_map(|slot| {
             if slot.is_empty() {
@@ -85,32 +97,62 @@ impl CrateAuthority {
     }
 }
 
-/// Compute the accepted-slot timer words in the verified x87 expression
-/// direction from `CrateSlot__PlaceOverlayAndInitTimer @ 0x004A17C0`.
-pub(crate) fn crate_timer_words(
+/// The live slot table and Scenario RNG borrowed together for crate placement or removal.
+pub(crate) struct CrateSlotUpdates<'a> {
+    authority: &'a mut CrateAuthority,
+    scenario_rng: &'a mut SimRng,
+}
+
+impl<'a> CrateSlotUpdates<'a> {
+    pub(crate) fn new(authority: &'a mut CrateAuthority, scenario_rng: &'a mut SimRng) -> Self {
+        Self {
+            authority,
+            scenario_rng,
+        }
+    }
+
+    /// `CrateSlot__PlaceOverlayAndInitTimer @ 0x004A17C0`: an accepted visible
+    /// or ghost crate stores its coordinate before drawing and installing its timer.
+    pub(super) fn accept_placement(
+        self,
+        index: usize,
+        cell: (u16, u16),
+        regen: NativeF64Bits,
+        current_frame: i32,
+    ) {
+        let slot = &mut self.authority.slots[index];
+        slot.cell_x = cell.0 as i16;
+        slot.cell_y = cell.1 as i16;
+        let draw = self.scenario_rng.next_range_u32_inclusive(0, 0x7fff_fffe);
+        (slot.start_frame, slot.aux, slot.duration) = crate_timer_words(regen, draw, current_frame);
+    }
+
+    /// `CrateSlot__ClearAndPreserveTimer @ 0x004A1750` frees the coordinate
+    /// after overlay removal and pauses a running timer at its remaining time.
+    pub(super) fn clear_and_preserve_timer(self, index: usize, current_frame: i32) {
+        let slot = &mut self.authority.slots[index];
+        slot.cell_x = 0;
+        slot.cell_y = 0;
+        let mut timer = slot.timer();
+        timer.pause(current_frame);
+        slot.start_frame = timer.start_frame();
+        slot.duration = timer.duration();
+    }
+}
+
+/// Compute the accepted-slot timer words of
+/// `CrateSlot__PlaceOverlayAndInitTimer @ 0x004A17C0`: the duration
+/// [`minutes_timer_frames`] draws from `CrateRegen=`, then
+/// `0x004A18BA..0x004A18C5` store the start frame, the high dword of the
+/// stored upper bound and that duration.
+pub(super) fn crate_timer_words(
     regen: NativeF64Bits,
     draw: u32,
     current_frame: i32,
 ) -> (i32, u32, i32) {
     debug_assert!(draw <= 0x7fff_fffe);
-    let regen = X87Chop53::load_f64(regen).expect("validated CrateRegen");
-    let lower = X87Chop53::mul(regen, X87Chop53::load_i32(450));
-    let upper = X87Chop53::mul(regen, X87Chop53::load_i32(1800));
-    let fraction = X87Chop53::div(
-        X87Chop53::load_i32(draw as i32),
-        X87Chop53::load_i32(0x7fff_fffe),
-    )
-    .expect("nonzero crate timer divisor");
-    let value = X87Chop53::add(
-        lower,
-        X87Chop53::mul(fraction, X87Chop53::sub(upper, lower)),
-    );
-    let stored_upper = X87Chop53::store_f64(upper).expect("finite CrateRegen upper");
-    // `Math__ftol @ 0x007C5F00` executes masked `FISTP qword`; an
-    // out-of-range conversion stores integer-indefinite i64::MIN. The crate
-    // writer at 0x004A18C5 keeps only EAX, so either-sign overflow becomes 0.
-    let duration = X87Chop53::ftol_i32_low_masked(value);
-    (current_frame, (stored_upper.bits() >> 32) as u32, duration)
+    let (duration, upper) = minutes_timer_frames(regen, draw);
+    (current_frame, (upper.bits() >> 32) as u32, duration)
 }
 
 mod crate_slot_array_serde {
@@ -167,7 +209,7 @@ mod crate_slot_array_serde {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_c_g))]
 mod tests {
     use super::*;
 
@@ -186,13 +228,13 @@ mod tests {
         }));
         assert_eq!(authority.first_empty_index(), Some(0));
 
-        authority.slot_mut(0).cell_x = 7;
+        authority.slot_mut_for_test(0).cell_x = 7;
         assert_eq!(authority.first_empty_index(), Some(1));
-        authority.slot_mut(0).cell_x = 0;
-        authority.slot_mut(0).cell_y = -2;
+        authority.slot_mut_for_test(0).cell_x = 0;
+        authority.slot_mut_for_test(0).cell_y = -2;
         assert_eq!(authority.first_empty_index(), Some(1));
-        authority.slot_mut(0).cell_y = 0;
-        authority.slot_mut(0).duration = 99;
+        authority.slot_mut_for_test(0).cell_y = 0;
+        authority.slot_mut_for_test(0).duration = 99;
         assert_eq!(
             authority.first_empty_index(),
             Some(0),
@@ -209,28 +251,31 @@ mod tests {
         );
     }
 
+    /// The words original PlaceOverlayAndInitTimer stores for six CrateRegen
+    /// values and eight draws: the top draw ends one frame short of
+    /// `regen * 1800`, a chopped `7.3 * 450` floors below 3285, and an
+    /// out-of-range FISTP keeps the integer indefinite's low dword 0.
     #[test]
-    fn crate_timer_native_endpoints_and_interior_vector() {
-        let regen = NativeF64Bits::from_bits(3.0_f64.to_bits());
-        assert_eq!(crate_timer_words(regen, 0, -1), (-1, 0x40b5_1800, 1350));
-        assert_eq!(
-            crate_timer_words(regen, 0x7fff_fffe, i32::MIN),
-            (i32::MIN, 0x40b5_1800, 5400)
-        );
-        assert_eq!(
-            crate_timer_words(regen, 0x3fff_ffff, 77),
-            (77, 0x40b5_1800, 3375)
-        );
-    }
-
-    #[test]
-    fn crate_timer_out_of_range_fistp_stores_integer_indefinite_low_dword() {
-        for regen in [1.0e20_f64, -1.0e20_f64] {
-            let (_, _, duration) =
-                crate_timer_words(NativeF64Bits::from_bits(regen.to_bits()), 0x3fff_ffff, 91);
+    fn crate_timer_words_match_the_native_rows() {
+        let corpus = crate::test_fixture::json("tools/unit_draw_oracle.json");
+        let rows = corpus["crate_timer"].as_array().expect("native rows");
+        assert_eq!(rows.len(), 48);
+        let int = |row: &serde_json::Value, key: &str| row[key].as_i64().expect(key);
+        for row in rows {
+            let regen = row["regen"].as_f64().expect("regen");
+            let draw = int(row, "draw") as u32;
             assert_eq!(
-                duration, 0,
-                "masked FISTP qword writes i64::MIN and the native slot keeps low EAX"
+                crate_timer_words(
+                    NativeF64Bits::from_bits(regen.to_bits()),
+                    draw,
+                    int(row, "frame") as i32
+                ),
+                (
+                    int(row, "start_frame") as i32,
+                    int(row, "aux") as u32,
+                    int(row, "duration") as i32
+                ),
+                "CrateRegen {regen}, draw {draw:#x}"
             );
         }
     }
@@ -278,7 +323,7 @@ mod tests {
             },
         ] {
             let mut changed = Simulation::new();
-            *changed.crate_authority.slot_mut(73) = slot;
+            *changed.crate_authority_mut_for_test().slot_mut_for_test(73) = slot;
             assert_ne!(baseline_current, changed.state_hash());
         }
     }
@@ -289,20 +334,19 @@ mod tests {
 
         let mut baseline = Simulation::with_seed(0x1414);
         let mut changed = Simulation::with_seed(0x1414);
-        *changed.crate_authority.slot_mut(4) = CrateSlot {
+        *changed.crate_authority_mut_for_test().slot_mut_for_test(4) = CrateSlot {
             start_frame: i32::MAX,
             aux: u32::MAX,
             duration: i32::MIN,
             cell_x: -7,
             cell_y: 31,
         };
-        let empty_families = [&[][..], &[][..], &[][..], &[][..], &[][..]];
         assert_eq!(
             baseline
-                .compute_retail_multiplayer_checksum(empty_families)
+                .compute_retail_multiplayer_checksum()
                 .expect("baseline checksum"),
             changed
-                .compute_retail_multiplayer_checksum(empty_families)
+                .compute_retail_multiplayer_checksum()
                 .expect("changed checksum")
         );
     }

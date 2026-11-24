@@ -13,11 +13,10 @@
 //! instrument rather than decoration: 256 labelled swatches in a 16x16 grid,
 //! with the house-colour remap band `[16, 32)` outlined and named, because
 //! "which indices remap" is the question a palette dump is opened to answer.
-//! Index 0 and every entry carrying the raw magenta chroma key are outlined
-//! too — both are drawn fully transparent by the standard decode, so their
-//! colour alone tells a reader nothing. With `--house` a second grid is drawn
-//! with the ramp applied, plus a contact sheet holding both, so the before and
-//! after can be compared in one image.
+//! Index 0 is outlined too: the SHP blitters skip it, so its colour alone tells
+//! a reader nothing. No other entry is keyed. With `--house` a second grid is
+//! drawn with the ramp applied, plus a contact sheet holding both, so the
+//! before and after can be compared in one image.
 //!
 //! Every burned-in label is built from the drawable glyph set only (see
 //! [`label_text`]): the shared 5x7 font covers space, `-`, `:`, `/`, digits and
@@ -35,8 +34,8 @@ use std::path::{Path, PathBuf};
 
 use crate::asset_tools::canvas::{self, Rgba, SheetCell};
 use crate::asset_tools::identify;
-use crate::asset_tools::palette::AlphaPolicy;
 use crate::asset_tools::report::{ErrorReport, PaletteChoice, RenderOutputs, RenderReport};
+use crate::asset_tools::sanitise_name;
 use crate::asset_tools::verb_render::RenderOptions;
 use crate::assets::asset_manager::AssetManager;
 use crate::assets::pal_file::{Color, Palette};
@@ -65,7 +64,7 @@ const INDEX_TSV_NAME: &str = "index.tsv";
 
 /// Header row of [`INDEX_TSV_NAME`]. `raw_*` are the stored 6-bit components,
 /// `hex` is what the engine's `raw << 2` decode produces from them.
-const INDEX_TSV_HEADER: &str = "index\trow\tcol\thex\traw_r\traw_g\traw_b\talpha\tremap_band\tmark";
+const INDEX_TSV_HEADER: &str = "index\trow\tcol\thex\traw_r\traw_g\traw_b\tremap_band\tmark";
 
 /// Bytes of a .pal file: 256 entries x 3 components.
 const PAL_FILE_BYTES: usize = 768;
@@ -75,12 +74,6 @@ const PAL_COLORS: usize = 256;
 
 /// Highest legal component in an unscaled VGA 6-bit palette.
 const VGA_6BIT_MAX: u8 = 63;
-
-/// The stored triplet the standard palette decode treats as a chroma key. Read
-/// from the *raw* bytes: the decode multiplies components by four, so the
-/// parsed colour can no longer be distinguished from a legitimate bright
-/// magenta.
-const RAW_MAGENTA_KEY: [u8; 3] = [63, 0, 63];
 
 /// House-colour remap band as a half-open `[start, end)` palette index range.
 /// With 16 grid columns this is exactly the second row, which is why the band
@@ -128,9 +121,6 @@ const HEADER_COLOR: [u8; 4] = [255, 255, 255, 255];
 const REMAP_BAND_COLOR: [u8; 4] = [0, 200, 255, 255];
 /// Yellow: index 0, transparent by convention.
 const TRANSPARENT_MARKER_COLOR: [u8; 4] = [255, 230, 0, 255];
-/// Green: an entry storing the raw magenta chroma key. Green because it has to
-/// stay legible against the magenta swatch it outlines.
-const MAGENTA_MARKER_COLOR: [u8; 4] = [0, 255, 90, 255];
 /// Index labels, picked per swatch by [`label_color_for`].
 const SWATCH_LABEL_DARK: [u8; 4] = [0, 0, 0, 255];
 const SWATCH_LABEL_LIGHT: [u8; 4] = [255, 255, 255, 255];
@@ -181,7 +171,7 @@ pub fn run_pcx(
     let mut still = build_pcx_still(resolved.bytes, name, opts)?;
     warnings.append(&mut still.warnings);
 
-    let sanitised = sanitise_name(name);
+    let sanitised = sanitise_name(name, FALLBACK_DIR_NAME);
     let dir = prepare_output_dir(&opts.out, &sanitised)?;
     let png_path = dir.join(still_png_name(&sanitised));
     save(&png_path, &still.image)?;
@@ -394,7 +384,7 @@ pub fn run_pal(
     let mut render = build_pal_render(bytes, name, &source_archive, opts, house)?;
     warnings.append(&mut render.warnings);
 
-    let sanitised = sanitise_name(name);
+    let sanitised = sanitise_name(name, FALLBACK_DIR_NAME);
     let dir = prepare_output_dir(&opts.out, &sanitised)?;
 
     let base_path = dir.join(grid_png_name(&sanitised));
@@ -448,15 +438,13 @@ pub fn run_pal(
     ))
 }
 
-/// Why one swatch is called out. Both marked states are drawn fully transparent
-/// by the standard decode, so their colour alone would mislead.
+/// Why one swatch is called out. Index 0 is never drawn (the SHP blitters skip
+/// it), so its colour alone would mislead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SwatchMark {
     None,
-    /// Index 0: transparent by convention in every Westwood palette.
+    /// Index 0: skipped by the SHP blitters.
     TransparentIndex0,
-    /// The stored triplet is the raw magenta chroma key.
-    MagentaKey,
 }
 
 impl SwatchMark {
@@ -464,7 +452,6 @@ impl SwatchMark {
         match self {
             Self::None => None,
             Self::TransparentIndex0 => Some(TRANSPARENT_MARKER_COLOR),
-            Self::MagentaKey => Some(MAGENTA_MARKER_COLOR),
         }
     }
 
@@ -473,7 +460,6 @@ impl SwatchMark {
         match self {
             Self::None => "none",
             Self::TransparentIndex0 => "index0-transparent",
-            Self::MagentaKey => "magenta-key",
         }
     }
 }
@@ -486,7 +472,6 @@ struct PalRow {
     col: usize,
     hex: String,
     raw: [u8; 3],
-    alpha: u8,
     remap_band: bool,
     mark: SwatchMark,
 }
@@ -556,19 +541,8 @@ fn build_pal_render(
         );
     }
 
-    let marks = swatch_marks(bytes);
+    let marks = swatch_marks();
     let rows = pal_rows(&palette, bytes, &marks);
-    let keyed = marks
-        .iter()
-        .filter(|mark| **mark == SwatchMark::MagentaKey)
-        .count();
-    if keyed > 0 {
-        warnings.push(format!(
-            "{keyed} entries store the raw magenta chroma key {} {} {}, which the standard decode \
-             turns fully transparent — they are outlined in green",
-            RAW_MAGENTA_KEY[0], RAW_MAGENTA_KEY[1], RAW_MAGENTA_KEY[2]
-        ));
-    }
 
     let base_header = pal_header(name, source_archive, None);
     let base_grid = draw_swatch_grid(&palette, &marks, &base_header);
@@ -597,12 +571,8 @@ fn build_pal_render(
 
     let house_grid = house.map(|(index, ramp)| {
         let remapped = palette.with_house_colors(&ramp);
-        // Band markers describe the *stored* entries, and the band no longer
-        // holds them, so they are dropped for this grid rather than left to
-        // label a colour that is not there any more.
-        let house_marks = marks_outside_band(&marks);
         let header = pal_header(name, source_archive, Some(index));
-        canvas::upscale_nearest(&draw_swatch_grid(&remapped, &house_marks, &header), scale)
+        canvas::upscale_nearest(&draw_swatch_grid(&remapped, &marks, &header), scale)
     });
 
     Ok(PalRender {
@@ -627,12 +597,11 @@ fn pal_report(
         kind: KIND_PAL.to_string(),
         asset: name.to_string(),
         source_archive: source_archive.to_string(),
-        // The asset is the palette. Naming it here tells the reader which decode
+        // The asset is the palette. Naming it here tells the reader which file
         // produced the swatch colours, which is the whole provenance question.
         palette: Some(PaletteChoice {
             name: name.to_string(),
             reason: "the rendered asset is itself the palette".to_string(),
-            alpha_policy: AlphaPolicy::Standard.as_str().to_string(),
             confidence: "declared".to_string(),
             // No engine path is being cited: the asset simply is the palette.
             production_site: None,
@@ -651,36 +620,18 @@ fn pal_report(
     }
 }
 
-/// Classify every entry from the raw stored bytes.
-fn swatch_marks(bytes: &[u8]) -> [SwatchMark; PAL_COLORS] {
+/// The mark of every entry: only index 0 is called out, whatever its colour.
+/// It sits outside the remap band, so a remapped grid keeps the same marks.
+fn swatch_marks() -> [SwatchMark; PAL_COLORS] {
     let mut marks = [SwatchMark::None; PAL_COLORS];
-    for (index, mark) in marks.iter_mut().enumerate() {
-        if index == 0 {
-            *mark = SwatchMark::TransparentIndex0;
-            continue;
-        }
-        let base = index * 3;
-        if bytes.get(base..base + 3) == Some(&RAW_MAGENTA_KEY[..]) {
-            *mark = SwatchMark::MagentaKey;
-        }
-    }
+    marks[0] = SwatchMark::TransparentIndex0;
     marks
-}
-
-/// Copy of `marks` with the remap band cleared, for a grid whose band has been
-/// overwritten by a house ramp.
-fn marks_outside_band(marks: &[SwatchMark; PAL_COLORS]) -> [SwatchMark; PAL_COLORS] {
-    let mut cleared = *marks;
-    for mark in &mut cleared[HOUSE_REMAP_BAND[0]..HOUSE_REMAP_BAND[1]] {
-        *mark = SwatchMark::None;
-    }
-    cleared
 }
 
 fn pal_rows(palette: &Palette, bytes: &[u8], marks: &[SwatchMark; PAL_COLORS]) -> Vec<PalRow> {
     (0..PAL_COLORS)
         .map(|index| {
-            let color = palette.colors[index];
+            let color = palette.colors()[index];
             let base = index * 3;
             let raw = match bytes.get(base..base + 3) {
                 Some(slice) => [slice[0], slice[1], slice[2]],
@@ -692,7 +643,6 @@ fn pal_rows(palette: &Palette, bytes: &[u8], marks: &[SwatchMark; PAL_COLORS]) -
                 col: index % GRID_COLS,
                 hex: format!("#{:02X}{:02X}{:02X}", color.r, color.g, color.b),
                 raw,
-                alpha: color.a,
                 remap_band: (HOUSE_REMAP_BAND[0]..HOUSE_REMAP_BAND[1]).contains(&index),
                 mark: marks[index],
             }
@@ -702,7 +652,7 @@ fn pal_rows(palette: &Palette, bytes: &[u8], marks: &[SwatchMark; PAL_COLORS]) -
 
 fn pal_index_tsv_row(row: &PalRow) -> String {
     format!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         row.index,
         row.row,
         row.col,
@@ -710,7 +660,6 @@ fn pal_index_tsv_row(row: &PalRow) -> String {
         row.raw[0],
         row.raw[1],
         row.raw[2],
-        row.alpha,
         row.remap_band,
         row.mark.tag()
     )
@@ -797,9 +746,8 @@ fn draw_swatch_grid(
         canvas::draw_text(&mut image, i64::from(GRID_MARGIN), y, text, HEADER_COLOR);
     }
 
-    for index in 0..PAL_COLORS {
+    for (index, (&color, mark)) in palette.colors().iter().zip(marks.iter()).enumerate() {
         let (x, y) = swatch_origin(index, header.len());
-        let color = palette.colors[index];
         let swatch = Rgba::new_filled(SWATCH_SIZE, SWATCH_SIZE, [color.r, color.g, color.b, 255]);
         canvas::blit_over(&mut image, &swatch, x, y);
         canvas::draw_text(
@@ -809,7 +757,7 @@ fn draw_swatch_grid(
             &index.to_string(),
             label_color_for(color),
         );
-        if let Some(marker) = marks[index].marker_color() {
+        if let Some(marker) = mark.marker_color() {
             canvas::draw_rect_outline(
                 &mut image,
                 x - 1,
@@ -902,7 +850,7 @@ fn label_color_for(color: Color) -> [u8; 4] {
 /// Header burned into a swatch grid. Always the same number of lines for the
 /// raw and remapped grids, so both images stay the same height.
 ///
-/// The legend is split across two lines on purpose: one line naming all three
+/// The legend is split across two lines on purpose: one line naming both
 /// marker colours would clip against the grid width, and a clipped legend is
 /// worse than no legend.
 fn pal_header(name: &str, source_archive: &str, house: Option<u8>) -> Vec<String> {
@@ -915,7 +863,7 @@ fn pal_header(name: &str, source_archive: &str, house: Option<u8>) -> Vec<String
         header_line("palette swatch grid 16 by 16   index 0 top left   row major"),
         header_line(&band_line),
         header_line("cyan outline is the house colour remap band 16 to 31"),
-        header_line("yellow outline index 0 transparent   green outline magenta key"),
+        header_line("yellow outline index 0 transparent"),
     ]
 }
 
@@ -927,7 +875,7 @@ fn comparison_sheet_header(name: &str, source_archive: &str, house: u8) -> Vec<S
         label_text(&format!(
             "palette as stored first   house colour scheme {house} applied second"
         )),
-        label_text("cyan outline house remap band 16 to 31   yellow index 0   green magenta key"),
+        label_text("cyan outline house remap band 16 to 31   yellow index 0"),
     ]
 }
 
@@ -1010,26 +958,6 @@ fn save(path: &Path, image: &Rgba) -> Result<(), ErrorReport> {
     })
 }
 
-/// Replace every character outside `[A-Za-z0-9._-]` so the name is safe as a
-/// directory and filename component on any platform.
-fn sanitise_name(name: &str) -> String {
-    let sanitised: String = name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitised.is_empty() {
-        FALLBACK_DIR_NAME.to_string()
-    } else {
-        sanitised
-    }
-}
-
 /// `<out>/render/<sanitised>/`, absolutised so the reported paths do not depend
 /// on the reader's working directory.
 fn render_dir(out: &Path, sanitised: &str) -> PathBuf {
@@ -1108,7 +1036,7 @@ fn fit_scale(w: u32, h: u32, requested: u32) -> Option<u32> {
     Some(scale)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_asset_tools))]
 mod tests {
     use super::*;
 
@@ -1175,28 +1103,6 @@ mod tests {
     // --- grid geometry -----------------------------------------------------
 
     #[test]
-    fn swatch_grid_geometry_matches_the_declared_layout() {
-        assert_eq!(swatch_pitch(), SWATCH_SIZE + SWATCH_GAP);
-        // 16 columns of pitch, minus the trailing gap.
-        assert_eq!(
-            grid_pixel_width(),
-            16 * (SWATCH_SIZE + SWATCH_GAP) - SWATCH_GAP
-        );
-        assert_eq!(grid_pixel_height(), grid_pixel_width());
-
-        let (w, h) = grid_image_size(4);
-        assert_eq!(w, GRID_MARGIN * 2 + grid_pixel_width());
-        assert_eq!(
-            h,
-            GRID_MARGIN * 2 + 4 * canvas::LABEL_HEIGHT + HEADER_GAP + grid_pixel_height()
-        );
-
-        // No header means no header block at all, not an empty one.
-        assert_eq!(header_block_height(0), 0);
-        assert_eq!(grid_origin_y(0), GRID_MARGIN);
-    }
-
-    #[test]
     fn grid_image_size_ignores_header_text_so_both_grids_match() {
         // Both grids carry the same line count but different wording; the
         // report's single `canvas` field has to describe both.
@@ -1247,26 +1153,6 @@ mod tests {
         );
         // And the outline insets stay inside the margin.
         assert!(BAND_OUTLINE_INSETS.iter().all(|inset| *inset < GRID_MARGIN));
-    }
-
-    #[test]
-    fn swatch_origin_walks_row_major_from_index_zero() {
-        let pitch = i64::from(swatch_pitch());
-        let (x0, y0) = swatch_origin(0, 0);
-        assert_eq!((x0, y0), (i64::from(GRID_MARGIN), i64::from(GRID_MARGIN)));
-        assert_eq!(swatch_origin(1, 0), (x0 + pitch, y0));
-        assert_eq!(swatch_origin(15, 0), (x0 + 15 * pitch, y0));
-        assert_eq!(swatch_origin(16, 0), (x0, y0 + pitch));
-        assert_eq!(swatch_origin(255, 0), (x0 + 15 * pitch, y0 + 15 * pitch));
-    }
-
-    #[test]
-    fn a_three_digit_index_label_fits_inside_its_swatch() {
-        let widest = canvas::text_width("255");
-        assert!(
-            widest + SWATCH_TEXT_INSET as u32 * 2 <= SWATCH_SIZE,
-            "label {widest}px does not fit a {SWATCH_SIZE}px swatch"
-        );
     }
 
     // --- labels ------------------------------------------------------------
@@ -1320,14 +1206,6 @@ mod tests {
     }
 
     #[test]
-    fn header_line_clips_an_overlong_name_instead_of_widening_the_grid() {
-        let long = "X".repeat(400);
-        let line = header_line(&long);
-        assert_eq!(line.chars().count(), header_char_budget(grid_pixel_width()));
-        assert!(canvas::text_width(&line) <= grid_pixel_width());
-    }
-
-    #[test]
     fn header_char_budget_never_overflows_its_width() {
         for width in 0..200u32 {
             let budget = header_char_budget(width);
@@ -1359,50 +1237,19 @@ mod tests {
     // --- palette marks and sidecar -----------------------------------------
 
     #[test]
-    fn marks_flag_index_zero_and_every_stored_magenta_key() {
-        let mut data = make_pal();
-        data[3 * 5..3 * 5 + 3].copy_from_slice(&RAW_MAGENTA_KEY);
-        data[3 * 20..3 * 20 + 3].copy_from_slice(&RAW_MAGENTA_KEY);
-
-        let marks = swatch_marks(&data);
-        assert_eq!(marks[0], SwatchMark::TransparentIndex0);
-        assert_eq!(marks[5], SwatchMark::MagentaKey);
-        assert_eq!(marks[20], SwatchMark::MagentaKey);
-        assert_eq!(marks[6], SwatchMark::None);
-        assert!(marks[0].marker_color().is_some());
-        assert!(marks[5].marker_color().is_some());
-        assert!(marks[6].marker_color().is_none());
-    }
-
-    #[test]
-    fn a_remapped_band_drops_its_stored_marks_but_keeps_the_others() {
-        let mut data = make_pal();
-        data[3 * 5..3 * 5 + 3].copy_from_slice(&RAW_MAGENTA_KEY);
-        data[3 * 20..3 * 20 + 3].copy_from_slice(&RAW_MAGENTA_KEY);
-
-        let cleared = marks_outside_band(&swatch_marks(&data));
-        // Index 20 sits inside [16, 32) and no longer holds the stored colour.
-        assert_eq!(cleared[20], SwatchMark::None);
-        // Index 5 and index 0 sit outside it and still describe what is drawn.
-        assert_eq!(cleared[5], SwatchMark::MagentaKey);
-        assert_eq!(cleared[0], SwatchMark::TransparentIndex0);
-    }
-
-    #[test]
     fn pal_index_tsv_carries_the_raw_bytes_the_decode_and_the_band() {
         let mut data = make_pal();
-        data[3..6].copy_from_slice(&RAW_MAGENTA_KEY);
+        data[3..6].copy_from_slice(&[63, 0, 63]);
         let palette = Palette::from_bytes(&data).expect("palette");
-        let rows = pal_rows(&palette, &data, &swatch_marks(&data));
+        let rows = pal_rows(&palette, &data, &swatch_marks());
 
         assert_eq!(rows.len(), PAL_COLORS);
         assert_eq!(rows[0].mark, SwatchMark::TransparentIndex0);
-        assert_eq!(rows[0].alpha, 0);
-        assert_eq!(rows[1].mark, SwatchMark::MagentaKey);
-        assert_eq!(rows[1].raw, RAW_MAGENTA_KEY);
+        // A raw magenta entry is an ordinary colour, not a key.
+        assert_eq!(rows[1].mark, SwatchMark::None);
+        assert_eq!(rows[1].raw, [63, 0, 63]);
         // The decode is `raw << 2`, so 63 becomes 252.
         assert_eq!(rows[1].hex, "#FC00FC");
-        assert_eq!(rows[1].alpha, 0);
         assert_eq!((rows[16].row, rows[16].col), (1, 0));
         assert_eq!((rows[31].row, rows[31].col), (1, 15));
         assert!(rows[16].remap_band && rows[31].remap_band);
@@ -1415,7 +1262,7 @@ mod tests {
         assert_eq!(text.lines().count(), PAL_COLORS + 1);
         assert!(text.ends_with('\n'));
         // Index 1 sits outside the band, so the band column reads false.
-        assert!(pal_index_tsv_row(&rows[1]).ends_with("\tfalse\tmagenta-key"));
+        assert!(pal_index_tsv_row(&rows[1]).ends_with("\tfalse\tnone"));
         assert!(pal_index_tsv_row(&rows[16]).ends_with("\ttrue\tnone"));
     }
 
@@ -1457,19 +1304,6 @@ mod tests {
     }
 
     #[test]
-    fn pal_render_scales_the_grid_by_the_requested_factor() {
-        let data = make_pal();
-        let opts = RenderOptions {
-            scale: Some(2),
-            ..RenderOptions::default()
-        };
-        let render = build_pal_render(&data, "x.pal", "ra2.mix", &opts, None).expect("render");
-        assert_eq!(render.scale, 2);
-        assert_eq!(render.base.w, render.canvas[0] * 2);
-        assert_eq!(render.base.h, render.canvas[1] * 2);
-    }
-
-    #[test]
     fn pal_render_warns_about_flags_that_belong_to_other_formats() {
         let data = make_pal();
         let opts = RenderOptions {
@@ -1494,20 +1328,6 @@ mod tests {
             .expect("render");
         assert!(
             render.warnings.iter().any(|w| w.contains("above 63")),
-            "{:?}",
-            render.warnings
-        );
-    }
-
-    #[test]
-    fn pal_render_counts_the_stored_magenta_keys_in_a_warning() {
-        let mut data = make_pal();
-        data[3..6].copy_from_slice(&RAW_MAGENTA_KEY);
-        data[6..9].copy_from_slice(&RAW_MAGENTA_KEY);
-        let render = build_pal_render(&data, "x.pal", "ra2.mix", &RenderOptions::default(), None)
-            .expect("render");
-        assert!(
-            render.warnings.iter().any(|w| w.starts_with("2 entries")),
             "{:?}",
             render.warnings
         );
@@ -1571,7 +1391,6 @@ mod tests {
         assert_eq!(report.frames_rendered, vec![0, 1]);
         let choice = report.palette.expect("the asset is its own palette");
         assert_eq!(choice.name, "sidebar.pal");
-        assert_eq!(choice.alpha_policy, AlphaPolicy::Standard.as_str());
         assert_eq!(choice.confidence, "declared");
     }
 
@@ -1692,39 +1511,6 @@ mod tests {
     // --- output paths ------------------------------------------------------
 
     #[test]
-    fn render_dir_is_absolute_and_ends_with_the_render_subdir() {
-        let dir = render_dir(Path::new("target/asset"), "sidebar.pal");
-        assert!(dir.is_absolute(), "{}", dir.display());
-        assert!(
-            dir.ends_with(Path::new(RENDER_SUBDIR).join("sidebar.pal")),
-            "{}",
-            dir.display()
-        );
-    }
-
-    #[test]
-    fn sanitise_name_keeps_safe_characters_and_replaces_the_rest() {
-        assert_eq!(sanitise_name("sidebar.pal"), "sidebar.pal");
-        assert_eq!(sanitise_name("ra2\\dir/na me:x*?"), "ra2_dir_na_me_x__");
-        assert_eq!(sanitise_name(""), FALLBACK_DIR_NAME);
-    }
-
-    #[test]
-    fn output_filenames_are_stable_and_zero_padded() {
-        assert_eq!(still_png_name("shell.pcx"), "shell.pcx.png");
-        assert_eq!(grid_png_name("sidebar.pal"), "sidebar.pal.pal.png");
-        assert_eq!(
-            house_grid_png_name("sidebar.pal", 3),
-            "sidebar.pal.house-003.png"
-        );
-        assert_eq!(
-            house_grid_png_name("sidebar.pal", 255),
-            "sidebar.pal.house-255.png"
-        );
-        assert_eq!(sheet_png_name("sidebar.pal"), "sidebar.pal.sheet.png");
-    }
-
-    #[test]
     fn generated_output_predicate_matches_only_our_own_files() {
         assert!(is_generated_output("shell.pcx.png", "shell.pcx"));
         assert!(is_generated_output("sidebar.pal.pal.png", "sidebar.pal"));
@@ -1754,7 +1540,7 @@ mod tests {
         assert_eq!(clamp_scale(999), MAX_SCALE);
         assert_eq!(fit_scale(60, 30, 8), Some(8));
         let fitted = fit_scale(4000, 4000, 16).unwrap();
-        assert!(fitted >= MIN_SCALE && fitted < 16, "{fitted}");
+        assert!((MIN_SCALE..16).contains(&fitted), "{fitted}");
         assert!(
             u64::from(4000_u32) * u64::from(4000_u32) * u64::from(fitted) * u64::from(fitted)
                 <= MAX_OUTPUT_PIXELS

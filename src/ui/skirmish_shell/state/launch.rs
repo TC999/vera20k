@@ -2,61 +2,75 @@
 
 use crate::map::scenario_menu::MapMenuEntry;
 use crate::skirmish_launch::{
-    HOUSE_COLOR_COUNT, LaunchCountry, LaunchStartPosition, LaunchTeam, LaunchValidationError,
-    PreFillAiHouseSlot, PreFillHouseRoster, PreFillHumanHouse, SKIRMISH_PLAYER_SLOT_COUNT,
+    LaunchStartPosition, LaunchTeam, LaunchValidationError, SKIRMISH_MAX_SLOT_COUNT,
     SkirmishAiSlot, SkirmishLaunchMode, SkirmishLaunchSession, SkirmishLocalSlot,
 };
-use crate::skirmish_modes::{SkirmishGameMode, mode_by_id};
-use crate::ui::main_menu::{SkirmishCountry, StartPosition};
+use crate::skirmish_modes::SkirmishGameMode;
 
 use super::SkirmishShellState;
 
-/// Map the menu country selection onto a launch country. When the slot is set
-/// to Random this still returns the currently-shown menu country as a
-/// placeholder; the caller flags the slot via `country_random` so the concrete
-/// country is drawn later on the app-owned front-end Scenario cursor.
-fn launch_country_from_menu(country: SkirmishCountry) -> LaunchCountry {
-    match country {
-        SkirmishCountry::America => LaunchCountry::America,
-        SkirmishCountry::Korea => LaunchCountry::Korea,
-        SkirmishCountry::France => LaunchCountry::France,
-        SkirmishCountry::Germany => LaunchCountry::Germany,
-        SkirmishCountry::GreatBritain => LaunchCountry::GreatBritain,
-        SkirmishCountry::Libya => LaunchCountry::Libya,
-        SkirmishCountry::Iraq => LaunchCountry::Iraq,
-        SkirmishCountry::Cuba => LaunchCountry::Cuba,
-        SkirmishCountry::Russia => LaunchCountry::Russia,
-        SkirmishCountry::Yuri => LaunchCountry::Yuri,
-    }
-}
-
 fn launch_start_position(
     slot: usize,
-    start_position: StartPosition,
+    start_position: LaunchStartPosition,
 ) -> Result<LaunchStartPosition, LaunchValidationError> {
     match start_position {
-        StartPosition::Auto => Ok(LaunchStartPosition::Auto),
-        StartPosition::Position(position) if position < SKIRMISH_PLAYER_SLOT_COUNT as u8 => {
+        LaunchStartPosition::Auto => Ok(LaunchStartPosition::Auto),
+        // VERA's maps with more than eight starts list them up to
+        // SKIRMISH_MAX_SLOT_COUNT.
+        LaunchStartPosition::Position(position) if position < SKIRMISH_MAX_SLOT_COUNT as u8 => {
             Ok(LaunchStartPosition::Position(position))
         }
-        StartPosition::Position(position) => {
+        LaunchStartPosition::Position(position) => {
             Err(LaunchValidationError::InvalidStartPosition { slot, position })
         }
     }
 }
 
-fn launch_color_index(slot: usize, color_index: usize) -> Result<u8, LaunchValidationError> {
-    if color_index < HOUSE_COLOR_COUNT {
-        Ok(color_index as u8)
-    } else {
-        Err(LaunchValidationError::InvalidColorIndex { slot, color_index })
+/// A picked colour has to be one the lobby lists. A Random row's stored
+/// colour is only what it last showed and the draw replaces it, so one the
+/// lobby no longer lists packs as the first colour instead of stopping Start.
+fn launch_color_index(
+    state: &SkirmishShellState,
+    slot: usize,
+    color_index: usize,
+    claimed: bool,
+) -> Result<u8, LaunchValidationError> {
+    let listed = u8::try_from(color_index)
+        .ok()
+        .filter(|&color| state.lobby_colors.is_lobby_priority(i32::from(color)));
+    match listed {
+        Some(color) => Ok(color),
+        None if !claimed => Ok(0),
+        None => Err(LaunchValidationError::InvalidColorIndex { slot, color_index }),
     }
 }
 
+/// Whether Start skips the "at least two players" and "more than one team"
+/// gates ([`launch_session`]'s `allow_single_team`): `[VERA] SoloSkirmish=`,
+/// or a front end Ares plays in. Ares_AllowSinglePlay (hook `0x006AD0ED`,
+/// Ares.dll `10003AD0`) jumps from after the capacity check over both
+/// (`TXT_NEED_AT_LEAST_TWO_PLAYERS`, `TXT_CANNOT_ALLY`) to `0x006AD2BA`.
+/// `frontend_rules` are the shell's Rules, whose
+/// [`ares`](crate::rules::ruleset::RuleSet::ares) answers for the front end.
+pub fn start_skips_side_gates(
+    solo_skirmish: bool,
+    frontend_rules: Option<&crate::rules::ruleset::RuleSet>,
+) -> bool {
+    solo_skirmish || frontend_rules.is_some_and(crate::rules::ruleset::RuleSet::ares)
+}
+
+/// Pack the current controls into a Start session, or refuse a match that has
+/// fewer than two sides.
+///
+/// `allow_single_team` ([`start_skips_side_gates`]) accepts a match with no
+/// opponent at all and one with every active AI on the local player's own
+/// explicit team. Retail keeps both the "at least two players" and the "more
+/// than one team" gates.
 pub fn launch_session(
     state: &SkirmishShellState,
     maps: &[MapMenuEntry],
     modes: &[SkirmishGameMode],
+    allow_single_team: bool,
 ) -> Result<SkirmishLaunchSession, LaunchValidationError> {
     let selected_map = maps
         .get(state.selected_map_idx)
@@ -75,10 +89,12 @@ pub fn launch_session(
             requested_players,
         });
     }
-    if active_count == 0 {
+    // Retail keeps its "at least two players" gate.
+    if active_count == 0 && !allow_single_team {
         return Err(LaunchValidationError::NoEnabledOpponent);
     }
-    if state.player_team >= 0 {
+    // With no opponent active there is no team conflict to report.
+    if state.player_team >= 0 && active_count > 0 && !allow_single_team {
         let local_team = state.player_team as u8;
         let all_active_ai_same_team = state
             .opponents
@@ -111,37 +127,26 @@ pub fn pack_launch_session_without_start_validation(
         .get(state.selected_map_idx)
         .ok_or(LaunchValidationError::NoSelectedMap)?;
     let selected_mode =
-        mode_by_id(modes, state.selected_mode_id).ok_or(LaunchValidationError::NoSelectedMode {
-            mode_id: state.selected_mode_id,
-        })?;
+        state
+            .selected_mode
+            .resolve(modes)
+            .ok_or(LaunchValidationError::NoSelectedMode {
+                mode_id: state.selected_mode.id,
+            })?;
 
     let local = SkirmishLocalSlot {
-        country: launch_country_from_menu(state.player_country),
+        country: state.player_country,
         country_random: state.player_country_random,
-        color_index: launch_color_index(0, state.player_color_index)?,
+        color_index: launch_color_index(
+            state,
+            0,
+            state.player_color_index,
+            state.player_color_claimed,
+        )?,
         color_random: !state.player_color_claimed,
         start_position: launch_start_position(0, state.player_start_position)?,
         team: LaunchTeam::from_shell_value(state.player_team),
     };
-
-    // Retain the native pre-compaction slot roster before closed AI rows are
-    // omitted from the gameplay-facing opponent vector.
-    let pre_fill_house_roster = PreFillHouseRoster::new(
-        vec![PreFillHumanHouse {
-            priority: 0,
-            source_order: 0,
-            observer: false,
-        }],
-        state
-            .opponents
-            .iter()
-            .enumerate()
-            .map(|(slot_index, opponent)| PreFillAiHouseSlot {
-                slot_index: slot_index as u8,
-                valid: opponent.is_active(),
-            })
-            .collect(),
-    );
 
     let mut opponents = Vec::new();
     for (idx, opponent) in state.opponents.iter().enumerate() {
@@ -150,9 +155,15 @@ pub fn pack_launch_session_without_start_validation(
         };
         let slot = idx + 1;
         opponents.push(SkirmishAiSlot {
-            country: launch_country_from_menu(opponent.country),
+            raw_slot_index: (idx + 1) as u8,
+            country: opponent.country,
             country_random: opponent.country_random,
-            color_index: launch_color_index(slot, opponent.color_index)?,
+            color_index: launch_color_index(
+                state,
+                slot,
+                opponent.color_index,
+                opponent.color_claimed,
+            )?,
             color_random: !opponent.color_claimed,
             start_position: launch_start_position(slot, opponent.start_position)?,
             team: LaunchTeam::from_shell_value(opponent.team),
@@ -173,14 +184,25 @@ pub fn pack_launch_session_without_start_validation(
     options.build_off_ally = state.build_off_ally;
     options.crates = state.crates;
     options.mcv_redeploy = state.mcv_redeploy;
+    // Then SkirmishDialog's Start/Back packing (`0x006AD88F..0x006AD8A4`)
+    // forces Bridge Destruction (`0x00A8B260`) on, and Fog of War, Harvester
+    // Truce and MultiEngineer off. VERA's Game Options can turn those three
+    // on and set Tech Level and Bases; with nothing turned on the session
+    // holds the forced values ([`super::skirmish_session_options`]).
+    options.bridges_destroyable = true;
+    options.set_session_options(state.session);
 
-    Ok(SkirmishLaunchSession {
-        mode: SkirmishLaunchMode::from_game_mode(selected_mode),
-        selected_map_file: Some(selected_map.file_name.clone()),
-        player_name: state.player_name_edit.text.clone(),
-        local,
+    Ok(SkirmishLaunchSession::from_rows(
+        SkirmishLaunchMode::from_game_mode(selected_mode),
+        Some(selected_map.file_name.clone()),
+        vec![crate::skirmish_launch::SkirmishHumanSlot {
+            raw_slot_index: Some(0),
+            name: state.player_name.clone(),
+            slot: local,
+            role: crate::skirmish_launch::LaunchHumanRole::from_observer(false),
+        }],
+        0,
         opponents,
-        pre_fill_house_roster,
         options,
-    })
+    ))
 }

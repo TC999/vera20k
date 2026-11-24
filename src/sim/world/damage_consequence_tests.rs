@@ -29,11 +29,11 @@ fn consequence_rules() -> RuleSet {
     ))
     .unwrap();
     let mut art = ArtRegistry::from_ini(&IniFile::from_str(
-        "[DEATHFX]\nReport=DeathReport\nEnd=80\n\
-         [DESTROYFX]\nReport=DestroyReport\nEnd=80\n",
+        "[DEATHFX]\nEnd=80\n[DESTROYFX]\nEnd=80\n",
     ));
-    for name in ["DEATHFX", "DESTROYFX"] {
+    for (name, report) in [("DEATHFX", "DeathReport"), ("DESTROYFX", "DestroyReport")] {
         art.bind_anim_frame_count_for_test(name, 80);
+        art.set_anim_sounds_for_test(name, Some(report), None);
     }
     rules.replace_art_registry_for_test(art);
     rules
@@ -42,14 +42,14 @@ fn consequence_rules() -> RuleSet {
 fn consequence_world() -> (Simulation, u64, u64) {
     let mut sim = Simulation::with_seed(17);
     sim.input_delay_ticks = 0;
-    let attacker = sim.allocate_stable_id();
-    let victim = sim.allocate_stable_id();
+    let attacker = sim.substrate.allocate_stable_id();
+    let victim = sim.substrate.allocate_stable_id();
     for (id, kind, owner, rx, hp) in [
         (attacker, "TESLA", "Americans", 5, 300),
         (victim, "TARGET", "Soviet", 8, 10),
     ] {
         let mut entity = GameEntity::test_default(id, kind, owner, rx, 5);
-        entity.health.current = hp;
+        entity.health.set_for_test(hp);
         sim.substrate.entities.insert(entity);
     }
     sim.interner = crate::sim::intern::test_interner();
@@ -59,15 +59,6 @@ fn consequence_world() -> (Simulation, u64, u64) {
     (sim, attacker, victim)
 }
 
-fn debris_fingerprint(sim: &Simulation, id: u64) -> u64 {
-    bincode::serialize(sim.substrate.voxel_anims.get(id).unwrap())
-        .unwrap()
-        .into_iter()
-        .fold(0xcbf29ce484222325_u64, |hash, byte| {
-            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
-        })
-}
-
 fn delivered_ids(sim: &Simulation) -> Vec<u64> {
     let debris = sim.substrate.voxel_anims.ids();
     assert_eq!(debris.len(), 1);
@@ -75,7 +66,7 @@ fn delivered_ids(sim: &Simulation) -> Vec<u64> {
     for name in ["DEATHFX", "DESTROYFX"] {
         ids.push(
             sim.anims()
-                .find(|(_, anim)| sim.interner.resolve(anim.type_id) == name)
+                .find(|(_, anim)| sim.interner.resolve(anim.type_id()) == name)
                 .unwrap_or_else(|| panic!("missing {name}"))
                 .0
                 .to_owned(),
@@ -89,18 +80,20 @@ fn delivered_ids(sim: &Simulation) -> Vec<u64> {
     ids
 }
 
-/// The kill lands in the bullet's tail slot, whose commit admits the death
-/// anims (their `Report=`) before it queues the die sound. RESIDUAL: the
-/// order of same-frame sound starts is not taken from gamemd; inaudible.
-fn delivery_sounds(sim: &Simulation) -> Vec<String> {
+/// Techno ReceiveDamage7021FB submits DieSound before debris and the later
+/// Unit death animation constructors. Each AnimClass owns its Report request.
+fn delivery_sounds(rules: &RuleSet, sim: &Simulation) -> Vec<String> {
     sim.sound_events
         .iter()
         .filter_map(|event| match event {
-            SimSoundEvent::EntityDied { die_sound_id, .. } => {
-                Some(sim.interner.resolve(*die_sound_id).to_owned())
+            SimSoundEvent::VocAt { sound_id, .. }
+            | SimSoundEvent::VocAtCoord { sound_id, .. }
+            | SimSoundEvent::EntityDied {
+                die_sound_id: sound_id,
+                ..
             }
-            SimSoundEvent::AnimationStarted { sound_id, .. } => {
-                Some(sim.interner.resolve(*sound_id).to_owned())
+            | SimSoundEvent::AnimationStarted { sound_id, .. } => {
+                Some(sound_id.name_in(rules).to_string())
             }
             _ => None,
         })
@@ -112,7 +105,7 @@ fn advance_lethal_shot(sim: &mut Simulation, rules: &RuleSet, attacker: u64, vic
     let grid = PathGrid::test_all_passable(64, 64);
     sim.queue_command(CommandEnvelope::new(
         owner,
-        sim.session.tick + 1,
+        sim.session.tick() + 1,
         Command::Attack {
             attacker_id: attacker,
             target_id: victim,
@@ -128,6 +121,10 @@ fn advance_lethal_shot(sim: &mut Simulation, rules: &RuleSet, attacker: u64, vic
     panic!("the command must produce a lethal shot");
 }
 
+// Phobos `ROF.RandomDelay` (`0x006FD0B5`) redraws the full-rearm jitter, and
+// Ares simulates the SparkSys itself (hooks 0x62DF05, 0x62FD60) with its own
+// draws, so this stock golden holds only in a stock game without Phobos.
+#[cfg(not(feature = "phobos"))]
 #[test]
 fn ordinary_lethal_fire_commits_debris_animations_and_sparks_once() {
     let rules = consequence_rules();
@@ -139,37 +136,53 @@ fn ordinary_lethal_fire_commits_debris_animations_and_sparks_once() {
         .particle_systems()
         .iter()
         .next()
-        .expect("late target lookup constructs spark")
+        .expect("FireAt constructs its spark before the Bullet visit")
         .0;
-    assert_eq!(spark, ids[2] + 1);
+    assert_eq!(spark + 1, ids[0]);
     ids.push(spark);
     assert_eq!(
         sim.live_object_order_snapshot(),
-        [vec![attacker], ids.clone()].concat()
+        [vec![attacker, spark], ids[..3].to_vec()].concat()
     );
     assert_eq!(
-        delivery_sounds(&sim),
-        ["DEATHREPORT", "DESTROYREPORT", "DieA"]
+        delivery_sounds(&rules, &sim),
+        ["DieA", "DEATHREPORT", "DESTROYREPORT"]
     );
     assert!(sim.substrate.entities.get(victim).is_none());
-    // Rust regression, not a gamemd-derived golden. Fingerprint includes the
-    // complete debris body. Re-captured when the debris and Explosion= draws
-    // moved to the Scenario stream (`0x007022C8`, `0x007386A7`); only the
-    // death sound stays on the main stream.
-    assert_eq!(sim.scenario_rng.state(), 3954386809370758752);
-    assert_eq!(sim.main_rng.state(), 6706932826526710953);
-    // Re-captured when the shot became a bullet: the body is unchanged but
-    // for its stable id, one later (the bullet took the one before it).
-    assert_eq!(debris_fingerprint(&sim, ids[0]), 17414601428498543321);
-    let next_id = sim.allocate_stable_id();
-    assert_eq!(next_id, spark + 1);
+    // Rust stream regressions: 16 Scenario words, three of them the Guard
+    // cadence of the idle mission both units take at Unlimbo, and 2 Main
+    // words. Native numeric body comparisons live with the constructor owner
+    // rather than a serialized Rust fingerprint that changes whenever its wire
+    // layout gains a field.
+    assert_eq!(sim.scenario_rng.state(), 2039729963231954301);
+    assert_eq!(sim.main_rng.state(), 8272706873942388551);
+    let debris_native = sim.voxel_anims().get(ids[0]).unwrap().native_unique_id();
+    let death_native = sim
+        .anims()
+        .find(|(id, _)| **id == ids[1])
+        .unwrap()
+        .1
+        .native_unique_id();
+    let destroy_native = sim
+        .anims()
+        .find(|(id, _)| **id == ids[2])
+        .unwrap()
+        .1
+        .native_unique_id();
+    assert_eq!(death_native, debris_native.wrapping_add(1));
+    assert_eq!(destroy_native, death_native.wrapping_add(1));
+    let next_id = sim.substrate.allocate_stable_id();
+    assert_eq!(next_id, ids[2] + 1);
     sim.advance_tick(&[], Some(&rules), Some(&grid), None, 100);
     assert_eq!(delivered_ids(&sim), ids[..3]);
     assert_eq!(
-        delivery_sounds(&sim),
-        ["DEATHREPORT", "DESTROYREPORT", "DieA"]
+        delivery_sounds(&rules, &sim),
+        ["DieA", "DEATHREPORT", "DESTROYREPORT"]
     );
-    assert_eq!(sim.particle_systems().len(), 1);
+    // No second spark system. This world has no terrain, so the first one's
+    // particles are refused their collision query and retire with their
+    // system (`tick_spark_system_with_query`) instead of holding it open.
+    assert_eq!(sim.particle_systems().len(), 0);
 }
 
 #[test]
@@ -177,20 +190,17 @@ fn ordinary_fatal_transport_finishes_cargo_lifecycle_before_consequence_admissio
     use crate::sim::passenger::{PassengerCargo, PassengerRole};
     let rules = consequence_rules();
     let (mut sim, attacker, carrier) = consequence_world();
-    let passenger = sim.allocate_stable_id();
+    let passenger = sim.substrate.allocate_stable_id();
     let mut entity = GameEntity::test_default(passenger, "TARGET", "Soviet", 8, 5);
-    entity.passenger_role = PassengerRole::Inside {
-        transport_id: carrier,
-        open_topped: false,
-    };
+    entity.set_passenger_role_for_test(PassengerRole::inside_for_test(carrier, false));
     sim.substrate.entities.insert(entity);
-    let mut cargo = PassengerCargo::new(1, 1);
-    assert!(cargo.board(passenger, 1));
+    let mut cargo = PassengerCargo::new(1, 1.0);
+    cargo.board_forced_chain(&[(passenger, 1.0)]);
     sim.substrate
         .entities
         .get_mut(carrier)
         .unwrap()
-        .passenger_role = PassengerRole::Transport { cargo };
+        .set_passenger_role_for_test(PassengerRole::transport(cargo));
     sim.lifecycle_test_events.clear();
     advance_lethal_shot(&mut sim, &rules, attacker, carrier);
     assert!(sim.substrate.entities.get(passenger).is_none());
@@ -205,14 +215,15 @@ fn ordinary_fatal_transport_finishes_cargo_lifecycle_before_consequence_admissio
         })
         .collect();
     assert_eq!(cleared, vec![passenger, carrier]);
-    // `passenger + 1` is the shot's bullet.
+    // `passenger + 1` is the shot's Bullet, then FireAt admits its spark
+    // before that Bullet's later live AI constructs the death consequences.
     assert_eq!(
         delivered_ids(&sim),
-        vec![passenger + 2, passenger + 3, passenger + 4]
+        vec![passenger + 3, passenger + 4, passenger + 5]
     );
     assert_eq!(
-        delivery_sounds(&sim),
-        ["DEATHREPORT", "DESTROYREPORT", "DieA"]
+        delivery_sounds(&rules, &sim),
+        ["DieA", "DEATHREPORT", "DESTROYREPORT"]
     );
 }
 
@@ -220,51 +231,53 @@ fn ordinary_fatal_transport_finishes_cargo_lifecycle_before_consequence_admissio
 fn immediate_bullet_commits_before_return_with_its_original_sound_order() {
     let rules = consequence_rules();
     let (mut sim, attacker, victim) = consequence_world();
-    let projectile = sim.allocate_stable_id();
+    let projectile = sim.substrate.allocate_stable_id();
     let impact = ProjectileCoord::new(8 * 256 + 128, 5 * 256 + 128, 0);
     let mut spawn = super::lifecycle_tests::gsi_05_02_projectile(attacker, Some(0));
     spawn.origin = impact;
     spawn.target = ProjectileTarget::Entity(victim);
     spawn.initial_target_position = impact;
-    spawn.payload = ProjectilePayload::new(
-        40,
-        sim.interner.intern("AP"),
-        sim.interner.intern("CoilBolt"),
-    );
+    spawn.payload = ProjectilePayload::new(40, sim.interner.intern("AP"), None, false);
     sim.admit_projectile(projectile, spawn);
-    assert!(sim.object_ai_visit_one(projectile, Some(&rules), ObjectAiCtx::default()));
+    // Supply the already-arrived Bullet AI boundary: this consequence-order
+    // fixture detonates at the receiver, after native launch placement.
+    sim.projectiles
+        .get_mut(projectile)
+        .unwrap()
+        .set_position_for_test(impact);
+    assert!(sim.object_ai_visit_one(projectile, Some(&rules), &mut ObjectAiCtx::default()));
     let ids = delivered_ids(&sim);
     assert_eq!(ids, vec![projectile + 1, projectile + 2, projectile + 3]);
     assert_eq!(
         sim.live_object_order_snapshot(),
         [vec![attacker], ids.clone()].concat()
     );
-    assert_eq!(sim.substrate.pending_delete, vec![victim, projectile]);
+    assert_eq!(
+        sim.substrate.pending_delete.object_ids(),
+        vec![victim, projectile]
+    );
     assert!(
         !sim.substrate
             .entities
             .get(victim)
             .unwrap()
             .lifecycle
-            .object_alive
+            .object_alive()
     );
     assert_eq!(
-        delivery_sounds(&sim),
-        ["DEATHREPORT", "DESTROYREPORT", "DieA"]
+        delivery_sounds(&rules, &sim),
+        ["DieA", "DEATHREPORT", "DESTROYREPORT"]
     );
     assert!(sim.particle_systems().is_empty());
-    // Rust regression from the real Bullet AI, re-captured when the debris and
-    // Explosion= draws moved to the Scenario stream; only the death sound
-    // stays on the main stream.
+    // Existing Rust stream regressions from the real Bullet AI.
     assert_eq!(sim.scenario_rng.state(), 2066545679410230777);
     assert_eq!(sim.main_rng.state(), 6706932826526710953);
-    assert_eq!(debris_fingerprint(&sim, ids[0]), 8120097345519581533);
     // Retired objects remain physically resolvable until the shared drain.
     // Visiting again must not deliver another death transaction.
-    let _ = sim.object_ai_visit_one(projectile, Some(&rules), ObjectAiCtx::default());
+    let _ = sim.object_ai_visit_one(projectile, Some(&rules), &mut ObjectAiCtx::default());
     assert_eq!(
-        delivery_sounds(&sim),
-        ["DEATHREPORT", "DESTROYREPORT", "DieA"]
+        delivery_sounds(&rules, &sim),
+        ["DieA", "DEATHREPORT", "DESTROYREPORT"]
     );
     assert_eq!(delivered_ids(&sim), ids);
 }

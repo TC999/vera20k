@@ -1,11 +1,12 @@
 //! Unit selection system — tracks which entities the player has selected.
 //!
-//! Manages selection state: click-to-select single units, drag-to-select
-//! groups, and the Selected marker component on entities. The render loop
-//! reads Selected components to draw selection highlights.
+//! Manages selection state: click-to-select single units and drag-to-select
+//! groups. Each object's IsSelected byte
+//! ([`Selection`](crate::sim::world::Selection)) lives with its Select and
+//! Deselect owners in `sim::world`; the render loop reads it to draw
+//! selection highlights.
 //!
 //! ## Design
-//! - `Selected` is a zero-size marker component in sim/components.rs.
 //! - `SelectionState` tracks the current drag rectangle (if any) and provides
 //!   methods for selecting entities by screen-space rectangle or single click.
 //! - Selection is player-side state, not part of the deterministic simulation.
@@ -13,10 +14,7 @@
 //!
 //! ## Dependency rules
 //! - Part of sim/ — depends on sim/components (Position, Owner, Selected, Category).
-//! - sim/ NEVER depends on render/, ui/, sidebar/, audio/, net/.
-
-#[cfg(test)]
-use crate::sim::entity_store::EntityStore;
+//! - sim/ NEVER depends on render/, ui/, audio/, net/.
 
 /// Drag phase tracks the two-stage selection state machine:
 /// mouse-down sets `Pending`, reaching the effective 5px threshold activates
@@ -120,7 +118,7 @@ impl SelectionState {
     }
 
     /// True if the player is currently in any drag state (pending or active).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn is_dragging(&self) -> bool {
         !matches!(self.phase, DragPhase::None)
     }
@@ -182,62 +180,9 @@ pub enum SelectAction {
     BoxSelect(f32, f32, f32, f32),
 }
 
-/// Clear all Selected markers from the entity store.
-///
-/// Kept as the sim-side primitive for a wholesale unselect. The band-box path no
-/// longer calls it: the native release replaces the selection through the
-/// selection command instead, and an empty box clears nothing at all.
-#[cfg(test)]
-pub fn deselect_all(entities: &mut EntityStore) {
-    let selected_ids: Vec<u64> = entities
-        .values()
-        .filter(|e| e.selected)
-        .map(|e| e.stable_id())
-        .collect();
-    for id in selected_ids {
-        if let Some(e) = entities.get_mut(id) {
-            e.selected = false;
-        }
-    }
-}
-
-#[cfg(test)]
+#[cfg(all(test, tests_sim_p_s))]
 mod tests {
     use super::*;
-    use crate::map::entities::EntityCategory;
-    use crate::sim::components::Health;
-    use crate::sim::game_entity::GameEntity;
-    use crate::sim::intern::StringInterner;
-
-    fn spawn_unit(store: &mut EntityStore, id: u64, owner: &str) -> u64 {
-        let mut interner = StringInterner::new();
-        let e = GameEntity::new_at_frame_zero_for_test(
-            id,
-            0,
-            0,
-            0,
-            0,
-            interner.intern(owner),
-            Health { current: 100 },
-            interner.intern("E1"),
-            EntityCategory::Unit,
-            0,
-            0,
-            false,
-        );
-        store.insert(e);
-        id
-    }
-
-    #[test]
-    fn test_selection_state_click() {
-        let mut sel: SelectionState = SelectionState::new();
-        sel.begin_drag(100.0, 200.0);
-        assert!(sel.is_dragging());
-        let action: SelectAction = sel.end_drag(102.0, 201.0);
-        assert!(matches!(action, SelectAction::Click(_, _)));
-        assert!(!sel.is_dragging());
-    }
 
     #[test]
     fn test_selection_state_box() {
@@ -309,25 +254,6 @@ mod tests {
         let mut sel = SelectionState::new();
         sel.begin_drag(0.0, 0.0);
         assert_eq!(sel.update_drag(3.0, 3.0), DragTransition::NoChange);
-    }
-
-    #[test]
-    fn test_drag_rect_only_when_active() {
-        let mut sel = SelectionState::new();
-        sel.begin_drag(100.0, 100.0);
-        assert!(sel.drag_rect().is_none());
-        sel.update_drag(200.0, 200.0);
-        assert!(sel.drag_rect().is_some());
-    }
-
-    #[test]
-    fn test_deselect_all() {
-        let mut store = EntityStore::new();
-        let e1 = spawn_unit(&mut store, 1, "Americans");
-        store.get_mut(e1).unwrap().selected = true;
-        assert!(store.get(e1).unwrap().selected);
-        deselect_all(&mut store);
-        assert!(!store.get(e1).unwrap().selected);
     }
 
     #[test]

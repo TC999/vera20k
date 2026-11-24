@@ -21,7 +21,7 @@ fn retail_middle_bridge_resident_recalc_admits_both_families() {
     let sim = scenario.sim();
     let initial = sim.resolved_terrain.as_ref().expect("resolved terrain");
     let overlays = sim.overlay_grid.as_ref().expect("live overlays");
-    let registry = &scenario.runtime.resources.overlay_registry;
+    let registry = scenario.runtime.resources.rules.overlay_registry();
     let keys = initial
         .high_bridge_rim_tiles()
         .expect("retail theater keys");
@@ -54,7 +54,7 @@ fn retail_middle_bridge_resident_recalc_admits_both_families() {
             for variant in 0..5 {
                 let target = base + variant;
                 for level_override in [-1, 0].into_iter().take(if variant == 4 { 2 } else { 1 }) {
-                    let cell = grid.cell_mut(coord.0, coord.1).unwrap();
+                    let cell = grid.cell_mut_for_test(coord.0, coord.1).unwrap();
                     *cell = source.clone();
                     cell.final_tile_index = target;
                     let outcome = grid
@@ -63,7 +63,7 @@ fn retail_middle_bridge_resident_recalc_admits_both_families() {
                             overlay,
                             level_override,
                             registry,
-                            sim.playfield_bounds,
+                            sim.playfield_bounds(),
                         )
                         .unwrap_or_else(|error| {
                             panic!("retail tile {target}/{sub}, level {level_override}: {error}")
@@ -86,7 +86,7 @@ fn retail_middle_bridge_resident_recalc_admits_both_families() {
                     assert_eq!(outcome.finalized, overlay);
                     coverage.insert((target, sub));
                 }
-                *grid.cell_mut(coord.0, coord.1).unwrap() = source.clone();
+                *grid.cell_mut_for_test(coord.0, coord.1).unwrap() = source.clone();
             }
         }
     }
@@ -120,22 +120,24 @@ fn retail_high_bridge_middle_tile_inputs() {
     let keys = terrain
         .high_bridge_rim_tiles()
         .expect("retail theater keys");
+    let overlays = sim.overlay_grid.as_ref().expect("live overlays");
     let cells: Vec<_> = terrain
         .iter()
         .map(|cell| {
+            let live = overlays.cell(cell.rx, cell.ry);
             json!([
                 cell.rx,
                 cell.ry,
                 cell.final_tile_index,
                 cell.final_sub_tile,
                 cell.bridge_facts.raw_flags,
-                cell.bridge_facts.overlay_id,
-                cell.bridge_facts.state_byte,
+                live.overlay_id,
+                live.overlay_data,
                 cell.bridge_facts
                     .native_anchor
                     .map(|anchor| terrain.native_cell_coord(anchor)),
                 cell.level,
-                cell.yr_cell_land_type
+                cell.land_type
             ])
         })
         .collect();
@@ -153,7 +155,7 @@ fn retail_high_bridge_middle_tile_inputs() {
         .map(|cell| {
             json!({"coord": [cell.rx, cell.ry], "tile": cell.final_tile_index,
         "subtile": cell.final_sub_tile, "level": cell.level, "slope": cell.slope_type,
-        "land": cell.yr_cell_land_type, "zone": cell.zone_type,
+        "land": cell.land_type, "zone": cell.zone_type,
         "has_deck": cell.has_bridge_deck, "walkable": cell.bridge_walkable,
         "bridge_facts": cell.bridge_facts})
         })

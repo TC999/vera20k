@@ -13,192 +13,114 @@
 //! 3. The Gaussian caches its second variate, so alternate calls consume no
 //!    random draws at all.
 //!
-//! `util::native_x87` covers similar ground but cannot be reused: its value
-//! type has private fields, it offers no division, and it is not yet committed.
-//! This module is deliberately self-contained.
+//! [`TruncF64`] runs `util::native_x87`'s chop-53 arithmetic ([`X87Chop53`]),
+//! the same FPU model the simulation uses, and its square root runs the shared
+//! `Sqrt_Approx` table step (`native_x87::sqrt_approx_bits`).
 
 use super::rng::RmgRng;
+use crate::util::native_x87::{NativeF64Bits, X87Chop53, X87Ordering, X87Value};
 
-/// A finite double held as sign, exponent and a 53-bit significand, with every
-/// operation truncating toward zero.
-///
-/// `value = (-1)^sign * significand * 2^(exponent - 52)`, with the significand
-/// normalised into `[2^52, 2^53)` — or zero, which is stored as a zero
-/// significand and keeps its sign.
+/// A finite double under the generator's control word: [`X87Chop53`]'s
+/// operations behind named calls. The generator's domain has no non-finite
+/// values; a non-finite input or a zero divisor gives zero rather than
+/// modelling the FPU's exception masks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TruncF64 {
-    sign: bool,
-    exponent: i32,
-    significand: u64,
-}
-
-/// Position of the implicit bit in the significand.
-const SIG_BITS: u32 = 52;
-const SIG_TOP: u64 = 1 << SIG_BITS;
+pub struct TruncF64(X87Value);
 
 impl TruncF64 {
-    pub const fn zero() -> Self {
-        Self {
-            sign: false,
-            exponent: 0,
-            significand: 0,
-        }
+    pub fn zero() -> Self {
+        Self(X87Chop53::load_i32(0))
     }
 
-    pub const fn is_zero(self) -> bool {
-        self.significand == 0
+    pub fn is_zero(self) -> bool {
+        X87Chop53::compare(self.0, X87Chop53::load_i32(0)) == X87Ordering::Equal
     }
 
-    /// Decompose a finite, normal double. Subnormals and non-finite values are
-    /// outside the generator's domain and collapse to zero.
+    /// `FLD m64real`. A NaN or infinity gives zero.
     pub fn from_f64(value: f64) -> Self {
-        let bits = value.to_bits();
-        let sign = bits >> 63 != 0;
-        let raw_exponent = ((bits >> SIG_BITS) & 0x7FF) as i32;
-        let fraction = bits & (SIG_TOP - 1);
-
-        if raw_exponent == 0 || raw_exponent == 0x7FF {
-            return Self {
-                sign,
-                exponent: 0,
-                significand: 0,
-            };
-        }
-        Self {
-            sign,
-            exponent: raw_exponent - 1023,
-            significand: fraction | SIG_TOP,
-        }
+        X87Chop53::load_f64(NativeF64Bits::from_bits(value.to_bits()))
+            .map_or_else(|_| Self::zero(), Self)
     }
 
+    /// `FSTP m64real`.
     pub fn to_f64(self) -> f64 {
-        if self.is_zero() {
-            return if self.sign { -0.0 } else { 0.0 };
-        }
-        let biased = (self.exponent + 1023) as u64;
-        let bits = (u64::from(self.sign) << 63)
-            | (biased << SIG_BITS)
-            | (self.significand & (SIG_TOP - 1));
-        f64::from_bits(bits)
+        let bits = X87Chop53::store_f64(self.0).expect("generator values stay inside binary64");
+        f64::from_bits(bits.bits())
     }
 
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "named calls keep the FPU operation sequence explicit at ~200 call sites"
+    )]
     pub fn neg(self) -> Self {
-        Self {
-            sign: !self.sign,
-            ..self
-        }
+        Self(X87Chop53::neg(self.0))
     }
 
-    /// Normalise a wide significand down to 53 bits, discarding the remainder.
-    ///
-    /// Truncation toward zero is exactly "drop the low bits of the magnitude",
-    /// so no rounding decision — and therefore no sticky bit — is involved.
-    fn from_wide(sign: bool, exponent: i32, wide: u128, wide_top_bit: u32) -> Self {
-        if wide == 0 {
-            return Self {
-                sign,
-                exponent: 0,
-                significand: 0,
-            };
-        }
-        let top = 127 - wide.leading_zeros();
-        // Restate the exponent against the actual leading bit, then shift the
-        // significand so its leading bit lands at SIG_BITS.
-        let exponent = exponent + top as i32 - wide_top_bit as i32;
-        let significand = if top >= SIG_BITS {
-            (wide >> (top - SIG_BITS)) as u64
-        } else {
-            (wide << (SIG_BITS - top)) as u64
-        };
-        Self {
-            sign,
-            exponent,
-            significand,
-        }
-    }
-
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "named calls keep the FPU operation sequence explicit at ~200 call sites"
+    )]
     pub fn mul(self, rhs: Self) -> Self {
-        if self.is_zero() || rhs.is_zero() {
-            return Self {
-                sign: self.sign ^ rhs.sign,
-                exponent: 0,
-                significand: 0,
-            };
-        }
-        let product = u128::from(self.significand) * u128::from(rhs.significand);
-        // Both inputs carry their leading bit at SIG_BITS, so the product's
-        // leading bit sits at 2*SIG_BITS (or one higher).
-        Self::from_wide(
-            self.sign ^ rhs.sign,
-            self.exponent + rhs.exponent,
-            product,
-            2 * SIG_BITS,
-        )
+        Self(X87Chop53::mul(self.0, rhs.0))
     }
 
+    /// A zero divisor gives zero.
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "named calls keep the FPU operation sequence explicit at ~200 call sites"
+    )]
     pub fn div(self, rhs: Self) -> Self {
-        if self.is_zero() || rhs.is_zero() {
-            return Self {
-                sign: self.sign ^ rhs.sign,
-                exponent: 0,
-                significand: 0,
-            };
-        }
-        // Shift the numerator up so the quotient carries well over 53 bits.
-        let numerator = u128::from(self.significand) << 64;
-        let quotient = numerator / u128::from(rhs.significand);
-        Self::from_wide(
-            self.sign ^ rhs.sign,
-            self.exponent - rhs.exponent,
-            quotient,
-            64,
-        )
+        X87Chop53::div(self.0, rhs.0).map_or_else(|_| Self::zero(), Self)
     }
 
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "named calls keep the FPU operation sequence explicit at ~200 call sites"
+    )]
     pub fn add(self, rhs: Self) -> Self {
-        if self.is_zero() {
-            return rhs;
-        }
-        if rhs.is_zero() {
-            return self;
-        }
-        // Align to the larger exponent, keeping headroom so no bits are lost
-        // before the subtraction below.
-        let (big, small) = if self.exponent >= rhs.exponent {
-            (self, rhs)
-        } else {
-            (rhs, self)
-        };
-        let shift = (big.exponent - small.exponent) as u32;
-        if shift > 64 {
-            return big;
-        }
-        const GUARD: u32 = 64;
-        let big_wide = u128::from(big.significand) << GUARD;
-        let small_wide = u128::from(small.significand) << (GUARD - shift.min(GUARD));
-
-        if big.sign == small.sign {
-            let sum = big_wide + small_wide;
-            Self::from_wide(big.sign, big.exponent, sum, SIG_BITS + GUARD)
-        } else {
-            // Opposite signs: the larger magnitude wins the sign.
-            if big_wide >= small_wide {
-                let diff = big_wide - small_wide;
-                Self::from_wide(big.sign, big.exponent, diff, SIG_BITS + GUARD)
-            } else {
-                let diff = small_wide - big_wide;
-                Self::from_wide(small.sign, big.exponent, diff, SIG_BITS + GUARD)
-            }
-        }
+        Self(X87Chop53::add(self.0, rhs.0))
     }
 
+    #[expect(
+        clippy::should_implement_trait,
+        reason = "named calls keep the FPU operation sequence explicit at ~200 call sites"
+    )]
     pub fn sub(self, rhs: Self) -> Self {
-        self.add(rhs.neg())
+        Self(X87Chop53::sub(self.0, rhs.0))
     }
 
-    /// Compare magnitudes and signs, as the FPU's compare does.
+    /// `FABS`.
+    pub fn abs(self) -> Self {
+        if self.lt(Self::zero()) {
+            self.neg()
+        } else {
+            self
+        }
+    }
+
+    /// `FCOM`: whether `self` is below `rhs`.
     pub fn lt(self, rhs: Self) -> bool {
-        self.to_f64() < rhs.to_f64()
+        X87Chop53::compare(self.0, rhs.0) == X87Ordering::Less
+    }
+}
+
+/// A value on the FPU stack: the table lookups return one and take one
+/// (`Math::SinFromTable @ 0x004CACB0` / `CosFromTable @ 0x004CAD00`).
+impl From<X87Value> for TruncF64 {
+    fn from(value: X87Value) -> Self {
+        Self(value)
+    }
+}
+
+impl From<TruncF64> for X87Value {
+    fn from(value: TruncF64) -> Self {
+        value.0
+    }
+}
+
+impl From<TruncF64> for crate::util::native_x87::MaskedX87Value {
+    fn from(value: TruncF64) -> Self {
+        value.0.into()
     }
 }
 
@@ -210,47 +132,13 @@ pub fn narrow_to_f32(value: TruncF64) -> TruncF64 {
     TruncF64::from_f64(f64::from(f32::from_bits(narrow_to_f32_bits(value))))
 }
 
-/// Narrow to single precision, truncating toward zero.
+/// Narrow to single precision, truncating toward zero (`FSTP m32real` under
+/// the chop control word).
 ///
 /// This is the store the approximate square root performs on its input, and it
 /// is where most of the precision goes.
 fn narrow_to_f32_bits(value: TruncF64) -> u32 {
-    if value.is_zero() {
-        return u32::from(value.sign) << 31;
-    }
-    let sign = u32::from(value.sign) << 31;
-    let exponent = value.exponent + 127;
-    if exponent <= 0 || exponent >= 0xFF {
-        // Outside the single-precision range; the generator never gets here
-        // with real inputs, so clamp rather than pretend to model it.
-        return sign;
-    }
-    // Drop the low 29 bits of the significand: truncation, not rounding.
-    let fraction = ((value.significand >> 29) as u32) & 0x007F_FFFF;
-    sign | ((exponent as u32) << 23) | fraction
-}
-
-/// One entry of the square-root lookup table.
-///
-/// The table is pure arithmetic, so it is computed rather than shipped: index
-/// `i` encodes a significand, and the entry is the truncated mantissa of its
-/// square root. Not shipping it also keeps the retail bytes out of this repo.
-///
-/// That all 16384 entries come out identical to the original's table is checked
-/// by `map::rmg::sqrt_table`, exhaustively, against the player's own
-/// `gamemd.exe`. It needs `RA2_DIR` and so is `#[ignore]`d; the spot values in
-/// this module's tests guard the formula on a plain `cargo test`.
-pub(crate) fn sqrt_table_entry(index: u32) -> u32 {
-    let significand = if index < 8192 {
-        // Even exponent: the significand lies in [1, 2).
-        1.0 + f64::from(index) / 8192.0
-    } else {
-        // Odd exponent: the implicit bit is set, so it lies in [2, 4).
-        2.0 * (1.0 + f64::from(index - 8192) / 8192.0)
-    };
-    // The root always lands in [1, 2), so the exponent field is zero and only
-    // the mantissa varies.
-    ((significand.sqrt() - 1.0) * 8_388_608.0) as u32
+    X87Chop53::store_f32_masked_chop(value.0).bits()
 }
 
 /// The generator's square root: a table approximation.
@@ -262,21 +150,27 @@ pub fn approx_sqrt(value: TruncF64) -> TruncF64 {
     if value.is_zero() {
         return TruncF64::zero();
     }
-    let bits = narrow_to_f32_bits(value);
-    let mut mantissa = bits & 0x007F_FFFF;
-    let biased = ((bits >> 23) & 0xFF) as i32;
-    let unbiased = biased - 127;
-
-    // An odd exponent borrows a factor of two into the significand.
-    if unbiased & 1 != 0 {
-        mantissa |= 0x0080_0000;
-    }
-    // Arithmetic halving, matching the original's 16-bit shift.
-    let half_exponent = unbiased >> 1;
-
-    let index = mantissa >> 10;
-    let result_bits = sqrt_table_entry(index).wrapping_add(((half_exponent + 127) as u32) << 23);
+    let result_bits = crate::util::native_x87::sqrt_approx_bits(narrow_to_f32_bits(value));
     TruncF64::from_f64(f64::from(f32::from_bits(result_bits)))
+}
+
+/// Store to a priority-heap node's `f32` key: `FSTP m32real` under the
+/// generator's chop control word, so the value truncates toward zero where a
+/// Rust `as f32` would round to nearest.
+pub fn store_f32(value: TruncF64) -> f32 {
+    f32::from_bits(narrow_to_f32_bits(value))
+}
+
+/// The jittered-distance heap key that blob, LAT-patch, tree and tiberium
+/// growth share: `sqrt(d²) + draw * 5.0 * K`, stored with [`store_f32`].
+/// Each original reads its own 5.0: `CarveBlob` 0x0059C1DB..0x0059C229
+/// (0x007ED808), 0x005A4E5F..0x005A4EA2 (0x007ED808), 0x005A49AC..0x005A49EB
+/// (0x007ED800) and 0x005A2D7E..0x005A2DB6 (0x007ED7C0).
+pub fn jittered_distance_key(squared_distance: i32, draw: u32) -> f32 {
+    let jitter = TruncF64::from_f64(f64::from(draw))
+        .mul(TruncF64::from_f64(5.0))
+        .mul(TruncF64::from_f64(f64::from_bits(super::rng::RANGE_K_BITS)));
+    store_f32(approx_sqrt(TruncF64::from_f64(f64::from(squared_distance))).add(jitter))
 }
 
 /// The generator's square root of an integer squared-distance, as the `f32`
@@ -290,9 +184,11 @@ pub fn approx_sqrt_f32(squared_distance: i32) -> f32 {
 /// The original computes this with `FYL2X` (`ln(2) * log2(x)`). Its low bits
 /// are largely irrelevant because `approx_sqrt` immediately narrows the result
 /// to single precision, but the last bit is not proven identical to the
-/// hardware instruction — see the FP contract report.
+/// hardware instruction — see the FP contract report. Host `ln`s disagree in
+/// that bit (`ln(3)` among them), so every client takes libm's, keeping the
+/// generated map the same on every target.
 pub fn ln(value: TruncF64) -> TruncF64 {
-    TruncF64::from_f64(value.to_f64().ln())
+    TruncF64::from_f64(libm::log(value.to_f64()))
 }
 
 /// Normally distributed draws, matching the original's Box-Muller helper.
@@ -345,16 +241,9 @@ fn unit_to_signed(rng: &mut RmgRng, one: TruncF64) -> TruncF64 {
     unit.add(unit).sub(one)
 }
 
-/// Truncation toward zero, as the float-to-int helper performs it.
-pub fn ftol(value: f64) -> i32 {
-    value as i32
-}
-
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod tests {
     use super::*;
-
-    const VECTORS: &str = include_str!("../../../tools/rmg_oracle/vectors/x87.json");
 
     /// Retail entries read from the game binary's 16384-entry square-root
     /// mantissa table (data section at 0x008650BC). Spot values chosen to pin
@@ -377,10 +266,21 @@ mod tests {
         (16383, 0x007F_FDFF),
     ];
 
+    /// The heap stores with `FSTP m32` under chop: a key just below 5.0 stays
+    /// below it, where round-to-nearest would store 5.0 and win ties it loses.
+    #[test]
+    fn jittered_key_store_truncates() {
+        let key = jittered_distance_key(0, u32::MAX);
+        assert_eq!(key, f32::from_bits(5.0f32.to_bits() - 1));
+    }
     #[test]
     fn sqrt_table_matches_retail_at_the_pinned_points() {
         for &(index, retail) in RETAIL_SQRT_SPOT {
-            assert_eq!(sqrt_table_entry(index), retail, "sqrt table entry {index}");
+            assert_eq!(
+                crate::util::native_x87::sqrt_approx_table_entry(index),
+                retail,
+                "sqrt table entry {index}"
+            );
         }
     }
 
@@ -399,23 +299,6 @@ mod tests {
             assert!(value >= previous, "non-monotone at {squared}");
             previous = value;
         }
-    }
-
-    #[test]
-    fn ftol_truncates_toward_zero() {
-        assert_eq!(ftol(3.9), 3);
-        assert_eq!(ftol(-3.9), -3, "toward zero, not floor");
-        assert_eq!(ftol(0.9999), 0);
-        assert_eq!(ftol(-0.9999), 0);
-        assert_eq!(ftol(100.0), 100);
-    }
-
-    #[test]
-    fn trunc_roundtrips_ordinary_values() {
-        for value in [1.0, -1.0, 0.5, 1234.5678, -0.000123, 3.999999] {
-            assert_eq!(TruncF64::from_f64(value).to_f64(), value, "{value}");
-        }
-        assert_eq!(TruncF64::from_f64(0.0).to_f64(), 0.0);
     }
 
     #[test]
@@ -480,21 +363,21 @@ mod tests {
     }
 
     #[test]
-    fn approx_sqrt_is_coarser_than_single_precision() {
-        // Guards against someone "fixing" this into a real sqrt later: the
-        // approximation must visibly disagree with an exact root.
-        let value = 1e-6;
-        let approx = approx_sqrt(TruncF64::from_f64(value)).to_f64();
-        let relative = (approx - value.sqrt()).abs() / value.sqrt();
-        assert!(
-            relative > 1e-5,
-            "the table approximation should be clearly coarse, got {relative}"
+    fn ln_is_the_same_on_every_target() {
+        // ln(3): Apple's libm gives 1.0986122886681098, libm one bit below;
+        // every client must take the same one.
+        assert_eq!(
+            ln(TruncF64::from_f64(3.0)).to_f64().to_bits(),
+            1.098_612_288_668_109_6_f64.to_bits()
         );
     }
 
     #[test]
     fn gaussian_matches_golden_vectors() {
-        let doc: serde_json::Value = serde_json::from_str(VECTORS).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/rmg_oracle/vectors/x87.json",
+        ))
+        .unwrap();
         assert_eq!(doc["source"].as_str(), Some("unicorn/gamemd.exe"));
 
         let mut seed_in_progress = None;

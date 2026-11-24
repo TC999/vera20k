@@ -14,7 +14,7 @@ ASSETS=Path(os.environ.get('VERA20K_SHRAPNEL_INPUTS', 'target/shrapnel-native-in
 
 class Rules(Sound):
  hook=Reader.hook
- def __init__(self):
+ def __init__(self,*,full_rules_constructor=False):
   raw=(ASSETS/'RULESMD.INI').read_bytes();sec,_=lexical(raw,{'OverlayTypes'})
   Reader.__init__(self,ASSETS,sec)
   self.u.mem_write(0xA83D80,dwords(0x7EB6D4,self.alloc(256*4),256,1,0,10))
@@ -23,7 +23,8 @@ class Rules(Sound):
   assert len(self.overlay_ptrs)==250
   self.names={i:self.string(p+0x24) for i,p in enumerate(self.overlay_ptrs)}
   self.rules=self.alloc(0x2000)
-  self.block(0x665F3B,0x665F41,{UC_X86_REG_ESI:self.rules,UC_X86_REG_EBX:0})
+  if full_rules_constructor:self.invoke(0x665650,self.rules)
+  else:self.block(0x665F3B,0x665F41,{UC_X86_REG_ESI:self.rules,UC_X86_REG_EBX:0})
   self.ctor_cliff=self.u.mem_read(self.rules+0x664,1)[0]
   self.land_names=[self.string(self.read32(0x839D68+i*4)) for i in range(12)]
   self.layers=[]
@@ -44,10 +45,6 @@ class Rules(Sound):
   self.u.reg_write(UC_X86_REG_ESP,SP)
   for k,v in regs.items():self.u.reg_write(k,v)
   run_checked(self.u,a,b,count=6000000)
- def invoke(self,fn,this,args=()):
-  from tools.native_oracle import RET_MAGIC
-  self.u.mem_write(SP,dwords(RET_MAGIC,*args));self.u.reg_write(UC_X86_REG_ESP,SP);self.u.reg_write(UC_X86_REG_ECX,this)
-  run_checked(self.u,fn,RET_MAGIC,count=2000000);return self.u.reg_read(UC_X86_REG_EAX)
  def snapshot(self):
   return dict(constructor_cliff=self.ctor_cliff,cliff=self.u.mem_read(self.rules+0x664,1)[0],overlays=[dict(index=i,name=self.names[i],land=self.read32(p+0x298),no_use_tile_land=self.u.mem_read(p+0x2AC,1)[0],tiberium=self.u.mem_read(p+0x2A9,1)[0],wall=self.u.mem_read(p+0x2A8,1)[0]) for i,p in enumerate(self.overlay_ptrs) if 74<=i<=101],land_table_hex=bytes(self.u.mem_read(0x89EA40,12*36)).hex(),layers=self.layers)
 

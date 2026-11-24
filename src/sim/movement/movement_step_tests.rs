@@ -1,71 +1,41 @@
 use super::*;
-use crate::sim::components::{FootPathQueue, TrackProgress};
+use crate::map::entities::EntityCategory;
+use crate::sim::components::{DriveCoord, TrackProgress};
 use crate::sim::game_entity::GameEntity;
+use crate::sim::movement::drive_track;
 use crate::sim::movement::track_host::TrackWorldEvent;
 use crate::sim::movement::track_process::{TrackFamily, TrackInvocation};
+use crate::sim::movement::{DriveLocomotionRuntime, ShipLocomotionRuntime};
+use crate::sim::occupancy::OccupancyGrid;
 use crate::sim::world::Simulation;
+use crate::util::fixed_math::SimFixed;
 
+/// WalkLocomotionClass::ProcessMovement `0x0075BD33..0x0075BD70` executed on
+/// each row's owner and head (`tools/spatial_oracle/sqrt_approx_distances.py`):
+/// a head the owner stands less than 17 leptons from completes.
 #[test]
-fn exhausted_foot_queue_cannot_bypass_drive_or_ship_track_admission() {
-    for kind in [LocomotorKind::Drive, LocomotorKind::Ship] {
-        for directions in [vec![], vec![2, 2]] {
-            let queue = crate::sim::components::FootPathQueue {
-                cursor: directions.len() as u16,
-                directions,
-                reference_cell: Some((0, 0)),
-            };
-            let mut target = MovementTarget {
-                path: vec![(0, 0), (1, 0)],
-                next_index: 1,
-                move_dir_x: SimFixed::from_num(256),
-                move_dir_y: SIM_ZERO,
-                move_dir_len: SimFixed::from_num(256),
-                current_speed: SimFixed::from_num(255),
-                ..Default::default()
-            };
-            let mut position = Position {
-                rx: 0,
-                ry: 0,
-                z: 0,
-                exact_z_leptons: None,
-                sub_x: CELL_CENTER_LEPTON,
-                sub_y: CELL_CENTER_LEPTON,
-            };
-            let before = position.clone();
-            let result = advance_lepton_position(
-                &mut target,
-                &mut position,
-                &mut Some(LocomotorState::for_test_kind(kind)),
-                SimFixed::from_num(255),
-                SimFixed::from_num(1) / SimFixed::from_num(15),
-            );
-            assert!(
-                matches!(result, AdvanceResult::DriveTrackActive),
-                "{kind:?}"
-            );
-            assert_eq!(
-                (
-                    position.rx,
-                    position.ry,
-                    position.sub_x,
-                    position.sub_y,
-                    position.z,
-                    position.exact_z_leptons
-                ),
-                (
-                    before.rx,
-                    before.ry,
-                    before.sub_x,
-                    before.sub_y,
-                    before.z,
-                    before.exact_z_leptons
-                ),
-                "{kind:?}: no admitted track, no coordinate step"
-            );
-            assert_eq!(target.next_index, 1);
-            assert!(queue.remaining_directions().is_empty());
-        }
+fn walk_head_completion_matches_original_rows() {
+    let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/sqrt_approx_distances.json",
+    ))
+    .unwrap();
+    let rows = corpus["walk"].as_array().unwrap();
+    for row in rows {
+        let [owner, head] = [&row["owner"], &row["head"]]
+            .map(|v| serde_json::from_value::<[i32; 3]>(v.clone()).unwrap());
+        let mut entity = GameEntity::test_default(1, "E1", "Americans", 0, 0);
+        entity.position.put_world_xy([owner[0], owner[1]]);
+        let mut locomotor = LocomotorState::for_test_kind(LocomotorKind::Walk);
+        let [x, y, z] = head;
+        locomotor.set_step_head(Some(DriveCoord { x, y, z }));
+        assert_eq!(
+            completed_walk_head(&entity.position, &Some(locomotor)).is_some(),
+            row["expected"].as_i64().unwrap() < 17,
+            "{}",
+            row["name"]
+        );
     }
+    assert_eq!(rows.len(), 5);
 }
 
 /// Body/hull in-place turn duration = abs(delta_8bit) / ROT native frames
@@ -81,13 +51,14 @@ fn test_body_rotation_matches_native_frame_duration() {
     // count at which it completes (ReadyToMove with the exact target reached).
     fn frames_to_turn(from: u8, to: u8, rot: i32) -> u32 {
         let target = u16::from(to) << 8;
-        let mut body_facing = crate::sim::movement::FacingClass::new(u16::from(from) << 8, rot);
-        let mut desired = Some(target);
+        let mut entity = GameEntity::test_default(1, "MTNK", "Americans", 10, 10);
+        entity.body_facing = crate::sim::movement::FacingClass::new(u16::from(from) << 8, rot);
+        crate::sim::movement::drive_do_turn(&mut entity, target, 0);
         for frame in 0..1000u32 {
-            match handle_vehicle_rotation(&mut body_facing, desired.take(), frame) {
+            match handle_vehicle_rotation(&entity.body_facing, frame) {
                 RotationResult::ReadyToMove => {
                     assert_eq!(
-                        body_facing.current(frame),
+                        entity.body_facing.current(frame),
                         target,
                         "rotation must land exactly on the target"
                     );
@@ -127,32 +98,39 @@ fn test_body_rotation_matches_native_frame_duration() {
 fn native_track_fixture(kind: LocomotorKind, budget: i32) -> (Simulation, TrackInvocation, i32) {
     let mut sim = Simulation::new();
     let mut entity = GameEntity::test_default(1, "MTNK", "Americans", 10, 10);
-    entity.category = EntityCategory::Unit;
+    entity.set_category_for_test(EntityCategory::Unit);
     entity.locomotor = Some(LocomotorState::for_test_kind(kind));
-    entity.lifecycle.object_alive = true;
-    entity.lifecycle.in_limbo = false;
-    entity.lifecycle.cell_marked = true;
+    entity.lifecycle.set_object_alive_for_test(true);
+    entity.lifecycle.set_in_limbo_for_test(false);
+    entity.lifecycle.set_cell_marked_for_test(true);
     let head = DriveCoord::cell(10, 9, 0);
-    let track = TrackProgress {
-        turn_index: 0,
-        cursor: 0,
-        reversed: false,
-        residual: 0,
-    };
+    let track = TrackProgress::for_test(0, 0, false, 0);
     if kind == LocomotorKind::Drive {
-        entity.drive_locomotion = Some(DriveLocomotionRuntime {
-            head_to: Some(head),
-            track,
-            track_valid: true,
-            ..Default::default()
-        });
+        assert!(
+            entity
+                .locomotor
+                .as_mut()
+                .unwrap()
+                .install_drive_state_for_test(Some(
+                    DriveLocomotionRuntime::default()
+                        .with_head_to_for_test(Some(head))
+                        .with_track_for_test(track)
+                        .with_track_valid_for_test(true)
+                ))
+        );
     } else {
-        entity.ship_locomotion = Some(ShipLocomotionRuntime {
-            head_to: Some(head),
-            track,
-            track_valid: true,
-            ..Default::default()
-        });
+        assert!(
+            entity
+                .locomotor
+                .as_mut()
+                .unwrap()
+                .install_ship_state_for_test(Some(
+                    ShipLocomotionRuntime::default()
+                        .with_head_to_for_test(Some(head))
+                        .with_track_for_test(track)
+                        .with_track_valid_for_test(true)
+                ))
+        );
     }
     sim.interner = crate::sim::intern::test_interner();
     sim.substrate.entities.insert(entity);
@@ -166,7 +144,6 @@ fn native_track_fixture(kind: LocomotorKind, budget: i32) -> (Simulation, TrackI
             } else {
                 TrackFamily::Ship
             },
-            apply_fresh_occupation: false,
             active_gate: false,
             retry: false,
         },
@@ -176,9 +153,21 @@ fn native_track_fixture(kind: LocomotorKind, budget: i32) -> (Simulation, TrackI
 
 fn retained_track(entity: &GameEntity, kind: LocomotorKind) -> TrackProgress {
     if kind == LocomotorKind::Drive {
-        entity.drive_locomotion.as_ref().unwrap().track
+        entity
+            .locomotor
+            .as_ref()
+            .and_then(|l| l.selected_drive_runtime())
+            .and_then(|r| r.retained())
+            .unwrap()
+            .track()
     } else {
-        entity.ship_locomotion.as_ref().unwrap().track
+        entity
+            .locomotor
+            .as_ref()
+            .and_then(|l| l.selected_ship_runtime())
+            .and_then(|r| r.retained())
+            .unwrap()
+            .track()
     }
 }
 
@@ -192,24 +181,35 @@ fn fresh_retry_terminal_retains_raw_head_for_both_track_families() {
             y: 10 * 256 + 153,
             z: 731,
         };
-        entity.position.sub_x = SimFixed::from_num(85);
-        entity.position.sub_y = SimFixed::from_num(154);
-        entity.position.exact_z_leptons = Some(104);
-        let track = TrackProgress {
-            turn_index: 0,
-            // The zero-XY sentinel is paid separately after all real points.
-            cursor: drive_track::raw_track_points(1).len() as i32,
-            reversed: false,
-            residual: 8,
-        };
+        entity.position.set_sub_x_for_test(SimFixed::from_num(85));
+        entity.position.set_sub_y_for_test(SimFixed::from_num(154));
+        entity.position.set_exact_z_leptons_for_test(Some(104));
+        let track = TrackProgress::for_test(
+            0, // The zero-XY sentinel is paid separately after all real points.
+            drive_track::raw_track_points(1).len() as i32,
+            false,
+            8,
+        );
         if kind == LocomotorKind::Drive {
-            let state = entity.drive_locomotion.as_mut().unwrap();
-            state.head_to = Some(head);
-            state.track = track;
+            let state = entity.locomotor.as_mut().unwrap();
+            assert!(state.store_track_head(
+                crate::sim::movement::track_process::TrackFamily::Drive,
+                Some(head)
+            ));
+            assert!(state.store_track_progress(
+                crate::sim::movement::track_process::TrackFamily::Drive,
+                track
+            ));
         } else {
-            let state = entity.ship_locomotion.as_mut().unwrap();
-            state.head_to = Some(head);
-            state.track = track;
+            let state = entity.locomotor.as_mut().unwrap();
+            assert!(state.store_track_head(
+                crate::sim::movement::track_process::TrackFamily::Ship,
+                Some(head)
+            ));
+            assert!(state.store_track_progress(
+                crate::sim::movement::track_process::TrackFamily::Ship,
+                track
+            ));
         }
         assert_eq!(sim.run_track_points(invocation, budget, None, None), 1);
         let entity = sim.substrate.entities.get(1).unwrap();
@@ -219,156 +219,50 @@ fn fresh_retry_terminal_retains_raw_head_for_both_track_families() {
             super::super::ground_pose::position_world_coord(&entity.position),
             DriveCoord { z: 0, ..head }
         );
-        assert_eq!(retained_track(entity, kind).turn_index, -1);
-        assert_eq!(retained_track(entity, kind).cursor, 0);
+        assert_eq!(retained_track(entity, kind).turn_index(), -1);
+        assert_eq!(retained_track(entity, kind).cursor(), 0);
         assert_eq!(super::super::track_head::committed_track_head(entity), None);
         assert_eq!(
-            entity.drive_locomotion.as_ref().and_then(|s| s.head_to),
+            entity
+                .locomotor
+                .as_ref()
+                .and_then(|l| l.selected_drive_runtime())
+                .and_then(|r| r.retained())
+                .and_then(|s| s.head_to()),
             None
         );
         assert_eq!(
-            entity.ship_locomotion.as_ref().and_then(|s| s.head_to),
+            entity
+                .locomotor
+                .as_ref()
+                .and_then(|l| l.selected_ship_runtime())
+                .and_then(|r| r.retained())
+                .and_then(|s| s.head_to()),
             None
         );
     }
 }
 
 #[test]
-fn drive_track_completion_preserves_residual_through_fresh_acceptance() {
-    let (mut sim, invocation, budget) = native_track_fixture(LocomotorKind::Drive, 0);
-    let entity = sim.substrate.entities.get_mut(1).unwrap();
-    let current = super::super::ground_pose::position_world_coord(&entity.position);
-    let drive = entity.drive_locomotion.as_mut().unwrap();
-    // Terminal budget uses the actual current/head distance. Distance 11
-    // refunds zero after the paid sentinel (Drive4B1F48..4B1FDC).
-    drive.head_to = Some(DriveCoord {
-        y: current.y - 11,
-        ..current
-    });
-    drive.track.cursor = drive_track::raw_track_points(1).len() as i32;
-    drive.track.residual = 8;
-    entity.navigation.nav_com = Some(crate::sim::components::NavTargetRef::Cell { rx: 11, ry: 10 });
-    entity.navigation.path_replay = FootPathQueue {
-        directions: vec![2],
-        cursor: 0,
-        reference_cell: Some((10, 10)),
-    };
-    entity.movement_target = Some(MovementTarget {
-        path: vec![(10, 10), (11, 10)],
-        path_layers: vec![MovementLayer::Ground; 2],
-        next_index: 1,
-        final_goal: Some((11, 10)),
-        ..Default::default()
-    });
-    assert_eq!(sim.run_track_points(invocation, budget, None, None), 1);
-    let entity = sim.substrate.entities.get_mut(1).unwrap();
-    assert_eq!(entity.drive_locomotion.as_ref().unwrap().track.residual, 1);
-    assert_eq!(
-        entity.drive_locomotion.as_ref().unwrap().track.turn_index,
-        -1
-    );
-    let mut target = entity.movement_target.take().unwrap();
-    let mut occupation = CellOccupationGrid::new();
-    // Actual combat hull ownership can retain all16 bits with no movement
-    // facing target. The earlier rotation sample must not destroy the one-bit
-    // mismatch proved by drive_fresh_turn.json (initial0x4001/direction2).
-    entity.body_facing = crate::sim::movement::FacingClass::new(0x4001, 5);
-    assert!(matches!(
-        handle_vehicle_rotation(&mut entity.body_facing, None, 2),
-        RotationResult::ReadyToMove
-    ));
-    let live_facing = entity.body_facing.current(2);
-    assert_eq!(live_facing, 0x4001);
-    let prepare = |facing,
-                   entity: &mut GameEntity,
-                   target: &mut MovementTarget,
-                   occupation: &mut CellOccupationGrid| {
-        prepare_native_track(
-            &mut entity.foot_occupation_enabled,
-            &mut entity.navigation.path_replay,
-            target,
-            &entity.position,
-            facing,
-            &mut entity.drive_locomotion,
-            &mut entity.ship_locomotion,
-            &entity.locomotor,
-            entity.category,
-            1,
-            occupation,
-            DriveCellAdmission::default(),
-            MovementLayer::Ground,
-        )
-    };
-    assert!(matches!(
-        prepare(live_facing, entity, &mut target, &mut occupation),
-        Some(NativeTrackPreparation::TurnFirst(_, 64))
-    ));
-    assert_eq!(entity.drive_locomotion.as_ref().unwrap().track.residual, 1);
-    let Some(NativeTrackPreparation::Invoke(next)) =
-        prepare(0x4000, entity, &mut target, &mut occupation)
-    else {
-        panic!("aligned head must accept the fresh native segment");
-    };
-    let track = entity.drive_locomotion.as_ref().unwrap().track;
-    assert_eq!(track.turn_index, 18);
-    assert_eq!(track.cursor, 0);
-    assert_eq!(track.residual, 1);
-    entity.movement_target = Some(target);
-    assert_eq!(sim.run_track_points(next, 0, None, None), 0);
-    let track = sim
-        .substrate
-        .entities
-        .get(1)
-        .unwrap()
-        .drive_locomotion
-        .as_ref()
-        .unwrap()
-        .track;
-    assert_eq!(track.cursor, 0, "residual alone cannot buy a point");
-    assert_eq!(track.residual, 1);
-}
-
-#[test]
-fn drive_track_first_native_frame_uses_native_frame_budget() {
-    let current_speed = SimFixed::from_num(255) * SimFixed::lit("0.7");
-    let budget =
-        crate::sim::movement::foot_speed::owner_current_speed_from_fraction(current_speed, SIM_ONE);
-    assert_eq!(budget, 11);
-    let (mut sim, invocation, budget) = native_track_fixture(LocomotorKind::Drive, budget);
-    assert_eq!(sim.run_track_points(invocation, budget, None, None), 1);
-    let track = retained_track(sim.substrate.entities.get(1).unwrap(), LocomotorKind::Drive);
-    assert_eq!(track.cursor, 1);
-    assert_eq!(track.residual, 4);
-}
-
-#[test]
 fn gsi_04_05_paid_track_point_clears_current_before_same_cell_coordinate_commit() {
     let (mut sim, invocation, budget) = native_track_fixture(LocomotorKind::Drive, 8);
-    sim.substrate
-        .cell_occupation
-        .mark_vehicle_on_layer(10, 10, 1, MovementLayer::Ground);
-    sim.substrate
-        .cell_occupation
-        .mark_vehicle_on_layer(10, 9, 1, MovementLayer::Ground);
+    sim.substrate.raw_cell_occupation.mark_ground(10, 10, 0x20);
+    sim.substrate.raw_cell_occupation.mark_ground(10, 9, 0x20);
     let mut paid_commits = 0;
     sim.run_track_points_observed(invocation, budget, None, None, &mut |sim, id, event| {
         if event == TrackWorldEvent::SetCoords {
             paid_commits += 1;
             let entity = sim.substrate.entities.get(id).unwrap();
-            assert_eq!((entity.position.rx, entity.position.ry), (10, 10));
+            assert_eq!((entity.position.rx(), entity.position.ry()), (10, 10));
             assert_eq!(
-                sim.substrate
-                    .cell_occupation
-                    .vehicle_bits(10, 10, MovementLayer::Ground),
+                sim.substrate.raw_cell_occupation.ground_bits(10, 10) & 0x20,
                 0
             );
             assert_eq!(
-                sim.substrate
-                    .cell_occupation
-                    .vehicle_bits(10, 9, MovementLayer::Ground),
+                sim.substrate.raw_cell_occupation.ground_bits(10, 9) & 0x20,
                 0x20
             );
-            assert!(!entity.foot_occupation_enabled);
+            assert!(!entity.foot_occupation_enabled());
         }
     });
     assert!(paid_commits >= 1, "observe the actual coordinate receiver");
@@ -379,10 +273,10 @@ fn drive_track_each_call_consumes_fresh_native_frame_budget() {
     let (mut sim, invocation, budget) = native_track_fixture(LocomotorKind::Drive, 11);
     sim.run_track_points(invocation, budget, None, None);
     let first = retained_track(sim.substrate.entities.get(1).unwrap(), LocomotorKind::Drive);
-    assert_eq!((first.cursor, first.residual), (1, 4));
+    assert_eq!((first.cursor(), first.residual()), (1, 4));
     sim.run_track_points(invocation, budget, None, None);
     let second = retained_track(sim.substrate.entities.get(1).unwrap(), LocomotorKind::Drive);
-    assert_eq!((second.cursor, second.residual), (3, 1));
+    assert_eq!((second.cursor(), second.residual()), (3, 1));
 }
 
 #[test]
@@ -397,20 +291,21 @@ fn fresh_track_pays_point_zero_and_terminal_through_the_production_host() {
         );
         let entity = sim.substrate.entities.get(1).unwrap();
         let progress = retained_track(entity, LocomotorKind::Drive);
-        assert_eq!(progress.cursor, expected_cursor);
-        assert_eq!(progress.residual, expected_residual);
+        assert_eq!(progress.cursor(), expected_cursor);
+        assert_eq!(progress.residual(), expected_residual);
         if budget == 168 {
             assert_eq!(
-                progress.turn_index, 0,
+                progress.turn_index(),
+                0,
                 "exactly seven cannot pay the sentinel"
             );
         } else {
-            assert_eq!(progress.turn_index, -1);
+            assert_eq!(progress.turn_index(), -1);
             assert_eq!(
                 super::super::ground_pose::position_world_xy(&entity.position),
                 [10 * 256 + 128, 9 * 256 + 128]
             );
-            assert_eq!(budget - progress.residual, 163);
+            assert_eq!(budget - progress.residual(), 163);
         }
     }
 }

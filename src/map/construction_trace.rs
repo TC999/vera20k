@@ -3,16 +3,20 @@
 //! Map generators produce this ordered data, while simulation bootstrap
 //! consumes it without depending on any generator implementation.
 
-/// The generated-Building constructor phases that consume Scenario words.
+/// The generated-Techno constructor phases that consume Scenario words.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RmgConstructionPhase {
+pub enum RmgConstructionPhase {
     BridgeRepairHut,
     NeutralTech,
+    /// Urban areas: civilian buildings, infantry and vehicles (`0x005A6510`,
+    /// `0x005A6920`), under Ares hook 0x598FB8 or VERA's opted-in Urban
+    /// Presence in any build.
+    UrbanAreas,
 }
 
 /// Whether a generated constructor survived placement and entered MapFile.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RmgConstructionOutcome {
+pub enum RmgConstructionOutcome {
     Discarded,
     Emitted {
         entity_index: usize,
@@ -22,25 +26,31 @@ pub(crate) enum RmgConstructionOutcome {
 
 /// One Scenario-consuming generated Building constructor, in native order.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RmgConstructionEvent {
-    pub(crate) ordinal: usize,
+pub struct RmgConstructionEvent {
+    pub ordinal: usize,
     pub(crate) phase: RmgConstructionPhase,
     pub(crate) techno_type: String,
-    pub(crate) outcome: RmgConstructionOutcome,
+    pub outcome: RmgConstructionOutcome,
 }
 
-/// Immutable transport of all generated Building constructor effects.
+/// Direct Scenario writes after the generator's synthetic Full_Init, before
+/// generated constructors (0059A529..0059A5EC). Values are already integer units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GeneratedLightingOverride {
+    pub ambient_percent: i32,
+    pub rgb_percent: [i32; 3],
+    pub level_units: i32,
+}
+
+/// Immutable transport of generated initialization and Building constructor effects.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct RmgConstructionTrace {
-    pub(crate) events: Vec<RmgConstructionEvent>,
+pub struct RmgConstructionTrace {
+    pub lighting: Option<GeneratedLightingOverride>,
+    pub events: Vec<RmgConstructionEvent>,
 }
 
 impl RmgConstructionTrace {
-    pub(crate) fn push_discarded(
-        &mut self,
-        phase: RmgConstructionPhase,
-        techno_type: String,
-    ) -> usize {
+    pub fn push_discarded(&mut self, phase: RmgConstructionPhase, techno_type: String) -> usize {
         let ordinal = self.events.len();
         self.events.push(RmgConstructionEvent {
             ordinal,
@@ -51,7 +61,7 @@ impl RmgConstructionTrace {
         ordinal
     }
 
-    pub(crate) fn push_emitted(
+    pub fn push_emitted(
         &mut self,
         phase: RmgConstructionPhase,
         techno_type: String,

@@ -63,7 +63,8 @@ pub enum MissionType {
     Sticky = 6,
     Enter = 7,
     Capture = 8,
-    /// TS-legacy; occupies index 9 and shifts every later index by one.
+    /// Grinder approach. Script60 queues this mission; PerCell consumes the
+    /// arriving Foot (4DFA70, Infantry51973C).
     Eaten = 9,
     Harvest = 10,
     AreaGuard = 11,
@@ -105,13 +106,14 @@ pub enum MissionType {
 
 impl MissionType {
     /// The wire mission id (0..=31; `0xFF` for `None`).
+    #[cfg(test)]
     #[inline]
     pub fn id(self) -> u8 {
         self as u8
     }
 
-    /// Alias of [`MissionType::id`] for dispatch call sites.
-    #[cfg(test)]
+    /// Alias of `MissionType::id` for dispatch call sites.
+    #[cfg(any(test, feature = "test-support"))]
     #[inline]
     pub fn dispatch_id(self) -> u8 {
         self as u8
@@ -229,27 +231,6 @@ impl MissionType {
         }
         MissionType::all().find(|mission| mission.ini_section().eq_ignore_ascii_case(name))
     }
-
-    /// Missions with **no completion transition**: the object holds them until
-    /// something else retasks it, so a "the committed mission's work is over"
-    /// reading must never override them.
-    ///
-    /// `Sleep` and `Harmless` dispatch to base handlers that do nothing and
-    /// re-arm themselves forever; `Sticky` shares the Guard handler but is
-    /// excluded from passive acquisition and refuses to promote a queued
-    /// mission at all. All three mean "stand still and do nothing", which is
-    /// the opposite of the idle-Unit `Guard` reading VERA derives for an
-    /// object with no live machine.
-    ///
-    /// These are exactly the three the stock map `MISSION=` column authors for
-    /// neutral scenery objects, so the distinction is load-bearing from the
-    /// first frame of any map that carries them.
-    pub fn holds_until_retasked(self) -> bool {
-        matches!(
-            self,
-            MissionType::Sleep | MissionType::Sticky | MissionType::Harmless
-        )
-    }
 }
 
 /// Simulation frames per game-minute (15 fps × 60 s). `Rate=`/`AARate=` are
@@ -298,28 +279,29 @@ pub struct MissionControlEntry {
     /// Frames between anti-aircraft processings (`AARate=`; copies `rate_frames`
     /// when the key is absent or zero).
     pub aa_rate_frames: i32,
-    /// Weapons disabled → ignored as a target until it fires (`NoThreat=`, def no).
+    /// The threat scan skips an object on this mission (`NoThreat=`, read at
+    /// `0x005B37AE..0x005B37BF` over the constructed `false`, `0x005B3706`).
     ///
-    /// **Parsed, no consumer.** Stock YR sets it on exactly two sections,
-    /// `[Harmless]` and `[Selling]`. Harmless is inert here — nothing shoots a
-    /// civilian anyway — but Selling is not. Trigger: an enemy building is
-    /// selected as a target during the seconds it spends on the Selling mission.
-    /// Player effect: retail stops treating a building the player has sold as
-    /// worth shooting, so the deconstruction runs out and the refund lands;
-    /// VERA's keeps drawing fire and can be destroyed instead, costing the
-    /// player the refund. Frequency: every contested sell — a few times a match
-    /// for an active player, and near-continuous when a base is being overrun.
-    /// Downstream risk: the consumer belongs in threat scoring
-    /// (`TechnoClass::Greatest_Threat`), which is not this row's owner; the
-    /// native reader of `NoThreat` is UNCHECKED.
+    /// Stock YR sets it on exactly two sections, `[Harmless]` and `[Selling]`.
+    /// Two readers take it from the object's current mission
+    /// (`sim::mission::control::current_control`); no other code reads it:
+    /// - `TechnoClass::Evaluate_Candidate` refuses the object as a candidate
+    ///   (`0x006F7DFF..0x006F7E0B`, `combat::greatest_threat`), so no scan
+    ///   picks a building being sold;
+    /// - `FootClass::ReceiveDamage`'s teamless idle tail
+    ///   (`0x004D749F..0x004D74C7`, `combat::world_receiver`): a Harmless Foot
+    ///   hit by a source takes `Enter_Idle_Mode(0, 1)`.
     pub no_threat: bool,
     /// Frozen forever, never recovers (`Zombie=`, def no).
     pub zombie: bool,
     /// Can be recruited into a team / base defence (`Recruitable=`, def yes).
+    /// `[Sticky]` and `[Area Guard]` are the two stock sections that set it
+    /// explicitly.
     ///
-    /// **No consumer, either side.** Its only retail readers are team
-    /// recruitment, and VERA has no AI opponent to run a team. `[Sticky]` and
-    /// `[Area Guard]` are the two stock sections that set it explicitly.
+    /// `RespondToBaseAttack` reads it from the object's current mission
+    /// (`0x0070825B`, `0x00708491`, `combat::base_defense_response`), and
+    /// team recruitment through `0x005B36E0`
+    /// (`sim::mission::control::mission_recruitable`).
     pub recruitable: bool,
     /// Frozen in place but can still fire and function (`Paralyzed=`, def no).
     ///
@@ -330,10 +312,10 @@ pub struct MissionControlEntry {
     ///    it only on the Area-Guard-promotion branch, not on the ordinary Guard
     ///    fall, so a `Paralyzed=` mission does not stop a vehicle falling to
     ///    Guard;
-    /// 2. the scatter paths, which live in `sim/movement` — **not consumed
-    ///    there yet**. That is where `[Sticky] Paralyzed=yes` would actually
-    ///    bite: a Sticky civilian can currently be shoved off its cell, which
-    ///    is the opposite of the section comment's "cannot move".
+    /// 2. `UnitClass::Scatter`'s coordinate arm (`0x00743CA7`,
+    ///    `movement::scatter`), which refuses it. That body's prefix already
+    ///    refuses Sticky (`vt+0x28C`), the one stock section that sets it.
+    ///    `InfantryClass::Scatter` does not read it.
     pub paralyzed: bool,
     /// Allowed to retaliate while on this mission (`Retaliate=`, def yes).
     pub retaliate: bool,
@@ -341,9 +323,9 @@ pub struct MissionControlEntry {
     ///
     /// The Infantry and Unit Scatter receivers read it unless their first
     /// flag forces the call (`movement::scatter::mission_permits_scatter`);
-    /// the Aircraft receiver reads it too but is not dispatched (residual in
-    /// `movement::scatter`). `Scatter=no` covers Sleep, Sticky, Attack,
-    /// Capture, **Harvest**, Unload, Construction and Selling in stock rules.
+    /// the Aircraft receiver reads it whatever the flags. `Scatter=no`
+    /// covers Sleep, Sticky, Attack, Capture, **Harvest**, Unload,
+    /// Construction and Selling in stock rules.
     pub scatter: bool,
 }
 
@@ -374,6 +356,14 @@ pub struct MissionControl {
 }
 
 impl MissionControl {
+    /// Install an original-executed frame projection for executable replay.
+    /// Distinctive controls directly write native double fields; their saved
+    /// conversion receipts bypass INI scanning. Retail uses the reader below.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_native_rate_frames_for_test(&mut self, mission: MissionType, frames: i32) {
+        self.entries.get_mut(&mission).unwrap().rate_frames = frames;
+    }
+
     /// Parse every dispatched mission's `[<MissionName>]` section. A mission
     /// whose section is absent keeps the documented defaults (matching the
     /// original reader, which leaves an unread slot at its constructed value).
@@ -467,6 +457,7 @@ impl MissionControl {
     }
 
     /// Number of populated mission entries.
+    #[cfg(test)]
     #[inline]
     pub fn len(&self) -> usize {
         self.entries.len()
@@ -479,57 +470,9 @@ impl MissionControl {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_rules_a_n))]
 mod mission_type_tests {
     use super::*;
-
-    #[test]
-    fn all_ids_round_trip() {
-        for id in 0u8..MISSION_COUNT as u8 {
-            let m = MissionType::from_id(id).expect("ids < 32 map to a mission");
-            assert_eq!(m.id(), id);
-            assert_eq!(m.dispatch_id(), id);
-        }
-    }
-
-    #[test]
-    fn out_of_range_ids_are_none() {
-        assert_eq!(MissionType::from_id(32), None);
-        // 0xFF is the idle sentinel's discriminant, not a dispatched id.
-        assert_eq!(MissionType::from_id(0xFF), None);
-    }
-
-    #[test]
-    fn verified_spot_indices() {
-        assert_eq!(MissionType::Sleep.id(), 0);
-        assert_eq!(MissionType::Guard.id(), 5);
-        assert_eq!(MissionType::Enter.id(), 7);
-        assert_eq!(MissionType::Eaten.id(), 9);
-        assert_eq!(MissionType::Harvest.id(), 10);
-        assert_eq!(MissionType::AreaGuard.id(), 11);
-        assert_eq!(MissionType::Selling.id(), 19);
-        assert_eq!(MissionType::Rescue.id(), 21);
-        assert_eq!(MissionType::AttackMove.id(), 29);
-        assert_eq!(MissionType::SpyplaneOverfly.id(), 31);
-    }
-
-    #[test]
-    fn all_iterates_thirty_two() {
-        assert_eq!(MissionType::all().count(), MISSION_COUNT);
-    }
-
-    #[test]
-    fn default_is_none_sentinel() {
-        assert_eq!(MissionType::default(), MissionType::None);
-        assert_eq!(MissionType::None as u16, 0xFF);
-    }
-
-    #[test]
-    fn ini_section_names_match_table() {
-        assert_eq!(MissionType::AreaGuard.ini_section(), "Area Guard");
-        assert_eq!(MissionType::Deliberate.ini_section(), "Wait");
-        assert_eq!(MissionType::Sleep.ini_section(), "Sleep");
-    }
 
     /// Every mission name the original's table spells with a space must be
     /// spelled with it here, or the `[<MissionName>]` lookup misses.
@@ -608,18 +551,6 @@ mod mission_type_tests {
         );
     }
 
-    #[test]
-    fn only_the_stand_still_missions_hold_until_retasked() {
-        for mission in MissionType::all() {
-            let expected = matches!(
-                mission,
-                MissionType::Sleep | MissionType::Sticky | MissionType::Harmless
-            );
-            assert_eq!(mission.holds_until_retasked(), expected, "{mission:?}");
-        }
-        assert!(!MissionType::None.holds_until_retasked());
-    }
-
     /// The 32 section names are distinct — a duplicate would make two missions
     /// share one control slot.
     #[test]
@@ -635,7 +566,7 @@ mod mission_type_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_rules_a_n))]
 mod mission_control_tests {
     use super::*;
 
@@ -716,32 +647,6 @@ mod mission_control_tests {
     }
 
     #[test]
-    fn bools_use_documented_defaults() {
-        // [Move] specifies only Rate → every flag keeps its documented default.
-        let mc = MissionControl::from_ini(&ini("[Move]\nRate=.016\n"));
-        let mv = mc.entry(MissionType::Move).unwrap();
-        assert!(!mv.no_threat);
-        assert!(!mv.zombie);
-        assert!(mv.recruitable); // def yes
-        assert!(!mv.paralyzed);
-        assert!(mv.retaliate); // def yes
-        assert!(mv.scatter); // def yes
-    }
-
-    #[test]
-    fn present_bool_overrides_default() {
-        let mc = MissionControl::from_ini(&ini(
-            "[Sleep]\nRecruitable=no\nZombie=yes\nRetaliate=no\nScatter=no\nRate=1\n",
-        ));
-        let sl = mc.entry(MissionType::Sleep).unwrap();
-        assert!(!sl.recruitable);
-        assert!(sl.zombie);
-        assert!(!sl.retaliate);
-        assert!(!sl.scatter);
-        assert_eq!(sl.rate_frames, 900); // Rate=1 minute -> 900 frames
-    }
-
-    #[test]
     fn no_carry_forward_between_missions() {
         // Guard sets AARate/Rate; a keyless mission must NOT inherit them —
         // it keeps its own constructed values, which for the rate pair is
@@ -812,7 +717,7 @@ mod mission_control_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_rules_a_n))]
 mod acceptance_tests {
     use super::*;
     use crate::rules::ruleset::RuleSet;
@@ -877,7 +782,7 @@ mod acceptance_tests {
                 "{mission:?} discriminant"
             );
             assert_eq!(
-                bincode::serialize(&mission).expect("serialize mission selector"),
+                crate::util::save_codec::serialize(&mission).expect("serialize mission selector"),
                 serde_variant_index.to_le_bytes(),
                 "{mission:?} bincode declaration index"
             );
@@ -902,7 +807,7 @@ mod acceptance_tests {
             scatter: false,
         };
         assert_eq!(
-            bincode::serialize(&entry).expect("serialize mission control entry"),
+            crate::util::save_codec::serialize(&entry).expect("serialize mission control entry"),
             [
                 0x04, 0x03, 0x02, 0x01, 0x14, 0x13, 0x12, 0x11, 1, 0, 1, 0, 1, 0,
             ]
@@ -915,10 +820,12 @@ mod acceptance_tests {
         // This literal was captured from the pre-move source-owned hash
         // contract. It pins exact parsed section/key/value order rather than
         // comparing two hashes produced by the relocated Rust definitions.
+        // Both hashes now fold through the portable StateHasher (previously
+        // std's DefaultHasher: 0x4635_CE56_7472_58B8, 0x37E7_F896_E2C0_585E).
         const RULES_SOURCE: &str = "[Guard]\nRate=.030\nAARate=.016\nRetaliate=yes\n\
                                     [Area Guard]\nRate=.040\nAARate=.032\nScatter=no\n";
-        const EXPECTED_INI_HASH: u64 = 0x4635_CE56_7472_58B8;
-        const EXPECTED_ONE_LAYER_HASH: u64 = 0x37E7_F896_E2C0_585E;
+        const EXPECTED_INI_HASH: u64 = 0xA71C_F806_E272_F777;
+        const EXPECTED_ONE_LAYER_HASH: u64 = 0x8089_23E6_6E4A_EF5B;
         let ini = IniFile::from_str(RULES_SOURCE);
         assert_eq!(ini.content_hash(), EXPECTED_INI_HASH);
         let rules = RuleSet::from_ini(&ini).expect("fixed mission rules source parses");

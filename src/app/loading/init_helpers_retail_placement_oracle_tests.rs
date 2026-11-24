@@ -10,16 +10,15 @@ use super::load_rules_with_merged_ini;
 use crate::assets::asset_manager::{AssetManager, MediaArchiveMode};
 use crate::map::entities::EntityCategory;
 use crate::map::map_file::{self, MapFile};
-use crate::map::overlay_types::OverlayTypeRegistry;
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::map::theater;
+use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::sim::command::{Command, CommandEnvelope};
 use crate::sim::movement::locomotor::MovementLayer;
 use crate::sim::overlay_grid::OverlayGrid;
 use crate::sim::pathfinding::PathGrid;
-use crate::sim::power_system::tick_power_states;
 use crate::sim::production::{
-    foundation_dimensions, placement_preview_for_owner_without_overlays, ready_buildings_for_owner,
+    placement_preview_for_owner_with_overlays, ready_buildings_for_owner,
 };
 use crate::sim::world::Simulation;
 
@@ -278,9 +277,9 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
 
     let conyard = rules.object(CONYARD).expect("stock GACNST");
     let gapowr = rules.object(POWER_PLANT).expect("stock GAPOWR");
-    assert_eq!(foundation_dimensions(&conyard.foundation), (4, 4));
+    assert_eq!(conyard.foundation.dimensions(), (4, 4));
     assert!(conyard.base_normal);
-    assert_eq!(foundation_dimensions(&gapowr.foundation), (2, 2));
+    assert_eq!(gapowr.foundation.dimensions(), (2, 2));
     assert_eq!(gapowr.adjacent, 2);
     assert_eq!(gapowr.strength, 750);
     assert_eq!(gapowr.power, 200);
@@ -307,11 +306,17 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
     .expect("Dustbowl must provide clear GACNST/valid GAPOWR cells beside nonblocking ore");
 
     let mut sim = Simulation::new();
-    sim.resolved_terrain = Some(resolved);
-    sim.overlay_grid = Some(overlay_grid);
-    sim.playfield_bounds = Some(crate::sim::cell_rect::PlayfieldBounds::from_map_header(
-        &map.header,
-    ));
+    *sim.resolved_terrain_mut_for_test() = Some(resolved);
+    *sim.overlay_grid_mut_for_test() = Some(overlay_grid);
+    *sim.playfield_bounds_mut_for_test() = Some(
+        crate::sim::cell_rect::PlayfieldBounds::from_map_header(&map.header),
+    );
+    let owner_id = sim.intern(OWNER);
+    // `HouseClass::CanBuild @ 0x004F7870` runs for a real house only.
+    sim.houses_mut_for_test()
+        .register(crate::sim::house_state::HouseState::new(
+            owner_id, 0, None, true, 10_000, 10,
+        ));
     let provider_id = sim
         .spawn_object(
             CONYARD,
@@ -323,34 +328,33 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
         )
         .expect("spawn stock GACNST through lifecycle authority");
     let provider = sim
-        .substrate
-        .entities
+        .entities()
         .get(provider_id)
         .expect("spawned provider retained");
-    assert!(provider.lifecycle.cell_marked);
-    assert!(provider.in_logic_vector);
-    assert_eq!(provider.foundation, "4x4");
+    assert!(provider.lifecycle.cell_marked());
+    assert!(provider.seldom.in_logic_vector.is_member());
+    assert_eq!(provider.seldom.type_facts.foundation().name(), "4x4");
 
-    let owner_id = sim.interner.intern(OWNER);
-    // `HouseClass::CanBuild @ 0x004F7870` runs for a real house only.
-    sim.houses.insert(
-        owner_id,
-        crate::sim::house_state::HouseState::new(owner_id, 0, None, true, 10_000, 10),
-    );
-    sim.session.house_order.push(owner_id);
-    let gapowr_id = sim.interner.intern(POWER_PLANT);
+    // This placement oracle starts after the yard's construction lifecycle.
+    let provider = sim.entity_mut_for_test(provider_id).unwrap();
+    provider.finish_building_construction_for_test();
+    provider.building_art.set_actually_placed_for_test(true);
+    sim.append_house_base_building_for_test(provider_id);
+    let gapowr_id = sim.intern(POWER_PLANT);
     assert!(crate::sim::production::enqueue_by_type(
         &mut sim,
         &rules,
         OWNER,
         POWER_PLANT,
+        &mut crate::sim::world::FrameEffects::default(),
+        false,
     ));
     let category = crate::sim::production::category_for_object(
         rules.object(POWER_PLANT).expect("stock GAPOWR profile"),
     );
     let held_id = sim
-        .production
-        .factory_shadow
+        .production()
+        .factories()
         .view(owner_id, category)
         .unwrap()
         .object
@@ -358,21 +362,15 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
         .entity_id
         .expect("enqueue constructs the held GAPOWR identity");
     assert!(
-        sim.production
-            .factory_shadow
+        sim.production_mut_for_test()
+            .factories_mut_for_test()
             .test_arm_ready(owner_id, category)
     );
-    // The factory owns completion accounting and its ready projection.
-    assert!(
-        !crate::sim::production::tick_production_with_overlay_registry(
-            &mut sim,
-            &rules,
-            Some(&overlay_registry),
-        )
-    );
+    // The Strip's publish accounts the completion once.
+    crate::sim::production::publish_production_changes_for_tests(&mut sim, &rules, owner_id);
     let completed = sim
-        .production
-        .factory_shadow
+        .production()
+        .factories()
         .view(owner_id, category)
         .unwrap()
         .object
@@ -380,16 +378,15 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
     assert!(completed.completion_accounted);
     assert_eq!(completed.entity_id, Some(held_id));
     assert_eq!(ready_buildings_for_owner(&sim, &rules, OWNER).len(), 1);
-    let held = sim.substrate.entities.get(held_id).unwrap();
-    assert!(held.lifecycle.in_limbo && !held.lifecycle.cell_marked);
+    let held = sim.entities().get(held_id).unwrap();
+    assert!(held.lifecycle.in_limbo() && !held.lifecycle.cell_marked());
 
     let blocked_cells = rect_cells(fixture.blocked, 2, 2);
     let overlay_before: BTreeMap<(u16, u16), (Option<u8>, u8)> = blocked_cells
         .iter()
         .map(|cell| {
             let overlay = sim
-                .overlay_grid
-                .as_ref()
+                .overlay_grid()
                 .expect("overlay grid")
                 .cell(cell.0, cell.1);
             (*cell, (overlay.overlay_id, overlay.overlay_data))
@@ -403,27 +400,28 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
         }),
         "blocked retail footprint must contain a map ore overlay"
     );
-    let preview = placement_preview_for_owner_without_overlays(
+    let preview = placement_preview_for_owner_with_overlays(
         &sim,
         &rules,
         OWNER,
         POWER_PLANT,
         fixture.blocked.0,
         fixture.blocked.1,
+        None,
     )
     .expect("stock GAPOWR preview");
     assert!(!preview.valid);
     assert!(
-        preview.cell_valid.iter().any(|valid| !valid),
+        preview.cells.iter().any(|cell| !cell.valid),
         "the ore-bearing foundation cell must be red"
     );
 
-    let entities_before = sim.substrate.entities.len();
-    let next_id_before = sim.substrate.next_stable_object_id;
-    let occupancy_generation_before = sim.substrate.occupancy.generation();
+    let entities_before = sim.entities().len();
+    let next_id_before = sim.next_stable_object_id();
+    let occupancy_generation_before = sim.occupancy().generation();
     let rejected = CommandEnvelope::new(
         owner_id,
-        sim.session.tick + 1,
+        sim.session().tick() + 1,
         Command::PlaceReadyBuilding {
             type_id: gapowr_id,
             rx: fixture.blocked.0,
@@ -433,16 +431,13 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
     let tick = sim.advance_tick(&[rejected], Some(&rules), Some(&path_grid), None, 67);
     assert_eq!(tick.executed_commands, 1);
     assert!(!tick.spawned_entities);
-    assert_eq!(sim.substrate.entities.len(), entities_before);
-    assert_eq!(sim.substrate.next_stable_object_id, next_id_before);
-    assert_eq!(
-        sim.substrate.occupancy.generation(),
-        occupancy_generation_before
-    );
+    assert_eq!(sim.entities().len(), entities_before);
+    assert_eq!(sim.next_stable_object_id(), next_id_before);
+    assert_eq!(sim.occupancy().generation(), occupancy_generation_before);
     assert_eq!(ready_buildings_for_owner(&sim, &rules, OWNER).len(), 1);
     assert_eq!(
-        sim.production
-            .factory_shadow
+        sim.production()
+            .factories()
             .view(owner_id, category)
             .unwrap()
             .object
@@ -456,8 +451,7 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
             .iter()
             .map(|cell| {
                 let overlay = sim
-                    .overlay_grid
-                    .as_ref()
+                    .overlay_grid()
                     .expect("overlay grid")
                     .cell(cell.0, cell.1);
                 (*cell, (overlay.overlay_id, overlay.overlay_data))
@@ -466,21 +460,29 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
         overlay_before
     );
 
-    let preview = placement_preview_for_owner_without_overlays(
+    let preview = placement_preview_for_owner_with_overlays(
         &sim,
         &rules,
         OWNER,
         POWER_PLANT,
         fixture.valid.0,
         fixture.valid.1,
+        None,
     )
     .expect("stock GAPOWR valid preview");
     assert!(preview.valid);
-    assert_eq!(preview.cell_valid, vec![true; 4]);
-    let generation_before_valid = sim.substrate.occupancy.generation();
+    assert_eq!(
+        preview
+            .cells
+            .iter()
+            .map(|cell| cell.valid)
+            .collect::<Vec<_>>(),
+        vec![true; 4]
+    );
+    let generation_before_valid = sim.occupancy().generation();
     let accepted = CommandEnvelope::new(
         owner_id,
-        sim.session.tick + 1,
+        sim.session().tick() + 1,
         Command::PlaceReadyBuilding {
             type_id: gapowr_id,
             rx: fixture.valid.0,
@@ -493,35 +495,30 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
     assert!(ready_buildings_for_owner(&sim, &rules, OWNER).is_empty());
 
     let placed = sim
-        .substrate
-        .entities
+        .entities()
         .values()
         .find(|entity| {
-            entity.type_ref == gapowr_id
-                && entity.position.rx == fixture.valid.0
-                && entity.position.ry == fixture.valid.1
+            entity.type_ref() == gapowr_id
+                && entity.position.rx() == fixture.valid.0
+                && entity.position.ry() == fixture.valid.1
         })
         .expect("accepted command spawned stock GAPOWR");
-    assert_eq!(placed.category, EntityCategory::Structure);
-    assert_eq!(placed.foundation, "2x2");
-    assert_eq!(placed.health.current, 750);
+    assert_eq!(placed.category(), EntityCategory::Structure);
+    assert_eq!(placed.seldom.type_facts.foundation().name(), "2x2");
+    assert_eq!(placed.health.current(), 750);
     assert_eq!(rules.object("GAPOWR").unwrap().strength, 750);
-    assert!(placed.lifecycle.cell_marked);
-    assert!(placed.in_logic_vector);
-    assert!(placed.building_up.is_some());
-    let placed_id = placed.stable_id;
+    assert!(placed.lifecycle.cell_marked());
+    assert!(placed.seldom.in_logic_vector.is_member());
+    assert!(placed.building_up());
+    let placed_id = placed.stable_id();
     assert_eq!(
         placed_id, held_id,
         "placement reuses the completed identity"
     );
-    assert_eq!(
-        sim.substrate.occupancy.generation(),
-        generation_before_valid + 4
-    );
+    assert_eq!(sim.occupancy().generation(), generation_before_valid + 4);
     for cell in rect_cells(fixture.valid, 2, 2) {
         assert!(
-            sim.substrate
-                .occupancy
+            sim.occupancy()
                 .get(cell.0, cell.1)
                 .is_some_and(|occupancy| {
                     occupancy
@@ -532,24 +529,18 @@ fn retail_dustbowl_gapowr_blocked_then_valid_placement_oracle() {
         );
     }
 
-    let _ = tick_power_states(
-        &mut sim.power_states,
-        &mut sim.substrate.entities,
-        &rules,
-        &sim.interner,
-    );
+    sim.assess_power_for_test(&rules);
     let power = sim
-        .power_states
+        .power_states()
         .get(&owner_id)
         .expect("placed GAPOWR contributes live power");
-    assert_eq!(power.total_output, 200);
-    assert_eq!(power.total_drain, 0);
-    assert!(!power.is_low_power);
+    assert_eq!(power.total_output(), 200);
+    assert_eq!(power.total_drain(), 0);
+    assert!(!power.is_low_power());
     assert!(
-        sim.substrate
-            .entities
+        sim.entities()
             .get(placed_id)
-            .is_some_and(|entity| entity.building_up.is_some()),
+            .is_some_and(|entity| entity.building_up()),
         "power must be live during the visible buildup"
     );
 }

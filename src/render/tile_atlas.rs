@@ -16,11 +16,10 @@
 use std::collections::HashMap;
 
 use crate::map::theater::{TileImage, TileKey};
+use crate::render::atlas_growth;
 use crate::render::batch::BatchRenderer;
 use crate::render::batch::BatchTexture;
-use crate::render::gpu::GpuContext;
-
-/// Maximum atlas texture width (pixels). 4096 is safe for all GPU targets.
+use crate::util::lookup_hash::LookupMap;
 
 /// Padding between tiles in the atlas (pixels). Prevents texture bleeding
 /// from bilinear filtering at tile boundaries.
@@ -45,7 +44,7 @@ pub struct TileUV {
 /// Created once at map load time. The batch renderer uses `get_uv()` to
 /// look up per-tile UV coordinates when building sprite instances.
 pub struct TileAtlas {
-    /// The GPU texture containing all packed tiles.
+    /// The GPU texture containing all packed tiles, as encoded colour.
     pub texture: BatchTexture,
     /// Parallel R8 depth atlas — same UV layout as color, one byte per pixel.
     /// Contains per-pixel Z-depth from TMP files for occlusion (cliffs, ramps).
@@ -53,8 +52,9 @@ pub struct TileAtlas {
     /// Pre-built bind group for the Z-depth pipeline (color + sampler + R8 depth).
     /// Used by `draw_with_buffer_zdepth()` in the render pass.
     pub zdepth_bind_group: wgpu::BindGroup,
-    /// Tile key → UV rectangle + rendering metadata.
-    uv_map: HashMap<TileKey, TileUV>,
+    /// Tile key → UV rectangle + rendering metadata. Lookup-only: the
+    /// terrain instance build reads it for every visible cell each draw.
+    uv_map: LookupMap<TileKey, TileUV>,
 }
 
 impl TileAtlas {
@@ -75,85 +75,76 @@ impl TileAtlas {
 /// left-to-right in rows. Each tile is stored at its actual dimensions — no
 /// clipping of oversized tiles with extra data (cliffs, shores).
 pub fn build_atlas(
-    gpu: &GpuContext,
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
     batch: &BatchRenderer,
     tiles: &HashMap<TileKey, TileImage>,
 ) -> TileAtlas {
     if tiles.is_empty() {
         let rgba: Vec<u8> = vec![0u8; 4];
-        let texture: BatchTexture = batch.create_texture(gpu, &rgba, 1, 1);
-        let depth_texture_view = create_r8_texture(gpu, &[0u8], 1, 1);
+        let texture: BatchTexture =
+            batch.create_encoded_texture_on_device(device, queue, &rgba, 1, 1);
+        let depth_texture_view = create_r8_texture(device, queue, &[0u8], 1, 1);
         let zdepth_bind_group =
-            batch.create_zdepth_bind_group(gpu, &texture.view, &depth_texture_view);
+            batch.create_zdepth_bind_group_on_device(device, &texture.view, &depth_texture_view);
         return TileAtlas {
             texture,
             depth_texture_view,
             zdepth_bind_group,
-            uv_map: HashMap::new(),
+            uv_map: LookupMap::default(),
         };
     }
 
-    // Sort by height descending for better shelf packing, then by key for determinism.
-    let mut sorted_keys: Vec<TileKey> = tiles.keys().copied().collect();
-    sorted_keys.sort_by(|a, b| {
-        let ha: u32 = tiles[a].height;
-        let hb: u32 = tiles[b].height;
-        hb.cmp(&ha)
-            .then(a.tile_id.cmp(&b.tile_id))
-            .then(a.sub_tile.cmp(&b.sub_tile))
-    });
-
-    // Estimate atlas width from total tile area (sqrt heuristic).
-    let total_area: u64 = sorted_keys
+    let sorted_keys = packing_order(tiles.keys().copied());
+    let sizes: Vec<[u32; 2]> = sorted_keys
         .iter()
-        .map(|k| {
-            (tiles[k].width as u64 + TILE_PADDING as u64)
-                * (tiles[k].height as u64 + TILE_PADDING as u64)
-        })
-        .sum();
-    let estimated_side: u32 = (total_area as f64).sqrt().ceil() as u32;
-    let max_texture_dim: u32 = gpu.device.limits().max_texture_dimension_2d;
-    let mut atlas_width: u32 = estimated_side.max(64).min(max_texture_dim);
-
-    // Shelf-pack with retry: widen atlas if height exceeds GPU texture limit.
-    let placements: Vec<(TileKey, u32, u32)>;
-    let atlas_height: u32;
-    loop {
-        let trial: Vec<(TileKey, u32, u32)> = shelf_pack(&sorted_keys, tiles, atlas_width);
-        let trial_height: u32 = trial
-            .iter()
-            .map(|&(key, _, py)| py + tiles[&key].height)
-            .max()
-            .unwrap_or(1);
-        if trial_height <= max_texture_dim {
-            placements = trial;
-            atlas_height = trial_height;
-            break;
-        }
-        if atlas_width >= max_texture_dim {
-            // Can't grow wider — use what we have and hope for the best.
-            log::warn!(
-                "Tile atlas height {} exceeds GPU limit {} even at max width {}",
-                trial_height,
-                max_texture_dim,
-                atlas_width
-            );
-            placements = trial;
-            atlas_height = trial_height.min(max_texture_dim);
-            break;
-        }
-        atlas_width = (atlas_width.saturating_mul(2)).min(max_texture_dim);
+        .map(|key| [tiles[key].width, tiles[key].height])
+        .collect();
+    let max_texture_dim: u32 = device.limits().max_texture_dimension_2d;
+    let plan = atlas_growth::plan_initial_shelves(
+        &sizes,
+        atlas_growth::InitialShelfPolicy {
+            padding: TILE_PADDING,
+            max_dim: max_texture_dim,
+            split_pages: false,
+        },
+    );
+    let atlas_width = plan.width;
+    let used_height = plan.single_page_height();
+    if used_height > max_texture_dim {
+        // Can't grow wider — use what we have and hope for the best.
+        log::warn!(
+            "Tile atlas height {} exceeds GPU limit {} even at max width {}",
+            used_height,
+            max_texture_dim,
+            atlas_width
+        );
     }
+    // A page of empty tiles has no rows; the device wants at least one. A
+    // tile placed past a clamped page would sample outside it: it is left
+    // out instead, and the log says how many.
+    let atlas_height = used_height.min(max_texture_dim).max(1);
+    let atlas_width = atlas_width.max(1);
+    let mut left_out = 0usize;
 
     // Allocate RGBA color buffer and R8 depth buffer (same layout), then blit tiles.
     let mut rgba: Vec<u8> = vec![0u8; (atlas_width * atlas_height * 4) as usize];
     let mut depth_buf: Vec<u8> = vec![0u8; (atlas_width * atlas_height) as usize];
-    let mut uv_map: HashMap<TileKey, TileUV> = HashMap::with_capacity(placements.len());
+    let mut uv_map: LookupMap<TileKey, TileUV> =
+        LookupMap::with_capacity_and_hasher(plan.placements.len(), Default::default());
     let aw: f32 = atlas_width as f32;
     let ah: f32 = atlas_height as f32;
 
-    for &(key, px, py) in &placements {
+    for placed in &plan.placements {
+        let [px, py] = placed.origin;
+        let key = sorted_keys[placed.index];
         let tile: &TileImage = &tiles[&key];
+        if py.saturating_add(tile.height) > atlas_height
+            || px.saturating_add(tile.width) > atlas_width
+        {
+            left_out += 1;
+            continue;
+        }
         blit_tile(&mut rgba, atlas_width, px, py, tile);
         blit_depth(&mut depth_buf, atlas_width, px, py, tile);
 
@@ -176,9 +167,17 @@ pub fn build_atlas(
         uv_map.len()
     );
 
-    let texture: BatchTexture = batch.create_texture(gpu, &rgba, atlas_width, atlas_height);
-    let depth_texture_view = create_r8_texture(gpu, &depth_buf, atlas_width, atlas_height);
-    let zdepth_bind_group = batch.create_zdepth_bind_group(gpu, &texture.view, &depth_texture_view);
+    let texture: BatchTexture =
+        batch.create_encoded_texture_on_device(device, queue, &rgba, atlas_width, atlas_height);
+    if left_out > 0 {
+        log::error!(
+            "Tile atlas: {left_out} tiles past the {atlas_width}x{atlas_height} px page this GPU allows are left out"
+        );
+    }
+    let depth_texture_view =
+        create_r8_texture(device, queue, &depth_buf, atlas_width, atlas_height);
+    let zdepth_bind_group =
+        batch.create_zdepth_bind_group_on_device(device, &texture.view, &depth_texture_view);
     log::info!(
         "Tile depth atlas: {}x{} R8 ({:.1} KB)",
         atlas_width,
@@ -193,41 +192,17 @@ pub fn build_atlas(
     }
 }
 
-/// Shelf-pack tiles into rows within the given atlas width.
-/// Returns (key, x, y) placement for each tile.
-fn shelf_pack(
-    sorted_keys: &[TileKey],
-    tiles: &HashMap<TileKey, TileImage>,
-    atlas_width: u32,
-) -> Vec<(TileKey, u32, u32)> {
-    let mut placements: Vec<(TileKey, u32, u32)> = Vec::with_capacity(sorted_keys.len());
-    let mut cursor_x: u32 = 0;
-    let mut cursor_y: u32 = 0;
-    let mut shelf_height: u32 = 0;
-
-    for &key in sorted_keys {
-        let tile: &TileImage = &tiles[&key];
-
-        // Start new shelf if tile doesn't fit on current row.
-        if cursor_x + tile.width > atlas_width {
-            cursor_y += shelf_height + TILE_PADDING;
-            cursor_x = 0;
-            shelf_height = 0;
-        }
-
-        placements.push((key, cursor_x, cursor_y));
-        cursor_x += tile.width + TILE_PADDING;
-        shelf_height = shelf_height.max(tile.height);
-    }
-
-    placements
-}
-
 /// Create an R8Unorm GPU texture from a single-channel byte buffer.
-fn create_r8_texture(gpu: &GpuContext, data: &[u8], width: u32, height: u32) -> wgpu::TextureView {
+fn create_r8_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    data: &[u8],
+    width: u32,
+    height: u32,
+) -> wgpu::TextureView {
     use wgpu::util::DeviceExt;
-    let texture = gpu.device.create_texture_with_data(
-        &gpu.queue,
+    let texture = device.create_texture_with_data(
+        queue,
         &wgpu::TextureDescriptor {
             label: Some("Tile Depth Atlas R8"),
             size: wgpu::Extent3d {
@@ -274,210 +249,31 @@ fn blit_tile(rgba: &mut [u8], atlas_width: u32, px: u32, py: u32, tile: &TileIma
     }
 }
 
-#[cfg(test)]
+/// The order tiles enter the shared shelf plan. The plan sorts tallest first
+/// and keeps input order between equal heights, so the whole key, variant
+/// included, breaks those ties: the tile map's own order differs per run.
+fn packing_order(keys: impl IntoIterator<Item = TileKey>) -> Vec<TileKey> {
+    let mut keys: Vec<TileKey> = keys.into_iter().collect();
+    keys.sort_by_key(|key| (key.tile_id, key.sub_tile, key.variant));
+    keys
+}
+
+#[cfg(all(test, tests_render_s_z))]
 mod tests {
     use super::*;
 
-    /// Create a solid-color tile image with given dimensions and offset.
-    fn make_tile_sized(w: u32, h: u32, ox: i32, oy: i32) -> TileImage {
-        let mut rgba: Vec<u8> = Vec::with_capacity((w * h * 4) as usize);
-        for _ in 0..(w * h) {
-            rgba.extend_from_slice(&[128, 128, 128, 255]);
-        }
-        TileImage {
-            rgba,
-            depth: vec![0u8; (w * h) as usize],
-            width: w,
-            height: h,
-            offset_x: ox,
-            offset_y: oy,
-        }
-    }
-
-    /// Create a standard 60×30 tile.
-    fn make_tile(r: u8, g: u8, b: u8) -> TileImage {
-        let mut rgba: Vec<u8> = Vec::with_capacity(60 * 30 * 4);
-        for _ in 0..(60 * 30) {
-            rgba.extend_from_slice(&[r, g, b, 255]);
-        }
-        TileImage {
-            rgba,
-            depth: vec![0u8; 60 * 30],
-            width: 60,
-            height: 30,
-            offset_x: 0,
-            offset_y: 0,
-        }
-    }
-
+    /// Variants of one sub-tile pack in variant order whatever order the tile
+    /// map hands them over, so the atlas layout is the same on every run.
     #[test]
-    fn test_shelf_packing_basic() {
-        // 4 standard 60×30 tiles should pack into rows.
-        let mut tiles: HashMap<TileKey, TileImage> = HashMap::new();
-        tiles.insert(
-            TileKey {
-                variant: 0,
-                tile_id: 0,
-                sub_tile: 0,
-            },
-            make_tile(255, 0, 0),
-        );
-        tiles.insert(
-            TileKey {
-                variant: 0,
-                tile_id: 1,
-                sub_tile: 0,
-            },
-            make_tile(0, 255, 0),
-        );
-        tiles.insert(
-            TileKey {
-                variant: 0,
-                tile_id: 2,
-                sub_tile: 0,
-            },
-            make_tile(0, 0, 255),
-        );
-        tiles.insert(
-            TileKey {
-                variant: 0,
-                tile_id: 3,
-                sub_tile: 0,
-            },
-            make_tile(255, 255, 0),
-        );
-
-        let mut sorted: Vec<TileKey> = tiles.keys().copied().collect();
-        sorted.sort_by(|a, b| a.tile_id.cmp(&b.tile_id));
-
-        // Atlas width of 130 fits 2 tiles per row (60 + 1 + 60 = 121 < 130).
-        let placements: Vec<(TileKey, u32, u32)> = shelf_pack(&sorted, &tiles, 130);
-        assert_eq!(placements.len(), 4);
-        // First two on row 0, next two on row 1.
-        assert_eq!(placements[0].1, 0); // x=0
-        assert_eq!(placements[0].2, 0); // y=0
-        assert_eq!(placements[1].1, 61); // x=60+1 padding
-        assert_eq!(placements[1].2, 0); // y=0
-        assert_eq!(placements[2].2, 31); // y=30+1 padding (new shelf)
-    }
-
-    #[test]
-    fn test_oversized_tile_not_clipped() {
-        // A cliff tile 60×55 should be stored at full size.
-        let mut tiles: HashMap<TileKey, TileImage> = HashMap::new();
-        tiles.insert(
-            TileKey {
-                variant: 0,
-                tile_id: 0,
-                sub_tile: 0,
-            },
-            make_tile_sized(60, 55, 0, -25),
-        );
-
-        let mut sorted: Vec<TileKey> = tiles.keys().copied().collect();
-        sorted.sort_by(|a, b| a.tile_id.cmp(&b.tile_id));
-
-        let placements: Vec<(TileKey, u32, u32)> = shelf_pack(&sorted, &tiles, 256);
-        assert_eq!(placements.len(), 1);
-
-        let atlas_h: u32 = placements
-            .iter()
-            .map(|&(k, _, py)| py + tiles[&k].height)
-            .max()
-            .unwrap();
-        // Atlas must be at least 55 pixels tall.
-        assert!(atlas_h >= 55);
-    }
-
-    #[test]
-    fn test_mixed_sizes_packing() {
-        // Mix of standard and oversized tiles.
-        let mut tiles: HashMap<TileKey, TileImage> = HashMap::new();
-        tiles.insert(
-            TileKey {
-                variant: 0,
-                tile_id: 0,
-                sub_tile: 0,
-            },
-            make_tile_sized(60, 30, 0, 0),
-        );
-        tiles.insert(
-            TileKey {
-                variant: 0,
-                tile_id: 1,
-                sub_tile: 0,
-            },
-            make_tile_sized(60, 55, 0, -25),
-        );
-        tiles.insert(
-            TileKey {
-                variant: 0,
-                tile_id: 2,
-                sub_tile: 0,
-            },
-            make_tile_sized(80, 45, -10, -15),
-        );
-
-        let mut sorted: Vec<TileKey> = tiles.keys().copied().collect();
-        // Sort by height descending (tallest first) like build_atlas does.
-        sorted.sort_by(|a, b| tiles[b].height.cmp(&tiles[a].height));
-
-        let placements: Vec<(TileKey, u32, u32)> = shelf_pack(&sorted, &tiles, 256);
-        assert_eq!(placements.len(), 3);
-
-        // Verify no overlaps: each tile's rectangle doesn't intersect others.
-        for i in 0..placements.len() {
-            for j in (i + 1)..placements.len() {
-                let (ki, xi, yi) = placements[i];
-                let (kj, xj, yj) = placements[j];
-                let wi: u32 = tiles[&ki].width;
-                let hi: u32 = tiles[&ki].height;
-                let wj: u32 = tiles[&kj].width;
-                let hj: u32 = tiles[&kj].height;
-                // Rectangles don't overlap if separated on either axis.
-                let no_overlap: bool = xi + wi + TILE_PADDING <= xj
-                    || xj + wj + TILE_PADDING <= xi
-                    || yi + hi + TILE_PADDING <= yj
-                    || yj + hj + TILE_PADDING <= yi;
-                assert!(no_overlap, "Tiles {} and {} overlap", i, j);
-            }
-        }
-    }
-
-    #[test]
-    fn test_tile_uv_metadata() {
-        // Verify TileUV carries correct pixel_size and draw_offset.
-        let mut tiles: HashMap<TileKey, TileImage> = HashMap::new();
-        tiles.insert(
-            TileKey {
-                variant: 0,
-                tile_id: 0,
-                sub_tile: 0,
-            },
-            make_tile_sized(60, 55, 0, -25),
-        );
-
-        let sorted: Vec<TileKey> = vec![TileKey {
-            tile_id: 0,
-            sub_tile: 0,
-            variant: 0,
-        }];
-        let placements: Vec<(TileKey, u32, u32)> = shelf_pack(&sorted, &tiles, 256);
-        let (key, px, py) = placements[0];
-        let tile: &TileImage = &tiles[&key];
-        let atlas_w: f32 = 256.0;
-        let atlas_h: f32 = 55.0;
-
-        let uv: TileUV = TileUV {
-            uv_origin: [px as f32 / atlas_w, py as f32 / atlas_h],
-            uv_size: [tile.width as f32 / atlas_w, tile.height as f32 / atlas_h],
-            pixel_size: [tile.width as f32, tile.height as f32],
-            draw_offset: [tile.offset_x as f32, tile.offset_y as f32],
+    fn variants_of_one_sub_tile_pack_in_variant_order() {
+        let key = |tile_id, sub_tile, variant| TileKey {
+            tile_id,
+            sub_tile,
+            variant,
         };
-
-        assert!((uv.pixel_size[0] - 60.0).abs() < f32::EPSILON);
-        assert!((uv.pixel_size[1] - 55.0).abs() < f32::EPSILON);
-        assert!((uv.draw_offset[0] - 0.0).abs() < f32::EPSILON);
-        assert!((uv.draw_offset[1] - (-25.0)).abs() < f32::EPSILON);
+        assert_eq!(
+            packing_order([key(4, 1, 2), key(4, 1, 0), key(3, 9, 1), key(4, 1, 1)]),
+            [key(3, 9, 1), key(4, 1, 0), key(4, 1, 1), key(4, 1, 2)]
+        );
     }
 }

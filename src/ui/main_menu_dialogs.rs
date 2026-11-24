@@ -10,9 +10,9 @@
 //!   The game does NOT quit on the first click; it quits only on confirm.
 //! - Options -> the retained launcher Options parent in `options`.
 //!
-//! Exit confirmation renders through the retail shell. Launcher Options retains
-//! an egui overlay when its native controls are unavailable. State lives on `AppState` as `Option<...>` fields so it
-//! persists across frames while open. All button labels resolve from the live
+//! Exit confirmation and launcher Options render through the retail shell.
+//! State lives on `AppState` as `Option<...>` fields and persists across frames
+//! while open. All button labels resolve from the live
 //! CSF table (passed in by the caller) with English fallbacks; no CSF text is
 //! hardcoded as the source of truth.
 //!
@@ -23,90 +23,81 @@ pub(crate) mod options;
 
 pub(crate) use options::OptionsDialogState;
 
+use crate::ui::shell::modal::ShellBox;
+
 /// Resolves a CSF string key to display text, with an English fallback when the
 /// table is missing the key. Provided by the caller (which owns the CSF table).
 pub(crate) type CsfLookup<'a> = dyn Fn(&str, &str) -> String + 'a;
 
-// ---------------------------------------------------------------------------
-// Exit confirm message box
-// ---------------------------------------------------------------------------
-
-/// CSF key for the confirm-dialog body/title text.
-pub(crate) const EXIT_CONFIRM_TITLE_KEY: &str = "GUI:ExitAreYouSure";
-/// CSF key for the confirm (quit) button. Return 0 in the original = confirm.
-pub(crate) const EXIT_CONFIRM_OK_KEY: &str = "TXT_OK";
-/// CSF key for the cancel (stay) button. Non-zero in the original = stay.
-pub(crate) const EXIT_CONFIRM_CANCEL_KEY: &str = "GUI:Cancel";
-
-const EXIT_CONFIRM_TITLE_FALLBACK: &str = "Are you sure you want to quit?";
-const EXIT_CONFIRM_OK_FALLBACK: &str = "OK";
-const EXIT_CONFIRM_CANCEL_FALLBACK: &str = "Cancel";
-
-/// State for the Exit-Game confirm message box. Holds resolved strings so the
-/// CSF table is read once at open, not every frame.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExitConfirmModalState {
-    pub title: String,
-    pub confirm: String,
-    pub cancel: String,
+/// ShellMessageBox__Run `0x005D3490`'s boxes, read from CSF once at open:
+/// body, then the buttons that answer 0 (OK slot), 1 (Cancel) and 2 (third).
+fn message(csf: &CsfLookup<'_>, [body, ok, cancel, third]: [(&str, &str); 4]) -> ShellBox {
+    let text = |(key, fallback): (&str, &str)| match key {
+        "" => String::new(),
+        key => csf(key, fallback),
+    };
+    ShellBox::message(text(body), text(ok), text(cancel), text(third))
 }
 
-impl ExitConfirmModalState {
-    /// Open the modal, resolving labels through the CSF lookup.
-    pub fn open(csf: &CsfLookup<'_>) -> Self {
-        Self {
-            title: csf(EXIT_CONFIRM_TITLE_KEY, EXIT_CONFIRM_TITLE_FALLBACK),
-            confirm: csf(EXIT_CONFIRM_OK_KEY, EXIT_CONFIRM_OK_FALLBACK),
-            cancel: csf(EXIT_CONFIRM_CANCEL_KEY, EXIT_CONFIRM_CANCEL_FALLBACK),
-        }
-    }
+const NONE: (&str, &str) = ("", "");
+const OK: (&str, &str) = ("TXT_OK", "OK");
+const CANCEL: (&str, &str) = ("GUI:Cancel", "Cancel");
+
+/// MapSelect's failed Init (FUN_005ADD10 @0x005ADDA6..5ADDCF): only TXT_OK.
+pub(crate) fn map_select_failure(csf: &CsfLookup<'_>) -> ShellBox {
+    let body = ("MSG:UnableMapSelect", "Unable to initiate Map Selection!");
+    message(csf, [body, OK, NONE, NONE])
 }
 
-// ---------------------------------------------------------------------------
-// Shared helpers
-// ---------------------------------------------------------------------------
-
-/// Paint a semi-transparent backdrop behind a modal so the menu reads as
-/// dimmed while the dialog is open.
-fn draw_backdrop(ctx: &egui::Context, id: &str) {
-    egui::Area::new(egui::Id::new(id))
-        .fixed_pos(egui::pos2(0.0, 0.0))
-        .interactable(false)
-        .show(ctx, |ui| {
-            let screen = ctx.content_rect();
-            ui.painter().rect_filled(
-                screen,
-                0.0,
-                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 120),
-            );
-        });
+/// Main-menu Exit Game (state 6): OK quits, Cancel stays.
+pub(crate) fn exit_confirm(csf: &CsfLookup<'_>) -> ShellBox {
+    let body = ("GUI:ExitAreYouSure", "Are you sure you want to quit?");
+    message(csf, [body, OK, CANCEL, NONE])
 }
 
-#[cfg(test)]
+/// VERA's Esc menu: the main menu's own Options (0), Cancel (1) and Exit
+/// Game (2), and no question, its buttons in a footer.
+pub(crate) fn shell_menu(csf: &CsfLookup<'_>) -> ShellBox {
+    let (options, exit) = (("GUI:Options", "Options"), ("GUI:ExitGame", "Exit Game"));
+    message(csf, [NONE, options, CANCEL, exit]).template(crate::ui::shell::modal::FOOTER_TEMPLATE)
+}
+
+/// GameExit::Defeat's campaign retry question: Yes (0) and No (1), loaded at
+/// `0x006860A0..0x006860DB` (strings 0x0083DB24, 0x00829F14, 0x00829F1C).
+pub(crate) fn campaign_replay(csf: &CsfLookup<'_>) -> ShellBox {
+    let body = ("TXT_TO_REPLAY", "Would you like to replay this mission?");
+    message(csf, [body, ("TXT_YES", "Yes"), ("TXT_NO", "No"), NONE])
+}
+
+#[cfg(all(test, tests_ui))]
 mod tests {
     use super::*;
 
-    fn fallback_lookup() -> impl Fn(&str, &str) -> String {
-        // Simulate a missing CSF table: every lookup returns its fallback.
-        |_key: &str, fallback: &str| fallback.to_string()
-    }
-
+    /// The captions land in answer order: the Esc menu's Options answers
+    /// 0, Cancel 1 and Exit Game 2.
     #[test]
-    fn exit_confirm_open_resolves_pinned_keys_to_fallbacks() {
-        let lookup = fallback_lookup();
-        let modal = ExitConfirmModalState::open(&lookup);
-        assert_eq!(modal.title, EXIT_CONFIRM_TITLE_FALLBACK);
-        assert_eq!(modal.confirm, EXIT_CONFIRM_OK_FALLBACK);
-        assert_eq!(modal.cancel, EXIT_CONFIRM_CANCEL_FALLBACK);
-    }
-
-    #[test]
-    fn exit_confirm_open_uses_csf_when_present() {
-        // A lookup that returns the key itself proves open() queries the keys.
+    fn message_boxes_read_their_csf_keys_in_answer_order() {
         let lookup = |key: &str, _fallback: &str| key.to_string();
-        let modal = ExitConfirmModalState::open(&lookup);
-        assert_eq!(modal.title, EXIT_CONFIRM_TITLE_KEY);
-        assert_eq!(modal.confirm, EXIT_CONFIRM_OK_KEY);
-        assert_eq!(modal.cancel, EXIT_CONFIRM_CANCEL_KEY);
+        let captions = |b: ShellBox| -> Vec<String> {
+            let mut texts = vec![b.body];
+            texts.extend(b.buttons.into_iter().map(|b| b.caption));
+            texts
+        };
+        assert_eq!(
+            captions(exit_confirm(&lookup)),
+            ["GUI:ExitAreYouSure", "TXT_OK", "GUI:Cancel"]
+        );
+        assert_eq!(
+            captions(campaign_replay(&lookup)),
+            ["TXT_TO_REPLAY", "TXT_YES", "TXT_NO"]
+        );
+        assert_eq!(
+            captions(map_select_failure(&lookup)),
+            ["MSG:UnableMapSelect", "TXT_OK"]
+        );
+        assert_eq!(
+            captions(shell_menu(&lookup)),
+            ["", "GUI:Options", "GUI:Cancel", "GUI:ExitGame"]
+        );
     }
 }

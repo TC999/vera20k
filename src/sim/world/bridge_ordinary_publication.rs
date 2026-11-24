@@ -9,21 +9,22 @@ use crate::sim::bridge_state::ordinary_damage::{self, OrdinaryDamageHost};
 use crate::sim::bridge_state::ordinary_repair::OrdinaryRepairHost;
 use crate::sim::bridge_state::ramp_repair::{Family, HutCells, Rect, RepairHost};
 use crate::sim::bridge_state::{ordinary_repair, ramp_repair};
+use crate::sim::world::FrameEffects;
 
 /// Already-admitted57BAA0/57CCF0 receiver. The area-damage caller owns strength RNG
 /// and detaches the original impact cell only when this driver returns true.
 pub(crate) fn damage_ordinary(
     sim: &mut Simulation,
     rules: &RuleSet,
-    registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
     input: CellCoord,
     family: Family,
+    frame_effects: &mut FrameEffects<'_>,
 ) -> Result<BodyResult, String> {
     let mut live = LivePublication {
         sim,
         rules,
-        registry,
         collapsed: false,
+        frame_effects: frame_effects.reborrow(),
     };
     let returned = ordinary_damage::damage(
         &mut LiveOrdinary {
@@ -43,14 +44,14 @@ pub(crate) fn damage_ordinary(
 pub(crate) fn repair_from_engineer(
     sim: &mut Simulation,
     rules: &RuleSet,
-    registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
     engineer: u64,
+    frame_effects: &mut FrameEffects<'_>,
 ) -> Result<bool, String> {
     let mut live = LivePublication {
         sim,
         rules,
-        registry,
         collapsed: false,
+        frame_effects: frame_effects.reborrow(),
     };
     let (input, family) = engineer_repair_family(&mut live, engineer)?;
     let mut host = LiveOrdinary {
@@ -79,8 +80,8 @@ fn engineer_repair_family(
                 .get(engineer)
                 .ok_or("repair engineer disappeared before family scan")?;
             let point = (
-                (current.position.rx as i16).wrapping_add(x),
-                (current.position.ry as i16).wrapping_add(y),
+                (current.position.rx() as i16).wrapping_add(x),
+                (current.position.ry() as i16).wrapping_add(y),
             );
             let cell = live.lookup(point);
             let tile = live.tile(cell);
@@ -105,11 +106,11 @@ fn engineer_repair_family(
         .entities
         .get(engineer)
         .ok_or("repair engineer disappeared before family entry")?;
-    let input = (current.position.rx as i16, current.position.ry as i16);
+    let input = (current.position.rx() as i16, current.position.ry() as i16);
     Ok((input, family))
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_a_b))]
 #[path = "bridge_engineer_family_tests.rs"]
 mod engineer_family_tests;
 
@@ -120,19 +121,11 @@ struct LiveOrdinary<'a, 'world> {
 
 impl LiveOrdinary<'_, '_> {
     fn overlay_identity(&self, cell: Cell) -> i32 {
-        match cell {
-            Cell::Real(index) => self.live.terrain().cells()[index]
-                .bridge_facts
-                .overlay_id
-                .map_or(-1, i32::from),
-            Cell::Dummy => {
-                self.live
-                    .terrain()
-                    .shared_cell_dummy()
-                    .overlay_identity_state()
-                    .0
-            }
-        }
+        self.live
+            .sim
+            .cell_overlay(cell)
+            .overlay_id
+            .map_or(-1, i32::from)
     }
 }
 
@@ -180,15 +173,11 @@ impl RepairHost for LiveOrdinary<'_, '_> {
         match family {
             Family::High => NativeStartBounds::from_session(sim, self.live.terrain()).contains(p),
             Family::Low => {
-                let Some((w, h)) = sim
-                    .bridge_state
-                    .as_ref()
-                    .and_then(|s| s.native_zone_source_size())
-                else {
+                let Some((w, h)) = sim.map_size_diamond() else {
                     return false;
                 };
-                let (x, y) = (i32::from(p.0), i32::from(p.1));
-                x + y > w && x - y < w && y - x < w && x + y <= w + 2 * h
+                // The 573540/570050 search loop is bounded by In_Bounds 0x00568300.
+                crate::map::playfield::size_diamond_contains(w, h, p)
             }
         }
     }
@@ -254,16 +243,17 @@ impl OrdinaryBridgeHost for LiveOrdinary<'_, '_> {
         {
             self.live.collapsed = true;
         }
-        self.live
-            .sim
-            .resolved_terrain
-            .as_mut()
-            .unwrap()
-            .write_native_cell_overlay(cell, Some(overlay));
-        if let Some((x, y)) = self.live.real_coord(cell) {
-            if let Some(grid) = self.live.sim.overlay_grid.as_mut() {
-                grid.write_bridge_overlay_identity(x, y, overlay);
+        match self.live.real_coord(cell) {
+            Some((x, y)) => {
+                if let Some(grid) = self.live.sim.overlay_grid.as_mut() {
+                    grid.write_bridge_overlay_identity(x, y, overlay);
+                }
             }
+            None => self
+                .live
+                .terrain()
+                .shared_cell_dummy()
+                .write_overlay_identity(i32::from(overlay)),
         }
         self.live.retain_real_write(cell);
     }
@@ -271,7 +261,8 @@ impl OrdinaryBridgeHost for LiveOrdinary<'_, '_> {
     fn radar(&mut self, p: CellCoord) {
         self.live
             .sim
-            .mark_radar_terrain_dirty_cells([(p.0 as u16, p.1 as u16)]);
+            .dirty_cells
+            .mark_radar([(p.0 as u16, p.1 as u16)]);
     }
     fn recalc(&mut self, cell: Cell) -> Result<(), String> {
         self.live.recalc_cell(cell, -1)
@@ -297,39 +288,49 @@ impl OrdinaryDamageHost for LiveOrdinary<'_, '_> {
     fn notify_span(&mut self, first: CellCoord, end: CellCoord) -> Result<(), String> {
         crate::sim::bridge_state::rim::visit_span_cells(first, end, |point| {
             let cell = self.live.lookup(point);
-            // The same tagged event31 dependency remains open as in the rim
-            // publisher. The selected stock Anytown/Shrapnel spans have no CellTags.
+            // The same 575EE0 per-cell Tag raise as the rim publisher.
+            let live = &mut *self.live;
+            live.sim.dispatch_bridge_cell_tag_event(
+                cell,
+                live.rules,
+                Some(live.rules.overlay_registry()),
+                &mut live.frame_effects,
+            );
             self.live.coord(cell)
         });
         Ok(())
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_a_b))]
 #[path = "bridge_concrete_damage_tests.rs"]
 mod concrete_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_a_b))]
+#[path = "bridge_fv_pursuit_tests.rs"]
+mod fv_pursuit_tests;
+
+#[cfg(all(test, tests_sim_world_a_b))]
 #[path = "bridge_wood_damage_tests.rs"]
 mod wood_tests;
 
-#[cfg(test)]
+#[cfg(test)] // shared by test groups
 #[path = "bridge_repair_publication_tests.rs"]
-mod tests;
-#[cfg(test)]
+pub(super) mod tests;
+#[cfg(all(test, tests_sim_world_a_b))]
 #[path = "track_fresh_response_tests.rs"]
 mod track_fresh_response_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_a_b))]
 #[path = "track_path_continuation_tests.rs"]
 mod track_path_continuation_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_a_b))]
 #[path = "walk_failed_path_tests.rs"]
 mod walk_failed_path_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_a_b))]
 #[path = "walk_prehead_response_tests.rs"]
 mod walk_prehead_response_tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_a_b))]
 #[path = "bridge_wood_occupant_tests.rs"]
 mod wood_occupant_tests;

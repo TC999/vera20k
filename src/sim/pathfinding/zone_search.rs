@@ -34,68 +34,74 @@
 //!    differing height therefore jumps from `0x00429EAF` straight to
 //!    `0x00429F04` and is expanded regardless of the corridor stamp, the
 //!    `+0x122` byte and `allowHS`.
-//! 6. Retry budget is `param_6 != -1 ? 1 : 5`. Each retry calls
-//!    `PathfinderClass::UpdateHierarchicalEdges` @ `0x0042CCD0`, re-reads
-//!    `allowHS` from `PathfinderClass+0x38`, and re-runs `Zone_precheck`;
-//!    a failed precheck ends the loop.
+//! 6. Retry budget is `maxSteps != -1 ? 1 : 5` (`0x0042CB8B..0x0042CBA1`),
+//!    and both callers pass -1. A cell A* that fails with `allowHS` set
+//!    (`0x0042CC13..0x0042CC19`) calls
+//!    `PathfinderClass::UpdateHierarchicalEdges` @ `0x0042CCD0` and the reset
+//!    `0x0042A5B0` (open lists emptied, search serial `+0x28` bumped), then
+//!    re-reads `allowHS` from `PathfinderClass+0x38`. With tries left it
+//!    re-runs `Zone_precheck`, whose failure ends the loop, or with `allowHS`
+//!    clear the plain A*, which runs once.
 //!
 //! ## What VERA does, and the remaining recorded gaps
 //!
 //! The live route is faithful in shape: `zone_precheck_flat` on the level-0
-//! hierarchy, then a hierarchy-marked cell A*; a precheck failure with matching
-//! zones falls back to the plain A*, and one with differing zones returns
-//! `None`. What is missing:
+//! hierarchy, then a hierarchy-marked cell A*, retried as point 6 says
+//! ([`find_layered_path_after_entry`], [`precheck_retry`]); a precheck failure
+//! with matching zones falls back to the plain A*, and one with differing
+//! zones returns `None`. What is missing:
 //!
-//! - **Two uncommon `allowHS` terms remain unmodelled.** VERA now threads the
-//!   canonical `TechnoClass+0x3D5` byte and applies exact bridge-resolved mode-1
-//!   endpoint membership before admitting hierarchy. It still does not model
-//!   `IsTrain=` (the INI key
-//!   behind `TechnoTypeClass+0xC94`, string `0x008444BC`, stored at
-//!   `0x00712284` — absent from stock `rulesmd.ini`, so this term never fires);
-//!   the `0x004DA1D0` predicate, which — given the other terms already hold at
-//!   the call site — reduces to
-//!   `mover+0x3D4 != 0` **or** current-or-queued mission == Retreat(4) **or**
-//!   (`mover+0x5D4` non-null and `FUN_006EC300`). Player effect: for such a
-//!   mover gamemd runs an unrestricted A*
-//!   and can return a route where VERA answers "unreachable" from the zone map,
-//!   so the unit refuses an order retail accepts. Frequency: a unit on Retreat
-//!   or linked to the remaining team predicate — uncommon in ordinary
-//!   skirmish, but not zero. Team6EC300 can perform mode1 waypoint lookups
-//!   before endpoint membership, changing shared dummy state. Its exits before
-//!   the waypoint read are `TeamScriptVm::member_step_reads_waypoint`; the read
-//!   itself is unported (no waypoint table in the simulation), and the current
-//!   bool is supplied externally.
-//! - **Without blocker counts there is no hierarchy search.** Every
-//!   production search supplies blocker counts (`movement_tick`,
-//!   `world_commands`, the miner system, the production queue), and every
-//!   `ZoneGrid` carries levels 0/1/2. A caller without counts gets the plain
-//!   cell A* once the zone test passes, where gamemd would run the
-//!   hierarchy-marked search. No live trigger is established here.
-//! - **gamemd's precheck retries are not modelled.** Its budget is
-//!   `param_6 != -1 ? 1 : 5`, each retry re-running `UpdateHierarchicalEdges`
-//!   and `Zone_precheck` (point 6); VERA runs one precheck.
+//! - **Without blocker counts there is no hierarchy search.** The one
+//!   production search, the live Foot search in `movement_tick`, supplies
+//!   blocker counts, and every `ZoneGrid` carries levels 0/1/2. A caller
+//!   without counts gets the plain cell A* once the zone test passes, where
+//!   gamemd would run the hierarchy-marked search. No live trigger is
+//!   established here.
+//! - **The retry keeps whole routes.** `Zone_precheck` writes each level's
+//!   route into 500 words with no bound (`0x0042C8A0..0x0042C8CE`), level 0
+//!   last, so a level-0 route over 500 zones overwrites level 1's, which a
+//!   split at level 1 hands `InvalidateZoneEdge`. VERA keeps each route
+//!   whole. Trigger: a failed corridor search after a precheck route of more
+//!   than 500 level-0 zones, each within one 2x2 block, so a route winding
+//!   for hundreds of cells. Effect: native may exclude other level-1 edges
+//!   or clear `+0x38`. Frequency: unmeasured, rare at retail map sizes.
+//!   [`super::core::HierarchyGate`] records the route-progress residuals.
+//! - **Without resolved terrain there is no retry.** The flood reads map
+//!   cells, so a failed corridor search without them ends with
+//!   `CellEntryUnavailable`. Every loaded map has them; fixtures may not.
+//! - **The JumpJet infantry precheck row is not ported.** For an Infantry
+//!   (`WhatAmI` 0xF) whose type sets `JumpJet=` (`+0xD94` through `+0x6C0`),
+//!   `0x0042CA43..0x0042CA69` hands `Zone_precheck` row 7 (Infantry) instead
+//!   of the type's row, then reads its locomotor's `IPersist::GetClassID`
+//!   (`0x0042CA7A..0x0042CAB5`) into a local nothing uses. VERA passes the
+//!   type's row. Trigger: such an infantry reaching `FootClass::Find_Path`.
+//!   No retail case does: Find_Path's callers are the Drive, Walk, Ship,
+//!   Hover and Mech locomotors, and both retail `JumpJet=` infantry, the
+//!   Rocketeer (`JUMPJET`) and the Cosmonaut (`LUNR`), move by the Jumpjet
+//!   locomotor.
 //!
 //! ## Dependency rules
 //! - Part of sim/ — depends on sim/zone_map, sim/pathfinding, sim/locomotor.
-//! - sim/ NEVER depends on render/, ui/, sidebar/, audio/, net/.
+//! - sim/ NEVER depends on render/, ui/, audio/, net/.
 
-use std::collections::BTreeSet;
+pub(crate) mod native_path_entry;
+mod precheck_retry;
 
-use super::{BlockerNeighborCounts, LayeredEntityBlockMap, MoverSearchFacts, SearchMarkerOverlay};
+use super::{BlockerNeighborCounts, MoverSearchFacts, RouteProgress, SearchMarkerOverlay};
 
-use super::terrain_cost::TerrainCostGrid;
 use super::zone_hierarchy::{
-    ZoneLevelGraph, ZonePrecheckExclusions, ZonePrecheckOutcome, zone_precheck_flat,
+    ZoneHierarchy, ZoneLevelGraph, ZonePrecheckExclusions, ZonePrecheckOutcome, ZonePrecheckResult,
+    ZonePrecheckThreat, zone_precheck_flat,
 };
 use super::zone_map::{ZoneGrid, ZoneId};
-use super::{
-    HierarchyGate, LayeredPathStep, PathGrid, find_layered_path_marker, find_path_with_costs_marker,
-};
+use super::{HierarchyGate, LayeredPathStep, PathGrid, find_layered_path_marker};
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
 use crate::map::tube_facts::TubeSource;
 use crate::rules::locomotor_type::MovementZone;
-use crate::sim::cell_rect::{PlayfieldBounds, cell_is_in_playfield_height_aware};
+use crate::sim::cell_rect::PlayfieldBounds;
 use crate::sim::movement::locomotor::MovementLayer;
+use crate::util::native_x87::NativeF64Bits;
+use native_path_entry::{NativePathEntry, prepare_native_path_entry};
 
 /// Provenance of a returned path failure. The Foot wrapper must not turn
 /// unavailable caches or compatibility-only rejection into a native core NULL.
@@ -109,34 +115,30 @@ pub enum PathSearchFailure {
     MissingHierarchyCell,
     ///The reduced compatibility graph rejected without native raw evidence.
     CompatibilityZoneRejected,
-    ///The existing cell search ran and returned no route.
+    ///AStar returned no route: its cell search ran out, or never ran because
+    ///the start cell and height are the goal's (0x429BF3..0x429C0A).
     CellSearchExhausted,
+    /// VERA-only: the receiver stopped the cell search
+    /// ([`super::SearchFootEntry::keeps_searching`]). Only the path batch
+    /// stops a search, one whose answer it drops.
+    Stopped,
 }
 
-/// Whether the path entry may answer reachability from the reduced per-row zone
-/// map before running A*.
+/// Whether the path entry may answer reachability from the zone ladder before
+/// running A*.
 ///
-/// Gamemd gates every row: `Can_Reach_Zone` short-circuits to "reachable" only on
-/// `mzRow == -1`, and the A*-entry precheck reads whatever row the type's
-/// `MovementZone=` gives. Stock rulesmd puts every main battle tank in
-/// `Destroyer`, every ore miner in `Crusher` and the Battle Fortress in
-/// `CrusherAll`, so excluding those rows bypassed the gate for the majority of
-/// all path searches in a match.
+/// `AStar_pathfind_search` (`0x0042C900`) takes the row from the type's
+/// `MovementZone=` (`+0x5B4`, `0x0042C963..0x0042C96D`), compares the raw
+/// labels (`0x0042CB22`) and runs `Zone_precheck` (`0x0042C290`) for every
+/// row, Water and WaterBeach included. Only the Foot's `+0x2CC` (`0x004D3810`,
+/// `foot_path_zone_precheck`) skips a row: `-1`, at `0x004D3825`.
 ///
-/// `Water` / `WaterBeach` remain excluded — VERA-internal, gamemd equivalent
-/// UNCHECKED. The terrain-aware zone builder's water/beach surface legality is
-/// still coarser than the runtime water-surface predicate, so hard-gating naval
-/// movers here would refuse orders gamemd accepts. Remove the exception once the
-/// naval surface classes are pinned.
+/// `Invalid` (`-1`) stays exempt, VERA-internal: past `+0x2CC`, `0x0042C900`
+/// reads row `-1`, before its label and passability tables, which Rust does
+/// not reproduce. Trigger: a type whose `MovementZone=` names no row; no
+/// retail type has one. Effect: VERA runs the plain cell A*.
 fn can_use_reduced_zone_precheck(movement_zone: Option<MovementZone>) -> bool {
-    match movement_zone {
-        None => true,
-        // `mzRow == -1` short-circuits to "reachable" in the engine, so the
-        // reduced zone gate must NOT be allowed to refuse the search.
-        Some(MovementZone::Invalid) => false,
-        Some(MovementZone::Water | MovementZone::WaterBeach) => false,
-        Some(_) => true,
-    }
+    movement_zone != Some(MovementZone::Invalid)
 }
 
 fn can_reach_same_or_zoned(
@@ -184,63 +186,105 @@ fn can_reach_through_explicit_tube(
     })
 }
 
-// Original42C900 compares raw GetZoneID results, including distinct invalid
-// row labels1/FFFF. Compatibility-only test/cache grids have no raw row.
-#[cfg(test)]
-fn native_path_zone_equality(
-    zones: &ZoneGrid,
-    terrain: Option<&ResolvedTerrainGrid>,
-    movement: MovementZone,
-    start: (u16, u16),
-    start_bridge: bool,
-    goal: (u16, u16),
-    goal_bridge: bool,
-) -> Option<bool> {
-    let terrain = terrain?;
-    Some(
-        zones.get_zone_id_native(terrain, start, movement, start_bridge)?
-            == zones.get_zone_id_native(terrain, goal, movement, goal_bridge)?,
-    )
-}
-
-include!("native_path_entry.rs");
-
 /// The level-0 corridor a passed `Zone_precheck` hands the cell A*
-/// (`AStar_main_loop @ 0x00429A90`'s last argument, `allowHS`).
+/// (`AStar_main_loop @ 0x00429A90`'s last argument, `allowHS`), the routes
+/// it chose and the search's progress along them.
 struct HierarchyCorridor<'a> {
     level0_zones: &'a ZoneLevelGraph,
-    marked_level0: BTreeSet<ZoneId>,
     blocker_neighbor_counts: &'a BlockerNeighborCounts,
+    /// Each level's route, start zone first (`PathfinderClass+0xBC`, 500
+    /// words a level; lengths at `+0xC74`), and the zones it marks.
+    routes: ZonePrecheckResult,
+    /// Written by the search, read by the retry after it fails.
+    progress: RouteProgress,
 }
 
 impl HierarchyCorridor<'_> {
-    fn gate(&self) -> HierarchyGate<'_> {
-        HierarchyGate {
-            level0_zones: self.level0_zones,
-            marked_level0: &self.marked_level0,
-            blocker_neighbor_counts: self.blocker_neighbor_counts,
-        }
+    /// The search's gate, and the progress it writes.
+    fn gate(&mut self) -> (HierarchyGate<'_>, &mut RouteProgress) {
+        (
+            HierarchyGate {
+                level0_zones: self.level0_zones,
+                marked_level0: self.routes.marked(0),
+                blocker_neighbor_counts: self.blocker_neighbor_counts,
+                level0_route: self.routes.route(0),
+            },
+            &mut self.progress,
+        )
     }
 }
 
-/// The endpoints one search asks the zone ladder about. The flat and layered
-/// searches share the ladder and differ only in these layers: the flat search
-/// compares a ground start with a ground goal, and without native labels falls
-/// back to the goal cell's structural-bridge flag; the layered search uses the
-/// mover's layer and the goal's live `Flags & 0x100` (`0x0042C9B7`) throughout.
+/// One search's `Zone_precheck` (`0x0042C290`, called at `0x0042CB58` and by
+/// each retry at `0x0042CCB3`): the hierarchy, the projected endpoints'
+/// level-0 zones, the row and the Foot's threat coefficient, all fixed for
+/// the search.
+struct CorridorPrecheck<'a> {
+    zone_grid: &'a ZoneGrid,
+    hierarchy: &'a ZoneHierarchy,
+    level0_zones: &'a ZoneLevelGraph,
+    blocker_neighbor_counts: &'a BlockerNeighborCounts,
+    start_zone: ZoneId,
+    goal_zone: ZoneId,
+    movement_zone: MovementZone,
+    threat_coefficient: NativeF64Bits,
+}
+
+impl<'a> CorridorPrecheck<'a> {
+    /// The corridor the precheck marks for a cell search from `start` while
+    /// `exclusions` hold, or `None` when it fails.
+    fn run(
+        &self,
+        exclusions: &ZonePrecheckExclusions,
+        foot_entry: &dyn super::SearchFootEntry,
+        start: (u16, u16),
+    ) -> Result<Option<HierarchyCorridor<'a>>, PathSearchFailure> {
+        let padded_lookup = |index| foot_entry.hierarchy_house_threat(index);
+        let threat = ZonePrecheckThreat::new(self.threat_coefficient, &padded_lookup);
+        let outcome = zone_precheck_flat(
+            self.hierarchy,
+            self.start_zone,
+            self.goal_zone,
+            self.movement_zone,
+            exclusions,
+            Some(threat),
+        )
+        .map_err(PathSearchFailure::CellEntryUnavailable)?;
+        let ZonePrecheckOutcome::Passed(routes) = outcome else {
+            return Ok(None);
+        };
+        Ok(Some(HierarchyCorridor {
+            level0_zones: self.level0_zones,
+            blocker_neighbor_counts: self.blocker_neighbor_counts,
+            routes,
+            progress: RouteProgress {
+                index: 0,
+                cell: start,
+            },
+        }))
+    }
+}
+
+/// The cell searches one path search may run. `AStar_pathfind_search`
+/// allows `maxSteps != -1 ? 1 : 5` (`0x0042CB8B..0x0042CBA1`), and both its
+/// callers pass -1 (`0x004CBC1E`, `0x00504D9B`), the limit the cell search
+/// reads as [`super::MAX_SEARCH_NODES`]. `0x005048A0`, the second caller,
+/// has no caller of its own and no port.
+const CELL_SEARCH_TRIES: usize = 5;
+
+/// The endpoints one search asks the zone ladder about: the mover's OnBridge
+/// layer (`Foot+0x8C`, `0x0042C973`) and the goal's live `Flags & 0x100`
+/// (`0x0042C9B7`).
 struct ZoneLadderQuery<'e> {
     start: (u16, u16),
     start_layer: MovementLayer,
     goal: (u16, u16),
     goal_layer: MovementLayer,
-    /// The goal's layer when the zones are compared without native labels.
-    fallback_goal_layer: MovementLayer,
     entry: &'e NativePathEntry,
 }
 
 /// Zone admission for one path search, after `prepare_native_path_entry`:
-/// `Ok(None)` runs the plain cell A*, `Ok(Some(corridor))` the hierarchy-marked
-/// one, and `Err` no cell A* at all.
+/// `Ok(None)` runs the plain cell A*, `Ok(Some(..))` the hierarchy-marked one
+/// with the precheck its retries run again, and `Err` no cell A* at all.
 fn admit_zone_search<'a>(
     zone_grid: Option<&'a ZoneGrid>,
     mz: MovementZone,
@@ -248,7 +292,8 @@ fn admit_zone_search<'a>(
     resolved_terrain: Option<&ResolvedTerrainGrid>,
     blocker_neighbor_counts: Option<&'a BlockerNeighborCounts>,
     query: &ZoneLadderQuery<'_>,
-) -> Result<Option<HierarchyCorridor<'a>>, PathSearchFailure> {
+    foot_entry: &dyn super::SearchFootEntry,
+) -> Result<Option<(CorridorPrecheck<'a>, HierarchyCorridor<'a>)>, PathSearchFailure> {
     let entry = query.entry;
     if !can_use_reduced_zone_precheck(movement_zone) {
         return Ok(None);
@@ -262,7 +307,7 @@ fn admit_zone_search<'a>(
     // Raw results were captured before retained-cell projection/playfield.
     let zones_match = entry.raw_equal.unwrap_or_else(|| {
         zone_map.zone_at(query.start.0, query.start.1, query.start_layer)
-            == zone_map.zone_at(query.goal.0, query.goal.1, query.fallback_goal_layer)
+            == zone_map.zone_at(query.goal.0, query.goal.1, query.goal_layer)
     });
 
     if let Some(blocker_neighbor_counts) = blocker_neighbor_counts
@@ -283,27 +328,23 @@ fn admit_zone_search<'a>(
         let goal_zone = zg
             .hierarchy_zone_at_native(0, entry.hierarchy_goal)
             .ok_or(PathSearchFailure::MissingHierarchyCell)?;
-        return Ok(
-            match zone_precheck_flat(
-                hierarchy,
-                start_zone,
-                goal_zone,
-                movement_zone.unwrap_or(mz),
-                &ZonePrecheckExclusions::default(),
-            ) {
-                ZonePrecheckOutcome::Passed(result) => {
-                    let [marked_level0, ..] = result.marked;
-                    Some(HierarchyCorridor {
-                        level0_zones,
-                        marked_level0,
-                        blocker_neighbor_counts,
-                    })
-                }
-                // The zones match, so a failed precheck clears allowHS and
-                // still runs the cell A*.
-                ZonePrecheckOutcome::Failed => None,
-            },
-        );
+        let precheck = CorridorPrecheck {
+            zone_grid: zg,
+            hierarchy,
+            level0_zones,
+            blocker_neighbor_counts,
+            start_zone,
+            goal_zone,
+            movement_zone: movement_zone.unwrap_or(mz),
+            threat_coefficient: foot_entry
+                .finishing_threat_coefficient()
+                .map_err(PathSearchFailure::CellEntryUnavailable)?,
+        };
+        // The zones match, so a failed precheck clears allowHS and still
+        // runs the cell A*. The exclusions start empty (0x42C912..0x42C925).
+        return Ok(precheck
+            .run(&ZonePrecheckExclusions::default(), foot_entry, query.start)?
+            .map(|corridor| (precheck, corridor)));
     }
 
     // Same-zone precheck failures still run cell A*; a cross-zone one aborts
@@ -336,296 +377,36 @@ fn admit_zone_search<'a>(
     Err(PathSearchFailure::CompatibilityZoneRejected)
 }
 
-/// The flat (ground-only) zone-aware search without a marker overlay, blocker
-/// counts or playfield bounds: the zone test gates a plain cell A*, and no
-/// hierarchy-marked search runs without counts.
-///
-/// TODO(RE): terrain-aware nodeIndex connectivity can still be a little looser than
-/// final movement legality because the recovered node flood-fill is 8-neighbor while
-/// the actual step predicate also applies tighter per-move checks. Treat zone gating
-/// here as a best-effort reject, not closed parity.
-#[cfg(test)]
-pub fn find_path_zoned(
-    grid: &PathGrid,
-    start: (u16, u16),
-    goal: (u16, u16),
-    costs: Option<&TerrainCostGrid>,
-    entity_blocks: Option<&BTreeSet<(u16, u16)>>,
-    zone_grid: Option<&ZoneGrid>,
-    mz: MovementZone,
-    movement_zone: Option<MovementZone>,
-    resolved_terrain: Option<&ResolvedTerrainGrid>,
-    entity_block_map: Option<&LayeredEntityBlockMap>,
-    urgency: u8,
-    mover_is_crusher: bool,
-    is_infantry: bool,
-) -> Option<Vec<(u16, u16)>> {
-    find_path_zoned_marker(
-        grid,
-        start,
-        goal,
-        costs,
-        entity_blocks,
-        zone_grid,
-        mz,
-        movement_zone,
-        resolved_terrain,
-        entity_block_map,
-        None,
-        None,
-        urgency,
-        mover_is_crusher,
-        is_infantry,
-        true,
-        None,
-    )
-}
-
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn find_path_zoned_marker(
-    grid: &PathGrid,
-    start: (u16, u16),
-    goal: (u16, u16),
-    costs: Option<&TerrainCostGrid>,
-    entity_blocks: Option<&BTreeSet<(u16, u16)>>,
-    zone_grid: Option<&ZoneGrid>,
-    mz: MovementZone,
-    movement_zone: Option<MovementZone>,
-    resolved_terrain: Option<&ResolvedTerrainGrid>,
-    entity_block_map: Option<&LayeredEntityBlockMap>,
-    marker_overlay: Option<&SearchMarkerOverlay>,
-    blocker_neighbor_counts: Option<&BlockerNeighborCounts>,
-    urgency: u8,
-    mover_is_crusher: bool,
-    is_infantry: bool,
-    allow_zone_hierarchy: bool,
-    playfield_bounds: Option<PlayfieldBounds>,
-) -> Option<Vec<(u16, u16)>> {
-    find_path_zoned_marker_detailed(
-        grid,
-        start,
-        goal,
-        costs,
-        entity_blocks,
-        zone_grid,
-        mz,
-        movement_zone,
-        resolved_terrain,
-        entity_block_map,
-        marker_overlay,
-        blocker_neighbor_counts,
-        MoverSearchFacts {
-            urgency,
-            mover_is_crusher,
-            is_infantry,
-            wall_cost: None,
-            foot_entry: None,
-        },
-        allow_zone_hierarchy,
-        playfield_bounds,
-    )
-    .ok()
-}
-
-pub(crate) fn find_path_zoned_marker_detailed(
-    grid: &PathGrid,
-    start: (u16, u16),
-    goal: (u16, u16),
-    costs: Option<&TerrainCostGrid>,
-    entity_blocks: Option<&BTreeSet<(u16, u16)>>,
-    zone_grid: Option<&ZoneGrid>,
-    mz: MovementZone,
-    movement_zone: Option<MovementZone>,
-    resolved_terrain: Option<&ResolvedTerrainGrid>,
-    entity_block_map: Option<&LayeredEntityBlockMap>,
-    marker_overlay: Option<&SearchMarkerOverlay>,
-    blocker_neighbor_counts: Option<&BlockerNeighborCounts>,
-    facts: MoverSearchFacts<'_>,
-    allow_zone_hierarchy: bool,
-    playfield_bounds: Option<PlayfieldBounds>,
-) -> Result<Vec<(u16, u16)>, PathSearchFailure> {
-    let entry = prepare_native_path_entry(
-        zone_grid,
-        resolved_terrain,
-        movement_zone.unwrap_or(mz),
-        start,
-        false,
-        goal,
-        allow_zone_hierarchy,
-        playfield_bounds,
-    );
-    find_flat_path_after_entry(
-        grid,
-        start,
-        goal,
-        &entry,
-        costs,
-        entity_blocks,
-        zone_grid,
-        mz,
-        movement_zone,
-        resolved_terrain,
-        entity_block_map,
-        marker_overlay,
-        facts,
-        blocker_neighbor_counts,
-    )
-}
-
-/// The flat search with the native entry's facts given directly (tests).
-#[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-fn find_path_zoned_marker_inner(
-    grid: &PathGrid,
-    start: (u16, u16),
-    goal: (u16, u16),
-    hierarchy_start: (u16, u16),
-    hierarchy_goal: (u16, u16),
-    native_zone_equal: Option<bool>,
-    costs: Option<&TerrainCostGrid>,
-    entity_blocks: Option<&BTreeSet<(u16, u16)>>,
-    zone_grid: Option<&ZoneGrid>,
-    mz: MovementZone,
-    movement_zone: Option<MovementZone>,
-    resolved_terrain: Option<&ResolvedTerrainGrid>,
-    entity_block_map: Option<&LayeredEntityBlockMap>,
-    marker_overlay: Option<&SearchMarkerOverlay>,
-    urgency: u8,
-    mover_is_crusher: bool,
-    is_infantry: bool,
-    blocker_neighbor_counts: Option<&BlockerNeighborCounts>,
-) -> Option<Vec<(u16, u16)>> {
-    let entry = NativePathEntry {
-        raw_equal: native_zone_equal,
-        goal_bridge: false,
-        hierarchy_start,
-        hierarchy_goal,
-        endpoints_in_playfield: true,
-    };
-    find_flat_path_after_entry(
-        grid,
-        start,
-        goal,
-        &entry,
-        costs,
-        entity_blocks,
-        zone_grid,
-        mz,
-        movement_zone,
-        resolved_terrain,
-        entity_block_map,
-        marker_overlay,
-        MoverSearchFacts {
-            urgency,
-            mover_is_crusher,
-            is_infantry,
-            wall_cost: None,
-            foot_entry: None,
-        },
-        blocker_neighbor_counts,
-    )
-    .ok()
-}
-
-#[allow(clippy::too_many_arguments)]
-fn find_flat_path_after_entry(
-    grid: &PathGrid,
-    start: (u16, u16),
-    goal: (u16, u16),
-    entry: &NativePathEntry,
-    costs: Option<&TerrainCostGrid>,
-    entity_blocks: Option<&BTreeSet<(u16, u16)>>,
-    zone_grid: Option<&ZoneGrid>,
-    mz: MovementZone,
-    movement_zone: Option<MovementZone>,
-    resolved_terrain: Option<&ResolvedTerrainGrid>,
-    entity_block_map: Option<&LayeredEntityBlockMap>,
-    marker_overlay: Option<&SearchMarkerOverlay>,
-    facts: MoverSearchFacts<'_>,
-    blocker_neighbor_counts: Option<&BlockerNeighborCounts>,
-) -> Result<Vec<(u16, u16)>, PathSearchFailure> {
-    let goal_structural_bridge = resolved_terrain
-        .and_then(|terrain| terrain.cell(goal.0, goal.1))
-        .is_some_and(|cell| cell.bridge_facts.has_structural_bridge());
-    let corridor = admit_zone_search(
-        zone_grid,
-        mz,
-        movement_zone,
-        resolved_terrain,
-        blocker_neighbor_counts,
-        &ZoneLadderQuery {
-            start,
-            start_layer: MovementLayer::Ground,
-            goal,
-            goal_layer: MovementLayer::Ground,
-            fallback_goal_layer: if goal_structural_bridge {
-                MovementLayer::Bridge
-            } else {
-                MovementLayer::Ground
-            },
-            entry,
-        },
-    )?;
-    find_path_with_costs_marker(
-        grid,
-        start,
-        goal,
-        costs,
-        entity_blocks,
-        corridor.as_ref().map(HierarchyCorridor::gate),
-        movement_zone,
-        resolved_terrain,
-        entity_block_map,
-        marker_overlay,
-        facts,
-    )
-}
-
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
+/// [`find_layered_path_zoned_marker_detailed`] asking [`super::WalkableEntry`].
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn find_layered_path_zoned_marker(
     grid: &PathGrid,
-    ground_blocks: Option<&BTreeSet<(u16, u16)>>,
-    bridge_blocks: Option<&BTreeSet<(u16, u16)>>,
     start: (u16, u16),
     start_layer: MovementLayer,
     goal: (u16, u16),
     zone_grid: Option<&ZoneGrid>,
     mz: MovementZone,
-    terrain_costs: Option<&TerrainCostGrid>,
     movement_zone: Option<MovementZone>,
     resolved_terrain: Option<&ResolvedTerrainGrid>,
-    entity_block_map: Option<&LayeredEntityBlockMap>,
     marker_overlay: Option<&SearchMarkerOverlay>,
     blocker_neighbor_counts: Option<&BlockerNeighborCounts>,
-    urgency: u8,
-    mover_is_crusher: bool,
-    is_infantry: bool,
     allow_zone_hierarchy: bool,
     playfield_bounds: Option<PlayfieldBounds>,
 ) -> Option<Vec<LayeredPathStep>> {
     find_layered_path_zoned_marker_detailed(
         grid,
-        ground_blocks,
-        bridge_blocks,
         start,
         start_layer,
         goal,
         zone_grid,
         mz,
-        terrain_costs,
         movement_zone,
         resolved_terrain,
-        entity_block_map,
         marker_overlay,
         blocker_neighbor_counts,
         MoverSearchFacts {
-            urgency,
-            mover_is_crusher,
-            is_infantry,
-            wall_cost: None,
-            foot_entry: None,
+            urgency: 0,
+            foot_entry: &super::WalkableEntry::new(grid),
         },
         allow_zone_hierarchy,
         playfield_bounds,
@@ -635,47 +416,87 @@ pub(crate) fn find_layered_path_zoned_marker(
 
 pub(crate) fn find_layered_path_zoned_marker_detailed(
     grid: &PathGrid,
-    ground_blocks: Option<&BTreeSet<(u16, u16)>>,
-    bridge_blocks: Option<&BTreeSet<(u16, u16)>>,
     start: (u16, u16),
     start_layer: MovementLayer,
     goal: (u16, u16),
     zone_grid: Option<&ZoneGrid>,
     mz: MovementZone,
-    terrain_costs: Option<&TerrainCostGrid>,
     movement_zone: Option<MovementZone>,
     resolved_terrain: Option<&ResolvedTerrainGrid>,
-    entity_block_map: Option<&LayeredEntityBlockMap>,
     marker_overlay: Option<&SearchMarkerOverlay>,
     blocker_neighbor_counts: Option<&BlockerNeighborCounts>,
     facts: MoverSearchFacts<'_>,
     allow_zone_hierarchy: bool,
     playfield_bounds: Option<PlayfieldBounds>,
 ) -> Result<Vec<LayeredPathStep>, PathSearchFailure> {
-    // `AStar @ 0x0042CAD6` admits hierarchy only while the mover's stored
-    // TechnoClass+0x3D5 byte is true. False is not a hard failure: it bypasses
-    // zone/hierarchy admission and runs the ordinary flat/layered cell A*.
-    let source_layer = if start_layer == MovementLayer::Bridge {
-        MovementLayer::Bridge
-    } else {
-        MovementLayer::Ground
-    };
+    // AStar_pathfind_search 0x0042CACC..0x0042CAEC bypasses the
+    // hierarchy for trains, an unset Techno+0x3D5 byte or a Foot that may
+    // leave the playfield. The Foot search supplies that decision.
     let entry = prepare_native_path_entry(
         zone_grid,
         resolved_terrain,
         movement_zone.unwrap_or(mz),
         start,
-        source_layer == MovementLayer::Bridge,
+        start_layer == MovementLayer::Bridge,
         goal,
         allow_zone_hierarchy,
         playfield_bounds,
     );
-    let goal_layer = if entry.goal_bridge {
-        MovementLayer::Bridge
-    } else {
-        MovementLayer::Ground
+    find_layered_path_after_entry(
+        grid,
+        start,
+        start_layer,
+        goal,
+        &entry,
+        zone_grid,
+        mz,
+        movement_zone,
+        resolved_terrain,
+        marker_overlay,
+        facts,
+        blocker_neighbor_counts,
+        playfield_bounds,
+    )
+}
+
+/// The search after `prepare_native_path_entry`: the zone ladder over `entry`,
+/// then the cell A* from `start_layer`, tried again while it fails
+/// (`0x0042CB8B..0x0042CCCB`).
+///
+/// A failed corridor search runs `UpdateHierarchicalEdges` from its
+/// progress cell, which excludes zone pairs or clears `+0x38`
+/// ([`precheck_retry`]). With tries left, a cleared `+0x38` runs the plain
+/// cell A* once more, whatever it returns (`0x0042CC9B` -> `0x0042CBA5`), and
+/// otherwise `Zone_precheck` runs again under the exclusions; a failed one
+/// ends the search. The exclusions, `+0x38` and the routes live for this one
+/// search: native resets them as it starts (`0x0042C909`, `0x0042C912`) and
+/// each passed precheck rewrites the routes. The reset `0x0042A5B0` after
+/// each update (`0x0042CC80`) gives the next precheck and cell search fresh
+/// marks, as each run here builds its own. The debug logs at `0x0042CBDE`
+/// and `0x0042CC65` are not ported.
+fn find_layered_path_after_entry(
+    grid: &PathGrid,
+    start: (u16, u16),
+    start_layer: MovementLayer,
+    goal: (u16, u16),
+    entry: &NativePathEntry,
+    zone_grid: Option<&ZoneGrid>,
+    mz: MovementZone,
+    movement_zone: Option<MovementZone>,
+    resolved_terrain: Option<&ResolvedTerrainGrid>,
+    marker_overlay: Option<&SearchMarkerOverlay>,
+    facts: MoverSearchFacts<'_>,
+    blocker_neighbor_counts: Option<&BlockerNeighborCounts>,
+    playfield_bounds: Option<PlayfieldBounds>,
+) -> Result<Vec<LayeredPathStep>, PathSearchFailure> {
+    let layer = |bridge: bool| {
+        if bridge {
+            MovementLayer::Bridge
+        } else {
+            MovementLayer::Ground
+        }
     };
-    let corridor = admit_zone_search(
+    let admitted = admit_zone_search(
         zone_grid,
         mz,
         movement_zone,
@@ -683,30 +504,66 @@ pub(crate) fn find_layered_path_zoned_marker_detailed(
         blocker_neighbor_counts,
         &ZoneLadderQuery {
             start,
-            start_layer: source_layer,
+            start_layer: layer(start_layer == MovementLayer::Bridge),
             goal,
-            goal_layer,
-            fallback_goal_layer: goal_layer,
-            entry: &entry,
+            goal_layer: layer(entry.goal_bridge),
+            entry,
         },
+        facts.foot_entry,
     )?;
-    find_layered_path_marker(
-        grid,
-        ground_blocks,
-        bridge_blocks,
-        start,
-        start_layer,
-        goal,
-        terrain_costs,
-        corridor.as_ref().map(HierarchyCorridor::gate),
-        movement_zone,
-        resolved_terrain,
-        entity_block_map,
-        marker_overlay,
-        facts,
-    )
+    let search = |hierarchy: Option<(HierarchyGate<'_>, &mut RouteProgress)>| {
+        find_layered_path_marker(
+            grid,
+            start,
+            start_layer,
+            goal,
+            hierarchy,
+            resolved_terrain,
+            marker_overlay,
+            facts,
+        )
+    };
+    let Some((precheck, mut corridor)) = admitted else {
+        return search(None);
+    };
+    let mut exclusions = ZonePrecheckExclusions::default();
+    let mut tries = 0;
+    loop {
+        match search(Some(corridor.gate())) {
+            Err(PathSearchFailure::CellSearchExhausted) => {}
+            found => return found,
+        }
+        tries += 1;
+        let retry = precheck_retry::RetryInputs {
+            zone_grid: precheck.zone_grid,
+            hierarchy: precheck.hierarchy,
+            terrain: resolved_terrain.ok_or_else(|| {
+                PathSearchFailure::CellEntryUnavailable(
+                    "the hierarchy retry floods map cells".into(),
+                )
+            })?,
+            bounds: playfield_bounds,
+            movement_zone: precheck.movement_zone,
+            foot_entry: facts.foot_entry,
+        };
+        let hierarchy_usable = precheck_retry::update_hierarchical_edges(
+            &retry,
+            &corridor.routes,
+            corridor.progress.cell,
+            &mut exclusions,
+        )?;
+        if tries >= CELL_SEARCH_TRIES {
+            return Err(PathSearchFailure::CellSearchExhausted);
+        }
+        if !hierarchy_usable {
+            return search(None);
+        }
+        corridor = precheck
+            .run(&exclusions, facts.foot_entry, start)?
+            .ok_or(PathSearchFailure::CellSearchExhausted)?;
+    }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(tests_sim_pathfinding, tests_sim_movement)))]
 #[path = "zone_search_tests.rs"]
 mod zone_search_tests;

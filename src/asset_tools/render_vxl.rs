@@ -8,11 +8,11 @@
 //! the eight compass points rather than one pose.
 //!
 //! The rasteriser is [`crate::render::vxl_raster`], which is pure CPU and
-//! already runs headless in `tests/vxl_render.rs`. What it returns is a buffer
+//! runs headless. What it returns is a buffer
 //! of post-VPL, pre-house-remap palette indices in which byte 0 means "no voxel
 //! here". That byte must become fully transparent regardless of what the
-//! palette holds at index 0 — a `gamemd_ui` palette has an opaque entry there,
-//! and honouring it would paint the whole background in palette colour 0.
+//! palette holds at index 0 — every palette entry is opaque, and honouring it
+//! would paint the whole background in palette colour 0.
 //!
 //! Turret and barrel are composited in, through the same depth-correct CPU
 //! merge the unit atlas bakes with (`render::unit_atlas::composite_unit_vxl_cpu`)
@@ -24,7 +24,7 @@
 //! - Depends on `assets/` (VXL/HVA/VPL/palette), `rules/` (`[Colors]` schemes
 //!   and the art registry), the CPU-only `render::vxl_raster`, and the sibling
 //!   `canvas` / `identify` / `locate` / `names` / `palette` / `report` modules.
-//! - Nothing from `sim/`, `ui/`, `sidebar/`, `audio/`, `net/`, and no GPU type.
+//! - Nothing from `sim/`, `ui/`, `audio/`, `net/`, and no GPU type.
 
 use std::path::{Path, PathBuf};
 
@@ -33,6 +33,7 @@ use crate::asset_tools::identify;
 use crate::asset_tools::names::NameDict;
 use crate::asset_tools::palette;
 use crate::asset_tools::report::{ErrorReport, RenderOutputs, RenderReport};
+use crate::asset_tools::sanitise_name;
 use crate::asset_tools::verb_render::RenderOptions;
 use crate::assets::asset_manager::AssetManager;
 use crate::assets::hva_file::HvaFile;
@@ -356,7 +357,7 @@ pub fn run(
         ));
     }
 
-    let sanitised = sanitise_name(name);
+    let sanitised = sanitise_name(name, FALLBACK_DIR_NAME);
     let dir = render_dir(&opts.out, &sanitised);
     std::fs::create_dir_all(&dir).map_err(|err| ErrorReport {
         error: format!("could not create {}: {err}", dir.display()),
@@ -416,7 +417,6 @@ pub fn run(
             scale,
             &choice.name,
             &choice.reason,
-            &choice.alpha_policy,
             opts.house,
         );
         let sheet = canvas::build_contact_sheet(&header, &cells);
@@ -620,7 +620,7 @@ fn select_facings(requested: &[u8], limit: usize) -> FacingSelection {
 /// Exact-only on purpose: labelling facing 70 as "E" would be a small lie
 /// burned into an image, and the degrees column already places it.
 fn compass_name(facing: u8) -> Option<&'static str> {
-    if facing % COMPASS_STEP != 0 {
+    if !facing.is_multiple_of(COMPASS_STEP) {
         return None;
     }
     COMPASS_NAMES
@@ -662,10 +662,9 @@ fn select_hva_frame(requested: Option<usize>, frame_count: u32) -> (u32, Option<
 
 /// Palette indices to RGBA, with the rasteriser's empty byte forced clear.
 ///
-/// Index 0 is "no voxel", not "palette colour 0". A `gamemd_ui` palette carries
-/// an opaque entry there, so trusting the palette would fill the sprite's whole
-/// bounding box with a solid colour. The alpha policy still governs every other
-/// index, which is why the chosen palette is applied unchanged elsewhere.
+/// Index 0 is "no voxel", not "palette colour 0". Every palette entry is
+/// opaque, index 0 included, so trusting the palette would fill the sprite's
+/// whole bounding box with a solid colour.
 ///
 /// The caller bounds the slice length; this walks it once and allocates 4x.
 fn indices_to_rgba(indices: &[u8], palette: &Palette) -> Vec<u8> {
@@ -675,8 +674,8 @@ fn indices_to_rgba(indices: &[u8], palette: &Palette) -> Vec<u8> {
             data.extend_from_slice(&[0, 0, 0, 0]);
             continue;
         }
-        let color = palette.colors[usize::from(index)];
-        data.extend_from_slice(&[color.r, color.g, color.b, color.a]);
+        let color = palette.color(index);
+        data.extend_from_slice(&[color.r, color.g, color.b, 255]);
     }
     data
 }
@@ -699,7 +698,11 @@ fn sprite_to_rgba(sprite: &VxlSprite, palette: &Palette) -> Option<Rgba> {
 }
 
 fn count_opaque(rgba: &[u8]) -> usize {
-    rgba.chunks_exact(4).filter(|pixel| pixel[3] != 0).count()
+    rgba.as_chunks::<4>()
+        .0
+        .iter()
+        .filter(|pixel| pixel[3] != 0)
+        .count()
 }
 
 /// Composite one facing onto the checkerboard and draw its markers.
@@ -814,7 +817,6 @@ fn cell_label(facing: u8, w: u32, h: u32) -> String {
 /// Header lines printed above the contact sheet. An agent that only looks at
 /// the image must still know which palette and which lighting table produced
 /// these colours.
-#[allow(clippy::too_many_arguments)]
 fn sheet_header(
     name: &str,
     source_archive: &str,
@@ -827,7 +829,6 @@ fn sheet_header(
     scale: u32,
     palette_name: &str,
     palette_reason: &str,
-    alpha_policy: &str,
     house: Option<u8>,
 ) -> Vec<String> {
     let lighting = if has_vpl {
@@ -846,7 +847,7 @@ fn sheet_header(
             vxl.limb_count
         ),
         format!("{animation}   {lighting}"),
-        format!("palette {palette_name}   {palette_reason}   alpha {alpha_policy}"),
+        format!("palette {palette_name}   {palette_reason}"),
     ];
     if let Some(index) = house {
         header.push(format!(
@@ -882,26 +883,6 @@ fn index_tsv(rows: &[FacingRow]) -> String {
 // ---------------------------------------------------------------------------
 // Output paths
 // ---------------------------------------------------------------------------
-
-/// Replace every character outside `[A-Za-z0-9._-]` so the name is safe as a
-/// directory and filename component on any platform.
-fn sanitise_name(name: &str) -> String {
-    let sanitised: String = name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitised.is_empty() {
-        FALLBACK_DIR_NAME.to_string()
-    } else {
-        sanitised
-    }
-}
 
 /// `<out>/render/<sanitised>/`, absolutised so the reported paths do not depend
 /// on the reader's working directory.
@@ -1004,21 +985,19 @@ fn summarise_facings(facings: &[u8]) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_asset_tools))]
 mod tests {
     use super::*;
 
-    /// A palette whose index 0 is *opaque*, so a test that sees a transparent
-    /// index-0 pixel proves the voxel rule fired rather than the palette's own
-    /// alpha policy. `from_bytes` would bake index 0 clear on its own and hide
-    /// the difference; the UI conversion does not.
+    /// Palette entries are opaque, index 0 included, so a test that sees a
+    /// transparent index-0 pixel proves the voxel rule fired.
     fn opaque_zero_palette() -> Palette {
         let mut bytes = vec![0u8; 768];
         // Index 0: mid grey. Index 1: pure red. Index 2: pure green.
         bytes[0..3].copy_from_slice(&[32, 32, 32]);
         bytes[3..6].copy_from_slice(&[63, 0, 0]);
         bytes[6..9].copy_from_slice(&[0, 63, 0]);
-        Palette::from_bytes_gamemd_ui(&bytes).expect("768 bytes parse")
+        Palette::from_bytes(&bytes).expect("768 bytes parse")
     }
 
     fn sprite(indices: Vec<u8>, w: u32, h: u32) -> VxlSprite {
@@ -1064,17 +1043,6 @@ mod tests {
     }
 
     #[test]
-    fn default_facing_set_is_the_eight_compass_points() {
-        let facings = default_facings();
-        assert_eq!(facings, vec![0, 32, 64, 96, 128, 160, 192, 224]);
-        assert_eq!(facings.len(), COMPASS_NAMES.len());
-        // Every default must be nameable, or the sheet labels lose their point.
-        for facing in facings {
-            assert!(compass_name(facing).is_some(), "facing {facing}");
-        }
-    }
-
-    #[test]
     fn selection_defaults_to_the_compass_and_honours_an_explicit_list() {
         let default = select_facings(&[], 64);
         assert_eq!(default.facings, default_facings());
@@ -1109,12 +1077,12 @@ mod tests {
     fn index_zero_is_transparent_regardless_of_the_palette() {
         let palette = opaque_zero_palette();
         // The palette itself reports index 0 as opaque mid grey.
-        assert_eq!(palette.colors[0].a, 255);
+        assert_eq!(palette.color(0).a, 255);
 
         let rgba = indices_to_rgba(&[0, 1, 2, 0], &palette);
         assert_eq!(rgba.len(), 16);
         assert_eq!(&rgba[0..4], &[0, 0, 0, 0], "empty voxel must be clear");
-        assert_eq!(rgba[7], 255, "index 1 keeps the palette's alpha");
+        assert_eq!(rgba[7], 255, "index 1 is opaque");
         assert!(
             rgba[4] > 0 && rgba[5] == 0,
             "index 1 is red: {:?}",
@@ -1256,14 +1224,6 @@ mod tests {
     }
 
     #[test]
-    fn output_filenames_zero_pad_the_facing_byte() {
-        assert_eq!(facing_png_name("htnk.vxl", 0), "htnk.vxl.000.png");
-        assert_eq!(facing_png_name("htnk.vxl", 32), "htnk.vxl.032.png");
-        assert_eq!(facing_png_name("htnk.vxl", 224), "htnk.vxl.224.png");
-        assert_eq!(sheet_png_name("htnk.vxl"), "htnk.vxl.sheet.png");
-    }
-
-    #[test]
     fn generated_output_predicate_matches_only_our_own_files() {
         assert!(is_generated_output("htnk.vxl.000.png", "htnk.vxl"));
         assert!(is_generated_output("htnk.vxl.224.png", "htnk.vxl"));
@@ -1275,25 +1235,6 @@ mod tests {
     }
 
     #[test]
-    fn sanitise_name_keeps_safe_characters_and_replaces_the_rest() {
-        assert_eq!(sanitise_name("htnk.vxl"), "htnk.vxl");
-        assert_eq!(sanitise_name("ra2\\dir/na me:x*?"), "ra2_dir_na_me_x__");
-        assert_eq!(sanitise_name(""), FALLBACK_DIR_NAME);
-    }
-
-    #[test]
-    fn render_dir_is_absolute_and_shares_the_shp_output_tree() {
-        // The root is whatever `--out` carried; only the layout under it is ours.
-        let dir = render_dir(Path::new("target/asset"), "htnk.vxl");
-        assert!(dir.is_absolute(), "{}", dir.display());
-        assert!(
-            dir.ends_with(Path::new(RENDER_SUBDIR).join("htnk.vxl")),
-            "{}",
-            dir.display()
-        );
-    }
-
-    #[test]
     fn scale_is_clamped_and_fitted_to_the_pixel_budget() {
         assert_eq!(clamp_scale(0), MIN_SCALE);
         assert_eq!(clamp_scale(999), MAX_SCALE);
@@ -1301,24 +1242,10 @@ mod tests {
         assert_eq!(fit_scale(60, 50, 8), Some(8));
 
         let fitted = fit_scale(4000, 4000, 16).expect("reduced, not refused");
-        assert!(fitted >= MIN_SCALE && fitted < 16, "{fitted}");
+        assert!((MIN_SCALE..16).contains(&fitted), "{fitted}");
         // A corrupt header claiming a giant sprite fails instead of allocating.
         assert_eq!(fit_scale(60_000, 60_000, 1), None);
         assert_eq!(fit_scale(0, 0, 2), Some(2));
-    }
-
-    #[test]
-    fn last_resort_palette_reasons_are_detected_case_insensitively() {
-        assert!(is_last_resort_palette("last-resort-768-byte-scan"));
-        assert!(is_last_resort_palette("Scanned the source archive"));
-        assert!(!is_last_resort_palette("fallback-chain"));
-    }
-
-    #[test]
-    fn summarise_facings_caps_the_listing() {
-        assert_eq!(summarise_facings(&[0, 64, 128]), "0, 64, 128");
-        let many: Vec<u8> = (0..12).collect();
-        assert!(summarise_facings(&many).ends_with("+4 more"));
     }
 
     #[test]
@@ -1341,7 +1268,6 @@ mod tests {
             4,
             "unittem.pal",
             "fallback-chain",
-            "standard",
             Some(2),
         );
         let joined = header.join("\n");

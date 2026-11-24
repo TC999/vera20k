@@ -10,13 +10,14 @@
 //! Foot4DBDF0/4DDC40 and Map56D100; the response never selects NavCom instead.
 
 use crate::map::entities::EntityCategory;
-use crate::map::houses::is_allied_with;
 use crate::map::resolved_terrain::NativeCellQuery;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::mission::authority::queue_entity_mission_deferred;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::movement::ground_pose;
 use crate::sim::pathfinding::zone_map::ZoneQueryCell;
+use crate::sim::timer::CdTimer;
+use crate::sim::world::FrameEffects;
 use crate::sim::world::Simulation;
 use crate::util::fixed_math::ra2_speed_to_leptons_per_frame;
 use crate::util::native_x87::{NativeF64Bits, X87Chop53, object_distance};
@@ -151,11 +152,6 @@ impl ResponseSelection {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn remaining_budget(&self) -> i32 {
-        self.remaining_budget
-    }
-
     pub(crate) fn can_scan(&self) -> bool {
         self.remaining_budget > 0
     }
@@ -234,57 +230,67 @@ impl ResponseSelection {
         victim_id: u64,
         attacker_id: u64,
     ) -> i32 {
-        let current_frame = world.session.binary_frame as i32;
+        let current_frame = world.session.binary_frame() as i32;
         let (budget, responders) = self.into_ranked();
-        if budget <= 0 {
-            return 0;
-        }
-
         let mut accumulated = 0;
-        for responder in responders {
-            let in_base_defense_team = world
-                .team_script_vm
-                .team_for_member(responder.entity_id)
-                .is_some_and(|(_, is_base_defense)| is_base_defense);
-            let draw = world.scenario_rng.next_range_u32_inclusive(0, 99);
-            let mission = match response_mission(draw, in_base_defense_team) {
-                ResponseMission::Rescue => MissionType::Rescue,
-                ResponseMission::AreaGuard => MissionType::AreaGuard,
-            };
-            let Some(responder_entity) = world.substrate.entities.get_mut(responder.entity_id)
-            else {
-                continue;
-            };
-            queue_entity_mission_deferred(responder_entity, MissionId::from_known(mission));
-            responder_entity.set_archive_target(Some(TargetKind::Entity(victim_id)));
-            world
-                .assign_target_represented(
-                    responder.entity_id,
-                    Some(TargetKind::Entity(attacker_id)),
-                    Some(rules),
-                )
-                .expect("selected responder remains present during synchronous target assignment");
-            let Some(responder_entity) = world.substrate.entities.get(responder.entity_id) else {
-                continue;
-            };
-            let threat = live_threat_posed(
-                responder_entity,
-                rules.object(world.interner.resolve(responder_entity.type_ref())),
-                &world.substrate.entities,
-                rules,
-                &world.interner,
-            );
-            let (next, overshot) = add_assigned_threat(accumulated, threat, budget);
-            accumulated = next;
-            if overshot {
-                if let Some(attacker) = world.substrate.entities.get_mut(attacker_id) {
-                    attacker.base_defense_response.cooldown.start(
-                        current_frame,
-                        response_delay_frames(rules.general.base_defense_delay_minutes),
+        // `0x0070863F`: a nonpositive budget skips the sort and assignments.
+        if budget > 0 {
+            for responder in responders {
+                let in_base_defense_team = world
+                    .team_script_vm
+                    .team_for_member(responder.entity_id)
+                    .is_some_and(|(_, is_base_defense)| is_base_defense);
+                let draw = world.scenario_rng.next_range_u32_inclusive(0, 99);
+                let mission = match response_mission(draw, in_base_defense_team) {
+                    ResponseMission::Rescue => MissionType::Rescue,
+                    ResponseMission::AreaGuard => MissionType::AreaGuard,
+                };
+                let Some(responder_entity) = world.substrate.entities.get_mut(responder.entity_id)
+                else {
+                    continue;
+                };
+                queue_entity_mission_deferred(responder_entity, MissionId::from_known(mission));
+                responder_entity.set_archive_target(Some(TargetKind::Entity(victim_id)));
+                world
+                    .assign_target_represented(
+                        responder.entity_id,
+                        Some(TargetKind::Entity(attacker_id)),
+                        rules,
+                        &mut FrameEffects::default(),
+                    )
+                    .expect(
+                        "selected responder remains present during synchronous target assignment",
                     );
+                let Some(responder_entity) = world.substrate.entities.get(responder.entity_id)
+                else {
+                    continue;
+                };
+                let threat = live_threat_posed(
+                    responder_entity,
+                    world
+                        .interner
+                        .object_type(responder_entity.type_ref(), rules),
+                    &world.substrate.entities,
+                    rules,
+                    &world.interner,
+                );
+                let (next, overshot) = add_assigned_threat(accumulated, threat, budget);
+                accumulated = next;
+                if overshot {
+                    break;
                 }
-                break;
             }
+        }
+        // `0x0070875C..0x007087A9`: the shared exit starts the attacker's
+        // cooldown whenever the sum strictly exceeds the budget, so a budget
+        // that engaged defenders drove negative arms it with no assignment.
+        if accumulated > budget
+            && let Some(attacker) = world.substrate.entities.get_mut(attacker_id)
+        {
+            attacker.seldom.base_defense_response.cooldown.start(
+                current_frame,
+                response_delay_frames(rules.general.base_defense_delay_minutes),
+            );
         }
         accumulated
     }
@@ -319,6 +325,97 @@ use admission::{
     candidate_admitted, current_target_disposition, destination_cell, primary_range_leptons,
 };
 
+/// Persistent TechnoClass state used by the active House base-defence
+/// responder. The two recruitment admission bytes are constructor-true; an
+/// authored object's scenario line ([`Self::author_recruitable`]) and
+/// `TeamClass::Add_Member` ([`Self::set_team_recruitable`]) write them. The
+/// cooldown starts only when the assigned sum strictly exceeds the budget: an
+/// assignment overshoot, or a scan whose engaged defenders left it negative. The
+/// ArchiveTarget (`+0x218`) stored here is the general Techno field, which
+/// responders, miners, the slave manager and the rally click all write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BaseDefenseResponseState {
+    /// `Techno+0x421`, RecruitableA.
+    recruitable_a: bool,
+    /// `Techno+0x422`, RecruitableB.
+    recruitable_b: bool,
+    archive_target: Option<TargetKind>,
+    /// `TechnoClass+0x650`/`+0x658`: the attacker's call-for-help cooldown
+    /// (`TechnoClass::RespondToBaseAttack @ 0x00708171..0x00708192`, written
+    /// at `0x0070879E..0x007087A9`); the constructor leaves it at `-1`, 0.
+    cooldown: CdTimer,
+}
+
+impl Default for BaseDefenseResponseState {
+    fn default() -> Self {
+        Self {
+            recruitable_a: true,
+            recruitable_b: true,
+            archive_target: None,
+            cooldown: CdTimer::from_raw(-1, 0),
+        }
+    }
+}
+
+impl BaseDefenseResponseState {
+    /// `Techno+0x421`, RecruitableA.
+    pub(crate) fn recruitable_a(&self) -> bool {
+        self.recruitable_a
+    }
+
+    /// `Techno+0x422`, RecruitableB.
+    pub(crate) fn recruitable_b(&self) -> bool {
+        self.recruitable_b
+    }
+
+    /// The scenario line's two recruitment bytes (Unit and Infantry trailing
+    /// fields 12 and 13, Aircraft 10 and 11), stored by the authored object's
+    /// construction.
+    pub(crate) fn author_recruitable(&mut self, recruitable_a: bool, recruitable_b: bool) {
+        self.recruitable_a = recruitable_a;
+        self.recruitable_b = recruitable_b;
+    }
+
+    /// `TeamClass::Add_Member @ 0x006EA500`'s store of the team type's
+    /// `AreTeamMembersRecruitable` into `+0x422`.
+    pub(crate) fn set_team_recruitable(&mut self, recruitable: bool) {
+        self.recruitable_b = recruitable;
+    }
+
+    /// The call-for-help cooldown; outside tests only
+    /// `respond_to_base_attack` reads and starts it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn cooldown(&self) -> CdTimer {
+        self.cooldown
+    }
+
+    /// ArchiveTarget (`+0x218`), read through `GameEntity::archive_target`.
+    pub(crate) fn archive_target(&self) -> Option<TargetKind> {
+        self.archive_target
+    }
+
+    /// `TechnoClass::Set_ArchiveTarget @ 0x0070C610`'s store, through
+    /// `GameEntity::set_archive_target`.
+    pub(crate) fn set_archive_target(&mut self, target: Option<TargetKind>) {
+        self.archive_target = target;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_recruitable_a_for_test(&mut self, recruitable: bool) {
+        self.recruitable_a = recruitable;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_recruitable_b_for_test(&mut self, recruitable: bool) {
+        self.recruitable_b = recruitable;
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_cooldown_for_test(&mut self, cooldown: CdTimer) {
+        self.cooldown = cooldown;
+    }
+}
+
 /// Execute one complete native response transaction after the receiver owner
 /// has selected the exact Building or protected-Techno call site.
 ///
@@ -328,6 +425,7 @@ pub(crate) fn respond_to_base_attack(
     rules: &RuleSet,
     victim_id: u64,
     attacker_id: u64,
+    frame_effects: &mut FrameEffects<'_>,
 ) {
     let entities = &world.substrate.entities;
     let interner = &world.interner;
@@ -337,38 +435,39 @@ pub(crate) fn respond_to_base_attack(
     let Some(attacker) = entities.get(attacker_id) else {
         return;
     };
-    let Some(victim_object) = rules.object(interner.resolve(victim.type_ref())) else {
+    let Some(victim_object) = interner.object_type(victim.type_ref(), rules) else {
         return;
     };
-    let Some(attacker_object) = rules.object(interner.resolve(attacker.type_ref())) else {
+    let Some(attacker_object) = interner.object_type(attacker.type_ref(), rules) else {
         return;
     };
     let victim_owner = victim.owner();
     let attacker_owner = attacker.owner();
     let budget = live_threat_posed(attacker, Some(attacker_object), entities, rules, interner)
         .wrapping_mul(rules.general.computer_base_defense_response);
-    let current_frame = world.session.binary_frame as i32;
+    let current_frame = world.session.binary_frame() as i32;
+    let campaign_base_defense = world.session.rule_policy().uses_campaign_base_defense();
 
-    if is_allied_with(
-        &world.house_alliances,
-        interner.resolve(victim_owner),
-        interner.resolve(attacker_owner),
-    ) || world
-        .houses
-        .get(&victim_owner)
-        .is_some_and(|house| house.is_human)
-        || attacker.lifecycle.in_limbo
+    if world
+        .house_alliances
+        .is_allied(interner, victim_owner, attacker_owner)
+        // gamemd.exe, RespondToBaseAttack @ 0x00708080 (call at 0x007080F9):
+        // HouseClass::IsControlledByHuman @ 0x0050B730 also rejects campaign
+        // PlayerControl, before suspension, responder RNG and cooldown writes.
+        || world.owner_is_human(victim_owner)
+        || attacker.lifecycle.in_limbo()
         // `0x00708114`: `[g_GameMode 0x00A8B238] == 0 && this->Is_Armed
         // (vt+0x2AC)` — an armed victim in that game mode defends itself
         // instead of calling for help.
-        || (!world.session.game_mode_nonzero && is_armed(victim, victim_object))
+        || (campaign_base_defense
+            && is_armed(victim, victim_object, entities, rules, interner))
         || !matches!(
-            attacker.category,
+            attacker.category(),
             EntityCategory::Unit | EntityCategory::Infantry
         )
         || victim_object.insignificant
         || !attacker
-            .base_defense_response
+            .seldom.base_defense_response
             .cooldown
             .expired(current_frame)
     {
@@ -381,8 +480,8 @@ pub(crate) fn respond_to_base_attack(
     if budget > 0
         && (world.zone_grid.is_none()
             || world.resolved_terrain.is_none()
-            || world.playfield_bounds.is_none()
-            || world.playfield_size_height.is_none())
+            || world.playfield_bounds().is_none()
+            || world.playfield_size_height().is_none())
     {
         return;
     }
@@ -392,11 +491,11 @@ pub(crate) fn respond_to_base_attack(
         rules.general.suspend_priority,
         response_delay_frames(rules.general.suspend_delay_minutes),
         rules,
+        frame_effects,
     );
+    // A nonpositive budget still reaches the shared cooldown exit through
+    // `dispatch`; each class loop below stops first (`0x007081BF`, `0x007083F5`).
     let mut selection = ResponseSelection::new(budget);
-    if !selection.can_scan() {
-        return;
-    }
 
     // Admission retains native lazy map-query effects on shared Dummy. Entity
     // and mission mutations follow the scan.
@@ -409,27 +508,35 @@ pub(crate) fn respond_to_base_attack(
     let attacker_coord = ground_pose::object_get_coords(attacker, sim.resolved_terrain.as_ref());
     let attacker_coord = [attacker_coord.x, attacker_coord.y, attacker_coord.z];
     let victim_is_self_anchor = victim.archive_target() == Some(TargetKind::Entity(victim_id));
-    let candidate_ids = entities.keys_sorted();
     for class in [ResponderClass::Infantry, ResponderClass::Unit] {
-        for &candidate_id in &candidate_ids {
+        let expected_category = match class {
+            ResponderClass::Infantry => EntityCategory::Infantry,
+            ResponderClass::Unit => EntityCategory::Unit,
+        };
+        // VERA walks only the victim's house's objects of the class, in the
+        // same order: admission (`0x007081D4`, `0x0070840A`) refuses every
+        // other house's after reading only its liveness, before any map
+        // query, score or draw.
+        for &candidate_id in entities.owned_ids(victim.owner(), expected_category) {
             if !selection.can_scan() {
                 break;
             }
-            let expected_category = match class {
-                ResponderClass::Infantry => EntityCategory::Infantry,
-                ResponderClass::Unit => EntityCategory::Unit,
-            };
             let Some(candidate) = entities.get(candidate_id) else {
                 continue;
             };
-            if candidate.category != expected_category {
-                continue;
-            }
-            let Some(candidate_object) = rules.object(sim.interner.resolve(candidate.type_ref()))
+            let Some(candidate_object) = sim.interner.object_type(candidate.type_ref(), rules)
             else {
                 continue;
             };
-            if !candidate_admitted(sim, rules, candidate, candidate_object, victim, attacker_id) {
+            if !candidate_admitted(
+                sim,
+                rules,
+                candidate,
+                candidate_object,
+                victim,
+                attacker_id,
+                campaign_base_defense,
+            ) {
                 continue;
             }
 
@@ -441,42 +548,26 @@ pub(crate) fn respond_to_base_attack(
             // resolve the victim before the candidate. Source-layer queries
             // use the same Foot/ground owners as movement, never NavCom.
             let Ok(victim_destination) =
-                destination_cell(victim, entities, Some(terrain), rules, &sim.interner)
+                destination_cell(victim, sim, Some(terrain), rules, &sim.interner)
             else {
                 continue;
             };
             let Ok(destination) =
-                destination_cell(candidate, entities, Some(terrain), rules, &sim.interner)
+                destination_cell(candidate, sim, Some(terrain), rules, &sim.interner)
             else {
                 continue;
             };
             let cells = NativeCellQuery::canonical(terrain);
-            let current = ground_pose::position_world_coord(&candidate.position);
-            let in_tube = candidate.low_bridge_tube_state.is_some();
             // Foot4DDC40 short-circuits before virtual+4C in a Tube.
-            let navigation = if in_tube {
-                current
-            } else {
-                match sim.foot_navigation_coordinate(candidate_id) {
-                    Ok(coord) => coord,
-                    Err(_) => continue,
-                }
-            };
-            let Ok(source_should_be_on_bridge) = ground_pose::navigation_should_be_on_bridge(
-                &cells,
-                navigation,
-                current,
-                candidate.on_bridge,
-                in_tube,
-            ) else {
+            let Ok(source_should_be_on_bridge) = sim.foot_should_be_on_bridge(candidate_id) else {
                 continue;
             };
             let bounds = sim
-                .playfield_bounds
+                .playfield_bounds()
                 .expect("positive scan validated bounds");
             let size = (
                 bounds.base,
-                sim.playfield_size_height
+                sim.playfield_size_height()
                     .expect("positive scan validated Size"),
             );
             if !sim
@@ -545,7 +636,7 @@ pub(crate) fn respond_to_base_attack(
             // Original7085A4/7085A9 evaluate threat first;7085AD then
             // refuses a Unit for a slave victim. Earlier rejection would
             // lose this candidate's shared-Dummy coordinate/layer/zone writes.
-            if class == ResponderClass::Unit && victim.slave.owner().is_some() {
+            if class == ResponderClass::Unit && victim.seldom.slave.owner().is_some() {
                 continue;
             }
             selection.consider(candidate_id, raw_score, class, victim_is_self_anchor);
@@ -555,10 +646,10 @@ pub(crate) fn respond_to_base_attack(
     selection.dispatch(world, rules, victim_id, attacker_id);
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_a_c))]
 #[path = "base_defense_response_tests.rs"]
 mod tests;
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_a_c))]
 #[path = "base_defense_response_oracle_tests.rs"]
 mod oracle_tests;

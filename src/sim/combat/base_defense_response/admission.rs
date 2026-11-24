@@ -20,17 +20,15 @@ use super::ExistingTargetDisposition;
 /// or the protected Building's class-specific coordinate.
 pub(super) fn destination_cell(
     entity: &GameEntity,
-    entities: &EntityStore,
+    sim: &Simulation,
     terrain: Option<&ResolvedTerrainGrid>,
     rules: &RuleSet,
     interner: &StringInterner,
 ) -> Result<(i32, i32), String> {
     let coord = crate::sim::movement::nav_target_coordinate(
-        crate::sim::components::NavTargetRef::Entity {
-            id: entity.stable_id(),
-        },
+        crate::sim::components::NavTargetRef::object(entity.stable_id()),
         None,
-        entities,
+        sim,
         terrain,
         Some((rules, interner)),
     )?;
@@ -50,15 +48,15 @@ pub(super) fn current_target_disposition(
     rules: &RuleSet,
     interner: &StringInterner,
 ) -> ExistingTargetDisposition {
-    match candidate.attack_target.as_ref().map(|target| target.target) {
+    match candidate.attack_target.target() {
         Some(TargetKind::Entity(id)) if id == attacker_id => {
             ExistingTargetDisposition::RequestedAttacker
         }
         Some(TargetKind::Entity(id))
             if entities.get(id).is_some_and(|target| {
-                rules
-                    .object(interner.resolve(target.type_ref()))
-                    .is_some_and(|object| is_armed(target, object))
+                interner
+                    .object_type(target.type_ref(), rules)
+                    .is_some_and(|object| is_armed(target, object, entities, rules, interner))
             }) =>
         {
             ExistingTargetDisposition::OtherArmedTarget
@@ -96,6 +94,7 @@ pub(super) fn candidate_admitted(
     candidate_object: &ObjectType,
     victim: &GameEntity,
     attacker_id: u64,
+    requires_recruitable_mission: bool,
 ) -> bool {
     if !candidate.is_object_alive()
         || candidate.owner() != victim.owner()
@@ -103,15 +102,17 @@ pub(super) fn candidate_admitted(
             .team_script_vm
             .team_for_member(candidate.stable_id())
             .is_some_and(|(_, is_base_defense)| !is_base_defense)
-        || !candidate.base_defense_response.recruitable_a
-        || !candidate.base_defense_response.recruitable_b
-        || !is_armed(candidate, candidate_object)
-        || (!sim.session.game_mode_nonzero
-            && !candidate
-                .mission
-                .current()
-                .known()
-                .and_then(|mission| rules.mission_control.entry(mission))
+        || !candidate.seldom.base_defense_response.recruitable_a
+        || !candidate.seldom.base_defense_response.recruitable_b
+        || !is_armed(
+            candidate,
+            candidate_object,
+            &sim.substrate.entities,
+            rules,
+            &sim.interner,
+        )
+        || (requires_recruitable_mission
+            && !crate::sim::mission::control::current_control(rules, &candidate.mission)
                 .is_some_and(|entry| entry.recruitable))
     {
         return false;
@@ -121,20 +122,18 @@ pub(super) fn candidate_admitted(
     let peek = FireSubject {
         world: sim,
         rules,
-        overlay_registry: None,
-        fog: Some(&sim.fog),
+        fog: Some(sim.fog.fire_view(&sim.house_alliances)),
         firer: candidate,
         obj: candidate_object,
         target: Some(TargetKind::Entity(attacker_id)),
         weapon_index: 0,
-        garrison: None,
     }
     .fire_error(false);
     if peek == FireError::Illegal {
         return false;
     }
-    if candidate.category == EntityCategory::Unit
-        && (candidate_object.resource_gatherer || candidate.bunker_link.installed_in().is_some())
+    if candidate.category() == EntityCategory::Unit
+        && (candidate_object.resource_gatherer || candidate.bunker.link().installed_in().is_some())
     {
         return false;
     }

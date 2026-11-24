@@ -13,72 +13,80 @@
 //! (HELLO/OVER_OUT/TETHER on real Unit and Building receivers) and the
 //! `can_dock` rows (the DOCKING handshake with every nested transmit).
 //!
-//! RESIDUALS (no represented reader or sender):
-//! - `RadioClass+0xD4..+0xDC`, the last three distinct received messages
-//!   (`0x0065A829`), is not kept.
-//! - Building OVER_OUT's `Begin_Mode(IDLE)` (`0x00447780`) queues the
-//!   building's IDLE BState (+0x538); VERA has no BState owner.
-//! - The bus carries no overlay registry, so RUN_AWAY's Scatter reaches an
-//!   Infantry receiver without one, and its overlay reads fail on any cell
-//!   holding an overlay (ore included); the error is logged. When
-//!   Find_Nearby_Passable_Cell found a cell, the draw and the setter have
-//!   already run: the man keeps that destination and walks at his next turn,
-//!   but loses the immediate Process. When the neighbour fallback runs
-//!   instead, he stays. Trigger: RUN_AWAY reaching an infantryman in radio
-//!   contact. Frequency: rare, radio contacts are mostly docked Units. A Unit
-//!   receiver reads no overlay.
+//! Receivers that read a cell's overlay take the match's OverlayTypeClass
+//! table from the frame's effects ([`FrameEffects::overlay_registry`]); the
+//! bus hands them only the rules and those effects.
+//!
+//! RESIDUAL (no represented reader or sender): `RadioClass+0xD4..+0xDC`, the
+//! last three distinct received messages (`0x0065A829`), is not kept.
 //!
 //! ## Dependency rules
 //! - Part of sim/ — depends on sim/radio + sim/world. sim/ NEVER depends on
-//!   render/, ui/, sidebar/, audio/, net/.
+//!   render/, ui/, audio/, net/.
 
 use crate::map::entities::EntityCategory;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::components::NavTargetRef;
-use crate::sim::docking::bunker_install::BunkerState;
-use crate::sim::mission::authority::EntityReadyInputProvider;
+use crate::sim::house_diplomacy::HouseAlliances;
+use crate::sim::intern::StringInterner;
+use crate::sim::mission::authority::LiveReadyInputProvider;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::movement::ScatterFlags;
 use crate::sim::radio::{RadioMessage, RadioPayload, RadioResponse, transmit};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::sim::world::LifecycleTestEvent;
-use crate::sim::world::Simulation;
+use crate::sim::world::ObjectSubstrate;
+use crate::sim::world::{FrameEffects, Simulation};
 
 /// The hull facing a Unit turns to on PREPARE_TO_DOCK (`0x007376E6`): east.
 pub(crate) const DOCK_FACING: u16 = 0x4000;
 
+/// The literal pad offset of `0x0043CA80..0x0043CA8D` (`add dx,3; inc ax`).
+const DOCK_PAD_OFFSET: [i32; 2] = [3, 1];
+
 /// The pad cell a DockUnload/Weeder dock sends in MOVE_HERE
 /// (`0x0043CA71..0x0043CAB8`): its NW cell (`Get_Cell`, Location / 256) plus
 /// (3, 1), CellStruct int16 adds. The stock refinery pad is this cell.
+#[cfg(test)]
 pub(crate) fn dock_pad_cell(rx: u16, ry: u16) -> (u16, u16) {
+    dock_pad_cell_at(rx, ry, DOCK_PAD_OFFSET)
+}
+
+/// The pad cell for an offset: each word is added as a CellStruct short.
+fn dock_pad_cell_at(rx: u16, ry: u16, offset: [i32; 2]) -> (u16, u16) {
     (
-        (rx as i16).wrapping_add(3) as u16,
-        (ry as i16).wrapping_add(1) as u16,
+        (rx as i16).wrapping_add(offset[0] as i16) as u16,
+        (ry as i16).wrapping_add(offset[1] as i16) as u16,
     )
 }
 
 /// Receiver-side radio dispatch. `target_sid` is the receiver; `sender_sid` is
 /// the RTTI-filtered sender (`None` when the sender failed the Techno filter).
 /// Returns the receiver's response code.
-pub fn receive_radio(
+pub(crate) fn receive_radio(
     sim: &mut Simulation,
     target_sid: u64,
     sender_sid: Option<u64>,
     msg: RadioMessage,
     payload: RadioPayload,
-    rules: Option<&RuleSet>,
+    rules: &RuleSet,
+    effects: &mut FrameEffects<'_>,
 ) -> RadioResponse {
-    let Some(category) = sim.substrate.entities.get(target_sid).map(|t| t.category) else {
+    let Some(category) = sim.substrate.entities.get(target_sid).map(|t| t.category()) else {
         return RadioResponse::None;
     };
     match category {
         EntityCategory::Structure => {
-            building_receive(sim, target_sid, sender_sid, msg, payload, rules)
+            building_receive(sim, target_sid, sender_sid, msg, payload, rules, effects)
         }
-        EntityCategory::Unit => unit_receive(sim, target_sid, sender_sid, msg, payload, rules),
-        EntityCategory::Infantry => foot_receive(sim, target_sid, sender_sid, msg, payload, rules),
+        EntityCategory::Unit => {
+            unit_receive(sim, target_sid, sender_sid, msg, payload, rules, effects)
+        }
+        EntityCategory::Infantry => {
+            foot_receive(sim, target_sid, sender_sid, msg, payload, rules, effects)
+        }
         EntityCategory::Aircraft => {
-            aircraft_receive(sim, target_sid, sender_sid, msg, payload, rules)
+            aircraft_receive(sim, target_sid, sender_sid, msg, payload, rules, effects)
         }
     }
 }
@@ -90,121 +98,403 @@ fn building_receive(
     sender: Option<u64>,
     msg: RadioMessage,
     payload: RadioPayload,
-    rules: Option<&RuleSet>,
+    rules: &RuleSet,
+    effects: &mut FrameEffects<'_>,
 ) -> RadioResponse {
-    // VERA's bunker install adapter owns a Bunker= building's CAN_LOAD and
-    // DOCK_NOW (native 0x0043C4F8 / 0x0043C75A arms).
-    if is_bunker_building(sim, building)
-        && matches!(msg, RadioMessage::CanEnter | RadioMessage::DockNow)
-    {
-        return bunker_receive(sim, building, sender, msg);
-    }
     match msg {
-        // 0x0043CD01: Begin_Mode(IDLE) (BState residual, module doc), then
-        // the Techno receiver; the answer is always ROGER.
+        // Original43CD01: Begin_Mode(IDLE) precedes the common teardown.
+        // Human PLACE reaches this while the child's body is Construction0.
         RadioMessage::Break => {
-            let _ = techno_receive(sim, building, sender, msg, payload, rules);
+            if let Some(entity) = sim.substrate.entities.get_mut(building) {
+                entity.begin_building_body(
+                    crate::sim::building_construction::BuildingBodyMode::Idle,
+                    sim.session.binary_frame() as i32,
+                );
+            }
+            let _ = techno_receive(sim, building, sender, msg, payload, rules, effects);
             RadioResponse::Roger
         }
-        RadioMessage::CanDock => building_docking(sim, building, sender, rules),
-        RadioMessage::DockNow => building_dock_now(sim, building, sender, payload, rules),
-        RadioMessage::CanEnter if is_repair_depot(sim, building, rules) => {
-            depot_can_load(sim, building, sender, rules)
+        // Original43CC39/43CCE0: the Construction status-zero first-contact
+        // message queues Repair, then delegates to Techno and answers ROGER.
+        RadioMessage::DockApproach => {
+            if let Some(entity) = sim.substrate.entities.get_mut(building) {
+                crate::sim::mission::authority::queue_entity_mission_deferred(
+                    entity,
+                    MissionId::from_known(MissionType::Repair),
+                );
+            }
+            let _ = techno_receive(sim, building, sender, msg, payload, rules, effects);
+            RadioResponse::Roger
         }
-        // 8, 0xB, 0xC, 0xD and any other 0xF (0x0043C2F8; the refinery scan
-        // evaluates CAN_LOAD directly) have no represented bus sender.
-        RadioMessage::RequestClearance
-        | RadioMessage::DockApproach
-        | RadioMessage::DockArrived
-        | RadioMessage::AnimStop
-        | RadioMessage::CanEnter => RadioResponse::None,
-        _ => techno_receive(sim, building, sender, msg, payload, rules),
+        // Original43CC4C..43CCE0: C queues Guard unless Selling. A yard
+        // replaces PreProduction7/Idle18 with the live health's Production8.
+        RadioMessage::DockArrived => {
+            let selling = sim.substrate.entities.get(building).is_some_and(|entity| {
+                entity.mission.effective().known() == Some(MissionType::Selling)
+            });
+            if !selling {
+                if let Some(entity) = sim.substrate.entities.get_mut(building) {
+                    crate::sim::mission::authority::queue_entity_mission_deferred(
+                        entity,
+                        MissionId::from_known(MissionType::Guard),
+                    );
+                }
+                if let Some(entity) = sim.substrate.entities.get(building)
+                    && let Some(object) = sim.entity_object_type(entity, rules)
+                    && object.construction_yard
+                {
+                    let damaged = crate::sim::building_art::requested_damage_state(
+                        entity.health,
+                        object.strength,
+                        rules.general.condition_yellow,
+                    );
+                    sim.clear_building_anim_slot(building, 7);
+                    sim.clear_building_anim_slot(building, 18);
+                    sim.set_building_anim_slot(building, 8, damaged, false, 0, rules);
+                }
+            }
+            let _ = techno_receive(sim, building, sender, msg, payload, rules, effects);
+            RadioResponse::Roger
+        }
+        RadioMessage::CanDock => building_docking(sim, building, sender, rules, effects),
+        RadioMessage::DockNow => building_dock_now(sim, building, sender, payload, rules, effects),
+        RadioMessage::CanEnter => building_can_load(sim, building, sender, payload, rules, effects),
+        RadioMessage::RequestClearance => {
+            let Some(object) = sim
+                .substrate
+                .entities
+                .get(building)
+                .and_then(|entity| sim.entity_object_type(entity, rules))
+            else {
+                return RadioResponse::None;
+            };
+            // 0x0043CD2B reads UnitRepair (+0x16A9) and Bunker (+0x16AB): a
+            // sender under 0x180 leptons from the dock (both GetCoords,
+            // `(dx²+dz²)+dy²` through Sqrt_Approx and ftol) stays linked and
+            // is answered ROGER (`0x0043CD4D..0x0043CDC8`).
+            if (object.unit_repair || object.bunker)
+                && sender
+                    .and_then(|from| sim.substrate.entities.get(from))
+                    .zip(sim.substrate.entities.get(building))
+                    .is_some_and(|(from, dock)| {
+                        let terrain = sim.resolved_terrain.as_ref();
+                        let a = crate::sim::movement::ground_pose::object_get_coords(dock, terrain);
+                        let b = crate::sim::movement::ground_pose::object_get_coords(from, terrain);
+                        crate::util::native_x87::distance_3d_leptons(
+                            [a.x, a.z, a.y],
+                            [b.x, b.z, b.y],
+                        ) < 0x180
+                    })
+            {
+                return RadioResponse::Roger;
+            }
+            //43CDDD delegates before re-reading the live type at43CDE2.
+            let _ = techno_receive(sim, building, sender, msg, payload, rules, effects);
+            if sim
+                .substrate
+                .entities
+                .get(building)
+                .and_then(|entity| sim.entity_object_type(entity, rules))
+                .is_some_and(|object| object.weapons_factory || object.unit_repair || object.bunker)
+            {
+                RadioResponse::Queued //43CE18 returns literal0x17.
+            } else {
+                RadioResponse::Roger
+            }
+        }
+        RadioMessage::AnimStop => {
+            //43CE24..CE44: a WeaponsFactory answers1 before Object Mark2.
+            //Other classes reach the existing shared refresh dispatcher.
+            if sim
+                .substrate
+                .entities
+                .get(building)
+                .and_then(|entity| sim.entity_object_type(entity, rules))
+                .is_some_and(|object| object.weapons_factory)
+            {
+                RadioResponse::Roger
+            } else {
+                techno_receive(sim, building, sender, msg, payload, rules, effects)
+            }
+        }
+        _ => techno_receive(sim, building, sender, msg, payload, rules, effects),
     }
 }
 
-fn is_repair_depot(sim: &Simulation, building: u64, rules: Option<&RuleSet>) -> bool {
-    let (Some(building), Some(rules)) = (sim.substrate.entities.get(building), rules) else {
-        return false;
-    };
-    sim.object_type(building.type_ref(), rules)
-        .is_some_and(|object| object.unit_repair)
+/// What CAN_LOAD answers ([`can_load`]) before its UnitRepair arm's
+/// IsOccupied question (`0x0043C56A`), which the caller sends.
+pub(crate) enum CanLoad {
+    Answer(RadioResponse),
+    AskOccupied,
 }
 
-/// CAN_LOAD, `BuildingClass::Receive_Radio` case 0x0F (`0x0043CB25..`), for a
-/// `UnitRepair=` building, the pending entry's second question
-/// (`building_dock::try_pending_entry`). In order: a sender that is no ally
-/// gets 0; Construction or Selling, the construction BState (`+0x534` = 0),
-/// no free or own slot (the absorb exemption aside), a Naval mismatch for a
-/// sender not `MovementZone=Amphibious`, a `BalloonHover=` sender and an
-/// offline depot (`+0x660`) each get NEGATORY; then the UnitRepair arm: a
-/// sender that is neither Unit nor Aircraft gets NEGATORY, and so does one
-/// already standing on the depot (IsOccupied 0x23 answering ROGER);
-/// otherwise ROGER. The Techno receiver's message history is not kept.
-///
-/// The UnitAbsorb/InfantryAbsorb, Grinding and Bunker arms ahead of the
-/// UnitRepair one belong to other building types; a depot type carrying one
-/// of those keys answers static (0) here, as an unported arm.
-fn depot_can_load(
-    sim: &mut Simulation,
-    depot: u64,
-    sender: Option<u64>,
-    rules: Option<&RuleSet>,
-) -> RadioResponse {
-    let (Some(from), Some(rules)) = (sender, rules) else {
-        return RadioResponse::None;
-    };
+/// CAN_LOAD0F, Building43C2D0: common admission, then class/type arm.
+/// The refinery scanner and pending depot entry use this same receiver.
+/// Effective mission43C310, body43C34C, contacts43C35A, Naval/Balloon/online
+/// gates precede UnitRepair43C61B and DockUnload43C64F. The wide scan's
+/// A8E7AC context skips contact/passenger capacity, not the other gates.
+pub(crate) fn can_load(
+    sim: &Simulation,
+    building_id: u64,
+    from: u64,
+    payload: RadioPayload,
+    rules: &RuleSet,
+) -> CanLoad {
     let (Some(building), Some(unit)) = (
-        sim.substrate.entities.get(depot),
+        sim.substrate.entities.get(building_id),
         sim.substrate.entities.get(from),
     ) else {
-        return RadioResponse::None;
+        return CanLoad::Answer(RadioResponse::None);
     };
-    let (Some(depot_type), Some(unit_type)) = (
+    let (Some(building_type), Some(unit_type)) = (
         sim.object_type(building.type_ref(), rules),
         sim.object_type(unit.type_ref(), rules),
     ) else {
-        return RadioResponse::None;
+        return CanLoad::Answer(RadioResponse::None);
     };
     if !crate::sim::combat::combat_weapon::is_ally_by_object(
-        Some(&sim.fog.alliances),
+        Some(&sim.house_alliances),
         &sim.interner,
         building.owner(),
         unit.owner(),
     ) {
-        return RadioResponse::None;
+        return CanLoad::Answer(RadioResponse::None);
     }
-    let absorbs = depot_type.unit_absorb || depot_type.infantry_absorb;
-    let refused = matches!(
-        building.mission.current().known(),
+    let absorbs = building_type.absorbs_passengers();
+    let ares = rules.ares_form();
+    // Ares 3.0 100174E0 (hook 0x43C326) skips the contact-capacity gate for
+    // a `Tunnel=` building as for an absorber.
+    let tunnel: Option<usize> = if ares {
+        sim.ares_tunnel_type(building_id, rules)
+    } else {
+        None
+    };
+    if matches!(
+        building.mission.effective().known(),
         Some(MissionType::Construction | MissionType::Selling)
     ) || building.in_construction_bstate()
-        || (!building.radio_contacts.has_free_or(from) && !absorbs)
+        || (!payload.ignore_dock_capacity
+            && !absorbs
+            && tunnel.is_none()
+            && !building.seldom.radio_contacts.has_free_or(from))
         || (unit_type.movement_zone != crate::rules::locomotor_type::MovementZone::Amphibious
-            && depot_type.naval != unit_type.naval)
+            && building_type.naval != unit_type.naval)
         || unit_type.balloon_hover
-        || !building.building_online();
-    if refused {
-        return RadioResponse::Negatory;
+        || !building.building_online()
+    {
+        return CanLoad::Answer(RadioResponse::Negatory);
     }
-    if absorbs || depot_type.grinding || depot_type.bunker {
+    // Ares 3.0 100174E0 (hook 0x43C326), past the power test and before the
+    // class arms: a sender of a type the building type's
+    // `Passengers.Allowed`/`.Disallowed` refuses (IsPassengerAllowed
+    // 1003DD60) is answered NEGATORY by every building.
+    if ares
+        && !building_type
+            .techno_combat()
+            .movement()
+            .passenger_allowed(unit_type.category, &unit_type.id)
+    {
+        return CanLoad::Answer(RadioResponse::Negatory);
+    }
+    // 0x0043C43B..0x0043C4F2, an absorber (UnitAbsorb +0x16AE /
+    // InfantryAbsorb +0x16AF): a Unit or an infantryman it does not absorb,
+    // or a sender controlling something (0x004722C0), is refused. With a
+    // free passenger slot (+0x114 against +0x5E0) and the sender's Size=
+    // within SizeLimit= it answers ROGER; otherwise the later arms decide.
+    // Both values are native doubles; preserve their binary64 comparison.
+    //
+    // Ares 3.0 100174E0 (hook 0x43C326) takes a `Tunnel=` building (also an
+    // absorber) down its own arm instead: a sender controlling something,
+    // or mind-controlled while it holds a capture manager, is refused; with
+    // room in the building owner's network (`sim::ares_tunnel`) and the
+    // sender's Size= within SizeLimit= it answers ROGER; otherwise the later
+    // arms decide (`0x0043C4F8`). `tunnel` is `None` without Ares.
+    if let Some(tunnel) = tunnel {
+        if let Some(manager) = unit.capture_manager.as_ref()
+            && (manager.has_any() || unit.seldom.mind_control.is_mind_controlled())
+        {
+            return CanLoad::Answer(RadioResponse::Negatory);
+        }
+        if sim.ares_tunnel_has_room(building.owner(), tunnel, rules)
+            && crate::sim::passenger::PassengerCargo::size_within_limit(
+                unit_type.size,
+                building_type.size_limit,
+            )
+        {
+            return CanLoad::Answer(RadioResponse::Roger);
+        }
+    }
+    if absorbs && tunnel.is_none() {
+        let class_refused = match unit.category() {
+            EntityCategory::Unit => !building_type.unit_absorb,
+            EntityCategory::Infantry => !building_type.infantry_absorb,
+            _ => false,
+        };
+        if class_refused
+            || unit
+                .capture_manager
+                .as_ref()
+                .is_some_and(|manager| manager.has_any())
+        {
+            return CanLoad::Answer(RadioResponse::Negatory);
+        }
+        let passengers = building
+            .passenger_role()
+            .cargo()
+            .map_or(0, |cargo| cargo.count());
+        if i64::from(passengers) < i64::from(building_type.passengers)
+            && crate::sim::passenger::PassengerCargo::size_within_limit(
+                unit_type.size,
+                building_type.size_limit,
+            )
+        {
+            return CanLoad::Answer(RadioResponse::Roger);
+        }
+    }
+    // `0x0043C4F8..0x0043C500`: a `Grinding=` building (`+0x16AD`) takes
+    // anyone the gates above admit. Original RA2 has no Grinding= field: the
+    // refund-on-entry behavior is hardcoded on the Cloning vats, so on the
+    // RA2 profile a `Cloning=` building also takes any admitted foot here.
+    if building_type.grinding || (rules.ra2() && building_type.cloning) {
+        return CanLoad::Answer(RadioResponse::Roger);
+    }
+    // 0x0043C506..0x0043C541, a `Bunker=` building (+0x16AB): CanEnterBunker
+    // (0x0070FB50) on the sender, then IS_OCCUPIED (0x23) to it, whose ROGER
+    // refuses. The common contact-capacity gate above owns reservation.
+    if building_type.bunker {
+        if !crate::sim::docking::bunker_link::can_auto_deploy_here(sim, from, rules) {
+            return CanLoad::Answer(RadioResponse::Negatory);
+        }
+        return CanLoad::AskOccupied;
+    }
+    if building_type.unit_repair {
+        if !matches!(
+            unit.category(),
+            EntityCategory::Unit | EntityCategory::Aircraft
+        ) {
+            return CanLoad::Answer(RadioResponse::Negatory);
+        }
+        return CanLoad::AskOccupied;
+    }
+    //Hospital43C58F..C61D: Infantry only, no captives or mind control;
+    //building Ammo must be nonzero. Techno's constructor starts it at0,
+    //and Building43FE98 explicitly excludes hospitals from auto-refill.
+    if building_type.hospital && unit.category() == EntityCategory::Infantry {
+        // Original RA2 leaves Hospital Ammo=0 in rules.ini (the "healing
+        // count" field is commented out) and treats that as unlimited healing;
+        // only captives/mind-controlled are refused. On the RA2 profile drop
+        // the Ammo==0 refusal. YR keeps the finite-count contract unchanged.
+        let refused = unit
+            .capture_manager
+            .as_ref()
+            .is_some_and(|manager| manager.has_any())
+            || unit.seldom.mind_control.is_mind_controlled()
+            || (!rules.ra2() && building.ammo().map_or(0, |ammo| ammo.current()) == 0);
+        return CanLoad::Answer(if refused {
+            RadioResponse::Negatory
+        } else {
+            RadioResponse::Roger
+        });
+    }
+    // An Armory takes an infantry trainee while it still has promotions.
+    // Native reads the absolute value of Ammo, so the constructor's -1 still
+    // admits exactly one soldier. Captives and mind-controlled infantry are
+    // refused just as they are at the Hospital.
+    if building_type.armory() && unit.category() == EntityCategory::Infantry {
+        let refused = unit
+            .capture_manager
+            .as_ref()
+            .is_some_and(|manager| manager.has_any())
+            || unit.seldom.mind_control.is_mind_controlled()
+            || crate::sim::docking::armory::promotions_remaining(building) <= 0;
+        return CanLoad::Answer(if refused {
+            RadioResponse::Negatory
+        } else {
+            RadioResponse::Roger
+        });
+    }
+    // 0x0043C620: a Helipad takes an Aircraft and nothing else.
+    if building_type.helipad {
+        return CanLoad::Answer(if unit.category() == EntityCategory::Aircraft {
+            RadioResponse::Roger
+        } else {
+            RadioResponse::Negatory
+        });
+    }
+    if unit.category() == EntityCategory::Unit
+        && (building_type.dock_unload && unit_type.harvester
+            || building_type.weeder && unit_type.weeder)
+    {
+        // Native passenger-head+118 is never filled by a refinery unload.
+        return CanLoad::Answer(RadioResponse::Roger);
+    }
+    CanLoad::Answer(RadioResponse::None)
+}
+
+fn building_can_load(
+    sim: &mut Simulation,
+    building_id: u64,
+    sender: Option<u64>,
+    payload: RadioPayload,
+    rules: &RuleSet,
+    effects: &mut FrameEffects<'_>,
+) -> RadioResponse {
+    let Some(from) = sender else {
         return RadioResponse::None;
+    };
+    match can_load(sim, building_id, from, payload, rules) {
+        CanLoad::Answer(reply) => reply,
+        CanLoad::AskOccupied => match transmit(
+            sim,
+            building_id,
+            from,
+            RadioMessage::IsOccupied,
+            RadioPayload::default(),
+            rules,
+            effects,
+        ) {
+            RadioResponse::Roger => RadioResponse::Negatory,
+            _ => RadioResponse::Roger,
+        },
     }
-    if !matches!(
-        unit.category,
-        EntityCategory::Unit | EntityCategory::Aircraft
-    ) {
-        return RadioResponse::Negatory;
+}
+
+/// CAN_LOAD as a click asks it (`InfantryClass::What_Action_OnObject` at
+/// `0x0051EE1A`, `UnitClass`'s `vt+0x278(0x0F)` at `0x0074017E`), sending
+/// nothing: the carrier's class receiver's answer. A building answers through
+/// [`can_load`], with
+/// the IsOccupied question answered by its receiver ([`foot_is_occupied`]);
+/// a Unit through [`unit_can_enter_radio`] and an Aircraft through
+/// [`aircraft_can_enter_radio`]. No Infantry receiver handles it.
+pub(crate) fn can_load_query(
+    sim: &Simulation,
+    carrier_id: u64,
+    from: u64,
+    rules: &RuleSet,
+) -> RadioResponse {
+    match sim
+        .substrate
+        .entities
+        .get(carrier_id)
+        .map(|carrier| carrier.category())
+    {
+        Some(EntityCategory::Structure) => {}
+        Some(EntityCategory::Unit) => {
+            return unit_can_enter_radio(sim, carrier_id, Some(from), rules);
+        }
+        Some(EntityCategory::Aircraft) => {
+            return aircraft_can_enter_radio(sim, carrier_id, Some(from), rules);
+        }
+        Some(EntityCategory::Infantry) | None => {
+            return RadioResponse::None;
+        }
     }
-    match transmit(
-        sim,
-        depot,
-        from,
-        RadioMessage::IsOccupied,
-        RadioPayload::default(),
-        Some(rules),
-    ) {
-        RadioResponse::Roger => RadioResponse::Negatory,
-        _ => RadioResponse::Roger,
+    match can_load(sim, carrier_id, from, RadioPayload::default(), rules) {
+        CanLoad::Answer(reply) => reply,
+        CanLoad::AskOccupied => match foot_is_occupied(sim, from, Some(carrier_id)) {
+            RadioResponse::Roger => RadioResponse::Negatory,
+            _ => RadioResponse::Roger,
+        },
     }
 }
 
@@ -237,15 +527,18 @@ fn foot_is_occupied(sim: &Simulation, foot: u64, sender: Option<u64>) -> RadioRe
 /// free sender back and ask it whether it is still moving (0x13). A
 /// `DockUnload=`/`Weeder=` dock then sends it to the pad (MOVE_HERE 0x12)
 /// and, once it answers that it is already there, tethers it (0x18) and has
-/// it turn and report ready (0x16); any other building stops after 0x13.
-/// The answer is ROGER unless the dock is offline.
+/// it turn and report ready (0x16). A `Helipad=` sends it to itself (MOVE_HERE
+/// with the dock as the parameter, `0x0043CA47`) and, answered ALREADY_THERE,
+/// sends TETHER to its own first contact (`0x0043CA5C`). Any other building
+/// stops after 0x13. The answer is ROGER unless the dock is offline.
 fn building_docking(
     sim: &mut Simulation,
     building_id: u64,
     sender: Option<u64>,
-    rules: Option<&RuleSet>,
+    rules: &RuleSet,
+    effects: &mut FrameEffects<'_>,
 ) -> RadioResponse {
-    let (Some(from), Some(rules)) = (sender, rules) else {
+    let Some(from) = sender else {
         return RadioResponse::None;
     };
     // 0x0043C7F6 runs the Techno receiver first; for 0x0E its only effect is
@@ -260,28 +553,125 @@ fn building_docking(
     let Some(object) = sim.object_type(building.type_ref(), rules) else {
         return RadioResponse::None;
     };
-    // The UnitRepair and Bunker arms (0x0043C814..0x0043C87F, and their
-    // distance force at 0x0043C93F..0x0043C9F0) and the Helipad MOVE_HERE
-    // (0x0043CA2F) belong to docks whose Enter probe VERA runs outside the bus
-    // (`building_dock::mission_enter_dispatch`, `bunker_install`, the aircraft
-    // landing flow), so no represented sender reaches them here. The
-    // Hospital/Armory arm (0x0043C882..0x0043C89E) is dormant: retail
-    // RULESMD.INI sets neither key.
-    if object.unit_repair || object.bunker || object.helipad {
-        return RadioResponse::None;
+    // UnitRepair43C814..849 asks the existing contact whether its
+    // signed Health/Strength is full before any HELLO or movement probe.
+    let unit_repair = object.unit_repair;
+    let bunker = object.bunker;
+    if unit_repair
+        && building.seldom.radio_contacts.contains(from)
+        && transmit(
+            sim,
+            building_id,
+            from,
+            RadioMessage::IsRepairing,
+            RadioPayload::default(),
+            rules,
+            effects,
+        ) == RadioResponse::Negatory
+    {
+        return RadioResponse::Negatory;
     }
+    // 43C84C..43C87F: a bunker rechecks CanEnterBunker only for a
+    // sender already in its contacts, before the common HELLO below.
+    if bunker
+        && sim
+            .substrate
+            .entities
+            .get(building_id)
+            .is_some_and(|building| building.seldom.radio_contacts.contains(from))
+        && !crate::sim::docking::bunker_link::can_auto_deploy_here(sim, from, rules)
+    {
+        return RadioResponse::Negatory;
+    }
+    let building = sim
+        .substrate
+        .entities
+        .get(building_id)
+        .expect("docking retains building");
+    let object = sim
+        .object_type(building.type_ref(), rules)
+        .expect("docking retains type");
     let pad_dock = object.dock_unload || object.weeder;
-    let (rx, ry) = (building.position.rx, building.position.ry);
+    let helipad = object.helipad;
+    let (rx, ry) = (building.position.rx(), building.position.ry());
+    // Ares 3.0 10014540 (hook 0x0043CA80) reads the pad offset from the
+    // type's art DockUnloadCell (default 3, 1).
+    let pad_offset = if rules.ares_form() {
+        object.building_type_ext().dock_unload_cell
+    } else {
+        DOCK_PAD_OFFSET
+    };
+    // Building43C882/43CB0C..CBC0: Hospital bypasses the general dock's
+    // HELLO/NeedToMove arm. Full contacts may release a finished patient.
+    if object.hospital {
+        if !building.seldom.radio_contacts.has_free_or(from) {
+            let capacity = building.seldom.radio_contacts.capacity();
+            for slot in 0..capacity {
+                let contact = sim
+                    .substrate
+                    .entities
+                    .get(building_id)
+                    .and_then(|building| building.seldom.radio_contacts.slot(slot));
+                if let Some(contact) = contact
+                    && transmit(
+                        sim,
+                        building_id,
+                        contact,
+                        RadioMessage::IsRepairing,
+                        RadioPayload::default(),
+                        rules,
+                        effects,
+                    ) == RadioResponse::Negatory
+                {
+                    transmit(
+                        sim,
+                        building_id,
+                        contact,
+                        RadioMessage::RunAway,
+                        RadioPayload::default(),
+                        rules,
+                        effects,
+                    );
+                }
+            }
+            return if sim
+                .substrate
+                .entities
+                .get(building_id)
+                .is_some_and(|building| building.seldom.radio_contacts.has_free_or(from))
+            {
+                RadioResponse::Roger
+            } else {
+                RadioResponse::Negatory
+            };
+        }
+        transmit(
+            sim,
+            building_id,
+            from,
+            RadioMessage::MoveToCell,
+            RadioPayload {
+                target: Some(NavTargetRef::cell(rx, ry)),
+                ..Default::default()
+            },
+            rules,
+            effects,
+        );
+        return RadioResponse::Roger;
+    }
     // 0x0043C8A4..0x0043C8CC: a sender that is not a contact is HELLOed back
     // when a slot is free or already its own.
-    if !building.radio_contacts.contains(from) && building.radio_contacts.has_free_or(from) {
+    if !building.seldom.radio_contacts.contains(from)
+        && building.seldom.radio_contacts.has_free_or(from)
+    {
         transmit(
             sim,
             building_id,
             from,
             RadioMessage::Hello,
             RadioPayload::default(),
-            Some(rules),
+            rules,
+            effects,
         );
     }
     // 0x0043C8D1..0x0043C93A: a contacted Foot whose NavCom is not the
@@ -290,13 +680,13 @@ fn building_docking(
         .substrate
         .entities
         .get(building_id)
-        .is_some_and(|building| building.radio_contacts.contains(from));
-    let force = contacted
+        .is_some_and(|building| building.seldom.radio_contacts.contains(from));
+    let pad_force = contacted
         && pad_dock
         && sim.substrate.entities.get(from).is_some_and(|foot| {
-            foot.category != EntityCategory::Structure
-                && foot.navigation.nav_com.is_some()
-                && foot.navigation.nav_com
+            foot.category() != EntityCategory::Structure
+                && foot.navigation.nav_com().is_some()
+                && foot.navigation.nav_com()
                     != crate::sim::movement::building_dock_cell(
                         &sim.substrate.entities,
                         building_id,
@@ -307,32 +697,87 @@ fn building_docking(
                     )
                     .map(|(x, y)| NavTargetRef::cell(x, y))
         });
+    // 43C93F..C9F0: a repair or bunker contact more than128 native leptons away
+    // forces the same movement probe. Reuse the native deterministic distance
+    // owner; the original sqrt approximation changes the129-lepton boundary.
+    let repair_force = (unit_repair || bunker)
+        && sim
+            .substrate
+            .entities
+            .get(building_id)
+            .and_then(|building| {
+                building
+                    .seldom
+                    .radio_contacts
+                    .slot(0)
+                    .map(|id| (building, id))
+            })
+            .and_then(|(building, id)| sim.substrate.entities.get(id).map(|unit| (building, unit)))
+            .is_some_and(|(building, unit)| {
+                let a = crate::sim::movement::ground_pose::object_get_coords(
+                    building,
+                    sim.resolved_terrain.as_ref(),
+                );
+                let b = crate::sim::movement::ground_pose::object_get_coords(
+                    unit,
+                    sim.resolved_terrain.as_ref(),
+                );
+                crate::util::native_x87::distance_3d_leptons([a.x, a.y, a.z], [b.x, b.y, b.z]) > 128
+            });
+    let force = pad_force || repair_force;
     let moving = transmit(
         sim,
         building_id,
         from,
         RadioMessage::NeedToMove,
         RadioPayload::default(),
-        Some(rules),
+        rules,
+        effects,
     );
     if moving != RadioResponse::Roger && !force {
         return RadioResponse::Roger;
     }
-    // 0x0043CA13..0x0043CA37: only a DockUnload/Weeder dock walks the sender
-    // onto its pad.
+    // 0x0043CA13..0x0043CA62: a DockUnload/Weeder dock walks the sender
+    // onto its pad; a Helipad calls it to itself.
     if !pad_dock {
+        if helipad
+            && transmit(
+                sim,
+                building_id,
+                from,
+                RadioMessage::MoveToCell,
+                RadioPayload {
+                    target: Some(NavTargetRef::object(building_id)),
+                    ..RadioPayload::default()
+                },
+                rules,
+                effects,
+            ) == RadioResponse::AlreadyThere
+        {
+            crate::sim::radio::transmit_to_contact(
+                sim,
+                building_id,
+                RadioMessage::Tether,
+                rules,
+                effects,
+            );
+        }
         return RadioResponse::Roger;
     }
     // 0x0043CA71..0x0043CAB8: the pad is Get_Cell() + (3, 1), CellStruct
     // int16 adds on the NW foundation cell.
-    let pad = dock_pad_cell(rx, ry);
+    let pad = dock_pad_cell_at(rx, ry, pad_offset);
     let arrived = transmit(
         sim,
         building_id,
         from,
         RadioMessage::MoveToCell,
-        RadioPayload { cell: Some(pad) },
-        Some(rules),
+        RadioPayload {
+            target: Some(NavTargetRef::cell(pad.0, pad.1)),
+            ..RadioPayload::default()
+        },
+        rules,
+        effects,
     );
     if arrived != RadioResponse::AlreadyThere {
         return RadioResponse::Roger;
@@ -343,7 +788,8 @@ fn building_docking(
         from,
         RadioMessage::Tether,
         RadioPayload::default(),
-        Some(rules),
+        rules,
+        effects,
     );
     // 0x0043CAD4..0x0043CAF7: a non-ROGER answer would Scatter the sender;
     // every represented PREPARE_TO_DOCK receiver (Unit 0x007376AD, Techno
@@ -354,20 +800,23 @@ fn building_docking(
         from,
         RadioMessage::PrepareToDock,
         RadioPayload::default(),
-        Some(rules),
+        rules,
+        effects,
     );
     RadioResponse::Roger
 }
 
 /// DOCK_NOW, `BuildingClass::Receive_Radio` case 0x15 (`0x0043C6F2`): a
-/// building being sold refuses; a `DockUnload=` dock queues Unload on the
-/// sender (no contact, tether or position test).
+/// building being sold refuses; a repair dock or a `Bunker=` building queues
+/// its Repair mission; a `DockUnload=` dock queues Unload on the sender (no
+/// contact, tether or position test).
 fn building_dock_now(
     sim: &mut Simulation,
     building_id: u64,
     sender: Option<u64>,
     payload: RadioPayload,
-    rules: Option<&RuleSet>,
+    rules: &RuleSet,
+    effects: &mut FrameEffects<'_>,
 ) -> RadioResponse {
     let Some(from) = sender else {
         return RadioResponse::None;
@@ -379,20 +828,57 @@ fn building_dock_now(
     if building.mission.effective() == MissionId::from_known(MissionType::Selling) {
         return RadioResponse::Negatory;
     }
-    let Some(rules) = rules else {
-        return RadioResponse::None;
-    };
     let Some(object) = sim.object_type(building.type_ref(), rules) else {
         return RadioResponse::None;
     };
-    // 0x0043C710..0x0043C72C: UnitAbsorb/InfantryAbsorb answer ROGER.
-    if object.unit_absorb || object.infantry_absorb {
+    // 0x0043C710..0x0043C72C: UnitAbsorb/InfantryAbsorb answer ROGER, and
+    // with Ares 3.0 a `Tunnel=` building too (100176B0, hook 0x43C716).
+    let tunnel = rules.ares_form() && sim.ares_tunnel_type(building_id, rules).is_some();
+    if object.absorbs_passengers() || tunnel {
         return RadioResponse::Roger;
     }
-    // 0x0043C732..0x0043C785: the repair docks and Bunker queue their own
-    // mission; VERA's depot and bunker flows own those links.
-    if object.unit_repair || object.bunker {
-        return RadioResponse::None;
+    // 0x0043C732..0x0043C785: the repair and reload docks and Bunker queue
+    // their own mission; the radio contacts retain the admitted sender.
+    // Hospital43C746 also queues Repair/Sleep; cargo arrival is owned by
+    // Infantry PerCell51A21F. An Armory uses this same service contact;
+    // its MissionRepair arm promotes the trainee instead of healing it.
+    if object.unit_repair || object.unit_reload || object.hospital || object.armory() {
+        // Building43C7B5..C7DC: service request and the occupant's Sleep
+        // queue. The Building mission owns the admitted pad contact.
+        if let Some(building) = sim.substrate.entities.get_mut(building_id) {
+            building.mission_leaf.set_building_ready_latch(1);
+        }
+        let now = sim.session.binary_frame();
+        let _ = sim.mission_queue_exact(
+            building_id,
+            MissionId::from_known(MissionType::Repair),
+            0,
+            now,
+            &LiveReadyInputProvider { rules },
+        );
+        let _ = sim.mission_queue_exact(
+            from,
+            MissionId::from_known(MissionType::Sleep),
+            0,
+            now,
+            &LiveReadyInputProvider { rules },
+        );
+        return RadioResponse::Roger;
+    }
+    // 0x0043C75A..0x0043C785, a `Bunker=` building: ready to commence, then
+    // Queue_Mission(Repair, 0), whose visits run UpdateBunker using contact 0.
+    if object.bunker {
+        if let Some(building) = sim.substrate.entities.get_mut(building_id) {
+            building.mission_leaf.set_building_ready_latch(1);
+        }
+        let _ = sim.mission_queue_exact(
+            building_id,
+            MissionId::from_known(MissionType::Repair),
+            0,
+            sim.session.binary_frame(),
+            &LiveReadyInputProvider { rules },
+        );
+        return RadioResponse::Roger;
     }
     // 0x0043C788..0x0043C7B2: Queue_Mission(Unload, 0) on the sender.
     if object.dock_unload {
@@ -400,8 +886,8 @@ fn building_dock_now(
             from,
             MissionId::from_known(MissionType::Unload),
             0,
-            sim.session.binary_frame,
-            &EntityReadyInputProvider,
+            sim.session.binary_frame(),
+            &LiveReadyInputProvider { rules },
         );
         return RadioResponse::Roger;
     }
@@ -411,7 +897,8 @@ fn building_dock_now(
         sender,
         RadioMessage::DockNow,
         payload,
-        Some(rules),
+        rules,
+        effects,
     )
 }
 
@@ -422,7 +909,8 @@ fn unit_receive(
     sender: Option<u64>,
     msg: RadioMessage,
     payload: RadioPayload,
-    rules: Option<&RuleSet>,
+    rules: &RuleSet,
+    effects: &mut FrameEffects<'_>,
 ) -> RadioResponse {
     match msg {
         // 0x00737B14: a unit on Return queues Guard, then the Foot receiver;
@@ -435,27 +923,448 @@ fn unit_receive(
                     unit,
                     MissionId::from_known(MissionType::Guard),
                     0,
-                    sim.session.binary_frame,
-                    &EntityReadyInputProvider,
+                    sim.session.binary_frame(),
+                    &LiveReadyInputProvider { rules },
                 );
             }
-            let _ = foot_receive(sim, unit, sender, msg, payload, rules);
+            let _ = foot_receive(sim, unit, sender, msg, payload, rules, effects);
             RadioResponse::Roger
         }
-        RadioMessage::PrepareToDock => unit_prepare_to_dock(sim, unit, sender, payload, rules),
+        RadioMessage::PrepareToDock => {
+            unit_prepare_to_dock(sim, unit, sender, payload, rules, effects)
+        }
         // 0x00737A98: a harvester mid-unload leaves it, then the Foot arm.
         RadioMessage::RunAway => {
-            unit_run_away(sim, unit, rules);
-            foot_receive(sim, unit, sender, msg, payload, rules)
+            unit_run_away(sim, unit, rules, effects);
+            foot_receive(sim, unit, sender, msg, payload, rules, effects)
         }
-        // 7, 0xE, 0xF and 0x15: the transport/service arms have no
-        // represented sender.
-        RadioMessage::DockingComplete
-        | RadioMessage::CanDock
-        | RadioMessage::CanEnter
-        | RadioMessage::DockNow => RadioResponse::None,
-        _ => foot_receive(sim, unit, sender, msg, payload, rules),
+        RadioMessage::CanEnter => unit_can_enter_radio(sim, unit, sender, rules),
+        RadioMessage::CanDock => match sender {
+            Some(from) => unit_docking(sim, unit, from, payload, rules, effects),
+            None => RadioResponse::None,
+        },
+        RadioMessage::HoldStill => unit_hold_still(sim, unit, sender, payload, rules, effects),
+        RadioMessage::WantRide => unit_want_ride(sim, unit, rules),
+        // 0x15: the service arm has no represented sender.
+        RadioMessage::DockNow => RadioResponse::None,
+        _ => foot_receive(sim, unit, sender, msg, payload, rules, effects),
     }
+}
+
+/// HOLD_STILL, Unit case 7 (`0x0073750A..0x00737587`), a Carryall's order to
+/// the Unit it will lift: the Foot arm first (Techno's `0x006F4C6F` TETHERs
+/// the sender, which TETHERs back), then the destination (vt+0x480(NULL, 1))
+/// and Target (vt+0x3C8) dropped, Sleep queued (vt+0x1E8(0, 0)) and the
+/// navigation list emptied (`0x004DA1C0`). A Unit still untethered, or with
+/// no contact 0, HELLOs the sender and TETHERs its contact. ROGER.
+fn unit_hold_still(
+    sim: &mut Simulation,
+    unit: u64,
+    sender: Option<u64>,
+    payload: RadioPayload,
+    rules: &RuleSet,
+    effects: &mut FrameEffects<'_>,
+) -> RadioResponse {
+    let _ = foot_receive(
+        sim,
+        unit,
+        sender,
+        RadioMessage::HoldStill,
+        payload,
+        rules,
+        effects,
+    );
+    let _ = sim.assign_destination_represented(unit, None, rules, effects);
+    let _ = sim.assign_target_represented(unit, None, rules, effects);
+    let _ = sim.mission_queue_exact(
+        unit,
+        MissionId::from_known(MissionType::Sleep),
+        0,
+        sim.session.binary_frame(),
+        &LiveReadyInputProvider { rules },
+    );
+    let Some(entity) = sim.substrate.entities.get_mut(unit) else {
+        return RadioResponse::Roger;
+    };
+    entity.navigation.clear_nav_list();
+    if entity.seldom.tether.partner().is_none() || entity.seldom.radio_contacts.slot(0).is_none() {
+        if let Some(from) = sender {
+            transmit(
+                sim,
+                unit,
+                from,
+                RadioMessage::Hello,
+                RadioPayload::default(),
+                rules,
+                effects,
+            );
+        }
+        crate::sim::radio::transmit_to_contact(sim, unit, RadioMessage::Tether, rules, effects);
+    }
+    RadioResponse::Roger
+}
+
+/// WANT_RIDE, Unit case 0x24 (`0x0073745C..0x00737507`), a Carryall's
+/// question whether it may lift this Unit: 0 when warped out (vt+0x1D4);
+/// NEGATORY under a bridge (its vt+0x4C coordinate's cell has a bridge,
+/// `+0x140 & 0x100`, and ShouldBeOnBridge vt+0xBC(0) is false), on Unload
+/// (Get_Mission 0x10), tethered (`+0x418`) or in a tube (`+0x684` not -1);
+/// otherwise ROGER.
+fn unit_want_ride(sim: &Simulation, unit: u64, rules: &RuleSet) -> RadioResponse {
+    let Some(entity) = sim.substrate.entities.get(unit) else {
+        return RadioResponse::None;
+    };
+    if entity.is_warped_out() {
+        return RadioResponse::None;
+    }
+    let in_tube = entity.low_bridge_tube_state.is_some();
+    if let Some(terrain) = sim.resolved_terrain.as_ref()
+        && let Ok(coord) = sim.navigation_target_coordinate(NavTargetRef::object(unit), None, rules)
+    {
+        let cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
+        let under_bridge = cells.flags(cells.lookup_world(coord.x, coord.y)) & 0x100 != 0
+            && !crate::sim::movement::ground_pose::navigation_should_be_on_bridge(
+                &cells,
+                coord,
+                crate::sim::movement::ground_pose::position_world_coord(&entity.position),
+                entity.on_bridge(),
+                in_tube,
+            )
+            .unwrap_or(false);
+        if under_bridge {
+            return RadioResponse::Negatory;
+        }
+    }
+    if entity.mission.effective() == MissionId::from_known(MissionType::Unload)
+        || entity.seldom.tether.partner().is_some()
+        || in_tube
+    {
+        return RadioResponse::Negatory;
+    }
+    RadioResponse::Roger
+}
+
+/// DOCKING, `UnitClass::Receive_Radio` case 0x0E (`0x007377D8..0x00737A95`),
+/// a passenger's question whether it may come aboard (the Infantry setter's
+/// Enter arm and every Mission_Enter dispatch ask it):
+/// - moving, or holding a NavCom, on Move (`+0xAC`, not Get_Mission) it
+///   answers NEGATIVE (`0x007377D8..0x0073780D`);
+/// - a sender that is not `Contacts[0]` needs room as CAN_LOAD measures it
+///   (NEGATIVE otherwise), and a transport with no contact HELLOs it
+///   (`0x0073781E..0x007378B0`);
+/// - with no NavCom it drives to the sender (vt+0x480(sender, 1)) and answers
+///   DOCKING when the sender's retained cell (`Foot+0x55C`) lies in another
+///   zone than its own under the sender type's MovementZone, or its own cell
+///   is water (`0x007378B6..0x0073798D`);
+/// - otherwise, with room, the Foot receiver runs, and a transport that is
+///   not moving, swinging its turret (`+0x6AF`) or tethered asks the sender
+///   NEED_TO_MOVE and on ROGER sends it MOVE_HERE with itself, breaking the
+///   contact when that is not answered ROGER; the answer is ROGER
+///   (`0x00737994..0x00737A95`). Without room it is the Foot receiver's.
+///
+/// No RNG is drawn here; the setters it reaches own their effects.
+fn unit_docking(
+    sim: &mut Simulation,
+    unit: u64,
+    from: u64,
+    payload: RadioPayload,
+    rules: &RuleSet,
+    effects: &mut FrameEffects<'_>,
+) -> RadioResponse {
+    let Some((transport, sender)) = sim
+        .substrate
+        .entities
+        .get(unit)
+        .zip(sim.substrate.entities.get(from))
+    else {
+        return RadioResponse::None;
+    };
+    let Some((transport_type, sender_type)) = sim
+        .object_type(transport.type_ref(), rules)
+        .zip(sim.object_type(sender.type_ref(), rules))
+    else {
+        return RadioResponse::None;
+    };
+    let moving = crate::sim::movement::motion_query::is_moving(transport) == Some(true);
+    if (moving || transport.navigation.nav_com().is_some())
+        && transport.mission.current() == MissionId::from_known(MissionType::Move)
+    {
+        return RadioResponse::Negatory;
+    }
+    let movement_zone = sender_type.movement_zone;
+    let ares = rules.ares_form();
+    if transport.seldom.radio_contacts.slot(0) != Some(from) {
+        if !transport_has_room(transport, transport_type, sender_type, ares) {
+            return RadioResponse::Negatory;
+        }
+        if transport.seldom.radio_contacts.is_empty() {
+            transmit(
+                sim,
+                unit,
+                from,
+                RadioMessage::Hello,
+                RadioPayload::default(),
+                rules,
+                effects,
+            );
+        }
+    }
+    let Some((transport, sender)) = sim
+        .substrate
+        .entities
+        .get(unit)
+        .zip(sim.substrate.entities.get(from))
+    else {
+        return RadioResponse::None;
+    };
+    if transport.navigation.nav_com().is_none() {
+        // Map56D230 with no bridge test. A sender that is not a Foot reads
+        // the DWORD -1 (`0x00737910..0x0073791B`). Without a zone grid both
+        // lookups answer None and compare equal.
+        let retained_zone = |foot: &crate::sim::game_entity::GameEntity| {
+            let (x, y) = foot.navigation.neighbor_state().cell();
+            sim.zone_grid
+                .as_ref()
+                .zip(sim.resolved_terrain.as_ref())
+                .and_then(|(zones, terrain)| {
+                    zones.get_zone_id_native(terrain, (x as u16, y as u16), movement_zone, false)
+                })
+        };
+        let transport_zone = retained_zone(transport);
+        let sender_zone = if sender.category() == EntityCategory::Structure {
+            Some(u32::MAX)
+        } else {
+            retained_zone(sender)
+        };
+        // `0x0073796B`: Land (`CellClass+0xEC`) of the cell holding its
+        // Location (vt+0x1B8) is Water (2).
+        let on_water = || {
+            let at = crate::sim::movement::ground_pose::position_world_coord(&transport.position);
+            sim.resolved_terrain.as_ref().is_some_and(|terrain| {
+                let cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
+                let cell = cells.lookup(((at.x / 256) as i16, (at.y / 256) as i16));
+                cells.land_type(cell)
+                    == i32::from(crate::rules::terrain_rules::LandType::Water.as_index())
+            })
+        };
+        if transport_zone != sender_zone || on_water() {
+            let _ = sim.assign_destination_represented(
+                unit,
+                Some(NavTargetRef::object(from)),
+                rules,
+                effects,
+            );
+            return RadioResponse::Docking;
+        }
+    }
+    let room =
+        sim.substrate.entities.get(unit).is_some_and(|transport| {
+            transport_has_room(transport, transport_type, sender_type, ares)
+        });
+    if transport_type.passengers <= 0 || !room {
+        return foot_receive(
+            sim,
+            unit,
+            Some(from),
+            RadioMessage::CanDock,
+            payload,
+            rules,
+            effects,
+        );
+    }
+    let _ = foot_receive(
+        sim,
+        unit,
+        Some(from),
+        RadioMessage::CanDock,
+        payload,
+        rules,
+        effects,
+    );
+    let Some(transport) = sim.substrate.entities.get(unit) else {
+        return RadioResponse::Roger;
+    };
+    if crate::sim::movement::motion_query::is_moving(transport) == Some(true)
+        || transport.turret_rotation_latch.is_set()
+        || transport.seldom.tether.partner().is_some()
+    {
+        return RadioResponse::Roger;
+    }
+    if transmit(
+        sim,
+        unit,
+        from,
+        RadioMessage::NeedToMove,
+        RadioPayload::default(),
+        rules,
+        effects,
+    ) == RadioResponse::Roger
+        && transmit(
+            sim,
+            unit,
+            from,
+            RadioMessage::MoveToCell,
+            RadioPayload {
+                target: Some(NavTargetRef::object(unit)),
+                ..RadioPayload::default()
+            },
+            rules,
+            effects,
+        ) != RadioResponse::Roger
+    {
+        transmit(
+            sim,
+            unit,
+            from,
+            RadioMessage::Break,
+            RadioPayload::default(),
+            rules,
+            effects,
+        );
+    }
+    RadioResponse::Roger
+}
+
+/// Unit737430 message0F, 73758A..7376AA: the mobile transport's admission
+/// query. Both the UI adapter and the real arrival radio use this one owner.
+/// Native controls: unit_transport_can_enter.py. It reads the receiver's
+/// one-way alliance, the ground Cell building list, and total cargo Size,
+/// not the passenger count. Native controls cover integer and fractional
+/// Size/SizeLimit inputs through the shared masked-x87 admission owner.
+pub(crate) fn unit_can_enter_radio(
+    sim: &Simulation,
+    unit: u64,
+    sender: Option<u64>,
+    rules: &RuleSet,
+) -> RadioResponse {
+    let Some((transport, passenger)) = sender.and_then(|sender| {
+        sim.substrate
+            .entities
+            .get(unit)
+            .zip(sim.substrate.entities.get(sender))
+    }) else {
+        return RadioResponse::None;
+    };
+    let Some((transport_type, passenger_type)) = sim
+        .object_type(transport.type_ref(), rules)
+        .zip(sim.object_type(passenger.type_ref(), rules))
+    else {
+        return RadioResponse::None;
+    };
+    // Ares73758A ->1004C250 returns the native no-response tail73761F.
+    // CanDrive admission is separate; ordinary cargo cannot board this hull.
+    let ares = rules.ares_form();
+    if ares && transport.driver_killed() {
+        return RadioResponse::None;
+    }
+    if transport_type.passengers == 0
+        || !crate::sim::combat::combat_weapon::is_ally_by_object(
+            Some(&sim.house_alliances),
+            &sim.interner,
+            transport.owner(),
+            passenger.owner(),
+        )
+        || transport.is_warped_out()
+    {
+        return RadioResponse::None;
+    }
+    // GetCell+1BC -> ground CellClass::Look_up_building_in_cell47C520.
+    let [x, y] = crate::sim::movement::ground_pose::object_center_xy(transport);
+    if u16::try_from(x / 256)
+        .ok()
+        .zip(u16::try_from(y / 256).ok())
+        .and_then(|(rx, ry)| {
+            sim.substrate.occupancy.first_building_on_layer(
+                rx,
+                ry,
+                crate::sim::movement::locomotor::MovementLayer::Ground,
+            )
+        })
+        .is_some()
+        || passenger.seldom.mind_control.is_mind_controlled()
+        || passenger.parasite.eater().is_some()
+        || passenger
+            .capture_manager
+            .as_ref()
+            .is_some_and(|manager| manager.has_any())
+    {
+        return RadioResponse::None;
+    }
+    if !transport_has_room(transport, transport_type, passenger_type, ares) {
+        return RadioResponse::Negatory;
+    }
+    // Ares 3.0 1004C270 (hook 0x73769E), at the ROGER: a passenger of a type
+    // `Passengers.Allowed`/`.Disallowed` refuses (IsPassengerAllowed
+    // 1003DD60) takes the no-room answer (`0x0073780F`).
+    if ares
+        && !transport_type
+            .techno_combat()
+            .movement()
+            .passenger_allowed(passenger_type.category, &passenger_type.id)
+    {
+        return RadioResponse::Negatory;
+    }
+    RadioResponse::Roger
+}
+
+/// A Unit transport's room for a sender, as its DOCKING and CAN_LOAD arms
+/// measure it (`UnitClass::Receive_Radio @ 0x00737430`, 0x0E and 0x0F): its
+/// cargo's signed-int total plus the sender's binary64 `Size=` within the
+/// receiver's integer `Passengers=`, and the sender's binary64 `Size=` within
+/// binary64 `SizeLimit=`. The original receiver performs these comparisons
+/// in the x87 owner exposed by PassengerCargo. `ares` is the game's
+/// `RuleSet::ares_form`.
+fn transport_has_room(
+    transport: &crate::sim::game_entity::GameEntity,
+    transport_type: &crate::rules::object_type::ObjectType,
+    sender_type: &crate::rules::object_type::ObjectType,
+    ares: bool,
+) -> bool {
+    // Ares 3.0 UnitClass_ReceivedRadioCommand_BySize1/3/4 (1004C150,
+    // 1004C1D0, 1004C210; hooks 0x73762B, 0x73782F, 0x737994): a
+    // `Passengers.BySize=no` transport counts heads below `Passengers=` in
+    // place of the Size total; the SizeLimit test after it stays.
+    if ares && !transport_type.ares_passengers_by_size {
+        let heads = transport
+            .passenger_role()
+            .cargo()
+            .map_or(0, |cargo| cargo.count() as i32);
+        return heads < transport_type.passengers
+            && crate::sim::passenger::PassengerCargo::size_within_limit(
+                sender_type.size,
+                transport_type.size_limit,
+            );
+    }
+    let occupied = transport
+        .passenger_role()
+        .cargo()
+        .map_or(0, |cargo| cargo.total_size());
+    crate::sim::passenger::PassengerCargo::size_fits_transport(
+        occupied,
+        sender_type.size,
+        transport_type.passengers,
+        transport_type.size_limit,
+    )
+}
+
+/// The facing a docking unit turns to: east ([`DOCK_FACING`]), or in a game
+/// read the Ares way `TechnoExt::GetDockUnloadFacing @ 10044C00`: the art
+/// `DockUnloadFacing` of the building in its first radio contact slot
+/// (`HasAnyLink`, `GetNthLink(0)`), else east.
+pub(crate) fn dock_unload_facing(sim: &Simulation, unit: u64, rules: &RuleSet) -> u16 {
+    if rules.ares_form()
+        && let Some(dock) = sim
+            .substrate
+            .entities
+            .get(unit)
+            .and_then(|entity| entity.seldom.radio_contacts.slot(0))
+            .and_then(|dock| sim.substrate.entities.get(dock))
+            .filter(|dock| dock.category() == EntityCategory::Structure)
+        && let Some(object) = sim.object_type(dock.type_ref(), rules)
+    {
+        return object.building_type_ext().dock_unload_direction();
+    }
+    DOCK_FACING
 }
 
 /// PREPARE_TO_DOCK, `UnitClass::Receive_Radio` case 0x16 (`0x007376AD`):
@@ -467,7 +1376,8 @@ fn unit_prepare_to_dock(
     unit: u64,
     sender: Option<u64>,
     payload: RadioPayload,
-    rules: Option<&RuleSet>,
+    rules: &RuleSet,
+    effects: &mut FrameEffects<'_>,
 ) -> RadioResponse {
     // 0x007376BA: the Foot receiver first (Techno sends TETHER back).
     let _ = foot_receive(
@@ -477,28 +1387,33 @@ fn unit_prepare_to_dock(
         RadioMessage::PrepareToDock,
         payload,
         rules,
+        effects,
     );
-    let frame = sim.session.binary_frame;
+    let frame = sim.session.binary_frame();
+    let facing = dock_unload_facing(sim, unit, rules);
     let Some(entity) = sim.substrate.entities.get_mut(unit) else {
         return RadioResponse::Roger;
     };
-    if !entity.turret_rotation_latch && entity.body_facing_current(frame) != DOCK_FACING {
-        crate::sim::movement::drive_do_turn(entity, DOCK_FACING, frame);
+    // Ares 3.0 10014970 (hook 0x007376D9) compares and turns to the dock's
+    // DockUnloadFacing ([`dock_unload_facing`]).
+    if !entity.turret_rotation_latch.is_set() && entity.body_facing_current(frame) != facing {
+        crate::sim::movement::drive_do_turn(entity, facing, frame);
         return RadioResponse::Roger;
     }
     if crate::sim::movement::motion_query::is_moving(entity).unwrap_or(false) {
         return RadioResponse::Roger;
     }
     let dock = entity
+        .seldom
         .radio_contacts
         .slot(0)
-        .filter(|_| entity.dock_entered_with.is_some())
+        .filter(|_| entity.seldom.tether.partner().is_some())
         .filter(|_| entity.mission.effective() == MissionId::from_known(MissionType::Enter));
     let dock = dock.filter(|&dock| {
         sim.substrate
             .entities
             .get(dock)
-            .is_some_and(|contact| contact.category == EntityCategory::Structure)
+            .is_some_and(|contact| contact.category() == EntityCategory::Structure)
     });
     if let Some(dock) = dock {
         transmit(
@@ -508,6 +1423,7 @@ fn unit_prepare_to_dock(
             RadioMessage::DockNow,
             RadioPayload::default(),
             rules,
+            effects,
         );
     }
     RadioResponse::Roger
@@ -517,15 +1433,12 @@ fn unit_prepare_to_dock(
 /// a `Harvester=`/`Weeder=` unit with its unload latch up drops it, scatters
 /// (forced, not no-kidding — the Unit Scatter refuses while Unload is still
 /// current), queues Harvest and commences it when ready.
-fn unit_run_away(sim: &mut Simulation, unit: u64, rules: Option<&RuleSet>) {
-    let Some(rules) = rules else {
-        return;
-    };
+fn unit_run_away(sim: &mut Simulation, unit: u64, rules: &RuleSet, effects: &mut FrameEffects<'_>) {
     let latched_harvester = sim.substrate.entities.get(unit).is_some_and(|entity| {
         entity
             .miner
             .as_ref()
-            .is_some_and(|miner| miner.unload_active)
+            .is_some_and(|miner| miner.unload_active())
             && sim
                 .object_type(entity.type_ref(), rules)
                 .is_some_and(|object| object.harvester || object.weeder)
@@ -533,43 +1446,434 @@ fn unit_run_away(sim: &mut Simulation, unit: u64, rules: Option<&RuleSet>) {
     if !latched_harvester {
         return;
     }
-    crate::sim::miner::clear_unload_latch(sim, unit);
-    if let Err(cause) = sim.scatter_null(unit, ScatterFlags::new(true, false), rules, None) {
+    crate::sim::miner::clear_unload_latch(&mut sim.substrate, unit);
+    if let Err(cause) = sim.scatter(
+        unit,
+        None,
+        ScatterFlags::new(true, false),
+        rules,
+        Some(rules.overlay_registry()),
+        effects,
+    ) {
         log::debug!("RUN_AWAY unit {unit} did not scatter: {cause}");
     }
-    let now = sim.session.binary_frame;
+    let now = sim.session.binary_frame();
     let _ = sim.mission_queue_exact(
         unit,
         MissionId::from_known(MissionType::Harvest),
         0,
         now,
-        &EntityReadyInputProvider,
+        &LiveReadyInputProvider { rules },
     );
     sim.mission_host_promote(unit, now, rules);
 }
 
-/// `AircraftClass::Receive_Radio @ 0x004190B0`: its own arms for 8, 0xE,
-/// 0xF, 0x12, 0x13, 0x15, 0x17, 0x1D, 0x1F and 0x21 are not represented; the
-/// rest (TETHER/UNTETHER included, table `0x0041957C`) take the Foot path.
+/// What the aircraft receiver's transport gates read: `Carryall=`
+/// (`+0xDFC`), `Passengers=` (`+0x5E0`) and the cargo count (`+0x114`).
+struct AircraftHold {
+    carryall: bool,
+    passengers: i32,
+    cargo: i32,
+}
+
+/// `AircraftClass::Receive_Radio @ 0x004190B0`. An aircraft on Retreat or a
+/// paradrop or Spy Plane mission without an Airstrike (`+0x294`) answers
+/// every message 0 (`0x004190B6..0x004190E3`). Its own arms (table
+/// `0x0041957C`) are the reload dock's queries (0x1D, 0x1F), MOVE_HERE (0x12),
+/// NEED_TO_MOVE (0x13) and RUN_AWAY (0x17). Message 8 takes the Foot path
+/// unless the type is `Carryall=` (`+0xDFC`, `0x004194C5`), and 0xE unless
+/// the type has `Passengers=` (`+0x5E0`) above its cargo (`+0x114`,
+/// `0x00419397`); the rest take the Foot path.
+///
+/// Message 8 (`0x004194C5..0x0041951F`): a `Carryall=` type on Move
+/// (Get_Mission) and tethered (`+0x418`) refuses it, NEGATORY, from its
+/// cargo's head (`+0x118`) or its NavCom (`+0x5A4`), so the Unit it flies to
+/// stays tethered (`aircraft::carryall`); otherwise the Foot path.
+///
+/// 0x21 (`0x0041918C`), which nothing sends, takes the Foot path.
 fn aircraft_receive(
     sim: &mut Simulation,
     aircraft: u64,
     sender: Option<u64>,
     msg: RadioMessage,
     payload: RadioPayload,
-    rules: Option<&RuleSet>,
+    rules: &RuleSet,
+    effects: &mut FrameEffects<'_>,
 ) -> RadioResponse {
+    let Some(entity) = sim.substrate.entities.get(aircraft) else {
+        return RadioResponse::None;
+    };
+    if aircraft_refuses_radio(entity) {
+        return RadioResponse::None;
+    }
+    let ammo = entity.ammo().map_or(-1, |ammo| ammo.current());
+    let object = sim.entity_object_type(entity, rules);
+    let type_ammo = object.map_or(-1, |object| object.ammo);
+    let transport = AircraftHold {
+        carryall: object.is_some_and(|object| object.carryall),
+        passengers: object.map_or(0, |object| object.passengers),
+        cargo: entity
+            .passenger_role()
+            .cargo()
+            .map_or(0, |cargo| cargo.count() as i32),
+    };
+    let holds_release = transport.carryall
+        && entity.mission.effective() == MissionId::from_known(MissionType::Move)
+        && entity.seldom.tether.partner().is_some()
+        && sender.is_some_and(|sender| {
+            entity
+                .passenger_role()
+                .cargo()
+                .and_then(|cargo| cargo.passengers().first())
+                == Some(&sender)
+                || entity.navigation.nav_com() == Some(NavTargetRef::object(sender))
+        });
+    let target = entity.attack_target.target().is_some();
     match msg {
-        RadioMessage::RequestClearance
-        | RadioMessage::CanDock
-        | RadioMessage::CanEnter
-        | RadioMessage::MoveToCell
-        | RadioMessage::NeedToMove
-        | RadioMessage::DockNow
-        | RadioMessage::RunAway
-        | RadioMessage::HelipadReserveAck
-        | RadioMessage::LinkPassenger => RadioResponse::None,
-        _ => foot_receive(sim, aircraft, sender, msg, payload, rules),
+        // 0x00419109: half its type's Ammo or more and a Target, it does not
+        // need the round; otherwise Techno takes it (`0x006F4C9C`).
+        RadioMessage::Reload if ammo >= type_ammo / 2 && target => RadioResponse::Roger,
+        // 0x00419153: ready to leave the dock with no Target and full Ammo.
+        RadioMessage::QueryReloaded => {
+            if !target && ammo == type_ammo {
+                RadioResponse::Roger
+            } else {
+                RadioResponse::Negatory
+            }
+        }
+        RadioMessage::MoveToCell => {
+            aircraft_move_here(sim, aircraft, sender, payload, rules, effects)
+        }
+        RadioMessage::NeedToMove => {
+            // 0x00419274: Foot first, its answer dropped.
+            let _ = foot_receive(sim, aircraft, sender, msg, payload, rules, effects);
+            aircraft_need_to_move(sim, aircraft, rules)
+        }
+        RadioMessage::RunAway => {
+            // 0x004191AF: Queue(Move), off to the nearest friendly airfield,
+            // OVER_OUT to the first contact, then the Foot arm.
+            let _ = sim.mission_queue_exact(
+                aircraft,
+                MissionId::from_known(MissionType::Move),
+                0,
+                sim.session.binary_frame(),
+                &LiveReadyInputProvider { rules },
+            );
+            let airfield = sim.aircraft_nearest_friendly_airfield_cell(aircraft, rules);
+            sim.assign_aircraft_destination(aircraft, Some(airfield), rules, effects);
+            crate::sim::radio::transmit_to_contact(
+                sim,
+                aircraft,
+                RadioMessage::Break,
+                rules,
+                effects,
+            );
+            foot_receive(sim, aircraft, sender, msg, payload, rules, effects)
+        }
+        RadioMessage::RequestClearance if holds_release => RadioResponse::Negatory,
+        RadioMessage::CanDock if transport.passengers <= transport.cargo => {
+            foot_receive(sim, aircraft, sender, msg, payload, rules, effects)
+        }
+        RadioMessage::CanDock if transport.passengers > 0 => {
+            aircraft_docking(sim, aircraft, sender, payload, rules, effects)
+        }
+        RadioMessage::CanEnter => aircraft_can_enter_radio(sim, aircraft, sender, rules),
+        RadioMessage::DockNow => aircraft_dock_now(sim, aircraft, sender, rules, effects),
+        RadioMessage::CanDock => RadioResponse::None,
+        _ => foot_receive(sim, aircraft, sender, msg, payload, rules, effects),
+    }
+}
+
+/// The mission gate before every Aircraft4190B0 message, shared with the
+/// read-only click query. It reads the current mission, not Get_Mission.
+fn aircraft_refuses_radio(entity: &crate::sim::game_entity::GameEntity) -> bool {
+    entity.airstrike_link().is_none()
+        && matches!(
+            entity.mission.current().known(),
+            Some(
+                MissionType::Retreat
+                    | MissionType::ParadropApproach
+                    | MissionType::ParadropOverfly
+                    | MissionType::SpyplaneApproach
+                    | MissionType::SpyplaneOverfly
+            )
+        )
+}
+
+/// CAN_LOAD, Aircraft41946B: any nonzero signed capacity admits the allied
+/// sender query. Capacity and CargoClass count alone decide 1 versus 10;
+/// size, locomotor and passenger category belong to the caller's gates.
+///
+/// Ares 3.0: a transport whose driver was killed answers 0 first
+/// (AircraftClass_ReceivedRadioCommand_QueryEnterAsPassenger_KillDriver
+/// 10048CF0, hook 0x41946B -> 0x4190DD), and below `Passengers=` a sender of
+/// a type `Passengers.Allowed`/`.Disallowed` refuses is NEGATORY
+/// (AircraftClass_ReceivedRadioCommand_SpecificPassengers 10048D10, hook
+/// 0x41949F; IsPassengerAllowed 1003DD60).
+fn aircraft_can_enter_radio(
+    sim: &Simulation,
+    aircraft: u64,
+    sender: Option<u64>,
+    rules: &RuleSet,
+) -> RadioResponse {
+    let Some((transport, passenger)) = sender.and_then(|sender| {
+        sim.substrate
+            .entities
+            .get(aircraft)
+            .zip(sim.substrate.entities.get(sender))
+    }) else {
+        return RadioResponse::None;
+    };
+    let Some(object) = sim.entity_object_type(transport, rules) else {
+        return RadioResponse::None;
+    };
+    let ares = rules.ares_form();
+    if ares && transport.driver_killed() {
+        return RadioResponse::None;
+    }
+    if aircraft_refuses_radio(transport)
+        || object.passengers == 0
+        || !crate::sim::combat::combat_weapon::is_ally_by_object(
+            Some(&sim.house_alliances),
+            &sim.interner,
+            transport.owner(),
+            passenger.owner(),
+        )
+    {
+        return RadioResponse::None;
+    }
+    let count = transport
+        .passenger_role()
+        .cargo()
+        .map_or(0, |cargo| cargo.count() as i32);
+    if count >= object.passengers {
+        return RadioResponse::Negatory;
+    }
+    if ares
+        && let Some(from_type) = sim.entity_object_type(passenger, rules)
+        && !object
+            .techno_combat()
+            .movement()
+            .passenger_allowed(from_type.category, &from_type.id)
+    {
+        return RadioResponse::Negatory;
+    }
+    RadioResponse::Roger
+}
+
+/// DOCK_NOW, Aircraft419300: close at exact capacity, then a qualifying
+/// civilian causes Target(NULL), Set_Destination(NULL, true), Queue(Retreat,
+/// false), in that order. This is independent of adding cargo.
+fn aircraft_dock_now(
+    sim: &mut Simulation,
+    aircraft: u64,
+    sender: Option<u64>,
+    rules: &RuleSet,
+    effects: &mut FrameEffects<'_>,
+) -> RadioResponse {
+    if let Some(entity) = sim.substrate.entities.get(aircraft)
+        && let Some(object) = sim.entity_object_type(entity, rules)
+        && entity
+            .passenger_role()
+            .cargo()
+            .map_or(0, |cargo| cargo.count() as i32)
+            == object.passengers
+    {
+        let ticks = object.deploy_time_ticks;
+        let now = sim.session.binary_frame();
+        sim.substrate
+            .entities
+            .get_mut(aircraft)
+            .unwrap()
+            .close_door(ticks, now);
+    }
+    if sender.is_some_and(|sender| sim.is_evacuation_civilian(sender, rules)) {
+        sim.assign_target_represented(aircraft, None, rules, effects)
+            .expect("civilian evacuation aircraft target");
+        sim.assign_aircraft_destination(aircraft, None, rules, effects);
+        let _ = sim.mission_queue_exact(
+            aircraft,
+            MissionId::from_known(MissionType::Retreat),
+            0,
+            sim.session.binary_frame(),
+            &LiveReadyInputProvider { rules },
+        );
+    }
+    RadioResponse::Code5
+}
+
+/// DOCKING, Aircraft419397: the caller has positive room. Foot receives it
+/// first; a stopped locomotor opens its shared door and asks the sender to
+/// move to the aircraft. Only a successful MOVE_HERE deselects Contact[0]
+/// (Object5F44A0, virtual+150); the contact is read after the nested replies.
+fn aircraft_docking(
+    sim: &mut Simulation,
+    aircraft: u64,
+    sender: Option<u64>,
+    payload: RadioPayload,
+    rules: &RuleSet,
+    effects: &mut FrameEffects<'_>,
+) -> RadioResponse {
+    let _ = foot_receive(
+        sim,
+        aircraft,
+        sender,
+        RadioMessage::CanDock,
+        payload,
+        rules,
+        effects,
+    );
+    let Some(entity) = sim.substrate.entities.get(aircraft) else {
+        return RadioResponse::Roger;
+    };
+    if crate::sim::movement::motion_query::is_moving(entity) == Some(true) {
+        return RadioResponse::Roger;
+    }
+    let ticks = sim
+        .entity_object_type(entity, rules)
+        .map_or(0, |object| object.deploy_time_ticks);
+    let now = sim.session.binary_frame();
+    sim.substrate
+        .entities
+        .get_mut(aircraft)
+        .unwrap()
+        .open_door(ticks, now);
+    let Some(sender) = sender else {
+        return RadioResponse::Roger;
+    };
+    if transmit(
+        sim,
+        aircraft,
+        sender,
+        RadioMessage::NeedToMove,
+        RadioPayload::default(),
+        rules,
+        effects,
+    ) != RadioResponse::Roger
+    {
+        return RadioResponse::Roger;
+    }
+    if transmit(
+        sim,
+        aircraft,
+        sender,
+        RadioMessage::MoveToCell,
+        RadioPayload {
+            target: Some(NavTargetRef::object(aircraft)),
+            ..RadioPayload::default()
+        },
+        rules,
+        effects,
+    ) != RadioResponse::Roger
+    {
+        transmit(
+            sim,
+            aircraft,
+            sender,
+            RadioMessage::Break,
+            RadioPayload::default(),
+            rules,
+            effects,
+        );
+    } else if let Some(contact) = sim
+        .substrate
+        .entities
+        .get(aircraft)
+        .and_then(|entity| entity.seldom.radio_contacts.slot(0))
+    {
+        sim.object_deselect(contact);
+    }
+    RadioResponse::Roger
+}
+
+/// MOVE_HERE, Aircraft case 0x12 (`0x004191F2`): the Foot arm first, its
+/// answer dropped; then a dock parameter that does not answer this aircraft's
+/// CAN_LOAD ROGER is refused (NEGATORY), one that does queues Enter, and any
+/// other parameter queues Move; the class setter takes the parameter and the
+/// mission commences (`vt+0x1EC`); ROGER.
+fn aircraft_move_here(
+    sim: &mut Simulation,
+    aircraft: u64,
+    sender: Option<u64>,
+    payload: RadioPayload,
+    rules: &RuleSet,
+    effects: &mut FrameEffects<'_>,
+) -> RadioResponse {
+    let _ = foot_receive(
+        sim,
+        aircraft,
+        sender,
+        RadioMessage::MoveToCell,
+        payload,
+        rules,
+        effects,
+    );
+    let dock = payload.target.and_then(|target| match target {
+        NavTargetRef::Object { id } => sim
+            .substrate
+            .entities
+            .get(id)
+            .filter(|entity| entity.category() == EntityCategory::Structure)
+            .map(|_| id),
+        NavTargetRef::Cell { .. } => None,
+    });
+    let mission = match dock {
+        Some(dock) => {
+            if transmit(
+                sim,
+                aircraft,
+                dock,
+                RadioMessage::CanEnter,
+                RadioPayload::default(),
+                rules,
+                effects,
+            ) != RadioResponse::Roger
+            {
+                return RadioResponse::Negatory;
+            }
+            MissionType::Enter
+        }
+        None => MissionType::Move,
+    };
+    let now = sim.session.binary_frame();
+    let _ = sim.mission_queue_exact(
+        aircraft,
+        MissionId::from_known(mission),
+        0,
+        now,
+        &LiveReadyInputProvider { rules },
+    );
+    sim.assign_aircraft_destination(aircraft, payload.target, rules, effects);
+    let _ = sim.substrate.mission_commence_exact(aircraft, now);
+    RadioResponse::Roger
+}
+
+/// NEED_TO_MOVE, Aircraft case 0x13 after the Foot arm (`0x00419286`): a
+/// Fly that is not moving (`Is_Moving`), or one with no NavCom, answers
+/// ROGER; one moving toward a NavCom answers NEGATORY unless it is
+/// AirportBound and that NavCom is the cell it is in.
+fn aircraft_need_to_move(sim: &Simulation, aircraft: u64, rules: &RuleSet) -> RadioResponse {
+    let Some(entity) = sim.substrate.entities.get(aircraft) else {
+        return RadioResponse::None;
+    };
+    if !crate::sim::movement::motion_query::is_moving(entity).unwrap_or(false) {
+        return RadioResponse::Roger;
+    }
+    let Some(nav_com) = entity.navigation.nav_com() else {
+        return RadioResponse::Roger;
+    };
+    let airport_bound = sim
+        .object_type(entity.type_ref(), rules)
+        .is_some_and(|object| object.airport_bound);
+    let location = crate::sim::movement::ground_pose::position_world_coord(&entity.position);
+    let own_cell = (location.x / 256, location.y / 256);
+    match nav_com {
+        NavTargetRef::Cell { rx, ry }
+            if airport_bound && (i32::from(rx), i32::from(ry)) == own_cell =>
+        {
+            RadioResponse::Roger
+        }
+        _ => RadioResponse::Negatory,
     }
 }
 
@@ -580,42 +1884,70 @@ fn foot_receive(
     sender: Option<u64>,
     msg: RadioMessage,
     payload: RadioPayload,
-    rules: Option<&RuleSet>,
+    rules: &RuleSet,
+    effects: &mut FrameEffects<'_>,
 ) -> RadioResponse {
     match msg {
-        RadioMessage::MoveToCell => foot_move_here(sim, foot, payload, rules),
+        RadioMessage::MoveToCell => foot_move_here(sim, foot, payload, rules, effects),
         RadioMessage::NeedToMove => foot_need_to_move(sim, foot),
         RadioMessage::RunAway => {
-            foot_run_away(sim, foot, rules);
-            techno_receive(sim, foot, sender, msg, payload, rules)
+            foot_run_away(sim, foot, rules, effects);
+            techno_receive(sim, foot, sender, msg, payload, rules, effects)
         }
         RadioMessage::IsOccupied => foot_is_occupied(sim, foot, sender),
-        // 0x11 and 0x1C have no represented sender.
-        RadioMessage::IsUnitLinked | RadioMessage::RepairTick => RadioResponse::None,
-        _ => techno_receive(sim, foot, sender, msg, payload, rules),
+        // Foot4D900E..4D9028: a live NavCom blocks the repair request before
+        // the shared Techno cost/heal/payment receiver is reached.
+        RadioMessage::RepairTick => {
+            if sim
+                .substrate
+                .entities
+                .get(foot)
+                .is_some_and(|entity| entity.navigation.nav_com().is_some())
+            {
+                RadioResponse::Negatory
+            } else {
+                techno_receive(sim, foot, sender, msg, payload, rules, effects)
+            }
+        }
+        // 0x11 has no represented sender.
+        RadioMessage::IsUnitLinked => RadioResponse::None,
+        _ => techno_receive(sim, foot, sender, msg, payload, rules, effects),
     }
 }
 
-/// MOVE_HERE, Foot case 0x12 (`0x004D9139`): already in the payload cell →
-/// ALREADY_THERE. Otherwise a unit on Guard with nothing queued queues Move,
-/// a queued Enter commences when ready, the class setter takes the cell and
-/// the mission timer restarts; ROGER.
+/// MOVE_HERE, Foot case 0x12 (`0x004D9139`): a receiver whose cell is the
+/// cell of the parameter's GetCoords (`vt+0x48`) answers ALREADY_THERE.
+/// Otherwise a unit on Guard with nothing queued queues Move, a queued Enter
+/// commences when ready, the class setter takes the parameter and the mission
+/// timer restarts; ROGER.
 fn foot_move_here(
     sim: &mut Simulation,
     foot: u64,
     payload: RadioPayload,
-    rules: Option<&RuleSet>,
+    rules: &RuleSet,
+    effects: &mut FrameEffects<'_>,
 ) -> RadioResponse {
     let Some(entity) = sim.substrate.entities.get(foot) else {
         return RadioResponse::None;
     };
-    if payload.cell == Some((entity.position.rx, entity.position.ry)) {
+    // 0x004D913D..0x004D9189: both cells are coordinate / 256, truncated
+    // toward zero; the receiver's is its Location's (`vt+0x1B8`).
+    let terrain = sim.resolved_terrain.as_ref();
+    let target_cell = payload.target.and_then(|target| match target {
+        NavTargetRef::Cell { rx, ry } => Some((i32::from(rx), i32::from(ry))),
+        NavTargetRef::Object { id } => {
+            let coords = crate::sim::movement::ground_pose::object_get_coords(
+                sim.substrate.entities.get(id)?,
+                terrain,
+            );
+            Some((coords.x / 256, coords.y / 256))
+        }
+    });
+    let location = crate::sim::movement::ground_pose::position_world_coord(&entity.position);
+    if target_cell == Some((location.x / 256, location.y / 256)) {
         return RadioResponse::AlreadyThere;
     }
-    let Some(rules) = rules else {
-        return RadioResponse::None;
-    };
-    let now = sim.session.binary_frame;
+    let now = sim.session.binary_frame();
     // 0x004D919A..0x004D91BA.
     if entity.mission.effective() == MissionId::from_known(MissionType::Guard)
         && entity.mission.queued() == MissionId::NONE
@@ -625,7 +1957,7 @@ fn foot_move_here(
             MissionId::from_known(MissionType::Move),
             0,
             now,
-            &EntityReadyInputProvider,
+            &LiveReadyInputProvider { rules },
         );
     }
     // 0x004D91C0..0x004D91DB: queued Enter && Ready_To_Commence → Commence.
@@ -638,20 +1970,11 @@ fn foot_move_here(
         sim.mission_host_promote(foot, now, rules);
     }
     // 0x004D91E1..0x004D91EB: the class setter vt+0x480(*P, 1).
-    match payload.cell {
-        Some(cell) => {
-            sim.set_unit_destination(
-                foot,
-                crate::sim::components::NavTargetRef::cell(cell.0, cell.1),
-                rules,
-            );
-        }
-        None => {
-            sim.assign_null_destination(foot, Some(rules));
-        }
-    }
+    let _ = sim.assign_destination_represented(foot, payload.target, rules, effects);
     // 0x004D91F1..0x004D920D: UpdateTimer (+0xC8) = {Frame, -, 0}. Inside a
-    // mission dispatch the MissionClass::AI epilogue overwrites it.
+    // mission dispatch (Mission_Enter's DOCKING) the MissionClass::AI
+    // epilogue overwrites it; reached at order time (the Infantry setter's
+    // DOCKING) it stands.
     if let Some(entity) = sim.substrate.entities.get_mut(foot) {
         entity.mission.write_dispatch_epilogue(now as i32, 0);
     }
@@ -662,28 +1985,18 @@ fn foot_move_here(
 /// the first contact is dropped; a unit asleep queues Guard and commences it
 /// when ready, one on Enter queues Guard; one with no NavCom and no turret
 /// swing (`+0x6AF`) scatters (forced, no-kidding). The Techno receiver follows.
-fn foot_run_away(sim: &mut Simulation, foot: u64, rules: Option<&RuleSet>) {
-    let Some(rules) = rules else {
-        return;
-    };
-    let now = sim.session.binary_frame;
+fn foot_run_away(sim: &mut Simulation, foot: u64, rules: &RuleSet, effects: &mut FrameEffects<'_>) {
+    let now = sim.session.binary_frame();
     let Some(entity) = sim.substrate.entities.get(foot) else {
         return;
     };
     // 0x004D902D..0x004D904F: In_Radio_Contact and NavCom == Contact(0).
-    let aimed_at_contact = match (entity.navigation.nav_com, entity.radio_contacts.slot(0)) {
-        (
-            Some(
-                NavTargetRef::Entity { id }
-                | NavTargetRef::Object { id }
-                | NavTargetRef::Building { id },
-            ),
-            Some(contact),
-        ) => id == contact,
-        _ => false,
-    };
+    let aimed_at_contact =
+        entity.seldom.radio_contacts.slot(0).is_some_and(|contact| {
+            entity.navigation.nav_com() == Some(NavTargetRef::object(contact))
+        });
     if aimed_at_contact {
-        sim.assign_null_destination(foot, Some(rules));
+        sim.assign_null_destination(foot, rules, Some(rules.overlay_registry()), effects);
     }
     let mission = |sim: &Simulation| {
         sim.substrate
@@ -698,7 +2011,7 @@ fn foot_run_away(sim: &mut Simulation, foot: u64, rules: Option<&RuleSet>) {
             MissionId::from_known(MissionType::Guard),
             0,
             now,
-            &EntityReadyInputProvider,
+            &LiveReadyInputProvider { rules },
         );
         sim.mission_host_promote(foot, now, rules);
     }
@@ -709,17 +2022,20 @@ fn foot_run_away(sim: &mut Simulation, foot: u64, rules: Option<&RuleSet>) {
             MissionId::from_known(MissionType::Guard),
             0,
             now,
-            &EntityReadyInputProvider,
+            &LiveReadyInputProvider { rules },
         );
     }
     // 0x004D90A5..0x004D90C6.
-    if sim
-        .substrate
-        .entities
-        .get(foot)
-        .is_some_and(|entity| !entity.turret_rotation_latch && entity.navigation.nav_com.is_none())
-        && let Err(cause) = sim.scatter_null(foot, ScatterFlags::new(true, true), rules, None)
-    {
+    if sim.substrate.entities.get(foot).is_some_and(|entity| {
+        !entity.turret_rotation_latch.is_set() && entity.navigation.nav_com().is_none()
+    }) && let Err(cause) = sim.scatter(
+        foot,
+        None,
+        ScatterFlags::new(true, true),
+        rules,
+        Some(rules.overlay_registry()),
+        effects,
+    ) {
         log::debug!("RUN_AWAY foot {foot} did not scatter: {cause}");
     }
 }
@@ -731,7 +2047,7 @@ fn foot_need_to_move(sim: &Simulation, foot: u64) -> RadioResponse {
     let Some(entity) = sim.substrate.entities.get(foot) else {
         return RadioResponse::None;
     };
-    if entity.navigation.nav_com.is_some()
+    if entity.navigation.nav_com().is_some()
         && crate::sim::movement::motion_query::is_moving(entity).unwrap_or(false)
     {
         RadioResponse::Negatory
@@ -747,13 +2063,14 @@ fn techno_receive(
     sender: Option<u64>,
     msg: RadioMessage,
     payload: RadioPayload,
-    rules: Option<&RuleSet>,
+    rules: &RuleSet,
+    effects: &mut FrameEffects<'_>,
 ) -> RadioResponse {
     match msg {
-        RadioMessage::Break => techno_over_out(sim, techno, sender, payload, rules),
+        RadioMessage::Break => techno_over_out(sim, techno, sender, payload, rules, effects),
         // 0x006F4C6F (7, 9, 0x16): TETHER back to the sender, then the Radio
         // receiver; ROGER.
-        RadioMessage::DockingComplete | RadioMessage::PrepareToDock => {
+        RadioMessage::HoldStill | RadioMessage::TetherBack | RadioMessage::PrepareToDock => {
             if let Some(from) = sender {
                 transmit(
                     sim,
@@ -762,21 +2079,185 @@ fn techno_receive(
                     RadioMessage::Tether,
                     RadioPayload::default(),
                     rules,
+                    effects,
                 );
             }
             let _ = radio_receive(sim, techno, sender, msg);
             RadioResponse::Roger
         }
-        RadioMessage::Tether => techno_tether(sim, techno, sender, rules),
-        RadioMessage::Untether => techno_untether(sim, techno, sender, rules),
-        // 8, 0x1A..0x1C, 0x1E and 0x1F have no represented sender.
-        RadioMessage::RequestClearance
-        | RadioMessage::SecondaryLockSet
+        // Object5F5339..5382: inherited health query used by depot DOCKING.
+        RadioMessage::IsRepairing => {
+            let Some((entity, object)) = sim.substrate.entities.get(techno).and_then(|entity| {
+                sim.object_type(entity.type_ref(), rules)
+                    .map(|object| (entity, object))
+            }) else {
+                return RadioResponse::None;
+            };
+            if entity.health.is_full(object.strength) {
+                RadioResponse::Negatory
+            } else {
+                RadioResponse::Roger
+            }
+        }
+        RadioMessage::Tether => techno_tether(sim, techno, sender, rules, effects),
+        RadioMessage::Untether => techno_untether(sim, techno, sender, rules, effects),
+        // Techno6F4C29: the RECEIVER sends0x19 then0x03 to the original sender.
+        // Radio65A970/Techno's existing nested receivers own both endpoints.
+        // Source: anytown_damage/unit_unlimbo factory exit radio controls.
+        RadioMessage::RequestClearance => {
+            if let Some(from) = sender {
+                transmit(
+                    sim,
+                    techno,
+                    from,
+                    RadioMessage::Untether,
+                    RadioPayload::default(),
+                    rules,
+                    effects,
+                );
+                // Original6F4C47..6F4C4D returns the nested Break reply.
+                transmit(
+                    sim,
+                    techno,
+                    from,
+                    RadioMessage::Break,
+                    RadioPayload::default(),
+                    rules,
+                    effects,
+                )
+            } else {
+                // Radio65A970 resolves a null explicit target through slot0
+                // on EACH send. Re-read after the nested Untether callback.
+                crate::sim::radio::transmit_to_contact(
+                    sim,
+                    techno,
+                    RadioMessage::Untether,
+                    rules,
+                    effects,
+                );
+                crate::sim::radio::transmit_to_contact(
+                    sim,
+                    techno,
+                    RadioMessage::Break,
+                    rules,
+                    effects,
+                )
+            }
+        }
+        RadioMessage::RepairTick => techno_repair_tick(sim, techno, rules, effects),
+        RadioMessage::Reload => techno_reload(&sim.interner, &mut sim.substrate, techno, rules),
+        // 0x1A, 0x1B and 0x1E have no represented sender; neither has 0x1D
+        // to anything but an aircraft, which answers it itself.
+        RadioMessage::SecondaryLockSet
         | RadioMessage::SecondaryLockClear
-        | RadioMessage::RepairTick
         | RadioMessage::DeploySetNav
-        | RadioMessage::LinkPassenger => RadioResponse::None,
+        | RadioMessage::QueryReloaded => RadioResponse::None,
         _ => radio_receive(sim, techno, sender, msg),
+    }
+}
+
+/// RELOAD, Techno case 0x1F (`0x006F4C9C`): Ammo at the type's `Ammo=`
+/// answers NEGATORY; otherwise one round more and ROGER.
+fn techno_reload(
+    interner: &StringInterner,
+    substrate: &mut ObjectSubstrate,
+    techno: u64,
+    rules: &RuleSet,
+) -> RadioResponse {
+    let Some(type_ammo) = substrate
+        .entities
+        .get(techno)
+        .and_then(|entity| interner.object_type(entity.type_ref(), rules))
+        .map(|object| object.ammo)
+    else {
+        return RadioResponse::None;
+    };
+    let Some(ammo) = substrate
+        .entities
+        .get_mut(techno)
+        .and_then(|entity| entity.ammo_mut())
+    else {
+        return RadioResponse::None;
+    };
+    if ammo.current() == type_ammo {
+        return RadioResponse::Negatory;
+    }
+    ammo.reload_round();
+    RadioResponse::Roger
+}
+
+/// REPAIR_TICK1C, Techno6F4CD7..6F4E3B. The type's shared repair-cost
+/// getter7120D0 owns its virtual GetCost; default712120 and Unit747F20 heal
+/// getters both read RepairStep. Payment precedes the actual/estimated adds,
+/// forced parasite release and damage-smoke retirement, then full-health clamp.
+/// Original execution: building_repair.depot_service.json receiver/history rows.
+fn techno_repair_tick(
+    sim: &mut Simulation,
+    techno: u64,
+    rules: &RuleSet,
+    effects: &mut FrameEffects<'_>,
+) -> RadioResponse {
+    let Some(entity) = sim.substrate.entities.get(techno) else {
+        return RadioResponse::None;
+    };
+    let Some(object) = sim.object_type(entity.type_ref(), rules) else {
+        return RadioResponse::None;
+    };
+    if entity.health.is_full(object.strength) {
+        return RadioResponse::Negatory;
+    }
+    let strength = object.strength;
+    // InfantryType5247A0/524790 override the shared Techno6F4CD7 getters:
+    // zero cost and signed Rules+16D8 IRepairStep. Techno6F4D1C clamps the
+    // virtual heal result to at least1 for every category.
+    let (cost, heal) = if entity.category() == EntityCategory::Infantry {
+        (0, rules.general.infantry_repair_step)
+    } else {
+        (
+            crate::sim::production::repair_step_cost(rules, object),
+            rules.general.repair_step,
+        )
+    };
+    let heal = heal.max(1);
+    let owner = entity.owner();
+    if crate::sim::credit_income::available_money(&sim.houses, owner) < cost {
+        return RadioResponse::InsufficientFunds;
+    }
+    if cost != 0 {
+        crate::sim::credit_income::spend_money(&mut sim.houses, owner, cost);
+    }
+    let Some(entity) = sim.substrate.entities.get_mut(techno) else {
+        return RadioResponse::None;
+    };
+    entity.health.heal(heal);
+    entity.estimated_health.add_repair(heal);
+    let eater = entity.parasite.eater();
+    if let Some(eater) = eater {
+        sim.parasite_force_release(
+            eater,
+            crate::sim::combat::parasite::FORCED_RELEASE_SUPPRESSION_FRAMES,
+            rules,
+            effects,
+        );
+    }
+    // Radio6F4DAB..6F4DE5 uses the same two-clause health/height gate as
+    // SelfHeal6FA75A. Its existing owner retires the retained smoke system.
+    Simulation::retire_damage_smoke_after_self_heal(
+        &sim.interner,
+        &mut sim.substrate,
+        &sim.resolved_terrain,
+        techno,
+        rules,
+    );
+    let Some(entity) = sim.substrate.entities.get_mut(techno) else {
+        return RadioResponse::None;
+    };
+    if entity.health.is_full(strength) {
+        entity.health.set(strength);
+        entity.estimated_health.reset(strength);
+        RadioResponse::RepairComplete
+    } else {
+        RadioResponse::Roger
     }
 }
 
@@ -787,15 +2268,16 @@ fn techno_over_out(
     techno: u64,
     sender: Option<u64>,
     _payload: RadioPayload,
-    rules: Option<&RuleSet>,
+    rules: &RuleSet,
+    effects: &mut FrameEffects<'_>,
 ) -> RadioResponse {
     if let Some(from) = sender {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         super::record_test_event(super::RadioTestEvent::ReceiverClassEffect {
             receiver_sid: techno,
             sender_sid: from,
         });
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         sim.trace_lifecycle_for_test(LifecycleTestEvent::BreakReceiverClassEffect {
             target: techno,
         });
@@ -803,7 +2285,7 @@ fn techno_over_out(
             sim.substrate
                 .entities
                 .get(id)
-                .is_some_and(|e| e.dock_entered_with.is_some())
+                .is_some_and(|e| e.seldom.tether.partner().is_some())
         };
         if tethered(techno) && tethered(from) {
             transmit(
@@ -813,6 +2295,7 @@ fn techno_over_out(
                 RadioMessage::Untether,
                 RadioPayload::default(),
                 rules,
+                effects,
             );
         }
     }
@@ -827,7 +2310,8 @@ fn techno_tether(
     sim: &mut Simulation,
     techno: u64,
     sender: Option<u64>,
-    rules: Option<&RuleSet>,
+    rules: &RuleSet,
+    effects: &mut FrameEffects<'_>,
 ) -> RadioResponse {
     let Some(from) = sender else {
         return RadioResponse::None;
@@ -835,15 +2319,15 @@ fn techno_tether(
     let Some(entity) = sim.substrate.entities.get(techno) else {
         return RadioResponse::None;
     };
-    let airport_bound = entity.category == EntityCategory::Aircraft
-        && rules
-            .and_then(|rules| sim.object_type(entity.type_ref(), rules))
+    let airport_bound = entity.category() == EntityCategory::Aircraft
+        && sim
+            .object_type(entity.type_ref(), rules)
             .is_some_and(|object| object.airport_bound);
-    if airport_bound || entity.dock_entered_with.is_some() {
+    if airport_bound || entity.seldom.tether.partner().is_some() {
         return radio_receive(sim, techno, sender, RadioMessage::Tether);
     }
     if let Some(entity) = sim.substrate.entities.get_mut(techno) {
-        entity.dock_entered_with = Some(from);
+        entity.seldom.tether.attach(from);
     }
     transmit(
         sim,
@@ -852,6 +2336,7 @@ fn techno_tether(
         RadioMessage::Tether,
         RadioPayload::default(),
         rules,
+        effects,
     );
     RadioResponse::Roger
 }
@@ -861,15 +2346,16 @@ fn techno_untether(
     sim: &mut Simulation,
     techno: u64,
     sender: Option<u64>,
-    rules: Option<&RuleSet>,
+    rules: &RuleSet,
+    effects: &mut FrameEffects<'_>,
 ) -> RadioResponse {
     let Some(entity) = sim.substrate.entities.get_mut(techno) else {
         return RadioResponse::None;
     };
-    if entity.dock_entered_with.is_none() {
+    if entity.seldom.tether.partner().is_none() {
         return radio_receive(sim, techno, sender, RadioMessage::Untether);
     }
-    entity.dock_entered_with = None;
+    entity.seldom.tether.release();
     if let Some(from) = sender {
         transmit(
             sim,
@@ -878,14 +2364,15 @@ fn techno_untether(
             RadioMessage::Untether,
             RadioPayload::default(),
             rules,
+            effects,
         );
     }
     RadioResponse::Roger
 }
 
 /// `RadioClass::Receive_Radio @ 0x0065A820` (HELLO and OVER_OUT); every other
-/// message reaches `ObjectClass::Receive_Radio @ 0x005F5320`, which answers 0
-/// for everything VERA sends over the bus.
+/// message reaches `ObjectClass::Receive_Radio @ 0x005F5320`. Literal13
+/// invokes the shared Mark(2) owner and always answers ROGER (`0x005F5370`).
 fn radio_receive(
     sim: &mut Simulation,
     receiver: u64,
@@ -893,7 +2380,39 @@ fn radio_receive(
     msg: RadioMessage,
 ) -> RadioResponse {
     match msg {
-        RadioMessage::Hello => radio_hello(sim, receiver, sender),
+        RadioMessage::Hello => radio_hello(
+            &sim.interner,
+            &sim.house_alliances,
+            &mut sim.substrate,
+            receiver,
+            sender,
+        ),
+        RadioMessage::AnimStop => {
+            #[cfg(any(test, feature = "test-support"))]
+            let sender_state = sender
+                .and_then(|id| sim.substrate.entities.get(id))
+                .map(|entity| {
+                    (
+                        entity.lifecycle.cell_marked(),
+                        sim.substrate.occupancy.contains_entity(
+                            entity.position.rx(),
+                            entity.position.ry(),
+                            entity.stable_id(),
+                        ),
+                    )
+                });
+            let accepted = Simulation::mark_entity_refresh(&sim.substrate, receiver);
+            #[cfg(any(test, feature = "test-support"))]
+            super::record_test_event(super::RadioTestEvent::ObjectMarkRefresh {
+                receiver_sid: receiver,
+                sender_sid: sender,
+                sender_cell_marked: sender_state.map(|state| state.0),
+                sender_cell_listed: sender_state.map(|state| state.1),
+                accepted,
+            });
+            let _ = accepted;
+            RadioResponse::Roger
+        }
         // 0x0065A854..0x0065A8AA: null the first slot holding the sender.
         RadioMessage::Break => {
             let Some(from) = sender else {
@@ -903,14 +2422,14 @@ fn radio_receive(
                 .substrate
                 .entities
                 .get_mut(receiver)
-                .and_then(|entity| entity.radio_contacts.remove(from))
+                .and_then(|entity| entity.seldom.radio_contacts.remove(from))
                 .is_some();
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             super::record_test_event(super::RadioTestEvent::ReceiverCommonCleared {
                 receiver_sid: receiver,
                 sender_sid: from,
             });
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             sim.trace_lifecycle_for_test(LifecycleTestEvent::BreakReceiverCleared {
                 target: receiver,
             });
@@ -929,23 +2448,29 @@ fn radio_receive(
 /// both directions); an existing link answers ROGER; otherwise the first null
 /// slot takes the sender, and a saturated receiver answers NEGATORY without
 /// evicting.
-fn radio_hello(sim: &mut Simulation, receiver: u64, sender: Option<u64>) -> RadioResponse {
+fn radio_hello(
+    interner: &StringInterner,
+    house_alliances: &HouseAlliances,
+    substrate: &mut ObjectSubstrate,
+    receiver: u64,
+    sender: Option<u64>,
+) -> RadioResponse {
     let Some(from) = sender else {
         return RadioResponse::None;
     };
     let (Some(this), Some(other)) = (
-        sim.substrate.entities.get(receiver),
-        sim.substrate.entities.get(from),
+        substrate.entities.get(receiver),
+        substrate.entities.get(from),
     ) else {
         return RadioResponse::None;
     };
-    if this.health.current == 0 {
+    if this.health.current() == 0 {
         return RadioResponse::None;
     }
     let ally = |asker, other| {
         crate::sim::combat::combat_weapon::is_ally_by_object(
-            Some(&sim.fog.alliances),
-            &sim.interner,
+            Some(house_alliances),
+            interner,
             asker,
             other,
         )
@@ -953,97 +2478,19 @@ fn radio_hello(sim: &mut Simulation, receiver: u64, sender: Option<u64>) -> Radi
     if !ally(other.owner(), this.owner()) || !ally(this.owner(), other.owner()) {
         return RadioResponse::Negatory;
     }
-    let Some(this) = sim.substrate.entities.get_mut(receiver) else {
+    let Some(this) = substrate.entities.get_mut(receiver) else {
         return RadioResponse::None;
     };
-    match this.radio_contacts.insert(from) {
+    match this.seldom.radio_contacts.insert(from) {
         Some(_) => RadioResponse::Roger,
         None => RadioResponse::Negatory,
     }
 }
 
-/// A tank bunker is any structure seeded with a `bunker_runtime` (Bunker=yes at
-/// spawn). Routing on this lets the bus stay rules-free (it has no `RuleSet`).
-fn is_bunker_building(sim: &Simulation, sid: u64) -> bool {
-    sim.substrate
-        .entities
-        .get(sid)
-        .is_some_and(|b| b.bunker_runtime.is_some())
-}
-
-/// Tank-bunker inbound admission + commit. Mirrors the refinery handshake shape:
-/// CAN_ENTER is the eligibility query; DOCK_NOW commits the install machine.
-fn bunker_receive(
-    sim: &mut Simulation,
-    bld: u64,
-    sender: Option<u64>,
-    msg: RadioMessage,
-) -> RadioResponse {
-    let Some(unit) = sender else {
-        return RadioResponse::None;
-    };
-    match msg {
-        RadioMessage::CanEnter => {
-            if bunker_admits(sim, bld, unit) {
-                RadioResponse::Roger
-            } else {
-                RadioResponse::Negatory
-            }
-        }
-        RadioMessage::DockNow => {
-            // Commit: start the install machine if the bunker is idle.
-            if let Some(b) = sim.substrate.entities.get_mut(bld) {
-                if let Some(rt) = b.bunker_runtime.as_mut() {
-                    if rt.state == BunkerState::Idle {
-                        rt.state = BunkerState::ArriveWait;
-                        rt.installing_unit = Some(unit);
-                    }
-                }
-            }
-            RadioResponse::Roger
-        }
-        RadioMessage::Break => {
-            // Bunker reciprocal-link teardown is owned by bunker_link's three
-            // verified trigger-specific helpers. Radio BREAK adds no guessed
-            // bunker mutation here; the shared receiver tail clears Contacts.
-            RadioResponse::None
-        }
-        _ => RadioResponse::None,
-    }
-}
-
-/// Sim-state admission gate (no rules): own-owner, alive, not occupied, idle.
-/// The rules-gated Bunkerable+weapon check runs at command time (EnterBunker).
-fn bunker_admits(sim: &Simulation, bld: u64, unit: u64) -> bool {
-    let Some(unit) = sim.substrate.entities.get(unit) else {
-        return false;
-    };
-    // CanEnterBunker 0x0070FBAF..0x0070FBC3, called from this receiver at
-    // 0x0043C512: a unit infected on its way in is refused at the door.
-    if unit.parasite_eating_me.is_some() {
-        return false;
-    }
-    let unit_owner = unit.owner();
-    let Some(b) = sim.substrate.entities.get(bld) else {
-        return false;
-    };
-    if b.dying || b.health.current == 0 {
-        return false;
-    }
-    if b.owner() != unit_owner {
-        return false;
-    }
-    if b.bunker_occupant.is_some() {
-        return false;
-    }
-    matches!(b.bunker_runtime.map(|rt| rt.state), Some(BunkerState::Idle))
-}
-
-#[cfg(test)]
+#[cfg(all(test, tests_sim_p_s))]
 mod tests {
-    use super::dock_pad_cell;
     use crate::map::entities::EntityCategory;
-    use crate::sim::components::Health;
+    use crate::sim::combat::Health;
     use crate::sim::game_entity::GameEntity;
     use crate::sim::radio::{
         RadioMessage, RadioPayload, RadioResponse, RadioTestEvent, broadcast_break,
@@ -1061,14 +2508,14 @@ mod tests {
             0,
             0,
             owner_id,
-            Health { current: 900 },
+            Health::new(900),
             type_id,
             EntityCategory::Structure,
             0,
             5,
             false,
         );
-        ge.radio_contacts.set_capacity(capacity);
+        ge.seldom.radio_contacts.set_capacity(capacity);
         sim.substrate.entities.insert(ge);
     }
 
@@ -1082,7 +2529,7 @@ mod tests {
             0,
             0,
             owner_id,
-            Health { current: 200 },
+            Health::new(200),
             type_id,
             EntityCategory::Unit,
             0,
@@ -1103,15 +2550,57 @@ mod tests {
             0,
             0,
             owner_id,
-            Health { current: 1000 },
+            Health::new(1000),
             type_id,
             EntityCategory::Structure,
             0,
             5,
             false,
         );
-        ge.bunker_runtime = Some(BunkerRuntime::idle());
+        ge.building.bunker_runtime = Some(BunkerRuntime::idle());
         sim.substrate.entities.insert(ge);
+    }
+
+    /// Ares UnitClass_ReceivedRadioCommand_BySize1 (1004C150, hook
+    /// 0x73762B): a `Passengers.BySize=no` hold of two size-3 riders takes a
+    /// third, which the Size total (3 + 3 + 3 over `Passengers=4`) refuses.
+    #[test]
+    fn ares_passengers_by_size_no_counts_heads() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        let rules =
+            crate::rules::ruleset::RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(
+                "[InfantryTypes]\n0=RIDER\n[VehicleTypes]\n0=BYSIZE\n1=BYHEAD\n\
+                 [RIDER]\nSize=3\n\
+                 [BYSIZE]\nPassengers=4\nSizeLimit=3\n\
+                 [BYHEAD]\nPassengers=4\nSizeLimit=3\nPassengers.BySize=no\n",
+            ))
+            .unwrap();
+        let rider = rules.object("RIDER").unwrap();
+        for (transport, room) in [("BYSIZE", false), ("BYHEAD", true)] {
+            let object = rules.object(transport).unwrap();
+            let mut hull = GameEntity::new_at_frame_zero_for_test(
+                1,
+                10,
+                10,
+                0,
+                0,
+                crate::sim::intern::InternedId::default(),
+                Health::new(100),
+                crate::sim::intern::InternedId::default(),
+                EntityCategory::Unit,
+                0,
+                5,
+                true,
+            );
+            let cargo = hull.passenger_role_mut_for_test().ensure_hold();
+            cargo.set_passengers_for_test(vec![2, 3]);
+            cargo.set_passenger_sizes_for_test(vec![3.0, 3.0]);
+            assert_eq!(
+                super::transport_has_room(&hull, object, rider, rules.ares_form()),
+                room,
+                "{transport}"
+            );
+        }
     }
 
     fn hello(sim: &mut Simulation, sender: u64, target: u64) -> RadioResponse {
@@ -1121,82 +2610,491 @@ mod tests {
             target,
             RadioMessage::Hello,
             RadioPayload::default(),
-            None,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            &mut crate::sim::world::FrameEffects::default(),
         )
     }
 
-    fn can_enter(sim: &mut Simulation, sender: u64, target: u64) -> RadioResponse {
+    fn can_enter(
+        sim: &mut Simulation,
+        sender: u64,
+        target: u64,
+        rules: &crate::rules::ruleset::RuleSet,
+    ) -> RadioResponse {
         transmit(
             sim,
             sender,
             target,
             RadioMessage::CanEnter,
             RadioPayload::default(),
-            None,
+            rules,
+            &mut crate::sim::world::FrameEffects::default(),
         )
     }
 
+    /// A NATBNK, a bunkerable TANK and an unarmed NOGUN.
+    fn bunker_rules() -> crate::rules::ruleset::RuleSet {
+        crate::rules::ruleset::RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(
+            "[VehicleTypes]\n0=TANK\n1=NOGUN\n\n[InfantryTypes]\n\n[AircraftTypes]\n\n\
+             [BuildingTypes]\n0=NATBNK\n\n\
+             [TANK]\nStrength=400\nArmor=heavy\nSpeed=6\nTurret=yes\nPrimary=120mm\n\n\
+             [NOGUN]\nStrength=400\nArmor=heavy\nSpeed=6\nTurret=yes\n\n\
+             [NATBNK]\nStrength=1000\nArmor=heavy\nBunker=yes\n",
+        ))
+        .expect("rules parse")
+    }
+
+    fn spawn_tank(sim: &mut Simulation, sid: u64, owner: &str, type_name: &str) {
+        spawn_miner(sim, sid, owner);
+        let tank = sim.interner.intern(type_name);
+        sim.substrate
+            .entities
+            .get_mut(sid)
+            .unwrap()
+            .set_type_ref_for_test(tank);
+    }
+
+    fn infantry_output_link(weapons_factory: bool) -> (Simulation, crate::rules::ruleset::RuleSet) {
+        use crate::rules::ini_parser::IniFile;
+        let rules = crate::rules::ruleset::RuleSet::from_ini(&IniFile::from_str(&format!(
+            "[InfantryTypes]\n0=E1\n[E1]\nStrength=125\n\
+             [BuildingTypes]\n0=GAPILE\n[GAPILE]\nStrength=500\n\
+             WeaponsFactory={weapons_factory}\nHospital=no\n"
+        )))
+        .unwrap();
+        let mut sim = Simulation::with_seed(31);
+        spawn_refinery(&mut sim, 2, "Americans", 3);
+        let type_ref = sim.intern("GAPILE");
+        let building = sim.substrate.entities.get_mut(2).unwrap();
+        building.set_type_ref_for_test(type_ref);
+        building.lifecycle.set_in_limbo_for_test(false);
+        building.lifecycle.set_cell_marked_for_test(true);
+        let owner = sim.intern("Americans");
+        let type_ref = sim.intern("E1");
+        let mut infantry = GameEntity::new_at_frame_zero_for_test(
+            1,
+            15,
+            16,
+            0,
+            128,
+            owner,
+            Health::new(125),
+            type_ref,
+            EntityCategory::Infantry,
+            0,
+            5,
+            false,
+        );
+        infantry.lifecycle.set_in_limbo_for_test(false);
+        infantry.lifecycle.set_cell_marked_for_test(true);
+        infantry.seldom.radio_contacts.set_capacity(3);
+        sim.substrate.entities.insert(infantry);
+        assert_eq!(hello(&mut sim, 1, 2), RadioResponse::Roger);
+        assert_eq!(
+            transmit(
+                &mut sim,
+                1,
+                2,
+                RadioMessage::Tether,
+                RadioPayload::default(),
+                &rules,
+                &mut crate::sim::world::FrameEffects::default(),
+            ),
+            RadioResponse::Roger
+        );
+        crate::sim::radio::take_transmit_log();
+        clear_test_trace();
+        (sim, rules)
+    }
+
+    /// Original P2 output frames268/485: ExitObject444DC3/444DD9 sends
+    /// HELLO2 then9; Foot4D90D9 reaches Techno6F4C6F, then three nested24
+    /// sends end with the innermost Radio/Object default0. The jump table
+    /// at6F4E88 maps9 to the same arm as7/0x16. This compares the radio
+    /// sequence, contacts/tether and unchanged RNG, not the other Exit work.
+    /// Native packet: basic-factory-output-prerequisites-research,
+    /// rally-consumer-handoff-primary-2.json, SHA00632f4d2610f63a4afe53513bd7441d834d51d8c46ee67480c7fbb17ad893e6.
     #[test]
-    fn bunker_bus_routes_and_admits_by_sim_state() {
-        use crate::sim::docking::bunker_install::BunkerState;
+    fn barracks_output_hello_then_nine_replays_native_reciprocal_tether() {
+        let (mut sim, rules) = infantry_output_link(false);
+        // Use the same canonical bus to return the reusable linked fixture to
+        // the supplied pre-output state: no contacts and no tether.
+        assert_eq!(
+            transmit(
+                &mut sim,
+                2,
+                1,
+                RadioMessage::Break,
+                RadioPayload::default(),
+                &rules,
+                &mut crate::sim::world::FrameEffects::default()
+            ),
+            RadioResponse::Roger
+        );
+        for id in [1, 2] {
+            let entity = sim.substrate.entities.get(id).unwrap();
+            assert!(entity.seldom.radio_contacts.is_empty());
+            assert_eq!(entity.seldom.tether.partner(), None);
+        }
+        crate::sim::radio::take_transmit_log();
+        clear_test_trace();
+        let rng = sim.rng_state();
+        assert_eq!(
+            transmit(
+                &mut sim,
+                2,
+                1,
+                RadioMessage::Hello,
+                RadioPayload::default(),
+                &rules,
+                &mut crate::sim::world::FrameEffects::default()
+            ),
+            RadioResponse::Roger
+        );
+        assert_eq!(
+            transmit(
+                &mut sim,
+                2,
+                1,
+                RadioMessage::TetherBack,
+                RadioPayload::default(),
+                &rules,
+                &mut crate::sim::world::FrameEffects::default()
+            ),
+            RadioResponse::Roger
+        );
+        let actual = crate::sim::radio::take_transmit_log()
+            .into_iter()
+            .map(|row| (row.sender_sid, row.msg, row.target_sid, row.reply))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual,
+            vec![
+                (2, 2, 1, Some(1)),
+                (2, 9, 1, Some(1)),
+                (1, 24, 2, Some(1)),
+                (2, 24, 1, Some(1)),
+                (1, 24, 2, Some(0)),
+            ]
+        );
+        for (id, peer) in [(1, 2), (2, 1)] {
+            let entity = sim.substrate.entities.get(id).unwrap();
+            assert_eq!(entity.seldom.radio_contacts.len(), 1);
+            assert!(entity.has_live_contact_with(peer));
+            assert_eq!(entity.seldom.tether.partner(), Some(peer));
+        }
+        assert_eq!(sim.rng_state(), rng);
+    }
+
+    /// Original P2 human GAPILE output:51A80C→43CDDD→6F4C29; all three
+    /// native RNG objects remain unchanged by the five nested transactions.
+    /// Saved executable witness: basic-factory-output-prerequisites-research,
+    /// manifest3b42b8512826dc477250a2b894585724db4cb35264770618729c8fd47a083bf5.
+    /// Extra sparse contacts check the existing bus's bounded teardown, not a
+    /// forced factory clear. The class/type priors and radio replies are native.
+    #[test]
+    fn infantry_output_clearance_replays_native_nested_release_and_preserves_other_links() {
+        let (mut sim, rules) = infantry_output_link(false);
+        for id in [1, 2] {
+            sim.substrate
+                .entities
+                .get_mut(id)
+                .unwrap()
+                .seldom
+                .radio_contacts
+                .set_slot(2, 99);
+        }
+        let rng_before = sim.rng_state();
+
+        assert_eq!(
+            transmit(
+                &mut sim,
+                1,
+                2,
+                RadioMessage::RequestClearance,
+                RadioPayload::default(),
+                &rules,
+                &mut crate::sim::world::FrameEffects::default(),
+            ),
+            RadioResponse::Roger
+        );
+
+        let actual = crate::sim::radio::take_transmit_log()
+            .into_iter()
+            .map(|event| (event.sender_sid, event.msg, event.target_sid, event.reply))
+            .collect::<Vec<_>>();
+        // Original entry order; nested replies are filled on return.
+        assert_eq!(
+            actual,
+            vec![
+                (1, 8, 2, Some(1)),
+                (2, 25, 1, Some(1)),
+                (1, 25, 2, Some(1)),
+                (2, 25, 1, Some(0)),
+                (2, 3, 1, Some(1)),
+            ]
+        );
+        for id in [1, 2] {
+            let entity = sim.substrate.entities.get(id).unwrap();
+            assert_eq!(entity.seldom.tether.partner(), None);
+            assert_eq!(entity.seldom.radio_contacts.slot(0), None);
+            assert_eq!(entity.seldom.radio_contacts.slot(1), None);
+            assert_eq!(entity.seldom.radio_contacts.slot(2), Some(99));
+        }
+        assert_eq!(sim.rng_state(), rng_before);
+    }
+
+    /// Building43CDE2 re-reads its type after the common release. Native
+    /// WeaponsFactory43CE15 returns0x17; stock GAPILE returns1 instead.
+    #[test]
+    fn a_weapons_factory_clearance_releases_before_its_literal_0x17_reply() {
+        let (mut sim, rules) = infantry_output_link(true);
+        assert_eq!(
+            transmit(
+                &mut sim,
+                1,
+                2,
+                RadioMessage::RequestClearance,
+                RadioPayload::default(),
+                &rules,
+                &mut crate::sim::world::FrameEffects::default(),
+            ),
+            RadioResponse::Queued
+        );
+        let log = crate::sim::radio::take_transmit_log();
+        assert_eq!(log[0].reply, Some(0x17));
+        assert_eq!(log.len(), 5);
+        for id in [1, 2] {
+            let entity = sim.substrate.entities.get(id).unwrap();
+            assert_eq!(entity.seldom.tether.partner(), None);
+            assert!(entity.seldom.radio_contacts.is_empty());
+        }
+    }
+
+    /// Original dirty GAPILE Mark2 witness270a1321...391127 returnsAL0 but
+    /// Object5F537A returns radio1, with no lifecycle, raw/list or RNG effects.
+    /// Object+80 itself remains unrepresented; this is the bounded dirty arm.
+    #[test]
+    fn dirty_gapile_mark_refresh_acknowledges_without_a_second_presence_transaction() {
+        let (mut sim, rules) = infantry_output_link(false);
+        let before = serde_json::to_value(sim.substrate.entities.get(2).unwrap()).unwrap();
+        let rng_before = sim.rng_state();
+        let lifecycle_before = sim.lifecycle_test_events_for_test().to_vec();
+        assert!(!Simulation::mark_entity_refresh(&sim.substrate, 2));
+        assert_eq!(
+            transmit(
+                &mut sim,
+                1,
+                2,
+                RadioMessage::AnimStop,
+                RadioPayload::default(),
+                &rules,
+                &mut crate::sim::world::FrameEffects::default(),
+            ),
+            RadioResponse::Roger
+        );
+        assert_eq!(
+            serde_json::to_value(sim.substrate.entities.get(2).unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(sim.rng_state(), rng_before);
+        assert_eq!(sim.lifecycle_test_events_for_test(), lifecycle_before);
+        assert_eq!(
+            take_test_trace(),
+            vec![RadioTestEvent::ObjectMarkRefresh {
+                receiver_sid: 2,
+                sender_sid: Some(1),
+                sender_cell_marked: Some(true),
+                sender_cell_listed: Some(false),
+                accepted: false,
+            }]
+        );
+        let log = crate::sim::radio::take_transmit_log();
+        assert_eq!(log.len(), 1);
+        assert_eq!((log[0].msg, log[0].reply), (13, Some(1)));
+    }
+
+    ///43CE24's WeaponsFactory gate acknowledges before Object5F5320.
+    #[test]
+    fn weapons_factory_mark_refresh_bypasses_the_object_receiver() {
+        let (mut sim, rules) = infantry_output_link(true);
+        assert_eq!(
+            transmit(
+                &mut sim,
+                1,
+                2,
+                RadioMessage::AnimStop,
+                RadioPayload::default(),
+                &rules,
+                &mut crate::sim::world::FrameEffects::default(),
+            ),
+            RadioResponse::Roger
+        );
+        assert!(take_test_trace().is_empty());
+    }
+
+    /// CAN_LOAD on a bunker (`0x0043C2F8..0x0043C541`): the common gates
+    /// (ally, Construction or Selling mission, BState), then the Bunker arm
+    /// (CanEnterBunker, IS_OCCUPIED). The common contact-capacity gate
+    /// reserves the bunker throughout approach and installation.
+    #[test]
+    fn bunker_can_load_runs_the_common_gates_then_its_bunker_arm() {
+        use crate::sim::mission::{MissionId, MissionType};
+        let rules = bunker_rules();
         let mut sim = Simulation::new();
         spawn_bunker(&mut sim, 2, "Americans");
-        spawn_miner(&mut sim, 1, "Americans"); // own-owner vehicle
-        spawn_miner(&mut sim, 3, "Soviets"); // enemy
+        spawn_tank(&mut sim, 1, "Americans", "TANK");
+        spawn_tank(&mut sim, 3, "Soviets", "TANK");
+        spawn_tank(&mut sim, 4, "Americans", "NOGUN");
+        spawn_tank(&mut sim, 5, "Americans", "TANK");
 
-        // Own-owner, idle, empty → admitted.
-        assert_eq!(can_enter(&mut sim, 1, 2), RadioResponse::Roger);
-        // Enemy owner → rejected.
-        assert_eq!(can_enter(&mut sim, 3, 2), RadioResponse::Negatory);
-
-        // Occupied → rejected.
-        sim.substrate.entities.get_mut(2).unwrap().bunker_occupant = Some(99);
-        assert_eq!(can_enter(&mut sim, 1, 2), RadioResponse::Negatory);
-        sim.substrate.entities.get_mut(2).unwrap().bunker_occupant = None;
-
-        // Installing (non-Idle) → rejected.
+        assert_eq!(can_enter(&mut sim, 1, 2, &rules), RadioResponse::Roger);
+        // 0x0043C311..0x0043C323: a sender of a house it is not allied with.
+        assert_eq!(can_enter(&mut sim, 3, 2, &rules), RadioResponse::None);
+        // 0x0043C326..0x0043C346: Construction and Selling refuse.
+        for mission in [MissionType::Construction, MissionType::Selling] {
+            sim.substrate
+                .entities
+                .get_mut(2)
+                .unwrap()
+                .mission
+                .set_current_for_test(MissionId::from_known(mission), 0);
+            assert_eq!(
+                can_enter(&mut sim, 1, 2, &rules),
+                RadioResponse::Negatory,
+                "{mission:?}"
+            );
+        }
         sim.substrate
             .entities
             .get_mut(2)
             .unwrap()
-            .bunker_runtime
-            .as_mut()
-            .unwrap()
-            .state = BunkerState::ArriveWait;
-        assert_eq!(can_enter(&mut sim, 1, 2), RadioResponse::Negatory);
-    }
+            .mission
+            .set_current_for_test(MissionId::from_known(MissionType::Guard), 0);
+        assert_eq!(can_enter(&mut sim, 1, 2, &rules), RadioResponse::Roger);
 
-    #[test]
-    fn bunker_dock_now_starts_install_machine() {
-        use crate::sim::docking::bunker_install::BunkerState;
-        let mut sim = Simulation::new();
-        spawn_bunker(&mut sim, 2, "Americans");
-        spawn_miner(&mut sim, 1, "Americans");
+        // 0x0043C512: CanEnterBunker refuses an unarmed unit.
+        assert_eq!(can_enter(&mut sim, 4, 2, &rules), RadioResponse::Negatory);
+
+        // Another tank's real HELLO reserves the single contact slot.
+        assert_eq!(hello(&mut sim, 5, 2), RadioResponse::Roger);
+        assert_eq!(can_enter(&mut sim, 1, 2, &rules), RadioResponse::Negatory);
         transmit(
             &mut sim,
-            1,
+            5,
             2,
-            RadioMessage::DockNow,
+            RadioMessage::Break,
             RadioPayload::default(),
-            None,
+            &rules,
+            &mut crate::sim::world::FrameEffects::default(),
         );
-        let rt = sim
-            .substrate
-            .entities
-            .get(2)
-            .unwrap()
-            .bunker_runtime
-            .unwrap();
-        assert_eq!(rt.state, BunkerState::ArriveWait);
-        assert_eq!(rt.installing_unit, Some(1));
+        assert_eq!(can_enter(&mut sim, 1, 2, &rules), RadioResponse::Roger);
     }
 
+    /// 43C84C..43C87F checks CanEnterBunker before HELLO, and only for an
+    /// existing contact. A newly contacted unarmed sender is refused on
+    /// its next DOCKING probe, rather than before the first handshake.
     #[test]
-    fn refinery_unchanged_when_not_a_bunker() {
+    fn bunker_docking_rechecks_eligibility_only_for_an_existing_contact() {
+        let rules = bunker_rules();
         let mut sim = Simulation::new();
-        spawn_refinery(&mut sim, 2, "Americans", 1);
-        spawn_miner(&mut sim, 1, "Americans");
-        assert_eq!(hello(&mut sim, 1, 2), RadioResponse::Roger);
+        spawn_bunker(&mut sim, 2, "Americans");
+        spawn_tank(&mut sim, 1, "Americans", "NOGUN");
+        let docking = |sim: &mut Simulation| {
+            transmit(
+                sim,
+                1,
+                2,
+                RadioMessage::CanDock,
+                RadioPayload::default(),
+                &rules,
+                &mut crate::sim::world::FrameEffects::default(),
+            )
+        };
+        assert_eq!(docking(&mut sim), RadioResponse::Roger);
+        assert_eq!(
+            sim.substrate
+                .entities
+                .get(1)
+                .unwrap()
+                .seldom
+                .radio_contacts
+                .slot(0),
+            Some(2)
+        );
+        assert_eq!(
+            sim.substrate
+                .entities
+                .get(2)
+                .unwrap()
+                .seldom
+                .radio_contacts
+                .slot(0),
+            Some(1)
+        );
+        assert_eq!(docking(&mut sim), RadioResponse::Negatory);
+    }
+
+    /// DOCK_NOW on a bunker (`0x0043C6F2..0x0043C785`): refused while it is
+    /// sold; otherwise ready to commence and Repair queued. It neither
+    /// creates a contact nor changes UpdateBunker's status.
+    #[test]
+    fn bunker_dock_now_queues_repair_unless_selling() {
+        use crate::sim::docking::bunker_install::BunkerState;
+        use crate::sim::mission::{MissionId, MissionType};
+        let rules = bunker_rules();
+        let dock_now = |sim: &mut Simulation| {
+            transmit(
+                sim,
+                1,
+                2,
+                RadioMessage::DockNow,
+                RadioPayload::default(),
+                &rules,
+                &mut crate::sim::world::FrameEffects::default(),
+            )
+        };
+        let runtime = |sim: &Simulation| {
+            sim.substrate
+                .entities
+                .get(2)
+                .unwrap()
+                .building
+                .bunker_runtime
+                .unwrap()
+        };
+        let mut sim = Simulation::new();
+        spawn_bunker(&mut sim, 2, "Americans");
+        spawn_tank(&mut sim, 1, "Americans", "TANK");
+
+        sim.substrate
+            .entities
+            .get_mut(2)
+            .unwrap()
+            .mission
+            .set_current_for_test(MissionId::from_known(MissionType::Selling), 0);
+        assert_eq!(dock_now(&mut sim), RadioResponse::Negatory);
+        assert_eq!(runtime(&sim).state(), BunkerState::Idle);
+        assert_eq!(
+            sim.substrate.entities.get(2).unwrap().mission.queued(),
+            MissionId::NONE
+        );
+
+        sim.substrate
+            .entities
+            .get_mut(2)
+            .unwrap()
+            .mission
+            .set_current_for_test(MissionId::from_known(MissionType::Guard), 0);
+        assert_eq!(dock_now(&mut sim), RadioResponse::Roger);
+        let bunker = sim.substrate.entities.get(2).unwrap();
+        assert_eq!(
+            bunker.mission.queued(),
+            MissionId::from_known(MissionType::Repair)
+        );
+        assert_eq!(bunker.building_ready_latch(), 1);
+        assert_eq!(runtime(&sim).state(), BunkerState::Idle);
+        assert!(bunker.seldom.radio_contacts.is_empty());
     }
 
     #[test]
@@ -1211,8 +3109,35 @@ mod tests {
         assert_eq!(hello(&mut sim, 3, 2), RadioResponse::Negatory);
 
         let refinery = sim.substrate.entities.get(2).expect("refinery");
-        assert!(refinery.radio_contacts.contains(1));
-        assert!(!refinery.radio_contacts.contains(3));
+        assert!(refinery.seldom.radio_contacts.contains(1));
+        assert!(!refinery.seldom.radio_contacts.contains(3));
+    }
+
+    /// Ares 3.0 `TechnoExt::GetDockUnloadFacing @ 10044C00`: a unit linked
+    /// to a dock faces that type's art `DockUnloadFacing` (16: south), and
+    /// east without a link.
+    #[test]
+    fn ares_dock_unload_facing_reads_the_linked_dock() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        let rules = crate::rules::ruleset::RuleSet::from_ini_with_fixed_art_for_test(
+            &crate::rules::ini_parser::IniFile::from_str(
+                "[BuildingTypes]\n0=GAREFN\n[GAREFN]\nStrength=900\n",
+            ),
+            &crate::rules::ini_parser::IniFile::from_str("[GAREFN]\nDockUnloadFacing=16\n"),
+        )
+        .unwrap();
+        let mut sim = Simulation::new();
+        spawn_refinery(&mut sim, 2, "Americans", 1);
+        spawn_miner(&mut sim, 1, "Americans");
+        assert_eq!(super::dock_unload_facing(&sim, 1, &rules), 0x4000);
+        sim.substrate
+            .entities
+            .get_mut(1)
+            .unwrap()
+            .seldom
+            .radio_contacts
+            .insert(2);
+        assert_eq!(super::dock_unload_facing(&sim, 1, &rules), 0x8000);
     }
 
     #[test]
@@ -1228,78 +3153,10 @@ mod tests {
                 .entities
                 .get(2)
                 .unwrap()
+                .seldom
                 .radio_contacts
                 .contains(1)
         );
-    }
-
-    #[test]
-    fn idempotent_hello_re_confirms_roger() {
-        let mut sim = Simulation::new();
-        spawn_refinery(&mut sim, 2, "Americans", 1);
-        spawn_miner(&mut sim, 1, "Americans");
-
-        assert_eq!(hello(&mut sim, 1, 2), RadioResponse::Roger);
-        assert_eq!(hello(&mut sim, 1, 2), RadioResponse::Roger);
-        assert_eq!(
-            sim.substrate.entities.get(2).unwrap().radio_contacts.len(),
-            1
-        );
-    }
-
-    #[test]
-    fn enter_dock_sets_flag_and_break_clears_both_sides() {
-        let mut sim = Simulation::new();
-        spawn_refinery(&mut sim, 2, "Americans", 1);
-        spawn_miner(&mut sim, 1, "Americans");
-
-        assert_eq!(hello(&mut sim, 1, 2), RadioResponse::Roger);
-        transmit(
-            &mut sim,
-            1,
-            2,
-            RadioMessage::Tether,
-            RadioPayload::default(),
-            None,
-        );
-        assert_eq!(
-            sim.substrate.entities.get(1).unwrap().dock_entered_with,
-            Some(2)
-        );
-
-        transmit(
-            &mut sim,
-            1,
-            2,
-            RadioMessage::Break,
-            RadioPayload::default(),
-            None,
-        );
-        assert_eq!(
-            sim.substrate.entities.get(1).unwrap().dock_entered_with,
-            None
-        );
-        assert!(
-            !sim.substrate
-                .entities
-                .get(2)
-                .unwrap()
-                .radio_contacts
-                .contains(1)
-        );
-        assert!(
-            !sim.substrate
-                .entities
-                .get(1)
-                .unwrap()
-                .radio_contacts
-                .contains(2)
-        );
-    }
-
-    #[test]
-    fn dock_pad_is_anchor_plus_three_one() {
-        assert_eq!(dock_pad_cell(10, 10), (13, 11));
     }
 
     /// TETHER on an `AirportBound=` aircraft takes the default path
@@ -1316,30 +3173,53 @@ mod tests {
         .unwrap();
         let mut sim = Simulation::new();
         spawn_refinery(&mut sim, 2, "Americans", 1);
-        sim.substrate.entities.get_mut(2).unwrap().type_ref = sim.interner.intern("GAAIRC");
+        sim.substrate
+            .entities
+            .get_mut(2)
+            .unwrap()
+            .set_type_ref_for_test(sim.interner.intern("GAAIRC"));
         spawn_miner(&mut sim, 1, "Americans");
         {
             let plane = sim.substrate.entities.get_mut(1).unwrap();
-            plane.category = EntityCategory::Aircraft;
-            plane.type_ref = sim.interner.intern("ORCA");
+            plane.set_category_for_test(EntityCategory::Aircraft);
+            plane.set_type_ref_for_test(sim.interner.intern("ORCA"));
         }
         for (id, partner) in [(1, 2), (2, 1)] {
             sim.substrate
                 .entities
                 .get_mut(id)
                 .unwrap()
+                .seldom
                 .radio_contacts
                 .set_slot(0, partner);
         }
 
-        crate::sim::radio::broadcast(&mut sim, 1, RadioMessage::Tether, Some(&rules));
+        crate::sim::radio::broadcast(
+            &mut sim,
+            1,
+            RadioMessage::Tether,
+            &rules,
+            &mut crate::sim::world::FrameEffects::default(),
+        );
 
         assert_eq!(
-            sim.substrate.entities.get(1).unwrap().dock_entered_with,
+            sim.substrate
+                .entities
+                .get(1)
+                .unwrap()
+                .seldom
+                .tether
+                .partner(),
             None
         );
         assert_eq!(
-            sim.substrate.entities.get(2).unwrap().dock_entered_with,
+            sim.substrate
+                .entities
+                .get(2)
+                .unwrap()
+                .seldom
+                .tether
+                .partner(),
             Some(1)
         );
     }
@@ -1353,26 +3233,33 @@ mod tests {
         spawn_refinery(&mut sim, 4, "Americans", 1);
 
         let sender = sim.substrate.entities.get_mut(1).unwrap();
-        sender.radio_contacts.set_capacity(4);
-        assert_eq!(sender.radio_contacts.insert(2), Some(0));
-        assert_eq!(sender.radio_contacts.insert(3), Some(1));
-        assert_eq!(sender.radio_contacts.insert(4), Some(2));
-        assert_eq!(sender.radio_contacts.remove(3), Some(1));
+        sender.seldom.radio_contacts.set_capacity(4);
+        assert_eq!(sender.seldom.radio_contacts.insert(2), Some(0));
+        assert_eq!(sender.seldom.radio_contacts.insert(3), Some(1));
+        assert_eq!(sender.seldom.radio_contacts.insert(4), Some(2));
+        assert_eq!(sender.seldom.radio_contacts.remove(3), Some(1));
         sim.substrate
             .entities
             .get_mut(2)
             .unwrap()
+            .seldom
             .radio_contacts
             .insert(1);
         sim.substrate
             .entities
             .get_mut(4)
             .unwrap()
+            .seldom
             .radio_contacts
             .insert(1);
 
         clear_test_trace();
-        broadcast_break(&mut sim, 1, None);
+        broadcast_break(
+            &mut sim,
+            1,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            &mut crate::sim::world::FrameEffects::default(),
+        );
         let trace = take_test_trace();
 
         let reads = trace
@@ -1402,6 +3289,7 @@ mod tests {
                 .entities
                 .get(1)
                 .unwrap()
+                .seldom
                 .radio_contacts
                 .is_empty()
         );
@@ -1419,7 +3307,8 @@ mod tests {
             2,
             RadioMessage::Tether,
             RadioPayload::default(),
-            None,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            &mut crate::sim::world::FrameEffects::default(),
         );
 
         clear_test_trace();
@@ -1429,7 +3318,8 @@ mod tests {
             2,
             RadioMessage::Break,
             RadioPayload::default(),
-            None,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            &mut crate::sim::world::FrameEffects::default(),
         );
 
         assert_eq!(
@@ -1450,7 +3340,13 @@ mod tests {
             ]
         );
         assert_eq!(
-            sim.substrate.entities.get(1).unwrap().dock_entered_with,
+            sim.substrate
+                .entities
+                .get(1)
+                .unwrap()
+                .seldom
+                .tether
+                .partner(),
             None
         );
         assert!(
@@ -1458,55 +3354,7 @@ mod tests {
                 .entities
                 .get(2)
                 .unwrap()
-                .radio_contacts
-                .contains(1)
-        );
-    }
-
-    #[test]
-    fn lifecycle_authority_break_receiver_effect_precedes_common_clear() {
-        let mut sim = Simulation::new();
-        spawn_refinery(&mut sim, 2, "Americans", 1);
-        spawn_miner(&mut sim, 1, "Americans");
-        assert_eq!(hello(&mut sim, 1, 2), RadioResponse::Roger);
-        transmit(
-            &mut sim,
-            1,
-            2,
-            RadioMessage::Tether,
-            RadioPayload::default(),
-            None,
-        );
-
-        clear_test_trace();
-        transmit(
-            &mut sim,
-            1,
-            2,
-            RadioMessage::Break,
-            RadioPayload::default(),
-            None,
-        );
-        let trace = take_test_trace();
-
-        let effect_index = trace
-            .iter()
-            .position(|event| matches!(event, RadioTestEvent::ReceiverClassEffect { .. }))
-            .expect("represented receiver effect boundary");
-        let common_index = trace
-            .iter()
-            .position(|event| matches!(event, RadioTestEvent::ReceiverCommonCleared { .. }))
-            .expect("common receiver clear boundary");
-        assert!(effect_index < common_index);
-        assert_eq!(
-            sim.substrate.entities.get(1).unwrap().dock_entered_with,
-            None
-        );
-        assert!(
-            !sim.substrate
-                .entities
-                .get(2)
-                .unwrap()
+                .seldom
                 .radio_contacts
                 .contains(1)
         );
@@ -1522,17 +3370,23 @@ mod tests {
             let mut sim = Simulation::new();
             spawn_miner(&mut sim, 1, "Americans");
             spawn_miner(&mut sim, 2, "Americans");
-            sim.substrate.entities.get_mut(2).unwrap().category = category;
+            sim.substrate
+                .entities
+                .get_mut(2)
+                .unwrap()
+                .set_category_for_test(category);
             sim.substrate
                 .entities
                 .get_mut(1)
                 .unwrap()
+                .seldom
                 .radio_contacts
                 .insert(2);
             sim.substrate
                 .entities
                 .get_mut(2)
                 .unwrap()
+                .seldom
                 .radio_contacts
                 .insert(1);
 
@@ -1542,7 +3396,8 @@ mod tests {
                 2,
                 RadioMessage::Break,
                 RadioPayload::default(),
-                None,
+                crate::rules::ruleset::RuleSet::empty_for_test(),
+                &mut crate::sim::world::FrameEffects::default(),
             );
 
             assert!(
@@ -1550,6 +3405,7 @@ mod tests {
                     .entities
                     .get(1)
                     .unwrap()
+                    .seldom
                     .radio_contacts
                     .contains(2)
             );
@@ -1558,6 +3414,7 @@ mod tests {
                     .entities
                     .get(2)
                     .unwrap()
+                    .seldom
                     .radio_contacts
                     .contains(1)
             );
@@ -1573,6 +3430,7 @@ mod tests {
             .entities
             .get_mut(1)
             .unwrap()
+            .seldom
             .radio_contacts
             .insert(2);
 
@@ -1582,7 +3440,8 @@ mod tests {
             2,
             RadioMessage::Break,
             RadioPayload::default(),
-            None,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            &mut crate::sim::world::FrameEffects::default(),
         );
         transmit(
             &mut sim,
@@ -1590,7 +3449,8 @@ mod tests {
             2,
             RadioMessage::Break,
             RadioPayload::default(),
-            None,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            &mut crate::sim::world::FrameEffects::default(),
         );
 
         assert!(
@@ -1598,6 +3458,7 @@ mod tests {
                 .entities
                 .get(1)
                 .unwrap()
+                .seldom
                 .radio_contacts
                 .is_empty()
         );
@@ -1606,8 +3467,392 @@ mod tests {
                 .entities
                 .get(2)
                 .unwrap()
+                .seldom
                 .radio_contacts
                 .is_empty()
+        );
+    }
+
+    /// Replays original Unit737430 message0F with supplied signed cargo,
+    /// binary64 Size/SizeLimit, alliance and refusal controls.
+    #[test]
+    fn unit_transport_can_enter_matches_original_radio_controls() {
+        use crate::rules::ini_parser::IniFile;
+        use crate::sim::capture_manager::{CaptureManagerState, MindControlLink};
+        use crate::sim::passenger::{PassengerCargo, PassengerRole};
+        let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/unit_transport_can_enter.json",
+        ))
+        .unwrap();
+        for row in corpus["rows"].as_array().unwrap() {
+            let input = &row["input"];
+            let capacity = input["capacity"].as_i64().unwrap();
+            let limit = input["size_limit"].as_f64().unwrap();
+            let size = input["passenger_size"].as_f64().unwrap();
+            let rules = crate::rules::ruleset::RuleSet::from_ini(&IniFile::from_str(&format!(
+                "[VehicleTypes]\n0=TRAN\n[TRAN]\nStrength=100\nPassengers={capacity}\nSizeLimit={limit}\n\
+                 [InfantryTypes]\n0=E1\n[E1]\nStrength=100\nSize={size}\n"
+            )))
+            .unwrap();
+            let mut sim = Simulation::with_seed(31);
+            let own = sim.intern("Americans");
+            let other = sim.intern("Russians");
+            if input["allied"].as_bool().unwrap_or(false) {
+                sim.house_alliances_mut_for_test()
+                    .insert("AMERICANS".into(), ["RUSSIANS".into()].into());
+            }
+            if input["reverse_allied"].as_bool().unwrap_or(false) {
+                sim.house_alliances_mut_for_test()
+                    .insert("RUSSIANS".into(), ["AMERICANS".into()].into());
+            }
+            let carrier_type = sim.intern("TRAN");
+            let mut carrier = GameEntity::new_at_frame_zero_for_test(
+                1,
+                10,
+                10,
+                128,
+                128,
+                own,
+                Health::new(100),
+                carrier_type,
+                EntityCategory::Unit,
+                0,
+                5,
+                false,
+            );
+            let mut cargo = PassengerCargo::new(capacity.max(0) as u32, limit);
+            for (index, entry) in input["cargo_sizes"].as_array().unwrap().iter().enumerate() {
+                cargo.board_forced_chain(&[(10 + index as u64, entry.as_f64().unwrap())]);
+            }
+            carrier.set_passenger_role_for_test(PassengerRole::transport(cargo));
+            if input["warped"].as_bool().unwrap_or(false) {
+                carrier.set_temporal_for_test(
+                    crate::sim::temporal::TemporalState::warped_by_for_test(99),
+                );
+            }
+            sim.substrate.entities.insert(carrier);
+            let passenger_type = sim.intern("E1");
+            let mut passenger = GameEntity::new_at_frame_zero_for_test(
+                2,
+                10,
+                10,
+                128,
+                128,
+                if input["other_house"].as_bool().unwrap_or(false) {
+                    other
+                } else {
+                    own
+                },
+                Health::new(100),
+                passenger_type,
+                EntityCategory::Infantry,
+                0,
+                5,
+                false,
+            );
+            if input["controlled"].as_bool().unwrap_or(false) {
+                passenger.seldom.mind_control = MindControlLink::controlled_by_for_test(99);
+            }
+            if input["parasite"].as_bool().unwrap_or(false) {
+                passenger.parasite.set_eater_for_test(Some(99));
+            }
+            if input["controlling"].as_bool().unwrap_or(false)
+                || input["empty_controller"].as_bool().unwrap_or(false)
+            {
+                passenger.capture_manager =
+                    Some(Box::new(CaptureManagerState::with_victims_for_test(
+                        1,
+                        false,
+                        if input["controlling"].as_bool().unwrap_or(false) {
+                            &[99]
+                        } else {
+                            &[]
+                        },
+                    )));
+            }
+            sim.substrate.entities.insert(passenger);
+            if input["building"].as_bool().unwrap_or(false) {
+                sim.substrate.occupancy.add(
+                    10,
+                    10,
+                    99,
+                    crate::sim::movement::locomotor::MovementLayer::Ground,
+                    None,
+                    crate::sim::occupancy::CellListInsertion::AppendBuilding,
+                );
+            }
+            let before = sim.rng_state();
+            let sender = (!input["no_sender"].as_bool().unwrap_or(false)).then_some(2);
+            let response = super::receive_radio(
+                &mut sim,
+                1,
+                sender,
+                RadioMessage::CanEnter,
+                RadioPayload::default(),
+                &rules,
+                &mut crate::sim::world::FrameEffects::default(),
+            );
+            assert_eq!(
+                u64::from(response.code()),
+                row["reply"].as_u64().unwrap(),
+                "{}",
+                input["name"]
+            );
+            assert_eq!(sim.rng_state(), before, "{}", input["name"]);
+        }
+    }
+
+    /// The click and arrival radio share Aircraft41946B's signed capacity
+    /// and alliance gate; a map may give a retail aircraft passengers.
+    #[test]
+    fn an_aircraft_with_passengers_answers_the_enter_query() {
+        use crate::rules::ini_parser::IniFile;
+        use crate::rules::ruleset::RuleSet;
+        use crate::sim::passenger::{PassengerCargo, PassengerRole};
+        let mut ini = IniFile::from_str(
+            "[AircraftTypes]\n0=SHAD\n[SHAD]\nStrength=200\nPassengers=5\n\
+             [InfantryTypes]\n0=E1\n[E1]\nStrength=100\nSize=1\n",
+        );
+        let rules = crate::rules::ruleset::RuleSet::from_ini(&ini).unwrap();
+        let mut sim = Simulation::with_seed(31);
+        let own = sim.intern("Americans");
+        let plane_type = sim.intern("SHAD");
+        let mut plane = GameEntity::new_at_frame_zero_for_test(
+            1,
+            10,
+            10,
+            128,
+            128,
+            own,
+            Health::new(200),
+            plane_type,
+            EntityCategory::Aircraft,
+            0,
+            5,
+            false,
+        );
+        plane.set_passenger_role_for_test(PassengerRole::transport(PassengerCargo::new(5, 0.0)));
+        sim.substrate.entities.insert(plane);
+        let gi_type = sim.intern("E1");
+        sim.substrate
+            .entities
+            .insert(GameEntity::new_at_frame_zero_for_test(
+                2,
+                11,
+                10,
+                128,
+                128,
+                own,
+                Health::new(100),
+                gi_type,
+                EntityCategory::Infantry,
+                0,
+                5,
+                false,
+            ));
+
+        assert_eq!(
+            super::can_load_query(&sim, 1, 2, &rules),
+            RadioResponse::Roger
+        );
+        assert!(crate::sim::passenger::can_enter_transport(
+            &sim, &rules, 2, 1
+        ));
+        assert_eq!(
+            super::receive_radio(
+                &mut sim,
+                1,
+                None,
+                RadioMessage::CanEnter,
+                RadioPayload::default(),
+                &rules,
+                &mut crate::sim::world::FrameEffects::default(),
+            ),
+            RadioResponse::None
+        );
+        let foreign = sim.intern("Russians");
+        sim.substrate
+            .entities
+            .get_mut(2)
+            .unwrap()
+            .set_owner_for_test(foreign);
+        assert_eq!(
+            super::can_load_query(&sim, 1, 2, &rules),
+            RadioResponse::None
+        );
+        sim.substrate
+            .entities
+            .get_mut(2)
+            .unwrap()
+            .set_owner_for_test(own);
+
+        // Aircraft419477 tests nonzero, not positive; count0 is already
+        // full for signed -1. The pure query reads the type, not Cargo.capacity.
+        ini.merge(&IniFile::from_str("[SHAD]\nPassengers=-1\n"));
+        let negative = RuleSet::from_ini(&ini).unwrap();
+        assert_eq!(
+            super::can_load_query(&sim, 1, 2, &negative),
+            RadioResponse::Negatory
+        );
+        ini.merge(&IniFile::from_str("[SHAD]\nPassengers=0\n"));
+        let zero = RuleSet::from_ini(&ini).unwrap();
+        assert_eq!(
+            super::can_load_query(&sim, 1, 2, &zero),
+            RadioResponse::None
+        );
+    }
+
+    /// The aircraft receiver's transport arms need `Carryall=` (`+0xDFC`) or
+    /// `Passengers=` (`+0x5E0`); no retail aircraft type sets either, so 8
+    /// and 0xE take the Foot path and CAN_LOAD answers 0.
+    #[test]
+    fn retail_fly_aircraft_take_no_radio_passengers() {
+        let Some(rules) = crate::rules::retail_ini_fixture::retail_rulesmd_rules() else {
+            return;
+        };
+        assert!(!rules.aircraft_ids.is_empty());
+        for name in &rules.aircraft_ids {
+            let object = rules.object(name).unwrap();
+            assert!(!object.carryall, "{name}");
+            assert_eq!(object.passengers, 0, "{name}");
+        }
+    }
+
+    /// CAN_LOAD of an aircraft with `Passengers=` (`0x0041946B`), as the
+    /// click asks it (`0x0051EE1A`): ROGER for an ally below the count,
+    /// NEGATORY at it, 0 for a house the owner is not allied with.
+    #[test]
+    fn an_aircraft_transport_answers_can_load_by_count() {
+        use crate::rules::ini_parser::IniFile;
+        use crate::sim::passenger::{PassengerCargo, PassengerRole};
+        let rules = crate::rules::ruleset::RuleSet::from_ini(&IniFile::from_str(
+            "[AircraftTypes]\n0=SHAD\n[SHAD]\nStrength=200\nPassengers=2\n\
+             [InfantryTypes]\n0=E1\n[E1]\nStrength=100\nSize=1\n",
+        ))
+        .unwrap();
+        let mut sim = Simulation::with_seed(31);
+        let own = sim.intern("Americans");
+        let enemy = sim.intern("Russians");
+        let plane_type = sim.intern("SHAD");
+        let mut plane = GameEntity::new_at_frame_zero_for_test(
+            1,
+            10,
+            10,
+            128,
+            128,
+            own,
+            Health::new(200),
+            plane_type,
+            EntityCategory::Aircraft,
+            0,
+            5,
+            false,
+        );
+        plane.set_passenger_role_for_test(PassengerRole::transport(PassengerCargo::new(2, 0.0)));
+        sim.substrate.entities.insert(plane);
+        let gi_type = sim.intern("E1");
+        for (id, owner) in [(2, own), (3, enemy)] {
+            sim.substrate
+                .entities
+                .insert(GameEntity::new_at_frame_zero_for_test(
+                    id,
+                    11,
+                    10,
+                    128,
+                    128,
+                    owner,
+                    Health::new(100),
+                    gi_type,
+                    EntityCategory::Infantry,
+                    0,
+                    5,
+                    false,
+                ));
+        }
+
+        assert_eq!(
+            super::can_load_query(&sim, 1, 2, &rules),
+            RadioResponse::Roger
+        );
+        assert!(crate::sim::passenger::can_enter_transport(
+            &sim, &rules, 2, 1
+        ));
+        assert_eq!(
+            super::can_load_query(&sim, 1, 3, &rules),
+            RadioResponse::None
+        );
+        sim.substrate
+            .entities
+            .get_mut(1)
+            .unwrap()
+            .passenger_role_mut_for_test()
+            .cargo_mut()
+            .unwrap()
+            .set_passengers_for_test(vec![90, 91]);
+        assert_eq!(
+            super::can_load_query(&sim, 1, 2, &rules),
+            RadioResponse::Negatory
+        );
+    }
+
+    /// Ares 3.0 10048D10 (hook 0x41949F): below `Passengers=`, a sender of a
+    /// type the aircraft's `Passengers.Disallowed` lists is NEGATORY.
+    #[test]
+    fn ares_aircraft_transport_refuses_a_disallowed_passenger() {
+        use crate::rules::ini_parser::IniFile;
+        use crate::sim::passenger::{PassengerCargo, PassengerRole};
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        let rules = crate::rules::ruleset::RuleSet::from_ini(&IniFile::from_str(
+            "[AircraftTypes]\n0=SHAD\n[SHAD]\nStrength=200\nPassengers=2\n\
+             Passengers.Disallowed=E2\n\
+             [InfantryTypes]\n0=E1\n1=E2\n[E1]\nStrength=100\n[E2]\nStrength=100\n",
+        ))
+        .unwrap();
+        let mut sim = Simulation::with_seed(31);
+        let own = sim.intern("Americans");
+        let plane_type = sim.intern("SHAD");
+        let mut plane = GameEntity::new_at_frame_zero_for_test(
+            1,
+            10,
+            10,
+            128,
+            128,
+            own,
+            Health::new(200),
+            plane_type,
+            EntityCategory::Aircraft,
+            0,
+            5,
+            false,
+        );
+        plane.set_passenger_role_for_test(PassengerRole::transport(PassengerCargo::new(2, 0.0)));
+        sim.substrate.entities.insert(plane);
+        for (id, name) in [(2, "E1"), (3, "E2")] {
+            let gi_type = sim.intern(name);
+            sim.substrate
+                .entities
+                .insert(GameEntity::new_at_frame_zero_for_test(
+                    id,
+                    11,
+                    10,
+                    128,
+                    128,
+                    own,
+                    Health::new(100),
+                    gi_type,
+                    EntityCategory::Infantry,
+                    0,
+                    5,
+                    false,
+                ));
+        }
+        assert_eq!(
+            super::can_load_query(&sim, 1, 2, &rules),
+            RadioResponse::Roger
+        );
+        assert_eq!(
+            super::can_load_query(&sim, 1, 3, &rules),
+            RadioResponse::Negatory
         );
     }
 }

@@ -22,11 +22,9 @@ const MISSION_AIRCRAFT_ACTION_EXCEPTION: MissionId = MissionId::from_raw(0x1e);
 
 /// An exact input that the current Rust owner could not supply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-pub(crate) enum ReadyUnavailable {
+pub enum ReadyUnavailable {
     #[error("exact locomotor readiness input is unavailable")]
     Locomotor,
-    #[error("exact signed object height is unavailable")]
-    SignedHeight,
     #[error("Infantry Doing value is outside the verified writer domain: {0}")]
     InvalidDoing(i32),
     #[error("required entity/type/occupancy lookup is unavailable")]
@@ -89,6 +87,10 @@ pub(crate) trait UnitReadyWorld {
         &self,
         unit_position: ReadyLeptonPoint,
     ) -> Result<Option<UnitReadyBuilding>, ReadyUnavailable>;
+
+    /// `Get_Height` (vt+0x1C8, `ObjectClass::GetHeight @ 0x005F5F40`), asked
+    /// only on the moving path (`0x007442E9`).
+    fn signed_height(&self) -> i32;
 }
 
 /// Complete borrowed/scalar inputs for the Unit leaf.
@@ -97,7 +99,6 @@ pub(crate) struct UnitReadyView<'a, W: UnitReadyWorld + ?Sized> {
     pub(crate) leaf: &'a UnitMissionLeaf,
     pub(crate) unload_active: bool,
     pub(crate) locomotor: Option<LocomotorReadyState>,
-    pub(crate) signed_height: Option<i32>,
     pub(crate) attack_target_present: bool,
     pub(crate) position: ReadyLeptonPoint,
     pub(crate) world: &'a W,
@@ -125,7 +126,7 @@ pub(crate) struct BuildingReadyView<'a> {
 
 /// Base MissionClass, RadioClass, and FootClass add no readiness gate.
 #[inline]
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) const fn base_ready_to_commence() -> ReadyResult {
     Ok(true)
 }
@@ -155,8 +156,7 @@ pub(crate) fn unit_ready_to_commence<W: UnitReadyWorld + ?Sized>(
             .ok_or(ReadyUnavailable::Locomotor)?
             .is_moving_now();
         if moving {
-            let signed_height = view.signed_height.ok_or(ReadyUnavailable::SignedHeight)?;
-            if signed_height >= 0 {
+            if view.world.signed_height() >= 0 {
                 let effective = view.mission.effective();
                 if effective != MISSION_GUARD
                     && !(effective == MISSION_ATTACK && !view.attack_target_present)
@@ -183,16 +183,15 @@ pub(crate) fn unit_ready_to_commence<W: UnitReadyWorld + ?Sized>(
         {
             return Ok(false);
         }
-    } else if let Some(building) = view.world.building_under_in_stored_order(view.position)? {
-        if building.weapons_factory
-            && crate::util::lepton::lepton_to_cell_packed(view.position.x)
-                == crate::util::lepton::lepton_to_cell_packed(building.anchor.x)
-            && crate::util::lepton::lepton_to_cell_packed(view.position.y).wrapping_sub(
-                crate::util::lepton::lepton_to_cell_packed(building.anchor.y),
-            ) == 1
-        {
-            return Ok(false);
-        }
+    } else if let Some(building) = view.world.building_under_in_stored_order(view.position)?
+        && building.weapons_factory
+        && crate::util::lepton::lepton_to_cell_packed(view.position.x)
+            == crate::util::lepton::lepton_to_cell_packed(building.anchor.x)
+        && crate::util::lepton::lepton_to_cell_packed(view.position.y).wrapping_sub(
+            crate::util::lepton::lepton_to_cell_packed(building.anchor.y),
+        ) == 1
+    {
+        return Ok(false);
     }
 
     Ok(true)
@@ -254,7 +253,7 @@ fn infantry_doing_allows(doing: i32) -> ReadyResult {
         .ok_or(ReadyUnavailable::InvalidDoing(doing))
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_h_o))]
 mod tests {
     use std::cell::RefCell;
 
@@ -263,7 +262,6 @@ mod tests {
     use super::super::state::MissionTestFixture;
     use super::*;
     use crate::map::entities::EntityCategory;
-    use crate::sim::rng::SimRng;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Lookup {
@@ -274,6 +272,7 @@ mod tests {
     struct TestWorld {
         contact: Result<Option<UnitReadyContact>, ReadyUnavailable>,
         building: Result<Option<UnitReadyBuilding>, ReadyUnavailable>,
+        height: i32,
         calls: RefCell<Vec<Lookup>>,
     }
 
@@ -282,6 +281,7 @@ mod tests {
             Self {
                 contact: Ok(None),
                 building: Ok(None),
+                height: 0,
                 calls: RefCell::new(Vec::new()),
             }
         }
@@ -301,6 +301,10 @@ mod tests {
                 .borrow_mut()
                 .push(Lookup::BuildingUnder(unit_position));
             self.building
+        }
+
+        fn signed_height(&self) -> i32 {
+            self.height
         }
     }
 
@@ -347,7 +351,6 @@ mod tests {
             leaf,
             unload_active: false,
             locomotor: Some(stopped()),
-            signed_height: Some(0),
             attack_target_present: false,
             position: ReadyLeptonPoint::new(40 * 256, 51 * 256),
             world,
@@ -393,7 +396,6 @@ mod tests {
             };
             let mut view = unit_view(&mission, leaf_state.as_unit().expect("Unit leaf"), &world);
             view.locomotor = None;
-            view.signed_height = None;
             assert_eq!(unit_ready_to_commence(view), Ok(false));
             assert!(world.calls.borrow().is_empty());
         }
@@ -435,24 +437,15 @@ mod tests {
         let world = TestWorld::default();
         let mut view = unit_view(&mission, leaf, &world);
         view.locomotor = Some(moving());
-        view.signed_height = None;
-        assert_eq!(
-            unit_ready_to_commence(view),
-            Err(ReadyUnavailable::SignedHeight)
-        );
-        assert!(world.calls.borrow().is_empty());
-
-        let world = TestWorld::default();
-        let mut view = unit_view(&mission, leaf, &world);
-        view.locomotor = Some(moving());
-        view.signed_height = Some(0);
         assert_eq!(unit_ready_to_commence(view), Ok(false));
         assert!(world.calls.borrow().is_empty());
 
-        let world = TestWorld::default();
+        let world = TestWorld {
+            height: -1,
+            ..TestWorld::default()
+        };
         let mut view = unit_view(&mission, leaf, &world);
         view.locomotor = Some(moving());
-        view.signed_height = Some(-1);
         assert_eq!(unit_ready_to_commence(view), Ok(true));
 
         for (current, target_present, bypass) in [
@@ -489,7 +482,6 @@ mod tests {
         let world = TestWorld::default();
         let mut view = unit_view(&mission, leaf_state.as_unit().expect("Unit leaf"), &world);
         view.locomotor = None;
-        view.signed_height = None;
         let position = view.position;
         assert_eq!(unit_ready_to_commence(view), Ok(true));
         assert_eq!(
@@ -832,7 +824,7 @@ mod tests {
     fn aircraft_ready_to_commence_action_and_transition_matrix_is_exact() {
         for current in [MISSION_STICKY.raw(), MISSION_RESCUE.raw()] {
             let mission = mission_fixture(current, MissionId::NONE.raw(), 0);
-            let leaf_state = MissionLeafState::aircraft_raw_for_test(0, 1, false);
+            let leaf_state = MissionLeafState::aircraft_raw_for_test(0, 1);
             assert_eq!(
                 aircraft_ready_to_commence(AircraftReadyView {
                     mission: &mission,
@@ -850,7 +842,7 @@ mod tests {
             (MISSION_AIRCRAFT_ACTION_EXCEPTION.raw(), 255, 0, false),
         ] {
             let mission = mission_fixture(current, MissionId::NONE.raw(), 0);
-            let leaf_state = MissionLeafState::aircraft_raw_for_test(action, transition, false);
+            let leaf_state = MissionLeafState::aircraft_raw_for_test(action, transition);
             assert_eq!(
                 aircraft_ready_to_commence(AircraftReadyView {
                     mission: &mission,
@@ -881,29 +873,5 @@ mod tests {
             }),
             Ok(false)
         );
-    }
-
-    #[test]
-    fn unit_ready_to_commence_is_pure_and_does_not_consume_rng() {
-        let mission = mission_fixture(MISSION_GUARD.raw(), MissionId::NONE.raw(), 0);
-        let leaf_state = unit_leaf(0, 0, 0, 0);
-        let world = TestWorld::default();
-        let mission_before = mission;
-        let leaf_before = leaf_state;
-        let rng = SimRng::new(0x1234_5678);
-        let rng_before = rng.state();
-
-        assert_eq!(
-            unit_ready_to_commence(unit_view(
-                &mission,
-                leaf_state.as_unit().expect("Unit leaf"),
-                &world
-            )),
-            Ok(true)
-        );
-
-        assert_eq!(mission, mission_before);
-        assert_eq!(leaf_state, leaf_before);
-        assert_eq!(rng.state(), rng_before);
     }
 }

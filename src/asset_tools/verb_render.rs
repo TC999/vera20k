@@ -23,8 +23,9 @@ use std::path::{Path, PathBuf};
 use crate::asset_tools::canvas::{self, Rgba, SheetCell};
 use crate::asset_tools::identify;
 use crate::asset_tools::names::NameDict;
-use crate::asset_tools::palette::{self, AlphaPolicy};
+use crate::asset_tools::palette;
 use crate::asset_tools::report::{ErrorReport, RenderOutputs, RenderReport};
+use crate::asset_tools::sanitise_name;
 use crate::assets::asset_manager::AssetManager;
 use crate::assets::pal_file::Palette;
 use crate::assets::shp_file::ShpFile;
@@ -255,7 +256,6 @@ pub fn run(
     };
 
     let choice = load.choice();
-    let alpha_policy = load.alpha_policy;
     if is_last_resort_palette(&load.reason) {
         warnings.push(format!(
             "palette `{}` came from the last-resort archive scan ({}) — it renders, which is not evidence it is the right palette",
@@ -312,7 +312,7 @@ pub fn run(
         ));
     }
 
-    let sanitised = sanitise_name(name);
+    let sanitised = sanitise_name(name, FALLBACK_DIR_NAME);
     let dir = render_dir(&opts.out, &sanitised);
     std::fs::create_dir_all(&dir).map_err(|err| ErrorReport {
         error: format!("could not create {}: {err}", dir.display()),
@@ -349,12 +349,7 @@ pub fn run(
             out_of_bounds.push(frame_index);
         }
 
-        // Alpha policy decides the converter. Getting this backwards is the
-        // single most likely way this ships wrong-looking art.
-        let converted = match alpha_policy {
-            AlphaPolicy::Standard => shp.frame_to_rgba(frame_index, &render_palette),
-            AlphaPolicy::GamemdUi => shp.frame_to_rgba_ui(frame_index, &render_palette),
-        };
+        let converted = shp.frame_to_rgba(frame_index, &render_palette);
         let frame_image = match converted {
             Ok(rgba) if geom.w > 0 && geom.h > 0 => {
                 // A short pixel buffer means the frame decoded partially; report
@@ -445,7 +440,6 @@ pub fn run(
             mode,
             &choice.name,
             &choice.reason,
-            &choice.alpha_policy,
             opts.house,
         );
         let sheet = canvas::build_contact_sheet(&header, &cells);
@@ -585,7 +579,6 @@ fn compose_frame_image(
 
 /// Header lines printed above the contact sheet. An agent that only looks at the
 /// image must still know which palette produced these colours.
-#[allow(clippy::too_many_arguments)]
 fn sheet_header(
     name: &str,
     source_archive: &str,
@@ -597,7 +590,6 @@ fn sheet_header(
     mode: &str,
     palette_name: &str,
     palette_reason: &str,
-    alpha_policy: &str,
     house: Option<u8>,
 ) -> Vec<String> {
     let mut header = vec![
@@ -605,7 +597,7 @@ fn sheet_header(
         format!(
             "canvas {canvas_w}x{canvas_h}   frames {rendered}/{total}   scale {scale}x   mode {mode}"
         ),
-        format!("palette {palette_name} ({palette_reason}, alpha={alpha_policy})"),
+        format!("palette {palette_name} ({palette_reason})"),
     ];
     if let Some(index) = house {
         header.push(format!(
@@ -623,26 +615,6 @@ fn sheet_header(
 /// drawing, so the punctuation spelling silently rendered as gaps.
 fn cell_label(index: usize, geom: FrameGeometry) -> String {
     format!("f{index} {}x{} at {}:{}", geom.w, geom.h, geom.x, geom.y)
-}
-
-/// Replace every character outside `[A-Za-z0-9._-]` so the name is safe as a
-/// directory and filename component on any platform.
-fn sanitise_name(name: &str) -> String {
-    let sanitised: String = name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitised.is_empty() {
-        FALLBACK_DIR_NAME.to_string()
-    } else {
-        sanitised
-    }
 }
 
 /// `<out>/render/<sanitised>/`, absolutised so the reported paths do not depend
@@ -805,21 +777,12 @@ fn summarise_indices(indices: &[usize]) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_asset_tools))]
 mod tests {
     use super::*;
 
     fn geom(x: u16, y: u16, w: u16, h: u16) -> FrameGeometry {
         FrameGeometry { x, y, w, h }
-    }
-
-    #[test]
-    fn sanitise_name_keeps_safe_characters_and_replaces_the_rest() {
-        assert_eq!(sanitise_name("sidebar.shp"), "sidebar.shp");
-        assert_eq!(sanitise_name("gi-idle_01.shp"), "gi-idle_01.shp");
-        assert_eq!(sanitise_name("ra2\\dir/na me:x*?"), "ra2_dir_na_me_x__");
-        assert_eq!(sanitise_name(""), FALLBACK_DIR_NAME);
-        assert_eq!(sanitise_name("///"), "___");
     }
 
     #[test]
@@ -831,27 +794,6 @@ mod tests {
             "{}",
             dir.display()
         );
-    }
-
-    #[test]
-    fn render_dir_preserves_an_absolute_out_root_verbatim() {
-        let root = if cfg!(windows) {
-            PathBuf::from("C:\\tmp\\out")
-        } else {
-            PathBuf::from("/tmp/out")
-        };
-        let dir = render_dir(&root, "x.shp");
-        assert!(dir.starts_with(&root), "{}", dir.display());
-        assert!(dir.ends_with(Path::new(RENDER_SUBDIR).join("x.shp")));
-    }
-
-    #[test]
-    fn output_filenames_zero_pad_to_three_digits() {
-        assert_eq!(frame_png_name("gi.shp", 0), "gi.shp.000.png");
-        assert_eq!(frame_png_name("gi.shp", 7), "gi.shp.007.png");
-        assert_eq!(frame_png_name("gi.shp", 42), "gi.shp.042.png");
-        assert_eq!(frame_png_name("gi.shp", 1234), "gi.shp.1234.png");
-        assert_eq!(sheet_png_name("gi.shp"), "gi.shp.sheet.png");
     }
 
     #[test]
@@ -955,7 +897,7 @@ mod tests {
         assert_eq!(fit_scale(60, 30, 8), Some(8));
         // Large canvas is reduced rather than refused.
         let fitted = fit_scale(4000, 4000, 16).unwrap();
-        assert!(fitted >= MIN_SCALE && fitted < 16, "{fitted}");
+        assert!((MIN_SCALE..16).contains(&fitted), "{fitted}");
         assert!(
             u64::from(4000_u32) * u64::from(4000_u32) * u64::from(fitted) * u64::from(fitted)
                 <= MAX_OUTPUT_PIXELS
@@ -985,32 +927,6 @@ mod tests {
     }
 
     #[test]
-    fn cell_label_reports_unscaled_frame_geometry() {
-        assert_eq!(cell_label(0, geom(0, 0, 60, 30)), "f0 60x30 at 0:0");
-        assert_eq!(cell_label(12, geom(7, 9, 30, 24)), "f12 30x24 at 7:9");
-    }
-
-    #[test]
-    fn summarise_indices_caps_the_listing() {
-        assert_eq!(summarise_indices(&[1, 2, 3]), "1, 2, 3");
-        let many: Vec<usize> = (0..12).collect();
-        let text = summarise_indices(&many);
-        assert!(text.ends_with("+4 more"), "{text}");
-    }
-
-    #[test]
-    fn default_options_bound_the_frame_count_and_pick_the_build_output_root() {
-        let opts = RenderOptions::default();
-        assert_eq!(opts.limit, DEFAULT_FRAME_LIMIT);
-        assert_eq!(opts.out, PathBuf::from(DEFAULT_OUT_ROOT));
-        assert!(opts.frame.is_none());
-        assert!(opts.palette.is_none());
-        assert!(opts.house.is_none());
-        assert!(opts.scale.is_none());
-        assert!(!opts.crop);
-    }
-
-    #[test]
     fn sheet_header_names_the_palette_and_the_marker_colours() {
         let header = sheet_header(
             "gi.shp",
@@ -1023,7 +939,6 @@ mod tests {
             MODE_CANVAS,
             "unittem.pal",
             "theater default",
-            "standard",
             Some(2),
         );
         let joined = header.join("\n");

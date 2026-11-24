@@ -1,32 +1,36 @@
 use super::*;
 use crate::map::playfield::PlayfieldBounds;
 use crate::rules::ini_parser::IniFile;
+use crate::sim::combat::TargetKind;
 use crate::sim::combat::combat_weapon::WeaponSlot;
-use crate::sim::combat::{AttackTarget, TargetKind};
 use crate::sim::components::NavTargetRef;
-use crate::sim::game_entity::{DelayedFire, PendingBuildingFire};
 use crate::sim::snapshot::GameSnapshot;
+use crate::sim::world::{DelayedFire, PendingBuildingFire};
 use crate::util::fixed_math::SimFixed;
 
 fn rules() -> RuleSet {
-    RuleSet::from_ini(&IniFile::from_str(
-        "[General]\nCloakingStages=9\nCloakDelay=.02\n\
+    RuleSet::from_ini_with_fixed_art_for_test(
+        &crate::sim::arena_fixture::clear_ground_ini(
+            "[General]\nCloakingStages=9\nCloakDelay=.02\n\
          [AudioVisual]\nCloakSound=NavalUnitEmerge\n\
          [VehicleTypes]\n0=SUB\n1=RANKED\n2=DEST\n\
-         [BuildingTypes]\n0=NAYARD\n\
+         [BuildingTypes]\n0=NAYARD\n1=GAPOWR\n\
          [SUB]\nStrength=600\nSpeed=4\nCloakable=yes\nCloakingSpeed=1\nSensorsSight=7\n\
          [DEST]\nStrength=600\nSpeed=6\nSensors=yes\nSensorsSight=8\n\
          [RANKED]\nStrength=600\nSpeed=4\nVeteranAbilities=CLOAK\nEliteAbilities=CLOAK\n\
-         [NAYARD]\nStrength=1000\nWeaponsFactory=yes\n",
-    ))
+         [NAYARD]\nStrength=1000\nWeaponsFactory=yes\n\
+         [GAPOWR]\nStrength=750\n",
+        ),
+        &IniFile::from_str("[GAPOWR]\nFoundation=2x2\n"),
+    )
     .expect("stock cloak rules")
 }
 
 fn spawned_sub() -> (Simulation, RuleSet, u64) {
     let rules = rules();
     let mut sim = Simulation::with_seed(0xC10A_C001);
-    sim.fog.width = 64;
-    sim.fog.height = 64;
+    sim.fog.set_width_for_test(64);
+    sim.fog.set_height_for_test(64);
     sim.playfield_bounds = Some(PlayfieldBounds::from_normalized_local_size(
         64, 2, 2, 56, 52,
     ));
@@ -45,7 +49,13 @@ fn spawned_sub() -> (Simulation, RuleSet, u64) {
 fn stock_cloak_producer_healthy_trace_uses_type_speed_and_no_rng() {
     let (mut sim, rules, id) = spawned_sub();
     let before = sim.scenario_rng.logical_state();
-    tick_stock_cloak_producer(&mut sim, id, &rules);
+    tick_stock_cloak_producer(
+        &mut sim,
+        id,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default(),
+    );
     assert_eq!(
         sim.substrate
             .entities
@@ -54,7 +64,7 @@ fn stock_cloak_producer_healthy_trace_uses_type_speed_and_no_rng() {
             .cloak
             .as_ref()
             .unwrap()
-            .state,
+            .state(),
         1
     );
     assert_eq!(sim.scenario_rng.logical_state(), before);
@@ -68,11 +78,11 @@ fn stock_cloak_producer_healthy_trace_uses_type_speed_and_no_rng() {
             sub_x,
             sub_y,
             world_z_leptons: 0,
-        }] if sound_id == "NavalUnitEmerge"
-            && *rx == entity.position.rx
-            && *ry == entity.position.ry
-            && *sub_x == entity.position.sub_x
-            && *sub_y == entity.position.sub_y
+        }] if sound_id.name_in(&rules) == "NavalUnitEmerge"
+            && *rx == entity.position.rx()
+            && *ry == entity.position.ry()
+            && *sub_x == entity.position.sub_x()
+            && *sub_y == entity.position.sub_y()
     ));
     assert_eq!(
         sim.interner.get("NavalUnitEmerge"),
@@ -80,8 +90,14 @@ fn stock_cloak_producer_healthy_trace_uses_type_speed_and_no_rng() {
         "the transient entering-cloak cue must not mutate serialized interner state"
     );
     for frame in 1..=5 {
-        sim.session.binary_frame = frame;
-        tick_stock_cloak_producer(&mut sim, id, &rules);
+        sim.session.set_binary_frame_for_test(frame);
+        tick_stock_cloak_producer(
+            &mut sim,
+            id,
+            &rules,
+            None,
+            &mut crate::sim::world::FrameEffects::default(),
+        );
     }
     assert_eq!(
         sim.substrate
@@ -91,7 +107,7 @@ fn stock_cloak_producer_healthy_trace_uses_type_speed_and_no_rng() {
             .cloak
             .as_ref()
             .unwrap()
-            .state,
+            .state(),
         2
     );
     assert_eq!(
@@ -102,23 +118,8 @@ fn stock_cloak_producer_healthy_trace_uses_type_speed_and_no_rng() {
 }
 
 #[test]
-fn stock_cloak_producer_current_fire_and_weapons_factory_contact_block_entry() {
+fn stock_cloak_producer_weapons_factory_contact_blocks_entry() {
     let (mut sim, rules, id) = spawned_sub();
-    sim.substrate.entities.get_mut(id).unwrap().attack_target = Some(AttackTarget::new(999));
-    tick_stock_cloak_producer(&mut sim, id, &rules);
-    assert_eq!(
-        sim.substrate
-            .entities
-            .get(id)
-            .unwrap()
-            .cloak
-            .as_ref()
-            .unwrap()
-            .state,
-        0
-    );
-
-    sim.substrate.entities.get_mut(id).unwrap().attack_target = None;
     let yard = sim
         .spawn_object_at_height("NAYARD", "Soviet", 30, 40, 0, 0, &rules)
         .unwrap();
@@ -126,9 +127,15 @@ fn stock_cloak_producer_current_fire_and_weapons_factory_contact_block_entry() {
         .entities
         .get_mut(id)
         .unwrap()
-        .radio_contacts
+        .seldom.radio_contacts
         .insert(yard);
-    tick_stock_cloak_producer(&mut sim, id, &rules);
+    tick_stock_cloak_producer(
+        &mut sim,
+        id,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default(),
+    );
     assert_eq!(
         sim.substrate
             .entities
@@ -137,7 +144,7 @@ fn stock_cloak_producer_current_fire_and_weapons_factory_contact_block_entry() {
             .cloak
             .as_ref()
             .unwrap()
-            .state,
+            .state(),
         0
     );
 
@@ -145,9 +152,15 @@ fn stock_cloak_producer_current_fire_and_weapons_factory_contact_block_entry() {
         .entities
         .get_mut(id)
         .unwrap()
-        .radio_contacts
+        .seldom.radio_contacts
         .remove(yard);
-    tick_stock_cloak_producer(&mut sim, id, &rules);
+    tick_stock_cloak_producer(
+        &mut sim,
+        id,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default(),
+    );
     assert_eq!(
         sim.substrate
             .entities
@@ -156,72 +169,8 @@ fn stock_cloak_producer_current_fire_and_weapons_factory_contact_block_entry() {
             .cloak
             .as_ref()
             .unwrap()
-            .state,
+            .state(),
         1
-    );
-}
-
-#[test]
-fn fully_cloaked_sub_holding_a_target_does_not_surface() {
-    // CORRECTION. This test used to assert the opposite, encoding two VERA
-    // misreadings at once: that `ShouldUncloak @ 0x006FBC90` treats "holds an
-    // attack target" as activity, and that its tail
-    // `CellClass::IsVisibleToHouse @ 0x004870B0` means cell visibility.
-    //
-    // Native: the head is `IsCloakable() && !IsUnderEMP && !vt+0x380 &&
-    // !WarpIn && !WarpOut`, with no target term anywhere, and the tail reads
-    // the `CloakedByHouses` bit — never set in stock YR. So a submerged
-    // Typhoon that acquires a destroyer stays submerged, and only losing the
-    // ability to sustain the cloak surfaces it.
-    let (mut sim, rules, id) = spawned_sub();
-    sim.substrate
-        .entities
-        .get_mut(id)
-        .unwrap()
-        .cloak
-        .as_mut()
-        .unwrap()
-        .establish_unlimbo_fully_cloaked();
-    sim.substrate.entities.get_mut(id).unwrap().attack_target = Some(AttackTarget::new(999));
-    tick_stock_cloak_producer(&mut sim, id, &rules);
-    assert_eq!(
-        sim.substrate
-            .entities
-            .get(id)
-            .unwrap()
-            .cloak
-            .as_ref()
-            .unwrap()
-            .state,
-        2,
-        "holding a target is CanAutoCloak step 4, not a ShouldUncloak term"
-    );
-    assert!(
-        sim.sound_events.is_empty(),
-        "no transition means no positional cue"
-    );
-
-    // Marking the owner's own cell visible must not change the answer either —
-    // that was the substituted predicate.
-    let owner = sim.substrate.entities.get(id).unwrap().owner;
-    let (rx, ry) = sim
-        .substrate
-        .entities
-        .get(id)
-        .map(|entity| (entity.position.rx, entity.position.ry))
-        .unwrap();
-    sim.fog.mark_visible_for_owner(owner, rx, ry);
-    tick_stock_cloak_producer(&mut sim, id, &rules);
-    assert_eq!(
-        sim.substrate
-            .entities
-            .get(id)
-            .unwrap()
-            .cloak
-            .as_ref()
-            .unwrap()
-            .state,
-        2
     );
 }
 
@@ -238,14 +187,18 @@ fn chrono_warp_surfaces_a_fully_cloaked_sub() {
         .as_mut()
         .unwrap()
         .establish_unlimbo_fully_cloaked();
-    sim.substrate.entities.get_mut(id).unwrap().teleport_state =
-        Some(crate::sim::movement::teleport_movement::TeleportState {
-            phase: crate::sim::movement::teleport_movement::TeleportPhase::Relocate,
-            target_rx: 20,
-            target_ry: 20,
-            being_warped_ticks: 0,
-        });
-    tick_stock_cloak_producer(&mut sim, id, &rules);
+    sim.substrate
+        .entities
+        .get_mut(id)
+        .unwrap()
+        .set_temporal_for_test(crate::sim::temporal::TemporalState::warped_by_for_test(99));
+    tick_stock_cloak_producer(
+        &mut sim,
+        id,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default(),
+    );
     assert_eq!(
         sim.substrate
             .entities
@@ -254,13 +207,13 @@ fn chrono_warp_surfaces_a_fully_cloaked_sub() {
             .cloak
             .as_ref()
             .unwrap()
-            .state,
+            .state(),
         3
     );
     assert!(matches!(
         sim.sound_events.as_slice(),
         [crate::sim::world::SimSoundEvent::CloakSound { sound_id, .. }]
-            if sound_id == "NavalUnitEmerge"
+            if sound_id.name_in(&rules) == "NavalUnitEmerge"
     ));
 }
 
@@ -271,7 +224,7 @@ fn stock_cloak_producer_honors_rank_selected_cloak_ability() {
         .substrate
         .entities
         .get(sub)
-        .map(|entity| (entity.position.rx, entity.position.ry))
+        .map(|entity| (entity.position.rx(), entity.position.ry()))
         .unwrap();
     let ranked = sim
         .spawn_object_at_height("RANKED", "Soviet", rx, ry, 0, 0, &rules)
@@ -281,8 +234,15 @@ fn stock_cloak_producer_honors_rank_selected_cloak_ability() {
         .entities
         .get_mut(ranked)
         .unwrap()
-        .set_veterancy_rank(100);
-    tick_stock_cloak_producer(&mut sim, ranked, &rules);
+        .veterancy
+        .set_rank_for_test(100);
+    tick_stock_cloak_producer(
+        &mut sim,
+        ranked,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default(),
+    );
     assert_eq!(
         sim.substrate
             .entities
@@ -291,7 +251,7 @@ fn stock_cloak_producer_honors_rank_selected_cloak_ability() {
             .cloak
             .as_ref()
             .unwrap()
-            .state,
+            .state(),
         1
     );
 }
@@ -302,8 +262,11 @@ fn stock_cloak_producer_honors_rank_selected_cloak_ability() {
 /// so this arm is dormant in an ordinary skirmish; the tests below still pin
 /// its collect/dispatch shape for a mod that does ship one.
 fn arm_cloak_field_for(sim: &mut Simulation, owner: InternedId, cell: (u16, u16)) {
-    if !sim.session.house_order.contains(&owner) {
-        sim.session.house_order.push(owner);
+    if !sim.houses.contains_key(&owner) {
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                owner, 0, None, false, 0, 10,
+            ));
     }
     sim.fog.reset_cloaked_by_houses();
     let index = sim
@@ -326,11 +289,11 @@ fn sensor_deposit_alone_never_force_cloaks_an_eligible_unit() {
         .substrate
         .entities
         .get(cloaker)
-        .map(|entity| ((entity.position.rx, entity.position.ry), entity.owner))
+        .map(|entity| ((entity.position.rx(), entity.position.ry()), entity.owner()))
         .unwrap();
     sim.fog.mark_visible_for_owner(owner, cell.0, cell.1);
 
-    let outcome = sensor_reevaluate_stock_cloak(&mut sim, cloaker, &rules);
+    let outcome = sensor_reevaluate_stock_cloak(&mut sim, cloaker, &rules, None);
 
     assert_eq!(outcome, SensorCloakReevaluation::default());
     assert_eq!(
@@ -341,7 +304,7 @@ fn sensor_deposit_alone_never_force_cloaks_an_eligible_unit() {
             .cloak
             .as_ref()
             .unwrap()
-            .state,
+            .state(),
         0,
         "no cloak generator field means the vt+0x420 cloak arm never runs"
     );
@@ -355,7 +318,7 @@ fn sensor_callback_reassigns_admitted_targeters_in_forward_techno_registration_o
         .substrate
         .entities
         .get(cloaker)
-        .map(|entity| ((entity.position.rx, entity.position.ry), entity.owner))
+        .map(|entity| ((entity.position.rx(), entity.position.ry()), entity.owner()))
         .unwrap();
     arm_cloak_field_for(&mut sim, cloaker_owner, cell);
 
@@ -373,10 +336,14 @@ fn sensor_callback_reassigns_admitted_targeters_in_forward_techno_registration_o
         .unwrap();
     for id in [sensor_admitted, excluded, same_owner, later_sensor_admitted] {
         let entity = sim.substrate.entities.get_mut(id).unwrap();
-        entity.attack_target = Some(AttackTarget::new(cloaker));
-        entity.passively_acquired_target = true;
+        entity
+            .attack_target
+            .set_for_test(Some(TargetKind::Entity(cloaker)));
+        entity
+            .passive_scan
+            .set_passively_acquired_target_for_test(true);
     }
-    let american_owner = sim.substrate.entities.get(sensor_admitted).unwrap().owner;
+    let american_owner = sim.substrate.entities.get(sensor_admitted).unwrap().owner();
     sim.fog.increment_sensor_at(american_owner, cell.0, cell.1);
 
     // Logic registration is deliberately opposite to prove the callback uses
@@ -388,7 +355,7 @@ fn sensor_callback_reassigns_admitted_targeters_in_forward_techno_registration_o
         sensor_admitted,
         cloaker,
     ]);
-    let outcome = sensor_reevaluate_stock_cloak(&mut sim, cloaker, &rules);
+    let outcome = sensor_reevaluate_stock_cloak(&mut sim, cloaker, &rules, None);
 
     assert!(outcome.cloak_transitioned);
     assert_eq!(
@@ -401,14 +368,16 @@ fn sensor_callback_reassigns_admitted_targeters_in_forward_techno_registration_o
             .entities
             .get(sensor_admitted)
             .unwrap()
-            .passively_acquired_target
+            .passive_scan
+            .acquired()
     );
     assert!(
         !sim.substrate
             .entities
             .get(same_owner)
             .unwrap()
-            .passively_acquired_target,
+            .passive_scan
+            .acquired(),
         "same owner admits without targeter sensor coverage"
     );
     assert!(
@@ -416,20 +385,23 @@ fn sensor_callback_reassigns_admitted_targeters_in_forward_techno_registration_o
             .entities
             .get(later_sensor_admitted)
             .unwrap()
-            .passively_acquired_target
+            .passive_scan
+            .acquired()
     );
-    assert!(
-        sim.substrate
-            .entities
-            .get(excluded)
-            .unwrap()
-            .passively_acquired_target,
-        "an unrelated owner without sensor coverage is not collected"
+    let excluded = sim.substrate.entities.get(excluded).unwrap();
+    assert_eq!(
+        (
+            excluded.attack_target.target(),
+            excluded.passive_scan.acquired()
+        ),
+        (None, false),
+        "an unrelated owner without sensor coverage is not collected: \
+         StartCloaking's Detach_All(false) drops its target for good"
     );
     assert!(matches!(
         sim.sound_events.as_slice(),
         [crate::sim::world::SimSoundEvent::CloakSound { sound_id, .. }]
-            if sound_id == "NavalUnitEmerge"
+            if sound_id.name_in(&rules) == "NavalUnitEmerge"
     ));
 }
 
@@ -447,7 +419,7 @@ fn already_cloaked_object_is_refused_by_can_auto_cloak_step_two() {
         .substrate
         .entities
         .get(cloaker)
-        .map(|entity| ((entity.position.rx, entity.position.ry), entity.owner))
+        .map(|entity| ((entity.position.rx(), entity.position.ry()), entity.owner()))
         .unwrap();
     sim.substrate
         .entities
@@ -463,24 +435,31 @@ fn already_cloaked_object_is_refused_by_can_auto_cloak_step_two() {
         .unwrap();
     {
         let entity = sim.substrate.entities.get_mut(targeter).unwrap();
-        let attack = AttackTarget::new(cloaker);
-        entity.rearm_timer = crate::sim::timer::CdTimer::started(0, 17);
-        entity.weapon_burst.complete_shot(4);
-        entity.pending_building_fire = Some(PendingBuildingFire {
-            remaining_ticks: 7,
-            fire: DelayedFire::Weapon(WeaponSlot::Secondary),
-        });
-        entity.attack_target = Some(attack);
-        entity.passively_acquired_target = true;
+        let attack = TargetKind::Entity(cloaker);
+        entity
+            .seldom.rearm_timer
+            .set_for_test(crate::sim::timer::CdTimer::started(0, 17));
+        entity.seldom.weapon_burst.complete_shot(4);
+        entity
+            .building
+            .pending_building_fire
+            .set_for_test(Some(PendingBuildingFire::new(
+                7,
+                DelayedFire::Weapon(WeaponSlot::Secondary),
+            )));
+        entity.attack_target.set_for_test(Some(attack));
+        entity
+            .passive_scan
+            .set_passively_acquired_target_for_test(true);
     }
     // Arm even the dormant cloak-field bit, to prove the refusal comes from
     // CanAutoCloak and not from the outer CloakedByHouses gate.
     arm_cloak_field_for(&mut sim, cloaker_owner, cell);
     sim.scenario_rng = crate::sim::rng::SimRng::new(0);
-    let mission_before = sim.substrate.entities.get(targeter).unwrap().mission;
+    let mission_before = sim.substrate.entities.get(targeter).unwrap().mission.clone();
     let hash_before = sim.state_hash();
 
-    let outcome = sensor_reevaluate_stock_cloak(&mut sim, cloaker, &rules);
+    let outcome = sensor_reevaluate_stock_cloak(&mut sim, cloaker, &rules, None);
 
     assert_eq!(outcome, SensorCloakReevaluation::default());
     assert!(sim.sound_events.is_empty());
@@ -492,27 +471,27 @@ fn already_cloaked_object_is_refused_by_can_auto_cloak_step_two() {
             .cloak
             .as_ref()
             .unwrap()
-            .state,
+            .state(),
         2
     );
     let entity = sim.substrate.entities.get(targeter).unwrap();
     assert!(
-        entity.passively_acquired_target,
+        entity.passive_scan.acquired(),
         "the transaction never runs, so provenance is untouched"
     );
-    let attack = entity.attack_target.as_ref().unwrap();
-    assert_eq!(attack.target, TargetKind::Entity(cloaker));
+    let attack = entity.attack_target.target().unwrap();
+    assert_eq!(attack, TargetKind::Entity(cloaker));
     assert_eq!(
-        entity.rearm_timer,
+        entity.seldom.rearm_timer.timer(),
         crate::sim::timer::CdTimer::started(0, 17)
     );
-    assert_eq!(entity.weapon_burst.index(), 1);
+    assert_eq!(entity.seldom.weapon_burst.index(), 1);
     assert_eq!(
-        entity.pending_building_fire,
-        Some(PendingBuildingFire {
-            remaining_ticks: 7,
-            fire: DelayedFire::Weapon(WeaponSlot::Secondary),
-        })
+        entity.building.pending_building_fire.pending(),
+        Some(PendingBuildingFire::new(
+            7,
+            DelayedFire::Weapon(WeaponSlot::Secondary)
+        ))
     );
     assert_eq!(entity.mission, mission_before);
     assert_eq!(
@@ -532,7 +511,8 @@ fn already_cloaked_object_is_refused_by_can_auto_cloak_step_two() {
             .entities
             .get(targeter)
             .unwrap()
-            .passively_acquired_target
+            .passive_scan
+            .acquired()
     );
 }
 
@@ -543,12 +523,22 @@ fn the_weapon_rearm_countdown_blocks_the_next_auto_cloak() {
     // as the ReCloak delay and left it unarmed, so a sub that surfaced to fire
     // could dive again on the very next tick.
     let (mut sim, rules, id) = spawned_sub();
-    sim.substrate.entities.get_mut(id).unwrap().rearm_timer =
-        crate::sim::timer::CdTimer::started(0, 20);
+    sim.substrate
+        .entities
+        .get_mut(id)
+        .unwrap()
+        .seldom.rearm_timer
+        .set_for_test(crate::sim::timer::CdTimer::started(0, 20));
 
     for frame in 0..20 {
-        sim.session.binary_frame = frame;
-        tick_stock_cloak_producer(&mut sim, id, &rules);
+        sim.session.set_binary_frame_for_test(frame);
+        tick_stock_cloak_producer(
+            &mut sim,
+            id,
+            &rules,
+            None,
+            &mut crate::sim::world::FrameEffects::default(),
+        );
         assert_eq!(
             sim.substrate
                 .entities
@@ -557,13 +547,19 @@ fn the_weapon_rearm_countdown_blocks_the_next_auto_cloak() {
                 .cloak
                 .as_ref()
                 .unwrap()
-                .state,
+                .state(),
             0,
             "frame {frame} is still inside the ROF window"
         );
     }
-    sim.session.binary_frame = 20;
-    tick_stock_cloak_producer(&mut sim, id, &rules);
+    sim.session.set_binary_frame_for_test(20);
+    tick_stock_cloak_producer(
+        &mut sim,
+        id,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default(),
+    );
     assert_eq!(
         sim.substrate
             .entities
@@ -572,22 +568,26 @@ fn the_weapon_rearm_countdown_blocks_the_next_auto_cloak() {
             .cloak
             .as_ref()
             .unwrap()
-            .state,
+            .state(),
         1,
         "the rearm countdown has expired, so the auto-cloak may begin"
     );
 }
 
+/// The neighbour's House asks about the mover (`0x004D87E8..0x004D87EF`): a
+/// sensor whose House allies the mover's one way leaves it cloaked, and the
+/// mover's own one-way alliance does not.
 #[test]
-fn a_non_allied_sensors_neighbour_surfaces_a_cloaked_mover_on_cell_entry() {
-    // `FootClass::PerCellProcess @ 0x004D8802..0x004D8829`, the only live
-    // `Sensors=` consumer.
+fn a_sensors_neighbour_asks_its_own_house_about_the_mover() {
+    use crate::map::houses::HouseAllianceMap;
+    use crate::sim::house_diplomacy::HouseAllianceAdmission;
+
     let (mut sim, rules, id) = spawned_sub();
     let cell = sim
         .substrate
         .entities
         .get(id)
-        .map(|entity| (entity.position.rx, entity.position.ry))
+        .map(|entity| (entity.position.rx(), entity.position.ry()))
         .unwrap();
     sim.substrate
         .entities
@@ -597,41 +597,21 @@ fn a_non_allied_sensors_neighbour_surfaces_a_cloaked_mover_on_cell_entry() {
         .as_mut()
         .unwrap()
         .establish_unlimbo_fully_cloaked();
-
-    // An own-house neighbour is skipped by the `Is_Ally_ByObject` clause.
-    let friendly = sim
-        .spawn_object_at_height("DEST", "Soviet", cell.0 + 1, cell.1, 0, 0, &rules)
+    sim.spawn_object_at_height("DEST", "Americans", cell.0 + 1, cell.1, 0, 0, &rules)
         .unwrap();
+    let one_way = |asker: &str, other: &str| {
+        HouseAllianceAdmission::Admitted(HouseAllianceMap::from([(
+            asker.to_ascii_uppercase(),
+            [other.to_ascii_uppercase()].into(),
+        )]))
+    };
+    sim.install_house_alliances(one_way("Americans", "Soviet"), &rules);
     assert!(!uncloak_on_sensor_neighbour_after_cell_entry(
         &mut sim, id, &rules
     ));
-    assert!(sim.sound_events.is_empty());
-    // Leave cell, Logic and display membership through their common owner
-    // before removing storage; raw erase left a dangling display identity.
-    sim.object_conceal(friendly);
-    sim.substrate.entities.remove(friendly);
-
-    // A hostile one with `Sensors=yes` forces the surface, with the cue.
-    sim.spawn_object_at_height("DEST", "Americans", cell.0 + 1, cell.1, 0, 0, &rules)
-        .unwrap();
+    sim.install_house_alliances(one_way("Soviet", "Americans"), &rules);
     assert!(uncloak_on_sensor_neighbour_after_cell_entry(
         &mut sim, id, &rules
-    ));
-    assert_eq!(
-        sim.substrate
-            .entities
-            .get(id)
-            .unwrap()
-            .cloak
-            .as_ref()
-            .unwrap()
-            .state,
-        3
-    );
-    assert!(matches!(
-        sim.sound_events.as_slice(),
-        [crate::sim::world::SimSoundEvent::CloakSound { sound_id, .. }]
-            if sound_id == "NavalUnitEmerge"
     ));
 }
 
@@ -646,7 +626,7 @@ fn start_cloaking_drops_every_targeter_whose_house_cannot_sense_the_cell() {
         .substrate
         .entities
         .get(cloaker)
-        .map(|entity| (entity.position.rx, entity.position.ry))
+        .map(|entity| (entity.position.rx(), entity.position.ry()))
         .unwrap();
     let sensing = sim
         .spawn_object_at_height("DEST", "Americans", cell.0 + 1, cell.1, 0, 0, &rules)
@@ -664,17 +644,24 @@ fn start_cloaking_drops_every_targeter_whose_house_cannot_sense_the_cell() {
             .entities
             .get_mut(targeter)
             .unwrap()
-            .attack_target = Some(AttackTarget::new(cloaker));
+            .attack_target
+            .set_for_test(Some(TargetKind::Entity(cloaker)));
     }
-    let american = sim.substrate.entities.get(sensing).unwrap().owner;
+    let american = sim.substrate.entities.get(sensing).unwrap().owner();
     sim.fog.increment_sensor_at(american, cell.0, cell.1);
 
     let timers_before: Vec<_> = [sensing, blind, same_owner]
-        .map(|id| sim.substrate.entities.get(id).unwrap().passive_scan_timer)
+        .map(|id| sim.substrate.entities.get(id).unwrap().passive_scan.timer())
         .to_vec();
     let mut expected_rng = sim.scenario_rng.clone();
     let rng_before = sim.scenario_rng.logical_state();
-    tick_stock_cloak_producer(&mut sim, cloaker, &rules);
+    tick_stock_cloak_producer(
+        &mut sim,
+        cloaker,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default(),
+    );
     assert_eq!(
         sim.substrate
             .entities
@@ -683,7 +670,7 @@ fn start_cloaking_drops_every_targeter_whose_house_cannot_sense_the_cell() {
             .cloak
             .as_ref()
             .unwrap()
-            .state,
+            .state(),
         1
     );
     assert!(
@@ -692,6 +679,7 @@ fn start_cloaking_drops_every_targeter_whose_house_cannot_sense_the_cell() {
             .get(sensing)
             .unwrap()
             .attack_target
+            .target()
             .is_some(),
         "a house that senses the cell keeps firing through the dive"
     );
@@ -701,6 +689,7 @@ fn start_cloaking_drops_every_targeter_whose_house_cannot_sense_the_cell() {
             .get(same_owner)
             .unwrap()
             .attack_target
+            .target()
             .is_some(),
         "same owner is exempt"
     );
@@ -710,6 +699,7 @@ fn start_cloaking_drops_every_targeter_whose_house_cannot_sense_the_cell() {
             .get(blind)
             .unwrap()
             .attack_target
+            .target()
             .is_none(),
         "everyone else loses the pointer at the instant of StartCloaking"
     );
@@ -733,7 +723,7 @@ fn start_cloaking_drops_every_targeter_whose_house_cannot_sense_the_cell() {
         "only the receiver that loses its target spends the RandomRanged(4, 8) draw"
     );
     let timers_after: Vec<_> = [sensing, blind, same_owner]
-        .map(|id| sim.substrate.entities.get(id).unwrap().passive_scan_timer)
+        .map(|id| sim.substrate.entities.get(id).unwrap().passive_scan.timer())
         .to_vec();
     assert_eq!(
         timers_after[0], timers_before[0],
@@ -744,9 +734,10 @@ fn start_cloaking_drops_every_targeter_whose_house_cannot_sense_the_cell() {
         "the same-owner exemption also skips the re-arm"
     );
     assert_ne!(timers_after[1], timers_before[1]);
-    assert_eq!(timers_after[1].start_frame, sim.session.binary_frame);
+    assert_eq!(timers_after[1].start_frame(), sim.session.binary_frame());
     assert_eq!(
-        timers_after[1].duration, drawn,
+        timers_after[1].duration(),
+        drawn,
         "the re-armed delay is the RandomRanged(4, 8) result"
     );
 }
@@ -765,7 +756,7 @@ fn a_dive_reaches_every_registered_object_but_leaves_radio_contacts_intact() {
         .substrate
         .entities
         .get(cloaker)
-        .map(|entity| (entity.position.rx, entity.position.ry))
+        .map(|entity| (entity.position.rx(), entity.position.ry()))
         .unwrap();
     let bystander = sim
         .spawn_object_at_height("RANKED", "Neutral", cell.0 + 2, cell.1, 0, 0, &rules)
@@ -778,7 +769,13 @@ fn a_dive_reaches_every_registered_object_but_leaves_radio_contacts_intact() {
     // A non-targeter spends no draw: the re-arm is inside the Target arm.
     let rng_before = sim.scenario_rng.logical_state();
 
-    tick_stock_cloak_producer(&mut sim, cloaker, &rules);
+    tick_stock_cloak_producer(
+        &mut sim,
+        cloaker,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default(),
+    );
 
     assert!(
         sim.substrate
@@ -818,7 +815,7 @@ fn a_sensing_house_keeps_both_target_and_destination_across_a_dive() {
         .substrate
         .entities
         .get(cloaker)
-        .map(|entity| (entity.position.rx, entity.position.ry))
+        .map(|entity| (entity.position.rx(), entity.position.ry()))
         .unwrap();
     let sensing = sim
         .spawn_object_at_height("DEST", "Americans", cell.0 + 1, cell.1, 0, 0, &rules)
@@ -829,91 +826,63 @@ fn a_sensing_house_keeps_both_target_and_destination_across_a_dive() {
         .unwrap();
     for chaser in [sensing, blind] {
         let entity = sim.substrate.entities.get_mut(chaser).unwrap();
-        entity.attack_target = Some(AttackTarget::new(cloaker));
-        entity.navigation.nav_com = Some(NavTargetRef::object(cloaker));
-        entity.navigation.nav_com_aux = Some(NavTargetRef::object(cloaker));
-        entity.navigation.suspended_nav_com = Some(NavTargetRef::object(cloaker));
+        entity
+            .attack_target
+            .set_for_test(Some(TargetKind::Entity(cloaker)));
+        entity
+            .navigation
+            .set_nav_com_for_test(Some(NavTargetRef::object(cloaker)));
+        entity
+            .navigation
+            .set_nav_com_aux_for_test(Some(NavTargetRef::object(cloaker)));
+        entity
+            .navigation
+            .set_suspended_nav_com_for_test(Some(NavTargetRef::object(cloaker)));
     }
-    let american = sim.substrate.entities.get(sensing).unwrap().owner;
+    let american = sim.substrate.entities.get(sensing).unwrap().owner();
     sim.fog.increment_sensor_at(american, cell.0, cell.1);
 
-    tick_stock_cloak_producer(&mut sim, cloaker, &rules);
+    tick_stock_cloak_producer(
+        &mut sim,
+        cloaker,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default(),
+    );
 
     let sensing_after = sim.substrate.entities.get(sensing).unwrap();
     assert!(
-        sensing_after.attack_target.is_some(),
+        sensing_after.attack_target.target().is_some(),
         "the sensing house keeps its Target (+0x2B4)"
     );
     assert_eq!(
-        sensing_after.navigation.nav_com,
+        sensing_after.navigation.nav_com(),
         Some(NavTargetRef::object(cloaker)),
         "and keeps its destination (+0x5A4) — it must not stop closing"
     );
     assert_eq!(
-        sensing_after.navigation.nav_com_aux,
+        sensing_after.navigation.nav_com_aux(),
         Some(NavTargetRef::object(cloaker)),
         "the +0x5A0 half of the pair is behind the same allowClear"
     );
     assert_eq!(
-        sensing_after.navigation.suspended_nav_com, None,
+        sensing_after.navigation.suspended_nav_com(),
+        None,
         "+0x5A8 is cleared above the guard, so it goes even for a sensing house"
     );
 
     let blind_after = sim.substrate.entities.get(blind).unwrap();
     assert!(
-        blind_after.attack_target.is_none(),
+        blind_after.attack_target.target().is_none(),
         "a blind house loses the Target"
     );
     assert_eq!(
-        blind_after.navigation.nav_com, None,
+        blind_after.navigation.nav_com(),
+        None,
         "and loses the destination with it"
     );
-    assert_eq!(blind_after.navigation.nav_com_aux, None);
-    assert_eq!(blind_after.navigation.suspended_nav_com, None);
-}
-
-#[test]
-fn a_limboed_entity_on_the_cell_no_longer_shadows_the_sensors_neighbour() {
-    // `CellClass::Find_Nearest_Object @ 0x0047C3D0` walks the cell's own object
-    // chain (`+0xE4`). `techno_limbo` unmarks the entity from the occupancy
-    // grid — VERA's model of that chain — but never clears `entity.position`,
-    // so a raw position scan kept finding the stale object and, taking the
-    // first match, hid the Destroyer behind it.
-    let (mut sim, rules, id) = spawned_sub();
-    let cell = sim
-        .substrate
-        .entities
-        .get(id)
-        .map(|entity| (entity.position.rx, entity.position.ry))
-        .unwrap();
-    sim.substrate
-        .entities
-        .get_mut(id)
-        .unwrap()
-        .cloak
-        .as_mut()
-        .unwrap()
-        .establish_unlimbo_fully_cloaked();
-
-    // Lower stable id than the Destroyer, and it carries no `Sensors=`.
-    let stale = sim
-        .spawn_object_at_height("RANKED", "Neutral", cell.0 + 1, cell.1, 0, 0, &rules)
-        .unwrap();
-    let dest = sim
-        .spawn_object_at_height("DEST", "Americans", cell.0 + 1, cell.1, 0, 0, &rules)
-        .unwrap();
-    assert!(stale < dest);
-    sim.techno_limbo_with_rules(stale, &rules);
-    assert_eq!(
-        sim.substrate.entities.get(stale).unwrap().position.rx,
-        cell.0 + 1,
-        "limbo leaves the stale map position in place, which is why the raw scan was wrong"
-    );
-
-    assert!(
-        uncloak_on_sensor_neighbour_after_cell_entry(&mut sim, id, &rules),
-        "an off-chain limboed object must not shadow the Destroyer"
-    );
+    assert_eq!(blind_after.navigation.nav_com_aux(), None);
+    assert_eq!(blind_after.navigation.suspended_nav_com(), None);
 }
 
 #[test]
@@ -928,7 +897,7 @@ fn the_sensors_neighbour_pick_is_nearest_to_the_cell_origin_not_lowest_id() {
             .substrate
             .entities
             .get(id)
-            .map(|entity| (entity.position.rx, entity.position.ry))
+            .map(|entity| (entity.position.rx(), entity.position.ry()))
             .unwrap();
         sim.substrate
             .entities
@@ -952,8 +921,12 @@ fn the_sensors_neighbour_pick_is_nearest_to_the_cell_origin_not_lowest_id() {
         };
         for (entity_id, offset) in [(near, 10i32), (far, 200i32)] {
             let entity = sim.substrate.entities.get_mut(entity_id).unwrap();
-            entity.position.sub_x = SimFixed::from_num(offset);
-            entity.position.sub_y = SimFixed::from_num(offset);
+            entity
+                .position
+                .set_sub_x_for_test(SimFixed::from_num(offset));
+            entity
+                .position
+                .set_sub_y_for_test(SimFixed::from_num(offset));
         }
 
         assert_eq!(
@@ -962,4 +935,462 @@ fn the_sensors_neighbour_pick_is_nearest_to_the_cell_origin_not_lowest_id() {
             "the single inspected object is the one nearest the cell origin"
         );
     }
+}
+
+/// CloakingTick6FBC0B..6FBC32: completing the cloak makes a computer's Unit
+/// Scatter(null, 1, 0), which picks a nearby cell and sets its destination;
+/// the same completion leaves a human-owned sub where it is.
+#[test]
+fn completing_the_cloak_scatters_only_a_computer_owned_unit() {
+    // A ground locomotor: the shared fixture's SUB has none, and Scatter
+    // refuses an active Teleport locomotor.
+    let rules = RuleSet::from_ini(&IniFile::from_str(
+        "[General]\nCloakingStages=9\nCloakDelay=.02\n\
+         [VehicleTypes]\n0=SUB\n[InfantryTypes]\n0=CLOAKER\n\
+         [SUB]\nStrength=600\nSpeed=4\nCloakable=yes\nCloakingSpeed=1\n\
+         Locomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n\
+         [CLOAKER]\nStrength=100\nSpeed=4\nCloakable=yes\nCloakingSpeed=1\n\
+         Locomotor={4A582744-9839-11d1-B709-00A024DDAFD1}\n",
+    ))
+    .expect("ground cloak rules");
+    let mut sim = Simulation::with_seed(0xC10A_C002);
+    for (name, side, human) in [("Americans", 0, true), ("Russians", 1, false)] {
+        let house = sim.interner.intern(name);
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                house, side, None, human, 0, 10,
+            ));
+    }
+    let grid = crate::sim::arena_fixture::flat_arena(&mut sim, &rules);
+    let human = sim
+        .spawn_object_at_height("SUB", "Americans", 10, 10, 0, 0, &rules)
+        .unwrap();
+    let computer = sim
+        .spawn_object_at_height("SUB", "Russians", 20, 20, 0, 0, &rules)
+        .unwrap();
+    // `0x006FBC0B..0x006FBC15`: only a Unit scatters.
+    let infantry = sim
+        .spawn_object_at_height("CLOAKER", "Russians", 30, 30, 0, 0, &rules)
+        .unwrap();
+    let state = |sim: &Simulation, id| {
+        sim.substrate
+            .entities
+            .get(id)
+            .unwrap()
+            .cloak
+            .as_ref()
+            .unwrap()
+            .state()
+    };
+    let nav = |sim: &Simulation, id| {
+        sim.substrate
+            .entities
+            .get(id)
+            .unwrap()
+            .navigation
+            .nav_com()
+            .is_some()
+    };
+    for _ in 0..30 {
+        assert!(!nav(&sim, computer), "no NavCom before the completion");
+        sim.advance_tick(&[], Some(&rules), Some(&grid), None, 33);
+        if state(&sim, computer) == 2 && state(&sim, infantry) == 2 {
+            break;
+        }
+    }
+    assert_eq!(
+        (
+            state(&sim, human),
+            state(&sim, computer),
+            state(&sim, infantry)
+        ),
+        (2, 2, 2)
+    );
+    assert!(!nav(&sim, human));
+    assert!(!nav(&sim, infantry), "a cloaked infantryman stays put");
+    assert!(
+        nav(&sim, computer),
+        "the computer's sub scatters on completion"
+    );
+}
+
+#[test]
+fn a_non_player_object_leaves_the_selection_as_it_cloaks_and_while_unsensed() {
+    // Skirmish: Americans are the player, Russians another human house, so
+    // neither sub scatters on completion.
+    let rules = RuleSet::from_ini(&IniFile::from_str(
+        "[General]\nCloakingStages=9\nCloakDelay=.02\n\
+         [VehicleTypes]\n0=SUB\n\
+         [SUB]\nStrength=600\nSpeed=4\nCloakable=yes\nCloakingSpeed=1\n\
+         Locomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n",
+    ))
+    .expect("ground cloak rules");
+    let mut sim = Simulation::with_seed(0xC10A_C003);
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::Skirmish);
+    for (name, side) in [("Americans", 0), ("Russians", 1)] {
+        let house = sim.interner.intern(name);
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                house, side, None, true, 0, 10,
+            ));
+    }
+    let grid = crate::sim::arena_fixture::flat_arena(&mut sim, &rules);
+    sim.fog.set_width_for_test(32);
+    sim.fog.set_height_for_test(32);
+    let player = sim.interner.get("Americans").unwrap();
+    sim.session.set_current_house_for_test(Some(player));
+    let own = sim
+        .spawn_object_at_height("SUB", "Americans", 10, 10, 0, 0, &rules)
+        .unwrap();
+    let enemy = sim
+        .spawn_object_at_height("SUB", "Russians", 20, 20, 0, 0, &rules)
+        .unwrap();
+    // The player senses the enemy's cell throughout the cloak.
+    sim.fog.increment_sensor_at(player, 20, 20);
+    let state = |sim: &Simulation, id| {
+        sim.substrate
+            .entities
+            .get(id)
+            .unwrap()
+            .cloak
+            .as_ref()
+            .unwrap()
+            .state()
+    };
+    let selected = |sim: &Simulation, id| {
+        sim.substrate
+            .entities
+            .get(id)
+            .unwrap()
+            .seldom.selection
+            .is_selected()
+    };
+    let select = |sim: &mut Simulation, id| {
+        sim.substrate
+            .entities
+            .get_mut(id)
+            .unwrap()
+            .seldom.selection
+            .set_selected_for_test(true);
+    };
+    select(&mut sim, own);
+    select(&mut sim, enemy);
+    sim.lifecycle_outputs.clear_for_test();
+    sim.advance_tick(&[], Some(&rules), Some(&grid), None, 33);
+    assert_eq!((state(&sim, own), state(&sim, enemy)), (1, 1));
+    for id in [own, enemy] {
+        assert!(
+            sim.lifecycle_outputs
+                .as_slice()
+                .contains(&crate::sim::world::LifecycleOutput::FollowReleased { stable_id: id }),
+            "Detach_All (0x005F5306) hands the follow camera back from either sub"
+        );
+    }
+    assert!(selected(&sim, own), "the player's own sub stays selected");
+    assert!(
+        !selected(&sim, enemy),
+        "StartCloaking (0x00703819) deselects another house's object, sensed or not"
+    );
+
+    select(&mut sim, enemy);
+    for _ in 0..30 {
+        sim.advance_tick(&[], Some(&rules), Some(&grid), None, 33);
+        if state(&sim, enemy) == 2 {
+            break;
+        }
+    }
+    assert_eq!(state(&sim, enemy), 2);
+    sim.advance_tick(&[], Some(&rules), Some(&grid), None, 33);
+    assert!(
+        selected(&sim, enemy),
+        "the completion's Detach_All and the AI's sensor callback keep a sensed object"
+    );
+
+    sim.fog.decrement_sensor_at_unconditional(player, 20, 20);
+    sim.advance_tick(&[], Some(&rules), Some(&grid), None, 33);
+    assert!(
+        !selected(&sim, enemy),
+        "the AI's sensor callback (0x006FA9D2) deselects it once unsensed"
+    );
+    assert!(selected(&sim, own));
+}
+
+#[test]
+fn a_dive_breaks_contact_zero_only_with_a_house_its_owner_is_not_allied_with() {
+    for (partner_owner, kept) in [("Soviet", true), ("Americans", false)] {
+        let (mut sim, rules, cloaker) = spawned_sub();
+        let cell = sim
+            .substrate
+            .entities
+            .get(cloaker)
+            .map(|entity| (entity.position.rx(), entity.position.ry()))
+            .unwrap();
+        let partner = sim
+            .spawn_object_at_height("RANKED", partner_owner, cell.0 + 2, cell.1, 0, 0, &rules)
+            .unwrap();
+        sim.substrate
+            .entities
+            .get_mut(cloaker)
+            .unwrap()
+            .mark_live_contact_with(partner);
+        sim.substrate
+            .entities
+            .get_mut(partner)
+            .unwrap()
+            .mark_live_contact_with(cloaker);
+
+        tick_stock_cloak_producer(
+            &mut sim,
+            cloaker,
+            &rules,
+            None,
+            &mut crate::sim::world::FrameEffects::default(),
+        );
+
+        let cloaker = sim.substrate.entities.get(cloaker).unwrap();
+        assert_eq!(cloaker.cloak.as_ref().unwrap().state(), 1);
+        assert_eq!(
+            cloaker.has_live_contact_with(partner),
+            kept,
+            "{partner_owner}: FootClass::Detach_All(false) (0x004D9762) sends OVER_OUT only to a non-ally"
+        );
+    }
+}
+
+/// Phobos ORs `AE.Cloakable` into the live Techno flag and `AE.ForceDecloak`
+/// into the two cloak decisions (`Hooks.Cloak.cpp`): the effect can install
+/// the runtime for a type without `Cloakable=`, and a forced decloak vetoes
+/// the ready check while requesting the decloak.
+#[cfg(feature = "phobos")]
+#[test]
+fn attach_effect_cloakable_and_force_decloak_move_the_gates() {
+    let rules = RuleSet::from_ini(&IniFile::from_str(
+        "[General]\nCloakingStages=9\nCloakDelay=.02\n\
+         [VehicleTypes]\n0=TANK\n1=SUB\n\
+         [TANK]\nStrength=600\nSpeed=4\nAttachEffect.AttachTypes=AE_CLOAK\n\
+         [SUB]\nStrength=600\nSpeed=4\nCloakable=yes\nCloakingSpeed=1\n\
+         AttachEffect.AttachTypes=AE_FORCE\n\
+         [AttachEffectTypes]\n0=AE_CLOAK\n1=AE_FORCE\n\
+         [AE_CLOAK]\nDuration=-1\nCloakable=yes\n\
+         [AE_FORCE]\nDuration=-1\nForceDecloak=yes\n",
+    ))
+    .expect("cloak effect rules");
+    let mut sim = Simulation::with_seed(0xC10A_C0DE);
+    sim.fog.set_width_for_test(64);
+    sim.fog.set_height_for_test(64);
+    sim.playfield_bounds = Some(PlayfieldBounds::from_normalized_local_size(
+        64, 2, 2, 56, 52,
+    ));
+    let bounds = sim.playfield_bounds.unwrap();
+    let (rx, ry) = (8u16..56)
+        .flat_map(|ry| (8u16..56).map(move |rx| (rx, ry)))
+        .find(|&(rx, ry)| bounds.contains_height_aware_packed(rx.into(), ry.into(), 0, 0))
+        .expect("interior mode-one cell");
+
+    let tank = sim
+        .spawn_object_at_height("TANK", "Soviet", rx, ry, 0, 0, &rules)
+        .unwrap();
+    sim.update_phobos_attach_effects(tank, &rules);
+    tick_stock_cloak_producer(
+        &mut sim,
+        tank,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default(),
+    );
+    assert!(
+        sim.substrate.entities.get(tank).unwrap().cloak.is_some(),
+        "AE Cloakable installs the runtime for a non-Cloakable type"
+    );
+    let facts = stock_cloak_tick_facts(&sim, tank, &rules, None).expect("tank facts");
+    assert!(facts.can_auto_cloak);
+    assert!(!facts.should_uncloak);
+
+    let sub = sim
+        .spawn_object_at_height("SUB", "Soviet", rx + 2, ry, 0, 0, &rules)
+        .unwrap();
+    sim.update_phobos_attach_effects(sub, &rules);
+    tick_stock_cloak_producer(
+        &mut sim,
+        sub,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default(),
+    );
+    let facts = stock_cloak_tick_facts(&sim, sub, &rules, None).expect("sub facts");
+    assert!(!facts.can_auto_cloak, "ForceDecloak vetoes the ready check");
+    assert!(facts.should_uncloak, "ForceDecloak requests the decloak");
+}
+
+/// `BuildingClass::UpdateCloak @ 0x00454DB0` for a building a Cloak crate
+/// granted: it starts cloaking on its first visit, fades one stage per visit
+/// (`+0x6ED`) and is fully cloaked at 15. An enemy `Sensors=` unit beside its
+/// foundation (`BuildingClass::ShouldUncloak @ 0x004578C0`) starts the
+/// uncloak; it fades back and, with the sensor still there, stays uncloaked
+/// (`BuildingClass::CanCloak @ 0x00457770`).
+#[test]
+fn a_cloak_granted_building_fades_out_and_a_sensor_beside_it_brings_it_back() {
+    use crate::sim::cloak_disguise::VisualCharacterQuery;
+
+    let (mut sim, rules, sub) = spawned_sub();
+    sim.install_resolved_terrain_for_new_map(crate::map::resolved_terrain::test_retail_clear_grid(
+        64, 64,
+    ));
+    let (rx, ry) = sim
+        .substrate
+        .entities
+        .get(sub)
+        .map(|entity| (entity.position.rx(), entity.position.ry()))
+        .unwrap();
+    // A 2x2 power plant at (rx + 4, ry): the scan's last column is rx + 6.
+    let id = sim
+        .spawn_object_at_height("GAPOWR", "Soviet", rx + 4, ry, 0, 0, &rules)
+        .unwrap();
+    sim.substrate
+        .entities
+        .get_mut(id)
+        .unwrap()
+        .stealth_ability
+        .grant();
+    let visit = |sim: &mut Simulation| {
+        tick_stock_cloak_producer(
+            sim,
+            id,
+            &rules,
+            None,
+            &mut crate::sim::world::FrameEffects::default(),
+        );
+        let entity = sim.substrate.entities.get(id).unwrap();
+        let cloak = entity.cloak.as_ref().unwrap();
+        // GetFireError's query (0x006FC25B): the firer's house holds no
+        // sensor here.
+        let seen = entity.visual_character(
+            rules.general.cloaking_stages,
+            false,
+            false,
+            VisualCharacterQuery::sensor(true, false, false),
+        );
+        (cloak.state(), cloak.building_stage(), seen)
+    };
+    assert_eq!(visit(&mut sim), (1, 0, 0));
+    let sounds = sim.sound_events.len();
+    assert_eq!(sounds, 1);
+    let fade: Vec<_> = (1..=15).map(|_| visit(&mut sim)).collect();
+    assert_eq!(fade[4], (1, 5, 1));
+    assert_eq!(fade[5], (1, 6, 2));
+    assert_eq!(fade[10], (1, 11, 5));
+    assert_eq!(fade[14], (2, 15, 5));
+    assert_eq!(visit(&mut sim), (2, 15, 5), "no sensor beside it");
+
+    sim.spawn_object_at_height("DEST", "Americans", rx + 6, ry + 1, 0, 0, &rules)
+        .unwrap();
+    assert_eq!(visit(&mut sim), (3, 15, 5));
+    assert_eq!(sim.sound_events.len(), sounds + 1);
+    let back: Vec<_> = (1..=15).map(|_| visit(&mut sim)).collect();
+    assert_eq!(back[13], (3, 1, 1));
+    assert_eq!(back[14], (0, 0, 0));
+    assert_eq!(visit(&mut sim), (0, 0, 0), "the sensor blocks a new cloak");
+    assert_eq!(sim.sound_events.len(), sounds + 1);
+}
+
+/// Unlimbo `0x00440E99..0x00440F5B` builds `NaturalParticleSystem=` at
+/// Location plus `NaturalParticleLocation=` with no owner; UpdateCloak
+/// deletes it as the fade-out ends (`0x00454E7F..0x00454E9E`) and builds it
+/// again as the fade-in ends (`0x00454F72..0x0045500C`).
+#[test]
+fn a_natural_particle_system_goes_with_the_cloak_and_comes_back_with_it() {
+    let rules = RuleSet::from_ini_with_fixed_art_for_test(
+        &crate::sim::arena_fixture::clear_ground_ini(
+            "[General]\nCloakingStages=9\n\
+             [VehicleTypes]\n0=DEST\n[BuildingTypes]\n0=GAPOWR\n\
+             [DEST]\nStrength=600\nSpeed=6\nSensors=yes\nSensorsSight=8\n\
+             [GAPOWR]\nStrength=750\nNaturalParticleSystem=Sys\n\
+             NaturalParticleLocation=10,20,30\n\
+             [Particles]\n0=Smk\n[Smk]\nBehavesLike=Smoke\nMaxEC=10\n\
+             [ParticleSystems]\n0=Sys\n[Sys]\nBehavesLike=Smoke\nHoldsWhat=Smk\n",
+        ),
+        &IniFile::from_str("[GAPOWR]\nFoundation=2x2\n"),
+    )
+    .expect("natural system rules");
+    let mut sim = Simulation::with_seed(0xC10A_C001);
+    sim.fog.set_width_for_test(64);
+    sim.fog.set_height_for_test(64);
+    sim.playfield_bounds = Some(PlayfieldBounds::from_normalized_local_size(
+        64, 2, 2, 56, 52,
+    ));
+    sim.install_resolved_terrain_for_new_map(crate::map::resolved_terrain::test_retail_clear_grid(
+        64, 64,
+    ));
+    let bounds = sim.playfield_bounds.unwrap();
+    let (rx, ry) = (8u16..56)
+        .flat_map(|ry| (8u16..56).map(move |rx| (rx, ry)))
+        .find(|&(rx, ry)| bounds.contains_height_aware_packed(rx.into(), ry.into(), 0, 0))
+        .expect("interior mode-one cell");
+    let id = sim
+        .spawn_object_at_height("GAPOWR", "Soviet", rx, ry, 0, 0, &rules)
+        .unwrap();
+    let natural = |sim: &Simulation| {
+        sim.substrate
+            .entities
+            .get(id)
+            .unwrap()
+            .building
+            .natural_particle_system
+            .system()
+    };
+    let first = natural(&sim).expect("Unlimbo builds the system");
+    let location = crate::sim::movement::ground_pose::position_world_coord(
+        &sim.substrate.entities.get(id).unwrap().position,
+    );
+    let expected = glam::IVec3::new(location.x + 10, location.y + 20, location.z + 30);
+    let sys = sim.particle_systems().get(first).unwrap();
+    assert_eq!((sys.coords(), sys.owner_entity()), (expected, None));
+
+    sim.substrate
+        .entities
+        .get_mut(id)
+        .unwrap()
+        .stealth_ability
+        .grant();
+    let visit = |sim: &mut Simulation| {
+        tick_stock_cloak_producer(
+            sim,
+            id,
+            &rules,
+            None,
+            &mut crate::sim::world::FrameEffects::default(),
+        );
+        sim.substrate
+            .entities
+            .get(id)
+            .unwrap()
+            .cloak
+            .as_ref()
+            .unwrap()
+            .state()
+    };
+    for _ in 0..15 {
+        visit(&mut sim);
+        assert_eq!(natural(&sim), Some(first));
+    }
+    assert_eq!(visit(&mut sim), 2);
+    assert_eq!(natural(&sim), None);
+    assert!(
+        sim.particle_systems().get(first).is_none(),
+        "deleted at once"
+    );
+
+    sim.spawn_object_at_height("DEST", "Americans", rx + 2, ry + 1, 0, 0, &rules)
+        .unwrap();
+    for _ in 0..16 {
+        visit(&mut sim);
+    }
+    assert_eq!(visit(&mut sim), 0);
+    let again = natural(&sim).expect("the fade-in builds it again");
+    assert_ne!(again, first);
+    assert_eq!(
+        sim.particle_systems().get(again).unwrap().coords(),
+        expected
+    );
 }

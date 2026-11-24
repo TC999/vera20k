@@ -5,13 +5,14 @@
 use super::*;
 use crate::rules::ini_parser::IniFile;
 use crate::sim::bridge_state::BridgeRuntimeState;
+use crate::sim::components::DriveCoord;
 use crate::sim::projectile::ProjectileDetonationReason;
 use crate::sim::world::Simulation;
 use serde_json::Value;
 
 fn corpus() -> Vec<Value> {
-    serde_json::from_str(include_str!(
-        "../../../tools/projectile_oracle/bridge_cluster_order.json"
+    serde_json::from_str(crate::test_fixture::text(
+        "tools/projectile_oracle/bridge_cluster_order.json",
     ))
     .unwrap()
 }
@@ -48,18 +49,19 @@ fn world(rules: &RuleSet, input: &Value) -> Simulation {
         .collect();
     let mut terrain = ResolvedTerrainGrid::from_cells(64, 64, cells);
     let anchor = terrain.native_cell_identity((9, 20));
-    terrain.cell_mut(9, 20).unwrap().bridge_facts.overlay_id =
-        Some(input["anchor_overlay"].as_u64().unwrap() as u8);
     // The oracle supplies false at the bridge driver boundary. Use the live
     // driver's no-transition state here, without a test hook or bridge mutation.
     // The wooden fallback has no anchor span and likewise returns no change.
     // This fixture compares admission/continuation, not valid bridge topology.
-    terrain.write_native_cell_state(anchor, 255);
+    let mut overlays = crate::sim::overlay_grid::OverlayGrid::new(64, 64);
+    let anchor_overlay = overlays.cell_mut_for_test(9, 20);
+    anchor_overlay.overlay_id = Some(input["anchor_overlay"].as_u64().unwrap() as u8);
+    anchor_overlay.overlay_data = 255;
     for y in 17..24 {
         for x in 7..14 {
             if (x, y) == (10, 20) || (input["bridge_patch"].as_bool().unwrap() && (x, y) != (9, 20))
             {
-                let cell = terrain.cell_mut(x, y).unwrap();
+                let cell = terrain.cell_mut_for_test(x, y).unwrap();
                 cell.bridge_facts.raw_flags = input["flags"].as_u64().unwrap() as u32;
                 cell.bridge_facts.native_anchor = Some(anchor);
             }
@@ -75,7 +77,9 @@ fn world(rules: &RuleSet, input: &Value) -> Simulation {
     sim.resolve_type_handles(rules);
     sim.install_resolved_terrain_for_new_map(terrain);
     sim.bridge_state = Some(bridges);
-    sim.session.no_damage = input["no_damage"].as_bool().unwrap();
+    sim.overlay_grid = Some(overlays);
+    sim.session
+        .set_no_damage_for_test(input["no_damage"].as_bool().unwrap());
     sim
 }
 
@@ -88,8 +92,10 @@ fn detonation(sim: &mut Simulation, input: &Value) -> ProjectileDetonation {
         payload: ProjectilePayload::new(
             input["damage"].as_i64().unwrap() as i32,
             sim.interner.intern("WH"),
-            sim.interner.intern("SHOT"),
-        ),
+            Some(sim.interner.intern("SHELL")),
+            false,
+        )
+        .with_installed_weapon(Some(sim.interner.intern("SHOT"))),
         reason: ProjectileDetonationReason::ReachedTarget,
     }
 }
@@ -134,7 +140,7 @@ fn ordinary_bridge_continuation_precedes_cluster_rng_like_native() {
                 )
             })
             .collect();
-        assert_eq!(sim.tactical_dirty_cells, dirty, "{name}");
+        assert_eq!(sim.dirty_cells.tactical_for_test(), dirty, "{name}");
         let rng = sim.scenario_rng.logical_view();
         assert_eq!(
             serde_json::json!([rng.index_a, rng.index_b]),
@@ -148,8 +154,8 @@ fn ordinary_bridge_continuation_precedes_cluster_rng_like_native() {
 
 #[test]
 fn nested_death_bridge_continuation_finishes_before_parent_area_returns() {
-    let native: Value = serde_json::from_str(include_str!(
-        "../../../tools/projectile_oracle/bridge_nested_draws.json"
+    let native: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/projectile_oracle/bridge_nested_draws.json",
     ))
     .unwrap();
     let mut input = corpus()
@@ -182,11 +188,29 @@ fn nested_death_bridge_continuation_finishes_before_parent_area_returns() {
         let mut units = Vec::new();
         for name in ["OUTER", "INNER"] {
             let id = sim
-                .construct_object_limbo_at_height(name, "Americans", 10, 20, 0, 6, &rules)
+                .construct_object_limbo_at_height(
+                    name,
+                    "Americans",
+                    10,
+                    20,
+                    0,
+                    6,
+                    &rules,
+                    &mut crate::sim::world::FrameEffects::default(),
+                )
                 .unwrap();
             // Both objects are in the deck list at the identical coordinate,
             // so OUTER's zero-spread death blast includes only the live INNER.
-            sim.substrate.entities.get_mut(id).unwrap().on_bridge = true;
+            {
+                let actor = sim.substrate.entities.get_mut(id).unwrap();
+                actor.position.put_location(DriveCoord {
+                    x: 2688,
+                    y: 5248,
+                    z: 624,
+                });
+                actor.position.set_z_for_test(6);
+                actor.set_on_bridge(true);
+            }
             sim.reveal_entity_with_rules(id, &rules);
             assert!(
                 sim.substrate
@@ -194,28 +218,33 @@ fn nested_death_bridge_continuation_finishes_before_parent_area_returns() {
                     .get(id)
                     .unwrap()
                     .lifecycle
-                    .cell_marked
+                    .cell_marked()
             );
             units.push(id);
         }
         sim.scenario_rng = SimRng::new(native["seed"].as_u64().unwrap());
-        sim.tactical_dirty_cells.clear();
+        sim.dirty_cells.clear_tactical_for_test();
         let warhead = sim.interner.intern("WH");
         let hit = EntityDamageEvent::area(units[0], 100, 0, RAD_NO_ATTACKER, None, warhead);
         let mut run = world_receiver::ReceiverRun::default();
-        let (effects, _) = world_receiver::commit_area(
+        let effects = world_receiver::commit_area(
             &mut sim,
             &mut run,
             &[combat_aoe::AreaDamageReceiver::Entity(hit)],
             &rules,
             None,
+            &mut Vec::new(),
         );
         assert_eq!(run.handled_deaths, units, "both recursive receivers ran");
         run.finish();
         assert!(!effects.bridge_state_changed);
         // INNER's signed -1 packet still draws first and cannot pass. OUTER
         // then compares the second native result:29000 fails,31000 succeeds.
-        assert_eq!(sim.tactical_dirty_cells, expected_dirty, "{outer_damage}");
+        assert_eq!(
+            sim.dirty_cells.tactical_for_test(),
+            expected_dirty,
+            "{outer_damage}"
+        );
         let rng = sim.scenario_rng.logical_view();
         assert_eq!(
             serde_json::json!([rng.index_a, rng.index_b]),

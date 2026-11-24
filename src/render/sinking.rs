@@ -51,25 +51,24 @@ impl SinkingWaterlines {
     }
 }
 
-/// The voxel shader's unused tint W lane transports this signed world row.
-/// A separate flag preserves all ordinary tint/opacity semantics and avoids
-/// changing SpriteInstance's cross-platform vertex ABI for a rare draw arm.
+/// The voxel shader's `sinking_row` lane transports this signed world row,
+/// which it reads only under FX_SINKING_CLIP.
 pub(crate) fn apply_waterline_clip(draw: &mut DrawState, row: Option<i16>) {
     draw.fx_flags &= !FX_SINKING_CLIP;
     if let Some(row) = row {
         draw.fx_flags |= FX_SINKING_CLIP;
-        draw.effect_tint[3] = f32::from(row);
+        draw.sinking_row = f32::from(row);
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(tests_render_s_z, tests_app_presentation_render)))]
 pub(crate) mod tests {
     use super::*;
     use serde_json::Value;
 
     pub(crate) fn unit_rows() -> Vec<Value> {
-        let corpus: Value = serde_json::from_str(include_str!(
-            "../../tools/spatial_oracle/naval_sinking_clip.json"
+        let corpus: Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/naval_sinking_clip.json",
         ))
         .unwrap();
         corpus["cases"]

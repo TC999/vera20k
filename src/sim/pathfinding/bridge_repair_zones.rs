@@ -9,7 +9,7 @@ use crate::sim::bridge_state::BridgeEndpointRecord;
 use crate::sim::cell_rect::{
     CellRef, PlayfieldBounds, cell_is_in_playfield_height_aware, get_cellclass_fallback,
 };
-use crate::sim::pathfinding::zone_build::HIGH_BRIDGE_HIERARCHY_DIRECTIONS;
+use crate::sim::pathfinding::zone_build::hierarchy::HIGH_BRIDGE_HIERARCHY_DIRECTIONS;
 use crate::sim::pathfinding::zone_hierarchy::{ZoneEdgeRecord, ZoneHierarchy};
 
 /// Original5851B0 directly appends six directed edges per level. Preserve
@@ -48,7 +48,9 @@ pub(crate) fn append_repaired_bridge_edges(
             for (from, to) in [(from, to), (to, from)] {
                 // Native sign-extends this word into an unchecked node pointer.
                 // Retain prior writes and expose unsupported pointer inputs.
-                if from > i16::MAX as u16 || usize::from(from) >= graph.record_slot_count() {
+                if (!graph.cell_grid().is_extended() && from > i16::MAX as super::ZoneId)
+                    || from as usize >= graph.record_slot_count()
+                {
                     return Err(format!(
                         "repair bridge hierarchy node {from} is not represented"
                     ));
@@ -70,6 +72,7 @@ impl ZoneGrid {
         record: &BridgeEndpointRecord,
         bounds: Option<PlayfieldBounds>,
     ) -> Result<bool, String> {
+        self.invalidate_navigation_history();
         let signed = |p: (u16, u16)| (i32::from(p.0 as i16), i32::from(p.1 as i16));
         let a = signed(record.endpoint_a);
         let b = signed(record.endpoint_b);
@@ -113,6 +116,7 @@ impl ZoneGrid {
         terrain: &ResolvedTerrainGrid,
         records: &[BridgeEndpointRecord],
     ) {
+        self.invalidate_navigation_history();
         // Compatibility readers retain a derived redirect per movement row.
         // Activation changes structural-cell lookup from the broken span's
         // chosen endpoint to A even when56DB70 requests no connectivity pass.
@@ -133,6 +137,6 @@ impl ZoneGrid {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(tests_sim_pathfinding, tests_sim_movement)))]
 #[path = "bridge_repair_zones_tests.rs"]
 mod tests;

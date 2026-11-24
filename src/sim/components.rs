@@ -11,237 +11,49 @@
 //!
 //! ## Dependency rules
 //! - Part of sim/.
-//! - sim/ NEVER depends on render/, ui/, sidebar/, audio/, net/.
+//! - sim/ NEVER depends on render/, ui/, audio/, net/.
 
+use crate::sim::cell_kernel::{CellCoordinate, WorldCoordinate, cell_center};
 use crate::sim::intern::InternedId;
-use crate::sim::movement::locomotor::MovementLayer;
-use crate::util::fixed_math::{SIM_ZERO, SimFixed};
+use crate::util::fixed_math::SimFixed;
 
-/// World position in isometric cell coordinates plus sub-cell lepton offset.
+pub use crate::sim::movement::ground_pose::Position;
+pub use crate::sim::movement::navcom::NavigationState;
+
+// MissionCom, MissionLeaf and the private GameEntity body own retained
+// construction and sale state.
+pub(crate) use crate::sim::building_construction::BuildingDown;
+#[cfg(any(test, feature = "test-support"))]
+pub use crate::sim::building_construction::BuildingUp;
+
+/// A NavCom-family pointer: NavCom (`Foot+0x5A4`), its auxiliary slot
+/// (`+0x5A0`), SuspendedNavCom (`+0x5A8`) and the NavQueue and navigation-list
+/// entries.
 ///
-/// RA2 uses leptons as its spatial unit (256 leptons = 1 cell). We store the
-/// cell coordinate (rx, ry) plus a sub-cell lepton offset (sub_x, sub_y) to
-/// get sub-cell precision without overflowing SimFixed on large maps.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct Position {
-    /// Isometric cell X coordinate.
-    pub rx: u16,
-    /// Isometric cell Y coordinate.
-    pub ry: u16,
-    /// Elevation level (0 = ground). Each level is 15px visual offset.
-    pub z: u8,
-    /// Exact native ObjectClass coordinate Z, in signed leptons.
-    ///
-    /// Ground movement retains ramp height at the native height-write points;
-    /// Drive/Ship residual XY interpolation can retain an earlier sampled Z.
-    /// TubeMovement also retains its signed interpolation remainder after exit.
-    /// Neither coordinate can be reconstructed from the coarse `z` level or
-    /// indiscriminately replaced with the current surface on idle ticks.
-    /// None is the legacy coarse/independent-altitude representation.
-    #[serde(default)]
-    pub exact_z_leptons: Option<i32>,
-    /// Sub-cell lepton offset X (0..256). 128 = cell center.
-    /// Provides sub-cell precision for smooth movement and accurate range checks.
-    pub sub_x: SimFixed,
-    /// Sub-cell lepton offset Y (0..256). 128 = cell center.
-    pub sub_y: SimFixed,
-}
-
-/// Signed actual ObjectClass health (+0x6C in gamemd.exe).
+/// In gamemd each is an untagged `AbstractClass*`. The Foot setter
+/// (`FootClass::Set_Destination_Internal @ 0x004D94B0`) stores its argument
+/// as given (`0x004D9510`), and readers ask the pointee for its kind or
+/// compare pointers: `AircraftClass::Mission_Enter @ 0x00419C80` compares
+/// NavCom with `+0x6CC` (`0x00419D25`) and calls NavCom's What_Am_I
+/// (virtual `+0x2C`, `0x00419D2F`) to test for a Building (6).
 ///
-/// Live ObjectType::strength owns the cap/ratio denominator. EstimatedHealth
-/// is independent state; writes to this field do not implicitly update it.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-pub struct Health {
-    pub current: i32,
-}
-
-impl Health {
-    /// ObjectClass::GetHealthRatio (gamemd.exe 0x005F5C60..0x005F5C7F).
-    /// Signed loads and PC53/chop division; zero Strength keeps the native
-    /// masked infinity/NaN result for the caller's actual comparison/conversion.
-    pub fn ratio(self, strength: i32) -> crate::util::native_x87::MaskedX87Value {
-        use crate::util::native_x87::MaskedX87Chop53 as X87;
-        X87::div(X87::load_i32(self.current), X87::load_i32(strength))
-    }
-
-    /// Compare the native ratio without converting masked values to a host float.
-    pub fn compare_ratio(
-        self,
-        strength: i32,
-        threshold: f64,
-    ) -> crate::util::native_x87::MaskedX87Ordering {
-        use crate::util::native_x87::{MaskedX87Chop53 as X87, NativeF64Bits};
-        X87::compare(
-            self.ratio(strength),
-            X87::load_f64(NativeF64Bits::from_bits(threshold.to_bits())),
-        )
-    }
-}
-
-/// The type control used by construction and pack-up (BState 0).
-/// `BuildingClass::Begin_Mode(0)` (`0x00447780`) restarts the entity's sole
-/// native stage from this control; `sim::building_construction` owns the
-/// control's completion and wrap decisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct BuildupStage {
-    /// The type's construction control (`Type+0xF04`): first frame, frame
-    /// count, rate (`RuleSet::buildup_control`).
-    pub control: [i32; 3],
-}
-
-/// Where a building's Construction mission (`0x12`) stands.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum ConstructionMission {
-    /// Queued behind no current mission (a human player's placement, a
-    /// deploy): the ready byte commences it (`0x0043FE27` once BState is not
-    /// 0, or `0x0043FF91`).
-    Queued,
-    /// Current with its mission timer due: the next dispatch is its first
-    /// visit (`Mission_Construction` status 0).
-    Due,
-    /// Visited (status 1): each visit completes on the ready byte.
-    Watching,
-}
-
-/// A building building up after its placement or deploy
-/// (`sim::building_construction`): its construction animation, its BState,
-/// its Construction mission, and `+0x6DD`, the byte set when the animation
-/// lands on its last frame. The render reads the actor's native stage from
-/// the Buildup SHP while BState is 0.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct BuildingUp {
-    /// The construction animation (BState 0); each `Begin_Mode(0)` restarts
-    /// it from the control.
-    pub anim: BuildupStage,
-    /// BState (`+0x534`) is 1, the idle control (`{0, 1, 0}`, the
-    /// BuildingType constructor's for every retail type), instead of 0.
-    pub idle: bool,
-    /// `Begin_Mode(1)` is queued (`+0x538`), applied at the end of the next
-    /// Update (`0x0043FFB4`): a human player's placement, whose factory
-    /// sends the building OVER_OUT (`0x004FB4A6` -> `0x0043CD01`).
-    pub idle_queued: bool,
-    pub mission: ConstructionMission,
-    /// `+0x6DD`, the animation-complete (ready-to-commence) byte.
-    pub done: bool,
-    /// The first frame with an Update: the frame after a human player's
-    /// placement, the placement frame of a computer house's, a deployed
-    /// building's creation frame.
-    pub first_frame: i32,
-}
-
-/// A building on the Selling mission (`BuildingClass::Sell @ 0x00449C30`,
-/// `sim::building_construction`; its visits `production::production_sell`):
-/// stage 0 and 1 visits, then the construction animation played again (drawn
-/// in reverse) until `+0x6DD`, when the building converts into its
-/// `UndeploysInto=` unit (`Simulation::finish_undeploy`) or is sold for its
-/// refund.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct BuildingDown {
-    /// The construction animation from stage 1's `Begin_Mode(0)`; before
-    /// that the building shows its idle frames. Sell's stage (`+0xBC`) is
-    /// the Selling mission's handler state (`MissionCom::handler_state`).
-    pub anim: BuildupStage,
-    /// The frame the Selling mission commenced; its visits start the frame
-    /// after.
-    pub commenced_frame: i32,
-    /// `+0x6DD`, the animation-complete byte.
-    pub done: bool,
-    /// Started by the player's undeploy order, VERA's stand-in for the retail
-    /// undeploy click (`BuildingClass::Active_Click_With 0x004436F0`), which
-    /// sets an ArchiveTarget before its SELL event: Sell and UpdateAnimation
-    /// read such a sale as archive-bearing (`+0x218`).
-    pub undeploy_order: bool,
-}
-
-/// Movement path target â€” entity is moving along a computed A* path.
+/// So there is one representation per pointee kind. A Cell is named by its
+/// cell. An Object, a Techno or a Terrain, is named by its stable ID; every
+/// object store draws from one ID namespace (`Simulation::allocate_stable_id`,
+/// and snapshot restore rejects an ID that two registries claim), so the ID
+/// alone says which store holds the object and what kind it is.
 ///
-/// Attached by `issue_move_command()` when a unit is ordered to move.
-/// The movement system (`tick_movement`) advances the entity along the path
-/// each tick. Removed automatically when the entity reaches its destination.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct MovementTarget {
-    /// Sequence of (rx, ry) cells from current position to goal (inclusive).
-    pub path: Vec<(u16, u16)>,
-    /// Spatial layer for each path step. Matches `path.len()`.
-    pub path_layers: Vec<MovementLayer>,
-    /// Index of the next cell to move toward in the path.
-    /// Starts at 1 (index 0 is the current position).
-    pub next_index: usize,
-    /// Maximum movement speed in leptons per second (from rules.ini Speed= value).
-    /// 256 leptons = 1 cell. Fixed-point for deterministic multiplayer.
-    pub speed: SimFixed,
-    /// The legacy pass lane's speed this frame (`movement_tick`): Hover's
-    /// throttled speed, else a ramp toward `speed` that brakes near the
-    /// destination, or `speed` itself without ramp data. It is not
-    /// GetCurrentSpeed, which the track and Walk steps and the readiness gate
-    /// query live (`movement::owner_current_speed`).
-    pub current_speed: SimFixed,
-    /// Fraction of max speed gained per tick during acceleration (AccelerationFactor=).
-    pub accel_factor: SimFixed,
-    /// Fraction of max speed lost per tick during braking (DeaccelerationFactor=).
-    pub decel_factor: SimFixed,
-    /// Lepton distance from destination at which braking begins (SlowdownDistance=).
-    pub slowdown_distance: SimFixed,
-    /// Direction vector toward next cell in leptons: `dx_cells * 256`, `dy_cells * 256`.
-    /// Recomputed when `next_index` advances. Cardinal = (±256, 0) or (0, ±256),
-    /// diagonal = (±256, ±256).
-    pub move_dir_x: SimFixed,
-    /// Y component of the direction vector (see `move_dir_x`).
-    pub move_dir_y: SimFixed,
-    /// Lepton distance from current cell center to next cell center.
-    /// 256 for cardinal moves, ~362 for diagonal. Used to normalize advancement.
-    pub move_dir_len: SimFixed,
-    /// Cell where this mover was last refused by a wall it could shoot.
-    ///
-    /// VERA-only scaffolding, and a recorded DRIFT. Native evaluates the cell
-    /// twice inside ONE `DriveLocomotionClass::Process_Movement` call: the 4/5
-    /// arm at `0x004B3ADB` drops `Path[0]`, stamps an already-expired timer and
-    /// tail-recurses at `0x004B4552` with `arg2 = 0`, which repaths and
-    /// re-evaluates immediately; the Override at `0x004B3BE9` fires only on that
-    /// second refusal. VERA issues its repath through `handle_blocked_tick` and
-    /// takes the second refusal on a later tick, so it needs to remember which
-    /// cell was refused. Cleared on any non-wall refusal, and naturally reset
-    /// when a new order replaces this target.
-    #[serde(default)]
-    pub wall_refusal_cell: Option<(u16, u16)>,
-    /// Ultimate destination — preserved across 24-step segment replanning.
-    /// When a path segment is exhausted before reaching this goal, the movement
-    /// system auto-replans from the current position. `None` for short paths
-    /// or test-only movement targets that don't need segmented replanning.
-    pub final_goal: Option<(u16, u16)>,
-    /// When true, the movement tick skips terrain cost passability checks
-    /// for cell entry. Used by `issue_direct_move` to let harvesters walk
-    /// onto ore cells that are terrain-blocked for their SpeedType.
-    pub ignore_terrain_cost: bool,
-    /// When true, the movement tick skips PathGrid walkability checks for
-    /// cell entry. Used by dock-sequence direct moves where the harvester
-    /// must traverse the refinery foundation footprint (cells marked
-    /// blocked by `block_building_footprint`). Does NOT bypass entity
-    /// occupancy checks — other movers still collide.
-    #[serde(default)]
-    pub bypass_grid: bool,
-    /// A Rust route adapter owns this route (`issue_direct_move`, component
-    /// fixtures): its cells were never published to Foot+5E0 and it names no
-    /// locomotor destination, so a Drive/Ship Unit keeps the pass lane while it
-    /// is pending. Native routes (the setter's empty scheduling adapter and
-    /// Find_Path's install) leave it false, so emptying their Foot+5E0 head
-    /// never reroutes the Unit through the adapter lane.
-    #[serde(default)]
-    pub adapter_route: bool,
-}
-
-/// Native-like navigation target reference.
-///
-/// In gamemd this is an `AbstractClass*`. Phase 1 needs cell targets for normal
-/// Drive move commands, while the entity variant gives action lines and later
-/// destination paths a shared shape without claiming those paths are complete.
+/// Derived coordinate equality compares cells by coordinates. Consumers that
+/// require native allocation identity (including Aircraft AI's dummy clear)
+/// use `TargetKind::cell_identity` after conversion; see the remaining
+/// `Per_Cell_Process` residual in `movement::per_cell`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum NavTargetRef {
+    /// A `CellClass*`, by its cell.
     Cell { rx: u16, ry: u16 },
-    Entity { id: u64 },
+    /// An `ObjectClass*`, by stable ID: a Techno in the entity store or a
+    /// Terrain object.
     Object { id: u64 },
-    Building { id: u64 },
 }
 
 impl NavTargetRef {
@@ -253,57 +65,47 @@ impl NavTargetRef {
         Self::Object { id }
     }
 
-    pub fn building(id: u64) -> Self {
-        Self::Building { id }
+    /// Compare retained Abstract pointers without querying or restamping Map.
+    /// Distinct missing-coordinate tokens name the one CellClass Dummy;
+    /// packed fixed-stride aliases also name the same allocated Cell.
+    pub(crate) fn same_pointer(
+        self,
+        other: Self,
+        terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
+    ) -> bool {
+        match (self, other, terrain) {
+            (Self::Cell { rx: ax, ry: ay }, Self::Cell { rx: bx, ry: by }, Some(terrain)) => {
+                terrain.native_fixed_cell_index(ax as i16, ay as i16)
+                    == terrain.native_fixed_cell_index(bx as i16, by as i16)
+            }
+            _ => self == other,
+        }
     }
-}
 
-/// FootClass-style owner navigation fields.
-///
-/// `nav_com` is the owner destination. It must stay separate from
-/// `MovementTarget`, which is only the active execution path.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct NavigationState {
-    /// Foot+55C is retained lifecycle history, not current occupancy.
-    #[serde(default)]
-    pub neighbor_state: crate::sim::cell_neighbors::FootNeighborState,
-    /// Foot timers, retry count and blockage latch survive path retirement.
-    #[serde(default)]
-    pub path_runtime: FootPathRuntime,
-    /// Foot-owned direction replay and reference cell (+5E0/+558), shared by
-    /// every locomotor instance. Retirement must not discard the owner queue.
-    /// Native chain tails reload the owner at Drive4B1DF7 / Ship6A143A.
-    #[serde(default)]
-    pub path_replay: FootPathQueue,
-    #[serde(default)]
-    pub nav_com_aux: Option<NavTargetRef>,
-    #[serde(default)]
-    pub nav_com: Option<NavTargetRef>,
-    #[serde(default)]
-    pub suspended_nav_com: Option<NavTargetRef>,
-    #[serde(default)]
-    pub nav_queue: Vec<NavTargetRef>,
-    /// Drive path execution reached the destination cell, but the owner
-    /// no-active-track arrival clear has not run yet.
-    #[serde(default)]
-    pub pending_arrival_clear: bool,
+    /// The object this names; a Cell names none.
+    pub(crate) const fn object_id(self) -> Option<u64> {
+        match self {
+            Self::Object { id } => Some(id),
+            Self::Cell { .. } => None,
+        }
+    }
 }
 
 /// Persistent Foot path state. The FootClass constructor 0x004D31E0 anchors
 /// both timers at the current frame (0x4D3320, 0x4D335B), stores +64C = 10
 /// (0x4D332C) and +6B7 = 0 (0x4D3451). Set_Destination_Internal 0x004D94B0
 /// rewrites the timers and latch at 0x4D96C2..0x4D9707 for every accepted
-/// setter, including a null destination, so this owner outlives MovementTarget.
+/// setter, including a null destination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FootPathRuntime {
     /// Foot+640/+648, including the native frame anchor.
-    pub movement_timer: crate::sim::timer::CdTimer,
+    movement_timer: crate::sim::timer::CdTimer,
     /// Foot+668/+670.
-    pub blocked_timer: crate::sim::timer::CdTimer,
+    blocked_timer: crate::sim::timer::CdTimer,
     /// Foot+6B7.
-    pub path_blocked: bool,
+    path_blocked: bool,
     /// Foot+64C, a dword decremented only while nonzero.
-    pub retries_left: u32,
+    retries_left: u32,
     /// Foot+68A: the pending path-failure sound byte. Ordinary construction
     /// clears it (0x004D33B4); raw Load (0x004103CD) and the no-init Foot
     /// constructor (0x004D3540) preserve the exact byte, including 255.
@@ -320,14 +122,123 @@ impl Default for FootPathRuntime {
 }
 
 impl FootPathRuntime {
+    /// `Foot+0x64C`'s reload value, the literal 10 every writer stores: the
+    /// constructor (`0x004D332C`), Drive and Ship after a found route
+    /// (`0x004B3285`, `0x006A28D5`), Hover (`0x00516BCD`) and Walk
+    /// (`0x0075B2E2`, `0x0075BA27`).
+    ///
+    /// On a failed route `Process_Movement` reads `[ECX+0x64C]` at
+    /// `0x004B2DC8`, and on `> 0` decrements and stores it back
+    /// (`0x004B2DD2`/`0x004B2DD3`) before continuing; on `<= 0` it clears the
+    /// drive coord, calls `FootClass::Stop_Moving` plus vtable `+0x480`/`+0x484`,
+    /// and plays the blocked voice at `Foot+0x68A`. The generic blocked label
+    /// `LAB_004B3282` stores the literal 10. The escalation clock is a separate
+    /// record: `Foot+0x668` = frame, `Foot+0x66C`, and `Foot+0x670` =
+    /// `Rules+0x1768`, stored only on the `Foot+0x6B7 == 0` transition of the
+    /// code-2 arm, which contains no `Scatter_Objects` call at all.
+    pub(crate) const RETRY_RELOAD: u32 = 10;
+
     pub const fn at_frame(frame: u32) -> Self {
         Self {
             movement_timer: crate::sim::timer::CdTimer::started(frame as i32, 0),
             blocked_timer: crate::sim::timer::CdTimer::started(frame as i32, 0),
             path_blocked: false,
-            retries_left: 10,
+            retries_left: Self::RETRY_RELOAD,
             scold_latch: 0,
         }
+    }
+
+    /// Find_Path's urgency on the code-2 ladders (Walk 0x0075B979, Drive/Ship
+    /// 0x4B36BC..0x4B36EF): 2 once the latched blockage timer has expired,
+    /// else 1.
+    pub(crate) fn code2_urgency(&self, frame: u32) -> u8 {
+        if self.path_blocked && self.blocked_timer.expired(frame as i32) {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// `Foot+0x640`/`+0x648`, the movement timer.
+    pub(crate) const fn movement_timer(&self) -> crate::sim::timer::CdTimer {
+        self.movement_timer
+    }
+
+    /// `Foot+0x668`/`+0x670`, the blockage timer.
+    pub(crate) const fn blocked_timer(&self) -> crate::sim::timer::CdTimer {
+        self.blocked_timer
+    }
+
+    /// `Foot+0x6B7`, the blockage latch.
+    pub const fn path_blocked(&self) -> bool {
+        self.path_blocked
+    }
+
+    /// The code-2 refusal's latch (Walk `0x0075B8A9..0x0075B979`, Drive/Ship
+    /// `0x004B3656..0x004B368D`, Hover's code 2): the first refusal stores
+    /// `Foot+0x6B7` and starts the BlockagePathDelay grace (`+0x668`); a
+    /// latched blockage keeps its running grace.
+    pub(crate) fn latch_blockage(&mut self, frame: u32, delay: i32) {
+        if !self.path_blocked {
+            self.path_blocked = true;
+            self.start_blocked(frame, delay);
+        }
+    }
+
+    /// Clear the blockage latch (`Foot+0x6B7 = 0`), keeping the grace timer:
+    /// progress, a found path or a new command ends the blockage.
+    pub(crate) fn clear_blockage(&mut self) {
+        self.path_blocked = false;
+    }
+
+    /// `Set_Destination_Internal` (`0x004D94B0`) tail `0x004D96C2..0x004D9707`
+    /// for every accepted destination: `+0x6B7 = 0`, `+0x668 = (frame,
+    /// Rules+1768)`, `+0x640 = (frame, 0)`. It never writes `+0x64C`.
+    pub(crate) fn accept_destination(&mut self, frame: u32, blockage_delay: i32) {
+        self.start_movement(frame, 0);
+        self.start_blocked(frame, blockage_delay);
+        self.path_blocked = false;
+    }
+
+    /// A fixture's blockage latch.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_path_blocked_for_test(&mut self, blocked: bool) {
+        self.path_blocked = blocked;
+    }
+
+    /// `Foot+0x64C`, the path retries left.
+    pub(crate) const fn retries_left(&self) -> u32 {
+        self.retries_left
+    }
+
+    /// Reload the path retries (`Foot+0x64C`) to [`Self::RETRY_RELOAD`]: a
+    /// found path (the no-head Process FindPath success, Walk `0x0075B2E2`)
+    /// restores the full budget.
+    pub(crate) fn reload_retries(&mut self) {
+        self.retries_left = Self::RETRY_RELOAD;
+    }
+
+    /// A fixture's path retries.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_retries_left_for_test(&mut self, retries: u32) {
+        self.retries_left = retries;
+    }
+
+    /// Spend one path retry.
+    pub(crate) fn decrement_retries_left(&mut self) {
+        self.retries_left -= 1;
+    }
+
+    /// A fixture's movement timer.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_movement_timer_for_test(&mut self, timer: crate::sim::timer::CdTimer) {
+        self.movement_timer = timer;
+    }
+
+    /// A fixture's blockage timer.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_blocked_timer_for_test(&mut self, timer: crate::sim::timer::CdTimer) {
+        self.blocked_timer = timer;
     }
 
     /// Native Foot checksum 0x004DBCFE reads the byte without normalizing it.
@@ -342,7 +253,7 @@ impl FootPathRuntime {
     }
 
     /// Supply native retained inputs without inventing a gameplay arming edge.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_scold_latch_for_test(&mut self, raw: u8) {
         self.scold_latch = raw;
     }
@@ -367,17 +278,31 @@ pub struct DriveCoord {
 }
 
 impl DriveCoord {
-    const CELL_LEPTONS: i32 = crate::util::lepton::LEPTONS_PER_CELL_I32;
-    const CELL_CENTER: i32 = crate::util::lepton::CELL_CENTER_LEPTON_I32;
-
+    /// Cell (rx, ry)'s centre ([`cell_center`]) at height `z`.
     pub fn cell(rx: u16, ry: u16, z: i32) -> Self {
+        let cell = CellCoordinate {
+            x: i32::from(rx),
+            y: i32::from(ry),
+        };
+        cell_center(cell, z).into()
+    }
+}
+
+impl From<WorldCoordinate> for DriveCoord {
+    fn from(point: WorldCoordinate) -> Self {
         Self {
-            x: i32::from(rx) * Self::CELL_LEPTONS + Self::CELL_CENTER,
-            y: i32::from(ry) * Self::CELL_LEPTONS + Self::CELL_CENTER,
-            z,
+            x: point.x,
+            y: point.y,
+            z: point.z,
         }
     }
 }
+
+/// The most direction words Find_Path's ordinary copy installs
+/// (`0x004D3E82..0x004D3EA1`): AStar returns the whole route, and a Foot
+/// requests the next window when this one runs short, so a long trip adapts
+/// to blockers found on the way.
+pub(crate) const FIND_PATH_WINDOW_WORDS: usize = 24;
 
 /// Foot-owned path replay. Native shifts a 24-dword queue on consumption;
 /// Rust retains the consumed prefix with an explicit cursor. Consumers must
@@ -388,18 +313,215 @@ pub struct FootPathQueue {
     /// Find_Path4D3E98 writes it; Drive/Ship movement consumes the same owner
     /// memory, independently of which locomotor is currently installed.
     #[serde(default)]
-    pub directions: Vec<u8>,
+    directions: Vec<u8>,
     #[serde(default)]
-    pub cursor: u16,
+    cursor: u16,
     /// Foot+558. Fresh acceptance writes this reference (4B4618/6A3C47);
     /// chain consumption preserves it (4B1DF7/6A143A).
     #[serde(default)]
-    pub reference_cell: Option<(i16, i16)>,
+    reference_cell: Option<(i16, i16)>,
 }
 
 impl FootPathQueue {
+    /// `Foot+0x5E0`, every direction word, consumed prefix included.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn directions(&self) -> &[u8] {
+        &self.directions
+    }
+
+    /// The index of the first unconsumed word.
+    pub(crate) fn cursor(&self) -> u16 {
+        self.cursor
+    }
+
+    /// `Foot+0x558`, the reference cell.
+    pub(crate) fn reference_cell(&self) -> Option<(i16, i16)> {
+        self.reference_cell
+    }
+
+    /// Write the native `-1` terminator at `slot`, when there is a word there:
+    /// the NavCom trim cuts the queue short.
+    pub(crate) fn terminate_at(&mut self, slot: usize) {
+        if let Some(word) = self.directions.get_mut(slot) {
+            *word = u8::MAX;
+        }
+    }
+
+    /// `Path[0] = -1`: every word consumed, the empty queue.
+    pub(crate) fn exhaust(&mut self) {
+        self.cursor = self.directions.len().min(u16::MAX as usize) as u16;
+    }
+
+    /// `Foot+0x558`, the cell the remaining directions start from.
+    pub(crate) fn rebase(&mut self, reference_cell: (i16, i16)) {
+        self.reference_cell = Some(reference_cell);
+    }
+
+    /// Build a fixture's queue and reference from a coordinate path.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn install(
+        &mut self,
+        reference: (u16, u16),
+        path: &[(u16, u16)],
+        first_destination: usize,
+    ) {
+        let mut from = (reference.0 as i16, reference.1 as i16);
+        let words: Vec<_> = path
+            .iter()
+            .skip(first_destination)
+            .map(|&to| {
+                let direction = direction_from_step(from, to);
+                from = (to.0 as i16, to.1 as i16);
+                i32::from(direction)
+            })
+            .collect();
+        self.install_directions(&words, false);
+        self.rebase((reference.0 as i16, reference.1 as i16));
+    }
+
+    /// Find_Path's direction copy (`0x004D3E82..0x004D3EA1`) precedes
+    /// follower callbacks; its separate reference write is at `0x004D4003`.
+    /// Copy up to the end of the 24-word window. A train's one retained
+    /// head is the current word after the consumed prefix. The Vec's end
+    /// represents the native terminator.
+    pub(crate) fn install_directions(&mut self, directions: &[i32], retain_head: bool) {
+        let head = self.directions.get(usize::from(self.cursor)).copied();
+        self.directions.clear();
+        if retain_head {
+            self.directions.push(head.unwrap_or(u8::MAX));
+        }
+        self.directions.extend(
+            directions
+                .iter()
+                .take(FIND_PATH_WINDOW_WORDS - usize::from(retain_head))
+                .map(|&dir| dir as u8),
+        );
+        self.cursor = 0;
+    }
+
+    /// Fresh acceptance (`0x004B4618`/`0x006A3C47`): `endpoint` becomes the
+    /// reference and `consumed_directions` words are popped.
+    pub(crate) fn accept(&mut self, endpoint: (i16, i16), consumed_directions: usize) {
+        self.reference_cell = Some(endpoint);
+        self.consume(consumed_directions);
+    }
+
+    /// Accepted chain `0x004B1DF7`/`0x006A143A` and the tube entries (Walk
+    /// `0x0075B3E0..0x0075B3EB`, Drive `0x004B135D..0x004B1373`, Ship
+    /// `0x006A0A25..0x006A0A3B`) pop the queue without rewriting `Foot+0x558`.
+    pub(crate) fn consume(&mut self, consumed_directions: usize) {
+        let cursor = usize::from(self.cursor)
+            .saturating_add(consumed_directions)
+            .min(self.directions.len());
+        self.cursor = cursor.min(u16::MAX as usize) as u16;
+    }
+
+    /// A fixture's cursor.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_cursor_for_test(&mut self, cursor: u16) {
+        self.cursor = cursor;
+    }
+
+    /// A fixture's reference cell.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_reference_cell_for_test(&mut self, reference_cell: Option<(i16, i16)>) {
+        self.reference_cell = reference_cell;
+    }
+
+    /// A fixture's direction word at `slot`, when there is one.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_direction_for_test(&mut self, slot: usize, direction: u8) {
+        if let Some(word) = self.directions.get_mut(slot) {
+            *word = direction;
+        }
+    }
+
+    /// A fixture's direction words.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_directions_for_test(&mut self, directions: Vec<u8>) {
+        self.directions = directions;
+    }
+
+    /// A fixture's queue.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn for_test(
+        directions: Vec<u8>,
+        cursor: u16,
+        reference_cell: Option<(i16, i16)>,
+    ) -> Self {
+        Self {
+            directions,
+            cursor,
+            reference_cell,
+        }
+    }
+
+    /// `start` followed by the cells `words` step through from it. A tube
+    /// word (8) names no adjacent cell and ends the walk.
+    fn walk_words(start: (i16, i16), words: &[u8]) -> Vec<(i16, i16)> {
+        let mut cell = start;
+        words
+            .iter()
+            .map_while(|&direction| {
+                let (dx, dy) =
+                    *crate::util::direction::DIRECTION_DELTAS.get(usize::from(direction))?;
+                cell = (
+                    cell.0.wrapping_add(dx as i16),
+                    cell.1.wrapping_add(dy as i16),
+                );
+                Some(cell)
+            })
+            .collect()
+    }
+
+    /// The cells the unpaid words step through, starting from the cell the head
+    /// word steps out of.
+    ///
+    /// Native shifts the 24-dword `Foot+5E0` queue left as it consumes, so index
+    /// 0 always steps out of the mover's own cell. Rust keeps the paid prefix
+    /// behind a cursor instead, which leaves the stored reference (`Foot+558`) as
+    /// a valid origin only where its owner refreshes it: `walk_host`'s completed
+    /// step rewrites it from the object's position after every paid step, and
+    /// `hover_process` rewrites it per cell. The chain and tube pops
+    /// (`track_host`, `tube_movement`) preserve it, as
+    /// [`FootPathQueue::consume`] records, so on
+    /// those paths the reference stays at the accepted endpoint while the cursor
+    /// moves on and a suffix walked from it falls a cell further behind the mover
+    /// per paid step. The anchor is therefore the caller's to supply: pass the
+    /// object's position cell, the same cell movement applies the head word to.
+    ///
+    /// A tube word (8) names no adjacent cell and ends the walk, as in
+    /// [`Self::walk_words`]. Diagnostics and tests.
+    pub fn remaining_cells_from(&self, head: (i16, i16)) -> Vec<(i16, i16)> {
+        Self::walk_words(head, self.remaining_directions())
+    }
+
+    /// The reference cell followed by the unpaid cells walked from it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn route_cells(&self) -> Vec<(u16, u16)> {
+        self.reference_cell
+            .into_iter()
+            .chain(self.remaining_cells_from(self.reference_cell.unwrap_or((0, 0))))
+            .map(|(x, y)| (x as u16, y as u16))
+            .collect()
+    }
+
+    /// `start` followed by the cells every word (consumed or not) steps
+    /// through from it: the route one Find_Path installed from `start`, while
+    /// the queue still holds that install's words.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn installed_cells(&self, start: (u16, u16)) -> Vec<(u16, u16)> {
+        std::iter::once((start.0 as i16, start.1 as i16))
+            .chain(Self::walk_words(
+                (start.0 as i16, start.1 as i16),
+                &self.directions,
+            ))
+            .map(|(x, y)| (x as u16, y as u16))
+            .collect()
+    }
+
     /// Native queue emptiness tests the unconsumed head, not retained history.
-    pub(crate) fn remaining_directions(&self) -> &[u8] {
+    pub fn remaining_directions(&self) -> &[u8] {
         let suffix = &self.directions[usize::from(self.cursor).min(self.directions.len())..];
         &suffix[..suffix
             .iter()
@@ -419,7 +541,7 @@ impl FootPathQueue {
     }
 }
 
-/// Foot-owned applied speed, shared by every installed locomotor instance.
+/// Foot-owned speed and retained crush flag, shared by every locomotor instance.
 ///
 /// SetSpeedFraction4D3710 writes Foot+578/+57C; GetCurrentSpeed4DB1A0 reads
 /// that fraction live (`movement::owner_current_speed`); nothing caches its
@@ -433,47 +555,120 @@ pub struct FootSpeedState {
     /// ported by `Default`); after that only `FootClass::SetSpeedFraction @
     /// 0x004D3710` writes it: [`Self::set_speed_fraction`] for a fixed-point
     /// request and [`Self::set_speed_fraction_native_bits`] for a native double.
-    applied_fraction: SimFixed,
+    applied_fraction: crate::util::native_x87::NativeF64Bits,
     /// Foot+580, initialized to exactly 1.0 at4D3292/4D329B. Retain the
     /// native bits: pickup refuses even the immediate neighbors of 1.0.
-    /// Every speed query reads it (GetCurrentSpeed multiplies it in).
-    /// RESIDUAL: its only native writer is the Speed crate
-    /// (`accept_speed_crate`), and crate pickup (Cell481A00 selection, removal,
-    /// effect dispatch) has no production caller yet, so it stays exactly 1.0.
-    /// Trigger: a Foot entering a crate cell. Effect: no crate is consumed and
-    /// no crate effect applies. Frequency: crate maps/options. Risk: saved and
-    /// hashed (v181) state that cannot differ from the constructor value until
-    /// the pickup receiver lands.
+    /// Every speed query reads it (GetCurrentSpeed multiplies it in). Its only
+    /// native writer is the Speed crate (`accept_speed_crate`), reached from
+    /// `CellClass::PickupCrate` (`crates::pickup`) when a Foot commits to a
+    /// crate cell; saved and hashed (v181). With Ares this is the permanent
+    /// Ext+90 baseline; the derived Foot+580 lives in the object's Ares part.
     crate_multiplier: crate::util::native_x87::NativeF64Bits,
+    /// Foot+6B5, constructor0 at4D3444. Drive's straight/CrusherAll
+    /// pre-entry arm4B1A2F sets it; Unit's admitted overlay tail73B067
+    /// clears it. Both the Track speed prefix and RockingUpdate read it.
+    /// It survives class replacement and ordinary movement/Stop calls.
+    crush_slowdown: bool,
+    /// Whether Ares100460A0 derived a Foot+580 other than the permanent
+    /// baseline above. The derived value lives in the object's Ares part
+    /// (`GameEntity::speed_multiplier`); this byte, in the struct's padding,
+    /// spares every speed query of a game Ares doesn't play in that read.
+    #[serde(default)]
+    attached: bool,
 }
 
 impl Default for FootSpeedState {
     fn default() -> Self {
         Self {
-            applied_fraction: crate::util::fixed_math::SIM_ZERO,
+            applied_fraction: crate::util::native_x87::NativeF64Bits::POSITIVE_ZERO,
             crate_multiplier: crate::util::native_x87::NativeF64Bits::ONE,
+            crush_slowdown: false,
+            attached: false,
         }
     }
 }
 
 impl FootSpeedState {
-    pub(crate) fn crate_multiplier(&self) -> crate::util::native_x87::NativeF64Bits {
+    pub fn crush_slowdown(&self) -> bool {
+        self.crush_slowdown
+    }
+
+    /// Drive's straight/CrusherAll pre-entry arm (`0x004B1A2F`) sets
+    /// `Foot+0x6B5`.
+    pub(crate) fn arm_crush_slowdown(&mut self) {
+        self.crush_slowdown = true;
+    }
+
+    /// Unit's admitted overlay tail (`0x0073B067`) clears `Foot+0x6B5`.
+    pub(crate) fn clear_crush_slowdown(&mut self) {
+        self.crush_slowdown = false;
+    }
+
+    /// A fixture's crush slowdown.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_crush_slowdown_for_test(&mut self, active: bool) {
+        self.crush_slowdown = active;
+    }
+
+    pub fn crate_multiplier(&self) -> crate::util::native_x87::NativeF64Bits {
         self.crate_multiplier
     }
 
-    /// Foot `+0x578`, the applied speed fraction.
-    pub(crate) fn applied_fraction(&self) -> SimFixed {
+    /// Whether Ares attachments hold a derived Foot+580 in the Ares part.
+    pub(crate) fn attached(&self) -> bool {
+        self.attached
+    }
+
+    pub(crate) fn set_attached(&mut self, attached: bool) {
+        self.attached = attached;
+    }
+
+    /// Fixed projection for diagnostics and fixed-input fixture adapters.
+    /// Runtime predicates and GetCurrentSpeed read the native owner below.
+    pub fn applied_fraction(&self) -> SimFixed {
+        let stored = self.applied_fraction.bits();
+        if stored == crate::util::native_x87::NativeF64Bits::ONE.bits() {
+            crate::util::fixed_math::SIM_ONE
+        } else {
+            // The setter admits only nonnegative finite values below one.
+            let exponent = ((stored >> 52) & 0x7ff) as i32;
+            let mantissa = stored & ((1 << 52) - 1);
+            let significand = if exponent == 0 {
+                mantissa
+            } else {
+                mantissa | (1 << 52)
+            };
+            let shift = 1075 - i64::from(exponent.max(1)) - 16;
+            SimFixed::from_bits(if shift >= 64 {
+                0
+            } else {
+                (significand >> shift) as i32
+            })
+        }
+    }
+
+    /// The complete stored Foot+578 double, including subnormal fractions.
+    pub fn native_applied_fraction(&self) -> crate::util::native_x87::NativeF64Bits {
         self.applied_fraction
+    }
+
+    pub(crate) fn speed_fraction_is_positive(&self) -> bool {
+        let bits = self.applied_fraction.bits();
+        // Ordered FCOM > 0, including raw values restored without the setter.
+        // Negative values and NaNs are outside this unsigned positive range.
+        bits > 0 && bits <= 0x7ff0_0000_0000_0000
     }
 
     /// `FootClass::SetSpeedFraction @ 0x004D3710` for a fixed-point request:
     /// at least 1 stores 1, at most 0 stores 0, and anything between is
     /// stored as given ([`Self::stored_speed_fraction`]).
     pub(crate) fn set_speed_fraction(&mut self, fraction: SimFixed) {
-        self.applied_fraction = fraction.clamp(
+        let fraction = fraction.clamp(
             crate::util::fixed_math::SIM_ZERO,
             crate::util::fixed_math::SIM_ONE,
         );
+        // Every I16F16 value is exactly representable as binary64.
+        self.set_speed_fraction_native_bits(fraction.to_num::<f64>().to_bits());
     }
 
     /// The double `FootClass::SetSpeedFraction @ 0x004D3710` stores at Foot
@@ -499,61 +694,28 @@ impl FootSpeedState {
         }
     }
 
-    /// `FootClass::SetSpeedFraction @ 0x004D3710` for a locomotor that computes
-    /// its fraction as a native double (the Jumpjet's `Process`): the double
-    /// [`Self::stored_speed_fraction`] keeps.
-    ///
-    /// The stored double becomes `SimFixed` by truncation, from its bits, so
-    /// the fraction's readers compare against the truncated thresholds
-    /// ([`Self::above_tenth`], [`Self::above_eight_tenths`]). A double within
-    /// 2^-16 above a threshold would read as not above it. The Jumpjet's speed
-    /// is always a whole number k (it steps by the constructor's 2.0 up and
-    /// 3.0 down: stock spells `JumpJetAccel=`, which the case-sensitive reader
-    /// never sees, and clamps to its integer cap C and 0), so k/C above 0.1 is
-    /// at least 0.1 + 1/(10C), outside that window for any C up to 6553, and
-    /// above 0.8 for any C up to 13107; k/C exactly 0.1 or 0.8 divides with
-    /// truncation to just below it, as native reads it.
-    pub(crate) fn set_speed_fraction_native_bits(&mut self, bits: u64) {
-        use crate::util::native_x87::NativeF64Bits;
-        let stored = Self::stored_speed_fraction(NativeF64Bits::from_bits(bits)).bits();
-        self.applied_fraction = if stored == NativeF64Bits::ONE.bits() {
-            crate::util::fixed_math::SIM_ONE
-        } else {
-            // 0 <= value < 1: floor(value * 2^16) from the significand.
-            let exponent = ((stored >> 52) & 0x7ff) as i32;
-            let mantissa = stored & ((1 << 52) - 1);
-            let significand = if exponent == 0 {
-                mantissa
-            } else {
-                mantissa | (1 << 52)
-            };
-            let shift = 1075 - i64::from(exponent.max(1)) - 16;
-            SimFixed::from_bits(if shift >= 64 {
-                0
-            } else {
-                (significand >> shift) as i32
-            })
-        };
+    /// Foot4D3710 stores an admitted interior double unchanged. The same
+    /// owner serves Jumpjet and the complete Drive/Ship numeric prefix.
+    pub fn set_speed_fraction_native_bits(&mut self, bits: u64) {
+        self.applied_fraction =
+            Self::stored_speed_fraction(crate::util::native_x87::NativeF64Bits::from_bits(bits));
     }
 
-    /// Foot `+0x578` above 0.1 (`0x007E3860`): the Infantry fire error's
-    /// moving gate (`0x0051C9B8`) and the sequencer's default arm
-    /// (`0x00520D45`). 0.1 lies between `SimFixed` raw 6553 and 6554; the
-    /// truncated threshold keeps a fraction that truncated to 6553 below it.
-    /// Original boundary witnesses: `tools/spatial_oracle/infantry_fire_speed.json`.
+    /// Strict comparison with binary64 0.1 at7E3860, used by Infantry fire
+    /// error and animation. Exclude negative and unordered raw saved values.
     pub(crate) fn above_tenth(&self) -> bool {
-        self.applied_fraction > SimFixed::ONE / SimFixed::from_num(10)
+        let bits = self.applied_fraction.bits();
+        bits > 0x3fb9_9999_9999_999a && bits <= 0x7ff0_0000_0000_0000
     }
 
-    /// Foot `+0x578` above 0.8 (`0x007EB5C8`): the Jumpjet infantryman's Fly
-    /// over Hover (`0x0052123C`). floor(0.8 * 2^16) = 52428.
+    /// Strict comparison with binary64 0.8 at7EB5C8 (Jumpjet Fly/Hover).
     pub(crate) fn above_eight_tenths(&self) -> bool {
-        self.applied_fraction > SimFixed::from_bits(52_428)
+        let bits = self.applied_fraction.bits();
+        bits > 0x3fe9_9999_9999_999a && bits <= 0x7ff0_0000_0000_0000
     }
-
     /// Cell48303A..483072: an already-modified Foot never stacks this effect.
     /// Class/radius eligibility belongs to the pickup effect caller.
-    pub(crate) fn accept_speed_crate(
+    pub fn accept_speed_crate(
         &mut self,
         multiplier: crate::util::native_x87::NativeF64Bits,
     ) -> bool {
@@ -569,259 +731,7 @@ impl FootSpeedState {
     }
 }
 
-/// ShipLocomotion-owned destination, committed head, and target speed state.
-///
-/// Ships share the ordinary TurnTrack/RawTrack curves and target fraction
-/// with Drive, but do not own Drive's
-/// tube, forced-track, or raw-occupation state.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct ShipLocomotionRuntime {
-    #[serde(default)]
-    pub destination: Option<DriveCoord>,
-    #[serde(default)]
-    pub head_to: Option<DriveCoord>,
-    #[serde(default)]
-    pub track: TrackProgress,
-    /// Ship+63, independent of head XYZ; admission6A05FC reads this byte.
-    #[serde(default)]
-    pub track_valid: bool,
-    /// Native class+62: last eligible Process observation of body rotation.
-    /// Do_Turn and track-point facing updates do not write this latch.
-    #[serde(default)]
-    pub turn_latched: bool,
-    #[serde(default)]
-    pub target_speed_fraction: SimFixed,
-    #[serde(default)]
-    pub occupation_head_to: Option<DriveOccupationFootprint>,
-    #[serde(default)]
-    pub occupation_handoff: Option<DriveOccupationFootprint>,
-}
-
-/// One active Drive/Ship locomotor's retained track selector, signed cursor,
-/// short-track choice and residual (+58/+5C/+60/+4C). Curve geometry and a
-/// temporary Process_Track call must not own serialized copies of this state.
-/// Native evidence: tools/spatial_oracle/locomotor_track_cursor.json.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct TrackProgress {
-    pub turn_index: i32,
-    /// Next-to-consume cursor. Drive constructor4AF5A6/4AF5A9 and Ship
-    /// constructor69ECB6/69ECB9 initialize selector/cursor to -1;
-    /// fresh/forced acceptance and completion retirement instead store zero.
-    pub cursor: i32,
-    pub reversed: bool,
-    pub residual: i32,
-}
-
-impl Default for TrackProgress {
-    fn default() -> Self {
-        Self {
-            turn_index: -1,
-            cursor: -1,
-            reversed: false,
-            residual: 0,
-        }
-    }
-}
-
-/// Drive-owned occupation mark installed ahead of the live object-list cell.
-///
-/// The cell list remains tied to the unit's committed coordinates. This record
-/// persists the independent head-to mark so the transient per-cell occupation
-/// index can be rebuilt after loading a snapshot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct DriveOccupationFootprint {
-    pub rx: u16,
-    pub ry: u16,
-    pub layer: MovementLayer,
-}
-
-/// DriveLocomotion-owned destination/head-to state.
-///
-/// Native can clear destination,
-/// head-to, and active track state at different points in the lifecycle.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct DriveLocomotionRuntime {
-    #[serde(default)]
-    pub destination: Option<DriveCoord>,
-    #[serde(default)]
-    pub head_to: Option<DriveCoord>,
-    #[serde(default)]
-    pub track: TrackProgress,
-    /// Drive+65, seeded true at constructor4AF5BB. Native4B4BE0/4B4BF0
-    /// disable/enable END while Foot Find_Path removes a Team membership.
-    /// No production Rust writer models that synchronous pair yet.
-    #[serde(default = "drive_end_permitted_default")]
-    pub end_permitted: bool,
-    #[serde(default)]
-    pub track_valid: bool,
-    /// Native class+62: last eligible Process observation of body rotation.
-    /// Do_Turn and track-point facing updates do not write this latch.
-    #[serde(default)]
-    pub turn_latched: bool,
-    #[serde(default)]
-    pub target_speed_fraction: SimFixed,
-    /// Head-to vehicle-occupation mark, independent from CellClass object-list
-    /// membership. Ordinary flat Drive installs one mark for its accepted next
-    /// cell before any paid track point is consumed.
-    #[serde(default)]
-    pub occupation_head_to: Option<DriveOccupationFootprint>,
-    /// Forward RawTrack handoff mark. A turning curve comes to rest on its head
-    /// cell but *passes through* an intermediate one, and the original claims
-    /// both: `Apply_Track_Occupation_Mode` applies the same mode to the track's
-    /// `+0x0C` handoff point — transformed around the stored head — before it
-    /// applies it to the supplied head coordinate. Without this the cell a
-    /// turning mover is about to drive through looks free to every other mover.
-    #[serde(default)]
-    pub occupation_handoff: Option<DriveOccupationFootprint>,
-}
-
-fn drive_end_permitted_default() -> bool {
-    true
-}
-
-impl Default for DriveLocomotionRuntime {
-    fn default() -> Self {
-        Self {
-            destination: None,
-            head_to: None,
-            track: TrackProgress::default(),
-            end_permitted: true,
-            track_valid: false,
-            turn_latched: false,
-            target_speed_fraction: SIM_ZERO,
-            occupation_head_to: None,
-            occupation_handoff: None,
-        }
-    }
-}
-
-/// Default acceleration/deceleration values — zero means no ramping,
-/// movement system falls back to using `speed` directly.
-impl Default for MovementTarget {
-    fn default() -> Self {
-        Self {
-            path: Vec::new(),
-            path_layers: Vec::new(),
-            next_index: 0,
-            speed: SIM_ZERO,
-            current_speed: SIM_ZERO,
-            accel_factor: SIM_ZERO,
-            decel_factor: SIM_ZERO,
-            slowdown_distance: SIM_ZERO,
-            move_dir_x: SIM_ZERO,
-            move_dir_y: SIM_ZERO,
-            move_dir_len: SIM_ZERO,
-            final_goal: None,
-            ignore_terrain_cost: false,
-            bypass_grid: false,
-            wall_refusal_cell: None,
-            adapter_route: false,
-        }
-    }
-}
-
-impl MovementTarget {
-    pub fn layer_at(&self, index: usize) -> MovementLayer {
-        debug_assert_eq!(
-            self.path.len(),
-            self.path_layers.len(),
-            "path/path_layers length mismatch: {} vs {}",
-            self.path.len(),
-            self.path_layers.len()
-        );
-        self.path_layers
-            .get(index)
-            .copied()
-            .unwrap_or(MovementLayer::Ground)
-    }
-}
-
-/// Persistent high-level order state that survives transient combat/movement components.
-///
-/// This keeps intent like attack-move or guard alive while systems temporarily
-/// add/remove `MovementTarget` and `AttackTarget`.
-///
-/// Slice 6: the "is this unit busy?" signalling role moved to the `mission`
-/// substrate (`mission::verb::get_current_mission`/`is_busy`). What remains here
-/// is the data `MissionType` cannot encode — the AttackMove goal / Guard anchor
-/// coords. Retiring this enum entirely waits
-/// on a goal field landing on the mission/nav substrate (a later slice).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum OrderIntent {
-    /// Move toward a destination but auto-acquire enemies along the way.
-    AttackMove { goal_rx: u16, goal_ry: u16 },
-    /// Hold position and auto-acquire nearby enemies.
-    Guard { anchor_rx: u16, anchor_ry: u16 },
-}
-
-/// Which part of a multi-part voxel model an entity/atlas entry represents.
-///
-/// Non-turret units use `Composite` (body+turret+barrel baked together).
-/// Turret units store Body/Turret/Barrel separately so the turret can
-/// be drawn at a different facing than the body at render time.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-)]
-pub enum VxlLayer {
-    /// All parts composited into one sprite (for units without independent turret).
-    Composite,
-    /// Body only (hull/chassis).
-    Body,
-    /// Turret only ({IMAGE}TUR.VXL).
-    Turret,
-    /// Barrel only ({IMAGE}BARL.VXL).
-    Barrel,
-    /// Ground shadow of the main voxel: each section's occupied (x, y) columns
-    /// flattened onto z = 0 and shifted by the shadow light vector, always at
-    /// motion frame 0. See `render::vxl_raster::render_vxl_shadow`.
-    Shadow,
-}
-
-/// Per-entity voxel HVA animation state.
-///
-/// Attached to voxel entities that cycle through HVA animation frames at runtime.
-/// Used for harvesting miners (arm/turret animation), and potentially other voxel
-/// units with multi-frame HVA files. The render loop reads `frame` to select
-/// the correct pre-rendered atlas sprite.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-pub struct VoxelAnimation {
-    /// Current HVA frame index (0-based).
-    pub frame: u32,
-    /// Total number of HVA animation frames.
-    pub frame_count: u32,
-    /// Reached native frames accumulated since last image advance.
-    pub elapsed_frames: u16,
-    /// Reached native frames per image. 0 = no auto-advance.
-    pub frame_delay: u16,
-    /// Whether the animation is currently playing (cycling frames).
-    pub playing: bool,
-}
-
-impl VoxelAnimation {
-    /// Create a new VoxelAnimation in stopped state.
-    pub fn new(frame_count: u32, frame_delay: u16) -> Self {
-        Self {
-            frame: 0,
-            frame_count,
-            elapsed_frames: 0,
-            frame_delay,
-            playing: false,
-        }
-    }
-}
-
-/// Harvest overlay animation state for the oregath.shp ore-gathering sprite.
-///
-/// Attached to harvester entities (HARV, CMIN). Shows the visual "sucking up ore"
-/// animation as an SHP overlay on top of the VXL body when actively harvesting.
-/// Uses the effect palette (anim.pal), independent of house colors.
-#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
-pub struct HarvestOverlay {
-    /// Current animation frame (0..14, 15 frames per facing direction).
-    pub frame: u16,
-    /// Whether the overlay is currently visible and animating.
-    pub visible: bool,
-}
+pub use crate::sim::movement::track_process::TrackProgress;
 
 /// Constructor row for a generic AnimClass-like runtime spawn.
 ///
@@ -858,6 +768,10 @@ pub struct AnimClassSpawnDescriptor {
     pub terrain_attached: bool,
     /// Instance draw-state bytes supplied by the native producer.
     pub draw_runtime: crate::sim::anim_class::AnimDrawRuntime,
+    /// The object the producer attaches the new Anim to right after the
+    /// constructor (`AnimClass::SetOwnerObject @ 0x00424B50`), if any.
+    #[serde(default)]
+    pub owner: Option<u64>,
 }
 
 impl AnimClassSpawnDescriptor {
@@ -884,19 +798,22 @@ impl AnimClassSpawnDescriptor {
             use_cell_drawer: false,
             terrain_attached: false,
             draw_runtime: crate::sim::anim_class::AnimDrawRuntime::default(),
+            owner: None,
         }
     }
 }
 
-/// Emitted by the refinery dock state machine for EVERY due dump gate of
-/// `UnitClass::Mission_Unload @ 0x0073D630` state 3 (`HarvesterDumpRate × 900
-/// <= unit+0xF8`, `0x0073E355..0x0073E374`), including the final gate that finds
-/// no cargo. The authoritative master-frame tail consumes it to spawn the
-/// refinery smoke burst (`BuildingClass` vtable+0x468 → `0x00459900`, fired
-/// first on each gate at `0x0073E37E`), start SpecialAnim slot 10 only while
-/// none is live (`building+0x584 == NULL`, `0x0073E384`), and cut the running
-/// SpecialAnim on the empty gate (`ClearAnimSlot(0xA)`, `0x0073E530`) before
-/// the returned state hash. The queue itself is transient and serde-skipped.
+/// Test observation of EVERY due dump gate of `UnitClass::Mission_Unload @
+/// 0x0073D630` state 3 (`HarvesterDumpRate × 900 <= unit+0xF8`,
+/// `0x0073E355..0x0073E374`), including the final gate that finds no cargo.
+/// The refinery dock commits the gate's effects itself
+/// (`building_anim::begin_refinery_unload_gate`, `end_refinery_unload_empty`):
+/// the refinery smoke burst (`BuildingClass` vtable+0x468 → `0x00459900`,
+/// fired first on each gate at `0x0073E37E`), SpecialAnim slot 10 only while
+/// none is live (`building+0x584 == NULL`, `0x0073E384`), and the cut of the
+/// running SpecialAnim on the empty gate (`ClearAnimSlot(0xA)`, `0x0073E530`).
+/// The frame tail drops the event.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BaleDepositEvent {
     /// Refinery stable_id where the bale was deposited.
@@ -911,161 +828,37 @@ pub struct BaleDepositEvent {
     pub empty: bool,
 }
 
-/// Emitted by the tank-bunker lifecycle when the walls rise (install) or fall
-/// (teardown). The authoritative frame tail creates the bunker's SpecialAnim
-/// overlays — document order within `kind == Special` decides the pair: 0/1 =
-/// walls-up, 2/3 = walls-down. `damaged` selects the `…Damaged` art variant when
-/// the building was at/below ConditionRed health at emit time. The queue is
-/// transient; its resulting overlay component participates in the frame hash.
+/// Test observation of the tank-bunker walls rising (install) or falling
+/// (teardown). The bunker link sets the wall anim slots itself
+/// (`building_anim::set_bunker_wall_slots`); `damaged` is the `…Damaged`
+/// variant choice it passed. The frame tail drops the event.
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct BunkerWallAnimEvent {
     /// Bunker building stable_id whose walls are animating.
     pub building_id: u64,
     /// `true` = walls rising (install), `false` = walls falling (teardown).
     pub up: bool,
-    /// Building was at/below ConditionRed when the event fired — use the
-    /// `…Damaged` SpecialAnim variant.
+    /// The building was at or below ConditionYellow when the event fired, so
+    /// the walls use the `…Damaged` SpecialAnim variant.
     pub damaged: bool,
 }
 
-/// Per-attacker walk-up intent for the C4 plant mission.
-///
-/// Mirrors gamemd's SEAL/Tanya/PTROOP behavior: while this is `Some`, the
-/// unit pathfinds toward the target building. On arrival at the target's
-/// cell, `tick_c4_plants` claims the plant by setting
-/// `PendingC4Detonation` on the building. This state is cleared when the
-/// player retasks the unit (Move/Stop) or when the target is lost.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct C4PlantState {
-    pub target_building_id: u64,
-}
-
-/// Body rocking state for voxel-bodied units.
-///
-/// Tracks spring-damped roll/pitch angles driven by weapon impacts and EMP
-/// wobble. Drive/Ship slope interpolation is locomotor-owned state and is
-/// intentionally independent from this optional component.
-///
-/// Optional component on `GameEntity` — present on vehicles, ships, and
-/// voxel-bodied buildings; `None` for infantry and SHP-bodied buildings, and
-/// for aircraft until `FootClass::Crash` sets their spin rates.
-#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
-pub struct RockingState {
-    /// Roll angle, rad. Positive sign matches AngleRotatedSideways convention.
-    pub angle_sideways: SimFixed,
-    /// Pitch angle, rad. Positive sign matches AngleRotatedForwards convention.
-    pub angle_forwards: SimFixed,
-    /// Roll angular velocity, rad/tick.
-    pub vel_sideways: SimFixed,
-    /// Pitch angular velocity, rad/tick.
-    pub vel_forwards: SimFixed,
-    /// If true, integrate without damping (EMP wobble, naval continuous rocking).
-    pub is_ship_rocking: bool,
-}
-
-impl RockingState {
-    /// Tilt-renderer deadband — both angles below this snap to zero and the unit
-    /// renders via the static atlas path.
-    pub const DEADBAND: SimFixed = SimFixed::lit("0.00002");
-
-    /// Returns true when the body-rocking transform is neutral.
-    #[cfg(test)]
-    pub fn is_neutral(&self) -> bool {
-        !self.is_ship_rocking
-            && self.angle_sideways.abs() <= Self::DEADBAND
-            && self.angle_forwards.abs() <= Self::DEADBAND
-    }
-}
-
-/// Shared per-building C4 / PostMortem detonation timer.
-///
-/// Native BuildingClass uses one latch and timer triple for both an infantry
-/// C4 plant and a qualifying `CausesDelayKill` fatal hit. Once elapsed, the
-/// building's own Update fires a forced C4Warhead receiver packet with damage
-/// equal to its current HP.
-///
-/// IronCurtain/ForceShield entry cancels this state. Normal targets keep an
-/// expired latch if the forced receiver unexpectedly leaves them alive;
-/// BridgeRepairHut owns the separate consume-and-clear branch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct PendingC4Detonation {
-    /// Native Building timer (`+0x528` start, `+0x530` duration), signed and
-    /// unclamped; its remaining time drives the shorten test, the Building
-    /// Update expiry and the checksum.
-    pub timer: crate::sim::timer::CdTimer,
-    /// Retained source-object identity (`+0x540`). Fresh PostMortem arms leave
-    /// this null; shortening an infantry C4 timer preserves its source.
-    pub source_entity_id: Option<u64>,
-}
-
-#[cfg(test)]
+#[cfg(all(test, tests_sim_c_g))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_position_creation() {
-        let pos: Position = Position {
-            rx: 30,
-            ry: 40,
-            z: 0,
-            exact_z_leptons: None,
-            sub_x: crate::util::lepton::CELL_CENTER_LEPTON,
-            sub_y: crate::util::lepton::CELL_CENTER_LEPTON,
-        };
-        assert_eq!(pos.rx, 30);
-        assert_eq!(pos.ry, 40);
-    }
+    use crate::sim::movement::DriveLocomotionRuntime;
 
     #[test]
     fn test_types_are_send_sync() {
         // GameEntity fields must be Send + Sync for future multithreaded sim ticks.
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<Position>();
-        assert_send_sync::<Health>();
-        assert_send_sync::<MovementTarget>();
-        assert_send_sync::<OrderIntent>();
+        assert_send_sync::<crate::sim::combat::Health>();
         assert_send_sync::<BuildingUp>();
-        assert_send_sync::<VoxelAnimation>();
-        assert_send_sync::<HarvestOverlay>();
         assert_send_sync::<crate::sim::movement::locomotor::LocomotorState>();
         assert_send_sync::<NavigationState>();
         assert_send_sync::<DriveLocomotionRuntime>();
-    }
-
-    #[test]
-    fn drive_coord_cell_uses_center_leptons() {
-        let coord = DriveCoord::cell(45, 40, 0);
-        assert_eq!(coord.x, 45 * 256 + 128);
-        assert_eq!(coord.y, 40 * 256 + 128);
-        assert_eq!(coord.z, 0);
-    }
-
-    #[test]
-    fn nav_target_ref_has_cell_object_and_building_shapes() {
-        assert_eq!(
-            NavTargetRef::cell(45, 40),
-            NavTargetRef::Cell { rx: 45, ry: 40 }
-        );
-        assert_eq!(NavTargetRef::object(7), NavTargetRef::Object { id: 7 });
-        assert_eq!(NavTargetRef::building(9), NavTargetRef::Building { id: 9 });
-    }
-
-    #[test]
-    fn drive_locomotion_default_is_inert() {
-        let drive = DriveLocomotionRuntime::default();
-        assert_eq!(drive.destination, None);
-        assert_eq!(drive.head_to, None);
-        let navigation = NavigationState::default();
-        assert!(navigation.path_replay.directions.is_empty());
-        assert_eq!(navigation.path_replay.cursor, 0);
-        assert_eq!(drive.track.turn_index, -1);
-        assert_eq!(drive.track.cursor, -1);
-        assert!(!drive.track_valid);
-        assert!(!drive.track.reversed);
-        assert_eq!(drive.target_speed_fraction, SIM_ZERO);
-        let owner_speed = FootSpeedState::default();
-        assert_eq!(owner_speed.applied_fraction, SIM_ZERO);
-        assert_eq!(drive.track.residual, 0);
     }
 
     /// `FootClass::SetSpeedFraction @ 0x004D3710` executed on the original
@@ -1075,8 +868,8 @@ mod tests {
     #[test]
     fn speed_fraction_setter_matches_the_original() {
         use crate::util::native_x87::NativeF64Bits;
-        let cases: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-            "../../tools/spatial_oracle/foot_speed_owner.json"
+        let cases: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/foot_speed_owner.json",
         ))
         .unwrap();
         let bits = |row: &serde_json::Value, hex: &str, float: &str| {
@@ -1090,6 +883,26 @@ mod tests {
             let requested = bits(&case["input"], "requested_bits", "requested");
             let stored = bits(&case["output"], "applied_bits", "applied");
             let requested_double = NativeF64Bits::from_bits(requested);
+            // Native raw comparison controls bypass the setter's clamp.
+            let raw = FootSpeedState {
+                applied_fraction: requested_double,
+                ..FootSpeedState::default()
+            };
+            assert_eq!(
+                raw.speed_fraction_is_positive(),
+                f64::from_bits(requested) > 0.0,
+                "raw positive: {case}"
+            );
+            assert_eq!(
+                raw.above_tenth(),
+                f64::from_bits(requested) > 0.1,
+                "raw tenth: {case}"
+            );
+            assert_eq!(
+                raw.above_eight_tenths(),
+                f64::from_bits(requested) > 0.8,
+                "raw eight tenths: {case}"
+            );
             assert_eq!(
                 FootSpeedState::stored_speed_fraction(requested_double).bits(),
                 stored,
@@ -1097,18 +910,22 @@ mod tests {
             );
             let mut speed = FootSpeedState::default();
             speed.set_speed_fraction_native_bits(requested);
+            assert_eq!(speed.native_applied_fraction().bits(), stored, "{case}");
+            assert_eq!(
+                speed.speed_fraction_is_positive(),
+                f64::from_bits(stored) > 0.0
+            );
+            assert_eq!(speed.above_tenth(), f64::from_bits(stored) > 0.1);
+            assert_eq!(speed.above_eight_tenths(), f64::from_bits(stored) > 0.8);
+            let encoded = crate::util::save_codec::serialize(&speed).unwrap();
+            let restored: FootSpeedState = crate::util::save_codec::deserialize(&encoded).unwrap();
+            assert_eq!(restored.native_applied_fraction().bits(), stored);
             // The stored double lies in [0, 1], so scaling by 2^16 is exact.
             let truncated = SimFixed::from_bits((f64::from_bits(stored) * 65536.0) as i32);
             assert_eq!(speed.applied_fraction(), truncated, "{case}");
             setter_rows += usize::from(case["input"]["family"] == "setter");
         }
         assert_eq!((cases.len(), setter_rows), (25, 13));
-    }
-
-    #[test]
-    fn drive_locomotion_serde_defaults_missing_fields() {
-        let drive: DriveLocomotionRuntime = serde_json::from_str("{}").expect("deserialize drive");
-        assert_eq!(drive, DriveLocomotionRuntime::default());
     }
 
     #[test]
@@ -1122,51 +939,19 @@ mod tests {
         }
 
         let drive_a = DriveLocomotionRuntime::default();
-        let mut drive_b = DriveLocomotionRuntime::default();
-        drive_b.destination = Some(DriveCoord::cell(45, 40, 0));
-        drive_b.track.residual = 6;
+        let drive_b = DriveLocomotionRuntime::default()
+            .with_destination_for_test(Some(DriveCoord::cell(45, 40, 0)))
+            .with_track_for_test(TrackProgress::for_test(-1, -1, false, 6));
 
         assert_ne!(hash_drive(&drive_a), hash_drive(&drive_b));
     }
+}
 
-    #[test]
-    fn c4_state_types_are_send_sync_copy() {
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<C4PlantState>();
-        assert_send_sync::<PendingC4Detonation>();
-        // Compile-time Copy assertion via fn-bound:
-        fn _assert_copy<T: Copy>() {}
-        _assert_copy::<C4PlantState>();
-        _assert_copy::<PendingC4Detonation>();
-    }
-
-    #[test]
-    fn rocking_default_is_neutral() {
-        let r = RockingState::default();
-        assert!(r.is_neutral());
-    }
-
-    #[test]
-    fn rocking_active_angle_is_not_neutral() {
-        let mut r = RockingState::default();
-        r.angle_sideways = SimFixed::lit("0.01");
-        assert!(!r.is_neutral());
-    }
-
-    #[test]
-    fn rocking_within_deadband_is_neutral() {
-        let mut r = RockingState::default();
-        // SimFixed precision is ~1.5e-5, so 1e-5 rounds to 0; pick a value
-        // strictly between the smallest representable nonzero and DEADBAND.
-        // DEADBAND is 2e-5; SIM_EPSILON is ~1.5e-5 — exactly one delta below.
-        r.angle_sideways = SimFixed::DELTA;
-        assert!(r.is_neutral());
-    }
-
-    #[test]
-    fn rocking_ship_rocking_is_not_neutral() {
-        let mut r = RockingState::default();
-        r.is_ship_rocking = true;
-        assert!(!r.is_neutral());
-    }
+/// The direction word of one route step; a non-adjacent step is the tube
+/// direction.
+pub(crate) fn direction_from_step(from: (i16, i16), to: (u16, u16)) -> u8 {
+    let dx = i32::from(to.0 as i16) - i32::from(from.0);
+    let dy = i32::from(to.1 as i16) - i32::from(from.1);
+    crate::util::direction::direction_from_delta(dx, dy)
+        .unwrap_or(crate::util::direction::TUBE_STEP_DIRECTION)
 }

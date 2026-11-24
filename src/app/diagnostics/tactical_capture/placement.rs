@@ -4,7 +4,7 @@
 //! placement authority through `production::placement_preview_for_owner_with_overlays`.
 
 use crate::map::entities::EntityCategory;
-use crate::map::overlay_types::OverlayTypeRegistry;
+use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::pathfinding::PathGrid;
 use crate::sim::production;
@@ -135,16 +135,12 @@ pub(crate) fn first_valid_placement(
     if path_grid.width() == 0 || path_grid.height() == 0 {
         return Err(PlacementSearchError::EmptyPathGrid);
     }
-    let anchor_valid = sim
-        .substrate
-        .entities
-        .get(anchor_yard_id)
-        .is_some_and(|entity| {
-            entity.is_active()
-                && entity.category == EntityCategory::Structure
-                && sim.interner.resolve(entity.owner()) == owner
-                && (entity.position.rx, entity.position.ry) == anchor_cell
-        });
+    let anchor_valid = sim.entities().get(anchor_yard_id).is_some_and(|entity| {
+        entity.is_active()
+            && entity.category() == EntityCategory::Structure
+            && sim.interner().resolve(entity.owner()) == owner
+            && (entity.position.rx(), entity.position.ry()) == anchor_cell
+    });
     if !anchor_valid {
         return Err(PlacementSearchError::AnchorYardMissing {
             anchor_yard_id,
@@ -155,7 +151,7 @@ pub(crate) fn first_valid_placement(
     let ready_count = production::ready_buildings_for_owner(sim, rules, owner)
         .iter()
         .filter(|ready| {
-            sim.interner
+            sim.interner()
                 .resolve(ready.type_id)
                 .eq_ignore_ascii_case(type_id)
         })
@@ -207,7 +203,7 @@ pub(crate) fn first_valid_placement(
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 mod placement_tests {
     use super::*;
     use crate::rules::ini_parser::IniFile;
@@ -235,7 +231,7 @@ Buildable=yes
         RuleSet::from_ini(&ini).expect("placement rules")
     }
 
-    fn ready_fixture(
+    fn yard_fixture(
         width: u16,
         height: u16,
         yard_cell: (u16, u16),
@@ -247,26 +243,23 @@ Buildable=yes
         let yard_id = sim
             .spawn_object("GACNST", "Russians", yard_cell.0, yard_cell.1, 0, &rules)
             .expect("yard");
-        let owner_id = sim.interner.intern("Russians");
-        let target_id = sim.interner.intern("NAPOWR");
-        sim.production
-            .ready_by_owner
-            .entry(owner_id)
-            .or_default()
-            .push_back(target_id);
         (sim, rules, grid, yard_id)
     }
 
-    #[test]
-    fn radius_zero_visits_center_once() {
-        assert_eq!(
-            ordered_square_ring_cells((4, 5), 10, 10, 0),
-            vec![SquareRingCandidate {
-                cell: (4, 5),
-                radius: 0,
-                candidate_index: 0,
-            }]
+    /// The yard fixture with a completed NAPOWR waiting in its owner's
+    /// building factory.
+    fn ready_fixture(
+        width: u16,
+        height: u16,
+        yard_cell: (u16, u16),
+    ) -> (Simulation, RuleSet, PathGrid, u64) {
+        let (mut sim, rules, grid, yard_id) = yard_fixture(width, height, yard_cell);
+        let owner_id = sim.intern("Russians");
+        let target_id = sim.intern("NAPOWR");
+        crate::sim::production::complete_held_building_for_test(
+            &mut sim, &rules, owner_id, target_id,
         );
+        (sim, rules, grid, yard_id)
     }
 
     #[test]
@@ -305,13 +298,14 @@ Buildable=yes
         let expected = ordered
             .iter()
             .find(|candidate| {
-                production::placement_preview_for_owner_without_overlays(
+                production::placement_preview_for_owner_with_overlays(
                     &sim,
                     &rules,
                     "Russians",
                     "NAPOWR",
                     candidate.cell.0,
                     candidate.cell.1,
+                    None,
                 )
                 .is_some_and(|preview| preview.valid)
             })
@@ -351,8 +345,7 @@ Buildable=yes
 
     #[test]
     fn target_must_be_ready_before_search() {
-        let (mut sim, rules, grid, yard_id) = ready_fixture(24, 24, (10, 10));
-        sim.production.ready_by_owner.clear();
+        let (sim, rules, grid, yard_id) = yard_fixture(24, 24, (10, 10));
         assert!(matches!(
             first_valid_placement(
                 &sim,
@@ -372,7 +365,7 @@ Buildable=yes
     #[test]
     fn anchor_must_still_be_the_live_local_structure() {
         let (mut sim, rules, grid, yard_id) = ready_fixture(24, 24, (10, 10));
-        sim.substrate.entities.remove(yard_id);
+        sim.entities_mut_for_test().remove(yard_id);
         assert!(matches!(
             first_valid_placement(
                 &sim,
@@ -391,7 +384,9 @@ Buildable=yes
 
     #[test]
     fn no_valid_candidate_fails_without_fallback() {
-        let (sim, rules, grid, yard_id) = ready_fixture(1, 1, (0, 0));
+        // Radius zero visits only the live yard's occupied anchor. A failed
+        // search must not fall back to a cell beyond the requested radius.
+        let (sim, rules, grid, yard_id) = ready_fixture(24, 24, (10, 10));
         assert!(matches!(
             first_valid_placement(
                 &sim,
@@ -399,8 +394,8 @@ Buildable=yes
                 "Russians",
                 "NAPOWR",
                 yard_id,
-                (0, 0),
-                16,
+                (10, 10),
+                0,
                 &grid,
                 None,
             ),

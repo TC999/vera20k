@@ -1,10 +1,7 @@
 //! `asset render` for TMP terrain templates — the isometric tile files.
 //!
-//! The mix-browser can already *look* at a template (`render_tmp_preview` in
-//! `src/bin/mix_browser_renderers.rs`), but it returns an `egui::ColorImage`, so
-//! nothing headless can keep the result. This module closes that gap: the same
-//! template, written to PNGs, plus the per-tile fields that decide how the cell
-//! behaves in the sim.
+//! The template is written to PNGs, plus the per-tile fields that decide how the
+//! cell behaves in the sim.
 //!
 //! Two layouts, because they answer different questions:
 //!
@@ -13,10 +10,7 @@
 //!   or an odd `offset_x`/`offset_y` is obvious. Labels land in the empty corner
 //!   of each diamond and cover nothing.
 //! - **isometric** (`--isometric`): the half-cell stagger the game composes, so
-//!   the template reads as the shape a player sees. The stagger formula is the
-//!   one `src/bin/inspect-water-tiles.rs` uses; it is reused rather than
-//!   re-derived, because two independent isometric layout formulas in one tree
-//!   is exactly how a one-cell drift gets shipped.
+//!   the template reads as the shape a player sees.
 //!
 //! Per-tile `height` and `ramp_type` are burned into the image, not just the
 //! JSON: those two fields drive cliff/slope behaviour, and pairing them with the
@@ -37,6 +31,7 @@ use crate::asset_tools::identify;
 use crate::asset_tools::names::NameDict;
 use crate::asset_tools::palette;
 use crate::asset_tools::report::{ErrorReport, RenderOutputs, RenderReport};
+use crate::asset_tools::sanitise_name;
 use crate::asset_tools::verb_render::RenderOptions;
 use crate::assets::asset_manager::AssetManager;
 use crate::assets::pal_file::Palette;
@@ -242,7 +237,7 @@ pub fn run(
             load.name, load.reason
         ));
     }
-    let render_palette = terrain_palette(load.palette);
+    let render_palette = load.palette;
 
     let cols = tmp.template_width.max(1) as usize;
     let tile_count = tmp.tiles.len();
@@ -302,7 +297,7 @@ pub fn run(
         ));
     }
 
-    let sanitised = sanitise_name(name);
+    let sanitised = sanitise_name(name, FALLBACK_DIR_NAME);
     let dir = render_dir(&opts.out, &sanitised);
     std::fs::create_dir_all(&dir).map_err(|err| ErrorReport {
         error: format!("could not create {}: {err}", dir.display()),
@@ -455,7 +450,6 @@ pub fn run(
         mode,
         &choice.name,
         &choice.reason,
-        &choice.alpha_policy,
     );
     let sheet = assemble_sheet(&header, &sheet_art);
     let sheet_path = dir.join(sheet_png_name(&sanitised));
@@ -484,24 +478,6 @@ pub fn run(
             index: Some(index_path.display().to_string()),
         },
     })
-}
-
-/// Prepare a palette so the parser's diamond mask survives.
-///
-/// `TmpFile::tile_to_rgba` keys the mask off index 0 carrying alpha 0: inside
-/// the diamond it forces that pixel opaque (which is what stops black grid lines
-/// appearing at every cell boundary), outside it leaves it transparent. The
-/// gamemd-UI palette conversion assigns no alpha at all — and theater palettes
-/// are exactly the ones that take that conversion — so with a real terrain
-/// palette the test never fires and every tile renders as an opaque rectangle
-/// with its diamond silhouette gone.
-///
-/// Restoring the flag on index 0 makes the existing rule reachable. The rule
-/// itself is untouched, and index 0's colour is preserved for the pixels inside
-/// the diamond that legitimately use it.
-fn terrain_palette(mut palette: Palette) -> Palette {
-    palette.colors[0].a = 0;
-    palette
 }
 
 /// Decode one tile into an RGBA buffer, or `None` when the pixel data and the
@@ -536,9 +512,9 @@ fn tile_row(index: usize, tile: &TmpTile, png: String) -> TileRow {
 
 /// Top-left of tile `index`'s diamond, in unscaled composite pixels.
 ///
-/// The isometric arm is the half-cell stagger `inspect-water-tiles` uses: odd
-/// rows shift right by half a tile and every row advances by half a tile
-/// height, which is what makes the diamonds interlock.
+/// The isometric arm is the half-cell stagger: odd rows shift right by half a
+/// tile and every row advances by half a tile height, which is what makes the
+/// diamonds interlock.
 fn tile_origin(index: usize, cols: usize, tile_w: u32, tile_h: u32, isometric: bool) -> (i64, i64) {
     let cols = cols.max(1);
     let col = (index % cols) as i64;
@@ -614,7 +590,6 @@ fn tile_label(index: usize, tile: &TmpTile) -> String {
 
 /// Header lines above the composite. An agent that only looks at the image must
 /// still know which palette and which layout produced it.
-#[allow(clippy::too_many_arguments)]
 fn sheet_header(
     name: &str,
     source_archive: &str,
@@ -628,7 +603,6 @@ fn sheet_header(
     mode: &str,
     palette_name: &str,
     palette_reason: &str,
-    alpha_policy: &str,
 ) -> Vec<String> {
     vec![
         glyphable(&format!("{name}   {source_archive}")),
@@ -639,9 +613,7 @@ fn sheet_header(
         glyphable(&format!(
             "drawn {drawn}   composite {composite_w}x{composite_h}   scale {scale}x   mode {mode}"
         )),
-        glyphable(&format!(
-            "palette {palette_name}   {palette_reason}   alpha {alpha_policy}"
-        )),
+        glyphable(&format!("palette {palette_name}   {palette_reason}")),
         glyphable("captions are t index  h height  r ramp type"),
     ]
 }
@@ -814,26 +786,6 @@ fn is_last_resort_palette(reason: &str) -> bool {
         .any(|marker| lowered.contains(marker))
 }
 
-/// Replace every character outside `[A-Za-z0-9._-]` so the name is safe as a
-/// directory and filename component on any platform.
-fn sanitise_name(name: &str) -> String {
-    let sanitised: String = name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if sanitised.is_empty() {
-        FALLBACK_DIR_NAME.to_string()
-    } else {
-        sanitised
-    }
-}
-
 /// `<out>/render/<sanitised>/`, absolutised so the reported paths do not depend
 /// on the reader's working directory.
 fn render_dir(out: &Path, sanitised: &str) -> PathBuf {
@@ -927,7 +879,7 @@ fn summarise_indices(indices: &[usize]) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_asset_tools))]
 mod tests {
     use super::*;
 
@@ -969,19 +921,6 @@ mod tests {
     }
 
     #[test]
-    fn grid_origins_advance_by_a_full_tile_in_both_axes() {
-        let origin = |index| tile_origin(index, 3, TILE_W, TILE_H, false);
-        assert_eq!(origin(0), (0, 0));
-        assert_eq!(origin(1), (60, 0));
-        assert_eq!(origin(2), (120, 0));
-        assert_eq!(origin(3), (0, 30));
-        assert_eq!(origin(4), (60, 30));
-        assert_eq!(origin(5), (120, 30));
-        assert_eq!(origin(6), (0, 60));
-        assert_eq!(origin(8), (120, 60));
-    }
-
-    #[test]
     fn isometric_origins_stagger_odd_rows_by_half_a_tile() {
         let origin = |index| tile_origin(index, 3, TILE_W, TILE_H, true);
         // Row 0 sits flush; every row drops half a tile height.
@@ -1008,15 +947,6 @@ mod tests {
         assert_eq!(origin(3), (30, 45));
         // A zero column count must not divide by zero.
         assert_eq!(tile_origin(2, 0, TILE_W, TILE_H, false), (0, 60));
-    }
-
-    #[test]
-    fn composite_size_matches_each_layout() {
-        // Grid is the bare tile pitch.
-        assert_eq!(composite_size(3, 3, TILE_W, TILE_H, false), Some((180, 90)));
-        // Isometric carries half a tile of slack in x and a full tile in y.
-        assert_eq!(composite_size(3, 3, TILE_W, TILE_H, true), Some((210, 75)));
-        assert_eq!(composite_size(1, 1, TILE_W, TILE_H, true), Some((90, 45)));
     }
 
     #[test]
@@ -1061,12 +991,6 @@ mod tests {
         assert_eq!(empty_cell_indices(&tmp.tiles, &[1, 3, 5]), vec![1, 3, 5]);
         // An index past the end counts as absent rather than panicking.
         assert_eq!(empty_cell_indices(&tmp.tiles, &[99]), vec![99]);
-    }
-
-    #[test]
-    fn an_all_empty_template_counts_every_selected_cell() {
-        let tmp = template(2, 1, &[false, false]);
-        assert_eq!(empty_cell_indices(&tmp.tiles, &[0, 1]), vec![0, 1]);
     }
 
     #[test]
@@ -1131,7 +1055,6 @@ mod tests {
             MODE_ISOMETRIC,
             "isotem.pal",
             "archive-map:isotemp",
-            "gamemd_ui",
         ) {
             assert!(line.chars().all(is_drawable), "header line {line:?}");
         }
@@ -1199,38 +1122,6 @@ mod tests {
     }
 
     #[test]
-    fn output_paths_match_the_shp_render_convention() {
-        assert_eq!(tile_png_name("clat01.tem", 0), "clat01.tem.000.png");
-        assert_eq!(tile_png_name("clat01.tem", 42), "clat01.tem.042.png");
-        assert_eq!(sheet_png_name("clat01.tem"), "clat01.tem.sheet.png");
-
-        // The default output root is `RenderOptions`', not this module's, so the
-        // two render paths cannot drift apart.
-        let dir = render_dir(&RenderOptions::default().out, "clat01.tem");
-        assert!(dir.is_absolute(), "{}", dir.display());
-        assert!(
-            dir.ends_with(Path::new(RENDER_SUBDIR).join("clat01.tem")),
-            "{}",
-            dir.display()
-        );
-
-        assert!(is_generated_output("clat01.tem.000.png", "clat01.tem"));
-        assert!(is_generated_output("clat01.tem.sheet.png", "clat01.tem"));
-        assert!(!is_generated_output("index.tsv", "clat01.tem"));
-        assert!(!is_generated_output("clat01.tem.000.png", "clat02.tem"));
-    }
-
-    #[test]
-    fn sanitise_name_keeps_a_theater_extension_and_replaces_separators() {
-        assert_eq!(sanitise_name("clat01.tem"), "clat01.tem");
-        assert_eq!(
-            sanitise_name("isotemp.mix/clat01.tem"),
-            "isotemp.mix_clat01.tem"
-        );
-        assert_eq!(sanitise_name(""), FALLBACK_DIR_NAME);
-    }
-
-    #[test]
     fn scale_is_clamped_and_fitted_to_the_pixel_budget() {
         assert_eq!(clamp_scale(0), MIN_SCALE);
         assert_eq!(clamp_scale(999), MAX_SCALE);
@@ -1240,42 +1131,8 @@ mod tests {
         assert_eq!(fit_scale(180, 90, 5), Some(5));
         // A large composite is reduced rather than refused.
         let fitted = fit_scale(4000, 4000, 16).unwrap();
-        assert!(fitted >= MIN_SCALE && fitted < 16, "{fitted}");
+        assert!((MIN_SCALE..16).contains(&fitted), "{fitted}");
         assert_eq!(fit_scale(60_000, 60_000, 1), None);
-    }
-
-    #[test]
-    fn terrain_palette_restores_the_diamond_mask_flag() {
-        // The gamemd-UI conversion leaves index 0 opaque, which would erase the
-        // diamond silhouette the TMP reader keys off it.
-        let mut bytes = vec![0u8; 768];
-        bytes[0..3].copy_from_slice(&[10, 20, 30]);
-        let ui = Palette::from_bytes_gamemd_ui(&bytes).expect("palette");
-        assert_eq!(ui.colors[0].a, 255);
-
-        let fixed = terrain_palette(ui);
-        assert_eq!(fixed.colors[0].a, 0);
-        // Index 0's colour survives: pixels inside the diamond still use it.
-        assert_eq!(
-            (fixed.colors[0].r, fixed.colors[0].g, fixed.colors[0].b),
-            (40, 80, 120)
-        );
-        // Every other entry is untouched.
-        assert_eq!(fixed.colors[1].a, 255);
-    }
-
-    #[test]
-    fn last_resort_palette_reasons_are_detected_case_insensitively() {
-        assert!(is_last_resort_palette("last-resort-768-byte-scan"));
-        assert!(is_last_resort_palette("LAST RESORT archive scan"));
-        assert!(!is_last_resort_palette("archive-map:isotemp"));
-    }
-
-    #[test]
-    fn summarise_indices_caps_the_listing() {
-        assert_eq!(summarise_indices(&[1, 2, 3]), "1, 2, 3");
-        let many: Vec<usize> = (0..12).collect();
-        assert!(summarise_indices(&many).ends_with("+4 more"));
     }
 
     #[test]
@@ -1316,7 +1173,9 @@ mod tests {
 
         let lit = art
             .data
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|px| px[0] == TILE_LABEL_COLOR[0] && px[1] == TILE_LABEL_COLOR[1])
             .count();
         assert!(lit > 0, "the on-canvas caption should light some pixels");

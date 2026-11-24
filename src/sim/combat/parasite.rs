@@ -13,58 +13,80 @@
 //! killing hit: ObjectClass::ReceiveDamage's exact-zero Destroy (`0x005F57AF`)
 //! runs Detach_All(1), whose announce visits the victim itself; its
 //! FootClass::PointerExpired forwards from Foot+694 to the eater's
-//! ParasiteClass (`0x004D99AA..0x004D99C6`, `Simulation::object_destroy_callback`).
+//! ParasiteClass (`0x004D99AA..0x004D99C6`, `Simulation::detach_all`).
 //! Ghidra plates on those addresses carry the evidence; retail data:
 //! `[ParasiteDog]`, `[Parasite]`, `[BadTeeth]`, `[DroneJump]`.
 //!
-//! The owner entity holds [`ParasiteState`]; the victim holds only the
-//! back-link `GameEntity::parasite_eating_me`.
+//! Each Foot's parasite fields are one [`FootParasite`]: the owner holds its
+//! [`ParasiteState`], the victim the back-link to its eater.
 //!
 //! Forced releases ported: Sonic hits, third-party damage suppression and
 //! heals (FootClass::ReceiveDamage `0x004D7330`), repair-depot steps (Radio
 //! 0x1C `0x006F4D70`), Iron Curtain (FootClass::IronCurtain `0x004DEAE0`) and
-//! the Teleport warp step (`0x007195BF`). Victim restrictions ported: transport
+//! the Teleport warp step (`0x007195BF`), and Grinder entry (`0x0073A13E`).
+//! Victim restrictions ported: transport
 //! loading, tank bunkers, DeploysInto, retaliation against the eater.
 //!
+//! Every release unlimbos the owner through the class Unlimbo
+//! (`Simulation::unlimbo_class_entry`). The AttachTo refusal and ExitUnit
+//! raise no `0x00A8E7AC`, so the owner's class `Can_Enter_Cell`
+//! (`0x005F4F1B..0x005F4F44`) decides, and an owner it refuses is deleted;
+//! an owner still holding its victim is admitted at the victim's cell
+//! (`0x0073F530`, `0x0051C259`). PointerExpired raises it around its Unlimbo
+//! (`0x0062A2F8..0x0062A311`, cleared at `0x0062A372..0x0062A379` and
+//! `0x0062A45C..0x0062A462`), which skips that query.
+//!
+//! A placed owner's sight: its Unlimbo reveals it (`0x006F6D27`), and the
+//! AttachTo refusal then takes it back (ReReveal `0x0062AA51`). The
+//! UpdateReveal that follows ExitUnit's (`0x0062A7A8`) and PointerExpired's
+//! (`0x0062A40B`) Unlimbo finds the latch that Unlimbo set and adds nothing.
+//!
 //! RESIDUALS (each needs a mechanism VERA does not have yet):
-//! - Area Guard after a release: Enter_Idle_Mode (Infantry `0x0051CD3E..`,
-//!   Unit `0x00738B67..`) picks Area Guard for DefaultToGuardArea types
-//!   (DOG/ADOG/DRON and 8 more) and, IQ-gated, for AI houses; the shared
-//!   selector (`queue_foot_enter_idle_mode`) still picks Guard. Effect: a
-//!   released dog or drone guards in place instead of chasing nearby targets.
-//!   Frequency: every release. Owner: the Enter_Idle_Mode selector port.
-//! - Unlimbo's Can_Enter_Cell (`0x005F4F1B..0x005F4F44`) runs on the unbracketed
-//!   AttachTo-refusal and ExitUnit releases and deletes an owner it refuses
-//!   (Unit/Infantry skip occupants of the attached victim's cell,
-//!   `0x0073F530`, `0x0051C259`). VERA places the owner. Trigger: a launch cell
-//!   taken during the jump, or a NearbyLocation cell only the victim can use.
-//!   Frequency: rare. Owner: the CanEnterCell consolidation (Drive/Ship port).
-//! - Paralysis in the movers: Drive/Ship Set_Destination and Process_Movement
-//!   (`0x004AFD5E`, `0x004B2759`, `0x0069F46E`, `0x006A1DA9`), Fly
-//!   `0x004CCD00`/`0x004CF96E`, Hover `0x00514DB9`/`0x00514FD2`, Teleport
-//!   `0x00718120`, `0x005B0099`, `0x00728B10`, and the player-control virtual
-//!   +0xA0 (`0x00700C90`) refuse a paralyzed Foot. Trigger: a successful
+//! - The fog border that follows the AttachTo refusal (`0x0062AA91`: from
+//!   the cached radius - 3 out to + 2) is not refreshed. Trigger: a jump
+//!   whose host is lost in flight. Effect: the shroud-edge frames of that
+//!   ring around the drone wait for its next reveal event. Frequency: each
+//!   such refusal. Risk: edge frames only. PointerExpired's border
+//!   (`0x0062A44B`: - 3 out to + 3) is not refreshed either, but it changes
+//!   nothing: the drone's Unlimbo border (`0x006F6D61`, from its cell out
+//!   to the radius + 3) has just refreshed that disc, and the UpdateReveal
+//!   between (`0x0062A40B`) reveals nothing new.
+//! - GetReleaseCoords' PlaceInfantryInCell finding no spot writes the zero
+//!   coordinate (`0x0089E778`), which a Unit owner turns into map cell
+//!   (0,0)'s GetCoords (`0x0062AE09..0x0062AE3E`); that is no longer the
+//!   invalid `0x00AC4948`, so PointerExpired unlimboes the owner there under
+//!   `0x00A8E7AC`, outside the map. VERA has no off-map Unlimbo and deletes
+//!   the owner. Trigger: a drone's victim dies where the drone cannot take
+//!   its place (in the air, on a building or terrain object, on water) and
+//!   the cell ahead of the victim holds a vehicle or a closed object.
+//!   Effect: the drone is lost instead of standing off the map's corner.
+//!   Frequency: rare. Risk: the owner's unit count only.
+//! - Paralysis in some movers: Fly `0x004CCD00`/`0x004CF96E`, Mech Move_To
+//!   `0x005B0099` and Tunnel Move_To `0x00728B10` refuse a paralyzed Foot;
+//!   VERA's ports of those do not read [`FootParasite::is_paralyzed`] yet
+//!   (Drive/Ship Move_To and fresh Process_Movement, Hover, Teleport and the
+//!   player-control virtual +0xA0 `0x00700C90` do). Trigger: a successful
 //!   release paralyzes the owner for 3x ROF (a drone knocked off a Chrono
-//!   Miner's warp: 180 frames). Effect: VERA's released drone moves and takes
-//!   orders at once. Frequency: rare. Risk: movement timing only. Owner: the
-//!   Drive/Ship Process path port, which holds those locomotors.
-//! - Grinder (UnitClass::PerCellProcess `0x0073A13E..0x0073A181`): credits the
-//!   eater's refund, then suppression 50 + ExitUnit. VERA has no grinding.
-//! - ChronoWarp (SuperClass::Launch case 4 `0x006CC763`): a Naval eater gets
-//!   suppression 500 + ExitUnit. VERA has no Chronosphere superweapon.
-//! - Magnetron lift (`0x00710026`): a Naval eater exits. VERA does not port the
-//!   IsLocomotor detonation arm.
+//!   Miner's warp: 180 frames). Effect: such a released owner can be given a
+//!   new destination at once. Frequency: rare. Risk: movement timing only.
+//!   Owner: those locomotors' ports.
 //! - Sonic weapons may target an allied infected Foot (What_Action_OnObject
 //!   `0x00700377`); the Sonic hit already ejects any eater (`0x004D7345`), but
 //!   the order needs the cursor/command legality VERA does not port yet.
 
 use crate::map::entities::EntityCategory;
+use crate::map::resolved_terrain::NativeCellQuery;
 use crate::rules::object_type::ObjectType;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::components::DriveCoord;
-use crate::sim::movement::ground_pose;
+use crate::sim::movement::{ground_pose, target_cell_coord};
 use crate::sim::timer::CdTimer;
-use crate::sim::world::Simulation;
+use crate::sim::world::{FrameEffects, Simulation, UninitContext};
+use crate::util::direction::DIRECTION_DELTAS;
+use crate::util::direction_tables::{dir_from_facing16, round_facing16_to_8};
+
+#[path = "parasite_grapple.rs"]
+mod grapple;
 
 /// Foot+698 launch lock: `TechnoClass::Fire @ 0x006FF81F` stores
 /// `Frame + 0x14`; GetFireError `0x006FCAE1` refuses parasite shots before it.
@@ -74,10 +96,14 @@ pub(crate) const LAUNCH_LOCK_FRAMES: u32 = 0x14;
 /// arm the suppression timer with 50 frames before ExitUnit.
 pub(crate) const FORCED_RELEASE_SUPPRESSION_FRAMES: i32 = 50;
 
+/// The Chrono Warp's release of a Naval eater (`SuperClass::Launch` case 4,
+/// `0x006CC78F..0x006CC7B7`): suppression 500, then ExitUnit.
+pub(crate) const CHRONO_WARP_SUPPRESSION_FRAMES: i32 = 500;
+
 /// Retained ParasiteClass instance fields. The owner (`+0x24`) is the entity
 /// storing this value.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub struct ParasiteState {
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ParasiteState {
     /// `+0x28` Victim (FootClass).
     victim: Option<u64>,
     /// `+0x2C` suppression timer. Armed by third-party damage and forced
@@ -85,48 +111,176 @@ pub struct ParasiteState {
     suppression: CdTimer,
     /// `+0x38` damage-delivery timer (bite cadence).
     damage: CdTimer,
+    /// Parasite+44..54: retained animation and manager-controlled progress.
+    /// Load6295B0 preserves these while restarting only the two timers.
+    grapple: grapple::GrappleState,
+}
+
+impl std::hash::Hash for ParasiteState {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.victim.hash(state);
+        self.suppression.hash(state);
+        self.damage.hash(state);
+        // Preserve the established non-grapple hash while including every
+        // nondefault field named by native ComputeCRC6294D0.
+        if self.grapple != Default::default() {
+            b"parasite-grapple-v371".hash(state);
+            self.grapple.hash(state);
+        }
+    }
 }
 
 impl ParasiteState {
     /// `ParasiteClass(owner) @ 0x006292B0`: both timers start at the current
     /// frame with zero duration (already expired); no victim.
-    pub(crate) fn constructed(frame: u32) -> Self {
+    fn constructed(frame: u32) -> Self {
         Self {
             victim: None,
             suppression: CdTimer::started(frame as i32, 0),
             damage: CdTimer::started(frame as i32, 0),
+            grapple: Default::default(),
         }
     }
 
-    #[cfg(test)]
+    /// `+0x28` Victim, which the owner's own `Can_Enter_Cell` also reads
+    /// (Unit `0x0073F530`, Infantry `0x0051C259`).
     pub(crate) fn victim(&self) -> Option<u64> {
         self.victim
     }
 
-    pub(crate) fn suppress(&mut self, frame: u32, duration: i32) {
+    pub(crate) fn grapple_anim(&self) -> Option<u64> {
+        self.grapple.anim()
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn suppression(&self) -> &CdTimer {
+        &self.suppression
+    }
+
+    fn suppress(&mut self, frame: u32, duration: i32) {
         self.suppression = CdTimer::started(frame as i32, duration);
     }
 
     /// ParasiteClass::Load `0x006295DB..0x006295F3`: both timers restart at
     /// the load frame with zero duration.
-    pub(crate) fn restart_timers_after_load(&mut self, frame: u32) {
+    fn restart_timers_after_load(&mut self, frame: u32) {
         self.suppression = CdTimer::started(frame as i32, 0);
         self.damage = CdTimer::started(frame as i32, 0);
+    }
+}
+
+/// A Foot's parasite fields: the ParasiteClass it owns as a parasite, the
+/// eater attached to it as a victim, the launch lock, its paralysis and the
+/// reselect memo.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct FootParasite {
+    /// Foot+69C `ParasiteImUsing`: this owner's ParasiteClass, allocated by
+    /// `TechnoClass::Init_Managers @ 0x006F4145` for a weapon-0 Parasite
+    /// warhead (attack dog, Terror Drone). Hashed and persisted (v193).
+    class: Option<Box<ParasiteState>>,
+    /// Foot+694 `ParasiteEatingMe`: the owner whose parasite is attached to
+    /// this victim (AttachTo `0x0062AB2B`). Hashed and persisted (v193).
+    eater: Option<u64>,
+    /// Foot+698: frame before which parasite shots at this Foot are refused
+    /// (`TechnoClass::Fire @ 0x006FF81F`, GetFireError `0x006FCAE1`).
+    launch_lock: u32,
+    /// Foot+6A0 ParalysisTimer. FootClass ctor `0x004D33FC` starts it at the
+    /// construction frame with zero duration; ParasiteClass arms it (bites,
+    /// release) and clears it, as does FootClass::IronCurtain `0x004DEAE0`.
+    /// The Squid grapple refreshes the host timer and clears the released
+    /// owner's timer (`0x0062987A`, `0x0062989E`, `0x00629CFF`).
+    paralysis: CdTimer,
+    /// Techno+432 ReselectIfLimboed memo (`TechnoClass::Fire @ 0x006FF79C`),
+    /// consumed by a successful parasite release. Process-local like
+    /// `selected`: written only for the local player's selection, so it is
+    /// saved but never folded into the peer hash.
+    limbo_reselect: bool,
+}
+
+impl FootParasite {
+    /// The FootClass constructor's fields: paralysis started at
+    /// `construction_frame` with zero duration (`0x004D33FC`).
+    pub(crate) fn new(construction_frame: u32) -> Self {
+        Self {
+            paralysis: CdTimer::started(construction_frame as i32, 0),
+            ..Self::default()
+        }
+    }
+
+    /// This owner's ParasiteClass, when it has one.
+    pub(crate) fn class(&self) -> Option<&ParasiteState> {
+        self.class.as_deref()
+    }
+
+    /// The owner whose parasite is attached to this victim.
+    pub(crate) fn eater(&self) -> Option<u64> {
+        self.eater
+    }
+
+    /// Foot+694's infestation test in What_Action700370..70038B. Queries
+    /// never expose or mutate the retained parasite-owner identity.
+    pub fn is_infested(&self) -> bool {
+        self.eater.is_some()
+    }
+
+    /// The frame before which parasite shots at this Foot are refused.
+    pub(crate) fn launch_lock(&self) -> u32 {
+        self.launch_lock
+    }
+
+    /// The ParalysisTimer.
+    pub(crate) fn paralysis(&self) -> CdTimer {
+        self.paralysis
+    }
+
+    /// `FootClass::IsParalyzed @ 0x004DE770` (vtable +0x380): the Foot+6A0
+    /// ParalysisTimer    /// has time left. Readers: GetFireError `0x006FC623`/`0x006FCCD5`,
+    /// CloakingTick `0x006FB775`, ShouldUncloak `0x006FBCC0`, and the
+    /// locomotor movement setters.
+    pub(crate) fn is_paralyzed(&self, frame: u32) -> bool {
+        self.paralysis.remaining(frame as i32) != 0
+    }
+
+    /// `TechnoClass::Init_Managers @ 0x006F4145`: allocate this owner's
+    /// ParasiteClass ([`type_allocates_parasite`]).
+    pub(crate) fn allocate_class(&mut self, frame: u32) {
+        self.class = Some(Box::new(ParasiteState::constructed(frame)));
+    }
+
+    fn class_mut(&mut self) -> Option<&mut ParasiteState> {
+        self.class.as_deref_mut()
+    }
+
+    /// ParalysisTimer = {Frame, 0}: a release's victim reset
+    /// (`0x0062A862`) and FootClass::IronCurtain `0x004DEAE0`.
+    pub(crate) fn end_paralysis(&mut self, frame: u32) {
+        self.paralysis = CdTimer::started(frame as i32, 0);
+    }
+
+    /// ParasiteClass::Load `0x006295DB..0x006295F3` for this owner's class.
+    pub(crate) fn restart_timers_after_load(&mut self, frame: u32) {
+        if let Some(class) = self.class_mut() {
+            class.restart_timers_after_load(frame);
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl FootParasite {
+    pub(crate) fn set_eater_for_test(&mut self, eater: Option<u64>) {
+        self.eater = eater;
+    }
+
+    pub fn set_paralysis_for_test(&mut self, paralysis: CdTimer) {
+        self.paralysis = paralysis;
     }
 }
 
 /// Naval+Organic owners (retail `[SQD]`) run the grapple machine `0x006297F0`
 /// from the class AI (`0x00629FE4..0x0062A00C`).
 ///
-/// RESIDUAL (Squid grapple): the grapple state machine, its SQDG anim, wakes,
-/// splashes, Culling and per-tick victim paralysis are not ported. Until they
-/// are, such owners neither LimboLaunch nor attach (both gates below). Trigger:
-/// a Giant Squid (SQD) firing SquidGrab/SquidGrabE. Effect: SQDJUMP is Inviso;
-/// VERA's instant-hit path runs the Parasite arm, whose attach this gate
-/// refuses, so the shot does nothing (no damage, the squid visible and the
-/// ship free), where native grapples, paralyzes, rocks and damages the ship
-/// every 40 frames and culls it when weak. Frequency: Yuri's Revenge naval
-/// games. Risk: naval balance.
+/// This predicate selects the separate grapple progression; launch,
+/// relationship, admission and release remain the same shared owners.
 pub(crate) fn owner_uses_grapple(object: &ObjectType) -> bool {
     object.naval && object.organic
 }
@@ -142,8 +296,7 @@ pub(crate) fn type_allocates_parasite(
 ) -> bool {
     category != EntityCategory::Structure
         && weapon_zero(rules, object, veterancy)
-            .and_then(|weapon| weapon.warhead.as_deref())
-            .and_then(|warhead| rules.warhead(warhead))
+            .and_then(|weapon| rules.weapon_warhead(weapon))
             .is_some_and(|warhead| warhead.parasite)
 }
 
@@ -153,37 +306,8 @@ fn weapon_zero<'r>(
     veterancy: u16,
 ) -> Option<&'r crate::rules::weapon_type::WeaponType> {
     super::combat_weapon::weapon_for_index(object, veterancy, 0)
-        .and_then(|(name, _)| rules.weapon(name))
-}
-
-/// `((raw >> 12) + 1) >> 1 & 7`: the eight-way direction of a facing word.
-fn dir8(raw: u16) -> usize {
-    (((u32::from(raw) >> 12) + 1) >> 1) as usize & 7
-}
-
-/// Unlimbo DirType argument `((raw >> 7) + 1) >> 1 & 0xFF`.
-fn dir_type(raw: u16) -> u8 {
-    ((((u32::from(raw) >> 7) + 1) >> 1) & 0xFF) as u8
-}
-
-/// `MapCoord_StepByDir` offsets, `g_DirectionOffsets @ 0x0089F688`.
-const ADJACENT: [(i16, i16); 8] = [
-    (0, -1),
-    (1, -1),
-    (1, 0),
-    (1, 1),
-    (0, 1),
-    (-1, 1),
-    (-1, 0),
-    (-1, -1),
-];
-
-fn cell_centre(cell: (i16, i16)) -> DriveCoord {
-    DriveCoord {
-        x: i32::from(cell.0) * 256 + 128,
-        y: i32::from(cell.1) * 256 + 128,
-        z: 0,
-    }
+        .and_then(|record| record.weapon_id)
+        .and_then(|name| rules.weapon(name))
 }
 
 impl Simulation {
@@ -218,51 +342,58 @@ impl Simulation {
 
     /// `AttachTo @ 0x0062A980`, reached only from the Parasite detonation arm
     /// with the bullet Target filtered to FootClass (`0x00469406`).
-    pub(crate) fn parasite_attach(&mut self, owner: u64, victim: Option<u64>, rules: &RuleSet) {
-        let frame = self.session.binary_frame;
-        // Squid residual: a visible grapple owner must not attach while its
-        // grapple is unported (every release path would fail its reveal).
-        if self
-            .substrate
-            .entities
-            .get(owner)
-            .and_then(|o| self.object_type(o.type_ref(), rules))
-            .is_some_and(owner_uses_grapple)
-        {
-            return;
-        }
+    pub(crate) fn parasite_attach(
+        &mut self,
+        owner: u64,
+        victim: Option<u64>,
+        rules: &RuleSet,
+        effects: &mut FrameEffects<'_>,
+    ) {
+        let frame = self.session.binary_frame();
+        // AttachTo629A989..629A9D4 clears old grapple progress and its
+        // dedicated animation before the damage timer and CanInfect query.
+        self.reset_parasite_grapple(owner, rules);
         let Some(state) = self
             .substrate
             .entities
             .get_mut(owner)
-            .and_then(|o| o.parasite.as_deref_mut())
+            .and_then(|o| o.parasite.class_mut())
         else {
             return;
         };
         // 0x0062A9D8: the first bite lands on the victim's next AI visit.
         state.damage = CdTimer::started(frame as i32, 0);
         if !self.parasite_can_infect(owner, victim, rules) {
-            self.parasite_return_to_launch_cell(owner, rules);
+            self.parasite_return_to_launch_cell(owner, rules, effects);
             return;
         }
         let victim = victim.expect("CanInfect admitted a victim");
         // 0x0062AAD9..0x0062AB24: the OWNER's locomotor Force_Track(-1, victim
-        // XYZ). Drive resets its track (and returns with the owner in limbo);
-        // Walk binds the base no-op 0x0055AC10.
+        // XYZ). Drive and Ship reset their track (and return with the owner in
+        // limbo); Walk binds the base no-op 0x0055AC10. SQD uses this same
+        // attachment; its victim AI selects the separate grapple progression.
         let victim_coord = ground_pose::position_world_coord(
             &self.substrate.entities.get(victim).unwrap().position,
         );
-        self.force_drive_track(owner, -1, victim_coord);
+        self.force_track(
+            owner,
+            -1,
+            victim_coord,
+            rules,
+            Some(rules.overlay_registry()),
+            effects,
+        );
         self.substrate
             .entities
             .get_mut(victim)
             .unwrap()
-            .parasite_eating_me = Some(owner);
+            .parasite
+            .eater = Some(owner);
         if let Some(state) = self
             .substrate
             .entities
             .get_mut(owner)
-            .and_then(|o| o.parasite.as_deref_mut())
+            .and_then(|o| o.parasite.class_mut())
         {
             state.victim = Some(victim);
         }
@@ -271,69 +402,107 @@ impl Simulation {
     /// AttachTo refusal `0x0062AA02..0x0062AAD6`: Unlimbo at the centre of the
     /// owner's last map cell (Foot+55C, its launch cell), facing 0; failure
     /// deletes it. This path neither reselects nor rejoins a team.
-    fn parasite_return_to_launch_cell(&mut self, owner: u64, rules: &RuleSet) {
+    fn parasite_return_to_launch_cell(
+        &mut self,
+        owner: u64,
+        rules: &RuleSet,
+        effects: &mut FrameEffects<'_>,
+    ) {
         let Some(cell) = self
             .substrate
             .entities
             .get(owner)
-            .map(|o| o.navigation.neighbor_state.cell())
+            .map(|o| o.navigation.neighbor_state().cell())
         else {
             return;
         };
-        if !self.parasite_unlimbo_owner(owner, cell_centre(cell), 0, false, rules) {
-            self.uninit_with_rules(owner, rules);
+        // 0x0062AA02..0x0062AA2E: Unlimbo at the cell's GetCoords, DirType 0.
+        let coords = target_cell_coord(
+            cell.0 as u16,
+            cell.1 as u16,
+            self.resolved_terrain
+                .as_ref()
+                .map(NativeCellQuery::canonical)
+                .as_ref(),
+        );
+        let mut context = UninitContext::new(rules).with_effects(effects);
+        if !self.parasite_unlimbo_owner(owner, coords, 0, rules, context.effects()) {
+            self.uninit_with_context(owner, context);
             return;
         }
-        self.parasite_released_owner_orders(owner, false, rules);
+        // 0x0062AA51: ReReveal(0, 0, 0, 0) takes back the sight the Unlimbo
+        // just opened (`0x006F6D27`): the owner stays blind until its next
+        // reveal event.
+        self.release_object_sight_with_context(owner, context);
+        self.parasite_released_owner_orders(owner, false, rules, effects);
     }
 
     /// Release tail shared by AttachTo refusal, ExitUnit and PointerExpired:
-    /// VERA has no planning path (Foot vtable +0x4AC is false), so the owner
-    /// clears its target and destination (`vt+0x480(0, 1)` at `0x0062A78A`,
-    /// `0x0062A3ED`, `0x0062AAB9`), then Enter_Idle_Mode(0,1). Only ExitUnit
-    /// (`0x0062A771`) and PointerExpired (`0x0062A3D4`) also clear the archive
-    /// target; the AttachTo refusal (`0x0062AA96..0x0062AAC9`) keeps it.
-    fn parasite_released_owner_orders(&mut self, owner: u64, clear_archive: bool, rules: &RuleSet) {
-        if let Some(entity) = self.substrate.entities.get_mut(owner) {
-            if clear_archive {
-                entity.set_archive_target(None);
+    /// unless the owner is on an attack-move (HaveMegaMission, vt+0x4AC at
+    /// `0x0062A763`, `0x0062A3C6`, `0x0062AA9B`), it clears its target and
+    /// destination (`vt+0x480(0, 1)` at `0x0062A78A`, `0x0062A3ED`,
+    /// `0x0062AAB9`); then Enter_Idle_Mode(0,1), whose RefreshMegaMission
+    /// resumes such an order. Only ExitUnit (`0x0062A771`) and PointerExpired
+    /// (`0x0062A3D4`) also clear the archive target; the AttachTo refusal
+    /// (`0x0062AA96..0x0062AAC9`) keeps it.
+    fn parasite_released_owner_orders(
+        &mut self,
+        owner: u64,
+        clear_archive: bool,
+        rules: &RuleSet,
+        effects: &mut FrameEffects<'_>,
+    ) {
+        if !self.mega_mission(owner).is_attack_move() {
+            if let Some(entity) = self.substrate.entities.get_mut(owner) {
+                if clear_archive {
+                    entity.set_archive_target(None);
+                }
+                crate::sim::mission::concrete_effects::represented_assign_target(
+                    entity,
+                    None,
+                    rules.ares_form(),
+                );
             }
-            crate::sim::mission::concrete_effects::represented_assign_target(entity, None);
+            self.assign_null_destination(owner, rules, Some(rules.overlay_registry()), effects);
         }
-        self.assign_null_destination(owner, Some(rules));
-        if let Some(entity) = self.substrate.entities.get_mut(owner) {
-            entity.movement_target = None;
-        }
-        crate::sim::world::queue_foot_enter_idle_mode(self, owner, rules);
+        crate::sim::world::enter_idle_mode(
+            self,
+            owner,
+            rules,
+            Some(rules.overlay_registry()),
+            effects,
+        );
     }
 
     /// A successful ExitUnit or PointerExpired release re-adds the owner to
     /// its team to rejoin (`+0x434`, `Add_Member(owner, 0)` at `0x0062A759`
     /// and `0x0062A3BC`), which asks `Can_Add`.
-    ///
-    /// RESIDUAL: the release paths carry no overlay registry, so the
-    /// `Calc_Center` a centreless team runs on the rejoin tests the closest
-    /// member's cell without overlays. Trigger: the dog's team lost its
-    /// centre (no joined member left) while it was away. Effect: that centre
-    /// can be the mean cell where an overlay would refuse it, until the next
-    /// `Calc_Center`.
-    fn parasite_rejoin_team(&mut self, owner: u64, rules: &RuleSet) {
+    fn parasite_rejoin_team(
+        &mut self,
+        owner: u64,
+        rules: &RuleSet,
+        effects: &mut FrameEffects<'_>,
+    ) {
         if let Some(team) = self.team_script_vm.team_to_rejoin(owner) {
-            self.team_add_member(team, owner, false, rules, None);
+            self.team_add_member(team, owner, false, rules, effects);
         }
     }
 
     /// `+0x432` reselect memo, consumed only by successful releases
-    /// (`0x0062A71C`, `0x0062A37F`) for the local player's house.
-    fn parasite_reselect(&mut self, owner: u64) {
-        let current = self.session.current_house;
-        if let Some(entity) = self.substrate.entities.get_mut(owner)
-            && entity.limbo_reselect
-            && current.is_some_and(|house| house == entity.owner())
-        {
-            entity.limbo_reselect = false;
-            entity.selected = true;
+    /// (`0x0062A71C`, `0x0062A37F`) for a human player's house
+    /// (`HouseClass::IsHumanPlayer @ 0x0050B6F0`), then Select (vt+0x14C,
+    /// `0x0062A744`/`0x0062A3A7`) with the current voice latch.
+    fn parasite_reselect(&mut self, owner: u64, rules: &RuleSet, effects: &mut FrameEffects<'_>) {
+        let Some(entity) = self.substrate.entities.get(owner) else {
+            return;
+        };
+        if !entity.parasite.limbo_reselect || !self.house_is_human_player(entity.owner()) {
+            return;
         }
+        if let Some(entity) = self.substrate.entities.get_mut(owner) {
+            entity.parasite.limbo_reselect = false;
+        }
+        self.techno_select(owner, UninitContext::new(rules).with_effects(effects));
     }
 
     /// ParasiteClass AI `0x00629FD0`, run at the tail of the victim's
@@ -342,21 +511,22 @@ impl Simulation {
         &mut self,
         victim: u64,
         rules: &RuleSet,
-        overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
+        overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+        effects: &mut FrameEffects<'_>,
     ) {
-        let frame = self.session.binary_frame;
+        let frame = self.session.binary_frame();
         let Some(owner) = self
             .substrate
             .entities
             .get(victim)
-            .and_then(|v| v.parasite_eating_me)
+            .and_then(|v| v.parasite.eater)
         else {
             return;
         };
         let Some(owner_entity) = self.substrate.entities.get(owner) else {
             return;
         };
-        let Some(state) = owner_entity.parasite.as_deref() else {
+        let Some(state) = owner_entity.parasite.class() else {
             return;
         };
         let Some(victim) = state.victim else {
@@ -366,42 +536,43 @@ impl Simulation {
             return;
         };
         if owner_uses_grapple(owner_object) {
+            self.parasite_grapple(owner, victim, rules, overlay_registry, effects);
             return;
         }
-        let Some(weapon) = weapon_zero(rules, owner_object, owner_entity.veterancy()) else {
+        let Some(weapon) = weapon_zero(rules, owner_object, owner_entity.veterancy.rank()) else {
             return;
         };
         let Some(warhead_name) = weapon.warhead.as_deref() else {
             return;
         };
-        let Some(warhead) = rules.warhead(warhead_name) else {
+        let Some(warhead) = rules.weapon_warhead(weapon) else {
             return;
         };
         if !state.damage.expired(frame as i32) {
             return;
         }
         let (rof, damage, paralyzes) = (weapon.rof, weapon.damage, warhead.paralyzes);
-        let anims = weapon.anim.clone();
+        let anims = &weapon.anim;
         let warhead_id = self.interner.intern(warhead_name);
         self.substrate
             .entities
             .get_mut(owner)
             .unwrap()
             .parasite
-            .as_deref_mut()
+            .class_mut()
             .unwrap()
             .damage = CdTimer::started(frame as i32, rof);
         let Some(victim_entity) = self.substrate.entities.get_mut(victim) else {
             return;
         };
-        victim_entity.paralysis_timer = CdTimer::started(frame as i32, paralyzes);
-        let infantry = victim_entity.category == EntityCategory::Infantry;
+        victim_entity.parasite.paralysis = CdTimer::started(frame as i32, paralyzes);
+        let infantry = victim_entity.category() == EntityCategory::Infantry;
         let location = ground_pose::position_world_coord(&victim_entity.position);
         let raw = victim_entity.body_facing_current(frame);
         let (amount, ignore_defenses) = if infantry {
             // 0x0062A0AF: an Infantry victim takes its own current Health,
             // ignoring defenses: one bite kills unless ReceiveDamage refuses.
-            (victim_entity.health.current, true)
+            (victim_entity.health.current(), true)
         } else {
             if let Some(system) = rules
                 .combat_damage
@@ -419,7 +590,14 @@ impl Simulation {
                     rules,
                 );
             }
-            if let Some(name) = anims.get(dir8(raw)).filter(|_| !anims.is_empty()) {
+            // RESIDUAL: native reads Anim[dir8] of any non-empty list
+            // without a bound check (`0x0062A11D..0x0062A138`), so a list
+            // under eight entries reads past its end; VERA plays none there.
+            // Retail parasite weapons list eight or none.
+            if let Some(name) = anims
+                .get(usize::from(dir_from_facing16(raw)))
+                .filter(|_| !anims.is_empty())
+            {
                 let world = crate::sim::anim_class::AnimWorldCoord {
                     x: location.x,
                     y: location.y,
@@ -442,10 +620,50 @@ impl Simulation {
                     log::debug!("parasite bite anim [{name}] did not construct: {error}");
                 }
             }
-            // 0x0062A17F: the rock's lateral sign. TechnoClass::Rock
-            // (vtable +0x3D8) itself belongs to the rocking subsystem, which
-            // has no producer or renderer yet; the Scenario draw is kept.
-            let _ = self.scenario_rng.next_range_i32_inclusive(0, 1);
+            //62A173..62A203: one ranged side after the real constructors,
+            // then a two-lepton impact offset. The wrapping first quarter
+            // turn precedes MOVSX; the shared radians owner subtracts the
+            // second0x3FFF after sign extension. Truncate Y before X.
+            use crate::util::native_x87::{NativeF32Bits, X87Chop53 as X};
+            let lateral = if self.scenario_rng.next_range_i32_inclusive(0, 1) == 0 {
+                2
+            } else {
+                -2
+            };
+            let angle = X::load_f64(crate::util::direction_tables::radians_from_facing16(
+                raw.wrapping_sub(0x3fff),
+            ))
+            .expect("finite parasite bite facing");
+            let trig = crate::util::retail_trig::TrigTable::embedded();
+            let y = X::ftol_i32_low_masked(X::sub(
+                X::load_i32(location.y),
+                X::mul(trig.sin_from_table(angle), X::load_i32(lateral)),
+            ));
+            let x = X::ftol_i32_low_masked(X::add(
+                X::mul(trig.cos_from_table(angle), X::load_i32(lateral)),
+                X::load_i32(location.x),
+            ));
+            //62A21C: the victim's actual ApplyRocker70B280. Its single
+            // owner retains loaded-model admission, Weight and rate stores.
+            let request = self.substrate.entities.get(victim).and_then(|entity| {
+                let handle = self.interner.type_handle(entity.type_ref(), rules)?;
+                let object = rules.object_by_handle(handle);
+                Some(crate::sim::rocking::RockerImpulse {
+                    position: [location.x, location.y, location.z],
+                    origin: [x, y, location.z],
+                    body_facing: raw,
+                    force: NativeF32Bits::from_bits(0x3fc0_0000),
+                    weight: object.weight,
+                    no_dampen: false,
+                    has_loaded_voxel: rules.object_has_loaded_voxel(handle),
+                })
+            });
+            if let Some(request) = request {
+                crate::sim::rocking::apply_rocker_impulse(
+                    &mut self.substrate.entities.get_mut(victim).unwrap().rocking,
+                    request,
+                );
+            }
             (damage, false)
         };
         let event = crate::sim::combat::EntityDamageEvent::direct_receiver(
@@ -460,16 +678,21 @@ impl Simulation {
                 arg6: true,
             },
         );
-        self.commit_direct_damage_receiver(rules, overlay_registry, event);
+        self.commit_direct_damage_receiver(rules, overlay_registry, event, effects);
     }
 
     /// ExitUnit `0x0062A4A0`: forced release from the victim.
-    pub(crate) fn parasite_exit_unit(&mut self, owner: u64, rules: &RuleSet) {
-        let frame = self.session.binary_frame;
+    pub(crate) fn parasite_exit_unit(
+        &mut self,
+        owner: u64,
+        rules: &RuleSet,
+        effects: &mut FrameEffects<'_>,
+    ) {
+        let frame = self.session.binary_frame();
         let Some(owner_entity) = self.substrate.entities.get(owner) else {
             return;
         };
-        let Some(victim) = owner_entity.parasite.as_deref().and_then(|s| s.victim) else {
+        let Some(victim) = owner_entity.parasite.class().and_then(|s| s.victim) else {
             return;
         };
         let Some(owner_object) = self.object_type(owner_entity.type_ref(), rules) else {
@@ -478,22 +701,23 @@ impl Simulation {
         let naval = owner_object.naval;
         let suppressed = owner_entity
             .parasite
-            .as_deref()
+            .class()
             .is_some_and(|s| s.suppression.remaining(frame as i32) != 0);
         let (speed_type, movement_zone) = (owner_object.speed_type, owner_object.movement_zone);
-        let rof = weapon_zero(rules, owner_object, owner_entity.veterancy()).map_or(0, |w| w.rof);
+        let rof =
+            weapon_zero(rules, owner_object, owner_entity.veterancy.rank()).map_or(0, |w| w.rof);
         let Some(victim_entity) = self.substrate.entities.get(victim) else {
             return;
         };
         let raw = victim_entity.body_facing_current(frame);
-        let released = if dir8(raw) <= 2 {
+        let released = if dir_from_facing16(raw) <= 2 {
             raw.wrapping_add(0x3FFF)
         } else {
             raw.wrapping_sub(0x3FFF)
         };
         let victim_cell = (
-            victim_entity.position.rx as i16,
-            victim_entity.position.ry as i16,
+            victim_entity.position.rx() as i16,
+            victim_entity.position.ry() as i16,
         );
         if !naval && suppressed {
             // 0x0062A89B: the owner dies with its host.
@@ -502,71 +726,63 @@ impl Simulation {
                 .get_mut(owner)
                 .unwrap()
                 .health
-                .current = 0;
-            self.detach_parasite_victim(owner, victim, frame);
-            self.uninit_with_rules(owner, rules);
+                .set(0);
+            self.substrate.detach_parasite_victim(owner, victim, frame);
+            self.uninit_with_context(owner, UninitContext::new(rules).with_effects(effects));
             return;
         }
         let requested = if naval {
-            let (dx, dy) = ADJACENT[dir8(released)];
+            let (dx, dy) = DIRECTION_DELTAS[usize::from(dir_from_facing16(released))];
             (
-                victim_cell.0.wrapping_add(dx),
-                victim_cell.1.wrapping_add(dy),
+                victim_cell.0.wrapping_add(dx as i16),
+                victim_cell.1.wrapping_add(dy as i16),
             )
         } else {
             victim_cell
         };
-        let cell = if self.cell_clear_for(requested, speed_type, movement_zone, rules) {
+        let cell = if self.cell_clear_for(requested, speed_type, movement_zone) {
             Some(requested)
         } else {
             self.techno_nearby_location(victim, None, rules)
         };
+        // 0x0062A5E8..0x0062A61F: Unlimbo at the chosen cell's GetCoords.
         let placed = cell.is_some_and(|cell| {
+            let coords = target_cell_coord(
+                cell.0 as u16,
+                cell.1 as u16,
+                self.resolved_terrain
+                    .as_ref()
+                    .map(NativeCellQuery::canonical)
+                    .as_ref(),
+            );
             self.parasite_can_place_at_victim(owner, victim, rules)
                 && self.parasite_unlimbo_owner(
                     owner,
-                    cell_centre(cell),
-                    dir_type(released),
-                    false,
+                    coords,
+                    round_facing16_to_8(released),
                     rules,
+                    effects,
                 )
         });
         if placed {
-            self.parasite_reselect(owner);
-            self.parasite_rejoin_team(owner, rules);
-            self.parasite_released_owner_orders(owner, true, rules);
+            self.parasite_reselect(owner, rules, effects);
+            self.parasite_rejoin_team(owner, rules, effects);
+            self.parasite_released_owner_orders(owner, true, rules, effects);
             if let Some(entity) = self.substrate.entities.get_mut(owner) {
-                entity.paralysis_timer = CdTimer::started(frame as i32, rof.wrapping_mul(3));
+                entity.parasite.paralysis = CdTimer::started(frame as i32, rof.wrapping_mul(3));
             }
+            // ExitUnit62A7E0..62A84B, before clearing the victim fields.
+            self.reset_parasite_grapple(owner, rules);
         } else {
             self.substrate
                 .entities
                 .get_mut(owner)
                 .unwrap()
                 .health
-                .current = 0;
-            self.uninit_with_rules(owner, rules);
+                .set(0);
+            self.uninit_with_context(owner, UninitContext::new(rules).with_effects(effects));
         }
-        self.detach_parasite_victim(owner, victim, frame);
-    }
-
-    /// Victim-side reset shared by every release: ParalysisTimer {Frame, 0},
-    /// Foot+694 = 0, Parasite.Victim = 0 (`0x0062A862..0x0062A88F`).
-    fn detach_parasite_victim(&mut self, owner: u64, victim: u64, frame: u32) {
-        if let Some(entity) = self.substrate.entities.get_mut(victim) {
-            entity.paralysis_timer = CdTimer::started(frame as i32, 0);
-            if entity.parasite_eating_me == Some(owner) {
-                entity.parasite_eating_me = None;
-            }
-        }
-        if let Some(state) = self
-            .substrate
-            .entities
-            .get_mut(owner)
-            .and_then(|o| o.parasite.as_deref_mut())
-        {
-            state.victim = None;
-        }
+        self.substrate.detach_parasite_victim(owner, victim, frame);
     }
 
     /// ParasiteClass::PointerExpired `0x0062A260`, forwarded by the victim's
@@ -576,14 +792,15 @@ impl Simulation {
         &mut self,
         owner: u64,
         expired: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
+        effects: &mut FrameEffects<'_>,
     ) {
-        let frame = self.session.binary_frame;
+        let frame = self.session.binary_frame();
         let Some(state) = self
             .substrate
             .entities
             .get(owner)
-            .and_then(|o| o.parasite.as_deref())
+            .and_then(|o| o.parasite.class())
         else {
             return;
         };
@@ -592,11 +809,6 @@ impl Simulation {
         }
         let victim = expired;
         let suppressed = state.suppression.remaining(frame as i32) != 0;
-        let Some(rules) = rules else {
-            // A rules-less fixture cannot run Unlimbo; drop the link only.
-            self.detach_parasite_victim(owner, victim, frame);
-            return;
-        };
         // Owner vtable +0x160 (0x0041BF40): Iron Curtain protects it here.
         let owner_protected = self.substrate.entities.get(owner).is_some_and(|o| {
             crate::sim::superweapon::invulnerability::is_invulnerable(
@@ -606,10 +818,10 @@ impl Simulation {
         });
         if suppressed && !owner_protected {
             if let Some(entity) = self.substrate.entities.get_mut(victim) {
-                entity.parasite_eating_me = None;
+                entity.parasite.eater = None;
             }
-            self.clear_parasite_victim(owner);
-            self.uninit_with_rules(owner, rules);
+            self.substrate.clear_parasite_victim(owner);
+            self.uninit_with_context(owner, UninitContext::new(rules).with_effects(effects));
             return;
         }
         let victim_raw = self
@@ -618,35 +830,68 @@ impl Simulation {
             .get(victim)
             .map_or(0, |v| v.body_facing_current(frame));
         let coords = self.parasite_release_coords(owner, victim, rules);
-        // 0x0062A2ED..0x0062A303: the 0xA8E7AC bracket around Unlimbo.
+        // Ares 3.0 ParasiteClass_PointerGotInvalid (1005CF20, hook
+        // 0x62A2F8): a non-naval Unit or an Infantry owner whose victim is
+        // at least two levels up (GetHeight 208) drops from the victim's
+        // Location as a bomb (+0x8D, +0x8F).
+        let coords = if rules.ares() {
+            let terrain = self.resolved_terrain.as_ref();
+            let falls =
+                self.substrate
+                    .entities
+                    .get(owner)
+                    .is_some_and(|eater| match eater.category() {
+                        EntityCategory::Unit => self
+                            .object_type(eater.type_ref(), rules)
+                            .is_some_and(|object| !object.naval),
+                        EntityCategory::Infantry => true,
+                        _ => false,
+                    });
+            let drop = self
+                .substrate
+                .entities
+                .get(victim)
+                .filter(|victim| {
+                    falls
+                        && crate::sim::movement::air_movement::current_fly_height(victim, terrain)
+                            >= 2 * crate::util::lepton::LEPTONS_PER_LEVEL as i32
+                })
+                .map(|victim| ground_pose::object_location(victim, terrain));
+            if drop.is_some()
+                && let Some(eater) = self.substrate.entities.get_mut(owner)
+            {
+                eater.begin_bomb_fall();
+            }
+            drop.or(coords)
+        } else {
+            coords
+        };
+        // 0x0062A2F8..0x0062A379: the 0xA8E7AC bracket around Unlimbo.
         let placed = coords.is_some_and(|coords| {
-            self.parasite_unlimbo_owner(owner, coords, dir_type(victim_raw), true, rules)
+            self.with_object_placement_scope(|sim| {
+                sim.parasite_unlimbo_owner(
+                    owner,
+                    coords,
+                    round_facing16_to_8(victim_raw),
+                    rules,
+                    effects,
+                )
+            })
         });
         if placed {
-            self.parasite_reselect(owner);
-            self.parasite_rejoin_team(owner, rules);
-            self.parasite_released_owner_orders(owner, true, rules);
+            self.parasite_reselect(owner, rules, effects);
+            self.parasite_rejoin_team(owner, rules, effects);
+            self.parasite_released_owner_orders(owner, true, rules, effects);
         } else {
             self.substrate
                 .entities
                 .get_mut(owner)
                 .unwrap()
                 .health
-                .current = 0;
-            self.uninit_with_rules(owner, rules);
+                .set(0);
+            self.uninit_with_context(owner, UninitContext::new(rules).with_effects(effects));
         }
-        self.clear_parasite_victim(owner);
-    }
-
-    fn clear_parasite_victim(&mut self, owner: u64) {
-        if let Some(state) = self
-            .substrate
-            .entities
-            .get_mut(owner)
-            .and_then(|o| o.parasite.as_deref_mut())
-        {
-            state.victim = None;
-        }
+        self.substrate.clear_parasite_victim(owner);
     }
 
     /// GetReleaseCoords `0x0062AC30`.
@@ -661,34 +906,46 @@ impl Simulation {
             .substrate
             .entities
             .get(owner)
-            .is_some_and(|o| o.category == EntityCategory::Unit);
-        let victim_on_bridge = victim_entity.on_bridge;
+            .is_some_and(|o| o.category() == EntityCategory::Unit);
+        let victim_on_bridge = victim_entity.on_bridge();
+        let terrain = self.resolved_terrain.as_ref();
+        let cells = terrain.map(NativeCellQuery::canonical);
+        let fixed_deck_at = |(x, y)| {
+            let terrain = terrain?;
+            let index = terrain.native_fixed_cell_index(x, y)?;
+            ground_pose::corrected_deck_z(
+                terrain,
+                crate::map::cell_index::NativeCellIdentity::Real(index),
+            )
+        };
         if self.parasite_can_place_at_victim(owner, victim, rules) {
             let victim_entity = self.substrate.entities.get(victim)?;
             let mut coords = ground_pose::position_world_coord(&victim_entity.position);
             if owner_is_unit {
                 let cell = ((coords.x / 256) as i16, (coords.y / 256) as i16);
-                coords = cell_centre(cell);
-                coords.z = self.cell_ground_z(cell);
+                coords = target_cell_coord(cell.0 as u16, cell.1 as u16, cells.as_ref());
                 if victim_on_bridge {
-                    coords.z = coords
-                        .z
-                        .wrapping_add(crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS);
+                    coords.z = fixed_deck_at(cell)
+                        .unwrap_or_else(|| ground_pose::z_at_height(coords.z, 0, true));
                 }
             }
-            self.substrate.entities.get_mut(owner)?.on_bridge = victim_on_bridge;
+            self.substrate
+                .entities
+                .get_mut(owner)?
+                .on_bridge
+                .store(victim_on_bridge);
             return Some(coords);
         }
-        let frame = self.session.binary_frame;
+        let frame = self.session.binary_frame();
         let raw = victim_entity.body_facing_current(frame);
         let victim_cell = (
-            victim_entity.position.rx as i16,
-            victim_entity.position.ry as i16,
+            victim_entity.position.rx() as i16,
+            victim_entity.position.ry() as i16,
         );
-        let (dx, dy) = ADJACENT[dir8(raw)];
+        let (dx, dy) = DIRECTION_DELTAS[usize::from(dir_from_facing16(raw))];
         let adjacent = (
-            victim_cell.0.wrapping_add(dx),
-            victim_cell.1.wrapping_add(dy),
+            victim_cell.0.wrapping_add(dx as i16),
+            victim_cell.1.wrapping_add(dy as i16),
         );
         let naval_owner = self
             .substrate
@@ -699,44 +956,52 @@ impl Simulation {
         if !naval_owner && self.land_blocks_release(adjacent, victim_cell) {
             return None;
         }
-        // CellClass::PlaceInfantryInCell 0x00481180 from the adjacent cell's
-        // centre, for every owner class; Unit owners then take the centre.
-        let centre = crate::util::fixed_math::SimFixed::from_num(128);
-        let spot = crate::sim::movement::bump_crush::place_infantry_in_cell(
-            &self.substrate.raw_cell_occupation,
+        // CellClass::PlaceInfantryInCell 0x00481180 (`0x0062ADCF..0x0062ADE9`)
+        // on the ground plane, at the adjacent cell's GetCoords, for every
+        // owner class; Unit owners then take the centre (`0x0062AE09..0x0062AE3E`).
+        let mut coords = target_cell_coord(
             adjacent.0 as u16,
             adjacent.1 as u16,
-            crate::sim::movement::locomotor::MovementLayer::Ground,
-            centre,
-            centre,
+            self.resolved_terrain
+                .as_ref()
+                .map(NativeCellQuery::canonical)
+                .as_ref(),
+        );
+        let spot = Self::place_infantry_in_ground_cell(
+            &self.interner,
             &mut self.scenario_rng,
+            &self.substrate,
+            &self.resolved_terrain,
+            rules,
+            coords,
         )?;
-        let (sub_x, sub_y) = crate::util::lepton::subcell_lepton_offset(Some(spot));
-        let mut coords = if owner_is_unit {
-            cell_centre(adjacent)
-        } else {
-            DriveCoord {
-                x: i32::from(adjacent.0) * 256 + sub_x.to_num::<i32>(),
-                y: i32::from(adjacent.1) * 256 + sub_y.to_num::<i32>(),
-                z: 0,
-            }
-        };
-        coords.z = self.cell_ground_z(adjacent);
+        if !owner_is_unit {
+            let (sub_x, sub_y) = crate::util::lepton::subcell_lepton_offset(Some(spot));
+            coords.x = i32::from(adjacent.0) * 256 + sub_x.to_num::<i32>();
+            coords.y = i32::from(adjacent.1) * 256 + sub_y.to_num::<i32>();
+        }
         let bridge = self.cell_has_bridge(adjacent);
+        let adjacent_fixed_deck = bridge.then(|| fixed_deck_at(adjacent)).flatten();
         let on_bridge = if victim_on_bridge {
             if bridge {
-                coords.z = coords
-                    .z
-                    .wrapping_add(crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS);
+                coords.z = adjacent_fixed_deck
+                    .unwrap_or_else(|| ground_pose::z_at_height(coords.z, 0, true));
             }
             bridge
         } else if bridge {
             // 0x0062AE63: only a deck below the victim's own height counts.
-            let victim_z = self.cell_ground_z(victim_cell);
-            if victim_z > coords.z {
-                coords.z = coords
-                    .z
-                    .wrapping_add(crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS);
+            let victim_z = target_cell_coord(
+                victim_cell.0 as u16,
+                victim_cell.1 as u16,
+                self.resolved_terrain
+                    .as_ref()
+                    .map(NativeCellQuery::canonical)
+                    .as_ref(),
+            )
+            .z;
+            if victim_z > adjacent_fixed_deck.unwrap_or(coords.z) {
+                coords.z = adjacent_fixed_deck
+                    .unwrap_or_else(|| ground_pose::z_at_height(coords.z, 0, true));
                 true
             } else {
                 false
@@ -744,7 +1009,11 @@ impl Simulation {
         } else {
             false
         };
-        self.substrate.entities.get_mut(owner)?.on_bridge = on_bridge;
+        self.substrate
+            .entities
+            .get_mut(owner)?
+            .on_bridge
+            .store(on_bridge);
         Some(coords)
     }
 
@@ -762,18 +1031,18 @@ impl Simulation {
             return false;
         }
         let cell = (
-            victim_entity.position.rx as i16,
-            victim_entity.position.ry as i16,
+            victim_entity.position.rx() as i16,
+            victim_entity.position.ry() as i16,
         );
         let owner_entity = self.substrate.entities.get(owner);
         let naval = owner_entity
             .and_then(|o| self.object_type(o.type_ref(), rules))
             .is_some_and(|o| o.naval);
         if !naval {
-            if owner_entity.is_some_and(|o| o.category == EntityCategory::Unit)
+            if owner_entity.is_some_and(|o| o.category() == EntityCategory::Unit)
                 && self
-                    .production
-                    .terrain_object_cells
+                    .terrain_objects
+                    .cell_index()
                     .contains_key(&(cell.0 as u16, cell.1 as u16))
             {
                 return false;
@@ -801,7 +1070,7 @@ impl Simulation {
             .resolved_terrain
             .as_ref()
             .and_then(|t| t.cell(cell.0 as u16, cell.1 as u16))
-            .map(|c| c.yr_cell_land_type);
+            .map(|c| c.land_type);
         let restricted = land.is_some_and(|land| {
             land == LandType::Water.as_index()
                 || land == LandType::Beach.as_index()
@@ -828,29 +1097,16 @@ impl Simulation {
         })
     }
 
-    fn cell_ground_z(&self, cell: (i16, i16)) -> i32 {
-        let centre = cell_centre(cell);
-        ground_pose::ground_surface_z_at(
-            [centre.x, centre.y],
-            false,
-            self.resolved_terrain.as_ref(),
-            None,
-        )
-        .unwrap_or(0)
-    }
-
-    /// `CellClass::IsClearToMove @ 0x004834A0` with (SpeedType, 0, 0, zone,
-    /// MovementZone, -1, 1) after `GetZoneID(cell, MovementZone, 0)`.
+    /// [`check_cell_passability`](crate::sim::cell_rect::check_cell_passability)
+    /// (`0x0062A61F`) with (SpeedType, 0, 0, zone, MovementZone, -1, 1),
+    /// where zone is `GetZoneID(cell, MovementZone, 0)` (`0x0062A5CF..0x0062A61E`).
     fn cell_clear_for(
         &self,
         cell: (i16, i16),
         speed_type: crate::rules::locomotor_type::SpeedType,
         movement_zone: crate::rules::locomotor_type::MovementZone,
-        rules: &RuleSet,
     ) -> bool {
-        use crate::sim::cell_rect::{
-            IsClearToMoveResult, LiveCellPassabilityQuery, evaluate_live_cell_passability,
-        };
+        use crate::sim::cell_rect::{CellPassabilityArgs, CellRef, check_cell_passability};
         let (Some(terrain), Some(zones)) =
             (self.resolved_terrain.as_ref(), self.zone_grid.as_ref())
         else {
@@ -860,114 +1116,73 @@ impl Simulation {
         let Some(terrain_cell) = terrain.cell(target.0, target.1) else {
             return false;
         };
-        let requested = zones.get_zone_id_native(terrain, target, movement_zone, false);
-        let actual =
-            zones.get_zone_id_native(terrain, target, movement_zone, self.cell_has_bridge(cell));
-        let land = rules
-            .terrain_rules
-            .semantics_for_land_type(terrain_cell.yr_cell_land_type)
-            .and_then(|row| row.cost_for_speed_type(speed_type))
-            .is_some_and(|cost| cost > 0);
-        let grid = self.path_grid_snapshot();
-        matches!(
-            evaluate_live_cell_passability(LiveCellPassabilityQuery {
-                target,
+        check_cell_passability(
+            &CellRef::Real(terrain_cell),
+            CellPassabilityArgs {
                 speed_type,
-                movement_zone,
-                // `0x004834A0` compares the full GetZoneID DWORDs.
-                requested_zone: requested,
-                actual_zone: actual.unwrap_or(u32::MAX),
-                requested_layer: None,
                 ignore_infantry: false,
                 ignore_vehicles: false,
-                land_passable: land,
-                path_grid: grid.as_deref(),
-                resolved_terrain: Some(terrain),
-                raw_occupation: Some(&self.substrate.raw_cell_occupation),
-            }),
-            IsClearToMoveResult::Clear { .. } | IsClearToMoveResult::ClearWinged
+                zone: zones.get_zone_id_native(terrain, target, movement_zone, false),
+                movement_zone,
+                level: None,
+                is_bridge: true,
+            },
+            &self.cell_passability_map(),
         )
+        .admits()
     }
 
-    /// Unlimbo(coord, dir) for a released or returning owner. Infantry place
-    /// through `PlaceInfantryInCell @ 0x00481180`: `guarded` is the
-    /// `0x00A8E7AC` bracket PointerExpired holds, which selects the priority
-    /// arm (no occupancy test, no RNG); otherwise the ordinary arm may draw.
+    /// Unlimbo(coord, dir) (vt+0xD8) for a released or returning owner: the
+    /// class half ([`Simulation::unlimbo_class_entry`]: InfantryClass::Unlimbo
+    /// `0x0051DFF0`'s PlaceInfantryInCell `0x00481180` for an infantryman,
+    /// then Object's class `Can_Enter_Cell` `0x005F4F1B..0x005F4F49` unless
+    /// the caller raised `0x00A8E7AC`), then the Reveal, which snaps the body
+    /// to `facing` (`0x006F6DAA`).
     fn parasite_unlimbo_owner(
         &mut self,
         owner: u64,
         coord: DriveCoord,
         facing: u8,
-        guarded: bool,
         rules: &RuleSet,
+        effects: &mut FrameEffects<'_>,
     ) -> bool {
+        use crate::sim::world::{PlacementEvidence, RevealOutcome, RevealPosition, RevealRequest};
         let rx = (coord.x / 256) as u16;
         let ry = (coord.y / 256) as u16;
-        let Some(entity) = self.substrate.entities.get(owner) else {
-            return false;
-        };
-        let infantry = entity.category == EntityCategory::Infantry;
-        // Unlimbo receives the whole coordinate. A deck release from
-        // GetReleaseCoords (`0x0062AC60..0x0062ACF6`) carries the deck height,
-        // which the reveal adapter reads as `level + 4` with the owner's
-        // OnBridge; cell-centre coordinates (ExitUnit, AttachTo refusal) are
-        // ground, `CellClass::GetCoords @ 0x00486840`.
+        // The stored level beside the coordinate: a deck release from
+        // GetReleaseCoords (`0x0062AC60..0x0062ACF6`) uses the selected deck
+        // with the owner's OnBridge; a cell's GetCoords is its ground.
         let ground_level = self.terrain_cell_level(rx, ry).unwrap_or(0);
         let coord_level =
             u8::try_from(coord.z.max(0) / crate::util::lepton::GROUND_LEVEL_HEIGHT_LEPTONS)
                 .unwrap_or(u8::MAX);
-        let z = ground_level.max(coord_level);
-        let sub_x = crate::util::fixed_math::SimFixed::from_num(coord.x.rem_euclid(256));
-        let sub_y = crate::util::fixed_math::SimFixed::from_num(coord.y.rem_euclid(256));
-        let (sub_cell, sub_x, sub_y) = if infantry {
-            let spot = if guarded {
-                crate::sim::movement::bump_crush::priority_sub_cell(sub_x, sub_y)
-            } else {
-                let Some(spot) = crate::sim::movement::bump_crush::place_infantry_in_cell(
-                    &self.substrate.raw_cell_occupation,
-                    rx,
-                    ry,
-                    crate::sim::movement::locomotor::MovementLayer::Ground,
-                    sub_x,
-                    sub_y,
-                    &mut self.scenario_rng,
-                ) else {
-                    return false;
-                };
-                spot
-            };
-            let (x, y) = crate::util::lepton::subcell_lepton_offset(Some(spot));
-            (Some(spot), x, y)
-        } else {
-            (None, sub_x, sub_y)
+        let requested = RevealPosition::new(
+            rx,
+            ry,
+            ground_level.max(coord_level),
+            Some(coord.z),
+            crate::util::fixed_math::SimFixed::from_num(coord.x.rem_euclid(256)),
+            crate::util::fixed_math::SimFixed::from_num(coord.y.rem_euclid(256)),
+        );
+        let Some((position, placement)) =
+            self.unlimbo_class_entry(owner, requested, PlacementEvidence::EvaluateMark, rules)
+        else {
+            return false;
         };
-        if let Some(entity) = self.substrate.entities.get_mut(owner) {
-            entity.sub_cell = sub_cell;
-        }
-        let revealed = matches!(
+        matches!(
             self.try_reveal_entity_with_context(
                 owner,
-                crate::sim::world::RevealRequest {
-                    position: crate::sim::world::RevealPosition {
-                        rx,
-                        ry,
-                        z,
-                        sub_x,
-                        sub_y,
-                    },
-                    placement: crate::sim::world::PlacementEvidence::MarkSucceeded,
+                RevealRequest {
+                    position,
+                    placement,
                     logic_eligible: true,
                 },
-                crate::sim::world::UninitContext::with_rules(rules),
+                UninitContext::new(rules)
+                    .with_effects(effects)
+                    .with_unlimbo_facing(Some(facing)),
             ),
-            crate::sim::world::RevealOutcome::Revealed { .. }
-        );
-        // Unlimbo's body snap (`0x006F6DAA`) follows a successful Reveal.
-        let frame = self.session.binary_frame;
-        if revealed && let Some(entity) = self.substrate.entities.get_mut(owner) {
-            entity.body_facing.snap(u16::from(facing) << 8, frame);
-        }
-        revealed
+            RevealOutcome::Revealed { .. }
+        )
     }
 
     /// `TechnoClass::Fire @ 0x006FF749..0x006FF872`, the LimboLaunch block,
@@ -979,35 +1194,35 @@ impl Simulation {
         weapon: &crate::rules::weapon_type::WeaponType,
         bullet: Option<u64>,
         rules: &RuleSet,
+        effects: &mut FrameEffects<'_>,
     ) {
-        let frame = self.session.binary_frame;
+        let frame = self.session.binary_frame();
         let Some(entity) = self.substrate.entities.get(firer) else {
             return;
         };
         let Some(object) = self.object_type(entity.type_ref(), rules) else {
             return;
         };
-        if owner_uses_grapple(object) {
-            return;
-        }
         let target_id = match target {
             super::TargetKind::Entity(id) => Some(id),
             super::TargetKind::Cell(..) => None,
         };
         let target_entity = target_id.and_then(|id| self.substrate.entities.get(id));
         let target_infantry =
-            target_entity.is_some_and(|target| target.category == EntityCategory::Infantry);
-        // 0x006FF763..0x006FF79C: ReselectIfLimboed memo for a selected,
-        // locally controlled firer jumping an Infantry target.
+            target_entity.is_some_and(|target| target.category() == EntityCategory::Infantry);
+        // 0x006FF763..0x006FF79C: ReselectIfLimboed memo for a selected firer
+        // of a human player's house (IsHumanPlayer 0x0050B6F0, 0x006FF786)
+        // jumping an Infantry target.
         let reselect = object.reselect_if_limboed
-            && entity.selected
-            && self.session.current_house == Some(entity.owner())
+            && entity.seldom.selection.is_selected()
+            && self.house_is_human_player(entity.owner())
             && target_infantry;
         if reselect {
             self.substrate
                 .entities
                 .get_mut(firer)
                 .unwrap()
+                .parasite
                 .limbo_reselect = true;
         }
         // 0x006FF7A3..0x006FF7E9: a RejoinTeamIfLimboed= Foot jumping an
@@ -1017,21 +1232,19 @@ impl Simulation {
         if object.rejoin_team_if_limboed && target_infantry {
             self.team_script_vm.remember_team_to_rejoin(firer);
         }
-        self.techno_limbo_with_rules(firer, rules);
-        let parasite = weapon
-            .warhead
-            .as_deref()
-            .and_then(|name| rules.warhead(name))
+        self.techno_limbo_with_context(firer, UninitContext::new(rules).with_effects(effects));
+        let parasite = rules
+            .weapon_warhead(weapon)
             .is_some_and(|warhead| warhead.parasite);
         // 0x006FF809..0x006FF81F: lock a Foot target for 20 frames.
         if parasite
             && let Some(target) = target_id.and_then(|id| self.substrate.entities.get_mut(id))
             && matches!(
-                target.category,
+                target.category(),
                 EntityCategory::Unit | EntityCategory::Infantry | EntityCategory::Aircraft
             )
         {
-            target.parasite_launch_lock = frame.wrapping_add(LAUNCH_LOCK_FRAMES);
+            target.parasite.launch_lock = frame.wrapping_add(LAUNCH_LOCK_FRAMES);
         }
         // 0x006FF825..0x006FF86C: the firer's Limbo detached the bullet's
         // Owner, so the bullet is Limboed, re-Constructed (`0x004664C0`) with
@@ -1047,25 +1260,44 @@ impl Simulation {
                 == Some(crate::sim::world::display_layers::DisplayLayer::SURFACE);
             if self.unregister_non_entity_object(bullet) {
                 self.projectiles.set_owner(bullet, firer);
+                Self::construct_bullet_scheme(
+                    &self.interner,
+                    &self.substrate,
+                    &self.houses,
+                    &mut self.projectiles,
+                    bullet,
+                    rules,
+                );
                 let registered = self.register_projectile(bullet, flat);
                 debug_assert!(registered);
+                self.unlimbo_alpha_shape(bullet, crate::sim::world::ObjectKind::Projectile, rules);
             }
         }
     }
 
     /// FootClass::PointerExpired `0x004D998C..0x004D99CD`, after the Techno
-    /// body, for one listener.
+    /// body, for one listener. `removed` is the expiry's control: UnInit
+    /// rather than a cloak's Detach_All(false).
+    ///
+    /// Ares FootClass_PointerGotInvalid_Parasite10048280 (hook4D99AA)
+    /// forwards the real control instead of stock's constant true, and
+    /// ParasiteClass_PointerGotInvalid_Cloak100482D0 (hook62A283) releases
+    /// the victim only when it was removed; the victim clears its own link
+    /// only then too. A victim that cloaks keeps its parasite.
     pub(crate) fn foot_parasite_pointer_expired(
         &mut self,
         listener: u64,
         expired: u64,
-        rules: Option<&RuleSet>,
+        removed: bool,
+        rules: &RuleSet,
+        effects: &mut FrameEffects<'_>,
     ) {
+        let removed = !rules.ares() || removed;
         let Some(eater) = self
             .substrate
             .entities
             .get(listener)
-            .and_then(|l| l.parasite_eating_me)
+            .and_then(|l| l.parasite.eater)
         else {
             return;
         };
@@ -1073,7 +1305,7 @@ impl Simulation {
             sim.substrate
                 .entities
                 .get(eater)
-                .map_or(0, |e| e.health.current)
+                .map_or(0, |e| e.health.current())
         };
         // 0x004D998C..0x004D99A4: an expiring eater that is dead drops the
         // link (the scenario-ended arm has no represented state).
@@ -1082,23 +1314,26 @@ impl Simulation {
                 .entities
                 .get_mut(listener)
                 .unwrap()
-                .parasite_eating_me = None;
+                .parasite
+                .eater = None;
         }
         // 0x004D99AA..0x004D99C6: forward to a live eater's ParasiteClass.
         if let Some(eater) = self
             .substrate
             .entities
             .get(listener)
-            .and_then(|l| l.parasite_eating_me)
+            .and_then(|l| l.parasite.eater)
             && eater_health(self, eater) > 0
+            && removed
         {
-            self.parasite_pointer_expired(eater, expired, rules);
+            self.parasite_pointer_expired(eater, expired, rules, effects);
         }
         // 0x004D99C9: the victim itself expiring clears its own link.
         if expired == listener
+            && removed
             && let Some(entity) = self.substrate.entities.get_mut(listener)
         {
-            entity.parasite_eating_me = None;
+            entity.parasite.eater = None;
         }
     }
 
@@ -1114,23 +1349,29 @@ impl Simulation {
         raw_damage: i32,
         warhead: crate::sim::intern::InternedId,
         rules: &RuleSet,
+        effects: &mut FrameEffects<'_>,
     ) {
-        let frame = self.session.binary_frame;
+        let frame = self.session.binary_frame();
         let Some(eater) = self
             .substrate
             .entities
             .get(victim)
-            .and_then(|v| v.parasite_eating_me)
+            .and_then(|v| v.parasite.eater)
         else {
             return;
         };
-        let sonic = rules
-            .warhead(self.interner.resolve(warhead))
+        let sonic = self
+            .interner
+            .warhead_type(warhead, rules)
             .is_some_and(|w| w.sonic);
         if sonic {
-            self.parasite_exit_unit(eater, rules);
+            self.parasite_exit_unit(eater, rules, effects);
             if let Some(source) = source.and_then(|id| self.substrate.entities.get_mut(id)) {
-                crate::sim::mission::concrete_effects::represented_assign_target(source, None);
+                crate::sim::mission::concrete_effects::represented_assign_target(
+                    source,
+                    None,
+                    rules.ares_form(),
+                );
             }
             return;
         }
@@ -1146,31 +1387,69 @@ impl Simulation {
                 .substrate
                 .entities
                 .get_mut(eater)
-                .and_then(|e| e.parasite.as_deref_mut())
+                .and_then(|e| e.parasite.class_mut())
         {
             state.suppress(frame, raw_damage.wrapping_mul(2).wrapping_sub(threshold));
         }
         if raw_damage < 0 {
-            self.parasite_force_release(eater, FORCED_RELEASE_SUPPRESSION_FRAMES, rules);
+            self.parasite_force_release(eater, FORCED_RELEASE_SUPPRESSION_FRAMES, rules, effects);
         }
     }
 
     /// The forced-release idiom of the repair, heal, Iron Curtain and grinder
     /// sites: arm the suppression timer, then ExitUnit.
-    pub(crate) fn parasite_force_release(&mut self, eater: u64, suppression: i32, rules: &RuleSet) {
-        let frame = self.session.binary_frame;
+    pub(crate) fn parasite_force_release(
+        &mut self,
+        eater: u64,
+        suppression: i32,
+        rules: &RuleSet,
+        effects: &mut FrameEffects<'_>,
+    ) {
+        let frame = self.session.binary_frame();
         if let Some(state) = self
             .substrate
             .entities
             .get_mut(eater)
-            .and_then(|e| e.parasite.as_deref_mut())
+            .and_then(|e| e.parasite.class_mut())
         {
             state.suppress(frame, suppression);
         }
-        self.parasite_exit_unit(eater, rules);
+        self.parasite_exit_unit(eater, rules, effects);
     }
 }
 
-#[cfg(test)]
+impl crate::sim::world::ObjectSubstrate {
+    /// Victim-side reset shared by every release: ParalysisTimer {Frame, 0},
+    /// Foot+694 = 0, Parasite.Victim = 0 (`0x0062A862..0x0062A88F`).
+    fn detach_parasite_victim(&mut self, owner: u64, victim: u64, frame: u32) {
+        if let Some(entity) = self.entities.get_mut(victim) {
+            if let Some(rocking) = entity.rocking.as_mut() {
+                rocking.set_angle_sideways(crate::util::fixed_math::SimFixed::ZERO);
+            }
+            entity.parasite.end_paralysis(frame);
+            if entity.parasite.eater == Some(owner) {
+                entity.parasite.eater = None;
+            }
+        }
+        if let Some(state) = self
+            .entities
+            .get_mut(owner)
+            .and_then(|o| o.parasite.class_mut())
+        {
+            state.victim = None;
+        }
+    }
+    fn clear_parasite_victim(&mut self, owner: u64) {
+        if let Some(state) = self
+            .entities
+            .get_mut(owner)
+            .and_then(|o| o.parasite.class_mut())
+        {
+            state.victim = None;
+        }
+    }
+}
+
+#[cfg(all(test, tests_sim_combat_d_z))]
 #[path = "parasite_tests.rs"]
 mod tests;

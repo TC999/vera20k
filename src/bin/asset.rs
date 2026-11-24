@@ -11,17 +11,28 @@ use vera20k::asset_tools::names::NameDict;
 use vera20k::asset_tools::report::{ErrorReport, to_json};
 use vera20k::asset_tools::{
     palette, render_dispatch, retail_corpus, root, verb_art, verb_compare, verb_csf, verb_extract,
-    verb_find, verb_info, verb_ini, verb_ls, verb_palette, verb_parse_check, verb_scan, verb_sound,
+    verb_find, verb_info, verb_ini, verb_ini_expand, verb_ls, verb_palette, verb_parse_check,
+    verb_scan, verb_sound,
 };
+use vera20k::util::archive_names::ArchiveNames;
 
 const EXIT_FAILED: i32 = 1;
 const EXIT_USAGE: i32 = 2;
 
+enum RunError {
+    Asset(ErrorReport),
+    Campaign(anyhow::Error),
+}
+
+impl From<ErrorReport> for RunError {
+    fn from(report: ErrorReport) -> Self {
+        Self::Asset(report)
+    }
+}
+
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
-        // Logs go to stderr; stdout is reserved for the JSON payload.
-        .target(env_logger::Target::Stderr)
-        .init();
+    // Logs go to stderr; stdout is reserved for the JSON payload.
+    let _ = vera20k::util::logging::init_stderr_logger("warn");
 
     let cli = match args::parse(std::env::args().skip(1)) {
         Ok(cli) => cli,
@@ -38,12 +49,15 @@ fn main() {
     }
 
     if let Err(error) = run(cli) {
-        print_error(&error.error, error.hint.as_deref());
+        match error {
+            RunError::Asset(report) => println!("{}", to_json(&report)),
+            RunError::Campaign(error) => print_campaign_error(&error),
+        }
         std::process::exit(EXIT_FAILED);
     }
 }
 
-fn run(cli: Cli) -> Result<(), ErrorReport> {
+fn run(cli: Cli) -> Result<(), RunError> {
     let (ra2_dir, source) =
         root::resolve_ra2_dir(cli.ra2_dir.as_deref()).map_err(|error| ErrorReport {
             error,
@@ -55,18 +69,96 @@ fn run(cli: Cli) -> Result<(), ErrorReport> {
         })?;
     log::info!("retail root {} (from {source:?})", ra2_dir.display());
 
-    let mut manager = root::open_manager(&ra2_dir, cli.all_mixes).map_err(|error| ErrorReport {
+    if let Verb::CampaignCheck(args) = &cli.verb {
+        let report = vera20k::headless_scenario::check_campaign_stage(
+            &ra2_dir,
+            &args.manifest,
+            &args.stage,
+            args.frames,
+        )
+        .map_err(RunError::Campaign)?;
+        println!("{}", to_json(&report));
+        return Ok(());
+    }
+
+    let source_only = matches!(cli.verb, Verb::IniExpand { .. }) && cli.ini_source_only;
+    let manager = if let Some(mod_dir) = &cli.mod_dir {
+        root::open_mod_manager(
+            &ra2_dir,
+            mod_dir,
+            cli.all_mixes,
+            cli.ini_roots.as_ref(),
+            cli.ares,
+        )
+    } else if source_only {
+        root::open_ini_probe_manager(&ra2_dir, cli.all_mixes)
+    } else if matches!(
+        cli.verb,
+        Verb::IniGet { .. } | Verb::IniType { .. } | Verb::IniRoots
+    ) {
+        root::open_ini_manager(&ra2_dir, cli.all_mixes, cli.ini_roots.as_ref(), cli.ares)
+    } else {
+        // Archive verbs without a mod keep the stock archive policy.
+        root::open_manager(&ra2_dir, cli.all_mixes, cli.ares, &ArchiveNames::default())
+    };
+    let mut manager = manager.map_err(|error| ErrorReport {
         error,
         hint: Some(format!(
             "check that {} is the install root containing ra2md.mix",
             ra2_dir.display()
         )),
     })?;
+    // The tool reads the game it opened as that game's launch does
+    // (`util::ares_launch`).
+    manager.open_for_play();
 
     match cli.verb {
-        Verb::Help => unreachable!("handled before dispatch"),
+        Verb::Help | Verb::CampaignCheck(_) => unreachable!("handled before archive dispatch"),
+        Verb::IniRoots => {
+            let sources = manager.ini_roots().names().into_iter().map(|name| {
+                vera20k::rules::retail_sources::select_ini(&manager, name).map(|selected| selected.source)
+            }).collect::<Result<Vec<_>, _>>().map_err(|error| ErrorReport {
+                error, hint: Some("Check the complete selected root triplet; missing roots do not fall back to YR.".into()),
+            })?;
+            println!(
+                "{}",
+                to_json(&serde_json::json!({
+                    "ini_roots": manager.ini_roots(), "sources": sources,
+                    "scope": if cli.all_mixes { "tooling_all_mixes" } else { "game_archive_stack" },
+                    "limits": "Selected roots and declared archive names; this does not establish gameplay compatibility."
+                }))
+            );
+        }
+        Verb::IniExpand { name } => {
+            let report = verb_ini_expand::run(
+                &manager,
+                &name,
+                cli.ini_strict,
+                cli.ini_max_depth,
+                cli.all_mixes,
+                source_only,
+            )?;
+            println!("{}", to_json(&report));
+        }
         Verb::IniGet { section, key } => {
-            let report = verb_ini::run(&mut manager, &ra2_dir, &section, &key, &cli.ini)?;
+            let report = verb_ini::run(
+                &mut manager,
+                &ra2_dir,
+                verb_ini::IniQuery::Accessor {
+                    section: &section,
+                    key: &key,
+                },
+                &cli.ini,
+            )?;
+            println!("{}", to_json(&report));
+        }
+        Verb::IniType { type_id } => {
+            let report = verb_ini::run(
+                &mut manager,
+                &ra2_dir,
+                verb_ini::IniQuery::Type { type_id: &type_id },
+                &cli.ini,
+            )?;
             println!("{}", to_json(&report));
         }
 
@@ -187,4 +279,26 @@ fn print_error(error: &str, hint: Option<&str>) {
         hint: hint.map(str::to_string),
     };
     println!("{}", to_json(&report));
+}
+
+fn print_campaign_error(error: &anyhow::Error) {
+    let Some(manifest) = error.downcast_ref::<vera20k::map::campaign_manifest::ManifestError>()
+    else {
+        print_error(&format!("{error:#}"), None);
+        return;
+    };
+    println!(
+        "{}",
+        to_json(&serde_json::json!({
+            "error": manifest.to_string(),
+            "hint": manifest.hint,
+            "detail": {
+                "file": manifest.file.display().to_string(),
+                "section": manifest.section,
+                "key": manifest.key,
+                "line": manifest.line,
+                "problem": manifest.problem,
+            }
+        }))
+    );
 }

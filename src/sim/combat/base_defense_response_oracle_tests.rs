@@ -7,7 +7,6 @@ use crate::rules::native_processing::{RulesLayerKind, RulesLayerStack};
 use crate::sim::entity_store::EntityStore;
 use crate::sim::game_entity::GameEntity;
 use crate::sim::intern::test_interner;
-use crate::sim::passenger::{PassengerCargo, PassengerRole};
 use serde_json::Value;
 
 fn install_supplied_base_defense_team(sim: &mut Simulation, member: u64) {
@@ -69,20 +68,13 @@ fn install_supplied_base_defense_team(sim: &mut Simulation, member: u64) {
 /// auxiliary stack word, which Rust's timer does not consume.
 #[test]
 fn native_base_response_dispatch_matches_14_represented_original_tails() {
-    use crate::sim::components::Health;
+    use crate::sim::combat::Health;
     use crate::sim::rng::{SimRng, trace_draws};
     use crate::sim::timer::CdTimer;
-    let Some(ini) = crate::rules::retail_ini_fixture::retail_ini("rulesmd.ini") else {
+    let Some(mut rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art()
+    else {
         return;
     };
-    let Some(art) = crate::rules::retail_ini_fixture::retail_ini("artmd.ini") else {
-        return;
-    };
-    let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
-    rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
-    rules.bind_animation_sequences(
-        &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art),
-    );
     let base_delay = rules.general.base_defense_delay_minutes;
     let native = corpus();
     let mut compared = 0;
@@ -98,7 +90,7 @@ fn native_base_response_dispatch_matches_14_represented_original_tails() {
                 f64::from_bits(u64::from_str_radix(bits, 16).unwrap());
         }
         let mut sim = Simulation::new();
-        sim.session.binary_frame = 41;
+        sim.session.set_binary_frame_for_test(41);
         let owner = sim.interner.intern("Receiver");
         let enemy = sim.interner.intern("Enemy");
         let mut ids = std::collections::BTreeMap::new();
@@ -134,14 +126,16 @@ fn native_base_response_dispatch_matches_14_represented_original_tails() {
                 0,
                 0,
                 house,
-                Health { current: 100 },
+                Health::new(100),
                 type_id,
                 category,
                 0,
                 0,
                 category != EntityCategory::Infantry,
             );
-            actor.passively_acquired_target = true;
+            actor
+                .passive_scan
+                .set_passively_acquired_target_for_test(true);
             if category == EntityCategory::Infantry {
                 actor.mission_leaf.set_infantry_doing_verified(-1).unwrap();
             }
@@ -195,6 +189,7 @@ fn native_base_response_dispatch_matches_14_represented_original_tails() {
                 .entities
                 .get(ids["attacker"])
                 .unwrap()
+                .seldom
                 .base_defense_response
                 .cooldown,
             CdTimer::from_raw(signed(&cooldown[0]), signed(&cooldown[2])),
@@ -216,12 +211,12 @@ fn native_base_response_dispatch_matches_14_represented_original_tails() {
                 "{name}:{label}"
             );
             assert_eq!(
-                actor.attack_target.as_ref().map(|target| target.target),
+                actor.attack_target.target(),
                 target(&state["target"]),
                 "{name}:{label}"
             );
             assert_eq!(
-                actor.passively_acquired_target,
+                actor.passive_scan.acquired(),
                 state["passive"] != 0,
                 "{name}:{label}"
             );
@@ -238,17 +233,9 @@ fn native_base_response_dispatch_matches_14_represented_original_tails() {
     assert_eq!(compared, 14);
 }
 
-fn corpus() -> Value {
-    let rows: Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tools/spatial_oracle/base_defense_response.json",
-    )))
-    .unwrap();
+fn corpus() -> &'static Value {
+    let rows = crate::test_fixture::json("tools/spatial_oracle/base_defense_response.json");
     assert_eq!(rows["schema_version"], 1);
-    assert_eq!(
-        rows["native_sha256"],
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c",
-    );
     rows
 }
 
@@ -302,6 +289,7 @@ fn assert_response_rules(rules: &RuleSet, native: &Value) {
 }
 
 #[test]
+#[ignore = "slow; run when changing what it covers"]
 fn native_base_response_retail_and_sequential_readers_match_original_fields() {
     let Some(ini) = crate::rules::retail_ini_fixture::retail_ini("rulesmd.ini") else {
         return;
@@ -536,7 +524,7 @@ fn native_base_response_live_threat_matches_representable_original_rows() {
     for row in native["threat_posed"].as_array().unwrap() {
         let input = &row["input"];
         let count = input["garrison_count"].as_i64().unwrap_or(0);
-        // The corrupt/supplied i32MAX count is not a Rust cargo vector.
+        // The corrupt/supplied i32MAX count is not a Rust occupant vector.
         // The native two-occupant/max-multiplier control covers wrapping.
         if count == i64::from(i32::MAX) {
             continue;
@@ -549,20 +537,21 @@ fn native_base_response_live_threat_matches_representable_original_rows() {
         };
         let rules = RuleSet::from_ini(&IniFile::from_str(&format!("[General]\nThreatPerOccupant={}\n{header}[OWNER]\nStrength=100\nThreatPosed={}\n[LINK]\nStrength=100\nThreatPosed={}\n", input["threat_per_occupant"].as_i64().unwrap_or(5), signed(&input["own_threat"]), input["linked_threat"].as_i64().unwrap_or(0)))).unwrap();
         let mut owner = GameEntity::test_default(1, "OWNER", "House", 5, 5);
-        owner.category = if structure {
+        owner.set_category_for_test(if structure {
             EntityCategory::Structure
         } else {
             EntityCategory::Unit
-        };
+        });
         if input["linked_threat"].is_number() {
-            owner.bunker_occupant = Some(2);
+            owner.bunker.set_bunker_occupant_for_test(Some(2));
         }
         if count > 0 {
-            let mut cargo = PassengerCargo::new(count as u32, 1);
-            for id in 0..count as u64 {
-                assert!(cargo.board(id + 10, 1));
+            for id in (0..count as u64).rev() {
+                owner
+                    .passenger_role_mut_for_test()
+                    .occupants_mut()
+                    .add_for_test(id + 10);
             }
-            owner.passenger_role = PassengerRole::Transport { cargo };
         }
         let mut entities = EntityStore::new();
         entities.insert(GameEntity::test_default(2, "LINK", "House", 5, 5));

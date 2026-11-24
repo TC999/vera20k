@@ -7,22 +7,18 @@ use crate::map::resolved_terrain::{NativeCellQuery, ResolvedTerrainGrid};
 use crate::map::tube_facts::{TubeFact, TubeId};
 use crate::rules::locomotor_type::LocomotorKind;
 use crate::sim::bridge_state::{BridgeEndpointRecord, BridgeRecordKind};
-use crate::sim::components::{
-    DriveCoord, DriveLocomotionRuntime, NavTargetRef, ShipLocomotionRuntime,
-};
+use crate::sim::components::{DriveCoord, NavTargetRef};
 use crate::sim::game_entity::GameEntity;
 use crate::sim::movement::locomotor::LocomotorState;
 use crate::sim::movement::tube_movement::LowBridgeTubeMovementState;
+use crate::sim::movement::{DriveLocomotionRuntime, ShipLocomotionRuntime};
 use crate::sim::pathfinding::{PathGrid, zone_map::ZoneGrid};
 use crate::sim::world::Simulation;
 use crate::util::fixed_math::SimFixed;
 use serde_json::Value;
 
-pub(crate) fn corpus() -> Value {
-    serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/foot_bridge_layer.json"
-    ))
-    .unwrap()
+pub(crate) fn corpus() -> &'static Value {
+    crate::test_fixture::json("tools/spatial_oracle/foot_bridge_layer.json")
 }
 
 pub(crate) fn coord(value: &Value) -> DriveCoord {
@@ -51,57 +47,88 @@ pub(crate) fn candidate(input: &Value, id: u64, type_name: &str) -> GameEntity {
         _ => unreachable!(),
     };
     let mut entity = GameEntity::test_default(id, type_name, "Victim", 0, 0);
-    entity.category = if kind == LocomotorKind::Walk {
+    entity.set_category_for_test(if kind == LocomotorKind::Walk {
         EntityCategory::Infantry
     } else {
         EntityCategory::Unit
-    };
+    });
     entity.mission_leaf =
-        crate::sim::mission::MissionLeafState::for_entity_category(entity.category);
-    entity.position.rx = (current.x / 256).clamp(0, i32::from(u16::MAX)) as u16;
-    entity.position.ry = (current.y / 256).clamp(0, i32::from(u16::MAX)) as u16;
-    entity.position.sub_x = SimFixed::from_num(current.x - i32::from(entity.position.rx) * 256);
-    entity.position.sub_y = SimFixed::from_num(current.y - i32::from(entity.position.ry) * 256);
-    entity.position.exact_z_leptons = Some(current.z);
-    entity.on_bridge = input["on_bridge"].as_bool().unwrap();
+        crate::sim::mission::MissionLeafState::for_entity_category(entity.category());
+    entity
+        .position
+        .set_rx_for_test((current.x / 256).clamp(0, i32::from(u16::MAX)) as u16);
+    entity
+        .position
+        .set_ry_for_test((current.y / 256).clamp(0, i32::from(u16::MAX)) as u16);
+    entity.position.set_sub_x_for_test(SimFixed::from_num(
+        current.x - i32::from(entity.position.rx()) * 256,
+    ));
+    entity.position.set_sub_y_for_test(SimFixed::from_num(
+        current.y - i32::from(entity.position.ry()) * 256,
+    ));
+    entity
+        .position
+        .set_exact_z_leptons_for_test(Some(current.z));
+    entity.set_on_bridge(input["on_bridge"].as_bool().unwrap());
     if input["locomotor_present"].as_bool().unwrap() {
         entity.locomotor = Some(LocomotorState::for_test_kind(kind));
-        let track = crate::sim::components::TrackProgress {
-            turn_index: input["turn_index"].as_i64().unwrap_or(-1) as i32,
-            cursor: input["cursor"].as_i64().unwrap_or(0) as i32,
-            ..Default::default()
+        let track = {
+            let mut value = crate::sim::components::TrackProgress::default();
+            value.set_turn_index(input["turn_index"].as_i64().unwrap_or(-1) as i32);
+            value.set_cursor(input["cursor"].as_i64().unwrap_or(0) as i32);
+            value
         };
         match kind {
             LocomotorKind::Drive => {
-                entity.drive_locomotion = Some(DriveLocomotionRuntime {
-                    head_to: Some(head),
-                    track,
-                    ..Default::default()
-                })
+                assert!(
+                    entity
+                        .locomotor
+                        .as_mut()
+                        .unwrap()
+                        .install_drive_state_for_test(Some(
+                            DriveLocomotionRuntime::default()
+                                .with_head_to_for_test(Some(head))
+                                .with_track_for_test(track)
+                        ))
+                )
             }
             LocomotorKind::Ship => {
-                entity.ship_locomotion = Some(ShipLocomotionRuntime {
-                    head_to: Some(head),
-                    track,
-                    ..Default::default()
-                })
+                assert!(
+                    entity
+                        .locomotor
+                        .as_mut()
+                        .unwrap()
+                        .install_ship_state_for_test(Some(
+                            ShipLocomotionRuntime::default()
+                                .with_head_to_for_test(Some(head))
+                                .with_track_for_test(track)
+                        ))
+                )
             }
+            LocomotorKind::Hover => entity
+                .locomotor
+                .as_mut()
+                .and_then(|loco| loco.hover_runtime_mut())
+                .unwrap()
+                .set_head(Some(head)),
             _ => entity.locomotor.as_mut().unwrap().set_step_head(Some(head)),
         }
     }
     if input["tube"].is_array() {
-        entity.low_bridge_tube_state = Some(LowBridgeTubeMovementState {
-            tube_id: TubeId(0),
-            cursor: 0,
-            target: DriveCoord { x: 0, y: 0, z: 0 },
-        });
+        entity.low_bridge_tube_state = Some(LowBridgeTubeMovementState::for_test(
+            TubeId(0),
+            0,
+            DriveCoord { x: 0, y: 0, z: 0 },
+        ));
     }
     if input["nav_com_coord"].is_array() {
         let nav = coord(&input["nav_com_coord"]);
-        entity.navigation.nav_com = Some(NavTargetRef::Cell {
-            rx: (nav.x / 256) as u16,
-            ry: (nav.y / 256) as u16,
-        });
+        entity
+            .navigation
+            .set_nav_com_for_test(Some(NavTargetRef::Cell {
+                rx: (nav.x / 256) as u16,
+                ry: (nav.y / 256) as u16,
+            }));
     }
     entity
 }
@@ -188,20 +215,21 @@ pub(crate) fn zones(terrain: &ResolvedTerrainGrid, row: &Value) -> ZoneGrid {
         terrain.height(),
         Some((i32::from(size.0), i32::from(size.1))),
     );
-    let base = zones.base_topology_mut();
-    base.zone_ids.fill(0);
+    let base = zones.base_topology_mut_for_test();
+    base.zone_ids_mut_for_test().fill(0);
     for cell in supplied["group_cells"].as_array().unwrap() {
         let (x, y) = pair(&cell["xy"]);
-        base.zone_ids[usize::from(y) * usize::from(terrain.width()) + usize::from(x)] =
-            cell["group"].as_u64().unwrap() as u16;
+        base.zone_ids_mut_for_test()
+            [usize::from(y) * usize::from(terrain.width()) + usize::from(x)] =
+            cell["group"].as_u64().unwrap() as crate::sim::pathfinding::zone_map::ZoneId;
     }
     let labels: Vec<_> = supplied["raw_labels"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|v| v.as_u64().unwrap() as u16)
+        .map(|v| v.as_u64().unwrap() as crate::sim::pathfinding::zone_map::ZoneId)
         .collect();
-    for raw in &mut base.raw_zone_ids_by_row {
+    for raw in base.raw_zone_ids_by_row_mut_for_test() {
         *raw = labels.clone();
     }
     reset_dummy(terrain, &row["input"]);
@@ -245,8 +273,12 @@ fn native_bridge_fresh_drive_ship_queries_survive_snapshot() {
         let mut entity = candidate(input, 1, "DEFENDER");
         // Drive4AF540/Ship69EC50, including base55A6C0, initialize a null
         // retained head. The Rust owner stores that fresh payload lazily.
-        entity.drive_locomotion = None;
-        entity.ship_locomotion = None;
+        if let Some(loco) = entity.locomotor.as_mut() {
+            let _ = loco.install_drive_state_for_test(None);
+        };
+        if let Some(loco) = entity.locomotor.as_mut() {
+            let _ = loco.install_ship_state_for_test(None);
+        };
         sim.substrate.entities.insert(entity);
         let bytes = crate::sim::snapshot::GameSnapshot::save(&sim, 1, 0, context, 0);
         let mut restored = crate::sim::snapshot::GameSnapshot::load(&bytes)

@@ -6,13 +6,18 @@
 //!
 //! ## Dependency rules
 //! - audio/ depends on: assets/ (decodes .aud files), sim/ (triggers on game events)
-//! - audio/ does NOT depend on: render/, ui/, sidebar/, net/
+//! - audio/ does NOT depend on: render/, ui/, net/
 
 pub mod arbiter;
+pub(crate) mod custom_music;
 pub mod events;
 pub mod movie_stream;
 pub mod music;
+#[cfg(not(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) mod output_health;
 pub mod sfx;
 pub(crate) mod theme;
 pub mod voice_queue;
 pub mod vox;
+#[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+pub mod web_output;

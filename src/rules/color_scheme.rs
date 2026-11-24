@@ -13,7 +13,7 @@
 //! ## Dependency rules
 //! - Part of rules/ — depends only on rules/ini_parser. No sim/render/ui deps.
 
-use crate::rules::ini_parser::IniFile;
+use crate::rules::ini_parser::{IniFile, IniSection};
 
 /// One `[Colors]` entry: a name and its H,S,V triple (each 0..=255), kept in
 /// section declaration order. Order is load-bearing: a player's color priority
@@ -35,15 +35,24 @@ pub const PRIORITY_TO_SCHEME_INDEX: [usize; 9] = [3, 11, 21, 29, 13, 25, 17, 15,
 pub const RANDOM_PRIORITY_SCHEME_INDEX: usize = 5;
 
 /// Map a color priority to a runtime scheme-array index, matching gamemd's
-/// SessionClass priority→scheme conversion: `-2` → a fixed default, `0..=8` go
-/// through the table, anything higher passes through unchanged.
+/// SessionClass priority→scheme conversion (`Game_GetLinkedColor`
+/// `0x0069A310`): `-2` → a fixed default, then [`linked_color_tail`].
 pub fn scheme_index_for_priority(priority: i32) -> usize {
     if priority == -2 {
         RANDOM_PRIORITY_SCHEME_INDEX
-    } else if (0..PRIORITY_TO_SCHEME_INDEX.len() as i32).contains(&priority) {
-        PRIORITY_TO_SCHEME_INDEX[priority as usize]
     } else {
-        priority.max(0) as usize
+        linked_color_tail(priority)
+    }
+}
+
+/// The conversion's tail (`0x0069A328..0x0069A334`): a value below 9
+/// (unsigned) reads the table, anything else passes through unchanged. A
+/// negative pass-through addresses no scheme, so it clamps to 0.
+pub fn linked_color_tail(value: i32) -> usize {
+    if (0..PRIORITY_TO_SCHEME_INDEX.len() as i32).contains(&value) {
+        PRIORITY_TO_SCHEME_INDEX[value as usize]
+    } else {
+        value.max(0) as usize
     }
 }
 
@@ -82,9 +91,7 @@ pub fn parse_color_schemes(ini: &IniFile) -> Vec<ColorSchemeEntry> {
             if !seen.insert(key.to_ascii_uppercase()) {
                 return None;
             }
-            let hsv = section
-                .read_int_fields(key, 0x40, [0; 3])
-                .map(|channel| channel as u8);
+            let hsv = read_scheme_hsv(section, key);
             Some(ColorSchemeEntry {
                 name: key.to_string(),
                 hsv,
@@ -93,12 +100,21 @@ pub fn parse_color_schemes(ini: &IniFile) -> Vec<ColorSchemeEntry> {
         .collect()
 }
 
+/// Original474C70's bounded string/sscanf read, shared by the compatibility
+/// projection and a retained ColorScheme observation before Scenario reset.
+pub(crate) fn read_scheme_hsv(section: &IniSection, key: &str) -> [u8; 3] {
+    section
+        .read_int_fields(key, 0x40, [0; 3])
+        .map(|channel| channel as u8)
+}
+
 /// Resolve the loading-bar color scheme for a player color priority.
 ///
 /// gamemd builds two runtime schemes per `[Colors]` entry (a documented quirk:
 /// the schemes "are all doubled"), so runtime scheme index `N` addresses
 /// `[Colors]` list entry `N / 2`; both halves of a pair share the same source
 /// H,S,V. The priority table selects the odd (`2*entry + 1`) half.
+#[cfg(any(test, feature = "test-support"))]
 pub fn scheme_for_priority(
     schemes: &[ColorSchemeEntry],
     priority: i32,
@@ -138,12 +154,12 @@ pub fn hsv_to_rgb(hsv: [u8; 3]) -> [u8; 3] {
 /// Resolve a player color priority to the loading-bar backing color in RGB,
 /// applying the priority table, the scheme-doubling, and HSV→RGB. Returns `None`
 /// when the `[Colors]` list is empty or the index is out of range.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn backing_rgb_for_priority(schemes: &[ColorSchemeEntry], priority: i32) -> Option<[u8; 3]> {
     scheme_for_priority(schemes, priority).map(|scheme| hsv_to_rgb(scheme.hsv))
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_rules_a_n))]
 mod tests {
     use super::*;
 
@@ -159,9 +175,10 @@ mod tests {
             value: u8,
             rgb_by_hue: String,
         }
-        let vectors: Vectors =
-            serde_json::from_str(include_str!("../../tools/color_oracle/hsv_to_rgb.json"))
-                .expect("native HSV vectors");
+        let vectors: Vectors = serde_json::from_str(crate::test_fixture::text(
+            "tools/color_oracle/hsv_to_rgb.json",
+        ))
+        .expect("native HSV vectors");
         // Require the intended sample, not merely whichever rows remain in the file.
         let pairs = [
             (0, 255),
@@ -220,26 +237,6 @@ mod tests {
     }
 
     #[test]
-    fn hsv_to_rgb_matches_gamemd_sextants() {
-        // DarkRed (H=0): pure red sextant.
-        assert_eq!(hsv_to_rgb([0, 230, 255]), [255, 25, 25]);
-        // DarkBlue (H=153): blue sextant, blue channel dominant.
-        assert_eq!(hsv_to_rgb([153, 214, 212]), [34, 105, 212]);
-        // Gold (H=43): yellow, red+green high.
-        assert_eq!(hsv_to_rgb([43, 239, 255]), [253, 255, 16]);
-        // Zero saturation is grey regardless of hue.
-        assert_eq!(hsv_to_rgb([0, 0, 131]), [131, 131, 131]);
-    }
-
-    #[test]
-    fn darkblue_reads_blue_dominant_darkred_red_dominant() {
-        let blue = hsv_to_rgb([153, 214, 212]);
-        assert!(blue[2] > blue[0] && blue[2] > blue[1], "{blue:?}");
-        let red = hsv_to_rgb([0, 230, 255]);
-        assert!(red[0] > red[1] && red[0] > red[2], "{red:?}");
-    }
-
-    #[test]
     fn priority_table_selects_the_eight_multiplayer_colors() {
         let schemes = schemes();
         // priority 0..=7 → the standard MP colors via the doubling (idx/2).
@@ -268,17 +265,6 @@ mod tests {
     }
 
     #[test]
-    fn backing_rgb_resolves_player_priority_to_scheme_color() {
-        let schemes = schemes();
-        // Priority 2 = DarkBlue → blue-dominant backing.
-        let blue = backing_rgb_for_priority(&schemes, 2).unwrap();
-        assert!(blue[2] > blue[0] && blue[2] > blue[1], "{blue:?}");
-        // Priority 1 = DarkRed → red-dominant backing.
-        let red = backing_rgb_for_priority(&schemes, 1).unwrap();
-        assert!(red[0] > red[1] && red[0] > red[2], "{red:?}");
-    }
-
-    #[test]
     fn parse_color_schemes_reads_section_in_order() {
         let ini = IniFile::from_str("[Colors]\nGold=43,239,255\nDarkRed=0,230,255\n");
         let parsed = parse_color_schemes(&ini);
@@ -302,16 +288,6 @@ mod tests {
     fn empty_or_missing_colors_section_yields_no_schemes() {
         assert!(parse_color_schemes(&IniFile::from_str("[General]\nX=1\n")).is_empty());
         assert!(backing_rgb_for_priority(&[], 0).is_none());
-    }
-
-    #[test]
-    fn scheme_entry_for_priority_matches_lut_div2() {
-        // p0→3/2=1 Gold, p1→11/2=5 DarkRed, p2→21/2=10 DarkBlue, p3→29/2=14 DarkGreen, random→5/2=2
-        assert_eq!(scheme_entry_for_priority(0), 1);
-        assert_eq!(scheme_entry_for_priority(1), 5);
-        assert_eq!(scheme_entry_for_priority(2), 10);
-        assert_eq!(scheme_entry_for_priority(3), 14);
-        assert_eq!(scheme_entry_for_priority(-2), 2);
     }
 
     #[test]

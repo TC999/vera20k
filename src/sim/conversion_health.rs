@@ -48,6 +48,22 @@ pub(crate) fn native_health(
 pub(crate) struct ConversionHealth(i32);
 
 impl ConversionHealth {
+    /// Ares in-place conversion1004370E..10043752 stores the source ratio
+    /// as a double before calling ObjectClass::SetHealthFraction5F5C80.
+    /// Keep that setter with Health; deploy conversions have another clamp.
+    pub(crate) fn capture_in_place(
+        source: &GameEntity,
+        source_type: &ObjectType,
+        destination_type: &ObjectType,
+    ) -> Self {
+        let fraction = crate::util::native_x87::MaskedX87Chop53::store_f64_masked_chop(
+            source.health.ratio(source_type.strength),
+        );
+        let mut health = source.health;
+        health.set_fraction(fraction, destination_type.strength);
+        Self(health.current())
+    }
+
     pub(crate) fn capture(
         source: &GameEntity,
         source_type: &ObjectType,
@@ -55,19 +71,22 @@ impl ConversionHealth {
         kind: ConversionKind,
     ) -> Self {
         Self(native_health(
-            source.health.current,
+            source.health.current(),
             source_type.strength,
             destination_type.strength,
             kind,
         ))
     }
 
+    /// Health and EstimatedHealth on the converted object: `UnitClass::Deploy`
+    /// stores them at `0x00739946..0x00739953`, `BuildingClass::Mission_Selling`
+    /// (undeploy) at `0x0044A02C..0x0044A039`.
     pub(crate) fn apply(self, destination: &mut GameEntity) {
-        destination.health.current = self.0;
+        destination.health.set(self.0);
         destination.estimated_health.reset(self.0);
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_c_g))]
 #[path = "conversion_health_tests.rs"]
 mod tests;

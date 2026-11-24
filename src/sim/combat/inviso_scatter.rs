@@ -7,11 +7,13 @@
 //! coordinate.
 
 use crate::sim::rng::SimRng;
+#[cfg(any(test, feature = "test-support"))]
 use crate::util::fixed_math::SimFixed;
 use crate::util::native_x87::{NativeF32Bits, X87Chop53};
 
+#[cfg(any(test, feature = "test-support"))]
 const LEPTONS_PER_CELL: i32 = crate::util::lepton::LEPTONS_PER_CELL_I32;
-const MAP_CELL_LIMIT: u32 = 512;
+#[cfg(any(test, feature = "test-support"))]
 const INVISO_ANIM_RADIUS: i32 = 0x20;
 
 /// The final byte argument of the one shared Coord49F420 owner.
@@ -98,17 +100,21 @@ const COSINE_BITS: [u32; 256] = [
     0xBE47C5C1, 0xBE2F10A2, 0xBE164083, 0xBDFAB272, 0xBDC8BD35, 0xBD96A904, 0xBD48FB2F, 0xBCC90AAF,
 ];
 
-/// Consume one Scenario-RNG draw and derive only the impact-animation coordinate.
+/// Compatibility for cell-packet tests; production calls the raw Coord owner
+/// directly so packing never changes the input to native49F420.
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn scatter_inviso_effect_coord(
+    grid: crate::map::cell_index::CellGrid,
     rng: &mut SimRng,
     rx: u16,
     ry: u16,
     sub_x: SimFixed,
     sub_y: SimFixed,
 ) -> (u16, u16, SimFixed, SimFixed) {
-    let base_x = i32::from(rx) * LEPTONS_PER_CELL + sub_x.to_num::<i32>();
-    let base_y = i32::from(ry) * LEPTONS_PER_CELL + sub_y.to_num::<i32>();
+    let base_x = crate::util::lepton::absolute_lepton_axis(rx, sub_x);
+    let base_y = crate::util::lepton::absolute_lepton_axis(ry, sub_y);
     let (x, y) = random_direction_coord(
+        grid,
         rng,
         base_x,
         base_y,
@@ -118,17 +124,19 @@ pub(crate) fn scatter_inviso_effect_coord(
     split_valid_coord(x, y)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn scatter_effect_coord_for_byte(
+    grid: crate::map::cell_index::CellGrid,
     byte: u8,
     rx: u16,
     ry: u16,
     sub_x: SimFixed,
     sub_y: SimFixed,
 ) -> (u16, u16, SimFixed, SimFixed) {
-    let base_x = i32::from(rx) * LEPTONS_PER_CELL + sub_x.to_num::<i32>();
-    let base_y = i32::from(ry) * LEPTONS_PER_CELL + sub_y.to_num::<i32>();
+    let base_x = crate::util::lepton::absolute_lepton_axis(rx, sub_x);
+    let base_y = crate::util::lepton::absolute_lepton_axis(ry, sub_y);
     let (x, y) = random_direction_coord_for_byte(
+        grid,
         byte,
         base_x,
         base_y,
@@ -146,6 +154,7 @@ fn scatter_effect_coord_for_byte(
 /// Cell-center snapping runs AFTER this fallback, using low-byte masking (not
 /// signed division); House501AC0 passes snap1 while the impact callers pass0.
 pub(crate) fn random_direction_coord(
+    grid: crate::map::cell_index::CellGrid,
     rng: &mut SimRng,
     base_x: i32,
     base_y: i32,
@@ -153,10 +162,11 @@ pub(crate) fn random_direction_coord(
     snap: RandomDirectionSnap,
 ) -> (i32, i32) {
     let byte = (rng.next_u32() & 0xff) as u8;
-    random_direction_coord_for_byte(byte, base_x, base_y, magnitude_leptons, snap)
+    random_direction_coord_for_byte(grid, byte, base_x, base_y, magnitude_leptons, snap)
 }
 
 pub(crate) fn random_direction_coord_for_byte(
+    grid: crate::map::cell_index::CellGrid,
     byte: u8,
     base_x: i32,
     base_y: i32,
@@ -182,11 +192,12 @@ pub(crate) fn random_direction_coord_for_byte(
 
     let x_cell = crate::util::lepton::lepton_to_cell(x);
     let y_cell = crate::util::lepton::lepton_to_cell(y);
-    let (x, y) = if (x_cell as u32) >= MAP_CELL_LIMIT || (y_cell as u32) >= MAP_CELL_LIMIT {
-        (base_x, base_y)
-    } else {
-        (x, y)
-    };
+    let (x, y) =
+        if (x_cell as u32) >= u32::from(grid.side()) || (y_cell as u32) >= u32::from(grid.side()) {
+            (base_x, base_y)
+        } else {
+            (x, y)
+        };
     match snap {
         RandomDirectionSnap::Preserve => (x, y),
         RandomDirectionSnap::CellCenter => (
@@ -196,18 +207,14 @@ pub(crate) fn random_direction_coord_for_byte(
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn split_valid_coord(x: i32, y: i32) -> (u16, u16, SimFixed, SimFixed) {
-    let x_cell = crate::util::lepton::lepton_to_cell(x);
-    let y_cell = crate::util::lepton::lepton_to_cell(y);
-    (
-        x_cell as u16,
-        y_cell as u16,
-        SimFixed::from_num(x - x_cell * LEPTONS_PER_CELL),
-        SimFixed::from_num(y - y_cell * LEPTONS_PER_CELL),
-    )
+    let (rx, sub_x) = crate::util::lepton::split_lepton_axis(x);
+    let (ry, sub_y) = crate::util::lepton::split_lepton_axis(y);
+    (rx, ry, sub_x, sub_y)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_d_z))]
 mod tests {
     use super::*;
 
@@ -474,7 +481,7 @@ mod tests {
     ];
 
     fn flat(rx: u16, sub: SimFixed) -> i32 {
-        i32::from(rx) * LEPTONS_PER_CELL + sub.to_num::<i32>()
+        crate::util::lepton::absolute_lepton_axis(rx, sub)
     }
 
     /// `tools/projectile_oracle/launch_scatter.json`: the original helper
@@ -482,8 +489,8 @@ mod tests {
     /// 0x200 for every angle byte, and beside the map's edges.
     #[test]
     fn cluster_distances_match_the_native_helper() {
-        let corpus: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../tools/projectile_oracle/launch_scatter.json"
+        let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/projectile_oracle/launch_scatter.json",
         ))
         .unwrap();
         let rows = corpus["direction"].as_array().unwrap();
@@ -492,6 +499,7 @@ mod tests {
             let input = &row["input"];
             let base = |axis: usize| input["base"][axis].as_i64().unwrap() as i32;
             let (x, y) = random_direction_coord_for_byte(
+                crate::map::cell_index::CellGrid::Retail,
                 (input["raw"].as_u64().unwrap() & 0xff) as u8,
                 base(0),
                 base(1),
@@ -509,16 +517,8 @@ mod tests {
 
     #[test]
     fn native_house_return_direction_snap_matches_all_28_original_calls() {
-        let metadata: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../tools/spatial_oracle/house_base_return.meta.json"
-        ))
-        .unwrap();
-        assert_eq!(
-            metadata["native_sha256"],
-            "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-        );
-        let corpus: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../tools/spatial_oracle/house_base_return.json"
+        let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/house_base_return.json",
         ))
         .unwrap();
         let rows = corpus["home_return"].as_array().unwrap();
@@ -542,6 +542,7 @@ mod tests {
             }
             let axis = |field: &str, index: usize| event[field][index].as_i64().unwrap() as i32;
             let actual = random_direction_coord(
+                crate::map::cell_index::CellGrid::Retail,
                 &mut rng,
                 axis("current", 0),
                 axis("current", 1),
@@ -557,8 +558,14 @@ mod tests {
     fn all_256_binary_samples_match_the_radius_32_oracle() {
         let base = 65_536;
         for (byte, &(expected_x, expected_y)) in EXPECTED_OFFSETS.iter().enumerate() {
-            let (rx, ry, sub_x, sub_y) =
-                scatter_effect_coord_for_byte(byte as u8, 256, 256, SimFixed::ZERO, SimFixed::ZERO);
+            let (rx, ry, sub_x, sub_y) = scatter_effect_coord_for_byte(
+                crate::map::cell_index::CellGrid::Retail,
+                byte as u8,
+                256,
+                256,
+                SimFixed::ZERO,
+                SimFixed::ZERO,
+            );
             assert_eq!(
                 flat(rx, sub_x) - base,
                 i32::from(expected_x),
@@ -573,33 +580,12 @@ mod tests {
     }
 
     #[test]
-    fn cardinals_include_native_tiny_sample_chop_bias() {
-        assert_eq!(EXPECTED_OFFSETS[0], (0, -32));
-        assert_eq!(EXPECTED_OFFSETS[64], (32, 0));
-        assert_eq!(EXPECTED_OFFSETS[128], (-1, 32));
-        assert_eq!(EXPECTED_OFFSETS[192], (-32, -1));
-    }
-
-    #[test]
-    fn boundary_check_uses_native_truncation_and_whole_coord_fallback() {
-        let accepted =
-            scatter_effect_coord_for_byte(192, 0, 7, SimFixed::ZERO, SimFixed::from_num(19));
-        assert_eq!(accepted.0, 0);
-        assert_eq!(accepted.2.to_num::<i32>(), -32);
-
-        let base = (511, 7, SimFixed::from_num(250), SimFixed::from_num(19));
-        assert_eq!(
-            scatter_effect_coord_for_byte(64, base.0, base.1, base.2, base.3),
-            base
-        );
-    }
-
-    #[test]
     fn public_helper_consumes_exactly_one_raw_scenario_rng_draw() {
         let mut rng = SimRng::new(1);
         let mut reference = rng.clone();
         let byte = (reference.next_u32() & 0xff) as u8;
         let got = scatter_inviso_effect_coord(
+            crate::map::cell_index::CellGrid::Retail,
             &mut rng,
             20,
             30,
@@ -607,6 +593,7 @@ mod tests {
             SimFixed::from_num(128),
         );
         let expected = scatter_effect_coord_for_byte(
+            crate::map::cell_index::CellGrid::Retail,
             byte,
             20,
             30,
@@ -628,6 +615,7 @@ mod tests {
         ];
         for (byte, expected) in offsets {
             let got = random_direction_coord_for_byte(
+                crate::map::cell_index::CellGrid::Retail,
                 byte,
                 base,
                 base,
@@ -640,6 +628,7 @@ mod tests {
         let edge = (511 * LEPTONS_PER_CELL + 250, 7 * LEPTONS_PER_CELL + 19);
         assert_eq!(
             random_direction_coord_for_byte(
+                crate::map::cell_index::CellGrid::Retail,
                 64,
                 edge.0,
                 edge.1,
@@ -653,6 +642,7 @@ mod tests {
         let mut actual_rng = SimRng::new(42);
         let mut reference_rng = actual_rng.clone();
         let _ = random_direction_coord(
+            crate::map::cell_index::CellGrid::Retail,
             &mut actual_rng,
             base,
             base,

@@ -1,9 +1,10 @@
 use super::*;
 use crate::map::entities::EntityCategory;
 use crate::map::tube_facts::{TubeFact, TubeId};
-use crate::sim::components::{DriveLocomotionRuntime, NavTargetRef, ShipLocomotionRuntime};
+use crate::sim::components::NavTargetRef;
 use crate::sim::movement::locomotor::LocomotorState;
 use crate::sim::movement::tube_movement::LowBridgeTubeMovementState;
+use crate::sim::movement::{DriveLocomotionRuntime, ShipLocomotionRuntime};
 use crate::util::fixed_math::SimFixed;
 use serde_json::Value;
 
@@ -17,42 +18,93 @@ fn coord(v: &Value) -> DriveCoord {
 
 fn entity(id: u64, kind: LocomotorKind, current: DriveCoord, head: DriveCoord) -> GameEntity {
     let mut e = GameEntity::test_default(id, "E1", "Americans", 0, 0);
-    e.category = if kind == LocomotorKind::Walk {
+    e.set_category_for_test(if kind == LocomotorKind::Walk {
         EntityCategory::Infantry
     } else {
         EntityCategory::Unit
-    };
-    e.position.rx = (current.x / 256).clamp(0, i32::from(u16::MAX)) as u16;
-    e.position.ry = (current.y / 256).clamp(0, i32::from(u16::MAX)) as u16;
-    e.position.sub_x = SimFixed::from_num(current.x - i32::from(e.position.rx) * 256);
-    e.position.sub_y = SimFixed::from_num(current.y - i32::from(e.position.ry) * 256);
-    e.position.exact_z_leptons = Some(current.z);
+    });
+    e.position
+        .set_rx_for_test((current.x / 256).clamp(0, i32::from(u16::MAX)) as u16);
+    e.position
+        .set_ry_for_test((current.y / 256).clamp(0, i32::from(u16::MAX)) as u16);
+    e.position.set_sub_x_for_test(SimFixed::from_num(
+        current.x - i32::from(e.position.rx()) * 256,
+    ));
+    e.position.set_sub_y_for_test(SimFixed::from_num(
+        current.y - i32::from(e.position.ry()) * 256,
+    ));
+    e.position.set_exact_z_leptons_for_test(Some(current.z));
     e.locomotor = Some(LocomotorState::for_test_kind(kind));
     match kind {
         LocomotorKind::Drive => {
-            e.drive_locomotion = Some(DriveLocomotionRuntime {
-                head_to: Some(head),
-                ..Default::default()
-            })
+            assert!(
+                e.locomotor
+                    .as_mut()
+                    .unwrap()
+                    .install_drive_state_for_test(Some(
+                        DriveLocomotionRuntime::default().with_head_to_for_test(Some(head))
+                    ))
+            )
         }
         LocomotorKind::Ship => {
-            e.ship_locomotion = Some(ShipLocomotionRuntime {
-                head_to: Some(head),
-                ..Default::default()
-            })
+            assert!(
+                e.locomotor
+                    .as_mut()
+                    .unwrap()
+                    .install_ship_state_for_test(Some(
+                        ShipLocomotionRuntime::default().with_head_to_for_test(Some(head))
+                    ))
+            )
         }
-        LocomotorKind::Walk | LocomotorKind::Hover => {
-            e.locomotor.as_mut().unwrap().set_step_head(Some(head))
-        }
+        LocomotorKind::Walk => e.locomotor.as_mut().unwrap().set_step_head(Some(head)),
+        LocomotorKind::Hover => e
+            .locomotor
+            .as_mut()
+            .and_then(|loco| loco.hover_runtime_mut())
+            .unwrap()
+            .set_head(Some(head)),
         _ => {}
     }
     e
 }
 
 #[test]
+fn lazy_track_constructor_projects_original_null_head_coordinates() {
+    let rows: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/foot_navigation_coordinate.json",
+    ))
+    .unwrap();
+    let mut checked = 0;
+    for row in rows.as_array().unwrap() {
+        let input = &row["input"];
+        let kind = match input["family"].as_str().unwrap() {
+            "drive" => LocomotorKind::Drive,
+            "ship" => LocomotorKind::Ship,
+            _ => continue,
+        };
+        if input["stored_head"] != serde_json::json!([0, 0, 0]) || input["tube"].is_array() {
+            continue;
+        }
+        let mut actor = entity(1, kind, coord(&input["current"]), NULL_COORD);
+        if let Some(loco) = actor.locomotor.as_mut() {
+            let _ = loco.install_drive_state_for_test(None);
+        };
+        if let Some(loco) = actor.locomotor.as_mut() {
+            let _ = loco.install_ship_state_for_test(None);
+        };
+        assert_eq!(
+            navigation_coordinate(&actor, None).unwrap(),
+            coord(&row["coordinate"])
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 4);
+}
+
+#[test]
 fn world_queries_match_all_original_foot_coordinate_rows_and_snapshot() {
-    let rows: Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/foot_navigation_coordinate.json"
+    let rows: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/foot_navigation_coordinate.json",
     ))
     .unwrap();
     assert_eq!(rows.as_array().unwrap().len(), 44);
@@ -73,14 +125,18 @@ fn world_queries_match_all_original_foot_coordinate_rows_and_snapshot() {
             coord(&input["current"]),
             coord(&input["stored_head"]),
         );
-        let track = e
-            .drive_locomotion
-            .as_mut()
-            .map(|s| &mut s.track)
-            .or_else(|| e.ship_locomotion.as_mut().map(|s| &mut s.track));
-        if let Some(track) = track {
-            track.turn_index = input["turn_index"].as_i64().unwrap() as i32;
-            track.cursor = input["cursor"].as_i64().unwrap() as i32;
+        let family = match kind {
+            LocomotorKind::Drive => Some(crate::sim::movement::track_process::TrackFamily::Drive),
+            LocomotorKind::Ship => Some(crate::sim::movement::track_process::TrackFamily::Ship),
+            _ => None,
+        };
+        if let Some(family) = family {
+            let loco = e.locomotor.as_mut().unwrap();
+            if let Some(mut track) = loco.track_progress(family) {
+                track.set_turn_index(input["turn_index"].as_i64().unwrap() as i32);
+                track.set_cursor(input["cursor"].as_i64().unwrap() as i32);
+                assert!(loco.store_track_progress(family, track));
+            }
         }
         if let Some(tube) = input["tube"].as_array() {
             let exit = (
@@ -93,11 +149,11 @@ fn world_queries_match_all_original_foot_coordinate_rows_and_snapshot() {
                 vec![],
                 vec![TubeFact::explicit((0, 0), exit, 0, vec![0])],
             ));
-            e.low_bridge_tube_state = Some(LowBridgeTubeMovementState {
-                tube_id: TubeId(0),
-                cursor: 0,
-                target: NULL_COORD,
-            });
+            e.low_bridge_tube_state = Some(LowBridgeTubeMovementState::for_test(
+                TubeId(0),
+                0,
+                NULL_COORD,
+            ));
         }
         sim.substrate.entities.insert(e);
         assert_eq!(
@@ -125,8 +181,8 @@ fn world_queries_match_all_original_foot_coordinate_rows_and_snapshot() {
         );
         if input["tube"].is_array() {
             let e = sim.substrate.entities.get_mut(1).unwrap();
-            e.lifecycle.object_alive = false;
-            e.lifecycle.in_limbo = true;
+            e.lifecycle.set_object_alive_for_test(false);
+            e.lifecycle.set_in_limbo_for_test(true);
             e.locomotor = None;
             assert_eq!(
                 sim.foot_navigation_coordinate(1).unwrap(),
@@ -137,21 +193,20 @@ fn world_queries_match_all_original_foot_coordinate_rows_and_snapshot() {
 }
 
 #[test]
-fn hover_projects_altitude_once_and_at_coord_ignores_tube_exit() {
+fn hover_reads_its_location_z_and_at_coord_ignores_tube_exit() {
     let raw = DriveCoord::cell(5, 5, 37);
     let mut e = entity(1, LocomotorKind::Hover, raw, NULL_COORD);
-    e.locomotor.as_mut().unwrap().altitude = SimFixed::from_num(125);
     assert_eq!(navigation_coordinate(&e, None).unwrap().z, 37);
-    // Exact Object Z already includes height. Only a legacy coarse position
-    // needs the independent controller displacement projected into it.
-    e.position.exact_z_leptons = None;
-    e.position.z = 1;
-    assert_eq!(navigation_coordinate(&e, None).unwrap().z, 229);
-    e.low_bridge_tube_state = Some(LowBridgeTubeMovementState {
-        tube_id: TubeId(0),
-        cursor: 0,
-        target: NULL_COORD,
-    });
+    // Exact Object Z already includes height; an object without one stands
+    // on its coarse level.
+    e.position.set_exact_z_leptons_for_test(None);
+    e.position.set_z_for_test(1);
+    assert_eq!(navigation_coordinate(&e, None).unwrap().z, 104);
+    e.low_bridge_tube_state = Some(LowBridgeTubeMovementState::for_test(
+        TubeId(0),
+        0,
+        NULL_COORD,
+    ));
     let terrain = ResolvedTerrainGrid::from_cells_with_tubes(
         1,
         1,
@@ -163,8 +218,8 @@ fn hover_projects_altitude_once_and_at_coord_ignores_tube_exit() {
         DriveCoord::cell(9, 10, 0)
     );
     let at = crate::sim::movement::at_coord::AtCoordQuery::from_entity(&e).unwrap();
-    assert_eq!(at.head_z(), 229);
-    assert!(at.matches(DriveCoord { z: 229, ..raw }));
+    assert_eq!(at.head_z(), 104);
+    assert!(at.matches(DriveCoord { z: 104, ..raw }));
 }
 
 #[test]
@@ -191,8 +246,13 @@ fn production_drive_reaim_reads_retained_target_head() {
         DriveCoord::cell(3, 4, 0),
         NULL_COORD,
     );
-    mover.navigation.nav_com = Some(NavTargetRef::Entity { id: 2 });
-    mover.drive_locomotion.as_mut().unwrap().destination = Some(DriveCoord::cell(7, 4, 0));
+    mover
+        .navigation
+        .set_nav_com_for_test(Some(NavTargetRef::Object { id: 2 }));
+    assert!(mover.locomotor.as_mut().unwrap().store_track_destination(
+        crate::sim::movement::track_process::TrackFamily::Drive,
+        Some(DriveCoord::cell(7, 4, 0))
+    ));
     let target_head = DriveCoord::cell(8, 4, 416);
     sim.substrate.entities.insert(mover);
     sim.substrate.entities.insert(entity(
@@ -206,21 +266,22 @@ fn production_drive_reaim_reads_retained_target_head() {
             .entities
             .get(1)
             .unwrap()
-            .drive_locomotion
+            .locomotor
             .as_ref()
+            .and_then(|l| l.selected_drive_runtime())
+            .and_then(|r| r.retained())
             .unwrap()
-            .destination
+            .destination()
     };
-    // Drive 0x4B05D0 is reached only after a track end in the same Process;
-    // an ordinary visit leaves +34 alone.
-    sim.process_ground_locomotor_for_test(1, None, None, None)
-        .unwrap();
+    // Drive 0x4B05D0, after a track end in the same Process, re-aims +34 at
+    // an Infantry NavCom's live coordinate.
     assert_eq!(destination(&sim), Some(DriveCoord::cell(7, 4, 0)));
     assert!(
         sim.begin_track_end_continuation(
             1,
             crate::sim::movement::track_process::TrackFamily::Drive,
-            None
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            &mut crate::sim::world::FrameEffects::default()
         )
         .unwrap()
     );
@@ -232,11 +293,11 @@ fn missing_foot_receiver_is_an_error_and_tube_does_not_hide_missing_descriptor()
     let mut e = entity(1, LocomotorKind::Drive, NULL_COORD, NULL_COORD);
     e.locomotor = None;
     assert!(navigation_coordinate(&e, None).is_err());
-    e.low_bridge_tube_state = Some(LowBridgeTubeMovementState {
-        tube_id: TubeId(0),
-        cursor: 0,
-        target: NULL_COORD,
-    });
+    e.low_bridge_tube_state = Some(LowBridgeTubeMovementState::for_test(
+        TubeId(0),
+        0,
+        NULL_COORD,
+    ));
     e.locomotor = None;
     assert!(
         navigation_coordinate(&e, None)
@@ -247,12 +308,9 @@ fn missing_foot_receiver_is_an_error_and_tube_does_not_hide_missing_descriptor()
 
 #[test]
 fn flight_queries_follow_live_altitude_producers_and_keep_jumpjet_exact_z() {
-    use crate::sim::movement::{air_movement, rocket_movement};
     let mut sim = Simulation::new();
-    sim.interner = crate::sim::intern::test_interner();
     let base = DriveCoord::cell(8, 6, 104);
-    // Fly reads GetHeight against actual terrain. Rocket still owns its
-    // independent displacement controller and receives the same starting Z.
+    // Fly reads GetHeight against actual terrain.
     let terrain = crate::map::resolved_terrain::ResolvedTerrainGrid::from_cells(
         16,
         16,
@@ -274,56 +332,35 @@ fn flight_queries_follow_live_altitude_producers_and_keep_jumpjet_exact_z() {
         Some(104)
     );
     let mut fly = entity(1, LocomotorKind::Fly, base, NULL_COORD);
+    fly.lifecycle.set_object_alive_for_test(true);
+    fly.lifecycle.set_in_limbo_for_test(false);
     let loco = fly.locomotor.as_mut().unwrap();
 
     loco.set_fly_target_height(1000);
+    // Process steps the height of a moving Fly (`0x004CDA0B`).
+    loco.fly_runtime_mut()
+        .unwrap()
+        .retain_destination(DriveCoord::cell(12, 6, 0), None, || 0);
     sim.substrate.entities.insert(fly);
-    sim.substrate
-        .entities
-        .insert(entity(2, LocomotorKind::Rocket, base, NULL_COORD));
-    assert!(rocket_movement::attach_rocket_state(
-        &mut sim.substrate.entities,
-        2,
-        (8, 6),
-        (18, 6),
-        SimFixed::from_num(250)
-    ));
-    sim.substrate
-        .entities
-        .get_mut(2)
-        .unwrap()
-        .rocket_state
-        .as_mut()
-        .unwrap()
-        .phase = rocket_movement::RocketPhase::Ascent;
-    air_movement::tick_air_movement(
-        &mut sim.substrate.entities,
-        &[1],
+    sim.interner = crate::sim::intern::test_interner();
+    sim.resolved_terrain = Some(terrain);
+    sim.tick_air_movement_with_cell_lists_one(
         1,
-        1,
-        Some(&terrain),
+        crate::rules::ruleset::RuleSet::empty_for_test(),
         None,
-    );
-    rocket_movement::process_rocket(sim.substrate.entities.get_mut(2).unwrap(), 1);
-    for id in [1, 2] {
-        let e = sim.substrate.entities.get(id).unwrap();
-        let altitude = if id == 1 {
-            e.locomotor.as_ref().unwrap().altitude
-        } else {
-            e.rocket_state.as_ref().unwrap().altitude
-        };
-        assert!(altitude > SimFixed::from_num(0));
-        assert_eq!(
-            sim.foot_navigation_coordinate(id).unwrap().z,
-            104 + altitude.to_num::<i32>()
-        );
-    }
-    let mut jumpjet = entity(
+        &mut crate::sim::world::FrameEffects::default(),
+    )
+    .unwrap();
+    let e = sim.substrate.entities.get(1).unwrap();
+    let height =
+        crate::sim::movement::air_movement::current_fly_height(e, sim.resolved_terrain.as_ref());
+    assert!(height > 0);
+    assert_eq!(sim.foot_navigation_coordinate(1).unwrap().z, 104 + height);
+    let jumpjet = entity(
         3,
         LocomotorKind::Jumpjet,
         DriveCoord { z: 604, ..base },
         NULL_COORD,
     );
-    jumpjet.locomotor.as_mut().unwrap().altitude = SimFixed::from_num(500);
     assert_eq!(navigation_coordinate(&jumpjet, None).unwrap().z, 604);
 }

@@ -1,7 +1,9 @@
 //! `BounceClass` — the rigid-body physics component that carries flying debris.
 //!
 //! gamemd-derived: `BounceClass::Init @ 0x004397E0`, `BounceClass::Update @
-//! 0x00439B00`. RTTI `.?AVBounceClass@@` at `0x00845E38`. It is a component,
+//! 0x00439B00`, `BounceClass::GetDrawingMatrix @ 0x004399E0` and the quaternion
+//! helpers they call (`0x00646480`, `0x00645ED0`, `0x00646980`); native
+//! execution in `tools/spatial_oracle/bounce_tumble.py`. RTTI `.?AVBounceClass@@` at `0x00845E38`. It is a component,
 //! never a standalone object: it has no vtable use of its own, no `WhatAmI`, no
 //! save slot, and is lifecycled entirely by its host. `VoxelAnimClass` embeds
 //! one at `+0xB0`; `AnimClass` embeds one too, for the SHP debris that uses the
@@ -23,15 +25,81 @@
 //!
 //! ## Dependency rules
 //! - Part of sim/ — depends on util/ and the rest of sim/.
-//! - sim/ NEVER depends on render/, ui/, sidebar/, audio/, net/.
+//! - sim/ NEVER depends on render/, ui/, audio/, net/.
 
-use glam::IVec3;
+use glam::{IVec3, Mat4, Vec3};
 use serde::{Deserialize, Serialize};
 
-use crate::sim::rng::SimRng;
+use crate::sim::rng::{SimRng, abs_before_modulo};
+use crate::util::native_quaternion::quaternion_to_matrix;
 use crate::util::native_x87::{
-    NativeF32Bits, NativeF64Bits, NativeX87Error, X87Chop53, sqrt_approx_f32,
+    NativeF32Bits, NativeF64Bits, NativeX87Error, X87Chop53, X87Ordering, X87Value, sqrt_approx_f32,
 };
+
+/// Transient meteor launch values (Steam gamemd): Anim4222FF..422433 and
+/// VoxelAnim749668..749787 take the same prefix.
+pub(crate) struct MeteorLaunch {
+    pub start: IVec3,
+    pub velocity: [NativeF32Bits; 3],
+    /// The shortened lifetime. Anim's literal 70 (4223D8) only places the
+    /// start; VoxelAnim shortens its Type Duration and stores it as the
+    /// countdown (74972C..74973F).
+    pub duration: i32,
+}
+
+/// The constructor draws Y, X, then the lifetime shortening. Reflect both
+/// stored float XY components when X < -Y. The third draw takes abs AFTER
+/// signed remainder20, unlike the first two: INT_MIN shortens by8, not -8.
+/// Original constructor/prefix controls pin axis pairing, reflection,
+/// ftol, signed origins, duration0 and constrained INT_MIN draws.
+pub(crate) fn meteor_launch(
+    origin: IVec3,
+    lifetime: i32,
+    min_z: NativeF64Bits,
+    max_xy: NativeF64Bits,
+    rng: &mut SimRng,
+) -> Result<MeteorLaunch, NativeX87Error> {
+    let y_draw = rng.next_u32();
+    let x_draw = rng.next_u32();
+    let max_xy = X87Chop53::load_f64(max_xy)?;
+    let divisor = X87Chop53::ftol_i64(X87Chop53::add(max_xy, max_xy))? as i32;
+    let axis = |draw| {
+        X87Chop53::store_f32(X87Chop53::sub(
+            X87Chop53::load_i32(abs_before_modulo(draw, divisor)),
+            max_xy,
+        ))
+    };
+    let mut y = axis(y_draw)?;
+    let mut x = axis(x_draw)?;
+    let z = X87Chop53::store_f32(X87Chop53::load_f64(min_z)?)?;
+    if X87Chop53::compare(
+        X87Chop53::load_f32(x)?,
+        X87Chop53::neg(X87Chop53::load_f32(y)?),
+    ) == X87Ordering::Less
+    {
+        x = NativeF32Bits::from_bits(x.bits() ^ 0x8000_0000);
+        y = NativeF32Bits::from_bits(y.bits() ^ 0x8000_0000);
+    }
+    let duration = lifetime.wrapping_sub(rng.next_raw_abs_modulo(20) as i32);
+    let place = |coord, velocity| -> Result<i32, NativeX87Error> {
+        Ok(X87Chop53::ftol_i64(X87Chop53::sub(
+            X87Chop53::load_i32(coord),
+            X87Chop53::mul(
+                X87Chop53::load_i32(duration),
+                X87Chop53::load_f32(velocity)?,
+            ),
+        ))? as i32)
+    };
+    Ok(MeteorLaunch {
+        start: IVec3::new(
+            place(origin.x, x)?,
+            place(origin.y, y)?,
+            place(origin.z, z)?,
+        ),
+        velocity: [x, y, z],
+        duration,
+    })
+}
 
 /// The 0x50-byte physics body, field for field.
 ///
@@ -44,70 +112,27 @@ use crate::util::native_x87::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BounceState {
     /// `+0x00`. Bounce coefficient from the type's `Elasticity`.
-    pub elasticity: NativeF64Bits,
+    elasticity: NativeF64Bits,
     /// `+0x08`. Subtracted from `velocity_z` every tick. 1.4 for voxel debris,
     /// hardcoded in `VoxelAnimClass::Constructor`; 3.0 in the terrain-meteor
     /// helper `FUN_00439690`.
-    pub gravity: NativeF64Bits,
+    gravity: NativeF64Bits,
     /// `+0x10`. Clamp threshold for the velocity vector's length. Zero disables
     /// the clamp, which is the voxel-debris case.
-    pub angular_velocity_magnitude: NativeF64Bits,
+    angular_velocity_magnitude: NativeF64Bits,
     /// `+0x18`, `+0x1C`, `+0x20`. World position in leptons, carried as float.
-    pub position: [NativeF32Bits; 3],
+    position: [NativeF32Bits; 3],
     /// `+0x24`, `+0x28`, `+0x2C`. Velocity in leptons per tick.
-    pub velocity: [NativeF32Bits; 3],
-    /// The tumble axis `Init` draws, normalised.
-    ///
-    /// Native keeps two quaternions here — the orientation at `+0x30` and the
-    /// per-tick rotation at `+0x40`, the latter built by
-    /// `Quaternion_FromAxisAngle @ 0x00646480` from this axis and
-    /// [`Self::spin_angle`]. The pair is carried as its axis/angle inputs
-    /// instead, because it drives only the drawn spin: nothing in the physics
-    /// reads the orientation, and `Update`'s only interaction with the rotation
-    /// quaternion is to negate its components on a bounce.
-    ///
-    /// RESIDUAL (GSI-05.14) — the quaternion integration itself is not built,
-    /// but it is now fully specified, table included, so the next slice builds
-    /// it rather than re-deriving it. Nothing about it is instrument-blocked:
-    /// it is unstarted work behind a renderer that has no VoxelAnim draw path.
-    /// - Units are RADIANS. `VoxelAnimTypeClass::ReadINI @ 0x0074B128`/
-    ///   `0x0074B159` multiplies `MinAngularVelocity=`/`MaxAngularVelocity=` by
-    ///   the double at `0x007F65E8`, whose bytes are pi/180. A degrees reading
-    ///   spins debris ~57x too slowly.
-    /// - `Quaternion_FromAxisAngle @ 0x00646480` re-normalises the axis a
-    ///   SECOND time through `Sqrt_Approx` and then stores
-    ///   `(axis * sin(a/2), cos(a/2))` via `Math__SinFromTable @ 0x004CACB0`
-    ///   and `Math__CosFromTable`. That table is READABLE, not unknown:
-    ///   `SinFromTable` multiplies the radian argument by the exact f32
-    ///   2607.594482421875, `Math__ftol`s it, then half-step-indexes
-    ///   `&DAT_0084F084`, whose image bytes read
-    ///   `0.0, 7.6699e-4, 1.53398e-3, 2.30097e-3, …` = `sin(n * 2/2607.5945)`.
-    ///   An earlier note here called the contents UNCHECKED; they were simply
-    ///   not read, which is not the same thing and does not defer the port.
-    /// - The product `FUN_00645ED0 @ 0x00645ED0` is a Hamilton product divided
-    ///   by the SQUARED norm, not the norm, guarded by a `!= 0.0` test. Port
-    ///   the quirk literally; a "corrected" normalise changes every frame of
-    ///   the tumble.
-    /// - `BounceClass::Update` integrates UNCONDITIONALLY once per tick at
-    ///   `0x0043A066` — `orientation(+0x30) = product(orientation, rotation)` —
-    ///   including on the no-contact early-out and on the tick that returns
-    ///   `Stopped`. The bounce arm negates only components 0..=2 of the
-    ///   rotation quaternion at `+0x40`, after the velocity writes at
-    ///   `0x00439E7F`..`0x00439E87` and before the integrate.
-    /// - Trigger: drawing any live piece of debris.
-    /// - Player effect: debris would fly the right arc but not tumble.
-    /// - Frequency: continuous while debris is airborne. The death-side
-    ///   producer now throws pieces on every vehicle death that authors
-    ///   `DebrisTypes=` (36 stock sections, all naming `[TIRE]`, of which 32
-    ///   reach the block in gamemd — `CMON`, `FV`, `HORV` and `HTK` spell
-    ///   `Maxdebris=` and take the default 0), and `[TIRE]` lives 150 ticks.
-    /// - Downstream risk: none to the simulation. The spin is display-only and
-    ///   consumes no RNG beyond the axis draws already taken here, so it moves
-    ///   no hash.
-    pub spin_axis: [NativeF32Bits; 3],
-    /// The per-tick rotation angle — `Init`'s trailing argument, the one
-    /// Ghidra's recovered signature omits.
-    pub spin_angle: NativeF64Bits,
+    velocity: [NativeF32Bits; 3],
+    /// `+0x30` CurrentAngle, the drawn orientation as a quaternion
+    /// `(x, y, z, w)`. `Init` sets it to `(+0, +0, +0, 1)`, and every
+    /// [`Self::update`] multiplies it by [`Self::rotation`]. Only the draw
+    /// reads it ([`Self::drawing_matrix`]).
+    orientation: [NativeF32Bits; 4],
+    /// `+0x40` AngularVelocity, the per-tick rotation `Init` builds from its
+    /// three axis draws and its angle argument. A bounce negates its vector
+    /// part, reversing the spin.
+    rotation: [NativeF32Bits; 4],
 }
 
 /// What one `BounceClass::Update` reported, from the switch in
@@ -125,9 +150,71 @@ pub enum BounceOutcome {
 }
 
 impl BounceState {
+    /// A fixture's body from the native BounceClass fields, in their
+    /// layout order (`+0x00`..`+0x40`).
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn from_native_for_test(
+        elasticity: NativeF64Bits,
+        gravity: NativeF64Bits,
+        angular_velocity_magnitude: NativeF64Bits,
+        position: [NativeF32Bits; 3],
+        velocity: [NativeF32Bits; 3],
+        orientation: [NativeF32Bits; 4],
+        rotation: [NativeF32Bits; 4],
+    ) -> Self {
+        Self {
+            elasticity,
+            gravity,
+            angular_velocity_magnitude,
+            position,
+            velocity,
+            orientation,
+            rotation,
+        }
+    }
+
+    pub const fn elasticity(&self) -> NativeF64Bits {
+        self.elasticity
+    }
+
+    pub const fn gravity(&self) -> NativeF64Bits {
+        self.gravity
+    }
+
+    pub const fn angular_velocity_magnitude(&self) -> NativeF64Bits {
+        self.angular_velocity_magnitude
+    }
+
+    pub const fn position(&self) -> [NativeF32Bits; 3] {
+        self.position
+    }
+
+    pub const fn velocity(&self) -> [NativeF32Bits; 3] {
+        self.velocity
+    }
+
+    pub const fn orientation(&self) -> [NativeF32Bits; 4] {
+        self.orientation
+    }
+
+    pub const fn rotation(&self) -> [NativeF32Bits; 4] {
+        self.rotation
+    }
+
+    /// Meteor tails42395C..423962 /74A7C8..74A7D4 add gravity BACK after
+    /// Update. Retain both float stores; bypassing gravity in the integrator
+    /// would lose the subtraction/addition rounding of the original.
+    pub(crate) fn compensate_meteor_gravity(&mut self) -> Result<(), NativeX87Error> {
+        self.velocity[2] = X87Chop53::store_f32(X87Chop53::add(
+            X87Chop53::load_f32(self.velocity[2])?,
+            X87Chop53::load_f64(self.gravity)?,
+        ))?;
+        Ok(())
+    }
+
     /// Fold the whole body, field bits in store order per axis. Every field
-    /// is simulation state: the spin axis and angle come off the shared
-    /// stream in `Init` even though the physics never reads them back.
+    /// is simulation state: the quaternions come off the shared stream in
+    /// `Init` even though the physics never reads them back.
     pub(crate) fn hash_bits(&self, hasher: &mut impl std::hash::Hasher) {
         use std::hash::Hash;
         self.elasticity.bits().hash(hasher);
@@ -136,9 +223,10 @@ impl BounceState {
         for axis in 0..3 {
             self.position[axis].bits().hash(hasher);
             self.velocity[axis].bits().hash(hasher);
-            self.spin_axis[axis].bits().hash(hasher);
         }
-        self.spin_angle.bits().hash(hasher);
+        for component in self.orientation.iter().chain(&self.rotation) {
+            component.bits().hash(hasher);
+        }
     }
 
     /// The host's world coordinate, in leptons.
@@ -155,7 +243,7 @@ impl BounceState {
     }
 
     /// The velocity vector, for the host's own reads.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn velocity_f32(&self) -> [f32; 3] {
         [
             f32::from_bits(self.velocity[0].bits()),
@@ -188,11 +276,15 @@ impl BounceState {
     ///
     /// Three `RandomRanged(-0xFFFF, 0xFFFF)` draws pick the tumble axis
     /// (`0x00439857`, `0x00439875`, `0x00439897`), each scaled by the float at
-    /// `0x007E3560`. The normalising sum associates `(y*y + z*z) + x*x` —
-    /// read from disassembly at `0x004398D0`, because the decompiler
-    /// canonicalises commutative FP sums and would have given a different
-    /// grouping. When the magnitude is exactly zero native divides nothing and
-    /// uses the unnormalised triple as-is, which is reproduced here.
+    /// `0x007E3560`. The axis takes them in reverse: X is the third draw and Z
+    /// the first (`0x004398A3..0x004398CC`). The normalising sum associates
+    /// `(y*y + z*z) + x*x` (`0x004398D0`). When the magnitude is exactly zero
+    /// native divides nothing and uses the unnormalised triple as-is.
+    ///
+    /// The rotation is `Quaternion_FromAxisAngle @ 0x00646480` of that axis
+    /// and the angle narrowed to a float (`0x0043993C..0x00439950`); the
+    /// orientation is what `0x00646730` makes of the identity matrix
+    /// `0x005AE860` builds ([`IDENTITY_QUATERNION`]).
     ///
     /// Every caller passes `angVelMagnitude` as two literal zeros
     /// (`VoxelAnimClass::Constructor` at `0x00749648`/`0x00749800`,
@@ -216,11 +308,12 @@ impl BounceState {
         ];
 
         let scale = X87Chop53::load_f32(AXIS_DRAW_SCALE)?;
-        let mut axis = [NativeF32Bits::POSITIVE_ZERO; 3];
-        for component in axis.iter_mut() {
+        let mut draws = [NativeF32Bits::POSITIVE_ZERO; 3];
+        for component in draws.iter_mut() {
             let drawn = ranged_i32(rng, AXIS_DRAW_MIN, AXIS_DRAW_MAX);
             *component = X87Chop53::store_f32(X87Chop53::mul(X87Chop53::load_i32(drawn), scale))?;
         }
+        let mut axis = [draws[2], draws[1], draws[0]];
 
         // `(y*y + z*z) + x*x`, then `Sqrt_Approx @ 0x004CAC40` — a table-driven
         // f32 approximation, not `FSQRT`.
@@ -240,6 +333,7 @@ impl BounceState {
                 )?)?;
             }
         }
+        let angle = X87Chop53::store_f32(X87Chop53::load_f64(rotation_angle_per_tick)?)?;
 
         Ok(Self {
             elasticity,
@@ -247,10 +341,126 @@ impl BounceState {
             angular_velocity_magnitude,
             position,
             velocity: start_velocity,
-            spin_axis: axis,
-            spin_angle: rotation_angle_per_tick,
+            orientation: IDENTITY_QUATERNION,
+            rotation: quaternion_from_axis_angle(axis, angle)?,
         })
     }
+
+    /// `BounceClass::GetDrawingMatrix @ 0x004399E0`: the orientation as a
+    /// rotation matrix, `Quaternion_ToMatrix @ 0x00646980`. Twelve floats, row
+    /// by row, each row's fourth (translation) entry zero.
+    pub fn drawing_matrix(&self) -> Result<[NativeF32Bits; 12], NativeX87Error> {
+        quaternion_to_matrix(self.orientation)
+    }
+}
+
+/// `(+0, +0, +0, 1)`: `Matrix3D → Quaternion @ 0x00646730` on the identity
+/// `0x005AE860` builds takes its positive-trace arm, `Sqrt_Approx(3 + 1)` is
+/// exactly 2, `w` is `2 * 0.5` and each vector term `(0 - 0) * 0.25`.
+const IDENTITY_QUATERNION: [NativeF32Bits; 4] = [
+    NativeF32Bits::POSITIVE_ZERO,
+    NativeF32Bits::POSITIVE_ZERO,
+    NativeF32Bits::POSITIVE_ZERO,
+    NativeF32Bits::ONE,
+];
+
+/// The float `0.5` at `0x007E5168` that halves the angle.
+const HALF: NativeF32Bits = NativeF32Bits::from_bits(0x3F00_0000);
+
+fn load_all<const N: usize>(bits: [NativeF32Bits; N]) -> Result<[X87Value; N], NativeX87Error> {
+    let mut values = [X87Chop53::load_i32(0); N];
+    for (value, bits) in values.iter_mut().zip(bits) {
+        *value = X87Chop53::load_f32(bits)?;
+    }
+    Ok(values)
+}
+
+/// An `FSTP float` the code reloads later.
+fn stored(value: X87Value) -> Result<X87Value, NativeX87Error> {
+    X87Chop53::load_f32(X87Chop53::store_f32(value)?)
+}
+
+/// `Quaternion_FromAxisAngle @ 0x00646480`: `(axis * sin(a/2), cos(a/2))`.
+///
+/// It normalises the axis again by `Sqrt_Approx` of `(z*z + y*y) + x*x`
+/// (`0x00646493..0x006464BA`), keeping the raw axis when that is zero, and
+/// reads both trig values from the retail table (`Math__SinFromTable @
+/// 0x004CACB0`, `Math__CosFromTable @ 0x004CAD00`) at the halved angle, which
+/// it passes as a double.
+fn quaternion_from_axis_angle(
+    axis: [NativeF32Bits; 3],
+    angle: NativeF32Bits,
+) -> Result<[NativeF32Bits; 4], NativeX87Error> {
+    let [x, y, z] = load_all(axis)?;
+    let length = sqrt_approx_f32(X87Chop53::add(
+        X87Chop53::add(X87Chop53::mul(z, z), X87Chop53::mul(y, y)),
+        X87Chop53::mul(x, x),
+    ))?;
+    let mut normal = axis;
+    if length != NativeF32Bits::POSITIVE_ZERO {
+        let divisor = X87Chop53::load_f32(length)?;
+        for component in normal.iter_mut() {
+            *component =
+                X87Chop53::store_f32(X87Chop53::div(X87Chop53::load_f32(*component)?, divisor)?)?;
+        }
+    }
+    let half = X87Chop53::load_f64(X87Chop53::store_f64(X87Chop53::mul(
+        X87Chop53::load_f32(angle)?,
+        X87Chop53::load_f32(HALF)?,
+    ))?)?;
+    let table = crate::util::retail_trig::TrigTable::embedded();
+    let sin = table.sin_from_table(half);
+    let cos = table.cos_from_table(half);
+    let [nx, ny, nz] = load_all(normal)?;
+    Ok([
+        X87Chop53::store_f32(X87Chop53::mul(nx, sin))?,
+        X87Chop53::store_f32(X87Chop53::mul(ny, sin))?,
+        X87Chop53::store_f32(X87Chop53::mul(nz, sin))?,
+        X87Chop53::store_f32(cos)?,
+    ])
+}
+
+/// `0x00645ED0`: the Hamilton product `a * b`, divided by its SQUARED norm
+/// unless that is zero. Read from the disassembly, with every float store the
+/// code makes along the way: the decompiler regroups the sums.
+fn quaternion_multiply(
+    a: [NativeF32Bits; 4],
+    b: [NativeF32Bits; 4],
+) -> Result<[NativeF32Bits; 4], NativeX87Error> {
+    let [ax, ay, az, aw] = load_all(a)?;
+    let [bx, by, bz, bw] = load_all(b)?;
+    let mul = X87Chop53::mul;
+    let ax_bw = mul(ax, bw);
+    let ay_bw = stored(mul(ay, bw))?;
+    let az_bw = stored(mul(az, bw))?;
+    let aw_bx = stored(mul(aw, bx))?;
+    let by_aw = stored(mul(by, aw))?;
+    let bz_aw = stored(mul(bz, aw))?;
+    let cross_x = X87Chop53::sub(mul(ay, bz), mul(az, by));
+    let cross_y = stored(X87Chop53::sub(mul(az, bx), mul(bz, ax)))?;
+    let cross_z = stored(X87Chop53::sub(mul(by, ax), mul(ay, bx)))?;
+    let product = [
+        X87Chop53::store_f32(X87Chop53::add(X87Chop53::add(cross_x, aw_bx), ax_bw))?,
+        X87Chop53::store_f32(X87Chop53::add(X87Chop53::add(ay_bw, by_aw), cross_y))?,
+        X87Chop53::store_f32(X87Chop53::add(X87Chop53::add(az_bw, bz_aw), cross_z))?,
+        X87Chop53::store_f32(X87Chop53::sub(
+            mul(aw, bw),
+            X87Chop53::add(X87Chop53::add(mul(az, bz), mul(ay, by)), mul(ax, bx)),
+        ))?,
+    ];
+    let [rx, ry, rz, rw] = load_all(product)?;
+    let norm = X87Chop53::add(
+        X87Chop53::add(X87Chop53::add(mul(rz, rz), mul(ry, ry)), mul(rw, rw)),
+        mul(rx, rx),
+    );
+    if X87Chop53::compare(norm, X87Chop53::load_i32(0)) == X87Ordering::Equal {
+        return Ok(product);
+    }
+    let mut out = product;
+    for component in out.iter_mut() {
+        *component = X87Chop53::store_f32(X87Chop53::div(X87Chop53::load_f32(*component)?, norm)?)?;
+    }
+    Ok(out)
 }
 
 /// The verified `BounceClass::Update @ 0x00439B00` contract, recorded ahead of
@@ -292,8 +502,8 @@ impl BounceState {
 ///    away, so it must be read from disassembly.
 /// 8. Slope re-bounce, when `cell(new).level - cell(old).level >= 2` and the
 ///    entry-tick velocity conditions against `-0.0002` / `-0.0003` hold: roll
-///    back to the snapshot, transform the velocity by one of four planar
-///    mirror matrices (`FUN_00755C60 @ 0x00755C60`), then scale all three
+///    back to the snapshot, transform the velocity by the Cell cliff direction's
+///    matrix (`FUN_00755C60 @ 0x00755C60`), then scale all three
 ///    components by `Elasticity` — as a `double` here, unlike step 7's f32
 ///    narrowing. This REPLACES step 7 rather than following it.
 /// 9. Stop test — and it is not `|Velocity|`. `FUN_00439A10 @ 0x00439A10`
@@ -320,8 +530,8 @@ impl BounceState {
 ///   default.
 ///
 /// Ground/deck queries are delivered by the current
-/// Phase 3 Bounce ground-height comparison. Cliff rollback and quaternion
-/// integration remain separate residuals below.
+/// Phase 3 Bounce ground-height comparison and the native cliff controls in
+/// tools/spatial_oracle/bounce_cliff.{json,md} retain the query/numeric evidence.
 const FLAT_RAMP: u8 = 0;
 
 /// The drop applied when the body rises back through the deck plane
@@ -365,15 +575,19 @@ pub trait BounceTerrain {
     fn selected_is_bridge(&self, cell: &Self::Cell) -> bool;
     /// `CellClass::GetGroundHeight` at the given world coordinate, in leptons.
     fn ground_height_leptons(&self, coord: IVec3) -> i32;
-    /// `CellClass+0x140 & 0x100` — the cell carries a bridge deck.
-    fn is_bridge_cell(&self, coord: IVec3) -> bool {
-        self.selected_is_bridge(&self.select_cell(coord))
+    /// Absolute Z of a live high-bridge deck, if retained by the map.
+    fn selected_fixed_deck_z(&self, _cell: &Self::Cell) -> Option<i32> {
+        None
     }
     /// `CellClass+0x11B`, the cell's height level. Only the difference between
     /// the pre- and post-move cells is read.
     fn cell_height_level(&self, coord: IVec3) -> i32;
     /// The cell's ramp index, which selects the reflection matrix.
     fn ramp(&self, coord: IVec3) -> u8;
+    /// Bounce439FF1/4848B0: independently select the post-snap Cell and query
+    /// its cliff direction against the previous world coordinate. None is the
+    /// native -1 result or an unrepresented raw displacement; faces are0..8.
+    fn cliff_face_direction(&self, coord: IVec3, previous: IVec3) -> Option<u8>;
     /// `Look_up_building_in_cell` non-null, or
     /// `CellClass::IsWallConnectableInDirection(-1, -1)`.
     fn has_bounce_surface(&self, cell: &Self::Cell) -> bool;
@@ -502,14 +716,23 @@ impl BounceState {
         let ground = terrain.ground_height_leptons(coord);
         // `FILD ground` then `FSUBR float [pos.Z]` — the reverse subtract makes
         // this `pos.Z - ground`, not `ground - pos.Z`.
-        let mut height_above = X87Chop53::ftol_i64(X87Chop53::sub(
-            X87Chop53::load_f32(self.position[2])?,
-            X87Chop53::load_i32(ground),
-        ))? as i32;
-        if terrain.is_bridge_cell(coord)
-            && height_above >= crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS
-        {
-            height_above -= crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS;
+        let z = X87Chop53::load_f32(self.position[2])?;
+        let height_above_surface = |surface| {
+            X87Chop53::ftol_i64(X87Chop53::sub(z, X87Chop53::load_i32(surface)))
+                .map(|height| height as i32)
+        };
+        let mut height_above = height_above_surface(ground)?;
+        let cell = terrain.select_cell(coord);
+        if terrain.selected_is_bridge(&cell) {
+            if let Some(deck) = terrain.selected_fixed_deck_z(&cell) {
+                if X87Chop53::compare(z, X87Chop53::load_i32(deck))
+                    != crate::util::native_x87::X87Ordering::Less
+                {
+                    height_above = height_above_surface(deck)?;
+                }
+            } else if height_above >= crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS {
+                height_above -= crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS;
+            }
         }
         let vx = X87Chop53::ftol_i64(X87Chop53::load_f32(self.velocity[0])?)? as i32;
         let vy = X87Chop53::ftol_i64(X87Chop53::load_f32(self.velocity[1])?)? as i32;
@@ -543,10 +766,10 @@ impl BounceState {
     ///    `0.0 < AVM` gate false everywhere in the image.
     /// 3. `Position += Velocity` (`FUN_0043A100`), between the pre- and
     ///    post-move `ftol` coordinate captures.
-    /// 4. Ground height at the POST-move coordinate, then the deck plane
-    ///    `ground + DAT_0089C76C`.
-    /// 5. Deck crossing, gated on either cell carrying the bridge flag: `fell`
-    ///    = new below the deck and old at or above it; `rose` = the reverse.
+    /// 4. Ground height at the POST-move coordinate. The native deck fallback
+    ///    is `ground + DAT_0089C76C`.
+    /// 5. Deck crossing uses the new bridge cell, or the old one on exit.
+    ///    `fell` = new below the deck and old at or above it; `rose` is the reverse.
     /// 6. Building/wall lookup, gated by the `150.0` proximity window ALONE —
     ///    that gate does not apply to ordinary ground contact.
     /// 7. Snap ladder. Below the ground surface the body always reflects; at or
@@ -557,8 +780,9 @@ impl BounceState {
     /// 9. The cliff face: a step of two levels or more restores the pre-tick
     ///    body (native execution: `tools/spatial_oracle/anim_bouncer_flight.py`).
     ///
-    /// Two arms are NOT modelled, each recorded where it is skipped: the
-    /// cliff-face mirror for a bouncy body and the quaternion integration.
+    /// 10. The tumble: a reflection negates the rotation's vector part, and
+    ///     every tick integrates the orientation ([`Self::finish_tick`]).
+    ///
     pub fn update(
         &mut self,
         terrain: &impl BounceTerrain,
@@ -580,12 +804,25 @@ impl BounceState {
         let new_coord = ftol_coord(self.position)?;
 
         let ground = terrain.ground_height_leptons(new_coord);
-        let deck = ground.wrapping_add(crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS);
         let new_cell = terrain.select_cell(new_coord);
+        // Bounce439B00: check the post-move Cell+0x140 flag first. If it
+        // fails, retain the old cell's fixed plane while leaving its edge.
+        let old_cell;
+        let bridge_cell = if terrain.selected_is_bridge(&new_cell) {
+            Some(&new_cell)
+        } else {
+            old_cell = terrain.select_cell(old_coord);
+            terrain.selected_is_bridge(&old_cell).then_some(&old_cell)
+        };
+        let deck = bridge_cell
+            .and_then(|cell| terrain.selected_fixed_deck_z(cell))
+            .unwrap_or_else(|| {
+                ground.wrapping_add(crate::util::lepton::BRIDGE_DECK_HEIGHT_LEPTONS)
+            });
 
         let mut fell_through_deck = false;
         let mut rose_through_deck = false;
-        if terrain.selected_is_bridge(&new_cell) || terrain.is_bridge_cell(old_coord) {
+        if bridge_cell.is_some() {
             if new_coord.z < deck {
                 fell_through_deck = deck <= old_coord.z;
             } else {
@@ -638,6 +875,12 @@ impl BounceState {
             self.elasticity,
             terrain.ramp(new_coord),
         )?;
+        // The spin reverses (`0x00439E89..0x00439EE3`: each vector component
+        // through `FLD`/`FCHS`/`FSTP float`, an exact sign flip). The cliff
+        // restore below puts back position and velocity only.
+        for component in &mut self.rotation[..3] {
+            *component = NativeF32Bits::from_bits(component.bits() ^ 0x8000_0000);
+        }
 
         // The cliff face (`0x00439F3A..0x0043A05A`): the OLD then the post-snap
         // coordinate's cell height levels. A step of two levels or more whose
@@ -647,34 +890,66 @@ impl BounceState {
         // -0.0002 with the body now above where it was, or else not below
         // -0.0003 with the body now more than `vz + 1` above it.
         let old_level = terrain.cell_height_level(old_coord);
-        let new_level = terrain.cell_height_level(ftol_coord(self.position)?);
+        let post_snap_coord = ftol_coord(self.position)?;
+        let new_level = terrain.cell_height_level(post_snap_coord);
         if new_level.wrapping_sub(old_level) >= CLIFF_FACE_LEVELS
             && Self::enters_cliff_face(snapshot, self.position[2])?
         {
             (self.position, self.velocity) = snapshot;
-            // RESIDUAL (GSI-05.14): the mirror is one of the planar matrices
-            // `FUN_00755C60` builds for the face's direction (`0x004848B0`),
-            // unreadable through this instrument. `Elasticity=0` — every
-            // stock SHP debris chunk — zeroes it whatever the matrix (the
-            // sign of each zero is not modelled); any other elasticity keeps
-            // the flat reflection of the restored velocity.
-            // - Trigger: a bouncing body entering a cell two or more levels up.
-            // - Player effect: a bouncy piece rebounds off the face vertically
-            //   instead of away from it.
-            // - Frequency: rare; only `[TIRE]` (0.8) bounces among stock types.
-            // - Downstream risk: none to the stream; no draws are involved.
-            self.velocity = if self.elasticity.bits() & !(1 << 63) == 0 {
-                [NativeF32Bits::POSITIVE_ZERO; 3]
-            } else {
-                Self::reflect_off_ground_or_flat(
-                    self.velocity,
-                    self.elasticity,
-                    terrain.ramp(new_coord),
-                )?
-            };
+            if let Some(direction) = terrain.cliff_face_direction(post_snap_coord, old_coord) {
+                self.velocity = Self::reflect_off_cliff(self.velocity, self.elasticity, direction)?;
+            }
         }
 
         self.finish_tick(terrain, BounceOutcome::Bounced)
+    }
+
+    /// Original755C60 ->5AFB80 ->43A043..43A05A. Startup754CB0 initializes
+    /// B450B8's four mirrors; direction8 copies the adjacent fifth48-byte row.
+    /// Consumed original startup/selector/fullUpdate: bounce_cliff.json.
+    fn reflect_off_cliff(
+        velocity: [NativeF32Bits; 3],
+        elasticity: NativeF64Bits,
+        direction: u8,
+    ) -> Result<[NativeF32Bits; 3], NativeX87Error> {
+        const ROWS: [[f32; 12]; 5] = [
+            [1., 0., 0., 0., 0., -1., 0., 0., 0., 0., 1., 0.],
+            [0., 1., 0., 0., 1., 0., 0., 0., 0., 0., 1., 0.],
+            [-1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0.],
+            [0., -1., 0., 0., -1., 0., 0., 0., 0., 0., 1., 0.],
+            [0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0.],
+        ];
+        // This is a single subtraction, not direction&3.
+        let index = if direction >= 4 {
+            direction - 4
+        } else {
+            direction
+        };
+        let row = ROWS
+            .get(usize::from(index))
+            .expect("Cell4848B0 cliff direction must be in0..8");
+        let matrix = Mat4::from_cols_array_2d(&[
+            [row[0], row[4], row[8], 0.],
+            [row[1], row[5], row[9], 0.],
+            [row[2], row[6], row[10], 0.],
+            [row[3], row[7], row[11], 1.],
+        ]);
+        // Reuse the single5AFB80 owner, including its per-row addition order
+        // and float stores. Each row selects at most one finite component.
+        let transformed = crate::util::native_affine::transform_point(
+            matrix,
+            Vec3::from_array(velocity.map(f32_of)),
+        )
+        .ok_or(NativeX87Error::NonFiniteInput { format: "f32" })?;
+        let scale = X87Chop53::load_f64(elasticity)?;
+        let mut result = [NativeF32Bits::POSITIVE_ZERO; 3];
+        for (axis, component) in transformed.to_array().into_iter().enumerate() {
+            result[axis] = X87Chop53::store_f32(X87Chop53::mul(
+                scale,
+                X87Chop53::load_f32(NativeF32Bits::from_bits(component.to_bits()))?,
+            ))?;
+        }
+        Ok(result)
     }
 
     /// The cliff-face entry test (`0x00439F67..0x00439FB1`) on the pre-tick
@@ -702,26 +977,15 @@ impl BounceState {
         Ok(X87Chop53::compare(risen, now_z) == Less)
     }
 
-    /// `LAB_0043A066` — the tail both the contact and the no-contact arms reach.
-    ///
-    /// RESIDUAL (GSI-05.14) — the unconditional quaternion integration
-    /// (`orientation = product(orientation, rotation)` at `0x0043A066`, and the
-    /// bounce arm's negation of the rotation quaternion's components 0..=2) is
-    /// not built. It is unstarted, not blocked — the
-    /// `Math__SinFromTable @ 0x004CACB0` table at `&DAT_0084F084` that
-    /// `Quaternion_FromAxisAngle @ 0x00646480` needs is readable and its values
-    /// are recorded on [`BounceState::spin_axis`]; what is missing is a
-    /// renderer that can draw a `VoxelAnimClass` at an arbitrary orientation.
-    /// Trigger: drawing any live piece of debris. Player effect: the
-    /// piece flies the right arc but does not tumble. Frequency: continuous
-    /// while debris is airborne. Downstream risk: none — the spin is
-    /// display-only, consumes no draws beyond the axis draws `Init` already
-    /// takes, and nothing in the physics reads the orientation.
+    /// `LAB_0043A066` — the tail both the contact and the no-contact arms
+    /// reach: `orientation = product(orientation, rotation)` (`0x00645ED0`,
+    /// copied into `+0x30` by `0x00645D20`), then the stop test.
     fn finish_tick(
-        &self,
+        &mut self,
         terrain: &impl BounceTerrain,
         contact: BounceOutcome,
     ) -> Result<BounceOutcome, NativeX87Error> {
+        self.orientation = quaternion_multiply(self.orientation, self.rotation)?;
         let magnitude = self.stop_magnitude(terrain)?;
         if (magnitude as f32) < STOP_MAGNITUDE_THRESHOLD {
             return Ok(BounceOutcome::Stopped);
@@ -740,7 +1004,7 @@ fn ranged_i32(rng: &mut SimRng, low: i32, high: i32) -> i32 {
     (low as i64 + drawn as i64) as i32
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 mod tests {
     use super::*;
 
@@ -870,103 +1134,79 @@ mod tests {
         assert_eq!(rng.logical_view(), expected.logical_view());
     }
 
-    #[test]
-    fn gsi_05_14_init_copies_position_and_velocity_verbatim() {
-        // Position is `FILD`ed from the integer coordinate; velocity is copied
-        // float for float from the constructor's vector. Neither is scaled.
-        let mut rng = SimRng::new(3);
-        let state = init_at(IVec3::new(1024, 2048, 96), 0.8, &mut rng);
-        assert_eq!(state.position_leptons(), IVec3::new(1024, 2048, 96));
-        assert_eq!(state.velocity_f32(), [3.0, -4.0, 12.0]);
-        assert_eq!(f64::from_bits(state.gravity.bits()), 1.4);
-        assert_eq!(f64::from_bits(state.elasticity.bits()), 0.8);
-        assert_eq!(
-            state.angular_velocity_magnitude,
-            NativeF64Bits::POSITIVE_ZERO,
-            "every caller passes two literal zeros, which is what makes the \
-             Update clamp dead"
-        );
+    fn golden() -> &'static serde_json::Value {
+        crate::test_fixture::json("tools/spatial_oracle/bounce_tumble.json")
     }
 
+    fn bits<const N: usize>(value: &serde_json::Value) -> [NativeF32Bits; N] {
+        std::array::from_fn(|i| NativeF32Bits::from_bits(value[i].as_u64().unwrap() as u32))
+    }
+
+    fn raw<const N: usize>(values: [NativeF32Bits; N]) -> [u32; N] {
+        values.map(NativeF32Bits::bits)
+    }
+
+    /// `Quaternion_FromAxisAngle @ 0x00646480`, the product `0x00645ED0` and
+    /// `Quaternion_ToMatrix @ 0x00646980`, executed on the original over unit,
+    /// unnormalised, short, zero and signed-zero axes, small to large and
+    /// negative angles, and zero and non-unit quaternions.
     #[test]
-    fn gsi_05_14_init_normalises_the_tumble_axis() {
-        // The axis is a unit vector for every seed that does not draw three
-        // exact zeros. Checked against the same `Sqrt_Approx` the engine uses,
-        // not against a real square root — the engine's is a table lookup and
-        // its result is what the division consumed.
-        for seed in 0..64u64 {
-            let mut rng = SimRng::new(seed);
-            let state = init_at(IVec3::ZERO, 0.0, &mut rng);
-            let [x, y, z] = state.spin_axis;
-            if x == NativeF32Bits::POSITIVE_ZERO
-                && y == NativeF32Bits::POSITIVE_ZERO
-                && z == NativeF32Bits::POSITIVE_ZERO
-            {
-                continue;
-            }
-            let (fx, fy, fz) = (
-                f32::from_bits(x.bits()),
-                f32::from_bits(y.bits()),
-                f32::from_bits(z.bits()),
-            );
-            let magnitude = (fx * fx + fy * fy + fz * fz).sqrt();
-            assert!(
-                (magnitude - 1.0).abs() < 1e-3,
-                "seed {seed} left the axis at magnitude {magnitude}"
-            );
+    fn quaternion_kernels_match_original_execution() {
+        let golden = golden();
+        for row in golden["from_axis_angle"].as_array().unwrap() {
+            let angle = NativeF32Bits::from_bits(row["angle_bits"].as_u64().unwrap() as u32);
+            let actual = quaternion_from_axis_angle(bits(&row["axis_bits"]), angle).unwrap();
+            assert_eq!(raw(actual), raw(bits::<4>(&row["out_bits"])), "{row}");
+        }
+        for row in golden["multiply"].as_array().unwrap() {
+            let actual = quaternion_multiply(bits(&row["a_bits"]), bits(&row["b_bits"])).unwrap();
+            assert_eq!(raw(actual), raw(bits::<4>(&row["out_bits"])), "{row}");
+        }
+        for row in golden["to_matrix"].as_array().unwrap() {
+            let actual = quaternion_to_matrix(bits(&row["q_bits"])).unwrap();
+            assert_eq!(raw(actual), raw(bits::<12>(&row["out_bits"])), "{row}");
         }
     }
 
+    /// Init's body from the original (`bounce_tumble.py` `flight`): the axis
+    /// takes the draws in reverse, the rotation is built from it and the
+    /// narrowed angle, the orientation starts at `(+0, +0, +0, 1)`, and the
+    /// three draws leave the generator where native leaves it.
     #[test]
-    fn gsi_05_14_axis_normalisation_associates_y_z_then_x() {
-        // Read from disassembly at `0x004398D0`: the sum is `(y*y + z*z) +
-        // x*x`. The decompiler canonicalises commutative FP sums, so following
-        // it would have produced a different grouping — and at f32 precision
-        // the groupings do not agree, which is why this is pinned rather than
-        // left to whichever order reads naturally.
-        let x = X87Chop53::load_f32(f32bits(1.0e-4)).unwrap();
-        let y = X87Chop53::load_f32(f32bits(1.0)).unwrap();
-        let z = X87Chop53::load_f32(f32bits(1.0)).unwrap();
+    fn init_builds_the_original_tumble() {
+        for row in golden()["flight"].as_array().unwrap() {
+            let input = &row["input"];
+            let coord = &input["coord"];
+            let at = |i: usize| coord[i].as_i64().unwrap() as i32;
+            let mut rng = SimRng::new(input["seed"].as_u64().unwrap());
+            let state = BounceState::init(
+                IVec3::new(at(0), at(1), at(2)),
+                f64bits(input["elasticity"].as_f64().unwrap()),
+                f64bits(1.4),
+                NativeF64Bits::POSITIVE_ZERO,
+                bits(&input["velocity_bits"]),
+                NativeF64Bits::from_bits(input["angle_bits"].as_u64().unwrap()),
+                &mut rng,
+            )
+            .unwrap();
+            let body = hex_bytes(row["init_body_hex"].as_str().unwrap());
+            let f32_at =
+                |offset: usize| u32::from_le_bytes(body[offset..offset + 4].try_into().unwrap());
+            let expected_orientation: [u32; 4] = std::array::from_fn(|i| f32_at(0x30 + i * 4));
+            let expected_rotation: [u32; 4] = std::array::from_fn(|i| f32_at(0x40 + i * 4));
+            assert_eq!(raw(state.orientation), expected_orientation, "{input}");
+            assert_eq!(raw(state.rotation), expected_rotation, "{input}");
+            for axis in 0..3 {
+                assert_eq!(state.position[axis].bits(), f32_at(0x18 + axis * 4));
+                assert_eq!(state.velocity[axis].bits(), f32_at(0x24 + axis * 4));
+            }
+            assert_eq!(rng.native_state_hex(), row["rng_after"].as_str().unwrap());
+        }
+    }
 
-        let native_order = sqrt_approx_f32(X87Chop53::add(
-            X87Chop53::add(X87Chop53::mul(y, y), X87Chop53::mul(z, z)),
-            X87Chop53::mul(x, x),
-        ))
-        .unwrap();
-        // The grouping the decompiler's `z*z + y*y + x*x` would suggest.
-        let decompiler_order = sqrt_approx_f32(X87Chop53::add(
-            X87Chop53::add(X87Chop53::mul(z, z), X87Chop53::mul(y, y)),
-            X87Chop53::mul(x, x),
-        ))
-        .unwrap();
-        // They agree here by symmetry; the point of the test is that the code
-        // under test uses the read order, so a later refactor that "tidies" the
-        // association has something to fail against.
-        assert_eq!(native_order, decompiler_order);
-
-        let mut rng = SimRng::new(9);
-        let state = init_at(IVec3::ZERO, 0.0, &mut rng);
-        let recomputed = sqrt_approx_f32(X87Chop53::add(
-            X87Chop53::add(
-                X87Chop53::mul(
-                    X87Chop53::load_f32(state.spin_axis[1]).unwrap(),
-                    X87Chop53::load_f32(state.spin_axis[1]).unwrap(),
-                ),
-                X87Chop53::mul(
-                    X87Chop53::load_f32(state.spin_axis[2]).unwrap(),
-                    X87Chop53::load_f32(state.spin_axis[2]).unwrap(),
-                ),
-            ),
-            X87Chop53::mul(
-                X87Chop53::load_f32(state.spin_axis[0]).unwrap(),
-                X87Chop53::load_f32(state.spin_axis[0]).unwrap(),
-            ),
-        ))
-        .unwrap();
-        let magnitude = f32::from_bits(recomputed.bits());
-        assert!(
-            (magnitude - 1.0).abs() < 1e-3,
-            "normalised axis should measure 1 under the engine's own sqrt, got {magnitude}"
-        );
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len() / 2)
+            .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
+            .collect()
     }
 }

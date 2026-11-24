@@ -1,41 +1,184 @@
-//! Order-intent tick systems for the Simulation.
-//!
-//! Handles automatic target acquisition for attack-move and guard orders
-//! (pre-combat), and resuming movement after combat ends (post-combat).
+//! Order helpers for the Simulation: click-order receivers and actions, the
+//! engineer and infiltrator building entries and pending building detonation.
 //!
 //! Dependency rules: same as sim/ (depends on rules/, map/; never render/ui/audio/net).
 
-use std::collections::BTreeSet;
+use crate::sim::world::FrameEffects;
 
-use super::{GroundMove, SimSoundEvent, Simulation};
+use super::{SimSoundEvent, Simulation};
 use crate::map::entities::EntityCategory;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::combat;
-use crate::sim::components::OrderIntent;
+use crate::sim::control_authority::{CommandCapability, ControlScope};
+use crate::sim::game_entity::GameEntity;
+use crate::sim::houses::Houses;
 use crate::sim::intern::InternedId;
 use crate::sim::mission::MissionType;
-use crate::sim::movement;
 use crate::sim::movement::locomotor::MovementLayer;
-use crate::util::fixed_math::ra2_speed_to_leptons_per_second;
+use crate::sim::scenario_session::{NativePlayerIdentity, ScenarioSession};
 
-/// Result of one `apply_c4_damage_to_building` call.
-#[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct C4DamageOutcome {
-    /// HP reached 0; building marked dying this tick.
-    pub killed_building: bool,
-    /// The C4 hit a BridgeRepairHut, the hut survived, and the connected
-    /// bridge collapsed. The app needs to rebuild PathGrid.
-    pub bridge_state_changed: bool,
-    /// The target's pending C4 marker should be cleared even though the
-    /// building entity survived. Used by BridgeRepairHut dispatch.
-    pub consumed_pending_marker: bool,
+/// Read-only control queries over the current session and House slots.
+/// The admitted seat authorizes orders. Native represented-viewer queries
+/// continue to use the original House flags and PlayerPtr. The borrowed
+/// world holds its House roster fixed while this projection reads it.
+#[derive(Clone)]
+pub struct ControlProjection<'a> {
+    session: &'a ScenarioSession,
+    houses: &'a Houses,
+    source: Option<(i8, InternedId)>,
 }
 
-/// Result of `tick_c4_plants` across all per-tick plants + detonations.
+impl<'a> ControlProjection<'a> {
+    /// Use the native viewer queries with this session's own House storage.
+    pub fn for_native_view(session: &'a ScenarioSession, houses: &'a Houses) -> Self {
+        Self {
+            session,
+            houses,
+            source: None,
+        }
+    }
+
+    pub fn native_player_on(&self, owner: InternedId, viewer: Option<InternedId>) -> bool {
+        match self.session.native_player_identity() {
+            NativePlayerIdentity::PlayerPointer => viewer == Some(owner),
+            NativePlayerIdentity::HouseFlags => self
+                .houses
+                .get(&owner)
+                .is_some_and(|house| house.is_human() || house.player_control()),
+        }
+    }
+
+    pub(super) fn uses_player_pointer(&self) -> bool {
+        self.session.native_player_identity() == NativePlayerIdentity::PlayerPointer
+    }
+
+    pub fn local_command_house(&self) -> Option<InternedId> {
+        if self.session.has_custom_control_grants() {
+            self.source.map(|(_, house)| house)
+        } else {
+            self.native_player_pointer()
+        }
+    }
+
+    fn native_player_pointer(&self) -> Option<InternedId> {
+        // HouseClass::IsHumanPlayer reads the saved A83D4C PlayerPtr at 50B716.
+        self.session.current_house()
+    }
+
+    pub fn native_current_player(&self, owner: InternedId) -> bool {
+        self.native_player_on(owner, self.native_player_pointer())
+    }
+
+    pub(super) const fn source(&self) -> Option<(i8, InternedId)> {
+        self.source
+    }
+
+    fn granted_scope(&self, owner: InternedId) -> Option<ControlScope> {
+        self.session
+            .has_custom_control_grants()
+            .then(|| match self.source {
+                Some((_, primary)) if primary == owner => ControlScope::OwnFull,
+                Some((source, _)) => {
+                    self.session
+                        .delegated_control_scope(self.houses, source, owner)
+                }
+                None => ControlScope::None,
+            })
+    }
+
+    pub(super) fn has_delegated_full_control(&self, owner: InternedId) -> bool {
+        self.granted_scope(owner) == Some(ControlScope::FullControl)
+    }
+
+    pub(super) fn permits(&self, owner: InternedId, capability: CommandCapability) -> Option<bool> {
+        self.granted_scope(owner)
+            .map(|scope| scope.permits(capability))
+    }
+
+    /// Native object-order queries used IsHumanPlayer in the stock case.
+    pub fn can_order(&self, owner: InternedId) -> bool {
+        self.permits(owner, CommandCapability::Tactical)
+            .unwrap_or_else(|| self.native_current_player(owner))
+    }
+
+    /// Orders whose stock producer compares the acting object's exact owner.
+    pub fn can_order_from(&self, owner: InternedId, player: InternedId) -> bool {
+        self.permits(owner, CommandCapability::Tactical)
+            .unwrap_or(owner == player)
+    }
+
+    /// Authority for an input feature scoped to the sender's own production queue.
+    pub fn can_manage_primary_house(&self, owner: InternedId, player: InternedId) -> bool {
+        self.permits(owner, CommandCapability::PrimaryHouse)
+            .unwrap_or(owner == player)
+    }
+
+    /// Management whose stock producer compares the acting object's exact owner.
+    pub fn can_manage_from(&self, owner: InternedId, player: InternedId) -> bool {
+        self.permits(owner, CommandCapability::FullControl)
+            .unwrap_or(owner == player)
+    }
+
+    /// Same native House predicate as the stock SellWall input query.
+    pub fn can_manage(&self, owner: InternedId) -> bool {
+        self.permits(owner, CommandCapability::FullControl)
+            .unwrap_or_else(|| self.native_current_player(owner))
+    }
+
+    /// TeamAssign731060, TeamRecall7311C0, TypeSelect 732580/732770 and
+    /// Unselect_If_Not_Owned 6DA770 read PlayerControl in mode 0. Other
+    /// modes use HouseClass::IsHumanPlayer. Delegated actors use Tactical.
+    pub fn can_select(&self, owner: InternedId) -> bool {
+        self.permits(owner, CommandCapability::Tactical)
+            .unwrap_or_else(|| match self.session.native_player_identity() {
+                NativePlayerIdentity::PlayerPointer => self.native_current_player(owner),
+                NativePlayerIdentity::HouseFlags => self
+                    .houses
+                    .get(&owner)
+                    .is_some_and(|house| house.player_control()),
+            })
+    }
+
+    fn can_order_as_native_owner(&self, owner: InternedId, player: InternedId) -> bool {
+        self.permits(owner, CommandCapability::Tactical)
+            .unwrap_or_else(|| owner == player && self.native_current_player(owner))
+    }
+}
+
+/// Techno `+0x338`: the native InfantryType index of the infantryman that
+/// captured this object. The Techno constructor stores -1 (`0x006F2EC8`). An
+/// engineer's capture stores its type after the owner change
+/// (`InfantryClass::PerCellProcess`, `0x00519A42` and `0x00519F94`, one per
+/// capture arm; [`Self::record`]). The vehicle capture store
+/// (`InfantryClass::TryThiefVehicleCapture`, `0x00520465`) shares this same
+/// metadata; Unit survivor creation and the house's build-limit query read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub(crate) struct CapturedInfantryType(i32);
+
+/// Native capture's consumed-actor result plus synchronous geometry changes
+/// that Rust's caller must carry to its derived map refresh.
 #[derive(Debug, Clone, Copy, Default)]
-pub(crate) struct C4TickOutcome {
-    pub destroyed_structure: bool,
-    pub bridge_state_changed: bool,
+pub(crate) struct VehicleCaptureOutcome {
+    pub(crate) consumed: bool,
+    pub(crate) bridge_state_changed: bool,
+}
+
+impl CapturedInfantryType {
+    /// The Techno constructor's -1.
+    pub(crate) const fn constructed() -> Self {
+        Self(-1)
+    }
+
+    /// The captor's native InfantryType index, or -1.
+    pub(crate) const fn get(self) -> i32 {
+        self.0
+    }
+
+    /// The capture receivers' store of the native InfantryType index.
+    pub(crate) fn record(&mut self, native_index: i32) {
+        self.0 = native_index;
+    }
 }
 
 /// Interior PerCell519948..519B58 result, before Engineer/hut type checks.
@@ -48,22 +191,1744 @@ enum InfantryPerCellBuildingAdmission {
     GroundBuilding(u64),
 }
 
-#[cfg(test)]
+/// The native Engineer object-action arm. Input and cursor consumers share
+/// this result rather than independently guessing from relation or health.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineerBuildingAction {
+    Capture,
+    Damage,
+    Repair(bool),
+    EnterHospital,
+    EnterGrinder,
+    /// Ares only: a hostile building above `EngineerCaptureLevel` while
+    /// `EngineerDamage` is 0 (`10025220`'s NoEnter, 0x1F).
+    NoEnter,
+}
+
+/// Unit73FD7C..73FE43's healing-weapon post-processing of an object action.
+/// Move is native action2: the barred move cursor still reaches the ordinary
+/// object-coordinate Move receiver when the unit can move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnitRepairAction {
+    Repair,
+    Select,
+    Move,
+}
+
+/// What DetermineAction holds besides the target when it asks a healer's
+/// object action: the ForceMove binding (`InputManagerClass::IsKeyPressed`
+/// on `0x00A8EBF8`/`0x00A8EBFC`), which only Ares' heal arms read (Ares.dll
+/// `1004E5A0`, `1004E2E0`), and the base action's GuardArea (0x1A, Ctrl+Alt)
+/// or Move (1, Alt), which the arms' tails keep.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct HealArmKeys {
+    pub force_move: bool,
+    pub guard_area: bool,
+    pub moves: bool,
+}
+
+/// `InfantryClass::What_Action_OnObject`'s healer arm over another object
+/// ([`Simulation::infantry_heal_action`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InfantryHealAction {
+    /// AttackSupport (0x3B, `0x0051E797`) over an object of a house the
+    /// healer is not allied with. Infantry ClickedAction (`0x0051F190`) hands
+    /// it to Foot's case 0x3B (`0x004D74E0`), which guards the healer itself;
+    /// SetCursorFromAction (`0x004AAE90`) has no case for it, so the cursor is
+    /// the arrow.
+    AttackSupport,
+    /// Heal (0x1B), which Infantry ClickedAction turns into Attack. With Ares
+    /// the cursor is InfantryHeal (0x5A) over an Organic or Infantry target
+    /// (`organic`), else UnitRepair (0x5B).
+    Heal { organic: bool },
+    /// Select (7, `0x0051E78B`).
+    Select,
+}
+
+/// What a class's `What_Action_OnObject` entry rows make of an object the
+/// actor might enter: a building or a passenger carrier
+/// ([`Simulation::entry_click_action`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryClickAction {
+    /// Action 3.
+    Enter,
+    /// Action 0xB, at a `Grinding=` building (`+0x16AD`).
+    Grind,
+    /// Action 0x1F.
+    NoEnter,
+    /// Action 0x11, a Carryall over a Unit it may lift
+    /// (`aircraft::carryall`).
+    Tote,
+    /// Action 0, which orders nothing: a Carryall's Tote over a Unit still
+    /// in its war factory (`0x00417E7D..0x00417EF3`).
+    Nothing,
+}
+
+/// The base action (`TechnoClass::What_Action_OnObject`) the entry rows
+/// test. The input layer decides it; Attack (5), GuardArea (0x1A),
+/// ToggleSelect (8) and a Unit's GRepair (0x1D) skip every entry row, and
+/// their callers do not ask.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryBaseAction {
+    /// Select (7): the building rows and the passenger rows.
+    Select,
+    /// Any other base action, such as Alt's Move (1): the passenger rows
+    /// only.
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct BuildingEntryResult {
+    pub(crate) bridge_state_changed: bool,
+    pub(crate) return_before_foot: bool,
+}
+
+impl Simulation {
+    /// InfantryClass::TryThiefVehicleCapture5202F0..5206AA, reached at
+    /// InfantryAI51BEC0 (retail gamemd.exe). EC5 Thief, not EC6
+    /// VehicleThief, admits this original receiver. There is no mission,
+    /// health or target-owner-side gate beyond the caller's live Infantry
+    /// and the actor's directional alliance check.
+    pub(crate) fn infantry_try_thief_capture(
+        &mut self,
+        actor_id: u64,
+        rules: &RuleSet,
+        registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+        effects: &mut FrameEffects<'_>,
+    ) -> Result<VehicleCaptureOutcome, String> {
+        use crate::sim::components::NavTargetRef;
+        use crate::sim::movement::ground_pose::object_get_coords;
+        use crate::util::native_x87::distance_3d_leptons;
+        let Some(actor) = self.substrate.entities.get(actor_id) else {
+            return Ok(VehicleCaptureOutcome::default());
+        };
+        if actor.category() != EntityCategory::Infantry {
+            return Ok(VehicleCaptureOutcome::default());
+        }
+        // The NavCom is read before the type only to spare an infantryman
+        // that is not walking to an object the type lookup; neither test
+        // writes (VERA-only order).
+        let Some(nav @ NavTargetRef::Object { id: target_id }) = actor.navigation.nav_com() else {
+            return Ok(VehicleCaptureOutcome::default());
+        };
+        if !self.entity_object_type(actor, rules).is_some_and(|ty| {
+            if rules.ares() {
+                // Ares 3.0 InfantryClass_UpdateVehicleThief_Check (10049970,
+                // hook 0x5202F9): VehicleThief (+EC6) or CanDrive.
+                ty.vehicle_thief || ty.driver_rules().can_drive()
+            } else {
+                ty.thief
+            }
+        }) {
+            return Ok(VehicleCaptureOutcome::default());
+        }
+        let Some(target) = self.substrate.entities.get(target_id) else {
+            return Ok(VehicleCaptureOutcome::default());
+        };
+        if target.category() != EntityCategory::Unit
+            || crate::sim::combat::combat_weapon::is_ally_by_object(
+                Some(&self.house_alliances),
+                &self.interner,
+                actor.owner(),
+                target.owner(),
+            )
+        {
+            return Ok(VehicleCaptureOutcome::default());
+        }
+        //520343..52038D: +4C supplies only the target's approach height.
+        // A8F240 is the standard 104-lepton height (startup517910..517940).
+        let approach = self.navigation_target_coordinate(nav, Some(actor_id), rules)?;
+        let from = object_get_coords(actor, self.resolved_terrain.as_ref());
+        let to = object_get_coords(target, self.resolved_terrain.as_ref());
+        let xyz = |point: crate::sim::components::DriveCoord| [point.x, point.y, point.z];
+        let distance = distance_3d_leptons(xyz(from), xyz(to));
+        if approach.z.wrapping_sub(from.z).wrapping_abs()
+            < crate::util::lepton::GROUND_LEVEL_HEIGHT_LEPTONS
+            && distance < 128
+        {
+            if rules.ares() {
+                //5203F7 ->100499A0: the shared Ares receiver returns whether
+                //this caller must consume the actor (Drive can board it).
+                let outcome =
+                    self.ares_capture_vehicle(actor_id, target_id, rules, registry, effects)?;
+                if outcome.consumed {
+                    self.uninit_with_context(
+                        actor_id,
+                        super::UninitContext::new(rules).with_effects(effects),
+                    );
+                }
+                return Ok(outcome);
+            } else {
+                //5203F7..52046D: each callback finishes before the next live
+                // read. Radio+274 addresses slot zero, not the broadcast walk.
+                let mut context = super::UninitContext::new(rules).with_effects(effects);
+                self.dispatch_object_tag_event(
+                    target_id,
+                    1,
+                    Some(actor_id),
+                    None,
+                    context.reborrow(),
+                );
+                crate::sim::radio::transmit_to_contact(
+                    self,
+                    target_id,
+                    crate::sim::radio::RadioMessage::Break,
+                    rules,
+                    context.effects(),
+                );
+                self.detach_all(target_id, false, context.reborrow());
+                self.trigger_runtime
+                    .transfer_object_tag(actor_id, target_id);
+                if let Some(owner) = self
+                    .substrate
+                    .entities
+                    .get(actor_id)
+                    .map(|actor| actor.owner())
+                {
+                    self.change_owner_with_rules(
+                        target_id,
+                        owner,
+                        rules,
+                        registry,
+                        context.effects(),
+                    );
+                }
+                let captor_type = self
+                    .substrate
+                    .entities
+                    .get(actor_id)
+                    .and_then(|actor| self.entity_object_type(actor, rules))
+                    .and_then(|ty| {
+                        rules.type_array_index(
+                            crate::rules::object_type::ObjectCategory::Infantry,
+                            &ty.id,
+                        )
+                    });
+                if let Some(index) = captor_type
+                    && let Some(target) = self.substrate.entities.get_mut(target_id)
+                {
+                    target.seldom.capture_infantry_type_index.record(index);
+                }
+                self.uninit_with_context(actor_id, context);
+                return Ok(VehicleCaptureOutcome {
+                    consumed: true,
+                    bridge_state_changed: false,
+                });
+            }
+        }
+
+        //52047D..52069B: compare the locomotor's FINAL destination, not
+        // its paid step/head. Near targets retain it within 128 leptons;
+        // distant ones retain it in the target's approach cell.
+        let destination = crate::sim::movement::motion_query::destination(actor)
+            .ok_or_else(|| format!("Thief {actor_id} has no active locomotor destination"))?;
+        let null = crate::sim::components::DriveCoord { x: 0, y: 0, z: 0 };
+        let reissue = if destination == null {
+            true
+        } else if distance < 512 {
+            distance_3d_leptons(xyz(to), xyz(destination)) > 128
+        } else {
+            let cell = |coord: crate::sim::components::DriveCoord| {
+                (
+                    crate::util::lepton::lepton_to_cell_packed(coord.x),
+                    crate::util::lepton::lepton_to_cell_packed(coord.y),
+                )
+            };
+            cell(destination) != cell(approach)
+        };
+        if reissue {
+            self.assign_destination_represented(actor_id, Some(nav), rules, effects)
+                .map_err(|error| format!("Thief {actor_id} destination: {error}"))?;
+        }
+        Ok(VehicleCaptureOutcome::default())
+    }
+}
+
+#[cfg(all(test, tests_sim_world_t_z))]
 #[path = "bridge_engineer_admission_tests.rs"]
 mod bridge_engineer_admission_tests;
 
-impl Simulation {
-    fn bridge_repair_notification_allowed(&self, owner: InternedId) -> bool {
-        // House50B6F0: nonzero session mode compares exactly to LocalPlayer;
-        // mode zero uses the two native human/control flags.
-        if self.session.game_mode_nonzero {
-            //50B716 loads A83D4C, the persisted native current-house input.
-            //Presentation viewer binding cannot change this receiver's result.
-            self.session.current_house == Some(owner)
+#[cfg(all(test, tests_sim_world_t_z))]
+#[path = "building_control_tests.rs"]
+mod building_control_tests;
+
+#[cfg(all(test, tests_sim_world_t_z))]
+#[path = "multi_engineer_tests.rs"]
+mod multi_engineer_tests;
+
+#[cfg(all(test, tests_sim_world_t_z))]
+#[path = "passenger_entry_tests.rs"]
+mod passenger_entry_tests;
+
+#[cfg(all(test, tests_sim_world_t_z))]
+#[path = "self_deploy_site_tests.rs"]
+mod self_deploy_site_tests;
+
+/// The infiltration arms' type test (`0x0051EE4E..0x0051EEE7`,
+/// `0x0051B2BD..0x0051B330`): an `Infiltrate=` infantryman (`+0xEBE`) may
+/// enter a `Spyable=` building (`+0x1576`) if it is an `Agent=` one
+/// (`+0xEC4`), else a `Capturable=` one (`+0x1572`). Ares replaces it with
+/// `Simulation::infiltrate_action`.
+fn infiltrator_admits(
+    infantry: &crate::rules::object_type::ObjectType,
+    building: &crate::rules::object_type::ObjectType,
+) -> bool {
+    infantry.infiltrate
+        && if infantry.agent {
+            building.spyable
         } else {
-            self.houses
-                .get(&owner)
-                .is_some_and(|h| h.is_controlled_by_human(false))
+            building.capturable
+        }
+}
+
+/// What an infantryman does entering a building with Ares
+/// (`InfantryExt::GetInfiltrateAction @ 100252D0`'s answers 0..4; names
+/// inferred). [`Simulation::infiltrate_action`] decides it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InfiltrateAction {
+    None,
+    Spy,
+    Sabotage,
+    Capture,
+    C4,
+}
+
+/// The damage an Engineer deals entering a hostile building with the
+/// MultiEngineer option (`0x00519DB6..0x00519E7D`), or `None` when the
+/// building is at or below `ConditionRed=` and is captured instead.
+///
+/// With Strength `S`, Health `H` and ConditionRed `R`, all in PC53/chop x87:
+/// `a = ftol(S * R * 0.5)`, `c = S * ((1 - R * 0.5) * 0.5)` and the damage is
+/// `ftol(c)` when `c` compares below `H - a` (or unordered), else `H - a`.
+/// It never takes the building below `S * R * 0.5`.
+fn multi_engineer_damage(health: combat::Health, strength: i32, condition_red: f64) -> Option<i32> {
+    use crate::util::native_x87::{MaskedX87Chop53 as X87, MaskedX87Ordering, NativeF64Bits};
+    //519DB8..519DCE: HealthRatio5F5C60 above Rules+1708; TEST AH,41.
+    if health.compare_ratio(strength, condition_red) != MaskedX87Ordering::Greater {
+        return None;
+    }
+    let constant = |value: f64| X87::load_f64(NativeF64Bits::from_bits(value.to_bits()));
+    // 0x007E1738 and 0x007E1718.
+    let (half, one) = (constant(0.5), constant(1.0));
+    let red = constant(condition_red);
+    let strength = X87::load_i32(strength);
+    //519DDE..519E0C: Health less the red line's half, stored as a double.
+    let floor = X87::ftol_i32_low_masked(X87::mul(X87::mul(strength, red), half));
+    let remaining = health.current().wrapping_sub(floor);
+    //519E1C..519E3A and again 519E57..519E75.
+    let share = X87::mul(strength, X87::mul(X87::sub(one, X87::mul(red, half)), half));
+    Some(match X87::compare(share, X87::load_i32(remaining)) {
+        MaskedX87Ordering::Less | MaskedX87Ordering::Unordered => X87::ftol_i32_low_masked(share),
+        MaskedX87Ordering::Equal | MaskedX87Ordering::Greater => remaining,
+    })
+}
+
+impl Simulation {
+    /// The selected objects whose ClickedAction can still send a click
+    /// order, in selection order. `ClickedAction_Object` and `_Cell` refuse a
+    /// berserk object (`+0x298`) before anything else: Foot
+    /// `0x004D74EC`/`0x004D7D58`, Infantry `0x0051F1D8`/`0x0051F28F` and Unit
+    /// `0x007388EB`/`0x0073893D`. Aircraft's own arms
+    /// (`0x00417BD0`: actions 3, 4 and 17) never see one, because a berserk
+    /// aircraft's What_Action answers 0 (`0x00417CC0` -> `0x006FFEC9`, cell
+    /// `0x00417F80`). Producer-side, like `unit_repair_action`: an event sent
+    /// before the object went berserk still executes.
+    ///
+    /// An object being warped out (vt+0x1D4) is not refused here: neither
+    /// the selection loop (`0x004AE829..0x004AE844`), Unit `0x00738890`,
+    /// Foot `0x004D74E0`, ClickedMission (`0x006FFBE0`) nor the MEGAMISSION
+    /// arm of Event::Execute (`0x004C71F6..0x004C74BA`) reads it. Its own
+    /// What_Action decides what it sends (Techno's warp arm, `0x006FFF03`,
+    /// though Unit's healer arm `0x0073FD7C` still answers Repair). The event
+    /// queues the mission and sets the target, which the next frozen AI frame
+    /// drops (`Simulation::temporal_ai_prologue`); the queued mission waits.
+    ///
+    /// With `ares` a Deactivated (`+0x1C8`) object is refused as well: Foot
+    /// ClickedAction_Object and _Cell (hooks `0x004D74EC`, `0x004D7D58`;
+    /// Ares.dll `1004CBC0`, `1004CBA0`), Building Active_Click_With_Cell
+    /// (`0x004436F7`, `1004CB30`) and Building ClickedAction_Object's
+    /// Deactivated arm (`0x00443414`, `10016F60`), which consumes the click.
+    /// The one action they let through, Detonate, is sent by the self-click
+    /// producer, which reads the whole selection.
+    /// `ares` is [`RuleSet::ares`](crate::rules::ruleset::RuleSet::ares).
+    pub fn click_order_receivers(&self, selection: &[u64], ares: bool) -> Vec<u64> {
+        selection
+            .iter()
+            .copied()
+            .filter(|&id| {
+                !self.substrate.entities.get(id).is_some_and(|entity| {
+                    entity.berserk.is_active() || (ares && entity.deactivated.is_offline())
+                })
+            })
+            .collect()
+    }
+
+    /// UnitClass::What_Action_OnObject73FD7C..73FE43, after the base self/
+    /// Shift action. Reproducible original control/weapon/health/display
+    /// and ClickedAction witnesses: spatial_oracle/bunker_attack_action.json
+    /// repair_rows (Steam gamemd). This is producer-side admission;
+    /// a delivered Attack event must not repeat it after cargo/health changes.
+    ///
+    /// With `ares`, hook `0x0073FDBD` (UnitClass_GetActionOnObject_Heal,
+    /// Ares.dll `1004E5A0`) replaces the arm from its vehicle test to
+    /// `0x0073FE43` ([`Self::ares_unit_heal_arm`]).
+    pub fn unit_repair_action(
+        &self,
+        actor_id: u64,
+        target_id: u64,
+        issuing_house: InternedId,
+        keys: HealArmKeys,
+        rules: &RuleSet,
+    ) -> Option<UnitRepairAction> {
+        self.unit_repair_action_with(
+            &self.control_projection(),
+            actor_id,
+            target_id,
+            issuing_house,
+            keys,
+            rules,
+        )
+    }
+
+    pub fn unit_repair_action_with(
+        &self,
+        control: &ControlProjection<'_>,
+        actor_id: u64,
+        target_id: u64,
+        issuing_house: InternedId,
+        keys: HealArmKeys,
+        rules: &RuleSet,
+    ) -> Option<UnitRepairAction> {
+        let actor = self.substrate.entities.get(actor_id)?;
+        let actor_type = self.object_type(actor.type_ref(), rules)?;
+        if actor.category() != EntityCategory::Unit
+            || !control.can_order_as_native_owner(actor.owner(), issuing_house)
+            || combat::combat_weapon::weapon_damage_value(
+                actor,
+                actor_type,
+                &self.substrate.entities,
+                rules,
+                &self.interner,
+            ) >= 0
+        {
+            return None;
+        }
+        let target = self.substrate.entities.get(target_id)?;
+        let target_type = self.object_type(target.type_ref(), rules)?;
+        if !self
+            .house_alliances
+            .is_allied(&self.interner, actor.owner(), target.owner())
+        {
+            return Some(UnitRepairAction::Move);
+        }
+        if rules.ares() {
+            return self.ares_unit_heal_arm(actor_id, target_id, keys, rules);
+        }
+        self.vanilla_unit_heal_arm(actor_id, target_id, target, target_type, rules)
+    }
+
+    /// The stock arm from the target's vehicle test (`0x0073FDBD..0x0073FE43`).
+    fn vanilla_unit_heal_arm(
+        &self,
+        actor_id: u64,
+        target_id: u64,
+        target: &crate::sim::game_entity::GameEntity,
+        target_type: &crate::rules::object_type::ObjectType,
+        rules: &RuleSet,
+    ) -> Option<UnitRepairAction> {
+        // The target's vt+80 (`0x0073FDBD`); every GameEntity is a Techno
+        // (vt+7C).
+        let vehicle = crate::sim::combat::vehicle_like(
+            target.category(),
+            target_type.non_vehicle,
+            target_type.is_1x1_with_undeploy(),
+            || {
+                if let Some(terrain) = self.resolved_terrain.as_ref() {
+                    let cells = crate::map::resolved_terrain::NativeCellQuery::isolated(terrain);
+                    crate::sim::movement::air_movement::is_low_flying_in_query(
+                        target,
+                        &cells,
+                        Some((rules, &self.interner)),
+                    )
+                } else {
+                    crate::sim::movement::air_movement::is_low_flying(
+                        target,
+                        None,
+                        Some((rules, &self.interner)),
+                    )
+                }
+            },
+        );
+        if !vehicle || target_id == actor_id {
+            //73FE2F..73FE43 preserves the base action for a Building.
+            return (target.category() != EntityCategory::Structure)
+                .then_some(UnitRepairAction::Select);
+        }
+        //73FDE1..73FE06: a grounded aircraft on a building is excluded.
+        if self.aircraft_rests_on_building(target) {
+            return None;
+        }
+        // Rules+16F8 is the fixed 1.0 threshold, not an INI condition key.
+        (!target.health.is_full(target_type.strength)).then_some(UnitRepairAction::Repair)
+    }
+
+    /// `0x0073FDE1..0x0073FE06`: an Aircraft (WhatAmI 2) whose GetCoords
+    /// cell holds a building.
+    fn aircraft_rests_on_building(&self, target: &crate::sim::game_entity::GameEntity) -> bool {
+        if target.category() != EntityCategory::Aircraft {
+            return false;
+        }
+        let coord = crate::sim::movement::ground_pose::position_world_coord(&target.position);
+        let cell = self.resolved_terrain.as_ref().and_then(|terrain| {
+            let cells = crate::map::resolved_terrain::NativeCellQuery::isolated(terrain);
+            match cells.lookup_world(coord.x, coord.y) {
+                crate::map::cell_index::NativeCellIdentity::Real(index) => {
+                    let cell = &terrain.cells()[index];
+                    Some((cell.rx, cell.ry))
+                }
+                crate::map::cell_index::NativeCellIdentity::Dummy => None,
+            }
+        });
+        cell.is_some_and(|(rx, ry)| {
+            self.substrate
+                .occupancy
+                .first_building_on_layer(rx, ry, MovementLayer::Ground)
+                .is_some()
+        })
+    }
+
+    /// Ares' heal arms (`1004E5A0`, `1004E2E0`): the Verses of the warhead of
+    /// the weapon the healer would pick against `target_id` (SelectWeapon,
+    /// GetWeapon) for the target's armor
+    /// (`WarheadTypeExt::ExtData::GetVerses`) is above 0.
+    fn ares_heal_verses_positive(&self, actor_id: u64, target_id: u64, rules: &RuleSet) -> bool {
+        let (Some(actor), Some(target)) = (
+            self.substrate.entities.get(actor_id),
+            self.substrate.entities.get(target_id),
+        ) else {
+            return false;
+        };
+        let (Some(actor_type), Some(target_type)) = (
+            self.object_type(actor.type_ref(), rules),
+            self.object_type(target.type_ref(), rules),
+        ) else {
+            return false;
+        };
+        let cells = self
+            .resolved_terrain
+            .as_ref()
+            .map(crate::map::resolved_terrain::NativeCellQuery::isolated);
+        combat::combat_weapon::select_weapon_index_against_in_query(
+            rules,
+            actor,
+            actor_type,
+            &combat::combat_weapon::attacker_facts(actor, actor_type),
+            Some(&combat::TargetKind::Entity(target_id)),
+            self,
+            &self.interner,
+            cells.as_ref(),
+            Some(&self.house_alliances),
+        )
+        .and_then(|index| {
+            combat::combat_weapon::get_weapon(
+                actor,
+                actor_type,
+                index,
+                &self.substrate.entities,
+                rules,
+                &self.interner,
+            )
+        })
+        .and_then(|weapon| rules.weapon_warhead(weapon))
+        .is_some_and(|warhead| {
+            f64::from_bits(
+                warhead
+                    .interaction(target_type.armor_id())
+                    .multiplier()
+                    .bits(),
+            ) > 0.0
+        })
+    }
+
+    /// Ares `UnitClass_GetActionOnObject_Heal @ 1004E5A0` (hook
+    /// `0x0073FDBD`, after the stock ally test), resuming at `0x0073FE48`,
+    /// `0x0073FE3B` (Select) or `0x0073FE08` (GRepair 0x1D with the
+    /// UnitRepair or InfantryHeal cursor, which the cursor owner sets). A
+    /// GuardArea base action keeps its own path; the unit itself, a held
+    /// ForceMove key, a target at full health (`GetHealthPercentage` against
+    /// Rules+16F8, 1.0), a grounded aircraft on a building and a warhead
+    /// whose Verses for the target's armor is not above 0 answer Select. Any
+    /// other damaged ally is repaired, building or not.
+    fn ares_unit_heal_arm(
+        &self,
+        actor_id: u64,
+        target_id: u64,
+        keys: HealArmKeys,
+        rules: &RuleSet,
+    ) -> Option<UnitRepairAction> {
+        if keys.guard_area {
+            return None;
+        }
+        let select = Some(UnitRepairAction::Select);
+        if target_id == actor_id || keys.force_move {
+            return select;
+        }
+        let target = self.substrate.entities.get(target_id)?;
+        let target_type = self.object_type(target.type_ref(), rules)?;
+        if target.health.is_full(target_type.strength)
+            || self.aircraft_rests_on_building(target)
+            || !self.ares_heal_verses_positive(actor_id, target_id, rules)
+        {
+            return select;
+        }
+        Some(UnitRepairAction::Repair)
+    }
+
+    /// `InfantryClass::What_Action_OnObject`'s healer arm
+    /// (`0x0051E6D8..0x0051E78B`) for a human player's Infantryman whose
+    /// `GetWeaponDamageValue(-1)` (`0x006F3970`) is negative, over an object
+    /// other than itself, a Techno or a Terrain object. The class's earlier
+    /// rows answer first (`context_order::healer_object_action`).
+    ///
+    /// An object of a house it is not allied with (`0x004F9A90`, which
+    /// refuses a Terrain object's null House) answers AttackSupport
+    /// (`0x0051E797`). Over an ally the stock arm heals a damaged
+    /// Infantryman (`GetHealthPercentage` below Rules+16F8, the fixed 1.0;
+    /// `0x0051E710..0x0051E73C`); with Ares, `1004E2E0` (hook `0x0051E710`)
+    /// heals any damaged Techno, unless a ForceMove key is held, whose
+    /// selected weapon's Verses is above 0 for its armor (`0x0051E739`), and
+    /// sends a `Grinding=` building to the later rows (`0x0051E7A6`). The
+    /// tail (`0x0051E757..0x0051E78B`) sends a Techno whose type has
+    /// `Passengers=` to the later rows too, keeps a GuardArea or Move base
+    /// action (`0x0051F17E`) and answers Select otherwise. None is the later
+    /// rows or the kept base action. The infantryman itself takes the self
+    /// arm at `0x0051E748` ([`Self::infantry_healer_guards_itself`]).
+    pub fn infantry_heal_action(
+        &self,
+        actor_id: u64,
+        target_id: u64,
+        issuing_house: InternedId,
+        keys: HealArmKeys,
+        rules: &RuleSet,
+    ) -> Option<InfantryHealAction> {
+        self.infantry_heal_action_with(
+            &self.control_projection(),
+            actor_id,
+            target_id,
+            issuing_house,
+            keys,
+            rules,
+        )
+    }
+
+    pub fn infantry_heal_action_with(
+        &self,
+        control: &ControlProjection<'_>,
+        actor_id: u64,
+        target_id: u64,
+        issuing_house: InternedId,
+        keys: HealArmKeys,
+        rules: &RuleSet,
+    ) -> Option<InfantryHealAction> {
+        let actor = self.substrate.entities.get(actor_id)?;
+        let actor_type = self.object_type(actor.type_ref(), rules)?;
+        if actor.category() != EntityCategory::Infantry
+            || target_id == actor_id
+            || !control.can_order_as_native_owner(actor.owner(), issuing_house)
+            || combat::combat_weapon::weapon_damage_value(
+                actor,
+                actor_type,
+                &self.substrate.entities,
+                rules,
+                &self.interner,
+            ) >= 0
+        {
+            return None;
+        }
+        let Some(target) = self.substrate.entities.get(target_id) else {
+            return self
+                .terrain_objects()
+                .get(target_id)
+                .map(|_| InfantryHealAction::AttackSupport);
+        };
+        let target_type = self.object_type(target.type_ref(), rules)?;
+        if !self
+            .house_alliances
+            .is_allied(&self.interner, actor.owner(), target.owner())
+        {
+            return Some(InfantryHealAction::AttackSupport);
+        }
+        let damaged = !target.health.is_full(target_type.strength);
+        let infantry = target.category() == EntityCategory::Infantry;
+        if rules.ares() {
+            if damaged
+                && !keys.force_move
+                && self.ares_heal_verses_positive(actor_id, target_id, rules)
+            {
+                return Some(InfantryHealAction::Heal {
+                    organic: target_type.organic || infantry,
+                });
+            }
+            if target.category() == EntityCategory::Structure && target_type.grinding {
+                return None;
+            }
+        } else if infantry && damaged {
+            return Some(InfantryHealAction::Heal { organic: true });
+        }
+        if target_type.passengers != 0 || keys.guard_area || keys.moves {
+            return None;
+        }
+        Some(InfantryHealAction::Select)
+    }
+
+    /// `InfantryClass::What_Action_OnObject`'s healer self arm: a human
+    /// player's Infantryman whose `GetWeaponDamageValue(-1)` is negative
+    /// (`0x0051E6D8..0x0051E6F6`) answers GuardArea (0x1A, `0x0051E748`) over
+    /// itself, which its own house's ally test (`0x004F9A90`) admits. Foot's
+    /// What_Action has answered before it, so the arm replaces a self,
+    /// Detonate or key answer; only Shift's ToggleSelect (`0x0051E453`) and
+    /// the Engineer prefixes return first. Ares' heal hook
+    /// (`0x0051E710`, Ares.dll `1004E2E0`) jumps to the same return for the
+    /// infantryman itself, and `NoSelfGuardArea=yes` (hook `0x0051E748`,
+    /// `10049710`) skips it to the rows after the heal arm (`0x0051E7A6`).
+    /// No retail infantryman heals, so only a mod's healers reach it.
+    pub fn infantry_healer_guards_itself(
+        &self,
+        control: &ControlProjection<'_>,
+        actor_id: u64,
+        rules: &RuleSet,
+    ) -> bool {
+        let Some(actor) = self.substrate.entities.get(actor_id) else {
+            return false;
+        };
+        let Some(actor_type) = self.object_type(actor.type_ref(), rules) else {
+            return false;
+        };
+        actor.category() == EntityCategory::Infantry
+            && control.can_order(actor.owner())
+            && combat::combat_weapon::weapon_damage_value(
+                actor,
+                actor_type,
+                &self.substrate.entities,
+                rules,
+                &self.interner,
+            ) < 0
+            && !(rules.ares() && actor_type.techno_combat().no_self_guard_area())
+    }
+
+    /// `UnitClass::What_Action_OnObject`'s building arm
+    /// (`0x00740122..0x007401BC`), with the base action Select: a human
+    /// player's Unit (House `0x0050B6F0`) over a Building of a house allied
+    /// with it (`0x004F9A90`), not being warped out (vt+0x1D4), sends CAN_LOAD
+    /// (`0x0074017E`, [`can_load_query`]). Any answer but ROGER leaves Select
+    /// (`None`), as a busy, unpowered or selling refinery gives a miner.
+    /// Producer-side, like [`Self::unit_repair_action`].
+    ///
+    /// [`can_load_query`]: crate::sim::radio::receive::can_load_query
+    pub fn unit_building_click_action(
+        &self,
+        actor_id: u64,
+        target_id: u64,
+        rules: &RuleSet,
+    ) -> Option<EntryClickAction> {
+        self.unit_building_click_action_with(&self.control_projection(), actor_id, target_id, rules)
+    }
+
+    fn unit_building_click_action_with(
+        &self,
+        control: &ControlProjection<'_>,
+        actor_id: u64,
+        target_id: u64,
+        rules: &RuleSet,
+    ) -> Option<EntryClickAction> {
+        let actor = self.substrate.entities.get(actor_id)?;
+        let target = self.substrate.entities.get(target_id)?;
+        if actor.category() != EntityCategory::Unit
+            || !control.can_order(actor.owner())
+            || !combat::combat_weapon::is_ally_by_object(
+                Some(&self.house_alliances),
+                &self.interner,
+                target.owner(),
+                actor.owner(),
+            )
+            || target.is_warped_out()
+            || target.category() != EntityCategory::Structure
+            || crate::sim::radio::receive::can_load_query(self, target_id, actor_id, rules)
+                != crate::sim::radio::RadioResponse::Roger
+        {
+            return None;
+        }
+        if self.object_type(actor.type_ref(), rules)?.movement_zone
+            == crate::rules::locomotor_type::MovementZone::Fly
+        {
+            return Some(EntryClickAction::NoEnter);
+        }
+        {
+            let target_obj = self.object_type(target.type_ref(), rules)?;
+            Some(
+                if target_obj.grinding || (rules.ra2() && target_obj.cloning) {
+                    EntryClickAction::Grind
+                } else {
+                    EntryClickAction::Enter
+                },
+            )
+        }
+    }
+
+    /// What a human player's object's class row makes of `target_id`, an
+    /// object it might enter: Enter (3), Grind (0xB) or NoEnter (0x1F),
+    /// shown as the Enter and NoEnter cursors (`SetCursorFromAction
+    /// 0x004AB555`, `0x004AB382`). `None` leaves the base action.
+    /// - A Unit's building arm (`0x00740122..0x007401BC`,
+    ///   [`Self::unit_building_click_action`]) runs for base action Select
+    ///   and asks CAN_LOAD of any building: a refinery, Service Depot, Tank
+    ///   Bunker or Grinder that admits it. Its NoEnter skips the passenger
+    ///   rung (`0x00740296`); otherwise the rung's answer replaces it.
+    /// - An Infantryman's passenger row comes first; only when it leaves the
+    ///   base action Select does the grinder row (`0x0051F0AF..0x0051F111`)
+    ///   answer, without asking: a `Grinding=` building (`+0x16AD`) that is
+    ///   not 1x1-with-undeploy (IsStrange vt+0x80, `0x00457620`) answers Grind
+    ///   when the player owns it (GetOwningHouse `+0x21C` against PlayerPtr
+    ///   `0x00A83D4C`), else NoEnter. An Engineer's own arm answers before
+    ///   both ([`Self::engineer_building_action`]); its other building rows
+    ///   have their own owners.
+    /// - The passenger rows: [`Self::passenger_click_action`].
+    /// - A Carryall's Tote rung ([`Self::carryall_tote_action`]) runs for base
+    ///   action Select over an allied Unit; Aircraft ClickedAction
+    ///   (`0x00417BD0`) sends Tote as Move with the Unit as destination.
+    ///   RESIDUAL: the rung also runs for base action 0, which
+    ///   [`EntryBaseAction`] does not tell apart from the others; an
+    ///   Aircraft over an allied Unit answers Select.
+    /// - An Aircraft's depot row (`0x00417DF6..0x00417E78`) runs for a human
+    ///   player's (House `0x0050B6F0`) base action Select over a `UnitRepair=`
+    ///   building (`+0x16A9`) and answers NoEnter; Aircraft ClickedAction
+    ///   (`0x00417BD0`) orders nothing for it. Its other rows have their own
+    ///   owners.
+    ///
+    /// Foot ClickedAction (`0x004D74E0`) turns Enter into mission Enter and
+    /// Grind into mission Eaten, each with the object as Destination, for a
+    /// receiver the player may order (vt+0xA0); NoEnter orders nothing.
+    ///
+    /// RESIDUAL: the Unit's UnitRepair and Bunker rows between the building
+    /// arm and the rung (`0x007401C1..0x0074027A`) are not represented. With
+    /// the base action still Select they answer Move for such a building
+    /// whose CAN_LOAD admits the Unit when it is not in radio contact. They
+    /// matter only where the building arm's own gates refused. An unallied
+    /// building or a computer's Unit fails CAN_LOAD's own alliance test
+    /// (`0x0043C2D0` case 0xF). A warped-out building is offline
+    /// (`TemporalGoOffline` `0x004521C0` clears +0x660), and CAN_LOAD answers
+    /// 10 for an offline building before its Bunker and UnitRepair arms; only
+    /// trigger action 62 (`0x006DE02E`, no warp test) puts it back online
+    /// mid-warp, and no stock map uses actions 60..62 (production-reader
+    /// census). DORMANT.
+    ///
+    /// RESIDUAL: the depot row first scans the Aircraft type's `Dock=` list
+    /// (`+0x3E8`) for the building's type; one listed asks for a free radio
+    /// contact (`0x0065ADF0`), an empty building `+0x118` and CAN_LOAD (0xF)
+    /// and answers Enter on ROGER. Retail lists only GAAIRC and AMRADR, which
+    /// are not `UnitRepair=`, so every retail aircraft answers NoEnter here,
+    /// as this row does for a listed type too. When Ares plays, the whole
+    /// row takes its own form (hook `0x417E16`, below).
+    pub fn entry_click_action(
+        &self,
+        actor_id: u64,
+        target_id: u64,
+        base: EntryBaseAction,
+        rules: &RuleSet,
+    ) -> Option<EntryClickAction> {
+        self.entry_click_action_with(&self.control_projection(), actor_id, target_id, base, rules)
+    }
+
+    pub fn entry_click_action_with(
+        &self,
+        control: &ControlProjection<'_>,
+        actor_id: u64,
+        target_id: u64,
+        base: EntryBaseAction,
+        rules: &RuleSet,
+    ) -> Option<EntryClickAction> {
+        let actor = self.substrate.entities.get(actor_id)?;
+        let target = self.substrate.entities.get(target_id)?;
+        let select = base == EntryBaseAction::Select;
+        match actor.category() {
+            EntityCategory::Unit => {
+                let building = if select {
+                    self.unit_building_click_action_with(control, actor_id, target_id, rules)
+                } else {
+                    None
+                };
+                if building == Some(EntryClickAction::NoEnter) {
+                    return building;
+                }
+                self.passenger_click_action(control, actor_id, target_id, rules)
+                    .or(building)
+            }
+            EntityCategory::Infantry => {
+                if let Some(action) =
+                    self.passenger_click_action(control, actor_id, target_id, rules)
+                {
+                    return Some(action);
+                }
+                let target_obj = self.object_type(target.type_ref(), rules)?;
+                (select
+                    && target.category() == EntityCategory::Structure
+                    && (target_obj.grinding || (rules.ra2() && target_obj.cloning))
+                    && control.can_order(actor.owner())
+                    && !target_obj.is_1x1_with_undeploy())
+                .then(|| {
+                    // The delegated form of the 0x0051F0AF ownership check
+                    // keeps the infantry and its Grinder in the same House.
+                    if actor.owner() == target.owner()
+                        && control
+                            .local_command_house()
+                            .is_some_and(|player| control.can_order_from(target.owner(), player))
+                    {
+                        EntryClickAction::Grind
+                    } else {
+                        EntryClickAction::NoEnter
+                    }
+                })
+            }
+            EntityCategory::Aircraft => {
+                // The Tote rung (`0x00417D06..0x00417D75`) for base Select.
+                if select && let Some(tote) = self.carryall_tote_action(actor_id, target_id, rules)
+                {
+                    use crate::sim::aircraft::carryall::CarryallTote;
+                    return match tote {
+                        CarryallTote::Tote => Some(EntryClickAction::Tote),
+                        CarryallTote::Nothing => Some(EntryClickAction::Nothing),
+                        CarryallTote::Kept => None,
+                    };
+                }
+                let target_obj = self.object_type(target.type_ref(), rules)?;
+                if !select
+                    || !control.can_order(actor.owner())
+                    || target.category() != EntityCategory::Structure
+                {
+                    return None;
+                }
+                // Ares 3.0 AircraftClass_GetActionOnObject_Dock 1004C8B0
+                // (hook 0x417E16) drops the `UnitRepair=` gate: a building
+                // whose type the aircraft's `Dock=` lists (Type+0x3EC) takes
+                // the row's dock arm at 0x417E4B, any other keeps Select
+                // (0x417E7D). The arm answers Enter when the building has a
+                // free or own contact slot (0x0065ADF0), no first passenger
+                // (+0x118, TechnoClass Passengers.FirstPassenger, which
+                // BuildingClass::Receive_Radio 0x0043C2D0 also tests) and its
+                // CAN_LOAD (vt+0x278(0xF)) is ROGER, else NoEnter.
+                if rules.ares() {
+                    let docks =
+                        self.object_type(actor.type_ref(), rules)
+                            .is_some_and(|actor_obj| {
+                                actor_obj
+                                    .dock
+                                    .iter()
+                                    .any(|dock| dock.eq_ignore_ascii_case(&target_obj.id))
+                            });
+                    docks.then(|| {
+                        if target.seldom.radio_contacts.has_free_or(actor_id)
+                            && target.passenger_role().passenger_count() == 0
+                            && crate::sim::radio::receive::can_load_query(
+                                self, target_id, actor_id, rules,
+                            ) == crate::sim::radio::RadioResponse::Roger
+                        {
+                            EntryClickAction::Enter
+                        } else {
+                            EntryClickAction::NoEnter
+                        }
+                    })
+                } else {
+                    target_obj.unit_repair.then_some(EntryClickAction::NoEnter)
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The passenger rows of `What_Action_OnObject`, an Infantryman's
+    /// (`0x0051ED10..0x0051EE36`) and a Unit's (`0x0074029F..0x00740378`),
+    /// for any base action they are asked under ([`EntryBaseAction`]). The
+    /// target is a Techno whose type has `Passengers=` (`+0x5E0`) above 0, of
+    /// a house the actor's house is allied with (`0x004F9A90`), neither
+    /// warped out (vt+0x1D4) nor warping in (vt+0x1D8); the actor is a human
+    /// player's (`0x0050B6F0`), and for a Unit not the target itself. Then:
+    /// - an Infantryman must be one the player may order (vt+0xA0). A
+    ///   `BalloonHover=` type (`+0xD6A`) answers NoEnter, as does a Foot
+    ///   target in a team whose TeamType is not `Loadable=` (`+0x5D4`,
+    ///   `+0x24`, `+0xA4`);
+    /// - a Foot target whose locomotor is moving (Is_Moving, vt+0x10)
+    ///   answers NoEnter;
+    /// - otherwise the target's CAN_LOAD decides (`vt+0x278(0x0F)`,
+    ///   [`can_load_query`]): ROGER is Enter, NEGATORY NoEnter, any other
+    ///   answer leaves the base action (`None`).
+    ///
+    /// Ares refuses a `NoManualEnter` target with the Passengers test; its
+    /// Infantry hook also admits Ares tunnels, which VERA does not port.
+    ///
+    /// [`can_load_query`]: crate::sim::radio::receive::can_load_query
+    fn passenger_click_action(
+        &self,
+        control: &ControlProjection<'_>,
+        actor_id: u64,
+        target_id: u64,
+        rules: &RuleSet,
+    ) -> Option<EntryClickAction> {
+        let actor = self.substrate.entities.get(actor_id)?;
+        let target = self.substrate.entities.get(target_id)?;
+        let infantry = match actor.category() {
+            EntityCategory::Infantry => true,
+            EntityCategory::Unit => false,
+            _ => return None,
+        };
+        // Ares 3.0 Infantry 100176E0 (hook 0x51ED8E) also lets him enter a
+        // `Tunnel=` building, whatever its Passengers= (`sim::ares_tunnel`).
+        let tunnel = rules.ares() && infantry && self.ares_tunnel_type(target_id, rules).is_some();
+        let target_obj = self.object_type(target.type_ref(), rules)?;
+        // Original RA2 (0x51E8A1) offers a normal infantryman an Enter action
+        // on a Hospital even though it has Passengers=0; VERA's shared
+        // Passengers gate rejects it. Add the RA2-only hospital exception.
+        let hospital_entry = rules.ra2()
+            && infantry
+            && target.category() == EntityCategory::Structure
+            && target_obj.hospital;
+        // An Armory also service-admits infantry even when its Passengers=
+        // is 0; the shared Passengers gate would otherwise hide Enter.
+        let armory_entry =
+            infantry && target.category() == EntityCategory::Structure && target_obj.armory();
+        if !combat::combat_weapon::is_ally_by_object(
+            Some(&self.house_alliances),
+            &self.interner,
+            actor.owner(),
+            target.owner(),
+        ) || !control.can_order(actor.owner())
+            || target.is_warped_out()
+            || target.is_warping_in()
+            || (!infantry && actor_id == target_id)
+            || (target_obj.passengers <= 0 && !tunnel && !hospital_entry && !armory_entry)
+        {
+            return None;
+        }
+        // Ares 3.0 Unit 1004BEA0 (hook 0x74031A) and Infantry 100176E0
+        // (hook 0x51ED8E) refuse a `NoManualEnter` transport at the same
+        // Passengers test (0x74037A, 0x51EE3B).
+        if rules.ares()
+            && !tunnel
+            && self
+                .object_type(target.type_ref(), rules)?
+                .techno_combat()
+                .movement()
+                .no_manual_enter()
+        {
+            return None;
+        }
+        if infantry {
+            if !self.local_techno_controllable_with(control, actor_id, rules) {
+                return None;
+            }
+            if self.object_type(actor.type_ref(), rules)?.balloon_hover {
+                return Some(EntryClickAction::NoEnter);
+            }
+        }
+        if target.category() != EntityCategory::Structure
+            && ((infantry && self.team_script_vm.member_team_loadable(target_id) == Some(false))
+                || crate::sim::movement::motion_query::is_moving(target) == Some(true))
+        {
+            return Some(EntryClickAction::NoEnter);
+        }
+        match crate::sim::radio::receive::can_load_query(self, target_id, actor_id, rules) {
+            crate::sim::radio::RadioResponse::Roger => Some(EntryClickAction::Enter),
+            crate::sim::radio::RadioResponse::Negatory => Some(EntryClickAction::NoEnter),
+            _ => None,
+        }
+    }
+
+    /// The site tests of `UnitClass::What_Action_OnObject`'s self arm
+    /// (`0x0073FE95..0x00740115`) that answer NoDeploy (0x1E) for a Unit's
+    /// own Self (4) ahead of CanDeploySlashUnload (`0x0073FFEA`):
+    /// - A `DeploysInto=` unit: that type's CanPlaceAt (vt+0xA8, no house) at
+    ///   the unit's cell, one cell north-west for a foundation wider or deeper
+    ///   than 2 (`0x0073FEAD..0x0073FF52`), with the unit lifted for the test
+    ///   (Mark(UP) and Mark_All_Occupation_Bits(0), `0x0073FF5C..0x0073FF81`;
+    ///   [`crate::sim::build_site::LiftedUnit`]).
+    /// - A loaded transport (`Passengers=` above 0) off a bridge (`+0x8C`) and
+    ///   in no tank bunker (`+0x2E4`): its first passenger's SpeedType on its
+    ///   cell's land below 1% (the float table `0x0089EA40` against 0.01 at
+    ///   `0x007E3808`), except on Water (`0x00740078..0x007400BE`), or, for
+    ///   a transport whose own SpeedType is not Hover, any height above the
+    ///   ground (GetHeight vt+0x1C8, `0x007400C6..0x007400EB`).
+    ///
+    /// An empty transport answers NoDeploy before these tests (`0x0074003F`);
+    /// a simple deployer goes straight to CanDeploySlashUnload (`0x00740013`),
+    /// as does a bunkered unit (`0x00740023`, `0x00740107`). The arm's
+    /// planning test (`0x0073FEA0`) belongs to the caller, which holds
+    /// Planning Mode.
+    pub fn unit_self_deploy_site_refused(
+        &self,
+        id: u64,
+        rules: &RuleSet,
+        registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+    ) -> bool {
+        use crate::rules::locomotor_type::SpeedType;
+        let Some(entity) = self
+            .substrate
+            .entities
+            .get(id)
+            .filter(|entity| entity.category() == EntityCategory::Unit)
+        else {
+            return false;
+        };
+        if let Some(yard) = crate::sim::mcv_deploy::deploys_into(self, entity, rules) {
+            let origin = super::world_spawn::deploy_origin_from_unit_cell(
+                entity.position.rx(),
+                entity.position.ry(),
+                &yard.foundation,
+            );
+            return !crate::sim::build_site::can_place_building_at(
+                self,
+                rules,
+                registry,
+                yard,
+                origin,
+                None,
+                None,
+                Some(&crate::sim::build_site::LiftedUnit::read(self, id)),
+            );
+        }
+        let Some(object) = self.object_type(entity.type_ref(), rules) else {
+            return false;
+        };
+        if object.is_simple_deployer
+            || object.passengers <= 0
+            || entity.bunker.link().installed_in().is_some()
+            || entity.on_bridge()
+        {
+            return false;
+        }
+        let Some(first) = entity
+            .passenger_role()
+            .cargo()
+            .and_then(|cargo| cargo.passengers().first())
+            .and_then(|&first| self.substrate.entities.get(first))
+        else {
+            return false;
+        };
+        let terrain = self.resolved_terrain.as_ref();
+        let stranded = terrain
+            .zip(self.object_type(first.type_ref(), rules))
+            .is_some_and(|(terrain, passenger)| {
+                let cells = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain);
+                let coord =
+                    crate::sim::movement::ground_pose::position_world_coord(&entity.position);
+                let land = cells.land_type(cells.lookup_world(coord.x, coord.y));
+                land != i32::from(crate::rules::terrain_rules::LandType::Water.as_index())
+                    && u8::try_from(land)
+                        .ok()
+                        .and_then(|land| rules.terrain_rules.semantics_for_land_type(land))
+                        .is_some_and(|row| {
+                            // UnitWhatAction7400A1..7400BE: first passenger,
+                            // strictly below the native double1% threshold.
+                            row.cost_for_speed_type(passenger.speed_type)
+                                .is_some_and(|cost| {
+                                    matches!(
+                                        crate::rules::terrain_rules::compare_speed_to_one_percent(
+                                            cost
+                                        ),
+                                        crate::util::native_x87::MaskedX87Ordering::Less
+                                            | crate::util::native_x87::MaskedX87Ordering::Unordered
+                                    )
+                                })
+                        })
+            });
+        stranded
+            || (object.speed_type != SpeedType::Hover
+                && crate::sim::movement::air_movement::current_fly_height(entity, terrain) != 0)
+    }
+
+    pub fn control_projection(&self) -> ControlProjection<'_> {
+        let source = self
+            .session
+            .has_custom_control_grants()
+            .then(|| self.local_grant_source())
+            .flatten();
+        ControlProjection {
+            session: &self.session,
+            houses: &self.houses,
+            source,
+        }
+    }
+
+    pub fn house_is_human_player(&self, owner: InternedId) -> bool {
+        Self::is_human_player(&self.session, &self.houses, owner)
+    }
+
+    /// HouseClass::IsHumanPlayer @ 0x0050B6F0 over the saved native inputs,
+    /// for callers that hold the object store mutably.
+    pub(crate) fn is_human_player(
+        session: &ScenarioSession,
+        houses: &Houses,
+        owner: InternedId,
+    ) -> bool {
+        ControlProjection::for_native_view(session, houses).native_current_player(owner)
+    }
+
+    pub fn local_actor_can_order(&self, id: u64) -> bool {
+        self.substrate
+            .entities
+            .get(id)
+            .is_some_and(|entity| self.control_projection().can_order(entity.owner()))
+    }
+
+    /// gamemd.exe TeamAssign731060/TeamClear7310D0: owner admission precedes
+    /// both stores. Selected eligible objects take the requested raw group;
+    /// other eligible objects in that group return to -1. No life/limbo gate.
+    /// Shared by the committed command and its pending input projection.
+    pub(super) fn assigned_control_group(
+        control: &ControlProjection<'_>,
+        entity: &crate::sim::game_entity::GameEntity,
+        current: i32,
+        group: i32,
+        selected: &std::collections::HashSet<u64>,
+    ) -> i32 {
+        if !(0..10).contains(&group) || !control.can_select(entity.owner()) {
+            current
+        } else if selected.contains(&entity.stable_id()) {
+            group
+        } else if current == group {
+            -1
+        } else {
+            current
+        }
+    }
+
+    pub(super) fn assign_control_group(&mut self, group: i32, selected: &[u64]) -> bool {
+        if !(0..10).contains(&group) {
+            return false;
+        }
+        let selected = selected.iter().copied().collect();
+        let control = self.control_projection();
+        let changes: Vec<_> = self
+            .substrate
+            .entities
+            .iter_sorted()
+            .filter_map(|(id, entity)| {
+                let current = entity.control_group();
+                let next =
+                    Self::assigned_control_group(&control, entity, current, group, &selected);
+                (next != current).then_some((id, next))
+            })
+            .collect();
+        // VERA network adaptation: the key's store is local to one client, so
+        // a network game keeps it in the local player's slot, off +214.
+        let local = self.session.execution_topology().is_lockstep();
+        for (id, group) in changes {
+            let entity = self.substrate.entities.get_mut(id).unwrap();
+            if local {
+                entity.assign_local_control_group(group);
+            } else {
+                entity.assign_object_group(group);
+            }
+        }
+        true
+    }
+
+    /// The Construction Yard repack checks in the ground-click arm
+    /// (`0x0044374F`), the rally search miss (`0x00443A8B`), and the
+    /// non-rally controllability arm (`0x0044F5F3`).
+    pub fn can_redeploy_construction_yard_from_input(
+        &self,
+        yard: &GameEntity,
+        control: Option<&ControlProjection<'_>>,
+    ) -> bool {
+        self.session
+            .rule_policy()
+            .allows_construction_yard_redeploy()
+            && self.construction_yard_redeploy_core_gate(
+                yard,
+                self.owner_is_human(yard.owner())
+                    || control.is_some_and(|view| view.has_delegated_full_control(yard.owner())),
+            )
+    }
+
+    /// Virtual+A0: Building44F5C0 or Unit/Infantry/Aircraft Techno700C40.
+    /// This is producer-side control admission; Event/lifecycle admission is separate.
+    /// House50B6F0, bunker link, Spawned, paralysis, warp, slave ownership and
+    /// launched-missile count remain with their existing authoritative owners.
+    ///
+    /// Ordinary Infantry +504 EMP starts zero in the native constructor.
+    /// EMPulseApply4C575E admits RTTI1/2, not Infantry15. The deactivated
+    /// latch +1C8 (700CBC) has its owner in `sim::powered_unit`.
+    /// vt+0x37C (700C58) is `GameEntity::is_under_emp`: EMP, which only Ares
+    /// currently supplies, or a Unit's running `DeathFrames=` counter.
+    /// Arbitrary authored native raw-save bytes are outside this producer.
+    /// See engineer_bridge_cursor_caller.md for executed gate controls/bounds.
+    pub fn techno_player_controllable(&self, id: u64, rules: &RuleSet) -> bool {
+        self.techno_controllable_for(id, rules, None, |owner| self.house_is_human_player(owner))
+    }
+
+    pub fn local_techno_controllable(&self, id: u64, rules: &RuleSet) -> bool {
+        self.local_techno_controllable_with(&self.control_projection(), id, rules)
+    }
+
+    pub fn local_techno_controllable_with(
+        &self,
+        control: &ControlProjection<'_>,
+        id: u64,
+        rules: &RuleSet,
+    ) -> bool {
+        if !self.session.has_custom_control_grants() {
+            return self.techno_player_controllable(id, rules);
+        }
+        self.substrate
+            .entities
+            .get(id)
+            .is_some_and(|actor| control.can_order(actor.owner()))
+            && self.techno_controllable_for(id, rules, Some(control), |_| true)
+    }
+
+    fn techno_controllable_for(
+        &self,
+        id: u64,
+        rules: &RuleSet,
+        control: Option<&ControlProjection<'_>>,
+        player_actor: impl FnOnce(InternedId) -> bool,
+    ) -> bool {
+        let Some(actor) = self.substrate.entities.get(id) else {
+            return false;
+        };
+        let Some(object) = self.object_type(actor.type_ref(), rules) else {
+            return false;
+        };
+        if actor.category() == EntityCategory::Structure {
+            // Steam gamemd: Building44F5C0, complete original control
+            // vectors in procedural_drawing_oracle/factory_destination.py --control.
+            // Buildings are outside the current Ares ground-victim producer;
+            // their EMP-specific control arm remains the constructor-zero subset.
+            // HasRallyPoint455DA0 bypasses the ConYard and House50B730 tests.
+            if object.has_rally_line() {
+                return true;
+            }
+            if object.construction_yard
+                && !self.can_redeploy_construction_yard_from_input(actor, control)
+            {
+                return false;
+            }
+            return crate::sim::production::undeploy_target(rules, &object.id).is_some();
+        }
+        if !player_actor(actor.owner()) || actor.bunker.link().installed_in().is_some() {
+            return false;
+        }
+        if object.spawned
+            || actor.parasite.is_paralyzed(self.session.binary_frame())
+            || actor.is_warped_out()
+            || actor.is_warping_in()
+            || actor.seldom.slave.owner().is_some()
+            || actor.deactivated.is_offline()
+            || actor.is_under_emp()
+        {
+            return false;
+        }
+        if let Some(manager) = actor.spawn_manager.as_ref() {
+            let count =
+                manager.count_launched_missiles(&self.substrate.entities, rules, &self.interner)
+                    as i32;
+            if count > 0 && count < object.spawns_number {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// `TechnoClass::IsActive @ 0x007010D0` (vt+0x9C, no override): not
+    /// deactivated (`+0x1C8`), owned by the player's house (`0x0050B6F0`),
+    /// its current weapon (vt+0x3F4) typed and not vt+0x37C
+    /// (`GameEntity::is_under_emp`). `is_armed` stands in for the weapon test.
+    pub fn techno_is_active(&self, id: u64, rules: &RuleSet) -> bool {
+        self.techno_active_for(id, rules, |owner| self.house_is_human_player(owner))
+    }
+
+    pub fn local_techno_is_active(&self, id: u64, rules: &RuleSet) -> bool {
+        self.local_techno_is_active_with(&self.control_projection(), id, rules)
+    }
+
+    pub fn local_techno_is_active_with(
+        &self,
+        control: &ControlProjection<'_>,
+        id: u64,
+        rules: &RuleSet,
+    ) -> bool {
+        self.techno_active_for(id, rules, |owner| control.can_order(owner))
+    }
+
+    fn techno_active_for(
+        &self,
+        id: u64,
+        rules: &RuleSet,
+        player_actor: impl FnOnce(InternedId) -> bool,
+    ) -> bool {
+        let Some(actor) = self.substrate.entities.get(id) else {
+            return false;
+        };
+        !actor.deactivated.is_offline()
+            && !actor.is_under_emp()
+            && player_actor(actor.owner())
+            && self
+                .object_type(actor.type_ref(), rules)
+                .is_some_and(|object| {
+                    combat::combat_weapon::is_armed(
+                        actor,
+                        object,
+                        &self.substrate.entities,
+                        rules,
+                        &self.interner,
+                    )
+                })
+    }
+
+    /// Ares `InfantryExt::GetEngineerEnterEnemyBuildingAction @ 10025220`:
+    /// outside a campaign, and in skirmish only with MultiEngineer, a
+    /// hostile building above `EngineerCaptureLevel` (Health over Strength in
+    /// float precision) is damaged, or barred while `EngineerDamage` is 0,
+    /// unless `EngineerAlwaysCaptureTech` holds for a building whose
+    /// initial owner (`+0x14C`) is `MultiplayPassive=`. Otherwise it is
+    /// captured.
+    pub(crate) fn ares_engineer_enemy_building_action(
+        &self,
+        building_id: u64,
+        rules: &RuleSet,
+    ) -> EngineerBuildingAction {
+        let allow_damage = !self.session.uses_campaign_world()
+            && (self.session.execution_topology().is_lockstep()
+                || self.session.game_options().multi_engineer);
+        let Some(building) = self.substrate.entities.get(building_id) else {
+            return EngineerBuildingAction::Capture;
+        };
+        let Some(object) = self.object_type(building.type_ref(), rules) else {
+            return EngineerBuildingAction::Capture;
+        };
+        let globals = rules.ares_building_globals();
+        let tech = self
+            .houses
+            .get(&building.initial_owner())
+            .is_some_and(|house| house.multiplay_passive());
+        let ratio = building.health.current() as f32 / object.strength as f32;
+        if allow_damage
+            && (!tech || !globals.engineer_always_capture_tech)
+            && f32::from_bits(rules.general.engineer_capture_level.bits()) < ratio
+        {
+            return if f64::from_bits(globals.engineer_damage.bits()) > 0.0 {
+                EngineerBuildingAction::Damage
+            } else {
+                EngineerBuildingAction::NoEnter
+            };
+        }
+        EngineerBuildingAction::Capture
+    }
+
+    /// Ares 3.0 `InfantryClass_GetActionOnObject_EngineerOverFriendlyBuilding
+    /// @ 10025420` (hook `0x51E635`): an Engineer over a `Rubble.Intact` or
+    /// `Rubble.Intact.Remove` building whose house is allied with it (the
+    /// building's owner asks) repairs it at any health.
+    pub fn ares_engineer_repairs_rubble(
+        &self,
+        actor_id: u64,
+        target_id: u64,
+        rules: &RuleSet,
+    ) -> bool {
+        let (Some(actor), Some(target)) = (
+            self.substrate.entities.get(actor_id),
+            self.substrate.entities.get(target_id),
+        ) else {
+            return false;
+        };
+        self.object_type(target.type_ref(), rules)
+            .is_some_and(|object| object.building_type_ext().rubble_intact.applies())
+            && self
+                .house_alliances
+                .is_allied(&self.interner, target.owner(), actor.owner())
+    }
+
+    /// Object-route Engineer action in Infantry51E49E..51E637. Ordinary
+    /// action/threshold vectors: engineer_repair_joined; hut caller/display
+    /// vectors: engineer_bridge_cursor_caller; shared geometric query:
+    /// bridge_repair_query. Repair(false) is terminal action32.
+    /// Admission belongs to the input producer, before a delayed mission event.
+    pub fn engineer_building_action(
+        &self,
+        actor_id: u64,
+        target_id: u64,
+        rules: &RuleSet,
+    ) -> Option<EngineerBuildingAction> {
+        self.engineer_building_action_with(&self.control_projection(), actor_id, target_id, rules)
+    }
+
+    pub fn engineer_building_action_with(
+        &self,
+        control: &ControlProjection<'_>,
+        actor_id: u64,
+        target_id: u64,
+        rules: &RuleSet,
+    ) -> Option<EngineerBuildingAction> {
+        let actor = self.substrate.entities.get(actor_id)?;
+        if actor.category() != EntityCategory::Infantry
+            || !self.object_type(actor.type_ref(), rules)?.engineer
+            || !control.can_order(actor.owner())
+        {
+            return None;
+        }
+        let target = self.substrate.entities.get(target_id)?;
+        if target.category() != EntityCategory::Structure {
+            return None;
+        }
+        let object = self.object_type(target.type_ref(), rules)?;
+        // Ares 3.0 10014850 (hook 0x51E4ED): `EngineerRepairable`, default
+        // `Repairable=`.
+        let repairable = if rules.ares() {
+            object
+                .building_type_ext()
+                .engineer_repairable(object.repairable)
+        } else {
+            object.repairable
+        };
+        if object.is_1x1_with_undeploy() || !repairable {
+            return None;
+        }
+        if !object.bridge_repair_hut {
+            let allied =
+                self.house_alliances
+                    .is_allied(&self.interner, actor.owner(), target.owner());
+            let passive_occupation = self
+                .houses
+                .get(&target.owner())
+                .is_some_and(|house| house.multiplay_passive())
+                && object.can_be_occupied
+                && !target.is_warped_out();
+            if !allied && !passive_occupation {
+                if !object.capturable {
+                    return None;
+                }
+                // Ares 3.0 10025540/10025550 (hooks 0x51E5BB, 0x51E5E1): the
+                // action is GetEngineerEnterEnemyBuildingAction's.
+                if rules.ares() {
+                    return Some(self.ares_engineer_enemy_building_action(target_id, rules));
+                } else {
+                    //51E5C6 compares threshold < health ratio (C0), not the
+                    //opposite. Equality returns Capture; masked NaN keeps C0=1.
+                    use crate::util::native_x87::{MaskedX87Chop53 as X87, MaskedX87Ordering};
+                    return Some(
+                        if matches!(
+                            X87::compare(
+                                X87::load_f32(rules.general.engineer_capture_level),
+                                target.health.ratio(object.strength),
+                            ),
+                            MaskedX87Ordering::Less | MaskedX87Ordering::Unordered
+                        ) {
+                            EngineerBuildingAction::Damage
+                        } else {
+                            EngineerBuildingAction::Capture
+                        },
+                    );
+                }
+            }
+            //ConditionGreen is the native forced1.0, not an authored key.
+            if object.hospital
+                && !actor
+                    .health
+                    .is_full(self.object_type(actor.type_ref(), rules)?.strength)
+            {
+                return Some(EngineerBuildingAction::EnterHospital);
+            }
+            // Ares 3.0 10025420 (hook 0x51E635): over a rubble its house is
+            // allied with, the repair action at any health; the cursor shows
+            // RepairTrench (`app::input::ares_cursor`).
+            if rules.ares() && self.ares_engineer_repairs_rubble(actor_id, target_id, rules) {
+                return Some(EngineerBuildingAction::Repair(true));
+            }
+            let full = matches!(
+                target.health.compare_ratio(object.strength, 1.0),
+                crate::util::native_x87::MaskedX87Ordering::Equal
+                    | crate::util::native_x87::MaskedX87Ordering::Unordered
+            );
+            return Some(if !full {
+                EngineerBuildingAction::Repair(true)
+            } else if object.grinding || (rules.ra2() && object.cloning) {
+                EngineerBuildingAction::EnterGrinder
+            } else {
+                EngineerBuildingAction::Repair(false)
+            });
+        }
+        let coord = crate::sim::movement::ground_pose::object_get_coords(
+            target,
+            self.resolved_terrain.as_ref(),
+        );
+        //51E52F..51E547: signed truncation by256 then packed-word narrowing.
+        Some(EngineerBuildingAction::Repair(
+            crate::sim::world::bridge_orchestrator::bridge_hut_can_repair(
+                self,
+                ((coord.x / 256) as u16, (coord.y / 256) as u16),
+            ),
+        ))
+    }
+
+    /// `InfantryClass::What_Action_OnObject`'s infiltration arm
+    /// (`0x0051EE3B..0x0051EEEF`): the local player's (`0x0050B6F0`)
+    /// `Infiltrate=` infantryman over a building its own house is not allied
+    /// to (`0x004F9A90`, one-way) that takes it — `Spyable=` for an `Agent=`
+    /// one, `Capturable=` for any other — turns its Attack action (5) into
+    /// Capture (9). Its base action is Attack there because
+    /// `TechnoClass::What_Action_OnObject` keeps Attack despite an ILLEGAL
+    /// fire error for exactly those flags (`0x007004A0..0x00700531`,
+    /// `0x00700548`); that function's other gates are the input producer's
+    /// hover classification and modifiers. The
+    /// foundation-zone search that follows (`0x0051EEFA..0x0051F04B`) only
+    /// leaves its loop: the action stays 9.
+    pub fn infiltrator_building_action(
+        &self,
+        actor_id: u64,
+        target_id: u64,
+        rules: &RuleSet,
+    ) -> bool {
+        self.infiltrator_building_action_with(
+            &self.control_projection(),
+            actor_id,
+            target_id,
+            rules,
+        )
+    }
+
+    pub fn infiltrator_building_action_with(
+        &self,
+        control: &ControlProjection<'_>,
+        actor_id: u64,
+        target_id: u64,
+        rules: &RuleSet,
+    ) -> bool {
+        let (Some(actor), Some(target)) = (
+            self.substrate.entities.get(actor_id),
+            self.substrate.entities.get(target_id),
+        ) else {
+            return false;
+        };
+        if actor.category() != EntityCategory::Infantry
+            || target.category() != EntityCategory::Structure
+            || !control.can_order(actor.owner())
+        {
+            return false;
+        }
+        let (Some(infantry), Some(building)) = (
+            self.object_type(actor.type_ref(), rules),
+            self.object_type(target.type_ref(), rules),
+        ) else {
+            return false;
+        };
+        let allied = self
+            .house_alliances
+            .is_allied(&self.interner, actor.owner(), target.owner());
+        // Ares 3.0 10025FC0 (hook 0x0051EE6B) asks the shared Ares
+        // classification instead of the type flags.
+        if rules.ares() {
+            infantry.infiltrate
+                && !allied
+                && self.infiltrate_action(actor_id, target_id, rules) != InfiltrateAction::None
+        } else {
+            infiltrator_admits(infantry, building) && !allied
+        }
+    }
+
+    /// `InfantryExt::GetInfiltrateAction @ 100252D0`, in its order:
+    /// - C4: the type's `C4=` (`+0xEC2`) or a rank holding the C4 ability
+    ///   ([`combat::veterancy::holds_c4`]), over a `CanC4=` building
+    ///   (`+0x1577`).
+    /// - Spy: an `Agent=` one (`+0xEC4`) over a `Spyable=` building
+    ///   (`+0x1576`) of a house its own is not allied to (`IsAlliedWith`).
+    /// - Sabotage: a `Saboteur=` one over a building it may blow up
+    ///   (`BuildingTypeExt::IsSabotagable @ 1000D790`).
+    /// - Capture: one that is neither over a `Capturable=` building
+    ///   (`+0x1572`).
+    ///
+    /// None for anything else, or when either object is missing or the
+    /// target is not a building. It asks neither `Infiltrate=` nor the
+    /// owner's control; its callers do.
+    pub fn infiltrate_action(
+        &self,
+        infantry_id: u64,
+        building_id: u64,
+        rules: &RuleSet,
+    ) -> InfiltrateAction {
+        let (Some(infantry), Some(building)) = (
+            self.substrate.entities.get(infantry_id),
+            self.substrate.entities.get(building_id),
+        ) else {
+            return InfiltrateAction::None;
+        };
+        if building.category() != EntityCategory::Structure {
+            return InfiltrateAction::None;
+        }
+        let (Some(kind), Some(target)) = (
+            self.object_type(infantry.type_ref(), rules),
+            self.object_type(building.type_ref(), rules),
+        ) else {
+            return InfiltrateAction::None;
+        };
+        if combat::veterancy::holds_c4(infantry.veterancy.rank_kind(), kind) && target.can_c4 {
+            return InfiltrateAction::C4;
+        }
+        if kind.agent
+            && target.spyable
+            && !self
+                .house_alliances
+                .is_allied(&self.interner, infantry.owner(), building.owner())
+        {
+            return InfiltrateAction::Spy;
+        }
+        let saboteur = kind.saboteur();
+        if saboteur && target.infiltration_rules().sabotagable(target) {
+            return InfiltrateAction::Sabotage;
+        }
+        if !kind.agent && !saboteur && target.capturable {
+            return InfiltrateAction::Capture;
+        }
+        InfiltrateAction::None
+    }
+
+    /// `InfantryClass::Assign_Target`'s infiltration arm
+    /// (`0x0051B2B1..0x0051B33F`), after the Techno base write: the building
+    /// an `Infiltrate=` infantryman with no NavCom (`+0x5A4`) heads for when
+    /// handed `target` (vt+0x480(target, 1)), if `infiltrator_admits` it.
+    /// Unlike the click's arm ([`Self::infiltrator_building_action`]), it asks
+    /// neither the owner's control nor alliance. Every path through the
+    /// setter's tail then clears the automatic Tesla charging latch `+0x68E`.
+    pub(crate) fn infiltrator_target_building(
+        &self,
+        actor_id: u64,
+        target: Option<crate::sim::combat::TargetKind>,
+        rules: &RuleSet,
+    ) -> Option<u64> {
+        let Some(crate::sim::combat::TargetKind::Entity(building_id)) = target else {
+            return None;
+        };
+        let actor = self.substrate.entities.get(actor_id)?;
+        let building = self.substrate.entities.get(building_id)?;
+        if actor.category() != EntityCategory::Infantry
+            || actor.navigation.nav_com().is_some()
+            || building.category() != EntityCategory::Structure
+        {
+            return None;
+        }
+        // Ares 3.0 10026080 (hook 0x0051B2CB): after the `Infiltrate=`
+        // test, every action but C4 heads for the building.
+        if rules.ares() {
+            (self.object_type(actor.type_ref(), rules)?.infiltrate
+                && matches!(
+                    self.infiltrate_action(actor_id, building_id, rules),
+                    InfiltrateAction::Spy | InfiltrateAction::Sabotage | InfiltrateAction::Capture
+                ))
+            .then_some(building_id)
+        } else {
+            infiltrator_admits(
+                self.object_type(actor.type_ref(), rules)?,
+                self.object_type(building.type_ref(), rules)?,
+            )
+            .then_some(building_id)
         }
     }
 
@@ -71,272 +1936,32 @@ impl Simulation {
         &mut self,
         owner: InternedId,
         cell: (u16, u16),
-        building_cell: (u16, u16),
+        hut_location: crate::sim::anim_class::AnimWorldCoord,
     ) {
-        let radar = self.bridge_repair_notification_allowed(owner).then(|| {
+        let radar = self.house_is_human_player(owner).then(|| {
             crate::sim::radar::RadarEventRequest::new(
                 crate::sim::radar::RadarEventType::BridgeRepaired,
                 cell.0,
                 cell.1,
             )
         });
-        self.sound_events.push(SimSoundEvent::BridgeRepaired {
-            rx: building_cell.0,
-            ry: building_cell.1,
-            owner,
+        self.sound_events.emit(SimSoundEvent::BridgeRepaired {
+            world: hut_location,
             radar,
         });
-    }
-
-    /// Pre-combat: entities with an OrderIntent but no current AttackTarget
-    /// try to acquire a nearby enemy to engage.
-    ///
-    /// The `order_intent.is_some()` selector is retired in spirit (the busy role
-    /// moves to the `mission` substrate) but kept unchanged in code: `OrderIntent`
-    /// carries the AttackMove/Guard *coords* that `MissionType` cannot encode.
-    /// Full retirement (a goal field on the mission/nav substrate) is a later slice.
-    pub(crate) fn tick_order_intents_pre_combat(
-        &mut self,
-        rules: &RuleSet,
-        overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
-        turn_suppressed: &BTreeSet<u64>,
-    ) {
-        // Collect attacker candidates from EntityStore.
-        let keys: Vec<u64> = self.substrate.entities.keys_sorted();
-        let mut attacker_ids: Vec<u64> = Vec::new();
-        for &id in &keys {
-            if turn_suppressed.contains(&id) {
-                continue;
-            }
-            if let Some(entity) = self.substrate.entities.get(id) {
-                // A warped object's missions do not run (`ai_frozen`), nor
-                // does a Health-0 wreck's (`MissionClass::AI @ 0x005B30A7`).
-                if entity.order_intent.is_some()
-                    && entity.attack_target.is_none()
-                    && !entity.ai_frozen()
-                    && super::techno_ai::mission_handlers_run(self, id)
-                {
-                    attacker_ids.push(id);
-                }
-            }
-        }
-
-        for attacker_id in attacker_ids {
-            let Some(scan_mask) = self
-                .substrate
-                .entities
-                .get(attacker_id)
-                .map(combat::scan_mission_for)
-            else {
-                continue;
-            };
-            let Some(target_sid) = self.greatest_threat_represented(
-                rules,
-                overlay_registry,
-                attacker_id,
-                scan_mask,
-                None,
-                combat::acquire_best_target_for_entity,
-            ) else {
-                continue;
-            };
-            let _ = self.assign_target_represented(
-                attacker_id,
-                Some(combat::TargetKind::Entity(target_sid)),
-                Some(rules),
-            );
-        }
-    }
-
-    /// Post-combat: entities with an OrderIntent but no active attack or movement
-    /// resume their patrol/guard movement toward the original goal. The resume
-    /// coords stay on `OrderIntent` — the `mission` substrate has no goal field
-    /// yet (Slice-8 follow-up); only the busy-signalling role moved off it.
-    #[cfg(test)]
-    pub(crate) fn tick_order_intents_post_combat(&mut self, rules: Option<&RuleSet>) {
-        self.tick_order_intents_post_combat_except(rules, &BTreeSet::new());
-    }
-
-    pub(crate) fn tick_order_intents_post_combat_except(
-        &mut self,
-        rules: Option<&RuleSet>,
-        turn_suppressed: &BTreeSet<u64>,
-    ) {
-        // Without a published grid no order resumes (air resumes included).
-        if self.path_grid().is_none() {
-            return;
-        }
-        // Collect (stable_id, goal) for entities that need to resume movement.
-        let keys: Vec<u64> = self.substrate.entities.keys_sorted();
-        let mut resumes: Vec<(u64, u16, u16)> = Vec::new();
-        for &id in &keys {
-            if turn_suppressed.contains(&id) {
-                continue;
-            }
-            if let Some(entity) = self.substrate.entities.get(id) {
-                let intent = match entity.order_intent {
-                    Some(ref i) => *i,
-                    None => continue,
-                };
-                if entity.attack_target.is_some()
-                    || entity.movement_target.is_some()
-                    || entity.ai_frozen()
-                    || !super::techno_ai::mission_handlers_run(self, id)
-                {
-                    continue;
-                }
-                match intent {
-                    OrderIntent::AttackMove { goal_rx, goal_ry }
-                        if (entity.position.rx, entity.position.ry) != (goal_rx, goal_ry) =>
-                    {
-                        resumes.push((id, goal_rx, goal_ry));
-                    }
-                    OrderIntent::Guard {
-                        anchor_rx,
-                        anchor_ry,
-                    } if (entity.position.rx, entity.position.ry) != (anchor_rx, anchor_ry) => {
-                        resumes.push((id, anchor_rx, anchor_ry));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        for (stable_id, goal_rx, goal_ry) in resumes {
-            let (speed, is_air) = self
-                .substrate
-                .entities
-                .get(stable_id)
-                .map(|e| {
-                    // A resumed order re-queries the getter like any other.
-                    let obj = rules.and_then(|r| self.object_type(e.type_ref(), r));
-                    let air: bool = e
-                        .locomotor
-                        .as_ref()
-                        .is_some_and(|l| l.layer == MovementLayer::Air);
-                    (crate::sim::movement::order_speed(e, obj, rules), air)
-                })
-                .unwrap_or((ra2_speed_to_leptons_per_second(4), false));
-
-            if is_air {
-                let _ =
-                    self.issue_air_cell_destination(stable_id, (goal_rx, goal_ry), speed, rules);
-            } else {
-                let _ = self.issue_ground_move(
-                    GroundMove {
-                        entity_id: stable_id,
-                        target: (goal_rx, goal_ry),
-                        speed,
-                        queue: false,
-                        speed_type: None,
-                        owner_blocks: false,
-                        object_destination: None,
-                    },
-                    rules,
-                );
-            }
-        }
-    }
-
-    /// Tick engineer capture orders: check if any engineer with a capture_target
-    /// has arrived adjacent to its target building. If so, transfer ownership and
-    /// consume the engineer.
-    ///
-    /// `BridgeRepairHut=yes` targets belong to the ordinary Walk/Infantry
-    /// PerCell2 receiver, which repairs and consumes the Engineer inside the
-    /// hut. This adjacent capture pass cannot capture or move toward a hut.
-    /// Returns true if any capture occurred (triggers atlas rebuild for new owner color).
-    pub(crate) fn tick_capture_orders(
-        &mut self,
-        rules: &RuleSet,
-        turn_suppressed: &BTreeSet<u64>,
-    ) -> bool {
-        let mut any_captured = false;
-        // Snapshot engineers with active capture targets.
-        let captures: Vec<(u64, u64, InternedId)> = self
-            .substrate
-            .entities
-            .values()
-            .filter(|e| {
-                e.capture_target.is_some()
-                    && !e.dying
-                    // A warped engineer never reaches PerCellProcess.
-                    && !e.ai_frozen()
-                    && !turn_suppressed.contains(&e.stable_id())
-            })
-            .map(|e| (e.stable_id(), e.capture_target.unwrap(), e.owner()))
-            .collect();
-
-        for (engineer_id, building_id, engineer_owner) in captures {
-            // Skip BridgeRepairHut targets — repair tick handles them.
-            let target_bridge_hut = self
-                .substrate
-                .entities
-                .get(building_id)
-                .and_then(|b| {
-                    self.object_type(b.type_ref(), rules)
-                        .map(|t| t.bridge_repair_hut)
-                })
-                .unwrap_or(false);
-            if target_bridge_hut {
-                continue;
-            }
-
-            // Check building still exists and is capturable.
-            let building_ok = self
-                .substrate
-                .entities
-                .get(building_id)
-                .is_some_and(|b| b.category == EntityCategory::Structure && !b.dying);
-            if !building_ok {
-                // Target lost — clear capture order.
-                if let Some(e) = self.substrate.entities.get_mut(engineer_id) {
-                    e.capture_target = None;
-                }
-                continue;
-            }
-
-            // Distance check: adjacent = Chebyshev distance <= 1 cell.
-            let (eng_rx, eng_ry) = self
-                .substrate
-                .entities
-                .get(engineer_id)
-                .map(|e| (e.position.rx, e.position.ry))
-                .unwrap_or((0, 0));
-            let (bld_rx, bld_ry) = self
-                .substrate
-                .entities
-                .get(building_id)
-                .map(|e| (e.position.rx, e.position.ry))
-                .unwrap_or((0, 0));
-            let dx = (eng_rx as i32 - bld_rx as i32).abs();
-            let dy = (eng_ry as i32 - bld_ry as i32).abs();
-
-            // InfantryClass::PerCellProcess turns the engineer away from a
-            // building being warped (`0x00519EF2`): no capture.
-            let target_warped = self
-                .substrate
-                .entities
-                .get(building_id)
-                .is_some_and(crate::sim::game_entity::GameEntity::is_warped_out);
-            if dx <= 1 && dy <= 1 && !target_warped {
-                self.announce_engineer_capture(building_id, engineer_owner, rules);
-                // CAPTURE: the ownership chokepoint moves HouseState counts
-                // and the entity owner exactly once.
-                self.change_owner_with_rules(building_id, engineer_owner, rules);
-                // Destroy engineer (consumed on capture).
-                self.uninit_with_rules(engineer_id, rules);
-                any_captured = true;
-            }
-        }
-        any_captured
     }
 
     /// `BuildingClass::ChangeOwner @ 0x00448260` announce block
     /// (`0x004483C0..0x0044848F`), run before the owner swap because native
     /// reads `this->Owner` (the OLD owner) there. The engineer capture site
-    /// (`InfantryClass::PerCellProcess 0x00519A27 PUSH 1`) passes
-    /// announce=true. Native gates: the old or the new owner is the local
+    /// (`InfantryClass::PerCellProcess 0x00519F79 PUSH 1`) passes
+    /// announce=true, and so do mind control's two (`CaptureManagerClass::
+    /// CaptureUnit 0x00471DAE`, `FreeUnit 0x004720D5`) and the unported
+    /// infantry takeover of a 1x1 `UndeploysInto=` building (`0x00519A27`,
+    /// see `infantry_per_cell_process`). The remaining callers that can reach
+    /// a building pass 0 (abandon `0x004582E6`/`0x00458316`, house transfer
+    /// `0x0050D2A3`/`0x0050D2F0`, trigger actions `0x006E0B33`/`0x006E0C03`/
+    /// `0x006E0C6A`). Native gates: the old or the new owner is the local
     /// player (`0x004483C6`/`0x004483D1 CALL 0x0050B6F0`) and the new
     /// owner's type is not `MultiplayPassive` (`0x004483E1 HouseType+0x1A6`).
     /// The sim has no local player, so it pre-filters on a human-controlled
@@ -350,7 +1975,7 @@ impl Simulation {
     /// dedupe, so on stock data the radar accepts every capture. The type's
     /// `CaptureEvaEvent=` (`Type+0x1554`, `0x00448443..0x00448459`) rides
     /// along for the app's local-new-owner branch.
-    pub(crate) fn announce_engineer_capture(
+    pub(crate) fn announce_building_capture(
         &mut self,
         building_id: u64,
         new_owner: InternedId,
@@ -360,26 +1985,20 @@ impl Simulation {
             .substrate
             .entities
             .get(building_id)
-            .map(|e| (e.owner(), e.type_ref(), e.position.rx, e.position.ry))
+            .map(|e| (e.owner(), e.type_ref(), e.position.rx(), e.position.ry()))
         else {
             return;
         };
         if old_owner == new_owner {
             return;
         }
-        let game_mode_nonzero = self.session.game_mode_nonzero;
-        let human = |sim: &Self, house: InternedId| {
-            sim.houses
-                .get(&house)
-                .is_some_and(|h| h.is_controlled_by_human(game_mode_nonzero))
-        };
-        if !(human(self, old_owner) || human(self, new_owner)) {
+        if !(self.owner_is_human(old_owner) || self.owner_is_human(new_owner)) {
             return;
         }
         if self
             .houses
             .get(&new_owner)
-            .is_some_and(|h| h.multiplay_passive)
+            .is_some_and(|h| h.multiplay_passive())
         {
             return;
         }
@@ -388,6 +2007,29 @@ impl Simulation {
             .map(|obj| (obj.needs_engineer, obj.capture_eva_event.clone()))
             .unwrap_or((false, None));
         let capture_eva_event = capture_eva_event.map(|name| self.interner.intern(&name));
+        // Ares 3.0 10013E40 (hook 0x0044840B): the tech block's LostEvaEvent
+        // and Message.Lost/Message.Capture labels.
+        let ares_tech = if rules.ares() {
+            let (lost_eva, labels) = self
+                .object_type(type_ref, rules)
+                .map(|obj| {
+                    let ext = obj.building_type_ext();
+                    (
+                        obj.lost_eva().map(str::to_owned),
+                        [ext.message_lost.clone(), ext.message_capture.clone()],
+                    )
+                })
+                .unwrap_or_default();
+            let [lost, capture] =
+                labels.map(|label| (!label.is_empty()).then(|| self.interner.intern(&label)));
+            crate::sim::world::AresTechCaptureLines {
+                lost_eva_event: lost_eva.map(|name| self.interner.intern(&name)),
+                message_lost: lost,
+                message_capture: capture,
+            }
+        } else {
+            crate::sim::world::AresTechCaptureLines::default()
+        };
         let radar = (!tech_building).then(|| {
             crate::sim::radar::RadarEventRequest::new(
                 crate::sim::radar::RadarEventType::BuildingCaptured,
@@ -395,12 +2037,13 @@ impl Simulation {
                 ry,
             )
         });
-        self.sound_events.push(SimSoundEvent::BuildingCaptured {
+        self.sound_events.emit(SimSoundEvent::BuildingCaptured {
             old_owner,
             new_owner,
             tech_building,
             radar,
             capture_eva_event,
+            ares_tech,
         });
     }
 
@@ -421,29 +2064,25 @@ impl Simulation {
         ) {
             return InfantryPerCellBuildingAdmission::MissionNotAdmitted;
         }
-        let nav_object = match infantry.navigation.nav_com {
-            Some(
-                NavTargetRef::Entity { id }
-                | NavTargetRef::Object { id }
-                | NavTargetRef::Building { id },
-            ) => Some(id),
-            _ => None,
-        };
+        let nav_object = infantry
+            .navigation
+            .nav_com()
+            .and_then(NavTargetRef::object_id);
         //519987 tests Techno RTTI bit1, not cell_marked. Building+80 is
         //457620 ->465D40;5199B8 also requires Building RTTI6 before the
         //separate5199A6 conversion/destination continuation can proceed,
         //which must not be treated as ordinary bridge repair. Stock CABHUT
-        //has no UndeploysInto. Existing regular capture remains separately
-        //owned by tick_capture_orders; this does not port that native branch.
+        //has no UndeploysInto. One-cell building conversion remains a separate mechanism; ordinary
+        //Engineer entry below shares this admitted ground-building identity.
         if let Some(target) = nav_object.and_then(|id| self.substrate.entities.get(id))
-            && target.category == EntityCategory::Structure
+            && target.category() == EntityCategory::Structure
             && self
                 .object_type(target.type_ref(), rules)
                 .is_some_and(|object| object.is_1x1_with_undeploy())
         {
             return InfantryPerCellBuildingAdmission::UndeployBuilding;
         }
-        let cell = (infantry.position.rx, infantry.position.ry);
+        let cell = (infantry.position.rx(), infantry.position.ry());
         let Some(building_id) =
             self.substrate
                 .occupancy
@@ -452,8 +2091,8 @@ impl Simulation {
             return InfantryPerCellBuildingAdmission::NoMatchingGroundBuilding;
         };
         if nav_object == Some(building_id)
-            || infantry.attack_target.as_ref().is_some_and(|attack| {
-                matches!(attack.target, crate::sim::combat::TargetKind::Entity(id) if id == building_id)
+            || infantry.attack_target.target().is_some_and(|attack| {
+                matches!(attack, crate::sim::combat::TargetKind::Entity(id) if id == building_id)
             })
         {
             InfantryPerCellBuildingAdmission::GroundBuilding(building_id)
@@ -462,331 +2101,545 @@ impl Simulation {
         }
     }
 
-    /// Ordinary Infantry PerCell2 engineer receiver. The active object cursor
+    /// `0x0051A071..0x0051A0CE`, where the building receiver finds no
+    /// building of his (none in his cell, or one that is neither his NavCom
+    /// nor his Target): on Capture, Area Guard or Patrol (Get_Mission) with
+    /// no NavCom, he enters idle mode (`Enter_Idle_Mode(0, 1)`, `0x0051A08C`,
+    /// [`Self::infantry_enter_idle_mode`]) unless his current mission
+    /// (`+0xAC`) is Area Guard; then, standing in a building's cell (the
+    /// first Building `0x0047C520` of Map[Location]), he takes
+    /// `Scatter(null, 1, 0)` (`0x0051A0CE`). The visit carries on to the
+    /// Enter arm. An Engineer whose hut target a repair cancelled reaches
+    /// this in the hut.
+    fn infantry_per_cell_no_destination(
+        &mut self,
+        id: u64,
+        rules: &RuleSet,
+        registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+        frame_effects: &mut FrameEffects<'_>,
+    ) -> Result<BuildingEntryResult, super::FrameAdvanceError> {
+        let Some(infantry) = self.substrate.entities.get(id) else {
+            return Ok(BuildingEntryResult::default());
+        };
+        if infantry.navigation.nav_com().is_some() {
+            return Ok(BuildingEntryResult::default());
+        }
+        if infantry.mission.current().known() != Some(MissionType::AreaGuard) {
+            self.infantry_enter_idle_mode(id, rules, registry, frame_effects);
+        }
+        let Some(infantry) = self.substrate.entities.get(id) else {
+            return Ok(BuildingEntryResult::default());
+        };
+        let at = crate::sim::movement::ground_pose::position_world_coord(&infantry.position);
+        let cell = ((at.x / 256) as i16 as u16, (at.y / 256) as i16 as u16);
+        if self
+            .substrate
+            .occupancy
+            .first_building_on_layer(cell.0, cell.1, MovementLayer::Ground)
+            .is_none()
+        {
+            return Ok(BuildingEntryResult::default());
+        }
+        let bridge_state_changed = self
+            .scatter(
+                id,
+                None,
+                crate::sim::movement::ScatterFlags::new(true, false),
+                rules,
+                registry,
+                frame_effects,
+            )
+            .map_err(|cause| super::FrameAdvanceError {
+                tick: self.session.tick(),
+                binary_frame: self.session.binary_frame(),
+                entity_id: id,
+                cause,
+            })?;
+        Ok(BuildingEntryResult {
+            bridge_state_changed,
+            return_before_foot: false,
+        })
+    }
+
+    /// Ordinary Infantry PerCell2 building receiver (`0x00519B17..0x0051A06E`):
+    /// an Engineer's capture, repair or bridge repair, or
+    /// [`Self::infantry_per_cell_infiltrator_entry`]. The active object cursor
     /// owns removal/next-object cadence; there is no second sorted repair pass.
-    pub(crate) fn infantry_per_cell_bridge_repair(
+    /// Finding no building of his, he falls through to
+    /// [`Self::infantry_per_cell_no_destination`].
+    pub(crate) fn infantry_per_cell_building_entry(
         &mut self,
         engineer_id: u64,
         rules: &RuleSet,
-        registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
-    ) -> Result<bool, super::FrameAdvanceError> {
+        registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+        frame_effects: &mut FrameEffects<'_>,
+    ) -> Result<BuildingEntryResult, super::FrameAdvanceError> {
         let Some(engineer) = self.substrate.entities.get(engineer_id) else {
-            return Ok(false);
+            return Ok(BuildingEntryResult::default());
         };
-        if engineer.category != EntityCategory::Infantry {
-            return Ok(false);
+        if engineer.category() != EntityCategory::Infantry {
+            return Ok(BuildingEntryResult::default());
         }
-        let InfantryPerCellBuildingAdmission::GroundBuilding(building_id) =
-            self.infantry_per_cell_building_admission(engineer, rules)
-        else {
-            return Ok(false);
+        let building_id = match self.infantry_per_cell_building_admission(engineer, rules) {
+            InfantryPerCellBuildingAdmission::GroundBuilding(building_id) => building_id,
+            InfantryPerCellBuildingAdmission::NoMatchingGroundBuilding => {
+                return self.infantry_per_cell_no_destination(
+                    engineer_id,
+                    rules,
+                    registry,
+                    frame_effects,
+                );
+            }
+            InfantryPerCellBuildingAdmission::MissionNotAdmitted
+            | InfantryPerCellBuildingAdmission::UndeployBuilding => {
+                return Ok(BuildingEntryResult::default());
+            }
         };
-        //519B3E's optional hut Tag event1 precedes this type gate. The live
-        //Tag receiver remains a separate required chain; ordinary Hills has
-        //no attached hut/Engineer Tag.519B58 tests Engineer before hut type.
-        if !self
-            .object_type(engineer.type_ref(), rules)
-            .is_some_and(|t| t.engineer)
-        {
-            return Ok(false);
+        //519B3E..519B53 raises the BUILDING attachment with this Infantry
+        //as actor, before the Engineer type gate. Synchronous actions may
+        //change either object; reload the Infantry after returning.
+        let mut context = super::UninitContext::new(rules).with_effects(frame_effects);
+        self.dispatch_object_tag_event(building_id, 1, Some(engineer_id), None, context.reborrow());
+        let Some(engineer) = self.substrate.entities.get(engineer_id) else {
+            return Ok(BuildingEntryResult::default());
+        };
+        let Some(infantry_type) = self.object_type(engineer.type_ref(), rules) else {
+            return Ok(BuildingEntryResult::default());
+        };
+        if !infantry_type.engineer {
+            return self.infantry_per_cell_infiltrator_entry(
+                engineer_id,
+                building_id,
+                infantry_type.agent,
+                rules,
+                registry,
+                frame_effects,
+            );
         }
-        let cell = (engineer.position.rx, engineer.position.ry);
+        let cell = (engineer.position.rx(), engineer.position.ry());
         let owner = engineer.owner();
         let Some(building) = self.substrate.entities.get(building_id) else {
-            return Ok(false);
+            return Ok(BuildingEntryResult::default());
         };
-        if !self
-            .object_type(building.type_ref(), rules)
-            .is_some_and(|t| t.bridge_repair_hut)
-        {
-            return Ok(false);
+        let Some(object) = self.object_type(building.type_ref(), rules) else {
+            return Ok(BuildingEntryResult::default());
+        };
+        if !object.bridge_repair_hut {
+            let allied = self
+                .house_alliances
+                .is_allied(&self.interner, owner, building.owner());
+            //519D6E's passive-occupation repair branch has no warp gate.
+            let repair = allied
+                || (object.can_be_occupied
+                    && self
+                        .houses
+                        .get(&building.owner())
+                        .is_some_and(|house| house.multiplay_passive()));
+            let full = building.health.current() == object.strength;
+            let refused_capture = building.mission.current().known() == Some(MissionType::Selling)
+                || building.is_warped_out();
+            let capturable = object.capturable;
+            let native_type_index = self
+                .interner
+                .type_array_index(
+                    engineer.type_ref(),
+                    crate::rules::object_type::ObjectCategory::Infantry,
+                    rules,
+                )
+                .unwrap_or(-1);
+            let multi_engineer = if rules.ares() {
+                // Ares 3.0 InfantryClass_UpdatePosition_MultiEngineer (hook
+                // 0x519D9C): the Damage action destroys
+                // ceil(Strength * EngineerDamage) and spends him (0x51A010);
+                // anything else goes on to the capture (0x519EAA).
+                (!repair
+                    && self.ares_engineer_enemy_building_action(building_id, rules)
+                        == EngineerBuildingAction::Damage)
+                    .then(|| {
+                        let share =
+                            f64::from_bits(rules.ares_building_globals().engineer_damage.bits());
+                        (f64::from(object.strength) * share).ceil() as i32
+                    })
+            } else {
+                //519D82..519EA5: with MultiEngineer on, a hostile building above
+                //ConditionRed takes damage and consumes the Engineer before the
+                //Capturable, Selling and warp tests.
+                (!repair
+                    && self.session.game_mode_nonzero()
+                    && self.session.game_options().multi_engineer)
+                    .then(|| {
+                        multi_engineer_damage(
+                            building.health,
+                            object.strength,
+                            rules.general.condition_red,
+                        )
+                    })
+                    .flatten()
+            };
+            if let Some(damage) = multi_engineer {
+                let warhead = self.interner.intern(&rules.bridge_warheads.c4_name);
+                let receipt = self.commit_direct_damage_receiver(
+                    rules,
+                    registry,
+                    combat::EntityDamageEvent::direct_receiver(
+                        building_id,
+                        damage,
+                        0,
+                        engineer_id,
+                        None,
+                        warhead,
+                        combat::ReceiverCallFlags {
+                            ignore_defenses: true,
+                            arg6: false,
+                        },
+                    ),
+                    context.effects(),
+                );
+                //519EA5 joins the consumption at51A010.
+                self.dispatch_object_tag_event(engineer_id, 48, Some(engineer_id), None, context);
+                self.uninit_with_context(
+                    engineer_id,
+                    super::UninitContext::new(rules).with_effects(frame_effects),
+                );
+                return Ok(BuildingEntryResult {
+                    bridge_state_changed: receipt.bridge_state_changed,
+                    return_before_foot: true,
+                });
+            }
+            // Ares 3.0 100257A0 (hook 0x519FAF), in the repair arm ahead of
+            // its full-health test: a rubble is rebuilt (sim::ares_rubble),
+            // and only an `EngineerRepairable` (default `Repairable=`)
+            // building is repaired; any other turns him away (0x519FB9).
+            if rules.ares() && repair {
+                let ext = object.building_type_ext();
+                let turned_away = if ext.rubble_intact.applies() {
+                    Some(!self.ares_engineer_rebuilds_rubble(
+                        engineer_id,
+                        building_id,
+                        &ext.rubble_intact,
+                        rules,
+                        registry,
+                        context.effects(),
+                    ))
+                } else {
+                    (!ext.engineer_repairable(object.repairable)).then_some(true)
+                };
+                if let Some(turned_away) = turned_away {
+                    if turned_away {
+                        self.turn_away_from_building(
+                            engineer_id,
+                            building_id,
+                            rules,
+                            registry,
+                            frame_effects,
+                        )?;
+                    }
+                    return Ok(BuildingEntryResult {
+                        return_before_foot: true,
+                        ..Default::default()
+                    });
+                }
+            }
+            if (repair && full) || (!repair && capturable && refused_capture) {
+                //519FB9/519EBB/519EFC, then an immediate return before
+                //FootPerCell.
+                self.turn_away_from_building(
+                    engineer_id,
+                    building_id,
+                    rules,
+                    registry,
+                    frame_effects,
+                )?;
+                return Ok(BuildingEntryResult {
+                    return_before_foot: true,
+                    ..Default::default()
+                });
+            }
+            let mut changed = false;
+            if repair {
+                crate::sim::production::engineer_repair(self, rules, building_id);
+            } else if capturable {
+                //519F44 re-reads the Building Tag and raises Entered again;
+                //do not deduplicate the earlier519B53 call.519F4F then reads
+                //the current owner, followed by optional519F6C Tag transfer.
+                self.dispatch_object_tag_event(
+                    building_id,
+                    1,
+                    Some(engineer_id),
+                    None,
+                    context.reborrow(),
+                );
+                if let Some(old_owner) = self
+                    .substrate
+                    .entities
+                    .get(building_id)
+                    .map(|building| building.owner())
+                    && let Some(old_house) = self.houses.get_mut(&old_owner)
+                {
+                    old_house.notify_building_capture();
+                }
+                self.trigger_runtime
+                    .transfer_object_tag(engineer_id, building_id);
+                //519F71 loads the entrant's live owner after the second
+                //Entered callback and Tag transfer. Action36 can change it
+                //again without restarting this admitted PerCell continuation.
+                if let Some(capture_owner) = self
+                    .substrate
+                    .entities
+                    .get(engineer_id)
+                    .map(|engineer| engineer.owner())
+                {
+                    self.announce_building_capture(building_id, capture_owner, rules);
+                    self.change_owner_with_rules(
+                        building_id,
+                        capture_owner,
+                        rules,
+                        registry,
+                        context.effects(),
+                    );
+                }
+                if let Some(building) = self.substrate.entities.get_mut(building_id) {
+                    // Techno+0x338 (`0x00519F94`).
+                    building
+                        .seldom
+                        .capture_infantry_type_index
+                        .record(native_type_index);
+                }
+                changed = self.scatter_building_infantry(
+                    building_id,
+                    rules,
+                    registry,
+                    context.effects(),
+                )?;
+            }
+            //519EAACapturable=false consumes too.519FF0 repair and519F9A
+            //capture join Tag event48 then virtualUnInit, with no Foot tail.
+            self.dispatch_object_tag_event(engineer_id, 48, Some(engineer_id), None, context);
+            self.uninit_with_context(
+                engineer_id,
+                super::UninitContext::new(rules).with_effects(frame_effects),
+            );
+            return Ok(BuildingEntryResult {
+                bridge_state_changed: changed,
+                return_before_foot: true,
+            });
         }
-        let building_cell = (building.position.rx, building.position.ry);
-        //519BB6 supplies the ENGINEER cell;519C02 supplies building XYZ.
+        //519BB6 supplies the ENGINEER cell;519BCE..519C02 the hut building's
+        //Location (Look_up_building_in_cell47C520 at519B20), before the repair.
         //519B90/50B6F0 gates insertion itself, including radar dedup state.
-        self.announce_bridge_repair(owner, cell, building_cell);
+        let hut_location = crate::sim::movement::ground_pose::object_location(
+            building,
+            self.resolved_terrain.as_ref(),
+        )
+        .into();
+        self.announce_bridge_repair(owner, cell, hut_location);
         let mut changed = crate::sim::world::bridge_orchestrator::repair_from_engineer(
             self,
             rules,
-            registry,
             engineer_id,
+            context.effects(),
         )
         .map_err(|cause| {
-            super::FrameAdvanceError::bridge_repair(
-                self.session.tick,
-                self.session.binary_frame,
+            super::FrameAdvanceError::new(
+                self.session.tick(),
+                self.session.binary_frame(),
                 engineer_id,
                 cause,
             )
         })?;
         //519D17..519D36 descends Infantry's registry with +28(hut,false).
         //Clearing NavCom does not stop a retained Walk head/destination.
-        self.expire_infantry_bridge_hut_targets(building_id);
-        changed |= self.scatter_bridge_hut(building_id, rules, registry)?;
-        // Attached Tag6E53A0 remains a separate synchronous receiver boundary.
-        self.uninit_with_rules(engineer_id, rules);
-        Ok(changed)
+        self.expire_infantry_bridge_hut_targets(building_id, rules, context.effects());
+        changed |=
+            self.scatter_building_infantry(building_id, rules, registry, context.effects())?;
+        //51A025 consumption raises own Tag48 before virtual UnInit.
+        self.dispatch_object_tag_event(engineer_id, 48, Some(engineer_id), None, context);
+        self.uninit_with_context(
+            engineer_id,
+            super::UninitContext::new(rules).with_effects(frame_effects),
+        );
+        Ok(BuildingEntryResult {
+            bridge_state_changed: changed,
+            return_before_foot: true,
+        })
     }
 
-    /// Tick C4 plant orders.
+    /// The PerCell2 building receiver's arm for an infantryman that is not
+    /// an Engineer (`0x00519B66` → `0x00519FF8..0x0051A06E`); both ends
+    /// return before the Foot body.
     ///
-    /// Phase 1 (walk-up): for each entity with `c4_plant`, check if it's
-    /// Chebyshev-≤-1 adjacent to the target building's anchor cell; if so
-    /// and the building doesn't already have a `pending_c4_detonation`
-    /// claimed by another attacker, claim it. Second attackers on an
-    /// already-claimed target hover (no-op) — matches gamemd's `+0x6df`
-    /// marker check.
+    /// An `Agent=` one runs `BuildingClass::Infiltrate` with its house
+    /// (`0x0051A002..0x0051A00B`, [`crate::sim::spy_infiltration`]) and
+    /// leaves the game as an engineer does: the attached Tag's event 0x30,
+    /// then vt+0xF8 UnInit (`0x0051A010..0x0051A02E`). Any other drops its
+    /// destination (vt+0x480(NULL, 1)) and scatters from the building's
+    /// GetCoords (vt+0x174(coord, 1, 1); `0x0051A03E..0x0051A061`).
     ///
-    /// Phase 2 (detonation): for each building with `pending_c4_detonation`,
-    /// if the wrapping native-frame elapsed count reaches
-    /// `rules.c4_delay_ticks`, apply C4Warhead
-    /// damage equal to the building's current HP. For normal buildings the
-    /// pending state is not cleared if damage is nullified by IronCurtain, so
-    /// it fires again next frame. When the building dies, the entity despawns
-    /// and the pending state goes with it. BridgeRepairHut dispatch clears
-    /// the pending marker after the bridge path runs because the hut survives.
+    /// With Ares the arm follows [`Self::infiltrate_action`] (`100260D0`,
+    /// hook `0x00519FF8`): Spy takes the `Agent=` arm, Sabotage plants
+    /// through [`Self::infantry_per_cell_sabotage`] and is consumed once
+    /// planted, and anything else is turned away.
     ///
-    /// Returns the per-tick C4 outcome: `destroyed_structure` is true if any
-    /// building died, and `bridge_state_changed` is true if any C4 detonation
-    /// on a `BridgeRepairHut` collapsed a bridge.
-    pub(crate) fn tick_c4_plants_with_overlay_registry(
+    /// The common caller raises the Building's Entered1 before this gate.
+    /// Consumption raises the spy's own48 synchronously before UnInit.
+    fn infantry_per_cell_infiltrator_entry(
         &mut self,
+        infantry_id: u64,
+        building_id: u64,
+        agent: bool,
         rules: &RuleSet,
-        overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
-        turn_suppressed: &BTreeSet<u64>,
-    ) -> C4TickOutcome {
-        use crate::sim::components::PendingC4Detonation;
-        let mut destroyed_structure = false;
-        let mut bridge_state_changed = false;
-
-        // ---- Phase 1: walk-up + plant claim ----
-        // Snapshot attackers with c4_plant. Deterministic sorted order via
-        // keys_sorted then look up c4_plant.
-        let mut walkup: Vec<(u64, u64)> = Vec::new();
-        for sid in self.substrate.entities.keys_sorted() {
-            if turn_suppressed.contains(&sid) {
-                continue;
-            }
-            if let Some(e) = self.substrate.entities.get(sid) {
-                if let Some(plant) = e.c4_plant {
-                    // A warped planter's mission does not run (`ai_frozen`).
-                    if !e.dying && !e.ai_frozen() {
-                        walkup.push((sid, plant.target_building_id));
-                    }
-                }
-            }
-        }
-
-        for (attacker_id, target_id) in walkup {
-            // Target gone or dying? Clear c4_plant.
-            let target_alive = self
+        registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+        frame_effects: &mut FrameEffects<'_>,
+    ) -> Result<BuildingEntryResult, super::FrameAdvanceError> {
+        let entered = BuildingEntryResult {
+            return_before_foot: true,
+            ..Default::default()
+        };
+        // Ares 3.0 100260D0 (hook 0x00519FF8): the shared classification
+        // picks the arm; a Saboteur plants its charge.
+        let action = rules
+            .ares()
+            .then(|| self.infiltrate_action(infantry_id, building_id, rules));
+        let agent = action.map_or(agent, |action| action == InfiltrateAction::Spy);
+        let consumed = if agent {
+            if let Some(owner) = self
                 .substrate
                 .entities
-                .get(target_id)
-                .is_some_and(|b| b.category == EntityCategory::Structure && !b.dying);
-            if !target_alive {
-                if let Some(e) = self.substrate.entities.get_mut(attacker_id) {
-                    e.c4_plant = None;
-                }
-                continue;
+                .get(infantry_id)
+                .map(|infantry| infantry.owner())
+            {
+                self.infiltrate_building(building_id, owner, rules);
             }
-
-            // gamemd claims only when the infantry's current cell resolves
-            // to the target building. The walk reaches it because the building
-            // is the NavCom, which the Infantry +1AC admits (`0x0051C2D3..`).
-            let attacker_cell = self
-                .substrate
-                .entities
-                .get(attacker_id)
-                .map(|e| (e.position.rx, e.position.ry));
-            let target_footprint = self.building_entry_target_footprint(target_id, rules);
-            let (Some(attacker_cell), Some(target_footprint)) = (attacker_cell, target_footprint)
-            else {
-                continue;
-            };
-
-            // Already claimed by another attacker?
-            let already_claimed = self
-                .substrate
-                .entities
-                .get(target_id)
-                .is_some_and(|b| b.pending_c4_detonation.is_some());
-            if already_claimed {
-                // Second SEAL — hover, no-op. Matches gamemd's marker-set early-return.
-                continue;
-            }
-
-            if !target_footprint.contains(&attacker_cell) {
-                continue; // walk-up still in progress
-            }
-
-            // Claim the plant.
-            // RESIDUAL: native's planter then re-arms (`GameEntity::rearm_timer`)
-            // with `GetROF(1)` (`InfantryClass::PerCellProcess
-            // 0x0051A60B..0x0051A65F`), and so does a second planter entering an
-            // already charged building (`0x0051A546..0x0051A5A0`), which VERA's
-            // walk-up leaves hovering outside. Outside FireAt the burst index is
-            // below `Burst=`, so `combat::rof::get_rof` takes its mid-burst arm:
-            // one Scenario `RandomRanged(3, 5)` (an empty slot 1 returns 1
-            // without a draw, `0x006FCFD4`). Trigger: every C4 plant. Effect: the
-            // planter can fire up to 5 frames early, and one draw per plant is
-            // missing. Belongs to the C4 plant mechanism.
-            if let Some(b) = self.substrate.entities.get_mut(target_id) {
-                b.pending_c4_detonation = Some(PendingC4Detonation {
-                    timer: crate::sim::timer::CdTimer::started(
-                        self.session.binary_frame as i32,
-                        rules.c4_delay_ticks as i32,
-                    ),
-                    source_entity_id: Some(attacker_id),
-                });
-            }
-
-            // Native PerCell51A60D stops the Foot; it does not request Attack
-            // Doing4. The full C4 Stop/destination/ROF tail remains its own
-            // mechanism. Infantry presentation reads the retained Doing owner.
-            if let Some(a) = self.substrate.entities.get_mut(attacker_id) {
-                a.movement_target = None;
-            }
-
-            // SealPlaceBomb spatial sound. App-side dispatcher resolves to
-            // `[SealPlaceBomb]` from soundmd.ini.
-            if let Some(a) = self.substrate.entities.get(attacker_id) {
-                self.sound_events
-                    .push(crate::sim::world::SimSoundEvent::C4Planted {
-                        rx: a.position.rx,
-                        ry: a.position.ry,
-                    });
-            }
-        }
-
-        // ---- Phase 2: detonation ----
-        let mut det_keys: Vec<u64> = Vec::new();
-        for sid in self.substrate.entities.keys_sorted() {
-            if let Some(e) = self.substrate.entities.get(sid) {
-                let bridge_hut = rules
-                    .object(self.interner.resolve(e.type_ref()))
-                    .is_some_and(|object| object.bridge_repair_hut);
-                if e.pending_c4_detonation.is_some() && !e.dying && bridge_hut {
-                    det_keys.push(sid);
-                }
-            }
-        }
-        // Early-out returns before rule-handle resolution so pre-feature
-        // fixtures never intern warhead names they do not exercise. They do not
-        // call it; guarding here keeps them passing.
-        if det_keys.is_empty() {
-            return C4TickOutcome {
-                destroyed_structure,
-                bridge_state_changed,
-            };
-        }
-
-        let c4_warhead_id = self.rule_handles().c4;
-        for building_id in det_keys {
-            let pending = self
-                .substrate
-                .entities
-                .get(building_id)
-                .and_then(|e| e.pending_c4_detonation);
-            let Some(pending) = pending else { continue };
-
-            if !pending.timer.expired(self.session.binary_frame as i32) {
-                continue;
-            }
-
-            // Timer elapsed — apply C4Warhead damage. Damage value = current_hp
-            // for guaranteed one-shot kill (matches gamemd's
-            // `&iStack_28 = this->Health` argument to TakeDamage).
-            // Normal-building pending state is only cleared by despawn;
-            // BridgeRepairHut returns consumed_pending_marker below.
-            let dmg: i32 = self
-                .substrate
-                .entities
-                .get(building_id)
-                .map(|b| b.health.current as i32)
-                .unwrap_or(0);
-            if dmg <= 0 {
-                continue;
-            }
-
-            // Resolve kill-credit. Attacker may have despawned — fall back to None.
-            let attacker_for_credit = pending
-                .source_entity_id
-                .filter(|&source_id| self.substrate.entities.get(source_id).is_some());
-
-            let outcome = self.apply_c4_damage_to_building(
-                building_id,
-                dmg,
-                c4_warhead_id,
-                attacker_for_credit,
-                rules,
-                overlay_registry,
+            true
+        } else {
+            action == Some(InfiltrateAction::Sabotage)
+                && self.infantry_per_cell_sabotage(infantry_id, building_id, rules, frame_effects)
+        };
+        if consumed {
+            self.dispatch_object_tag_event(
+                infantry_id,
+                48,
+                Some(infantry_id),
+                None,
+                super::UninitContext::new(rules).with_effects(frame_effects),
             );
-            bridge_state_changed |= outcome.bridge_state_changed;
-            if outcome.killed_building {
-                destroyed_structure = true;
-                // pending_c4_detonation goes away with the entity via despawn path.
-                // Trigger scatter walk-away for any attacker on this cell with
-                // c4_plant pointing at this building. Matches gamemd
-                // Mission_Enter post-detonation block.
-                self.queue_c4_post_detonation_scatter(building_id);
-            } else if outcome.consumed_pending_marker {
-                if let Some(building) = self.substrate.entities.get_mut(building_id) {
-                    building.pending_c4_detonation = None;
-                }
-                if let Some(attacker_id) = pending.source_entity_id
-                    && let Some(attacker) = self.substrate.entities.get_mut(attacker_id)
-                {
-                    if attacker
-                        .c4_plant
-                        .is_some_and(|plant| plant.target_building_id == building_id)
-                    {
-                        attacker.c4_plant = None;
-                    }
-                }
-            }
+            self.uninit_with_context(
+                infantry_id,
+                super::UninitContext::new(rules).with_effects(frame_effects),
+            );
+            return Ok(entered);
         }
-
-        C4TickOutcome {
-            destroyed_structure,
-            bridge_state_changed,
-        }
+        self.turn_away_from_building(infantry_id, building_id, rules, registry, frame_effects)?;
+        Ok(entered)
     }
 
-    /// BuildingClass::Update's shared C4/PostMortem expiry tail. Called from
-    /// the current Structure LogicVector visit, so the forced receiver and any
-    /// nested DeathWeapon complete before the next live object is visited.
+    /// How PerCell2 turns an infantryman away from a building: the occupier
+    /// arm (`0x005196DD..0x00519700`) and the building receiver
+    /// (`0x00519EBB`, `0x00519EFC`, `0x00519FB9`, `0x0051A03E..0x0051A061`).
+    /// SetDestination(NULL, 1) (vt+0x480), then
+    /// [`Self::scatter_from_building`].
+    pub(crate) fn turn_away_from_building(
+        &mut self,
+        infantry_id: u64,
+        building_id: u64,
+        rules: &RuleSet,
+        registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+        frame_effects: &mut FrameEffects<'_>,
+    ) -> Result<(), super::FrameAdvanceError> {
+        self.assign_null_destination(infantry_id, rules, registry, frame_effects);
+        self.scatter_from_building(infantry_id, building_id, rules, registry, frame_effects)
+    }
+
+    /// PerCell2's Scatter from a building's real GetCoords (vt+0x174(coord,
+    /// 1, 1)), which does not Process. Its heading away from the building
+    /// draws one Scenario `RandomRanged(0, 4)` (`0x0051D258..0x0051D2D4`).
+    pub(crate) fn scatter_from_building(
+        &mut self,
+        infantry_id: u64,
+        building_id: u64,
+        rules: &RuleSet,
+        registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+        frame_effects: &mut FrameEffects<'_>,
+    ) -> Result<(), super::FrameAdvanceError> {
+        let Some(coord) = self.substrate.entities.get(building_id).map(|building| {
+            crate::sim::movement::ground_pose::object_get_coords(
+                building,
+                self.resolved_terrain.as_ref(),
+            )
+        }) else {
+            return Ok(());
+        };
+        self.infantry_scatter_from(
+            infantry_id,
+            (coord.x, coord.y),
+            crate::sim::movement::ScatterFlags::new(true, true),
+            rules,
+            registry,
+            frame_effects,
+        )
+        .map_err(|cause| {
+            super::FrameAdvanceError::new(
+                self.session.tick(),
+                self.session.binary_frame(),
+                infantry_id,
+                cause,
+            )
+        })
+    }
+
+    /// BuildingClass::Update's shared C4/PostMortem expiry tail
+    /// (`0x004401D2..0x00440358`). Called from the current Structure
+    /// LogicVector visit, so the forced receiver and any nested DeathWeapon
+    /// complete before the next live object is visited. Once the C4Timer
+    /// runs out:
+    /// - A bridge repair hut (`0x00440213..0x00440331`) collapses its bridge
+    ///   (`0x00574000`, or the wooden `0x00574C20`; `bridge_orchestrator`)
+    ///   and lets its charge go (`+0x6DF`, C4AppliedBy `+0x540`). The hut
+    ///   takes no damage.
+    /// - Any other building takes its own health as `C4Warhead=` damage
+    ///   from C4AppliedBy, ignoring defenses (`0x00440333..0x00440358`), and
+    ///   keeps the charge.
+    ///
+    /// Answers whether a bridge changed.
     pub(crate) fn tick_pending_building_detonation(
         &mut self,
         building_id: u64,
         rules: &RuleSet,
-        overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
-    ) {
-        let Some((pending, health, bridge_hut)) = self
+        overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+        frame_effects: &mut FrameEffects<'_>,
+    ) -> bool {
+        let Some((pending, health, bridge_hut, cell)) = self
             .substrate
             .entities
             .get(building_id)
             .and_then(|building| {
-                let pending = building.pending_c4_detonation?;
-                let object = rules.object(self.interner.resolve(building.type_ref()))?;
+                let pending = building.building.pending_c4_detonation.pending()?;
+                let object = self.interner.object_type(building.type_ref(), rules)?;
                 Some((
                     pending,
-                    i32::from(building.health.current),
+                    building.health.current(),
                     object.bridge_repair_hut,
+                    (building.position.rx(), building.position.ry()),
                 ))
             })
         else {
-            return;
+            return false;
         };
-        if !pending.timer.expired(self.session.binary_frame as i32) || health <= 0 {
-            return;
+        if !pending.timer().expired(self.session.binary_frame() as i32) || health <= 0 {
+            return false;
         }
 
         if bridge_hut {
-            // Preserve the existing bridge-specific Phase-5 consumer outside
-            // this damage slice. It owns collapse, attacker cleanup, and the
-            // result flag that invalidates bridge navigation for the caller.
-            return;
+            let changed = crate::sim::world::bridge_orchestrator::dispatch_bridge_collapse_from_hut_with_overlay_registry(
+                self,
+                rules,
+                cell,
+                frame_effects,
+            );
+            if let Some(hut) = self.substrate.entities.get_mut(building_id) {
+                hut.building.pending_c4_detonation.cancel();
+            }
+            return changed;
         }
 
         let event = crate::sim::combat::EntityDamageEvent::direct_receiver(
@@ -794,7 +2647,7 @@ impl Simulation {
             health,
             0,
             pending
-                .source_entity_id
+                .source_entity_id()
                 .unwrap_or(crate::sim::combat::RAD_NO_ATTACKER),
             None,
             self.rule_handles().c4,
@@ -803,488 +2656,12 @@ impl Simulation {
                 arg6: false,
             },
         );
-        self.commit_noncombat_aoe_hits(rules, overlay_registry, &[event]);
-    }
-
-    fn building_entry_target_footprint(
-        &self,
-        target_id: u64,
-        rules: &RuleSet,
-    ) -> Option<Vec<(u16, u16)>> {
-        let target = self.substrate.entities.get(target_id)?;
-        let obj = self.object_type(target.type_ref(), rules)?;
-        // Infantry building-entry resolves through normal building cell lookup.
-        // AddOccupy/RemoveOccupy only affect hidden occupancy counters.
-        Some(c4_base_foundation_cells(
-            target.position.rx,
-            target.position.ry,
-            obj.foundation.as_str(),
-        ))
-    }
-
-    /// Post-detonation: any attacker that was on the destroyed building's
-    /// cell with `c4_plant` targeting this building scatters one cell in a
-    /// deterministic direction derived from the current tick. Matches gamemd
-    /// `Mission_Enter` post-detonation block:
-    /// `uVar13 = (tick >> 12 + 1) >> 1 & 7` → 1 of 8 directions via
-    /// the direction-delta tables.
-    ///
-    /// Also clears each attacker's `c4_plant`.
-    fn queue_c4_post_detonation_scatter(&mut self, dead_building_id: u64) {
-        // 8 cardinal+ordinal directions in standard RA2 order:
-        // N, NE, E, SE, S, SW, W, NW.
-        const DIR_DELTAS: [(i16, i16); 8] = [
-            (0, -1),  // N
-            (1, -1),  // NE
-            (1, 0),   // E
-            (1, 1),   // SE
-            (0, 1),   // S
-            (-1, 1),  // SW
-            (-1, 0),  // W
-            (-1, -1), // NW
-        ];
-        // Mirror the native-frame bit-twiddle: `(frame >> 12 + 1) >> 1 & 7`.
-        // C operator precedence: `>>` is left-to-right at same level, so
-        // this evaluates as `(((frame >> 12) + 1) >> 1) & 7`.
-        let dir: usize = ((((self.session.binary_frame >> 12) + 1) >> 1) & 7) as usize;
-        let (dx, dy) = DIR_DELTAS[dir];
-
-        let bld_cell = self
-            .substrate
-            .entities
-            .get(dead_building_id)
-            .map(|b| (b.position.rx, b.position.ry));
-        let Some((brx, bry)) = bld_cell else { return };
-
-        // Collect attackers on this cell with c4_plant on this building.
-        let mut scatterers: Vec<u64> = Vec::new();
-        for sid in self.substrate.entities.keys_sorted() {
-            if let Some(e) = self.substrate.entities.get(sid) {
-                if !e.dying
-                    && e.position.rx == brx
-                    && e.position.ry == bry
-                    && e.c4_plant
-                        .map_or(false, |p| p.target_building_id == dead_building_id)
-                {
-                    scatterers.push(sid);
-                }
-            }
-        }
-
-        for sid in scatterers {
-            let target_rx = (brx as i16 + dx).max(0) as u16;
-            let target_ry = (bry as i16 + dy).max(0) as u16;
-            if let Some(e) = self.substrate.entities.get_mut(sid) {
-                e.c4_plant = None;
-            }
-            // Queue a Move command for the next tick. Simpler than
-            // reimplementing the pathfind call; 1-tick delay is below the
-            // human-observable threshold.
-            if let Some(owner) = self.substrate.entities.get(sid).map(|e| e.owner()) {
-                self.queue_command(crate::sim::command::CommandEnvelope::new(
-                    owner,
-                    self.session.tick + 1,
-                    crate::sim::command::Command::Move {
-                        entity_id: sid,
-                        target_rx,
-                        target_ry,
-                        queue: false,
-                    },
-                ));
-            }
-        }
-    }
-
-    /// Apply one C4Warhead damage instance to a building entity. Returns
-    /// `C4DamageOutcome` reporting whether the building died and whether a
-    /// connected bridge collapsed (for `BridgeRepairHut` targets). Non-hut
-    /// targets honor IronCurtain via the standard invulnerability check.
-    /// Used by `tick_c4_plants` Phase 2.
-    fn apply_c4_damage_to_building(
-        &mut self,
-        building_id: u64,
-        damage: i32,
-        warhead_id: crate::sim::intern::InternedId,
-        attacker_id: Option<u64>,
-        rules: &RuleSet,
-        overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
-    ) -> C4DamageOutcome {
-        // BridgeRepairHut target: reroute the explosion into the bridge
-        // collapse cascade and leave the hut at full HP. The hut never
-        // takes C4 / demo-truck damage — destruction is the linked bridge
-        // segment's, not the hut's. Also the right entry point for a
-        // future demo-truck damage path.
-        let target_bridge_hut = self
-            .substrate
-            .entities
-            .get(building_id)
-            .and_then(|b| {
-                rules
-                    .object(self.interner.resolve(b.type_ref()))
-                    .map(|t| t.bridge_repair_hut)
-            })
-            .unwrap_or(false);
-        if target_bridge_hut {
-            let bld_center = self
-                .substrate
-                .entities
-                .get(building_id)
-                .map(|b| (b.position.rx, b.position.ry));
-            let bridge_state_changed = match bld_center {
-                Some(center) => {
-                    crate::sim::world::bridge_orchestrator::dispatch_bridge_collapse_from_hut_with_overlay_registry(
-                        self,
-                        rules,
-                        center,
-                        overlay_registry,
-                    )
-                }
-                None => false,
-            };
-            let _ = attacker_id; // the hut survives: nothing is credited
-            return C4DamageOutcome {
-                killed_building: false,
-                bridge_state_changed,
-                consumed_pending_marker: true,
-            };
-        }
-
-        let event = crate::sim::combat::EntityDamageEvent::direct_receiver(
-            building_id,
-            damage,
-            0,
-            attacker_id.unwrap_or(crate::sim::combat::RAD_NO_ATTACKER),
-            None,
-            warhead_id,
-            crate::sim::combat::ReceiverCallFlags {
-                ignore_defenses: true,
-                arg6: false,
-            },
-        );
-        self.commit_noncombat_aoe_hits(rules, overlay_registry, &[event]);
-        if self
-            .substrate
-            .entities
-            .get(building_id)
-            .is_none_or(|b| b.dying)
-        {
-            C4DamageOutcome {
-                killed_building: true,
-                bridge_state_changed: false,
-                consumed_pending_marker: false,
-            }
-        } else {
-            C4DamageOutcome::default()
-        }
-    }
-
-    /// Pre-combat: entities with an `attack_target` that's out of weapon
-    /// range walk toward the target. Entities that just entered range halt
-    /// their movement so the combat tick can fire from a stationary
-    /// position.
-    ///
-    /// Range failure preserves the target; pursuit closes the gap.
-    ///
-    /// Skips entities that can't or shouldn't pursue:
-    /// - Structures (can't move)
-    /// - Aircraft (own state machine in `attack_mission.rs`)
-    /// - Deployed-fire infantry (locked while deployed)
-    /// - Entities inside transports
-    /// - Dying entities, and Health-0 wrecks, which run no mission
-    /// - Objects holding a target their own scanner picked up (see below)
-    /// - Objects on the **Sticky** mission, which drop the target instead
-    ///
-    /// **A passively-acquired target is never pursued.** The original's passive
-    /// commit writes the target pointer and nothing else — no mission assign and
-    /// no destination assign — and a Guard-mission unit derives any destination
-    /// it does have from its OWN position, never from the target's. So an idle
-    /// unit that notices an enemy fires from where it stands and stays put.
-    /// Without this skip an idle base-defence force would walk off across the
-    /// map, unleashed, the first time an enemy scouted past: nothing carries
-    /// these units home because they have no `OrderIntent` to resume.
-    #[cfg(test)]
-    pub(crate) fn tick_attack_pursuit(&mut self, rules: &RuleSet) {
-        self.tick_attack_pursuit_with_overlay_registry(rules, None, &BTreeSet::new());
-    }
-
-    pub(crate) fn tick_attack_pursuit_with_overlay_registry(
-        &mut self,
-        rules: &RuleSet,
-        overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
-        turn_suppressed: &BTreeSet<u64>,
-    ) {
-        // Without a published grid pursuit decides nothing this tick.
-        if self.path_grid().is_none() {
-            return;
-        }
-
-        // Phase 1: collect pursuit decisions (read-only on entities).
-        // Two action kinds: issue a new path, or clear an existing one.
-        enum PursuitAction {
-            IssueMove {
-                entity_id: u64,
-                goal: (u16, u16),
-            },
-            ClearMovement {
-                entity_id: u64,
-            },
-            /// A Sticky object that cannot already shoot its target: drop the
-            /// target AND the destination, and produce no pursuit cell.
-            DropTargetAndMovement {
-                entity_id: u64,
-            },
-        }
-
-        let keys: Vec<u64> = self.substrate.entities.keys_sorted();
-        let mut actions: Vec<PursuitAction> = Vec::new();
-
-        for &id in &keys {
-            if turn_suppressed.contains(&id) {
-                continue;
-            }
-            let Some(entity) = self.substrate.entities.get(id) else {
-                continue;
-            };
-            let Some(attack) = entity.attack_target.as_ref() else {
-                continue;
-            };
-
-            // Skip filters — see "Skips" doc above. The approach is Mission_
-            // Attack's, which a Health-0 wreck does not run
-            // (`MissionClass::AI @ 0x005B30A7`).
-            if entity.dying || !super::techno_ai::mission_handlers_run(self, id) {
-                continue;
-            }
-            if entity.passively_acquired_target {
-                continue;
-            }
-            // `FootClass::Mission_Guard @ 0x004D5070` has no approach call
-            // (vt+0x53C): an object committed to Guard fires at what it holds
-            // from where it stands, whoever assigned it. A player "guard this
-            // spot" order is VERA's Area Guard stand-in (`OrderIntent::Guard`)
-            // and still approaches.
-            if entity.mission.current().known() == Some(crate::sim::mission::MissionType::Guard)
-                && entity.order_intent.is_none()
-            {
-                continue;
-            }
-            if entity.category == EntityCategory::Structure {
-                continue;
-            }
-            if entity.aircraft_mission.is_some() {
-                continue;
-            }
-            if entity.is_deployed() {
-                continue;
-            }
-            // A passenger never walks: an open-topped transport's rider has
-            // its chase off (`+0x82`, `0x004D5782`) and a destination refused
-            // (`0x004D94D7`); its reach is `open_transport_reach_step`.
-            if entity.passenger_role.is_inside_transport() {
-                continue;
-            }
-
-            // Ground Infantry's native approach helper4D5690 returns at
-            // 4D5A07..18 while NavCom is present. An accepted Walk path/head
-            // continues through Process; FootPerCell(mode2)4D882F..896E makes
-            // the range-stop decision after completion. Dropping the path
-            // adapter here strands its independently retained head/raw claim.
-            if entity
-                .locomotor
-                .as_ref()
-                .is_some_and(|loco| loco.kind == crate::rules::locomotor_type::LocomotorKind::Walk)
-                && entity.navigation.nav_com.is_some()
-            {
-                continue;
-            }
-
-            // Resolve target coords using the same helper combat tick uses.
-            // None means entity-target despawned; combat tick's target-dead
-            // branch handles cleanup.
-            let target_pos =
-                combat::resolve_target_coords(&attack.target, &self.substrate.entities);
-            let Some((trx, try_, _tsx, _tsy)) = target_pos else {
-                continue;
-            };
-
-            // Resolve the weapon using the shared helper. None means the
-            // selected slot names no weapon. Legality is not asked here, as
-            // Approach_Target asks none: the fire routine's GetFireError and
-            // the 16-frame check decide what happens to the target.
-            let Some(weapon) = combat::pursuit_selected_weapon(
-                entity,
-                &attack.target,
-                &self.substrate.entities,
-                rules,
-                &self.interner,
-                self.resolved_terrain.as_ref(),
-                Some(&self.house_alliances),
-            ) else {
-                continue;
-            };
-
-            // Range check — the SAME predicate the combat tick's fire gate
-            // uses, line-of-fire walk included. The approach search
-            // (`FootClass::Greatest_Threat_Scan @ 0x004D5690`, vt+0x53C,
-            // reached from `Mission_Attack` 0x004D4DC0 at 0x004D4E6A) decides
-            // with `TechnoClass::InRange` 0x006F7220 at 0x004D622C /
-            // 0x004D6550, and `InRange` ends in the wall/cliff walk at
-            // 0x006F7642. If this stage used the plain radius while the fire
-            // gate ran the walk, a unit ordered to shoot across a wall would
-            // halt here and then be refused the shot, standing still under a
-            // live order.
-            //
-            // The one refusal that must NOT produce a pursuit cell is
-            // `MinimumRange`: native's approach search picks a candidate
-            // FARTHER out, and the target's own cell — VERA's only candidate —
-            // is the worst one in that set. `HoldInsideMinimumRange` therefore
-            // takes the halt arm, which is exactly what this stage did for that
-            // case before the walk landed. See `PursuitRangeVerdict`.
-            let verdict = combat::pursuit_in_range(
-                entity,
-                &attack.target,
-                weapon,
-                &self.substrate.entities,
-                rules,
-                &self.interner,
-                self.resolved_terrain.as_ref(),
-                // Same alliance view the fire gate hands the walk
-                // (`resolve_attacker_fire` passes `fog.alliances`) and the same
-                // one the sibling pre-combat scan uses, so the two stages
-                // cannot disagree on the `AlliedWallTransparency` arm.
-                &combat::line_of_fire::LineOfFireInputs {
-                    overlay_grid: self.overlay_grid.as_ref(),
-                    overlay_registry,
-                    alliances: Some(&self.fog.alliances),
-                },
-            );
-
-            // `FootClass::Per_Cell_Process @ 0x004D885C`: an `OpenTopped=`
-            // mover chasing a Foot target, on a mission the range stop admits,
-            // stops only on entering a cell, by distance
-            // (`foot_per_cell_range_stop`), never by InRange. A loaded Battle
-            // Fortress drives on to its GIs' M60 range. On any other mission
-            // (VERA's Guard and AttackMove orders among them) the stop never
-            // fires, and the halt below stands in as for every other mover.
-            let open_topped_chase = matches!(
-                attack.target,
-                combat::TargetKind::Entity(target_id)
-                    if self.substrate.entities.get(target_id).is_some_and(|target| {
-                        target.category != EntityCategory::Structure
-                    })
-            ) && movement::range_stop_admits(entity)
-                && self
-                    .object_type(entity.type_ref(), rules)
-                    .is_some_and(|obj| obj.open_topped);
-
-            if verdict == combat::PursuitRangeVerdict::CloseIn {
-                // **Sticky never chases.** The one place the engine tells
-                // Sticky apart from Guard at all — they share a mission handler
-                // — is the pursuit-cell producer: when the can-fire-at query
-                // fails and the object's committed mission is Sticky, it drops
-                // both its target and its destination and returns "nowhere to
-                // go", *before* the fallthrough that lets a Guard-family object
-                // pursue. That is the whole of `[Sticky]`'s "just like guard
-                // mode, but cannot move".
-                //
-                // Read off the RAW committed selector, as the original does —
-                // not the derived reading.
-                if entity.mission.current().known() == Some(MissionType::Sticky) {
-                    actions.push(PursuitAction::DropTargetAndMovement { entity_id: id });
-                } else if entity.movement_target.is_none() {
-                    // Out of range, no current pursuit — issue a path. A
-                    // mover on Teleport warps to this cell (the target's
-                    // own): see `teleport_move_to`'s residual.
-                    actions.push(PursuitAction::IssueMove {
-                        entity_id: id,
-                        goal: (trx, try_),
-                    });
-                }
-                // else: existing pursuit movement is still running; let it continue.
-            } else if entity.movement_target.is_some() && !open_topped_chase {
-                // `CanFire` — halt for firing. `HoldInsideMinimumRange` halts
-                // here too: closing further cannot help, and this is the arm it
-                // took before the walk landed.
-                actions.push(PursuitAction::ClearMovement { entity_id: id });
-            }
-        }
-
-        // Phase 2: apply mutations.
-        for action in actions {
-            match action {
-                PursuitAction::IssueMove { entity_id, goal } => {
-                    let Some(info) = self.resolve_move_info(entity_id, Some(rules)) else {
-                        continue;
-                    };
-                    let _issued = self.issue_ground_move(
-                        GroundMove {
-                            entity_id,
-                            target: goal,
-                            speed: info.speed,
-                            queue: false,
-                            speed_type: Some(info.speed_type),
-                            owner_blocks: true,
-                            object_destination: None,
-                        },
-                        Some(rules),
-                    );
-                    // No-op if A* fails — pursuit retries next tick.
-                }
-                PursuitAction::ClearMovement { entity_id } => {
-                    let Some(e) = self.substrate.entities.get_mut(entity_id) else {
-                        continue;
-                    };
-                    // A prior null destination (for example Stop) still
-                    // leaves a paid Walk head active until its completion.
-                    if !e.locomotor.as_ref().is_some_and(|loco| {
-                        loco.kind == crate::rules::locomotor_type::LocomotorKind::Walk
-                            && loco.step_head().is_some()
-                    }) {
-                        e.movement_target = None;
-                    }
-                    // The range stop in `FootClass::Per_Cell_Process`
-                    // (`0x004D8920..0x004D8968`): under Rescue, Area Guard,
-                    // Attack or Hunt with an empty NavQueue it calls the class
-                    // SetDestination(NULL, 1), so a vehicle that stops to fire
-                    // holds no NavCom. GetFireError's NavCom tests (U7..U10)
-                    // would otherwise keep refusing a spark, flame, drain or
-                    // temporal weapon. Infantry and open-topped units take
-                    // the per-cell owner's stop (`movement/per_cell.rs`).
-                    if e.category == EntityCategory::Unit && movement::range_stop_admits(e) {
-                        self.set_unit_null_destination(entity_id, Some(rules));
-                    }
-                }
-                PursuitAction::DropTargetAndMovement { entity_id } => {
-                    // Foot4D5730 dispatches virtual+3C8 on Sticky refusal.
-                    let _ = self.assign_target_represented(entity_id, None, Some(rules));
-                    if let Some(e) = self.substrate.entities.get_mut(entity_id) {
-                        e.movement_target = None;
-                        e.navigation.nav_com = None;
-                    }
-                }
-            }
-        }
+        self.commit_noncombat_aoe_hits(rules, overlay_registry, &[event], frame_effects);
+        false
     }
 }
 
-fn c4_base_foundation_cells(origin_rx: u16, origin_ry: u16, foundation: &str) -> Vec<(u16, u16)> {
-    let (w, h) = crate::rules::foundation::foundation_dimensions(foundation);
-    let mut cells = Vec::with_capacity(w as usize * h as usize);
-
-    for dx in 0..w {
-        for dy in 0..h {
-            let rx = origin_rx as i32 + dx as i32;
-            let ry = origin_ry as i32 + dy as i32;
-            if rx >= 0 && rx <= u16::MAX as i32 && ry >= 0 && ry <= u16::MAX as i32 {
-                cells.push((rx as u16, ry as u16));
-            }
-        }
-    }
-
-    cells
-}
-
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_t_z))]
 mod repair_notification_tests {
     use super::*;
 
@@ -1294,14 +2671,15 @@ mod repair_notification_tests {
         let owner = sim.interner.intern("Americans");
         let other = sim.interner.intern("Russians");
         for id in [owner, other] {
-            sim.houses.insert(
-                id,
-                crate::sim::house_state::HouseState::new(id, 0, None, true, 0, 1),
-            );
-            sim.session.house_order.push(id);
+            sim.houses
+                .register(crate::sim::house_state::HouseState::new(
+                    id, 0, None, true, 0, 1,
+                ));
         }
-        sim.session.current_house = Some(owner);
-        sim.session.game_mode_nonzero = true;
+        sim.session.set_current_house_for_test(Some(owner));
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
         sim.scenario_rng = crate::sim::rng::SimRng::new(0);
         let bytes = crate::sim::snapshot::GameSnapshot::save(&sim, 0, 0, "notification", 0);
         let restore = || {
@@ -1309,9 +2687,10 @@ mod repair_notification_tests {
                 .unwrap()
                 .sim
         };
+        let hut = crate::sim::components::DriveCoord::cell(8, 8, 0).into();
         let mut restored = restore();
-        assert_eq!(restored.session.current_house, Some(owner));
-        restored.announce_bridge_repair(owner, (7, 8), (8, 8));
+        assert_eq!(restored.session.current_house(), Some(owner));
+        restored.announce_bridge_repair(owner, (7, 8), hut);
         assert!(
             matches!(
                 restored.sound_events.last(),
@@ -1328,8 +2707,10 @@ mod repair_notification_tests {
         );
 
         let mut other_current = restore();
-        other_current.session.current_house = Some(other);
-        other_current.announce_bridge_repair(owner, (7, 8), (8, 8));
+        other_current
+            .session
+            .set_current_house_for_test(Some(other));
+        other_current.announce_bridge_repair(owner, (7, 8), hut);
         assert!(
             matches!(
                 other_current.sound_events.last(),
@@ -1347,13 +2728,17 @@ mod repair_notification_tests {
         let ai = sim.interner.intern("Russians");
         let player = sim.interner.intern("Americans");
         for owner in [ai, player] {
-            sim.houses.insert(
-                owner,
-                crate::sim::house_state::HouseState::new(owner, 0, None, false, 0, 0),
-            );
+            sim.houses
+                .register(crate::sim::house_state::HouseState::new(
+                    owner, 0, None, false, 0, 0,
+                ));
         }
-        sim.houses.get_mut(&player).unwrap().player_control = true;
-        sim.announce_bridge_repair(ai, (7, 8), (8, 8));
+        sim.houses
+            .get_mut(&player)
+            .unwrap()
+            .set_player_control_for_test(true);
+        let hut = crate::sim::components::DriveCoord::cell(8, 8, 0).into();
+        sim.announce_bridge_repair(ai, (7, 8), hut);
         assert!(
             matches!(
                 sim.sound_events.last(),
@@ -1361,7 +2746,7 @@ mod repair_notification_tests {
             ),
             "an AI repair never reaches CreateRadarEvent, so it cannot dedupe the human's"
         );
-        sim.announce_bridge_repair(player, (7, 8), (8, 8));
+        sim.announce_bridge_repair(player, (7, 8), hut);
         assert!(matches!(
             sim.sound_events.last(),
             Some(SimSoundEvent::BridgeRepaired { radar: Some(_), .. })

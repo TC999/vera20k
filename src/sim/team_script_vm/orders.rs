@@ -3,31 +3,13 @@
 //! Team code orders its members only through these: `Queue_Mission`
 //! (`vt+0x1E8`), `Ready_To_Commence`/`Commence` (`vt+0x200`/`vt+0x1EC`),
 //! `Assign_Target` (`vt+0x3C8`), `Set_Destination` (`vt+0x480`),
-//! `Enter_Idle_Mode` (`vt+0x484`) and `Set_ArchiveTarget` (`0x0070C610`).
-//!
-//! RESIDUALS:
-//! - `Set_Destination` for an aircraft (`0x0041AA80`), a Walk unit, a
-//!   Hover or Jumpjet unit, or a Jumpjet infantryman is not given. VERA has
-//!   no class setter for the aircraft, Walk-unit and Jumpjet-infantry
-//!   receivers. The Unit setter's cell arm reaches Hover and Jumpjet
-//!   Move_To, but this caller keeps to `unit_setter_receiver`: Hover's
-//!   represented Move_To publishes no NavCom (#689), which the team's move
-//!   checks read. Trigger: such a member in a team ordered to move or to
-//!   join up. Effect: it stays where it is and never joins, so a team of
-//!   them never finishes action 53 or 54 (`Coordinate_Move`) and passes
-//!   action 0 without attacking.
-//!   Frequency: 24 retail AIMD TeamTypes hold ORCA, DISK, SHAD, JUMPJET,
-//!   ZEP, SCHP, BEAG or V3ROCKET members; all run action 0 and 16 also run
-//!   53 or 54. Downstream: a stuck team keeps its members and its `Max=`
-//!   slot.
-//! - `Enter_Idle_Mode` for an aircraft (`0x004176F0`) is not ported; see
-//!   [`Simulation::team_member_enter_idle_mode`].
+//! `Enter_Idle_Mode` (`vt+0x484`, [`crate::sim::world::enter_idle_mode`])
+//! and `Set_ArchiveTarget` (`0x0070C610`).
 
-use crate::map::entities::EntityCategory;
-use crate::map::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::mission::authority::LiveReadyInputProvider;
 use crate::sim::mission::{MissionId, MissionType};
+use crate::sim::world::FrameEffects;
 use crate::sim::world::Simulation;
 
 use super::TeamTarget;
@@ -52,7 +34,7 @@ impl Simulation {
         mission: MissionId,
         rules: &RuleSet,
     ) {
-        let now = self.session.binary_frame;
+        let now = self.session.binary_frame();
         let readiness = LiveReadyInputProvider { rules };
         let _ = self.mission_queue_exact(id, mission, 0, now, &readiness);
     }
@@ -61,15 +43,15 @@ impl Simulation {
     /// the member is ready for it.
     pub(super) fn team_member_commence(&mut self, id: u64, rules: &RuleSet) {
         if self.mission_ready_to_commence(id, rules) {
-            let now = self.session.binary_frame;
-            let _ = self.mission_commence_exact(id, now);
+            let now = self.session.binary_frame();
+            let _ = self.substrate.mission_commence_exact(id, now);
         }
     }
 
     /// `vt+0x3C8` `Assign_Target(NULL)`: `TechnoClass::Assign_Target @
     /// 0x006FCDB0`, Infantry's `0x0051B1F0`.
     pub(super) fn team_member_clear_target(&mut self, id: u64, rules: &RuleSet) {
-        let _ = self.assign_target_represented(id, None, Some(rules));
+        let _ = self.assign_target_represented(id, None, rules, &mut FrameEffects::default());
     }
 
     /// `vt+0x3C8` `Assign_Target(target)`.
@@ -78,77 +60,36 @@ impl Simulation {
         id: u64,
         target: TeamTarget,
         rules: &RuleSet,
+        frame_effects: &mut FrameEffects<'_>,
     ) {
-        let _ = self.assign_target_represented(id, Some(target.target_kind()), Some(rules));
+        let _ =
+            self.assign_target_represented(id, Some(target.target_kind()), rules, frame_effects);
     }
 
-    /// `Set_ArchiveTarget(NULL)` (`0x0070C610`), a plain store.
-    pub(super) fn team_member_clear_archive_target(&mut self, id: u64) {
-        if let Some(entity) = self.substrate.entities.get_mut(id) {
-            entity.set_archive_target(None);
-        }
-    }
-
-    /// `vt+0x480` `Set_Destination(target, 1)`: Infantry `0x0051AA40`, Unit
-    /// `0x00741970` (see the module residuals for the receivers and targets
-    /// without a port).
+    /// `vt+0x480` `Set_Destination(target, 1)` through the class setters
+    /// ([`Simulation::assign_destination_represented`]).
     pub(super) fn team_member_set_destination(
         &mut self,
         id: u64,
         target: Option<TeamTarget>,
         rules: &RuleSet,
-        registry: Option<&OverlayTypeRegistry>,
+        frame_effects: &mut FrameEffects<'_>,
     ) {
-        let Some(target) = target else {
-            self.assign_null_destination(id, Some(rules));
-            return;
-        };
-        let requested = match target {
+        let requested = target.map(|target| match target {
             TeamTarget::Cell { x, y } => {
                 crate::sim::components::NavTargetRef::cell(x as u16, y as u16)
             }
             TeamTarget::Object(id) => crate::sim::components::NavTargetRef::object(id),
-        };
-        let Some(category) = self
-            .substrate
-            .entities
-            .get(id)
-            .map(|entity| entity.category)
-        else {
-            return;
-        };
-        match category {
-            EntityCategory::Infantry => {
-                let _ = self.set_infantry_destination(id, requested, rules, registry);
-            }
-            EntityCategory::Unit if self.unit_setter_receiver(id, Some(rules)) => {
-                self.set_unit_destination(id, requested, rules);
-            }
-            _ => {}
-        }
+        });
+        let _ = self.assign_destination_represented(id, requested, rules, frame_effects);
     }
+}
 
-    /// `vt+0x484` `Enter_Idle_Mode(0, 1)`: Unit `0x00738970`
-    /// ([`Self::unit_enter_idle_mode`]), Infantry `0x0051CBA0` (VERA's Foot
-    /// selector, [`crate::sim::world::queue_foot_enter_idle_mode`]).
-    ///
-    /// RESIDUAL: Aircraft `0x004176F0` is not ported; an aircraft leaving a
-    /// team keeps its mission. Trigger: an aircraft member leaves its team
-    /// alive. Effect: it does not return to its idle mission.
-    pub(crate) fn team_member_enter_idle_mode(&mut self, id: u64, rules: &RuleSet) {
-        match self
-            .substrate
-            .entities
-            .get(id)
-            .map(|entity| entity.category)
-        {
-            Some(EntityCategory::Unit) => {
-                self.unit_enter_idle_mode(id, Some(rules));
-            }
-            Some(EntityCategory::Infantry) => {
-                crate::sim::world::queue_foot_enter_idle_mode(self, id, rules);
-            }
-            _ => {}
+impl crate::sim::world::ObjectSubstrate {
+    /// `Set_ArchiveTarget(NULL)` (`0x0070C610`), a plain store.
+    pub(super) fn team_member_clear_archive_target(&mut self, id: u64) {
+        if let Some(entity) = self.entities.get_mut(id) {
+            entity.set_archive_target(None);
         }
     }
 }

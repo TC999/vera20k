@@ -5,12 +5,18 @@ from unicorn import Uc, UC_ARCH_X86, UC_MODE_32, UC_HOOK_CODE
 from unicorn.x86_const import UC_X86_REG_EAX, UC_X86_REG_ECX, UC_X86_REG_EIP, UC_X86_REG_ESP, UC_X86_REG_FPCW
 from tools.native_oracle import load_image,run_checked,STACK_BASE,STACK_SIZE,SCRATCH,RET_MAGIC,finish_vectors,provenance
 from tools.spatial_oracle.map_queries import dwords,packed
+from tools.spatial_oracle.nearby_raw_occupation import nearby_arguments
 ACTOR,TYPE,HOUSE,LOCO,VT,BASE,RAW,RECORDS,OUT,CLICK=[SCRATCH+i*0x1000 for i in range(10)]
 CELLS=SCRATCH+0x10000
 ACTION=SCRATCH+0xF000
 MAP,TABLE,DUMMY=0x87F7E8,0xC00000,0xABDC50
 
-def query(row):
+def prepare_fixture(row):
+ """Prepare the shared native 16x16 Cell/zone fixture and original locomotor.
+
+ Returns the emulator and its read/return/call helpers before caller hooks or
+ the Foot resolver run. Procedural rally input uses these same map owners.
+ """
  u=Uc(UC_ARCH_X86,UC_MODE_32);load_image(u);u.mem_map(STACK_BASE,STACK_SIZE);u.mem_map(SCRATCH,0x40000);u.mem_map(RET_MAGIC,0x1000);u.reg_write(UC_X86_REG_FPCW,0x0E7F)
  def r32(p):return struct.unpack('<I',u.mem_read(p,4))[0]
  def ret(cleanup,result):
@@ -35,6 +41,10 @@ def query(row):
  for i,(a,b,active,kind) in enumerate(row.get('records',[])):u.mem_write(RECORDS+i*16,packed(*a)+packed(*b)+dwords(active,kind))
  u.mem_write(MAP+0x60,dwords(len(row.get('records',[]))))
  for c in row.get('shrouded',[]):u.mem_write(CELLS+(c[1]*16+c[0])*0x200+0x12C,b'\0')
+ return u,r32,ret,call
+
+def query(row):
+ u,r32,ret,call=prepare_fixture(row)
  events=[];last=[]
  def observe(_u,a,_s,_d):
   sp=u.reg_read(UC_X86_REG_ESP);last.append(hex(a))
@@ -47,7 +57,7 @@ def query(row):
   elif a==0x56D100:
    args=[r32(sp+4+i*4) for i in range(6)];events.append(['reach',list(struct.unpack('<hh',u.mem_read(args[0],4))),list(struct.unpack('<hh',u.mem_read(args[1],4))),*args[2:]])
   elif a==0x56DC20:
-   args=[r32(sp+4+i*4) for i in range(15)];events.append(['fnpc',list(struct.unpack('<hh',u.mem_read(args[1],4))),*args[2:12],list(struct.unpack('<hh',u.mem_read(args[12],4))),*args[13:]])
+   request=nearby_arguments(u,r32,sp);args=request['args'];events.append(['fnpc',request['seed'],*args[2:12],request['target'],*args[13:]])
  u.hook_add(UC_HOOK_CODE,observe)
  u.mem_write(CLICK,packed(*row.get('clicked',[11,5])));before=bytes(u.mem_read(ACTOR,0x700));before_loco=bytes(u.mem_read(LOCO,0x38));call(0x4DE1D0,ACTOR,[OUT,CLICK,0]);assert bytes(u.mem_read(ACTOR,0x700))==before;assert bytes(u.mem_read(LOCO,0x38))==before_loco
  return dict(input=row,cell=list(struct.unpack('<hh',u.mem_read(OUT,4))),dummy=list(struct.unpack('<hh',u.mem_read(DUMMY+0x24,4))),events=events)
@@ -71,6 +81,52 @@ def inputs():
  for row in [{'movement_zone':0,'split':True},{'movement_zone':1},{'movement_zone':10,'split':True,'receiver':'ship'},{'movement_zone':10,'clicked':[16,5],'receiver':'ship'}]:
   yield dict({'receiver':'unit'},**row)
 def generate():return [query(row) for row in inputs()]
+
+def live_cell_input(f, actor, clicked, *, keys=(), invoke, snapshot, sequence, record=None):
+ """Original GI WhatAction/CellClick on an existing constructed native actor.
+
+ This does not select a Cell, manufacture an Event or interpret Shift as a
+ queue flag. The caller supplies the authored coordinate and OS key words;
+ Options defaults, every gameplay receiver and local Event construction run
+ original instructions. Caller auxiliary arguments are literal zero.
+ """
+ from tools.spatial_oracle import building_construction as bc
+ from tools.spatial_oracle._factory_infantry_output.runtime import require
+ u, r = f.u, f.read32
+ receivers = {0x7EB058:('GI',0x51F800,0x51F250), 0x7F5C70:('Unit',0x7404B0,0x738910)}
+ require(r(actor) in receivers, 'Live input requires a represented original vtable')
+ family,query,click = receivers[r(actor)]
+ require(r(r(actor)+0x70) == query and r(r(actor)+0x140) == click,
+         'Original input slots differ')
+ require(r(0xAA0444) == 0, 'Selected OS key-state route requires native cache flag0')
+ words = {int(key): 0x8000 for key in keys}
+ os_calls = []
+ require(not hasattr(f,'os_input_transport'),'Nested OS input transport')
+ for pc,raw in ((0x53EC9A,'ff15e0137e00'),(0x646F20,'ff1530157e00')):
+  require(bytes(u.mem_read(pc,6)) == bytes.fromhex(raw),'Original OS import call changed')
+ def observe_transport(row):
+  os_calls.append(dict(sequence=sequence(),frame=r(bc.FRAME),**row))
+ coord = f.allocate(4)
+ u.mem_write(coord,packed(*clicked))
+ out = dict(clicked=list(clicked), coordinate_pointer=coord,
+     keys=[dict(key=k,short=v) for k,v in sorted(words.items())],
+     what_action_args=[coord,0,0], cell_click_args=None,
+     before=snapshot(), os_transport=os_calls)
+ if record is not None:record(out)
+ # Existing Engineer Fixture.hook is the one OS import/stack owner. This
+ # input helper supplies words and observes it, with no register mutation.
+ f.os_input_transport=dict(key_words=words,observe=observe_transport)
+ try:
+  action = invoke('actual_'+family+'_WhatAction',query,actor,coord,0,0)
+  out['queried_action'] = action
+  out['after_query'] = snapshot()
+  out['cell_click_args'] = [action,coord,0,0]
+  out['click_return_eax'] = invoke('actual_'+family+'_CellClick',click,actor,action,coord,0,0)
+  out['after_click'] = snapshot()
+ finally:
+  del f.os_input_transport
+ return out
+
 
 if __name__=='__main__':
  finish_vectors(generate,Path(__file__).with_suffix('.json'),provenance=lambda:provenance(

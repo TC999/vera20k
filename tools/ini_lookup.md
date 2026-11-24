@@ -66,16 +66,18 @@ The source selector transfers its snapshots into `NativeRulesProcessOwner`; it
 never owns a second registry. Random-map preview and `.SED` launch obtain their
 root-only terrain input and startup tech-building projection from that retained
 owner. Replacing a loose INI after startup therefore cannot change those inputs.
+This CLI still reports only its selected noncampaign Rules query; it does not
+simulate the campaign basename prepass or the mode-5 THETEAM/TMCJ4F route.
 The app-local Rules composer and source rereader have been removed.
 
-[Recorded validation](ini_lookup.validation.json) includes strict-retail library
+Recorded validation (`tools/ini_lookup.validation.json`, in git at 1b1a8b43e) includes strict-retail library
 and Clippy results, explicit random-map/reader witnesses, three reproduced native
 corpora, release CLI cases, a headless Hills run and an unchanged production frame.
 Reproduce the additional production witnesses with the existing tools:
 
 ```sh
 VERA20K_REQUIRE_RETAIL_INI=1 python -m tools.cargo_run -- test -p vera20k --lib app::random_map_lifecycle_tests::gsi_04_12_random_map_ui_to_sed_launch_lifecycle_converges -- --ignored --exact
-python -m tools.cargo_run -- build --release -p vera20k --bin parity-digest --bin vera20k
+python -m tools.cargo_run -- build --release --workspace --bin parity-digest --bin vera20k
 parity_bin=$(python -m tools.cargo_run --resolve parity-digest --profile release)
 "$parity_bin" --ra2-dir "$RA2_DIR" --map Hills.mmx --seed 305419896 --ticks 30 --out <NEW_JSONL>
 ```

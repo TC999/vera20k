@@ -1,8 +1,8 @@
 #[test]
 fn native_tube_hierarchy_pairs_match_original_executable() {
     use crate::map::tube_facts::{TubeFact, TubeId};
-    let corpus: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/tube_hierarchy.json"
+    let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/tube_hierarchy.json",
     ))
     .unwrap();
     let cases = corpus["cases"].as_array().unwrap();
@@ -49,7 +49,9 @@ fn native_tube_hierarchy_pairs_match_original_executable() {
             .collect();
         let tw = allocated.iter().map(|(_, x, _)| x + 1).max().unwrap_or(1);
         let th = allocated.iter().map(|(_, _, y)| y + 1).max().unwrap_or(1);
-        let mut cells = redirect_terrain(tw, th, None, None, |_| {}).cells;
+        let mut cells = redirect_terrain(tw, th, None, None, |_| {})
+            .cells()
+            .to_vec();
         for &(i, x, y) in &allocated {
             let cell = &mut cells[usize::from(y) * usize::from(tw) + usize::from(x)];
             cell.tube_index = Some(TubeId(i as u16));
@@ -74,7 +76,7 @@ fn native_tube_hierarchy_pairs_match_original_executable() {
             .as_array()
             .unwrap()
             .iter()
-            .map(|v| v.as_u64().unwrap() as u16)
+            .map(|v| v.as_u64().unwrap() as ZoneId)
             .collect();
         let record = BridgeEndpointRecord {
             endpoint_a: coord(&case["a"]),
@@ -86,9 +88,10 @@ fn native_tube_hierarchy_pairs_match_original_executable() {
         for seed in case["seed_pairs"].as_array().unwrap() {
             register_native_hierarchy_pair(
                 &mut buckets,
-                seed[0].as_u64().unwrap() as u16,
-                seed[1].as_u64().unwrap() as u16,
+                seed[0].as_u64().unwrap() as ZoneId,
+                seed[1].as_u64().unwrap() as ZoneId,
                 seed[2].as_u64().unwrap() as u8,
+                crate::map::cell_index::CellGrid::Retail,
             );
         }
         let width = case["width"].as_u64().unwrap() as u16;
@@ -141,14 +144,15 @@ fn tube_hierarchy_generated_records_connect_full_and_local_precheck() {
             cell.zone_type = zone_class::OUTSIDE;
         }
     })
-    .cells;
+    .cells()
+    .to_vec();
     let tubes: Vec<_> = [15u16, 16, 17]
         .into_iter()
         .enumerate()
         .map(|(i, x)| {
             let cell = &mut cells[32 * usize::from(width) + usize::from(x)];
             cell.tube_index = Some(TubeId(i as u16));
-            cell.yr_cell_land_type = LandType::Tunnel.as_index();
+            cell.land_type = LandType::Tunnel.as_index();
             TubeFact::explicit((x, 32), (x + 32, 32), 0, vec![2; 32])
         })
         .collect();
@@ -178,7 +182,9 @@ fn tube_hierarchy_generated_records_connect_full_and_local_precheck() {
             graph.zone_at(48, 32),
             MovementZone::Normal,
             &ZonePrecheckExclusions::default(),
+            None,
         )
+        .unwrap()
     };
     let mut hierarchy = build_zone_hierarchy(&base, Some(&terrain), &[], width, height);
     assert!(
@@ -199,30 +205,25 @@ fn tube_hierarchy_generated_records_connect_full_and_local_precheck() {
         bridges.native_zone_source_size(),
     );
     let counts = super::super::BlockerNeighborCounts::new(width, height);
-    let route = super::super::zone_search::find_path_zoned_marker(
+    let route = super::super::zone_search::find_layered_path_zoned_marker(
         &path,
         (16, 32),
+        crate::sim::movement::locomotor::MovementLayer::Ground,
         (48, 32),
-        None,
-        None,
         Some(&zone_grid),
         MovementZone::Normal,
         Some(MovementZone::Normal),
         Some(&terrain),
         None,
-        None,
         Some(&counts),
-        0,
-        false,
-        false,
         true,
         None,
     )
-    .expect("generated Tube graph reaches live flat route selection");
+    .expect("generated Tube graph reaches live route selection");
     assert!(
         route
             .windows(2)
-            .any(|pair| pair[0].0.abs_diff(pair[1].0) > 1),
+            .any(|pair| pair[0].rx.abs_diff(pair[1].rx) > 1),
         "the class barrier is crossed by the Tube path transition"
     );
     for level in 0..3 {
@@ -257,8 +258,8 @@ fn tube_hierarchy_generated_records_connect_full_and_local_precheck() {
 fn tube_hierarchy_native_read_tubes_tail_publishes_retained_dummy_index() {
     use crate::map::tube_facts::TubeFact;
     use crate::map::tubes::{ConstructedMapTube, NativeMapTubeReceipt, TubeNativeInit};
-    let corpus: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/tube_hierarchy.json"
+    let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/tube_hierarchy.json",
     ))
     .unwrap();
     let writes = corpus["dummy_writes"].as_array().unwrap();
@@ -310,8 +311,8 @@ fn tube_hierarchy_native_read_tubes_tail_publishes_retained_dummy_index() {
 
 #[test]
 fn tube_hierarchy_constant_walk_endpoints_match_original_executable() {
-    let corpus: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/tube_hierarchy.json"
+    let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/tube_hierarchy.json",
     ))
     .unwrap();
     let terrain = redirect_terrain(1, 1, None, None, |_| {});
@@ -322,9 +323,53 @@ fn tube_hierarchy_constant_walk_endpoints_match_original_executable() {
             |v: &serde_json::Value| (v[0].as_i64().unwrap() as u16, v[1].as_i64().unwrap() as u16);
         let token = case["token"].as_i64().unwrap() as i32;
         assert_eq!(
-            hierarchy_walk_tube_path(&terrain, coord(&case["start"]), &[token]),
+            terrain.walk_native_path(coord(&case["start"]), &[token]),
             Ok(coord(&case["end"])),
             "raw token {token}"
         );
     }
+}
+
+/// 582D70 picks the bucket from the zones it was given but stores the
+/// sign-extended transcript, so two pairs can store the same edge under
+/// different buckets. Each bucket keeps its copy; a repeat in one bucket
+/// keeps the first flag.
+#[test]
+fn a_sign_extended_pair_is_kept_once_per_bucket() {
+    let mut buckets = HierarchyEdgeBuckets::new();
+    register_native_hierarchy_pair(
+        &mut buckets,
+        1,
+        0x8001,
+        0,
+        crate::map::cell_index::CellGrid::Retail,
+    );
+    register_native_hierarchy_pair(
+        &mut buckets,
+        2,
+        0x8001,
+        0,
+        crate::map::cell_index::CellGrid::Retail,
+    );
+    register_native_hierarchy_pair(
+        &mut buckets,
+        1,
+        0x8001,
+        1,
+        crate::map::cell_index::CellGrid::Retail,
+    );
+    let stored: Vec<_> = buckets
+        .buckets
+        .iter()
+        .enumerate()
+        .flat_map(|(i, bucket)| {
+            bucket
+                .iter()
+                .map(move |e| (i, e.existing, e.current, e.flag))
+        })
+        .collect();
+    assert_eq!(
+        stored,
+        [(0x11, 0xffff, 0x8001, 0), (0x21, 0xffff, 0x8001, 0)]
+    );
 }

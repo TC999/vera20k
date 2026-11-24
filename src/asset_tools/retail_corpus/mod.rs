@@ -12,15 +12,15 @@
 mod decoder_ratchets;
 mod manifest;
 
-#[cfg(test)]
+#[cfg(all(test, tests_asset_tools))]
 mod certify_audio;
-#[cfg(test)]
+#[cfg(all(test, tests_asset_tools))]
 mod certify_roundtrip;
-#[cfg(test)]
+#[cfg(all(test, tests_asset_tools))]
 mod certify_structural;
-#[cfg(test)]
+#[cfg(all(test, tests_asset_tools))]
 mod ratchet_tests;
-#[cfg(test)]
+#[cfg(all(test, tests_asset_tools))]
 mod tests;
 
 use std::collections::BTreeMap;
@@ -29,22 +29,12 @@ use std::path::Path;
 use crate::assets::asset_manager::AssetManager;
 use crate::assets::audio_bag::{AudioIndex, decode_bag_audio};
 use crate::assets::format_sniff::detect_format;
+use crate::util::fnv::{FNV1A64_OFFSET_BASIS, fnv1a64_fold_bytes};
 
 use manifest::Manifest;
 #[cfg(test)]
 use manifest::read_manifest;
 pub use manifest::{CandidateReport, export_candidate};
-
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
-
-fn fnv1a(bytes: &[u8], mut h: u64) -> u64 {
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    h
-}
 
 struct CorpusEntry {
     archive: String,
@@ -106,10 +96,10 @@ fn corpus_inventory(am: &AssetManager) -> Result<(ArchiveInventory, FormatCounts
     let mut archives = BTreeMap::new();
     let mut format_counts = BTreeMap::new();
     am.visit_archives(|name, archive| {
-        let mut h = FNV_OFFSET;
+        let mut h = FNV1A64_OFFSET_BASIS;
         for entry in archive.entries() {
-            h = fnv1a(&(entry.id as u32).to_le_bytes(), h);
-            h = fnv1a(&entry.size.to_le_bytes(), h);
+            h = fnv1a64_fold_bytes(h, &(entry.id as u32).to_le_bytes());
+            h = fnv1a64_fold_bytes(h, &entry.size.to_le_bytes());
         }
         archives.insert(name.to_string(), (archive.entry_count(), h));
     });
@@ -209,7 +199,13 @@ fn required_corpus() -> AssetManager {
     reject_ambient_write().expect("read-only retail validation");
     let (root, _) =
         super::root::resolve_ra2_dir(None).expect("retail corpus requires RA2_DIR or config.toml");
-    super::root::open_manager(&root, true).expect("mount the complete retail archive corpus")
+    super::root::open_manager(
+        &root,
+        true,
+        Default::default(),
+        &crate::util::archive_names::ArchiveNames::default(),
+    )
+    .expect("mount the complete retail archive corpus")
 }
 
 #[cfg(test)]

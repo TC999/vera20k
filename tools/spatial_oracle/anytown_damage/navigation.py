@@ -16,7 +16,38 @@ class Navigation(Geometry):
  nav_snapshot=ConnectivityRepair.nav_snapshot
  graph_snapshot=HierarchyRepair.graph_snapshot
  dummy_snapshot=HierarchyRepair.dummy_snapshot
- def __init__(self,r,t,tiles,*,case=None,create_actor=True,actor_coord=(87,53),actor_height=4,admission_cells=None,stages=None,scenario_theater=None):
+ @classmethod
+ def on_existing_map(cls,owner,*,size,class_height_plane,storage_mapped=False):
+  """Join native graphs to an existing VM and declared admitted map prior.
+
+  Cell membership, dimensions and the class/height bytes are caller inputs,
+  not answers to a path query. Original connectivity/hierarchy and all later
+  pathfinding execute. The existing runtime owns every allocation and hook.
+  storage_mapped means that owner already mapped the shared cache storage.
+  """
+  from types import MethodType
+  m=cls.__new__(cls);m.uc=owner.u;m.case=dict(size=list(size))
+  m.width=sum(size);m.side=m.width+1
+  assert list(struct.unpack('<2i',m.uc.mem_read(MAP+0xF4,8)))==list(size)
+  assert len(class_height_plane)==m.side*m.side*4
+  m.allocate=owner.allocate;m.call=MethodType(ConnectivityRepair.call,m)
+  if not storage_mapped:m.uc.mem_map(0x44000000,0x800000)
+  m.uc.mem_write(BASE,class_height_plane)
+  m.uc.mem_write(MAP+0x68,dwords(BASE,m.side*m.side,PLANE))
+  return m
+ @staticmethod
+ def setup_pathfinder(call):
+  """Original shared workspace producer; call transport owns execution budget.
+
+  42A6D0 constructs the global, 42AC00 sizes its map arrays, and 42C1C0
+  derives scratch from retained native hierarchy. No query result is supplied.
+  """
+  call(0x49F3A0,this=0)
+  call(0x42A6D0,this=0x87E8B8)
+  call(0x42AC00,this=0x87E8B8,args=(MAP+0xEC,))
+  call(0x42C1C0,this=0x87E8B8)
+ def __init__(self,r,t,tiles,*,case=None,create_actor=True,actor_coord=(87,53),actor_height=4,admission_cells=None,stages=None,scenario_theater=None,cell_inputs_only=False,terrain_inputs_only=False,runtime_lifecycle=False,wall_overlay_packs=False):
+  assert not (cell_inputs_only and terrain_inputs_only)
   self.create_actor=create_actor;self.actor_coord=actor_coord;self.actor_height=actor_height
   self.admission_cells=admission_cells if admission_cells is not None else [(87,53),(86,54),(87,54),(88,54),(87,55),(85,54),(89,54)]
   self.stages=stages;self.tile_count=t['count']
@@ -31,9 +62,10 @@ class Navigation(Geometry):
   u.mem_map(0x44000000,0x800000);u.mem_map(0x48000000,0x8000000)
   for a,n in [(0xA83D80,24),(0xA8E318,24),(0x8B4150,24),(0xB0F4E8,24),(0xB0EDC0,0x1000),(0x89EA40,12*36)]:u.mem_write(a,bytes(r.u.mem_read(a,n)))
   u.mem_write(0x8871E0,dwords(r.rules));u.mem_write(MAP+0x68,dwords(BASE,self.side*self.side,PLANE));u.mem_write(BASE,b'\x07\x00\x00\x00'*(self.side*self.side))
+  wall_sources={c for c,v in physical.items() if wall_overlay_packs and v['overlay'] is not None and r.u.mem_read(r.overlay_ptrs[v['overlay']]+0x2A8,1)[0]}
   self.activity='cell_ctor'
   for c,p in self.ptrs.items():
-   self.call(0x47BBF0,this=p,count=2000);v=physical[c];u.mem_write(p+0x24,packed(*c));u.mem_write(p+0x38,dwords(v['tile']));u.mem_write(p+0x44,dwords(v['overlay'] if v['overlay'] is not None else -1));u.mem_write(p+0x11A,bytes([v['subtile'],v['level']]));u.mem_write(p+0x11E,bytes([v['frame']]));u.mem_write(p+0x119,bytes([v['ice']]))
+   self.call(0x47BBF0,this=p,count=2000);v=physical[c];u.mem_write(p+0x24,packed(*c));u.mem_write(p+0x38,dwords(v['tile']));u.mem_write(p+0x44,dwords(v['overlay'] if v['overlay'] is not None and c not in wall_sources else -1));u.mem_write(p+0x11A,bytes([v['subtile'],v['level']]));u.mem_write(p+0x11E,bytes([0 if c in wall_sources else v['frame']]));u.mem_write(p+0x119,bytes([v['ice']]))
   self.call(0x47BBF0,this=DUMMY,count=2000)
   self.tile_image_getter=sr.u32(u,0x7ECC48+0x9C)
   self.activity='tile_ctor';u.mem_write(0xA8ED28,dwords(0x7EB6D4,0x44000000,t['count'],1,0,10));u.mem_write(0xB0F670,dwords(0x7EB6D4,self.allocate(4096*4),4096,1,0,10))
@@ -46,6 +78,7 @@ class Navigation(Geometry):
   for i,name in t['tiles'].items():
    p=0x44480000+i*0x400;u.mem_write(COORD+0x100,name[:-4].encode('ascii')+b'\0');self.call(0x5447C0,this=p,args=(i,-65,0,COORD+0x100,0),count=10000)
    properties=self.tile_properties[i]
+   if 'allow_tiberium' in properties:u.mem_write(p+0x306,bytes([properties['allow_tiberium']]))
    u.mem_write(p+0x2E1,bytes([int(bool(properties['shadow'] and properties['shadow_tiles']))]))
    anim=properties['animations'].get(i-properties['base'])
    if anim:u.mem_write(p+0x2C8,dwords(anim['index'],anim['values']['XOffset'],anim['values']['YOffset'],anim['values']['AttachesTo'],anim['values']['ZAdjust']))
@@ -59,7 +92,67 @@ class Navigation(Geometry):
   assert sr.u32(u,0xA8ED38)==t['count']
   print('native cells and tile heads ready',flush=True)
   self.activity='initial_recalc';self.sweeps=[];self.trace.clear();self.writes.clear()
+  cell_rng_before={k:sr.rng_state(u,p) for k,p in self.rngs.items()}
   self.sweep()
+  if cell_inputs_only:
+   # Reuse the authentic Cell/type/TMP input producer without executing later
+   # Terrain placement, graph construction or actor setup. No native return is
+   # substituted to impose this fixture boundary.
+   self.cell_inputs_rng=dict(before=cell_rng_before,after={k:sr.rng_state(u,p) for k,p in self.rngs.items()})
+   self.initial_cells=self.cell_plane();self.trace.clear();self.writes.clear();self.pending.clear();self.reached={};self.activity='cell_inputs'
+   return
+  if runtime_lifecycle:
+   # Opt-in runtime object prerequisites, before any Terrain/Object registration.
+   # Keep the populated IsoTile/Abstract owner; initialize only missing vectors.
+   from tools.spatial_oracle.bridge_constructor import OriginalBridgeConstructor
+   abstract=bytes(u.mem_read(0xB0F670,24))
+   OriginalBridgeConstructor.empty_registries(u,self.allocate,capacity=4096,preserve=(0xB0F670,))
+   assert bytes(u.mem_read(0xB0F670,24))==abstract
+   u.mem_write(0x87F5D8,dwords(0x7E17CC))
+   self.call(0x5FC310,this=0)
+   # Original Resize stores produce MapRect from the physical Size. The full
+   # resize allocator is outside this already-allocated physical-map fixture.
+   geometry=self.allocate(16);u.mem_write(geometry,dwords(0,0,*case['size']))
+   sp=STACK_BASE+STACK_SIZE-0x1000
+   u.mem_write(sp+0x64,dwords(geometry));u.reg_write(UC_X86_REG_ESP,sp);u.reg_write(UC_X86_REG_EBX,MAP)
+   run_checked(u,0x5662AC,0x56633E,count=100000)
+  if wall_overlay_packs:
+   assert runtime_lifecycle
+   # Preserve the selected existing AP reader's declared Session input for
+   # original OverlayPack's nonzero-mode crate admission gate.
+   u.mem_write(0xA8B238,bytes(r.u.mem_read(0xA8B238,4)))
+   from tools.spatial_oracle.bridge_constructor import OriginalBridgeConstructor
+   OriginalBridgeConstructor.prepare_deferred_services(u)
+   # MainPrepareSession enables original Object::Unlimbo before ReadScenario
+   # places authored objects; this must precede the first wall constructor.
+   self.game_active=[u.mem_read(0xA8E9A0,1)[0]]
+   run_checked(u,0x52D9D7,0x52D9DE)
+   self.game_active.append(u.mem_read(0xA8E9A0,1)[0])
+   # Real nested ReadScenario/FullInit counter producers, before authored
+   # overlays and before Terrain. No host supplies a nonzero admission result.
+   self.scenario_init=[sr.u32(u,0xA8E7AC)]
+   assert self.scenario_init==[0]
+   sp=STACK_BASE+STACK_SIZE-0x1000
+   u.reg_write(UC_X86_REG_ESP,sp);run_checked(u,0x68467C,0x68468A)
+   self.scenario_init.append(sr.u32(u,0xA8E7AC))
+   u.reg_write(UC_X86_REG_EBX,0);u.reg_write(UC_X86_REG_ESI,0);u.reg_write(UC_X86_REG_ECX,0)
+   run_checked(u,0x686B35,0x686B55)
+   self.scenario_init.append(sr.u32(u,0xA8E7AC))
+   # These same native graph owners establish the initialized caches needed by
+   # actual wall Mark's synchronous connectivity/hierarchy edits.
+   self.finish_graphs()
+   self.activity='authored_walls';self.wall_stamp_receipts=[]
+   for xy in sorted(wall_sources,key=lambda c:(c[1],c[0])):
+    p=self.ptrs[xy];v=physical[xy]
+    before=dict(overlay=sr.i32(u,p+0x44),data=u.mem_read(p+0x11E,1)[0],neighbors=u.mem_read(p+0x122,1)[0])
+    admission=OriginalBridgeConstructor.construct_authored(self,xy,v['overlay'])
+    self.wall_stamp_receipts.append(dict(cell=list(xy),requested=v['overlay'],before=before,admission=admission,
+      overlay=sr.i32(u,p+0x44),data=u.mem_read(p+0x11E,1)[0],owner=sr.i32(u,p+0x50),neighbors=u.mem_read(p+0x122,1)[0]))
+   selected=next(row for row in self.wall_stamp_receipts if row['cell']==[43,81])
+   assert selected['overlay']==203,selected
+   for xy,v in sorted(physical.items(),key=lambda row:(row[0][1],row[0][0])):
+    OriginalBridgeConstructor.apply_authored_data(self,xy,v['frame'])
+   self.call(0x725C70,this=0,count=10000000)
   self.activity='terrain_place';self.terrain_placement=[]
   u.mem_write(0xA8E988,dwords(0x7EB6D4,self.allocate(1024*4),1024,1,0,10))
   for key,name,line in sections['Terrain']:
@@ -69,10 +162,31 @@ class Navigation(Geometry):
    self.call(0x5683C0,args=(COORD,p),count=300000)
    self.terrain_placement.append(dict(key=key,name=name,coord=list(coord),native_xyz=list(struct.unpack('<3i',u.mem_read(p+0x9C,12)))))
   print('native terrain placements ready',flush=True)
+  if terrain_inputs_only:
+   # Full_Init687A85/687A8A initializes ore queues after the existing
+   # Terrain reader/place phase, before Technos and final568BB0. Reuse
+   # the prepared original Cell/TMP/Terrain owner without later graphs.
+   self.initial_cells=self.cell_plane();self.trace.clear();self.writes.clear();self.pending.clear();self.reached={};self.activity='terrain_inputs'
+   return
   self.activity='final_recalc';self.final_tiberium_value=self.call(0x568BB0,args=(0,),count=80000000)
   print('native cell planes established',dict(self.counters),flush=True)
   self.initial_cells=self.cell_plane();self.trace.clear();self.writes.clear();self.pending.clear();self.reached={}
-  self.activity='connectivity';u.mem_write(MAP+0x18,bytes(13*4));u.mem_write(MAP+0x54,dwords(0,0,1,0,10))
+  self.finish_graphs();self.actor_constructor_before={k:sr.rng_state(u,p) for k,p in self.rngs.items()};self.trace.clear()
+  if self.create_actor:self.build_actor(r.mtnk)
+  self.actor_constructor=dict(before_rng=self.actor_constructor_before,after_rng={k:sr.rng_state(u,p) for k,p in self.rngs.items()},trace=list(self.trace));self.initial=self.state();print('native hierarchy established',[len(x['records']) for x in self.initial['graphs']],flush=True)
+  self.activity='bridge'
+ def finish_graphs(self,*,compute_bridge_records=False):
+  """Build original graphs over this VM's already-constructed Cell state.
+
+  This owner reuses its established vector caller-boundary headers and native
+  56C510/581F90/42C1C0 chain. It does not reconstruct Cells or bridge stamps.
+  """
+  u=self.uc;case=self.case
+  self.activity='connectivity';u.mem_write(MAP+0x18,bytes(13*4))
+  if compute_bridge_records:
+   from tools.spatial_oracle.bridge_records import compute_on_map
+   self.bridge_record_production=compute_on_map(self)
+  else:u.mem_write(MAP+0x54,dwords(0,0,1,0,10))
   for address in (0x49F0E0,0x49F190,0x49F2F0,0x49F2D0,0x49F280):self.call(address,count=10000)
   root=self.allocate(16);buckets=self.allocate(256*24);template=self.allocate(24);self.call(0x58AFF0,this=template,args=(0,0),count=1000);u.mem_write(template,dwords(0x7ED540));u.mem_write(template+16,dwords(0,20));u.mem_write(buckets,bytes(u.mem_read(template,24))*256);u.mem_write(root,dwords(buckets,0x56CB80,256,20));u.mem_write(MAP+0x14,dwords(root));self.call(0x56C510,count=60000000)
   print('native base graph established',self.nav_snapshot()['zone_count'],flush=True)
@@ -80,10 +194,7 @@ class Navigation(Geometry):
   for level in range(3):
    header=MAP+0x8C+level*24;self.call(0x58AE60,this=header,args=(0,0),count=1000);u.mem_write(header,dwords(0x7ED4A0));u.mem_write(header+16,dwords(0,w*h*4//(1<<(2*(level+1)))));buckets=self.allocate(256*24);root=self.allocate(16);u.mem_write(root,dwords(buckets,0x56CB80,256,20));u.mem_write(MAP+0x80+level*4,dwords(root));u.mem_write(buckets,bucket_template*256)
   for level in (2,1,0):self.call(0x581F90,args=(level,),count=80000000)
-  self.call(0x42C1C0,this=0x87E8B8,count=10000000);self.actor_constructor_before={k:sr.rng_state(u,p) for k,p in self.rngs.items()};self.trace.clear()
-  if self.create_actor:self.build_actor(r.mtnk)
-  self.actor_constructor=dict(before_rng=self.actor_constructor_before,after_rng={k:sr.rng_state(u,p) for k,p in self.rngs.items()},trace=list(self.trace));self.initial=self.state();print('native hierarchy established',[len(x['records']) for x in self.initial['graphs']],flush=True)
-  self.activity='bridge'
+  self.call(0x42C1C0,this=0x87E8B8,count=10000000)
  def sweep(self):
   self.call(0x578350);coords=[]
   while True:
@@ -106,6 +217,9 @@ class Navigation(Geometry):
   return result
  def state(self):return dict(rng={k:sr.rng_state(self.uc,p) for k,p in self.rngs.items()},movement_admissions=self.movement_admissions() if self.create_actor else [],navigation=self.nav_snapshot(),graphs=self.graph_snapshot(),dummy=self.dummy_snapshot(),cells=self.cell_plane())
  def observe(self,u,a,n,d):
+  # Optional composed observation must see original entry registers/stack
+  # before an inherited presentation/OS seam updates ESP or EIP.
+  if observer:=getattr(self,'entry_observer',None):observer(u,a,n,d)
   if self.phase!='measure':return super().observe(u,a,n,d)
   if self.range_pending and a==self.range_pending[-1][0]:
    _,row=self.range_pending.pop();row['result']=u.reg_read(UC_X86_REG_EAX)
@@ -121,7 +235,11 @@ class Navigation(Geometry):
   if a in (0x47D2B0,0x47CA80,0x483C80,0x5FDD20,0x547370,0x71C110,0x47E8A0):
    self.counters[f'{self.activity}:{a:08X}']+=1
    if a==0x47D2B0:return
+  if a==0x6551C0 and getattr(self,'wall_live',False):return
   if a==0x421EA0:
+   if getattr(self,'wall_live',False):raise AssertionError(('uncovered live wall animation',hex(a)))
+   if getattr(self,'ore_live',False):
+    self.ore_animation_reached=True;raise AssertionError(('uncovered live ore animation',hex(a)))
    sp=u.reg_read(UC_X86_REG_ESP);self.counters[f'{self.activity}:animation_constructor_boundary']+=1;self.ret(28,u.reg_read(UC_X86_REG_ECX));return
   if a in (0x547020,0x727FD0):raise AssertionError(('uncovered dependency',self.activity,hex(a)))
   if a in (0x56C510,0x586990,0x584550,0x581F90,0x5824A0,0x42C1C0,0x578460,0x56CB90,0x56C6CB):

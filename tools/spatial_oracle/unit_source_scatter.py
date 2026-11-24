@@ -20,15 +20,17 @@ MAP, TABLE = 0x87F7E8, 0xC00000
 NEIGHBORS = [(10, 9), (11, 9), (11, 10), (11, 11), (10, 11), (9, 11), (9, 10), (9, 9)]
 
 
-def make_source_fixture(case):
-    u, call, read32 = make_fixture(case)
-    u.mem_map(CELLS, 0x90000)
+def make_source_fixture(case, *, uc=None, cells_base=CELLS):
+    # Composed histories may keep House state in the default cell arena.
+    # Relocation changes only storage; all table lookups use original code.
+    u, call, read32 = make_fixture(case, uc=uc)
+    u.mem_map(cells_base, 0x90000)
     u.reg_write(UC_X86_REG_FPCW, 0x0E7F)
     table = bytearray(0x100000)
     overrides = {(x, y): (level, flags) for x, y, level, flags in case.get('cells', [])}
     for y in range(32):
         for x in range(32):
-            ptr = CELLS + (y * 32 + x) * 0x200
+            ptr = cells_base + (y * 32 + x) * 0x200
             struct.pack_into('<I', table, (y * 512 + x) * 4, ptr)
             u.mem_write(ptr, dwords(0x7E4EEC))
             u.mem_write(ptr + 0x24, packed(x, y))
@@ -38,9 +40,9 @@ def make_source_fixture(case):
             u.mem_write(ptr + 0x44, dwords(-1))
             u.mem_write(ptr + 0x54, dwords(-1, -1))
     for x, y, ground, deck in case.get('raw', []):
-        u.mem_write(CELLS + (y * 32 + x) * 0x200 + 0x124, dwords(ground, deck))
+        u.mem_write(cells_base + (y * 32 + x) * 0x200 + 0x124, dwords(ground, deck))
     for x, y in case.get('blocked_terrain', []):
-        u.mem_write(CELLS + (y * 32 + x) * 0x200 + 0xEC, dwords(1))
+        u.mem_write(cells_base + (y * 32 + x) * 0x200 + 0xEC, dwords(1))
     u.mem_write(0x89EA40, struct.pack('<18f', *([1.0] * 9 + [0.0] * 9)))
     u.mem_write(TABLE, bytes(table))
     u.mem_write(MAP + 0x13C, dwords(TABLE, 0x40000))
@@ -60,9 +62,11 @@ def make_source_fixture(case):
     u.mem_write(ACTOR + 0x6AF, bytes([case.get('turret_latch', False)]))
     u.mem_write(ACTOR + 0x6D1, bytes([case.get('unload_active', False)]))
     u.mem_write(ACTOR + 0x2B4, dwords(TYPE if case.get('target') else 0))
-    u.mem_write(TYPE + 0x67C, dwords(1))  # supplied speed row 1 (all nine rows agree)
-    u.mem_write(TYPE + 0xDFC, dwords(-1))  # no type-specific land restriction
-    u.mem_write(LOCO + 0x40, dwords(*case.get('head', [0, 0, 0])))
+    if not case.get('retained_type', False):
+        u.mem_write(TYPE + 0x67C, dwords(1))  # supplied speed row 1 (all nine rows agree)
+        u.mem_write(TYPE + 0xDFC, dwords(-1))  # no type-specific land restriction
+    if case.get('family') != 'jumpjet':
+        u.mem_write(LOCO + 0x40, dwords(*case.get('head', [0, 0, 0])))
     control = 0xA8E3A8 + case.get('mission', 5) * 32
     u.mem_write(control + 9, bytes([case.get('mission_scatter', True)]))
     u.mem_write(control + 7, bytes([case.get('paralyzed', False)]))
@@ -146,6 +150,8 @@ def generate():
             dict(blocked_terrain=NEIGHBORS), dict(raw=[[11, 10, 0x20, 0]]),
             dict(cells=[[x, y, 0, 0x100] for x, y in NEIGHBORS])]
     cases += [dict(case, live_entry=True) for case in live]
+    # A Target draws only when the call is unforced, whatever no_kidding says.
+    cases += [dict(target=True), dict(target=True, force=False, second=True)]
     return [query(case) for case in cases]
 
 

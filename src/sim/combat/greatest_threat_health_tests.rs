@@ -1,6 +1,6 @@
 use super::*;
 use crate::rules::ini_parser::IniFile;
-use crate::sim::components::Health;
+use crate::sim::combat::Health;
 use serde_json::Value;
 
 fn bits(row: &Value, key: &str) -> NativeF64Bits {
@@ -9,16 +9,14 @@ fn bits(row: &Value, key: &str) -> NativeF64Bits {
 
 #[test]
 fn native_health_term_spills_and_retaliation_predicates_preserve_nonfinite_values() {
-    let corpus: Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/threat_health.json"
+    let corpus: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/threat_health.json",
     ))
     .unwrap();
     let rows = corpus["health_terms"].as_array().unwrap();
     assert_eq!(rows.len(), 672);
     for row in rows {
-        let health = Health {
-            current: row["current"].as_i64().unwrap() as i32,
-        };
+        let health = Health::new(row["current"].as_i64().unwrap() as i32);
         let strength = row["strength"].as_i64().unwrap() as i32;
         let ratio = health.ratio(strength);
         let before_store = ScoreX87::add(
@@ -62,8 +60,8 @@ fn native_health_term_spills_and_retaliation_predicates_preserve_nonfinite_value
 
 #[test]
 fn actual_scorer_consumes_live_signed_strength_and_masked_zero_division() {
-    let corpus: Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/threat_health.json"
+    let corpus: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/threat_health.json",
     ))
     .unwrap();
     let mut compared = 0;
@@ -79,11 +77,13 @@ fn actual_scorer_consumes_live_signed_strength_and_masked_zero_division() {
         let mut interner = crate::sim::intern::test_interner();
         let mut entities = EntityStore::new();
         let mut scorer = GameEntity::test_default(1, "SCORER", "Americans", 2, 2);
-        scorer.type_ref = interner.intern("SCORER");
+        scorer.set_type_ref_for_test(interner.intern("SCORER"));
         entities.insert(scorer);
         let mut candidate = GameEntity::test_default(2, "CANDIDATE", "Soviet", 2, 2);
-        candidate.type_ref = interner.intern("CANDIDATE");
-        candidate.health.current = row["current"].as_i64().unwrap() as i32;
+        candidate.set_type_ref_for_test(interner.intern("CANDIDATE"));
+        candidate
+            .health
+            .set_for_test(row["current"].as_i64().unwrap() as i32);
         entities.insert(candidate);
         let result = calculate_threat_score(
             &entities,
@@ -112,4 +112,49 @@ fn actual_scorer_consumes_live_signed_strength_and_masked_zero_division() {
         compared += 1;
     }
     assert_eq!(compared, 168);
+}
+
+/// The E term subtracts the selected weapon's +B4 leptons over 256, rounded
+/// toward zero (`0x0070CF6F..0x0070CF99`), not its range in floored cells.
+/// `Range=-1` keeps ReadRange's default (`0x0047463E`), the constructor zero,
+/// and `Range=-1.5` is -384 leptons, -1 cell.
+#[test]
+fn distance_term_reads_the_weapon_range_in_leptons() {
+    for (range, score) in [("-1", 100_000), ("-1.5", 99_990)] {
+        let rules = RuleSet::from_ini(&IniFile::from_str(&format!(
+            "[VehicleTypes]\n0=SCORER\n1=CANDIDATE\n\
+             [SCORER]\nStrength=100\nPrimary=Gun\n[CANDIDATE]\nStrength=100\n\
+             [Gun]\nDamage=1\nRange={range}\nWarhead=HE\n[HE]\nCellSpread=0\n"
+        )))
+        .unwrap();
+        let mut interner = crate::sim::intern::test_interner();
+        let mut entities = EntityStore::new();
+        let mut scorer = GameEntity::test_default(1, "SCORER", "Americans", 2, 2);
+        scorer.set_type_ref_for_test(interner.intern("SCORER"));
+        entities.insert(scorer);
+        let mut candidate = GameEntity::test_default(2, "CANDIDATE", "Soviet", 2, 2);
+        candidate.set_type_ref_for_test(interner.intern("CANDIDATE"));
+        entities.insert(candidate);
+        let result = calculate_threat_score(
+            &entities,
+            1,
+            2,
+            &rules,
+            &interner,
+            None,
+            None,
+            ThreatCoefficients {
+                my_effectiveness: 0.0,
+                target_effectiveness: 0.0,
+                target_special_threat: 0.0,
+                target_strength: 0.0,
+                target_distance: -10.0,
+            },
+            ThreatReference::NullCoord,
+            None,
+        )
+        .unwrap();
+        // Zero distance: the score is 100000 + 10 * min(range in cells, 0).
+        assert_eq!(truncate_score(result), score, "Range={range}");
+    }
 }

@@ -17,6 +17,9 @@ struct SuppliedCell {
     tile: i32,
     subtile: u8,
     facts: BridgeCellFacts,
+    /// Native +44 (None is -1) and +11E.
+    overlay: Option<u8>,
+    state: u8,
     // Native +2C is a pointer, not the derived self relation in BridgeCellFacts.
     anchor: Option<RimCoord>,
 }
@@ -24,8 +27,8 @@ struct SuppliedCell {
 impl SuppliedCell {
     fn snapshot(&self) -> Value {
         json!({"coord": self.coord, "flags": self.facts.raw_flags,
-            "overlay": self.facts.overlay_id.map_or(-1, i32::from),
-            "state": self.facts.state_byte, "anchor": self.anchor})
+            "overlay": self.overlay.map_or(-1, i32::from),
+            "state": self.state, "anchor": self.anchor})
     }
 }
 
@@ -50,8 +53,8 @@ fn coord(value: &Value) -> RimCoord {
 
 impl SuppliedHost {
     fn stock() -> Self {
-        let input: Value = serde_json::from_str(include_str!(
-            "../../../tools/spatial_oracle/bridge_rim_stock_inputs.json"
+        let input: Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/bridge_rim_stock_inputs.json",
         ))
         .unwrap();
         Self::from_input(&input)
@@ -80,22 +83,26 @@ impl SuppliedHost {
                 tile: -1,
                 subtile: 0,
                 facts: BridgeCellFacts::default(),
+                overlay: None,
+                state: 0,
                 anchor: None,
             },
         };
+        type RimRow = (
+            i16,
+            i16,
+            i32,
+            u8,
+            u32,
+            Option<u8>,
+            u8,
+            Option<RimCoord>,
+            u8,
+            u8,
+        );
         for row in input["cells"].as_array().unwrap() {
-            let (x, y, tile, subtile, flags, overlay, state, anchor, _, _): (
-                i16,
-                i16,
-                i32,
-                u8,
-                u32,
-                Option<u8>,
-                u8,
-                Option<RimCoord>,
-                u8,
-                u8,
-            ) = serde_json::from_value(row.clone()).unwrap();
+            let (x, y, tile, subtile, flags, overlay, state, anchor, _, _): RimRow =
+                serde_json::from_value(row.clone()).unwrap();
             host.source_order.push((x, y));
             host.cells.insert(
                 (x, y),
@@ -105,10 +112,10 @@ impl SuppliedHost {
                     subtile,
                     facts: BridgeCellFacts {
                         raw_flags: flags,
-                        state_byte: state,
-                        overlay_id: overlay,
                         ..Default::default()
                     },
+                    overlay,
+                    state,
                     anchor: anchor.filter(|_| flags & 0x80 == 0),
                 },
             );
@@ -166,8 +173,8 @@ impl SuppliedHost {
 
 #[test]
 fn retained_dummy_and_requested_endpoint_match_original_control_cases() {
-    let original: Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/bridge_rim_control.json"
+    let original: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/bridge_rim_control.json",
     ))
     .unwrap();
     for case in original["cases"].as_array().unwrap() {
@@ -275,6 +282,9 @@ impl HighBridgeRimHost for SuppliedHost {
                     | BridgeStampSlot::Forward2
                     | BridgeStampSlot::Opposite
             ) {
+                // 47E040 stores +11E = 0 on each destroyed slot before its
+                // fallout, as the live publication's finish_slot does.
+                cell.state = 0;
                 let snapshot = cell.snapshot();
                 let coord = cell.coord;
                 self.calls
@@ -286,8 +296,8 @@ impl HighBridgeRimHost for SuppliedHost {
     }
     fn clear_overlay_and_mark_radar(&mut self, handle: SuppliedHandle) {
         let cell = self.by_handle_mut(handle);
-        cell.facts.state_byte = 0;
-        cell.facts.overlay_id = None;
+        cell.state = 0;
+        cell.overlay = None;
         let coord = cell.coord;
         self.calls
             .push(json!({"kind": "radar_sink", "coord": coord}));
@@ -350,11 +360,8 @@ fn compare_stock_cases(cases: &Value, bounds: impl Fn(&Value) -> Option<RimBound
     }
 }
 
-fn stock_original() -> Value {
-    serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/bridge_rim.json"
-    ))
-    .unwrap()
+fn stock_original() -> &'static Value {
+    crate::test_fixture::json("tools/spatial_oracle/bridge_rim.json")
 }
 
 #[test]

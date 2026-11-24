@@ -7,15 +7,12 @@
 use std::cmp::Ordering;
 
 /// Sort record indices, keeping the records under their existing owner.
-pub(crate) fn sort_indices_by(
-    indices: &mut [usize],
-    mut compare: impl FnMut(usize, usize) -> Ordering,
-) {
+pub fn sort_indices_by(indices: &mut [usize], mut compare: impl FnMut(usize, usize) -> Ordering) {
     sort_by(indices, |&left, &right| compare(left, right));
 }
 
 /// qsort over the records themselves, as native swaps them in place.
-pub(crate) fn sort_by<T>(items: &mut [T], mut compare: impl FnMut(&T, &T) -> Ordering) {
+pub fn sort_by<T>(items: &mut [T], mut compare: impl FnMut(&T, &T) -> Ordering) {
     if items.len() < 2 {
         return;
     }
@@ -85,15 +82,16 @@ pub(crate) fn sort_by<T>(items: &mut [T], mut compare: impl FnMut(&T, &T) -> Ord
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_util))]
 mod tests {
     use super::*;
 
     #[test]
     fn saved_entry_order_and_comparison_count_match_original_instructions() {
-        let vectors: serde_json::Value =
-            serde_json::from_str(include_str!("../../tools/storage_oracle/seed_order.json"))
-                .unwrap();
+        let vectors: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/storage_oracle/seed_order.json",
+        ))
+        .unwrap();
         let cases = vectors["cases"].as_object().unwrap();
         assert_eq!(cases.len(), 36);
         for (name, case) in cases {

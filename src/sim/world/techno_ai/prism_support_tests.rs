@@ -16,8 +16,12 @@
 //! than 1 or 2 at expiry (`mode_0`, `mode_3`) is skipped: every native writer
 //! pairs the mode with its countdown and writes only 1 or 2.
 //! `fire_at_returns_null` is FireAt's refusal, which VERA meets in its own
-//! emission path, where [`Simulation::take_support_bonus`] runs only for a
+//! emission path, where [`ObjectSubstrate::take_support_bonus`](crate::sim::world::ObjectSubstrate::take_support_bonus) runs only for a
 //! launched bullet.
+//!
+//! A game where Ares plays replaces the stock arm (`ares_prism_forwarding`):
+//! its oracle rows run in a stock game only, and the `ares_prism_*` tests
+//! below cover the replacement with the same fixture.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -28,10 +32,11 @@ use crate::map::resolved_terrain::test_flat_ground_grid;
 use crate::rules::ini_parser::IniFile;
 use crate::rules::native_processing::{RulesLayerKind, RulesLayerStack};
 use crate::rules::ruleset::PrismSupportRules;
-use crate::sim::combat::AttackTarget;
+use crate::sim::combat::TargetKind;
+use crate::sim::combat::receiver_fixture::with_building_fire_stub;
 use crate::sim::mission::MissionDispatchTimer;
 use crate::sim::mission::state::MissionTestFixture;
-use crate::sim::projectile::ProjectileCoord;
+use crate::sim::projectile::{ProjectileCoord, ProjectilePayload};
 use crate::sim::timer::{CdTimer, PAUSED_START_FRAME};
 use crate::util::fixed_math::SimFixed;
 
@@ -48,11 +53,8 @@ const DELAY: i32 = 28;
 /// The oracle's FireAt rearm (the row's `rof`, retail PrismShot's 45).
 const ROF: i32 = 45;
 
-fn golden() -> Value {
-    serde_json::from_str(include_str!(
-        "../../../../tools/spatial_oracle/building_prism.json"
-    ))
-    .unwrap()
+fn golden() -> &'static Value {
+    crate::test_fixture::json("tools/spatial_oracle/building_prism.json")
 }
 
 fn rows<'a>(golden: &'a Value, set: &str) -> &'a [Value] {
@@ -64,8 +66,9 @@ fn rows<'a>(golden: &'a Value, set: &str) -> &'a [Value] {
 /// `PrismShot` of 2048 leptons, Weapon[1] `PrismSupport` of `support_range`
 /// (EliteWeapon[1] of `elite_range` when given), the SpecialAnim `GAPRIS_A`
 /// and its Damaged `GAPRIS_AD`, `DelayedFireDelay=28` and MissionControl as
-/// building_guard_attack's cadence (AARate .016).
-fn rules(support_range: i32, elite_range: Option<i32>) -> RuleSet {
+/// building_guard_attack's cadence (AARate .016). `tower_keys` extends
+/// `[TWR]`.
+fn rules(support_range: i32, elite_range: Option<i32>, tower_keys: &str) -> RuleSet {
     let cells = |leptons: i32| f64::from(leptons) / 256.0;
     let elite = elite_range.map_or(String::new(), |range| {
         format!(
@@ -82,14 +85,15 @@ fn rules(support_range: i32, elite_range: Option<i32>) -> RuleSet {
         "Image=TWRART\nStrength=600\nArmor=steel\nFoundation=1x1\nPowered=yes\nPower=-75\n\
          Primary=PrismShot\nSecondary=PrismSupport\n{elite_key}"
     );
-    let rules_ini = IniFile::from_str(&format!(
+    let twr = format!("{tower}{tower_keys}");
+    let rules_ini = crate::sim::arena_fixture::clear_ground_ini(&format!(
         "[General]\nPrismType=TWR\nPrismSupportModifier=150%\nPrismSupportMax=8\n\
          PrismSupportDelay=45\n\
          [Guard]\nRate=.030\nAARate=.016\n\
          [Attack]\nRate=.016\nAARate=.016\n\
          [BuildingTypes]\n0=TWR\n1=OTHER\n2=SHED\n\
          [Animations]\n0=GAPRIS_A\n1=GAPRIS_AD\n\
-         [TWR]\n{tower}\
+         [TWR]\n{twr}\
          [OTHER]\n{tower}\
          [SHED]\nStrength=1000\nArmor=wood\nFoundation=1x1\n\
          [PrismShot]\nDamage=120\nROF=45\nRange=8\nProjectile=Beam\nWarhead=Prism\n\
@@ -126,16 +130,12 @@ fn mission_of(name: &str) -> MissionId {
 
 /// A delayed fire's mode (`+0x704`) and countdown (`+0x714`).
 fn delayed_fire(entity: &crate::sim::game_entity::GameEntity) -> (i64, i32) {
-    match entity.pending_building_fire {
+    match entity.building.pending_building_fire.pending() {
         None => (0, 0),
-        Some(PendingBuildingFire {
-            remaining_ticks,
-            fire: DelayedFire::Weapon(_),
-        }) => (1, remaining_ticks),
-        Some(PendingBuildingFire {
-            remaining_ticks,
-            fire: DelayedFire::SupportBeam { .. },
-        }) => (2, remaining_ticks),
+        Some(pending) => match pending.fire() {
+            DelayedFire::Weapon(_) => (1, pending.remaining_ticks()),
+            DelayedFire::SupportBeam { .. } => (2, pending.remaining_ticks()),
+        },
     }
 }
 
@@ -162,14 +162,27 @@ impl Fixture {
             input["elite_support_range"]
                 .as_i64()
                 .map(|range| range as i32),
+            input["tower_keys"].as_str().unwrap_or(""),
         );
         let mut sim = Simulation::new();
         sim.install_resolved_terrain_for_new_map(test_flat_ground_grid(48));
+        crate::sim::arena_fixture::supply_native_map_keyed(&mut sim, "prism flat ground 48");
         let owner = sim.interner.intern("Americans");
-        sim.houses.insert(
-            owner,
-            crate::sim::house_state::HouseState::new(owner, 0, None, false, 0, 10),
-        );
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                owner, 0, None, false, 0, 10,
+            ));
+        // The target's House: building spawns mark their owner's reservation.
+        let target_owner = sim.interner.intern("Russians");
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                target_owner,
+                1,
+                None,
+                false,
+                0,
+                10,
+            ));
         let mut buildings = BTreeMap::new();
         let mut spawned = Vec::new();
         let towers = input["towers"].as_array().cloned().unwrap_or_default();
@@ -197,17 +210,17 @@ impl Fixture {
             spawned.push(id);
         }
         // Unlimbo's House+68 appends, in spawn order.
-        assert_eq!(sim.houses[&owner].base_projection.buildings(), spawned);
+        assert_eq!(sim.houses[&owner].base_projection().buildings(), spawned);
         let target = sim
             .spawn_object("SHED", "Russians", 15, 12, 0, &rules)
             .unwrap();
         // No power state: every tower is operational until `unpower`.
-        sim.power_states.clear();
-        sim.session.binary_frame = FRAME as u32;
+        sim.power_states.map_mut_for_test().clear();
+        sim.session.set_binary_frame_for_test(FRAME as u32);
         for &id in &spawned {
             let entity = sim.substrate.entities.get_mut(id).unwrap();
             assert!(
-                entity.building_anim_slots.iter().all(Option::is_none),
+                entity.building_art.anim_slots().iter().all(Option::is_none),
                 "the oracle's anim slots start empty"
             );
             entity.mission.apply_test_fixture(MissionTestFixture {
@@ -221,7 +234,10 @@ impl Fixture {
                 dispatch_timer: MissionDispatchTimer::from_raw(FRAME, 0),
             });
             entity.mission_leaf.set_building_ready_latch(1);
-            entity.rearm_timer = CdTimer::started(FRAME - 100, 0);
+            entity
+                .seldom
+                .rearm_timer
+                .set_for_test(CdTimer::started(FRAME - 100, 0));
         }
         let mut fixture = Self {
             sim,
@@ -243,7 +259,7 @@ impl Fixture {
                 .houses
                 .get_mut(&owner)
                 .unwrap()
-                .base_projection
+                .base_projection_mut()
                 .replace_buildings_for_test(ids);
         }
         fixture
@@ -267,10 +283,10 @@ impl Fixture {
         let target = self.target;
         let entity = self.sim.substrate.entities.get_mut(id).unwrap();
         if state["alive"] == false {
-            entity.lifecycle.object_alive = false;
+            entity.lifecycle.set_object_alive_for_test(false);
         }
         if let Some(health) = state["health"].as_u64() {
-            entity.health.current = health as i32;
+            entity.health.set_for_test(health as i32);
         }
         if state["mission"].is_string() || state["queued"].is_string() {
             entity.mission.apply_test_fixture(MissionTestFixture {
@@ -285,50 +301,62 @@ impl Fixture {
             });
         }
         if let Some(aimed) = state["target"].as_bool() {
-            entity.attack_target = aimed.then(|| AttackTarget::new(target));
+            entity
+                .attack_target
+                .set_for_test(aimed.then(|| TargetKind::Entity(target)));
         }
         if let Some(rearm) = state["rearm"].as_array() {
             let start = rearm[0]
                 .as_i64()
                 .map_or(PAUSED_START_FRAME, |relative| FRAME + relative as i32);
-            entity.rearm_timer = CdTimer::started(start, rearm[1].as_i64().unwrap() as i32);
+            entity
+                .seldom
+                .rearm_timer
+                .set_for_test(CdTimer::started(start, rearm[1].as_i64().unwrap() as i32));
         }
         if state["drained"] == true {
-            entity.draining_me = Some(u64::MAX);
+            entity.drain.set_draining_me_for_test(Some(u64::MAX));
         }
         if let Some(count) = state["count"].as_i64() {
-            entity.prism_support_count = count as i32;
+            entity
+                .building
+                .prism_support_count
+                .set_for_test(count as i32);
         }
         if let Some(veterancy) = state["veterancy"].as_f64() {
-            entity.set_veterancy_rank((veterancy * 100.0) as u16);
+            entity
+                .veterancy
+                .set_rank_for_test((veterancy * 100.0) as u16);
         }
         let countdown = state["countdown"].as_i64().unwrap_or(0) as i32;
         let payload = |axis: usize| state["payload"][axis].as_i64().unwrap_or(0) as i32;
-        entity.pending_building_fire = match state["mode"].as_i64().unwrap_or(0) {
-            0 if countdown == 0 => None,
-            0 => {
-                self.mode_unheld.insert(id);
-                Some(PendingBuildingFire {
-                    remaining_ticks: countdown,
-                    fire: DelayedFire::Weapon(WeaponSlot::Primary),
-                })
-            }
-            1 => Some(PendingBuildingFire {
-                remaining_ticks: countdown,
-                fire: DelayedFire::Weapon(if payload(0) == 1 {
-                    WeaponSlot::Secondary
-                } else {
-                    WeaponSlot::Primary
-                }),
-            }),
-            2 => Some(PendingBuildingFire {
-                remaining_ticks: countdown,
-                fire: DelayedFire::SupportBeam {
-                    to: ProjectileCoord::new(payload(0), payload(1), payload(2)),
-                },
-            }),
-            other => panic!("mode {other} has no VERA state"),
-        };
+        entity.building.pending_building_fire.set_for_test(
+            match state["mode"].as_i64().unwrap_or(0) {
+                0 if countdown == 0 => None,
+                0 => {
+                    self.mode_unheld.insert(id);
+                    Some(PendingBuildingFire::new(
+                        countdown,
+                        DelayedFire::Weapon(WeaponSlot::Primary),
+                    ))
+                }
+                1 => Some(PendingBuildingFire::new(
+                    countdown,
+                    DelayedFire::Weapon(if payload(0) == 1 {
+                        WeaponSlot::Secondary
+                    } else {
+                        WeaponSlot::Primary
+                    }),
+                )),
+                2 => Some(PendingBuildingFire::new(
+                    countdown,
+                    DelayedFire::SupportBeam {
+                        to: ProjectileCoord::new(payload(0), payload(1), payload(2)),
+                    },
+                )),
+                other => panic!("mode {other} has no VERA state"),
+            },
+        );
     }
 
     /// The target's Location `east` leptons east of [`ORIGIN`].
@@ -342,14 +370,13 @@ impl Fixture {
     /// replayed rows only the building it names asks (Mission_Guard, the
     /// support beam and the Prism walk do not).
     fn unpower(&mut self) {
-        self.sim.power_states.insert(
-            self.owner,
-            crate::sim::power_system::PowerState {
-                total_output: 0,
-                total_drain: 75,
-                ..Default::default()
-            },
-        );
+        let mut power_state = crate::sim::power_system::PowerState::default();
+        power_state.set_total_output_for_test(0);
+        power_state.set_total_drain_for_test(75);
+        self.sim
+            .power_states
+            .map_mut_for_test()
+            .insert(self.owner, power_state);
     }
 
     /// `state` after the call: count, delayed-fire mode and countdown, rearm
@@ -361,7 +388,7 @@ impl Fixture {
         let name = self.name(id);
         let (mode, countdown) = delayed_fire(entity);
         assert_eq!(
-            i64::from(entity.prism_support_count),
+            i64::from(entity.building.prism_support_count.count()),
             native["count"].as_i64().unwrap(),
             "{at} {name} count"
         );
@@ -376,8 +403,8 @@ impl Fixture {
         let rearm = &native["rearm"];
         assert_eq!(
             [
-                entity.rearm_timer.start_frame(),
-                entity.rearm_timer.duration()
+                entity.seldom.rearm_timer.start_frame(),
+                entity.seldom.rearm_timer.duration()
             ],
             [0, 1].map(|index| rearm[index].as_i64().unwrap() as i32),
             "{at} {name} rearm"
@@ -390,7 +417,7 @@ impl Fixture {
             );
         }
         assert_eq!(
-            entity.attack_target.as_ref().map(|attack| attack.target),
+            entity.attack_target.target(),
             native["target"]
                 .as_str()
                 .map(|_| TargetKind::Entity(self.target)),
@@ -398,7 +425,7 @@ impl Fixture {
         );
         if let Some(counter) = native["turret_counter"].as_i64() {
             assert_eq!(
-                i64::from(entity.turret_anim_frame),
+                i64::from(entity.turret_anim_frame.frame()),
                 counter,
                 "{at} {name} +0x148"
             );
@@ -414,11 +441,11 @@ impl Fixture {
 fn place(sim: &mut Simulation, id: u64, offset: [i32; 3]) {
     let [x, y, z] = [0, 1, 2].map(|axis| ORIGIN[axis] + offset[axis]);
     let position = &mut sim.substrate.entities.get_mut(id).unwrap().position;
-    position.rx = (x >> 8) as u16;
-    position.ry = (y >> 8) as u16;
-    position.sub_x = SimFixed::from_num(x & 0xFF);
-    position.sub_y = SimFixed::from_num(y & 0xFF);
-    position.exact_z_leptons = Some(z);
+    position.set_rx_for_test((x >> 8) as u16);
+    position.set_ry_for_test((y >> 8) as u16);
+    position.set_sub_x_for_test(SimFixed::from_num(x & 0xFF));
+    position.set_sub_y_for_test(SimFixed::from_num(y & 0xFF));
+    position.set_exact_z_leptons_for_test(Some(z));
 }
 
 fn location(sim: &Simulation, id: u64) -> [i32; 3] {
@@ -429,11 +456,17 @@ fn location(sim: &Simulation, id: u64) -> [i32; 3] {
 }
 
 fn slot_anim(sim: &Simulation, id: u64, slot: usize) -> Option<String> {
-    sim.substrate.entities.get(id).unwrap().building_anim_slots[slot].map(|anim| {
-        sim.interner
-            .resolve(sim.anim(anim).unwrap().type_id)
-            .to_string()
-    })
+    sim.substrate
+        .entities
+        .get(id)
+        .unwrap()
+        .building_art
+        .anim_slots()[slot]
+        .map(|anim| {
+            sim.interner
+                .resolve(sim.anim(anim).unwrap().type_id())
+                .to_string()
+        })
 }
 
 /// Every `recruit` row: Mission_Attack's arm for a GetFireError answering OK
@@ -448,6 +481,8 @@ fn slot_anim(sim: &Simulation, id: u64, slot: usize) -> Option<String> {
 /// and weapon-1 range of every tower the walk measures (Sqrt_Approx and ftol,
 /// elite range when elite); and no Scenario draw.
 #[test]
+// The stock PrismType support; an Ares game replaces it
+// (`techno_ai::ares_prism_forwarding`).
 fn prism_recruitment_matches_the_original() {
     let golden = golden();
     let recruit = rows(&golden, "recruit");
@@ -477,7 +512,7 @@ fn prism_recruitment_matches_the_original() {
             .values()
             .map(|&id| {
                 let entity = fixture.sim.substrate.entities.get(id).unwrap();
-                (id, entity.pending_building_fire)
+                (id, entity.building.pending_building_fire.pending())
             })
             .collect();
         let target = TargetKind::Entity(fixture.target);
@@ -488,6 +523,8 @@ fn prism_recruitment_matches_the_original() {
             target,
             0,
             FireError::Ok,
+            &mut ObjectAiCtx::default(),
+            &mut false,
         );
         assert_eq!(
             i64::from(returns),
@@ -502,7 +539,7 @@ fn prism_recruitment_matches_the_original() {
 
         let armed_now = |id: u64| {
             let entity = fixture.sim.substrate.entities.get(id).unwrap();
-            let pending = entity.pending_building_fire;
+            let pending = entity.building.pending_building_fire.pending();
             pending.filter(|_| pending != pending_before[&id])
         };
         let recruited: Vec<&str> = fixture
@@ -524,10 +561,10 @@ fn prism_recruitment_matches_the_original() {
         );
         assert_eq!(
             armed_now(master)
-                == Some(PendingBuildingFire {
-                    remaining_ticks: DELAY,
-                    fire: DelayedFire::Weapon(WeaponSlot::Primary),
-                }),
+                == Some(PendingBuildingFire::new(
+                    DELAY,
+                    DelayedFire::Weapon(WeaponSlot::Primary)
+                )),
             row["armed"].as_bool().unwrap(),
             "{name} armed"
         );
@@ -548,11 +585,17 @@ fn prism_recruitment_matches_the_original() {
                 fixture.rules.object("TWR").unwrap(),
                 0,
                 0,
+                Default::default(),
             )
             .coord;
             let supporter = fixture.sim.substrate.entities.get(supporter).unwrap();
             assert_eq!(
-                supporter.pending_building_fire.unwrap().fire,
+                supporter
+                    .building
+                    .pending_building_fire
+                    .pending()
+                    .unwrap()
+                    .fire,
                 DelayedFire::SupportBeam { to: flh },
                 "{name} beam point"
             );
@@ -623,11 +666,13 @@ fn prism_recruitment_matches_the_original() {
 /// Every `bonus` row VERA can hold (module doc): ProcessDelayedFire's
 /// countdown and, at its end, a request for the combat phase's FireAt only
 /// with a target and GetFireError OK, whose bullet takes
-/// [`Simulation::take_support_bonus`] (the row's `bullet_multiplier`) and
+/// [`ObjectSubstrate::take_support_bonus`](crate::sim::world::ObjectSubstrate::take_support_bonus) (the row's `bullet_multiplier`) and
 /// clears the count; otherwise the count stays. The row's GetFireError answer
 /// is made real: RANGE by the target's distance, REARM by the rearm timer,
 /// CANT by a power outage.
 #[test]
+// The stock PrismType support; an Ares game replaces it
+// (`techno_ai::ares_prism_forwarding`).
 fn prism_support_bonus_matches_the_original() {
     let golden = golden();
     let bonus = rows(&golden, "bonus");
@@ -650,24 +695,32 @@ fn prism_support_bonus_matches_the_original() {
             Some(8) => fixture.move_target(OUT_OF_RANGE),
             Some(3) => {
                 let entity = fixture.sim.substrate.entities.get_mut(master).unwrap();
-                entity.rearm_timer = CdTimer::started(FRAME, ROF);
+                entity
+                    .seldom
+                    .rearm_timer
+                    .set_for_test(CdTimer::started(FRAME, ROF));
             }
             Some(6) => fixture.unpower(),
             Some(other) => panic!("{name}: GetFireError {other}"),
         }
         let draws_before = fixture.scenario_state();
-        process_delayed_fire(
-            &mut fixture.sim,
-            master,
-            &fixture.rules,
-            ObjectAiCtx::default(),
-        );
+        let (_, calls) = with_building_fire_stub(None, || {
+            process_delayed_fire(
+                &mut fixture.sim,
+                master,
+                &fixture.rules,
+                &mut ObjectAiCtx::default(),
+                &mut false,
+            )
+        });
         assert_eq!(
             fixture.scenario_state(),
             draws_before,
             "{name}: no Scenario draw"
         );
-        let requested = fixture.sim.fire_requests.buildings.remove(&master);
+        let requested = calls
+            .first()
+            .map(|(_, shot, multiplier)| (*shot, *multiplier));
         let fire_at = row["calls"]
             .as_array()
             .unwrap()
@@ -675,7 +728,7 @@ fn prism_support_bonus_matches_the_original() {
             .find(|call| call[0] == "fire_at");
         match (requested, fire_at) {
             (None, None) => {}
-            (Some(BuildingShot::Delayed { slot, target }), Some(fire_at)) => {
+            (Some((BuildingShot::Delayed { slot, target }, multiplier)), Some(fire_at)) => {
                 let native_slot = if fire_at[2] == 1 {
                     WeaponSlot::Secondary
                 } else {
@@ -689,11 +742,9 @@ fn prism_support_bonus_matches_the_original() {
                         .substrate
                         .entities
                         .get(master)
-                        .and_then(|entity| entity.attack_target.as_ref())
-                        .map(|attack| attack.target),
+                        .and_then(|entity| entity.attack_target.target()),
                     "{name} target"
                 );
-                let multiplier = fixture.sim.take_support_bonus(master, &fixture.rules);
                 assert_eq!(
                     Some(i64::from(multiplier)),
                     row["bullet_multiplier"].as_i64(),
@@ -705,7 +756,7 @@ fn prism_support_bonus_matches_the_original() {
         let entity = fixture.sim.substrate.entities.get(master).unwrap();
         let native = &row["master"];
         assert_eq!(
-            i64::from(entity.prism_support_count),
+            i64::from(entity.building.prism_support_count.count()),
             native["count"].as_i64().unwrap(),
             "{name} count"
         );
@@ -734,7 +785,8 @@ fn prism_bonus_damage_matches_the_original() {
         let payload = ProjectilePayload::new(
             input["damage"].as_i64().unwrap() as i32,
             interner.intern("PRISM"),
-            interner.intern("PRISMSHOT"),
+            None,
+            false,
         )
         .with_damage_multiplier(input["multiplier"].as_i64().unwrap() as i32);
         assert_eq!(
@@ -751,6 +803,8 @@ fn prism_bonus_damage_matches_the_original() {
 /// made, with no check of drain, sale or power, no request and no Scenario
 /// draw; a countdown still running only counts down.
 #[test]
+// The stock PrismType support; an Ares game replaces it
+// (`techno_ai::ares_prism_forwarding`).
 fn prism_support_beam_matches_the_original() {
     let golden = golden();
     let beam = rows(&golden, "beam");
@@ -772,9 +826,10 @@ fn prism_support_beam_matches_the_original() {
             &mut fixture.sim,
             supporter,
             &fixture.rules,
-            ObjectAiCtx::default(),
+            &mut ObjectAiCtx::default(),
+            &mut false,
         );
-        assert!(fixture.sim.fire_requests.buildings.is_empty(), "{name}");
+        assert!(fixture.sim.fire_events.is_empty(), "{name}");
         assert_eq!(
             fixture.scenario_state(),
             draws_before,
@@ -791,7 +846,7 @@ fn pending_fires(fixture: &Fixture) -> BTreeMap<u64, Option<PendingBuildingFire>
         .values()
         .map(|&id| {
             let entity = fixture.sim.substrate.entities.get(id).unwrap();
-            (id, entity.pending_building_fire)
+            (id, entity.building.pending_building_fire.pending())
         })
         .collect()
 }
@@ -803,13 +858,20 @@ fn apply_event(fixture: &mut Fixture, action: &str, building: u64) {
         // TarCom written as the passive scan or a detach writes it.
         "acquire" | "lose" => {
             let entity = fixture.sim.substrate.entities.get_mut(building).unwrap();
-            entity.attack_target = (action == "acquire").then(|| AttackTarget::new(target));
+            entity
+                .attack_target
+                .set_for_test((action == "acquire").then(|| TargetKind::Entity(target)));
         }
         // The IDLE event's BuildingClass::SetTarget(0).
         "stop" => {
             fixture
                 .sim
-                .assign_target_represented(building, None, Some(&fixture.rules))
+                .assign_target_represented(
+                    building,
+                    None,
+                    &fixture.rules,
+                    &mut crate::sim::world::FrameEffects::default(),
+                )
                 .unwrap();
         }
         "out_of_range" => fixture.move_target(OUT_OF_RANGE),
@@ -822,21 +884,20 @@ fn apply_event(fixture: &mut Fixture, action: &str, building: u64) {
 /// Every `cadence` row through BuildingClass::Update's mission pieces, per
 /// frame and per building in the row's Logic order as the oracle runs them:
 /// the two ready checks around MissionClass::AI, then ProcessDelayedFire.
-/// A requested FireAt is served where VERA's combat phase emits it, after
-/// every building's turn, as the oracle answers it: its bullet takes the
-/// support bonus and its rearm is exactly ROF 45. The turns after the
-/// shooter's see its request, not the rearm native FireAt already started
-/// (`k_shooter_rearms_before_a_later_walk`), and its state is compared once
-/// served. Per turn: whether MissionClass::AI ran a handler, and the Attack
-/// return; each recruit, arm, beam and shot with its multiplier; and the
-/// building's count, delayed fire, rearm, mission and target, against the
-/// native frames. A
+/// The oracle replaces FireAt with a bullet return and exact ROF45; this
+/// caller-only replay installs the same substitute at the synchronous live
+/// receiver boundary. Later tower visits read the actual rearm immediately,
+/// including `k_shooter_rearms_before_a_later_walk`. Each returned bullet's
+/// support multiplier and the entire per-tower state are compared before
+/// moving to the next native object. Full live-fire tests run separately.
 /// Guard dispatch's `RandomRanged(0, 2)` is pinned by
 /// `building_guard_attack.json`'s replay; here VERA's delay is checked to be
 /// AARate's 14 plus 0..=2 and replaced by the native one, since each
 /// supporter's Guard cadence decides when a tower with its own target turns
 /// master.
 #[test]
+// The stock PrismType support; an Ares game replaces it
+// (`techno_ai::ares_prism_forwarding`).
 fn prism_cadence_matches_the_original() {
     let golden = golden();
     let cadence = rows(&golden, "cadence");
@@ -858,7 +919,7 @@ fn prism_cadence_matches_the_original() {
                 .map(|building| fixture.id(building.as_str().unwrap()))
                 .collect(),
             None => fixture.sim.houses[&fixture.owner]
-                .base_projection
+                .base_projection()
                 .buildings()
                 .to_vec(),
         };
@@ -866,12 +927,11 @@ fn prism_cadence_matches_the_original() {
         for frame in row["frames"].as_array().unwrap() {
             let k = frame["frame"].as_i64().unwrap();
             let now = FRAME + k as i32;
-            fixture.sim.session.binary_frame = now as u32;
+            fixture.sim.session.set_binary_frame_for_test(now as u32);
             for event in events.iter().filter(|event| event[0] == k) {
                 let building = fixture.id(event[2].as_str().unwrap());
                 apply_event(&mut fixture, event[1].as_str().unwrap(), building);
             }
-            let mut served = Vec::new();
             for &id in &order {
                 let building = fixture.name(id).to_string();
                 let at = format!("{name} frame {k} {building}");
@@ -879,7 +939,7 @@ fn prism_cadence_matches_the_original() {
                 let native_events = native["events"].as_array().unwrap();
                 let native_event = |kind: &str| native_events.iter().find(|event| event[0] == kind);
 
-                ready_commence(&mut fixture.sim, id);
+                ready_commence(&fixture.sim.session, &mut fixture.sim.substrate, id, true);
                 let entity = fixture.sim.substrate.entities.get(id).unwrap();
                 let timer_before = entity.mission.dispatch_timer();
                 let mission_before = entity.mission.current();
@@ -887,8 +947,9 @@ fn prism_cadence_matches_the_original() {
                 dispatch(
                     &mut fixture.sim,
                     id,
-                    Some(&fixture.rules),
-                    ObjectAiCtx::default(),
+                    &fixture.rules,
+                    &mut ObjectAiCtx::default(),
+                    &mut false,
                 );
                 let entity = fixture.sim.substrate.entities.get_mut(id).unwrap();
                 let timer = entity.mission.dispatch_timer();
@@ -930,68 +991,55 @@ fn prism_cadence_matches_the_original() {
                 );
                 let arm = armed.contains(&(
                     id,
-                    PendingBuildingFire {
-                        remaining_ticks: DELAY,
-                        fire: DelayedFire::Weapon(WeaponSlot::Primary),
-                    },
+                    PendingBuildingFire::new(DELAY, DelayedFire::Weapon(WeaponSlot::Primary)),
                 ));
                 assert_eq!(arm, native_event("arm").is_some(), "{at} arm");
                 recruits += usize::from(recruit.is_some());
                 arms += usize::from(arm);
 
-                ready_commence(&mut fixture.sim, id);
-                let beaming = matches!(
-                    pending_after[&id],
-                    Some(PendingBuildingFire {
-                        remaining_ticks: ..=1,
-                        fire: DelayedFire::SupportBeam { .. },
-                    })
-                );
-                process_delayed_fire(&mut fixture.sim, id, &fixture.rules, ObjectAiCtx::default());
+                ready_commence(&fixture.sim.session, &mut fixture.sim.substrate, id, false);
+                let beaming = pending_after[&id].is_some_and(|pending| {
+                    pending.remaining_ticks() <= 1
+                        && matches!(pending.fire(), DelayedFire::SupportBeam { .. })
+                });
+                let (_, calls) = with_building_fire_stub(Some(ROF), || {
+                    process_delayed_fire(
+                        &mut fixture.sim,
+                        id,
+                        &fixture.rules,
+                        &mut ObjectAiCtx::default(),
+                        &mut false,
+                    )
+                });
                 assert_eq!(beaming, native_event("beam").is_some(), "{at} beam");
                 beams += usize::from(beaming);
-                match (
-                    fixture.sim.fire_requests.buildings.get(&id),
-                    native_event("shot"),
-                ) {
-                    (None, None) => fixture.assert_state(id, native, &at),
+                match (calls.as_slice(), native_event("shot")) {
+                    ([], None) => {}
                     (
-                        Some(BuildingShot::Delayed {
-                            slot: WeaponSlot::Primary,
-                            ..
-                        }),
+                        [
+                            (
+                                called_id,
+                                BuildingShot::Delayed {
+                                    slot: WeaponSlot::Primary,
+                                    ..
+                                },
+                                multiplier,
+                            ),
+                        ],
                         Some(shot),
                     ) => {
-                        let multiplier = shot[3].as_i64().unwrap();
-                        served.push((id, multiplier, native, at));
+                        assert_eq!(*called_id, id, "{at} firer");
+                        assert_eq!(
+                            i64::from(*multiplier),
+                            shot[3].as_i64().unwrap(),
+                            "{at} multiplier"
+                        );
+                        shots += 1;
                     }
-                    (shot, native) => panic!("{at}: shot {shot:?}, native {native:?}"),
+                    (calls, native) => panic!("{at}: calls {calls:?}, native {native:?}"),
                 }
-            }
-            // The combat phase's FireAt, after every building's turn.
-            for (id, native_multiplier, native, at) in served {
-                let request = fixture.sim.fire_requests.buildings.remove(&id);
-                assert!(
-                    matches!(
-                        request,
-                        Some(BuildingShot::Delayed {
-                            slot: WeaponSlot::Primary,
-                            ..
-                        })
-                    ),
-                    "{at}"
-                );
-                let multiplier = fixture.sim.take_support_bonus(id, &fixture.rules);
-                assert_eq!(i64::from(multiplier), native_multiplier, "{at} multiplier");
-                let entity = fixture.sim.substrate.entities.get_mut(id).unwrap();
-                entity.rearm_timer.start(now, ROF);
-                shots += 1;
                 fixture.assert_state(id, native, &at);
             }
-            assert!(
-                fixture.sim.fire_requests.buildings.is_empty(),
-                "{name} frame {k}"
-            );
         }
     }
     // Every recruit, arm, beam and shot of the rows.
@@ -1017,6 +1065,7 @@ fn prism_general_reader_matches_the_original() {
         modifier: native["modifier"].as_i64().unwrap() as i32,
         max: native["max"].as_i64().unwrap() as i32,
         delay: native["delay"].as_i64().unwrap() as i32,
+        duration: native["duration"].as_i64().unwrap() as i32,
     };
     for row in reader {
         let input = &row["input"];
@@ -1073,4 +1122,347 @@ fn prism_general_reader_matches_the_original() {
             );
         }
     }
+}
+
+#[test]
+fn ares_prism_modifier_retains_percent_across_map_layers_and_scales_one_shot() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let mut layers =
+        RulesLayerStack::new(IniFile::from_str("[General]\nPrismSupportModifier=125%\n"));
+    layers.push(
+        RulesLayerKind::GameMode,
+        IniFile::from_str("[General]\nName=Mode without a prism override\n"),
+    );
+    layers.push(
+        RulesLayerKind::Scenario,
+        IniFile::from_str("[General]\nName=Map without a prism override\n"),
+    );
+    let rules = RuleSet::from_processed_rules(&layers.process().unwrap()).unwrap();
+    assert_eq!(rules.general.prism_support.modifier, 125);
+
+    let mut fixture = Fixture::new(&serde_json::json!({}), "master");
+    let master = fixture.id("master");
+    // A single supporting tower's beam adds 125% to the master's reserve
+    // (Update_Prism 100169A0), rather than a map's retained value times
+    // another 100; the shot takes ((125 + 100) * 256) / 100.
+    let modifier = crate::rules::ares_prism_forwarding::PrismForwardingRules::default()
+        .support_modifier(rules.general.prism_support.modifier);
+    let reserve = |fixture: &mut Fixture, modifier| {
+        fixture
+            .sim
+            .substrate
+            .entities
+            .get_mut(master)
+            .unwrap()
+            .seldom
+            .ares
+            .ares_prism
+            .set_modifier_reserve_for_test(modifier);
+    };
+    reserve(&mut fixture, modifier);
+    assert_eq!(
+        fixture.sim.substrate.take_support_bonus(master, &rules),
+        576
+    );
+    reserve(&mut fixture, 0);
+    assert_eq!(
+        fixture.sim.substrate.take_support_bonus(master, &rules),
+        256
+    );
+
+    layers.push(
+        RulesLayerKind::Scenario,
+        IniFile::from_str("[General]\nPrismSupportModifier=150%\n"),
+    );
+    let overridden = RuleSet::from_processed_rules(&layers.process().unwrap()).unwrap();
+    assert_eq!(overridden.general.prism_support.modifier, 150);
+}
+
+/// Ares: the building's Prism network.
+fn network(fixture: &Fixture, id: u64) -> crate::sim::world::AresPrismForwarding {
+    fixture
+        .sim
+        .substrate
+        .entities
+        .get(id)
+        .unwrap()
+        .seldom
+        .ares
+        .ares_prism
+        .clone()
+}
+
+/// Ares: Mission_Attack's OK arm for `id` at the fixture's target.
+fn ares_attack(fixture: &mut Fixture, id: u64) {
+    let target = TargetKind::Entity(fixture.target);
+    attack_arm(
+        &mut fixture.sim,
+        id,
+        &fixture.rules,
+        target,
+        0,
+        FireError::Ok,
+        &mut ObjectAiCtx::default(),
+        &mut false,
+    );
+}
+
+/// Ares: one ProcessDelayedFire visit of each building, in order.
+fn ares_visit(fixture: &mut Fixture, ids: &[u64]) {
+    for &id in ids {
+        process_delayed_fire(
+            &mut fixture.sim,
+            id,
+            &fixture.rules,
+            &mut ObjectAiCtx::default(),
+            &mut false,
+        );
+    }
+}
+
+/// Ares: the support beams born so far, as (width, supported).
+fn ares_beams(fixture: &Fixture) -> Vec<(i32, bool)> {
+    fixture
+        .sim
+        .lifecycle_outputs
+        .iter()
+        .filter_map(|output| match output {
+            crate::sim::world::LifecycleOutput::LaserCreated(birth) => {
+                Some((birth.width, birth.supported))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Ares Mi_Attack_IsPrism (100167E0): the idle PrismType tower turns master
+/// and recruits, in one visit and nearest first, every tower whose range
+/// (PrismShot's 2048 plus a cell, without a support weapon; inclusive)
+/// reaches it; `OTHER` is no forwarding tower. SetChargeDelay (10018CD0)
+/// holds the master one frame while the supporters start charging at once.
+/// Each supporter's beam (Update_Prism 100169A0) adds PrismSupportModifier
+/// to the master's reserve, which its shot takes as
+/// ((3 * 150 + 100) * 256) / 100.
+#[test]
+fn ares_prism_master_recruits_its_whole_network_in_one_visit() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let input = serde_json::json!({"towers": [
+        {"name": "far", "offset": [2304, 0, 0]},
+        {"name": "near", "offset": [512, 0, 0]},
+        {"name": "out", "offset": [2305, 0, 0]},
+        {"name": "other", "type": "other", "offset": [256, 0, 0]},
+        {"name": "mid", "offset": [0, 768, 0]},
+    ]});
+    let mut fixture = Fixture::new(&input, "master");
+    let master = fixture.id("master");
+    fixture.apply(
+        master,
+        &serde_json::json!({"mission": "attack", "target": true}),
+    );
+    let draws = fixture.scenario_state();
+    ares_attack(&mut fixture, master);
+    assert_eq!(fixture.scenario_state(), draws, "no Scenario draw");
+    let supporters = ["near", "mid", "far"].map(|name| fixture.id(name));
+    assert_eq!(network(&fixture, master).senders(), supporters);
+    assert_eq!(network(&fixture, master).charge_delay(), 1);
+    let entity = fixture.sim.substrate.entities.get(master).unwrap();
+    assert_eq!(
+        entity.building.pending_building_fire.pending(),
+        Some(PendingBuildingFire::new(
+            DELAY,
+            DelayedFire::Weapon(WeaponSlot::Primary)
+        ))
+    );
+    assert_eq!(entity.building.prism_support_count.count(), 1);
+    assert_eq!(slot_anim(&fixture.sim, master, 10), None);
+    for &id in &supporters {
+        let entity = fixture.sim.substrate.entities.get(id).unwrap();
+        assert!(
+            entity
+                .building
+                .pending_building_fire
+                .pending()
+                .is_some_and(|pending| {
+                    pending.remaining_ticks() == DELAY
+                        && matches!(pending.fire(), DelayedFire::SupportBeam { .. })
+                })
+        );
+        assert_eq!(network(&fixture, id).support_target(), Some(master));
+        assert_eq!(network(&fixture, id).charge_delay(), 0);
+        assert_eq!(slot_anim(&fixture.sim, id, 10).as_deref(), Some("GAPRIS_A"));
+    }
+    for name in ["out", "other"] {
+        let entity = fixture
+            .sim
+            .substrate
+            .entities
+            .get(fixture.id(name))
+            .unwrap();
+        assert!(
+            entity.building.pending_building_fire.pending().is_none(),
+            "{name}"
+        );
+    }
+
+    // The master's first visit ends its charge delay and starts its anim.
+    ares_visit(&mut fixture, &[master]);
+    assert_eq!(network(&fixture, master).charge_delay(), 0);
+    assert_eq!(
+        slot_anim(&fixture.sim, master, 10).as_deref(),
+        Some("GAPRIS_A")
+    );
+    for _ in 0..DELAY {
+        ares_visit(&mut fixture, &supporters);
+    }
+    assert_eq!(ares_beams(&fixture), [(3, false); 3]);
+    // The beam's downtime runs on ReloadTimer (Techno+1FC), not the rearm.
+    for &id in &supporters {
+        let entity = fixture.sim.substrate.entities.get(id).unwrap();
+        assert!(entity.building.pending_building_fire.pending().is_none());
+        let reload = entity.ammo_reload_timer();
+        assert_eq!([reload.start_frame(), reload.duration()], [FRAME, 45]);
+        assert_eq!(entity.seldom.rearm_timer.remaining(FRAME), 0);
+    }
+    assert!(network(&fixture, master).senders().is_empty());
+    assert_eq!(
+        fixture
+            .sim
+            .substrate
+            .take_support_bonus(master, &fixture.rules),
+        1408
+    );
+}
+
+/// With `PrismForwarding.MaxChainLength=2` a tower out of the master's
+/// range joins through one in range (AcquireSlaves_MultiStage 100185B0).
+/// SetChargeDelay staggers the chain by one frame per link and
+/// SupportingPrisms counts the links behind each tower (10017970). The
+/// middle tower passes its supporter's reserve on with its own (100169A0),
+/// and its beam, one link supported, thickens by Intensity -2 (10016490).
+#[test]
+fn ares_prism_chains_relay_their_reserves_to_the_master() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let input = serde_json::json!({
+        "tower_keys": "PrismForwarding.MaxChainLength=2\n",
+        "towers": [
+            {"name": "end", "offset": [4000, 0, 0]},
+            {"name": "link", "offset": [2000, 0, 0]},
+        ],
+    });
+    let mut fixture = Fixture::new(&input, "master");
+    let [master, link, end] = ["master", "link", "end"].map(|name| fixture.id(name));
+    fixture.apply(
+        master,
+        &serde_json::json!({"mission": "attack", "target": true}),
+    );
+    ares_attack(&mut fixture, master);
+    assert_eq!(network(&fixture, master).senders(), [link]);
+    assert_eq!(network(&fixture, link).senders(), [end]);
+    assert_eq!(network(&fixture, end).support_target(), Some(link));
+    for (id, delay, links) in [(master, 2, 2), (link, 1, 1), (end, 0, 0)] {
+        assert_eq!(network(&fixture, id).charge_delay(), delay);
+        let entity = fixture.sim.substrate.entities.get(id).unwrap();
+        assert_eq!(entity.building.prism_support_count.count(), links);
+    }
+    // The network is saved and folded into the world hash.
+    let bytes = crate::sim::snapshot::GameSnapshot::save(&fixture.sim, 1, 2, "prism.map", 0);
+    let mut restored = crate::sim::snapshot::GameSnapshot::load(&bytes)
+        .unwrap()
+        .sim;
+    for id in [master, link, end] {
+        let entity = restored.substrate.entities.get(id).unwrap();
+        assert_eq!(entity.seldom.ares.ares_prism, network(&fixture, id));
+    }
+    let hash = restored.state_hash();
+    restored
+        .substrate
+        .entities
+        .get_mut(end)
+        .unwrap()
+        .seldom
+        .ares
+        .ares_prism = Default::default();
+    assert_ne!(restored.state_hash(), hash);
+    // `end` beams after its countdown, `link` one frame later.
+    for _ in 0..=DELAY {
+        ares_visit(&mut fixture, &[end, link]);
+    }
+    assert_eq!(ares_beams(&fixture), [(3, false), (5, false)]);
+    assert_eq!(
+        fixture
+            .sim
+            .substrate
+            .take_support_bonus(master, &fixture.rules),
+        ((2 * 150 + 100) * 256) / 100
+    );
+}
+
+/// `PrismForwarding.BreakSupport=yes`: a charging supporter's GetFireError
+/// skips the busy test (10016360) and Mission_Attack turns it master in
+/// place, keeping its countdown (100167E0). A sale (10016970) then takes the
+/// master out of its network at once (RemoveFromNetwork 10018BB0): the other
+/// supporter, already charging, keeps its countdown but feeds nobody, and
+/// goes idle without a beam.
+#[test]
+fn ares_prism_break_support_and_a_sale_break_up_the_network() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let input = serde_json::json!({
+        "tower_keys": "PrismForwarding.BreakSupport=yes\n",
+        "towers": [
+            {"name": "breaker", "offset": [0, 512, 0]},
+            {"name": "loyal", "offset": [512, 0, 0]},
+        ],
+    });
+    let mut fixture = Fixture::new(&input, "master");
+    let [master, breaker, loyal] = ["master", "breaker", "loyal"].map(|name| fixture.id(name));
+    fixture.apply(
+        master,
+        &serde_json::json!({"mission": "attack", "target": true}),
+    );
+    ares_attack(&mut fixture, master);
+    assert_eq!(network(&fixture, master).senders(), [breaker, loyal]);
+    ares_visit(&mut fixture, &[breaker, loyal]);
+    let target = TargetKind::Entity(fixture.target);
+    fixture
+        .sim
+        .substrate
+        .entities
+        .get_mut(breaker)
+        .unwrap()
+        .attack_target
+        .set_for_test(Some(target));
+    assert_eq!(
+        fire_error_at(&fixture.sim, &fixture.rules, breaker, Some(target), 0, true,),
+        FireError::Ok
+    );
+    ares_attack(&mut fixture, breaker);
+    let entity = fixture.sim.substrate.entities.get(breaker).unwrap();
+    assert_eq!(
+        entity.building.pending_building_fire.pending(),
+        Some(PendingBuildingFire::new(
+            DELAY - 1,
+            DelayedFire::Weapon(WeaponSlot::Primary)
+        ))
+    );
+    assert_eq!(network(&fixture, breaker).support_target(), None);
+    assert_eq!(network(&fixture, master).senders(), [loyal]);
+
+    let _ = crate::sim::production::sell_back(
+        &mut fixture.sim,
+        &fixture.rules,
+        master,
+        crate::sim::production::SellOrder::Player,
+        None,
+        &mut crate::sim::world::FrameEffects::default(),
+    );
+    let entity = fixture.sim.substrate.entities.get(master).unwrap();
+    assert!(entity.building.pending_building_fire.pending().is_none());
+    assert!(network(&fixture, master).senders().is_empty());
+    assert_eq!(network(&fixture, loyal).support_target(), None);
+    for _ in 1..DELAY {
+        ares_visit(&mut fixture, &[loyal]);
+    }
+    let entity = fixture.sim.substrate.entities.get(loyal).unwrap();
+    assert!(entity.building.pending_building_fire.pending().is_none());
+    assert!(ares_beams(&fixture).is_empty());
 }

@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-pub(crate) struct Sha256 {
+pub struct Sha256 {
     state: [u32; 8],
     block: [u8; 64],
     block_len: usize,
@@ -10,7 +10,7 @@ pub(crate) struct Sha256 {
 }
 
 impl Sha256 {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             state: [
                 0x6a09_e667,
@@ -28,7 +28,7 @@ impl Sha256 {
         }
     }
 
-    pub(crate) fn update(&mut self, mut bytes: &[u8]) {
+    pub fn update(&mut self, mut bytes: &[u8]) {
         self.total_len = self
             .total_len
             .checked_add(bytes.len() as u64)
@@ -56,7 +56,7 @@ impl Sha256 {
         self.block_len = bytes.len();
     }
 
-    pub(crate) fn finalize(mut self) -> [u8; 32] {
+    pub fn finalize(mut self) -> [u8; 32] {
         let bit_length = self
             .total_len
             .checked_mul(8)
@@ -75,7 +75,7 @@ impl Sha256 {
         let block = self.block;
         self.compress(&block);
         let mut output = [0_u8; 32];
-        for (chunk, word) in output.chunks_exact_mut(4).zip(self.state) {
+        for (chunk, word) in output.as_chunks_mut::<4>().0.iter_mut().zip(self.state) {
             chunk.copy_from_slice(&word.to_be_bytes());
         }
         output
@@ -149,8 +149,8 @@ impl Sha256 {
             0xc671_78f2,
         ];
         let mut words = [0_u32; 64];
-        for (index, chunk) in block.chunks_exact(4).enumerate() {
-            words[index] = u32::from_be_bytes(chunk.try_into().expect("four-byte chunk"));
+        for (index, chunk) in block.as_chunks::<4>().0.iter().enumerate() {
+            words[index] = u32::from_be_bytes(*chunk);
         }
         for index in 16..64 {
             let s0 = words[index - 15].rotate_right(7)
@@ -191,7 +191,7 @@ impl Sha256 {
     }
 }
 
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+pub fn sha256_hex(bytes: &[u8]) -> String {
     digest_hex(sha256_bytes(bytes))
 }
 
@@ -201,7 +201,7 @@ pub(crate) fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     sha.finalize()
 }
 
-pub(crate) fn digest_hex(digest: [u8; 32]) -> String {
+pub fn digest_hex(digest: [u8; 32]) -> String {
     let mut output = String::with_capacity(64);
     for byte in digest {
         write!(&mut output, "{byte:02x}").expect("writing into String cannot fail");
@@ -209,7 +209,8 @@ pub(crate) fn digest_hex(digest: [u8; 32]) -> String {
     output
 }
 
-#[cfg(test)]
+// The client's build script includes this file, and knows no test group.
+#[cfg(test)] // shared by test groups
 mod tests {
     use super::sha256_hex;
 

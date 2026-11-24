@@ -13,10 +13,8 @@ python -m tools.spatial_oracle.foot_navigation_coordinate --bridge-layers --chec
 Configure the original executable with `VERA20K_GAMEMD_EXE` or `RA2_DIR` as
 described in [native_oracle.md](../native_oracle.md). `--check` does not write;
 `--bridge-layers --write` deliberately replaces only the new bridge golden
-and its metadata. The shared oracle checks SHA-256
-`1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c`
-before mapping those same bytes. The sidecar also pins the payload, Unicorn
-binding/core, and normalized-LF hashes of the four Python source owners.
+and its metadata. The sidecar pins the payload and Unicorn
+binding/core.
 
 ## Executed original bodies
 
@@ -216,7 +214,7 @@ zone cache. A common `(32,32)` translation preserves the authored scene's relati
 geometry within the native Size diamond. It keeps the frame's existing PathGrid
 owner. The mining tripwire now requires field acquisition, movement and cargo.
 
-[The paired Rust receipts](foot_bridge_layer.replay.json) isolate this fixture
+The paired Rust receipts (`tools/spatial_oracle/foot_bridge_layer.replay.json`, in git at 1b1a8b43e) isolate this fixture
 change from the ore-query migration. The control restored only `ore_scan.rs` and
 `zone_map.rs` from parent commit `b34f76e72c2afe614bf9e65fe42ecf07d166d4e0`;
 all other candidate code, including the independently native-proved fresh Foot
@@ -234,15 +232,10 @@ native comparison.
 Across all 600 ticks the two Rust executions matched every world hash, serialized
 entity and RNG fingerprint, plus all 319 raw draws. The unchanged absolute RNG
 pins and duel checks still pass. The final world hash `B3DF7D9407AF305B` then reflected
-the completed fixture's map, coordinates and movement context (later composition-only
-moves are recorded beside `GLOBAL_HARNESS_FINAL_HASH`). These are Rust
+the completed fixture's map, coordinates and movement context. These are Rust
 regression and baseline provenance checks, not a native skirmish comparison.
-The current baseline and strengthened mining checks are reproducible with:
-
-```sh
-VERA20K_REQUIRE_RETAIL_INI=1 python -m tools.cargo_run -- test -p vera20k --lib \
-  sim::world::global_parity_harness_tests::global_skirmish_replay_is_deterministic_and_baseline_stable
-```
+The global replay test that held that baseline and the mining checks was
+removed on 2026-11-11; git history keeps it.
 
 These source queries draw no RNG, write no actor timer and perform no detach.
 They retain the shared map Dummy coordinate writes. The response's existing
@@ -275,7 +268,7 @@ remaining Building+2E4 source substitution. These query comparisons do not close
 ## Bridge-response prerequisite replay provenance (2026-09-30)
 
 The `bridge_ai_prerequisite_followup` entry in
-[the same Rust receipt owner](foot_bridge_layer.replay.json) records real spawn
+the same Rust receipt owner (`tools/spatial_oracle/foot_bridge_layer.replay.json`, in git at 1b1a8b43e) records real spawn
 and `advance_tick` calls after the class-target, Foot mission and idle changes.
 It compares missing-ART inputs against explicit E1 `Image=GI` and the fixed
 GI/sequence excerpt bound through the production reader. These are Rust
@@ -357,7 +350,7 @@ visibility/GPU comparisons are not closed by these response/action dependencies.
 
 ## Incoming-main replay composition
 
-[The complete incoming-main receipt](foot_bridge_layer.main986.replay.json)
+The complete incoming-main receipt (`tools/spatial_oracle/foot_bridge_layer.main986.replay.json`, in git at 1b1a8b43e)
 retains all819 before/final/control observations. Its lossless comparison accounts
 for all2,734 field differences: two buildings retain exact floor Z=0 rather than
 None (1,202 fields), their hash views change (1,201 fields), and331 raw caller
@@ -380,7 +373,7 @@ bridge `4477C32418EDA27F` and Slice6 `77B7FEF300222AB2` stay unchanged. The rece
 preserves complete source, installation/restoration and binary identities, actual
 old-pin failure logs, control logs and the comparison recipes. None is a native
 whole-world golden. The earlier full replay contexts remain unchanged in
-[the historical receipt](foot_bridge_layer.replay.json).
+the historical receipt (`tools/spatial_oracle/foot_bridge_layer.replay.json`, in git at 1b1a8b43e).
 
 The final strict-retail library run passes9,463 tests (211 ignored); lib clippy
 finishes with765 existing warnings. Field ownership is2,646 versus2,661 on
@@ -400,7 +393,7 @@ validate connected production output; their native parity certification is NONE.
 
 ## Final main474 integration
 
-The same [replay receipt](foot_bridge_layer.main986.replay.json) adds complete
+The same replay receipt (`tools/spatial_oracle/foot_bridge_layer.main986.replay.json`, in git at 1b1a8b43e) adds complete
 main474/HEAD95d observations after integrating the shared Aircraft CanEnter and
 Object SetHeight owners. All819 actor/hash/state/RNG records agree with the
 preceding candidate. Only331 raw caller strings change, through seven exact

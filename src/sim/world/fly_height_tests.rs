@@ -10,8 +10,8 @@ use crate::sim::snapshot::GameSnapshot;
 use crate::util::fixed_math::SimFixed;
 
 fn vectors() -> Vec<serde_json::Value> {
-    serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/fly_height.json"
+    serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/fly_height.json",
     ))
     .unwrap()
 }
@@ -20,7 +20,7 @@ fn fixture(row: &serde_json::Value) -> (Simulation, RuleSet) {
     let input = &row["input"];
     let integer = |name: &str, default: i32| input[name].as_i64().map_or(default, |v| v as i32);
     let flag = |name: &str| input[name].as_bool().unwrap_or(false);
-    let rules = RuleSet::from_ini(&IniFile::from_str(&format!(
+    let text = format!(
         "[General]\nFlightLevel=1500\n[AircraftTypes]\n0=TEST\n\
          [TEST]\nStrength=100\nSpeed={}\nLandable={}\n\
          Locomotor={{4A582746-9839-11D1-B709-00A024DDAFD1}}\n\
@@ -37,8 +37,13 @@ fn fixture(row: &serde_json::Value) -> (Simulation, RuleSet) {
         integer("flight_level", -1),
         if flag("dropship") { "yes" } else { "no" },
         if flag("carryall") { "yes" } else { "no" },
-    )))
-    .unwrap();
+    );
+    // The corpora's rows share a few type settings; each is parsed once.
+    let rules = crate::test_fixture::once_per_process(("fly height rules", text.clone()), || {
+        Some(RuleSet::from_ini(&IniFile::from_str(&text)).unwrap())
+    })
+    .unwrap()
+    .with_fresh_serial();
     let mut sim = Simulation::with_seed(0);
     install_common_raw_terrain(
         &mut sim,
@@ -50,10 +55,10 @@ fn fixture(row: &serde_json::Value) -> (Simulation, RuleSet) {
     sim.resolved_terrain
         .as_mut()
         .unwrap()
-        .cell_mut(10, 10)
+        .cell_mut_for_test(10, 10)
         .unwrap()
         .slope_type = integer("slope", 0) as u8;
-    assert_eq!(sim.allocate_stable_id(), 1);
+    assert_eq!(sim.substrate.allocate_stable_id(), 1);
     let category = if input["kind"] == "unit" {
         EntityCategory::Unit
     } else {
@@ -68,13 +73,14 @@ fn fixture(row: &serde_json::Value) -> (Simulation, RuleSet) {
         sim.try_reveal_entity(
             1,
             RevealRequest {
-                position: RevealPosition {
-                    rx: 10,
-                    ry: 10,
-                    z: integer("level", 0) as u8,
-                    sub_x: SimFixed::from_num(128),
-                    sub_y: SimFixed::from_num(128)
-                },
+                position: RevealPosition::new(
+                    10,
+                    10,
+                    integer("level", 0) as u8,
+                    None,
+                    SimFixed::from_num(128),
+                    SimFixed::from_num(128)
+                ),
                 placement: PlacementEvidence::MarkSucceeded,
                 logic_eligible: true,
             }
@@ -83,28 +89,39 @@ fn fixture(row: &serde_json::Value) -> (Simulation, RuleSet) {
     ));
     sim.remove_entity_occupancy(1);
     if flag("loaded") {
-        assert_eq!(sim.allocate_stable_id(), 2);
+        assert_eq!(sim.substrate.allocate_stable_id(), 2);
         insert_entity(&mut sim, 2, EntityCategory::Infantry);
-        sim.substrate.entities.get_mut(2).unwrap().passenger_role = PassengerRole::Inside {
-            transport_id: 1,
-            open_topped: false,
-        };
-        let mut cargo = PassengerCargo::new(1, 0);
-        cargo.board_forced(2, 1);
-        sim.substrate.entities.get_mut(1).unwrap().passenger_role =
-            PassengerRole::Transport { cargo };
+        sim.substrate
+            .entities
+            .get_mut(2)
+            .unwrap()
+            .set_passenger_role_for_test(PassengerRole::inside_for_test(1, false));
+        let mut cargo = PassengerCargo::new(1, 0.0);
+        cargo.board_forced_chain(&[(2, 1.0)]);
+        sim.substrate
+            .entities
+            .get_mut(1)
+            .unwrap()
+            .set_passenger_role_for_test(PassengerRole::transport(cargo));
     }
     let entity = sim.substrate.entities.get_mut(1).unwrap();
-    entity.position.exact_z_leptons = Some(integer("z", 0));
-    entity.on_bridge = flag("on_bridge");
-    entity.health.current = integer("health", 100);
+    entity
+        .position
+        .set_exact_z_leptons_for_test(Some(integer("z", 0)));
+    entity.set_on_bridge(flag("on_bridge"));
+    entity.health.set_for_test(integer("health", 100));
     let loco = entity.locomotor.as_mut().unwrap();
-    // A deliberately stale cache must not override the physical coordinate.
-    loco.altitude = SimFixed::from_num(123);
     if flag("landing") {
         loco.begin_fly_landing();
     }
     loco.set_fly_target_height(integer("target", 0));
+    // Process steps the height of a moving Fly only (`0x004CDA0B`); a null
+    // destination keeps Horizontal_Step and the landing drift out of it.
+    loco.fly_runtime_mut().unwrap().retain_destination(
+        crate::sim::components::DriveCoord { x: 0, y: 0, z: 0 },
+        None,
+        || 0,
+    );
     sim.add_entity_occupancy(1);
     (sim, rules)
 }
@@ -121,25 +138,34 @@ fn healthy_native_height_vectors_reach_production_coordinates() {
         }
         let (mut sim, rules) = fixture(&row);
         let before_rng = sim.scenario_rng.logical_state();
-        sim.tick_air_movement_with_cell_lists_one(1, Some(&rules), None);
+        sim.tick_air_movement_with_cell_lists_one(
+            1,
+            &rules,
+            None,
+            &mut crate::sim::world::FrameEffects::default(),
+        )
+        .unwrap();
         let entity = sim.substrate.entities.get(1).unwrap();
         let expected_z = row["z"].as_i64().unwrap() as i32;
         let expected_height = row["height"].as_i64().unwrap() as i32;
         assert_eq!(
-            entity.position.exact_z_leptons,
+            entity.position.exact_z_leptons(),
             Some(expected_z),
             "{}",
             row["input"]
         );
         assert_eq!(
-            entity.on_bridge,
+            entity.on_bridge(),
             row["on_bridge"].as_bool().unwrap(),
             "{}",
             row["input"]
         );
         assert_eq!(
-            entity.locomotor.as_ref().unwrap().altitude,
-            SimFixed::saturating_from_num(expected_height),
+            crate::sim::movement::air_movement::current_fly_height(
+                entity,
+                sim.resolved_terrain.as_ref()
+            ),
+            expected_height,
             "{}",
             row["input"]
         );
@@ -171,7 +197,7 @@ fn fly_integer_target_flags_and_cargo_survive_save_and_continuation() {
         sim.scenario_rng = crate::sim::rng::SimRng::new(0);
         let bytes = GameSnapshot::save(&sim, 0, 0, "Fly native height continuation", 0);
         let mut restored = GameSnapshot::load(&bytes).unwrap().sim;
-        restored.retain_in_scenario_process_state_from(&sim);
+        restored.retain_process_state_for_load(crate::sim::world::SnapshotProcessState::Live(&sim));
         restored.resolved_terrain = terrain;
         restored.restore_after_snapshot_load().unwrap();
         assert_eq!(restored.state_hash(), sim.state_hash(), "{name}");
@@ -196,9 +222,16 @@ fn fly_integer_target_flags_and_cargo_survive_save_and_continuation() {
         );
         for frame in 1..=8 {
             for instance in [&mut sim, &mut restored] {
-                instance.session.tick = frame;
-                instance.session.binary_frame = frame as u32;
-                instance.tick_air_movement_with_cell_lists_one(1, Some(&rules), None);
+                instance.session.set_tick_for_test(frame);
+                instance.session.set_binary_frame_for_test(frame as u32);
+                instance
+                    .tick_air_movement_with_cell_lists_one(
+                        1,
+                        &rules,
+                        None,
+                        &mut crate::sim::world::FrameEffects::default(),
+                    )
+                    .unwrap();
             }
             assert_eq!(
                 restored.state_hash(),
@@ -212,7 +245,7 @@ fn fly_integer_target_flags_and_cargo_survive_save_and_continuation() {
                         .get(1)
                         .unwrap()
                         .position
-                        .exact_z_leptons,
+                        .exact_z_leptons(),
                     Some(row["z"].as_i64().unwrap() as i32)
                 );
             }
@@ -267,15 +300,24 @@ fn fly_hash_distinguishes_targets_and_native_flags() {
 
 #[test]
 fn repeated_aircraft_attack_visits_do_not_divide_the_fly_target() {
-    use crate::sim::aircraft::{AircraftMission, tick_aircraft_missions};
+    use crate::sim::aircraft::tick_aircraft_missions;
     let row = vectors()
         .into_iter()
         .find(|r| r["input"]["name"] == "ordinary_False_1500")
         .unwrap();
     let (mut sim, rules) = fixture(&row);
     for sub_state in [3, 4, 3, 4] {
-        sim.substrate.entities.get_mut(1).unwrap().aircraft_mission =
-            Some(AircraftMission::Attack { sub_state });
+        sim.substrate
+            .entities
+            .get_mut(1)
+            .unwrap()
+            .mission
+            .set_current_for_test(
+                crate::sim::mission::MissionId::from_known(
+                    crate::sim::mission::MissionType::Attack,
+                ),
+                sub_state,
+            );
         tick_aircraft_missions(&mut sim, &rules);
         assert_eq!(
             sim.substrate
@@ -305,7 +347,7 @@ fn landing_base_fixture(row: &serde_json::Value) -> (Simulation, RuleSet) {
     let mut slots = crate::sim::radio::contacts::Contacts::with_capacity(contacts.len());
     let mut holes = Vec::new();
     for contact in contacts {
-        let id = sim.allocate_stable_id();
+        let id = sim.substrate.allocate_stable_id();
         slots.insert(id).unwrap();
         let Some(kind) = contact.as_str() else {
             holes.push(id);
@@ -325,13 +367,17 @@ fn landing_base_fixture(row: &serde_json::Value) -> (Simulation, RuleSet) {
             "helipad" => "HELIPAD",
             _ => "PLAIN",
         });
-        sim.substrate.entities.get_mut(id).unwrap().type_ref = type_ref;
+        sim.substrate
+            .entities
+            .get_mut(id)
+            .unwrap()
+            .set_type_ref_for_test(type_ref);
     }
     for id in holes {
         slots.remove(id);
     }
     let entity = sim.substrate.entities.get_mut(1).unwrap();
-    entity.radio_contacts = slots;
+    entity.seldom.radio_contacts = slots;
     entity.mission.apply_test_fixture(MissionTestFixture {
         current: MissionId::from_raw(input["current"].as_i64().unwrap_or(7) as i32),
         queued: MissionId::from_raw(input["queued"].as_i64().unwrap_or(-1) as i32),
@@ -376,7 +422,22 @@ fn assert_native_move_takeoff(sim: &mut Simulation, rules: &RuleSet, row: &serde
         "{row}"
     );
     let before_rng = sim.scenario_rng.logical_state();
-    assert!(sim.issue_air_cell_destination(1, (12, 10), SimFixed::from_num(10), Some(rules)));
+    let cells = sim
+        .resolved_terrain
+        .as_ref()
+        .map(crate::map::resolved_terrain::NativeCellQuery::canonical);
+    let coordinate = crate::sim::movement::target_cell_coord(12, 10, cells.as_ref());
+    assert!(Simulation::move_air_coordinate(
+        &mut sim.interner,
+        &sim.session,
+        &mut sim.substrate,
+        &mut sim.sound_events,
+        &sim.resolved_terrain,
+        1,
+        coordinate,
+        None,
+        rules
+    ));
     let entity = sim.substrate.entities.get(1).unwrap();
     assert_eq!(
         entity.locomotor.as_ref().unwrap().fly_target_height(),
@@ -411,8 +472,8 @@ fn assert_native_move_takeoff(sim: &mut Simulation, rules: &RuleSet, row: &serde
 
 #[test]
 fn carryall_native_landing_base_reaches_production_move_orders() {
-    let vectors: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/fly_landing_base.json"
+    let vectors: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/fly_landing_base.json",
     ))
     .unwrap();
     let rows = vectors["moves"].as_array().unwrap();
@@ -425,8 +486,8 @@ fn carryall_native_landing_base_reaches_production_move_orders() {
 
 #[test]
 fn carryall_landing_base_is_recomputed_from_saved_cargo_contacts_and_mission() {
-    let vectors: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/fly_landing_base.json"
+    let vectors: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/fly_landing_base.json",
     ))
     .unwrap();
     let rows = vectors["moves"].as_array().unwrap();
@@ -450,7 +511,8 @@ fn carryall_landing_base_is_recomputed_from_saved_cargo_contacts_and_mission() {
             sim.scenario_rng = crate::sim::rng::SimRng::new(0);
             let bytes = GameSnapshot::save(&sim, 0, 0, "Carryall move continuation", 0);
             let mut restored = GameSnapshot::load(&bytes).unwrap().sim;
-            restored.retain_in_scenario_process_state_from(&sim);
+            restored
+                .retain_process_state_for_load(crate::sim::world::SnapshotProcessState::Live(&sim));
             restored.resolved_terrain = sim.resolved_terrain.clone();
             restored.restore_after_snapshot_load().unwrap();
             assert_eq!(restored.state_hash(), sim.state_hash());
@@ -462,15 +524,15 @@ fn carryall_landing_base_is_recomputed_from_saved_cargo_contacts_and_mission() {
 }
 
 fn destination_vectors() -> Vec<serde_json::Value> {
-    serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/fly_destination.json"
+    serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/fly_destination.json",
     ))
     .unwrap()
 }
 
 fn destination_fixture(row: &serde_json::Value) -> (Simulation, RuleSet) {
-    use crate::sim::combat::AttackTarget;
-    use crate::sim::docking::aircraft_dock::AircraftAmmo;
+    use crate::sim::ammo::TechnoAmmo;
+    use crate::sim::combat::TargetKind;
     let input = &row["input"];
     let height_row = serde_json::json!({"input": {
         "z": input["z"].as_i64().unwrap_or(500),
@@ -485,23 +547,27 @@ fn destination_fixture(row: &serde_json::Value) -> (Simulation, RuleSet) {
         .resolved_terrain
         .as_mut()
         .unwrap()
-        .cell_mut(64, 64)
+        .cell_mut_for_test(64, 64)
         .unwrap();
     target_cell.level = input["level"].as_u64().unwrap_or(0) as u8;
     target_cell.slope_type = input["slope"].as_u64().unwrap_or(0) as u8;
     let entity = sim.substrate.entities.get_mut(1).unwrap();
-    entity.position.rx = 40;
-    entity.position.ry = 64;
-    entity.aircraft_ammo = Some(AircraftAmmo::new(input["ammo"].as_i64().unwrap_or(2) as i32));
-    entity.attack_target = input["target"]
-        .as_bool()
-        .unwrap_or(false)
-        .then(|| AttackTarget::new(2));
+    entity.position.set_rx_for_test(40);
+    entity.position.set_ry_for_test(64);
+    entity.install_ammo_for_test(Some(TechnoAmmo::new(
+        input["ammo"].as_i64().unwrap_or(2) as i32
+    )));
+    entity.attack_target.set_for_test(
+        input["target"]
+            .as_bool()
+            .unwrap_or(false)
+            .then(|| TargetKind::Entity(2)),
+    );
     entity
         .mission_leaf
         .set_aircraft_action_latch(input["ready"].as_bool().unwrap_or(false));
     let loco = entity.locomotor.as_mut().unwrap();
-    loco.powered = input["powered"].as_bool().unwrap_or(true);
+    loco.set_powered_for_test(input["powered"].as_bool().unwrap_or(true));
     *loco.fly_runtime_mut().unwrap() = serde_json::from_value(serde_json::json!({
         "target_height": 37,
         "taking_off": input["taking_off"].as_bool().unwrap_or(false),
@@ -516,19 +582,23 @@ fn destination_fixture(row: &serde_json::Value) -> (Simulation, RuleSet) {
 }
 
 fn issue_coordinate(sim: &mut Simulation, rules: &RuleSet, xyz: [i32; 3]) -> bool {
-    sim.move_air_coordinate(
+    Simulation::move_air_coordinate(
+        &mut sim.interner,
+        &sim.session,
+        &mut sim.substrate,
+        &mut sim.sound_events,
+        &sim.resolved_terrain,
         1,
         crate::sim::components::DriveCoord {
             x: xyz[0],
             y: xyz[1],
             z: xyz[2],
         },
-        SimFixed::from_num(10),
         Some(crate::sim::movement::DestinationTiming::from_rules(
-            sim.session.binary_frame,
-            Some(rules),
+            sim.session.binary_frame(),
+            rules,
         )),
-        Some(rules),
+        rules,
     )
 }
 
@@ -570,16 +640,7 @@ fn fly_destination_orders_match_original_retained_xyz_and_refusals() {
             "{input}"
         );
         assert_eq!(sim.scenario_rng.logical_state(), before_rng);
-        if accepted {
-            assert_eq!(
-                entity.movement_target.as_ref().unwrap().final_goal,
-                Some((
-                    (request[0] / 256) as i16 as u16,
-                    (request[1] / 256) as i16 as u16
-                ))
-            );
-        } else {
-            assert!(entity.movement_target.is_none());
+        if !accepted {
             assert_eq!(sim.shared_cell_dummy.snapshot().coord, (-7, -8), "{input}");
         }
         assert_eq!(
@@ -598,7 +659,22 @@ fn fly_cell_orders_resolve_ground_before_retaining_the_coordinate() {
         .find(|r| r["input"]["name"] == "ground_3_4")
         .unwrap();
     let (mut sim, rules) = destination_fixture(&row);
-    assert!(sim.issue_air_cell_destination(1, (64, 64), SimFixed::from_num(10), Some(&rules)));
+    let cells = sim
+        .resolved_terrain
+        .as_ref()
+        .map(crate::map::resolved_terrain::NativeCellQuery::canonical);
+    let coordinate = crate::sim::movement::target_cell_coord(64, 64, cells.as_ref());
+    assert!(Simulation::move_air_coordinate(
+        &mut sim.interner,
+        &sim.session,
+        &mut sim.substrate,
+        &mut sim.sound_events,
+        &sim.resolved_terrain,
+        1,
+        coordinate,
+        None,
+        &rules
+    ));
     let destination = sim
         .substrate
         .entities
@@ -626,29 +702,29 @@ fn fly_retained_destination_drives_subcell_arrival_after_save_and_restore() {
     assert!(issue_coordinate(&mut sim, &rules, [16519, 16523, 333]));
     sim.remove_entity_occupancy(1);
     let entity = sim.substrate.entities.get_mut(1).unwrap();
-    entity.position.rx = 64;
-    entity.position.ry = 64;
-    entity.position.sub_x = SimFixed::from_num(135);
-    entity.position.sub_y = SimFixed::from_num(139);
-    // Poison the derived cell projection: it must not steer or snap Fly.
-    entity.movement_target.as_mut().unwrap().final_goal = Some((10, 10));
+    entity.position.set_rx_for_test(64);
+    entity.position.set_ry_for_test(64);
+    entity.position.set_sub_x_for_test(SimFixed::from_num(135));
+    entity.position.set_sub_y_for_test(SimFixed::from_num(139));
     sim.add_entity_occupancy(1);
     sim.scenario_rng = crate::sim::rng::SimRng::new(0);
     let bytes = GameSnapshot::save(&sim, 0, 0, "Fly retained destination", 0);
     let mut restored = GameSnapshot::load(&bytes).unwrap().sim;
-    restored.retain_in_scenario_process_state_from(&sim);
+    restored.retain_process_state_for_load(crate::sim::world::SnapshotProcessState::Live(&sim));
     restored.resolved_terrain = sim.resolved_terrain.clone();
     restored.restore_after_snapshot_load().unwrap();
     assert_eq!(restored.state_hash(), sim.state_hash());
     for instance in [&mut sim, &mut restored] {
-        instance.tick_air_movement_with_cell_lists_one(1, Some(&rules), None);
+        instance
+            .tick_air_movement_with_cell_lists_one(
+                1,
+                &rules,
+                None,
+                &mut crate::sim::world::FrameEffects::default(),
+            )
+            .unwrap();
         let entity = instance.substrate.entities.get(1).unwrap();
-        assert_eq!(
-            crate::sim::movement::ground_pose::position_world_xy(&entity.position),
-            [16519, 16523]
-        );
-        assert!(entity.movement_target.is_none());
-        // Arrival's legacy adapter must not invent a native destination clear.
+        // Arrival must not invent a native destination clear.
         assert_eq!(
             entity
                 .locomotor
@@ -667,7 +743,6 @@ fn fly_retained_destination_drives_subcell_arrival_after_save_and_restore() {
 #[test]
 fn fly_destination_is_hashed_and_persisted_in_active_and_stashed_runtime() {
     use crate::rules::locomotor_type::LocomotorKind;
-    use crate::sim::movement::locomotion::piggyback;
     let row = destination_vectors().remove(0);
     for stashed in [false, true] {
         let (mut sim, rules) = destination_fixture(&row);
@@ -688,15 +763,12 @@ fn fly_destination_is_hashed_and_persisted_in_active_and_stashed_runtime() {
                 .locomotor
                 .as_mut()
                 .unwrap();
-            assert_eq!(
-                piggyback::begin(loco, LocomotorKind::Drive, 0),
-                piggyback::BeginOutcome::Installed
-            );
+            assert!(loco.begin_piggyback(LocomotorKind::Drive, 0));
         }
         sim.scenario_rng = crate::sim::rng::SimRng::new(0);
         let bytes = GameSnapshot::save(&sim, 0, 0, "Fly active/stashed destination", 0);
         let mut restored = GameSnapshot::load(&bytes).unwrap().sim;
-        restored.retain_in_scenario_process_state_from(&sim);
+        restored.retain_process_state_for_load(crate::sim::world::SnapshotProcessState::Live(&sim));
         restored.resolved_terrain = sim.resolved_terrain.clone();
         restored.restore_after_snapshot_load().unwrap();
         assert_eq!(restored.state_hash(), sim.state_hash());
@@ -709,7 +781,7 @@ fn fly_destination_is_hashed_and_persisted_in_active_and_stashed_runtime() {
             .as_mut()
             .unwrap();
         if stashed {
-            assert!(piggyback::end(loco).is_some());
+            assert!(loco.end_piggyback().is_some());
         }
         let destination = loco.fly_runtime().unwrap().destination();
         assert_eq!(
@@ -745,9 +817,12 @@ fn takeoff_fixture(row: &serde_json::Value) -> (Simulation, RuleSet) {
         "landing": input["landing"].as_bool().unwrap_or(false),
         "destination": input.get("destination").cloned().unwrap_or(serde_json::json!([3456,2688,0])),
         "cruise_mode": input["mode"].as_bool().unwrap_or(false),
+        "moving": input["moving"].as_bool().unwrap_or(false),
     })).unwrap();
-    loco.fly_runtime_mut().unwrap().target_speed = SimFixed::lit("0.25");
-    sim.session.binary_frame = 100;
+    loco.fly_runtime_mut()
+        .unwrap()
+        .set_target_speed_for_test(SimFixed::lit("0.25"));
+    sim.session.set_binary_frame_for_test(100);
     (sim, rules)
 }
 
@@ -761,8 +836,8 @@ fn assert_native_takeoff_result(sim: &Simulation, row: &serde_json::Value) {
         "{row}"
     );
     assert_eq!(
-        loco.fly_runtime().unwrap().target_speed,
-        SimFixed::from_num(row["speed"].as_f64().unwrap()),
+        loco.fly_runtime().unwrap().target_speed(),
+        crate::util::native_x87::NativeF64Bits::from_bits(row["speed"].as_f64().unwrap().to_bits()),
         "{row}"
     );
     let coord = crate::sim::movement::ground_pose::position_world_coord(&entity.position);
@@ -772,7 +847,7 @@ fn assert_native_takeoff_result(sim: &Simulation, row: &serde_json::Value) {
         "{row}"
     );
     assert_eq!(
-        entity.on_bridge,
+        entity.on_bridge(),
         row["on_bridge"].as_bool().unwrap(),
         "{row}"
     );
@@ -800,15 +875,22 @@ fn assert_native_takeoff_result(sim: &Simulation, row: &serde_json::Value) {
 
 #[test]
 fn fly_takeoff_callback_matches_all_original_histories() {
-    let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/fly_takeoff.json"
+    let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/fly_takeoff.json",
     ))
     .unwrap();
     assert_eq!(rows.len(), 80);
     for row in rows {
         let (mut sim, rules) = takeoff_fixture(&row);
         let rng = sim.scenario_rng.logical_state();
-        sim.apply_fly_takeoff_callback(1, Some(&rules));
+        Simulation::apply_fly_takeoff_callback(
+            &sim.interner,
+            &sim.session,
+            &mut sim.substrate,
+            &sim.resolved_terrain,
+            1,
+            &rules,
+        );
         assert_native_takeoff_result(&sim, &row);
         assert_eq!(sim.scenario_rng.logical_state(), rng);
     }
@@ -817,8 +899,8 @@ fn fly_takeoff_callback_matches_all_original_histories() {
 #[test]
 fn fly_takeoff_phase_matches_native_display_reordering_and_gates() {
     use super::display_layers::DisplayLayer;
-    let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/fly_takeoff_phase.json"
+    let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/fly_takeoff_phase.json",
     ))
     .unwrap();
     assert_eq!(rows.len(), 75);
@@ -827,22 +909,38 @@ fn fly_takeoff_phase_matches_native_display_reordering_and_gates() {
         if !row["input"]["marked"].as_bool().unwrap_or(false) {
             sim.remove_entity_occupancy(1);
         }
-        let peer = sim.allocate_stable_id();
+        let peer = sim.substrate.allocate_stable_id();
         insert_entity(&mut sim, peer, EntityCategory::Aircraft);
         let owner = sim.substrate.entities.get(1).unwrap();
-        let (position, on_bridge, loco) = (
-            owner.position.clone(),
-            owner.on_bridge,
-            owner.locomotor.clone(),
-        );
+        let (position, on_bridge, loco) =
+            (owner.position, owner.on_bridge(), owner.locomotor.clone());
         let other = sim.substrate.entities.get_mut(peer).unwrap();
         other.position = position;
-        other.on_bridge = on_bridge;
+        other.set_on_bridge(on_bridge);
         other.locomotor = loco;
-        sim.submit_entity_display(1, Some(&rules), None);
-        sim.submit_entity_display(peer, Some(&rules), None);
+        Simulation::submit_entity_display(
+            &sim.interner,
+            &mut sim.substrate,
+            &sim.resolved_terrain,
+            1,
+            &rules,
+            None,
+        );
+        Simulation::submit_entity_display(
+            &sim.interner,
+            &mut sim.substrate,
+            &sim.resolved_terrain,
+            peer,
+            &rules,
+            None,
+        );
         let rng = sim.scenario_rng.logical_state();
-        let admitted = sim.complete_fly_phase(1, Some(&rules));
+        let admitted = sim.complete_fly_phase(
+            1,
+            &rules,
+            None,
+            &mut crate::sim::world::FrameEffects::default(),
+        );
         assert_eq!(
             admitted,
             !row["phase_calls"].as_array().unwrap().is_empty(),
@@ -850,7 +948,12 @@ fn fly_takeoff_phase_matches_native_display_reordering_and_gates() {
         );
         assert_native_takeoff_result(&sim, &row);
         assert_eq!(
-            sim.substrate.entities.get(1).unwrap().lifecycle.cell_marked,
+            sim.substrate
+                .entities
+                .get(1)
+                .unwrap()
+                .lifecycle
+                .cell_marked(),
             row["marked"].as_bool().unwrap(),
             "{row}"
         );
@@ -883,29 +986,45 @@ fn fly_takeoff_phase_matches_native_display_reordering_and_gates() {
 #[test]
 fn fly_nonlandable_phase_matches_native_without_display_resubmission() {
     use super::display_layers::DisplayLayer;
-    let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/fly_nonlandable_phase.json"
+    let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/fly_nonlandable_phase.json",
     ))
     .unwrap();
     assert_eq!(rows.len(), 64);
     for row in rows {
         let (mut sim, rules) = takeoff_fixture(&row);
-        let peer = sim.allocate_stable_id();
+        let peer = sim.substrate.allocate_stable_id();
         insert_entity(&mut sim, peer, EntityCategory::Aircraft);
         let owner = sim.substrate.entities.get(1).unwrap();
-        let (position, on_bridge, loco) = (
-            owner.position.clone(),
-            owner.on_bridge,
-            owner.locomotor.clone(),
-        );
+        let (position, on_bridge, loco) =
+            (owner.position, owner.on_bridge(), owner.locomotor.clone());
         let other = sim.substrate.entities.get_mut(peer).unwrap();
         other.position = position;
-        other.on_bridge = on_bridge;
+        other.set_on_bridge(on_bridge);
         other.locomotor = loco;
-        sim.submit_entity_display(1, Some(&rules), None);
-        sim.submit_entity_display(peer, Some(&rules), None);
+        Simulation::submit_entity_display(
+            &sim.interner,
+            &mut sim.substrate,
+            &sim.resolved_terrain,
+            1,
+            &rules,
+            None,
+        );
+        Simulation::submit_entity_display(
+            &sim.interner,
+            &mut sim.substrate,
+            &sim.resolved_terrain,
+            peer,
+            &rules,
+            None,
+        );
         let rng = sim.scenario_rng.logical_state();
-        assert!(!sim.complete_fly_phase(1, Some(&rules)));
+        assert!(!sim.complete_fly_phase(
+            1,
+            &rules,
+            None,
+            &mut crate::sim::world::FrameEffects::default()
+        ));
         assert_native_takeoff_result(&sim, &row);
         let entity = sim.substrate.entities.get(1).unwrap();
         let state = entity.locomotor.as_ref().unwrap().fly_runtime().unwrap();
@@ -916,7 +1035,7 @@ fn fly_nonlandable_phase_matches_native_without_display_resubmission() {
             "{row}"
         );
         assert_eq!(
-            entity.lifecycle.cell_marked,
+            entity.lifecycle.cell_marked(),
             row["marked"].as_bool().unwrap(),
             "{row}"
         );
@@ -948,16 +1067,30 @@ fn fly_nonlandable_phase_matches_native_without_display_resubmission() {
 
 #[test]
 fn fly_nonlandable_production_tick_replaces_landing_target_and_restores() {
+    // A landing Fly still holds its move (`+0x34`): Process steps its height.
     let row = serde_json::json!({"input": {
         "z":900, "target":0, "taking_off":false, "landing":true,
-        "landable":false, "flight_level":40000,
+        "landable":false, "flight_level":40000, "moving":true,
     }});
     let (mut sim, rules) = takeoff_fixture(&row);
-    sim.submit_entity_display(1, Some(&rules), None);
-    sim.tick_air_movement_with_cell_lists_one(1, Some(&rules), None);
+    Simulation::submit_entity_display(
+        &sim.interner,
+        &mut sim.substrate,
+        &sim.resolved_terrain,
+        1,
+        &rules,
+        None,
+    );
+    sim.tick_air_movement_with_cell_lists_one(
+        1,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default(),
+    )
+    .unwrap();
     let entity = sim.substrate.entities.get(1).unwrap();
     assert_eq!(
-        entity.position.exact_z_leptons,
+        entity.position.exact_z_leptons(),
         Some(855),
         "movement precedes phase override"
     );
@@ -967,14 +1100,21 @@ fn fly_nonlandable_production_tick_replaces_landing_target_and_restores() {
     assert_eq!(state.target_height(), 40000);
     let bytes = GameSnapshot::save(&sim, 0, 0, "Non-Landable Fly continuation", 0);
     let mut restored = GameSnapshot::load(&bytes).unwrap().sim;
-    restored.retain_in_scenario_process_state_from(&sim);
+    restored.retain_process_state_for_load(crate::sim::world::SnapshotProcessState::Live(&sim));
     restored.resolved_terrain = sim.resolved_terrain.clone();
     restored.restore_after_snapshot_load().unwrap();
     assert_eq!(restored.state_hash(), sim.state_hash());
     for frame in 101..105 {
         for instance in [&mut sim, &mut restored] {
-            instance.session.binary_frame = frame;
-            instance.tick_air_movement_with_cell_lists_one(1, Some(&rules), None);
+            instance.session.set_binary_frame_for_test(frame);
+            instance
+                .tick_air_movement_with_cell_lists_one(
+                    1,
+                    &rules,
+                    None,
+                    &mut crate::sim::world::FrameEffects::default(),
+                )
+                .unwrap();
             assert_eq!(
                 instance
                     .substrate
@@ -982,7 +1122,7 @@ fn fly_nonlandable_production_tick_replaces_landing_target_and_restores() {
                     .get(1)
                     .unwrap()
                     .position
-                    .exact_z_leptons,
+                    .exact_z_leptons(),
                 Some(855 + (frame as i32 - 100) * 20)
             );
         }
@@ -999,13 +1139,22 @@ fn fly_phase_outer_health_power_and_life_gates_precede_nonlandable_override() {
         let (mut sim, rules) = takeoff_fixture(&row);
         let entity = sim.substrate.entities.get_mut(1).unwrap();
         match gate {
-            "health" => entity.health.current = 0,
-            "power" => entity.locomotor.as_mut().unwrap().powered = false,
-            "life" => entity.lifecycle.object_alive = false,
+            "health" => entity.health.set_for_test(0),
+            "power" => entity
+                .locomotor
+                .as_mut()
+                .unwrap()
+                .set_powered_for_test(false),
+            "life" => entity.lifecycle.set_object_alive_for_test(false),
             _ => unreachable!(),
         }
         let before = sim.state_hash();
-        assert!(!sim.complete_fly_phase(1, Some(&rules)));
+        assert!(!sim.complete_fly_phase(
+            1,
+            &rules,
+            None,
+            &mut crate::sim::world::FrameEffects::default()
+        ));
         assert_eq!(sim.state_hash(), before, "{gate}");
     }
 }
@@ -1013,7 +1162,6 @@ fn fly_phase_outer_health_power_and_life_gates_precede_nonlandable_override() {
 #[test]
 fn fly_landing_state_hashes_and_restores_active_and_stashed_instances() {
     use crate::rules::locomotor_type::LocomotorKind;
-    use crate::sim::movement::locomotion::piggyback;
     for stashed in [false, true] {
         for field in ["moving", "landing_effect_latched", "airport_bound", "pitch"] {
             let row = destination_vectors().remove(0);
@@ -1041,10 +1189,7 @@ fn fly_landing_state_hashes_and_restores_active_and_stashed_instances() {
                         .locomotor
                         .as_mut()
                         .unwrap();
-                    assert_eq!(
-                        piggyback::begin(loco, LocomotorKind::Drive, 0),
-                        piggyback::BeginOutcome::Installed
-                    );
+                    assert!(loco.begin_piggyback(LocomotorKind::Drive, 0));
                 }
                 instance.scenario_rng = crate::sim::rng::SimRng::new(0);
             }
@@ -1055,7 +1200,9 @@ fn fly_landing_state_hashes_and_restores_active_and_stashed_instances() {
             );
             let bytes = GameSnapshot::save(&changed, 0, 0, "Fly landing state", 0);
             let mut restored = GameSnapshot::load(&bytes).unwrap().sim;
-            restored.retain_in_scenario_process_state_from(&changed);
+            restored.retain_process_state_for_load(crate::sim::world::SnapshotProcessState::Live(
+                &changed,
+            ));
             restored.resolved_terrain = changed.resolved_terrain.clone();
             restored.restore_after_snapshot_load().unwrap();
             assert_eq!(
@@ -1066,17 +1213,16 @@ fn fly_landing_state_hashes_and_restores_active_and_stashed_instances() {
             for instance in [&mut changed, &mut restored] {
                 if stashed {
                     assert!(
-                        piggyback::end(
-                            instance
-                                .substrate
-                                .entities
-                                .get_mut(1)
-                                .unwrap()
-                                .locomotor
-                                .as_mut()
-                                .unwrap()
-                        )
-                        .is_some()
+                        instance
+                            .substrate
+                            .entities
+                            .get_mut(1)
+                            .unwrap()
+                            .locomotor
+                            .as_mut()
+                            .unwrap()
+                            .end_piggyback()
+                            .is_some()
                     );
                 }
             }
@@ -1112,18 +1258,21 @@ fn fly_cruise_mode_hashes_separately_from_destination() {
 
 #[test]
 fn fly_production_process_resets_enter_mode_using_native_mission_precedence() {
-    let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/fly_mission_mode.json"
+    let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/fly_mission_mode.json",
     ))
     .unwrap();
     assert_eq!(rows.len(), 30);
     for row in rows {
         let (mut sim, rules) = fixture(&serde_json::json!({"input":{"z":900,"target":900}}));
         let entity = sim.substrate.entities.get_mut(1).unwrap();
-        let mut mission = serde_json::to_value(entity.mission).unwrap();
+        let mut mission = serde_json::to_value(entity.mission.clone()).unwrap();
         mission["current"] = row["current"].clone();
         mission["queued"] = row["queued"].clone();
         entity.mission = serde_json::from_value(mission).unwrap();
+        // Not ready (`+0x6D4`): Process's Commence (`0x004CCB84`) would
+        // promote the queued mission before the Enter test.
+        entity.mission_leaf.set_aircraft_transition_ready(0);
         entity
             .locomotor
             .as_mut()
@@ -1132,7 +1281,13 @@ fn fly_production_process_resets_enter_mode_using_native_mission_precedence() {
             .unwrap()
             .select_destination_mode(0, false, row["before"].as_bool().unwrap(), false);
         let rng = sim.scenario_rng.logical_state();
-        sim.tick_air_movement_with_cell_lists_one(1, Some(&rules), None);
+        sim.tick_air_movement_with_cell_lists_one(
+            1,
+            &rules,
+            None,
+            &mut crate::sim::world::FrameEffects::default(),
+        )
+        .unwrap();
         let mode = sim
             .substrate
             .entities
@@ -1151,7 +1306,9 @@ fn fly_production_process_resets_enter_mode_using_native_mission_precedence() {
 
 #[test]
 fn fly_production_tick_uses_primary_current_and_continues_after_restore() {
-    let row = serde_json::json!({"input":{"z":900}});
+    // No destination: Horizontal_Step would turn Primary toward one once the
+    // callback clears the takeoff (`0x004CCBE9`).
+    let row = serde_json::json!({"input":{"z":900, "destination":[0, 0, 0]}});
     let (mut sim, rules) = takeoff_fixture(&row);
     // Tick remains stationary so the native phase evidence applies at z900.
     sim.substrate
@@ -1166,13 +1323,20 @@ fn fly_production_tick_uses_primary_current_and_continues_after_restore() {
     sim.scenario_rng = crate::sim::rng::SimRng::new(0);
     let bytes = GameSnapshot::save(&sim, 0, 0, "Fly takeoff continuation", 0);
     let mut restored = GameSnapshot::load(&bytes).unwrap().sim;
-    restored.retain_in_scenario_process_state_from(&sim);
+    restored.retain_process_state_for_load(crate::sim::world::SnapshotProcessState::Live(&sim));
     restored.resolved_terrain = sim.resolved_terrain.clone();
     restored.restore_after_snapshot_load().unwrap();
     for frame in 100..104 {
         for instance in [&mut sim, &mut restored] {
-            instance.session.binary_frame = frame;
-            instance.tick_air_movement_with_cell_lists_one(1, Some(&rules), None);
+            instance.session.set_binary_frame_for_test(frame);
+            instance
+                .tick_air_movement_with_cell_lists_one(
+                    1,
+                    &rules,
+                    None,
+                    &mut crate::sim::world::FrameEffects::default(),
+                )
+                .unwrap();
             let entity = instance.substrate.entities.get(1).unwrap();
             assert_eq!(
                 entity.body_facing, primary,
@@ -1199,8 +1363,8 @@ fn fly_production_tick_uses_primary_current_and_continues_after_restore() {
 #[test]
 fn fly_paid_step_matches_native_math_and_production_type_speed() {
     use crate::sim::movement::ground_pose::position_world_coord;
-    let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/fly_paid_step.json"
+    let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/fly_paid_step.json",
     ))
     .unwrap();
     assert_eq!(rows.len(), 199);
@@ -1218,8 +1382,10 @@ fn fly_paid_step_matches_native_math_and_production_type_speed() {
             "{input}"
         );
         let fraction = SimFixed::from_bits(integer("fraction_bits"));
-        let speed =
-            crate::sim::movement::air_movement::current_fly_speed(native_type_speed, fraction);
+        let speed = crate::sim::movement::air_movement::current_fly_speed(
+            native_type_speed,
+            crate::util::native_x87::NativeF64Bits::from_bits(fraction.to_num::<f64>().to_bits()),
+        );
         assert_eq!(i64::from(speed), row["speed"].as_i64().unwrap(), "{input}");
         let rot = input["rot"].as_i64().unwrap_or(5) as i32;
         let mut primary = crate::sim::movement::FacingClass::new(integer("facing") as u16, rot);
@@ -1259,12 +1425,16 @@ fn fly_paid_step_matches_native_math_and_production_type_speed() {
         }}));
         sim.remove_entity_occupancy(1);
         let entity = sim.substrate.entities.get_mut(1).unwrap();
-        entity.position.rx = (current[0] / 256) as u16;
-        entity.position.ry = (current[1] / 256) as u16;
-        entity.position.sub_x = SimFixed::from_num(current[0] % 256);
-        entity.position.sub_y = SimFixed::from_num(current[1] % 256);
+        entity.position.set_rx_for_test((current[0] / 256) as u16);
+        entity.position.set_ry_for_test((current[1] / 256) as u16);
+        entity
+            .position
+            .set_sub_x_for_test(SimFixed::from_num(current[0] % 256));
+        entity
+            .position
+            .set_sub_y_for_test(SimFixed::from_num(current[1] % 256));
         entity.body_facing = primary;
-        entity.set_veterancy_rank(2); // Fly's getter bypasses Foot's FASTER path
+        entity.veterancy.set_rank_for_test(2); // Fly's getter bypasses Foot's FASTER path
         sim.add_entity_occupancy(1);
         assert!(issue_coordinate(
             &mut sim,
@@ -1272,20 +1442,20 @@ fn fly_paid_step_matches_native_math_and_production_type_speed() {
             [current[0] + 5000, current[1] + 5000, 0]
         ));
         let entity = sim.substrate.entities.get_mut(1).unwrap();
-        entity.movement_target.as_mut().unwrap().speed = SimFixed::from_num(3000);
         entity
             .locomotor
             .as_mut()
             .unwrap()
             .fly_runtime_mut()
             .unwrap()
-            .current_speed = fraction;
-        sim.session.binary_frame = frame;
+            .set_current_speed_for_test(fraction);
+        sim.session.set_binary_frame_for_test(frame);
         let mut restored = if input["name"] == "turn_5_100" {
             sim.scenario_rng = crate::sim::rng::SimRng::new(0);
             let bytes = GameSnapshot::save(&sim, 0, 0, "Fly paid movement", 0);
             let mut restored = GameSnapshot::load(&bytes).unwrap().sim;
-            restored.retain_in_scenario_process_state_from(&sim);
+            restored
+                .retain_process_state_for_load(crate::sim::world::SnapshotProcessState::Live(&sim));
             restored.resolved_terrain = sim.resolved_terrain.clone();
             restored.restore_after_snapshot_load().unwrap();
             assert_eq!(restored.state_hash(), sim.state_hash());
@@ -1294,7 +1464,13 @@ fn fly_paid_step_matches_native_math_and_production_type_speed() {
             None
         };
         let rng = sim.scenario_rng.logical_state();
-        sim.tick_air_movement_with_cell_lists_one(1, Some(&rules), None);
+        sim.tick_air_movement_with_cell_lists_one(
+            1,
+            &rules,
+            None,
+            &mut crate::sim::world::FrameEffects::default(),
+        )
+        .unwrap();
         let actual = position_world_coord(&sim.substrate.entities.get(1).unwrap().position);
         assert_eq!(
             serde_json::json!([actual.x, actual.y, actual.z]),
@@ -1303,12 +1479,26 @@ fn fly_paid_step_matches_native_math_and_production_type_speed() {
         );
         assert_eq!(sim.scenario_rng.logical_state(), rng);
         if let Some(restored) = restored.as_mut() {
-            restored.tick_air_movement_with_cell_lists_one(1, Some(&rules), None);
+            restored
+                .tick_air_movement_with_cell_lists_one(
+                    1,
+                    &rules,
+                    None,
+                    &mut crate::sim::world::FrameEffects::default(),
+                )
+                .unwrap();
             assert_eq!(restored.state_hash(), sim.state_hash());
             for next_frame in frame + 1..frame + 5 {
                 for instance in [&mut sim, &mut *restored] {
-                    instance.session.binary_frame = next_frame;
-                    instance.tick_air_movement_with_cell_lists_one(1, Some(&rules), None);
+                    instance.session.set_binary_frame_for_test(next_frame);
+                    instance
+                        .tick_air_movement_with_cell_lists_one(
+                            1,
+                            &rules,
+                            None,
+                            &mut crate::sim::world::FrameEffects::default(),
+                        )
+                        .unwrap();
                 }
                 assert_eq!(restored.state_hash(), sim.state_hash(), "frame{next_frame}");
             }

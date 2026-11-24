@@ -5,9 +5,9 @@
 //!   `[General]` RepairStep=, RepairPercent= and SeparateAircraft=, read
 //!   through the production reader;
 //! - `toggle` rows: [`production::toggle_repair`] over the controls VERA
-//!   issues (-1, 0 and 1): the repair byte, and for a row whose owner is the
-//!   local player the EVA and the sound at the building's Location (the app
-//!   applies `IsHumanPlayer`);
+//!   issues (-1, 0 and 1): the repair byte, the native Flash(7) request's
+//!   countdown through the existing Building flash owner, and for a row
+//!   whose owner is the local player the EVA and sound at its Location;
 //! - `update` rows: [`production::update_repair_and_power`] on a building of
 //!   the row's house: health and its estimate, the repair byte, the retained
 //!   damage state, the smoke's done byte, the owner's balance and spending
@@ -18,7 +18,7 @@
 //! - `release` rows: `HouseState::release_repair_latch`.
 //!
 //! Not compared: the wrench byte (`+0x6DE`, read only by the Building CRC),
-//! ToggleRepair's flash and the redraw byte (presentation), and the
+//! the redraw byte (presentation), and the
 //! damage-state slot anims, which a building without art does not own: the
 //! retained flag they follow is compared (`building_art_transition` replays
 //! the anims), and the rows' anims change with it.
@@ -26,7 +26,8 @@
 use crate::map::entities::EntityCategory;
 use crate::rules::ini_parser::IniFile;
 use crate::rules::ruleset::RuleSet;
-use crate::sim::components::{BuildingUp, Health};
+use crate::sim::combat::Health;
+use crate::sim::components::BuildingUp;
 use crate::sim::estimated_health::EstimatedHealth;
 use crate::sim::game_entity::GameEntity;
 use crate::sim::house_state::{HouseDifficulty, HouseState};
@@ -42,11 +43,92 @@ use serde_json::{Value, json};
 /// `ScoldSound=`.
 const SOUNDS: [(i64, &str); 2] = [(42, "OracleClick"), (43, "OracleScold")];
 
-fn corpus() -> Value {
-    serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/building_repair.json"
-    ))
-    .unwrap()
+fn rules_with_fixed_sounds(root: IniFile, sounds: IniFile) -> RuleSet {
+    let mut owner = crate::rules::process_owner::NativeRulesProcessOwner::from_cold_start_sources(
+        root,
+        None,
+        IniFile::empty(),
+        std::sync::Arc::new(crate::rules::sound_ini::SoundRegistry::from_ini(&sounds)),
+        Default::default(),
+    )
+    .unwrap();
+    owner
+        .load_scenario(
+            crate::rules::process_owner::NativeScenarioRulesPrefix::NonCampaign(None),
+            &IniFile::empty(),
+        )
+        .unwrap()
+        .into_parts()
+        .0
+}
+
+fn oracle_rules_with_sounds(root: IniFile) -> RuleSet {
+    rules_with_fixed_sounds(
+        root,
+        IniFile::from_str("[SoundList]\n0=OracleClick\n1=OracleScold\n"),
+    )
+}
+
+#[test]
+fn repair_click_retains_the_retail_cue_after_an_unknown_map_override() {
+    // ToggleRepair446FF0 consumes Rules+70C; its reader66AD24..66AD56
+    // retains the registered startup cue when this legal map read fails.
+    let Some(fixture) = crate::rules::retail_ini_fixture::retail_battle_rules_with_map_patch(
+        &IniFile::from_str("[AudioVisual]\nGenericClick=UnknownRepairClick\n"),
+    ) else {
+        return;
+    };
+    let rules = fixture.rules;
+    let strength = rules.object("GAPOWR").unwrap().strength;
+    let mut sim = Simulation::new();
+    let owner = sim.interner.intern("Americans");
+    sim.session.set_current_house_for_test(Some(owner));
+    sim.houses
+        .register(HouseState::new(owner, 0, None, true, 1000, 10));
+    let kind = sim.interner.intern("GAPOWR");
+    sim.substrate
+        .entities
+        .insert(GameEntity::new_at_frame_zero_for_test(
+            1,
+            12,
+            12,
+            0,
+            0,
+            owner,
+            Health::new(strength / 2),
+            kind,
+            EntityCategory::Structure,
+            0,
+            5,
+            false,
+        ));
+    for control in [RepairControl::Start, RepairControl::Stop] {
+        sim.sound_events.clear_for_test();
+        assert!(production::toggle_repair(&mut sim, &rules, 1, control));
+        let clicks: Vec<_> = sim
+            .sound_events
+            .iter()
+            .filter_map(|event| match event {
+                SimSoundEvent::VocAt {
+                    sound_id,
+                    audible_to,
+                    rx,
+                    ry,
+                    ..
+                } => {
+                    assert_eq!(*audible_to, Some([owner, owner]));
+                    assert_eq!((*rx, *ry), (12, 12));
+                    Some(sound_id.name_in(&rules))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(clicks, ["MenuClick"]);
+    }
+}
+
+fn corpus() -> &'static Value {
+    crate::test_fixture::json("tools/spatial_oracle/building_repair.json")
 }
 
 fn constant(corpus: &Value, name: &str) -> u64 {
@@ -59,11 +141,11 @@ fn yes_no(value: bool) -> &'static str {
 
 /// The building's sound events as the oracle records them: `EVA_Repairing`
 /// and each `VocClass::PlayAt` with its sound index, coordinate and handle.
-fn sounds(sim: &Simulation, owner: crate::sim::intern::InternedId) -> Vec<Value> {
+fn sounds(rules: &RuleSet, sim: &Simulation, owner: crate::sim::intern::InternedId) -> Vec<Value> {
     sim.sound_events
         .iter()
         .filter_map(|event| match event {
-            SimSoundEvent::Repairing { owner: speaker } => {
+            SimSoundEvent::Repairing { owner: speaker, .. } => {
                 assert_eq!(*speaker, owner);
                 Some(json!(["eva", "EVA_Repairing", -1, -1]))
             }
@@ -79,9 +161,9 @@ fn sounds(sim: &Simulation, owner: crate::sim::intern::InternedId) -> Vec<Value>
                 assert_eq!(*audible_to, Some([owner, owner]), "the owner's player");
                 let index = SOUNDS
                     .iter()
-                    .find(|(_, name)| name == sound_id)
+                    .find(|(_, name)| *name == sound_id.name_in(rules))
                     .map(|(index, _)| *index)
-                    .unwrap_or_else(|| panic!("sound {sound_id}"));
+                    .unwrap_or_else(|| panic!("sound {}", sound_id.name_in(rules)));
                 Some(json!([
                     "play_at",
                     index,
@@ -180,14 +262,11 @@ fn the_repair_step_cost_matches_the_original() {
 /// `BuildingClass::ToggleRepair @ 0x00446FF0` over the controls VERA issues.
 #[test]
 fn toggle_repair_matches_the_original() {
-    let rules = RuleSet::from_ini(&IniFile::from_str(&format!(
-        // VERA's rules reader reads `[AudioVisual]` sounds only with a
-        // non-empty `[General]` section.
+    let rules = oracle_rules_with_sounds(IniFile::from_str(&format!(
         "[General]\nFixtureOnly=1\n[AudioVisual]\nGenericClick={}\nScoldSound={}\n[InfantryTypes]\n\
          [VehicleTypes]\n[AircraftTypes]\n[BuildingTypes]\n0=YAREFN\n[YAREFN]\nStrength=1000\n",
         SOUNDS[0].1, SOUNDS[1].1
-    )))
-    .unwrap();
+    )));
     let mut compared = 0;
     for row in corpus()["toggle"].as_array().unwrap() {
         let input = &row["input"];
@@ -201,11 +280,20 @@ fn toggle_repair_matches_the_original() {
             _ => continue,
         };
         let mut sim = Simulation::new();
-        sim.session.game_mode_nonzero = input["game_mode"].as_i64().unwrap_or(1) != 0;
+        sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(
+                input["game_mode"].as_i64().unwrap_or(1) != 0,
+            ),
+        );
         let owner = sim.interner.intern("AI");
+        // Native House50B6F0's nonzero-mode identity input, distinct from
+        // its campaign human/control bytes. The flash call is gated here;
+        // the sound events retain their app-side audibility admission.
+        sim.session
+            .set_current_house_for_test((input["player"] == true).then_some(owner));
         let mut house = HouseState::new(owner, 0, None, input["human"] == true, 0, 10);
-        house.player_control = input["player_control"] == true;
-        sim.houses.insert(owner, house);
+        house.set_player_control_for_test(input["player_control"] == true);
+        sim.houses.register(house);
         let kind = sim.interner.intern("YAREFN");
         let mut building = GameEntity::new_at_frame_zero_for_test(
             1,
@@ -214,26 +302,68 @@ fn toggle_repair_matches_the_original() {
             0,
             0,
             owner,
-            Health {
-                current: input["health"].as_i64().unwrap() as i32,
-            },
+            Health::new(input["health"].as_i64().unwrap() as i32),
             kind,
             EntityCategory::Structure,
             0,
             5,
             false,
         );
-        building.repairing = input["repairing"] == 1;
+        building
+            .building
+            .repairing
+            .set_for_test(input["repairing"] == 1);
         sim.substrate.entities.insert(building);
-        assert!(production::toggle_repair(&mut sim, &rules, 1, control));
+        let timer_before = *sim.houses[&owner].repair_latch_timer();
+        let latch_before = sim.houses[&owner].repair_start_latch();
+        let (admitted, draws) = crate::sim::rng::trace_draws(|| {
+            production::toggle_repair(&mut sim, &rules, 1, control)
+        });
+        assert!(admitted);
+        assert!(
+            draws.is_empty(),
+            "{name}: manual ToggleRepair spends no RNG"
+        );
         assert_eq!(
-            u64::from(sim.substrate.entities.get(1).unwrap().repairing),
+            *sim.houses[&owner].repair_latch_timer(),
+            timer_before,
+            "{name}"
+        );
+        assert_eq!(
+            sim.houses[&owner].repair_start_latch(),
+            latch_before,
+            "{name}"
+        );
+        assert_eq!(
+            u64::from(
+                sim.substrate
+                    .entities
+                    .get(1)
+                    .unwrap()
+                    .building
+                    .repairing
+                    .is_on()
+            ),
             row["repairing"].as_u64().unwrap(),
             "{name}: +0x6E8"
         );
+        // Original446FF0 calls456E00(7) at447091, before EVA/GenericClick.
+        // The corpus records that actual call; the shared flash owner
+        // supplies the countdown rather than a repair-specific timer.
+        let native_flash = row["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event[0] == "flash")
+            .map_or(0, |event| event[1].as_i64().unwrap());
+        assert_eq!(
+            i64::from(sim.substrate.entities.get(1).unwrap().flashing.frames()),
+            native_flash,
+            "{name}: Building456E00 Flash request"
+        );
         let native = native_sounds(row);
         if local_player(input) {
-            assert_eq!(sounds(&sim, owner), native, "{name}: sounds");
+            assert_eq!(sounds(&rules, &sim, owner), native, "{name}: sounds");
         } else {
             assert!(native.is_empty(), "{name}: not the local player");
         }
@@ -245,18 +375,17 @@ fn toggle_repair_matches_the_original() {
 /// The row's scene: the row's rules, its computer (or human) house, and the
 /// refinery YAREFN with the row's health, estimate, mission, repair and AI
 /// repair bytes, capture, retained damage state and smoke, with the Scenario
-/// RNG seeded last. VERA keeps a build-up in `building_up` without the
-/// Construction mission: a row's Construction, current or queued, is a
-/// build-up that completes on the next frame.
+/// RNG seeded last. Current/queued Construction is represented by the same
+/// MissionCom fields that native Get_Mission reads.
 fn update_scene(corpus: &Value, input: &Value) -> (Simulation, RuleSet, Option<u64>) {
     let int = |key: &str, default: i64| input[key].as_i64().unwrap_or(default) as i32;
     let flag = |key: &str, default: bool| input[key].as_bool().unwrap_or(default);
-    let rules = RuleSet::from_ini(&IniFile::from_str(&format!(
+    let rules = oracle_rules_with_sounds(IniFile::from_str(&format!(
         "[General]\nRepairStep=8\nRepairPercent=15%\nRepairRate=.016\n[AI]\nCreditReserve={}\n\
          [IQ]\nRepairSell=1\nSellBack=2\n[AudioVisual]\nConditionYellow=50%\nConditionRed=25%\n\
          GenericClick={}\nScoldSound={}\n[InfantryTypes]\n[VehicleTypes]\n[AircraftTypes]\n\
          [BuildingTypes]\n0=YAREFN\n[YAREFN]\nStrength=1000\nCost={}\nClickRepairable={}\n\
-         Repairable=yes\nFoundation=2x2\n[Particles]\n0=Smk\n[ParticleSystems]\n0=Sys\n\
+         Repairable=yes\nHasStupidGuardMode=no\nFoundation=2x2\n[Particles]\n0=Smk\n[ParticleSystems]\n0=Sys\n\
          [Smk]\nBehavesLike=Smoke\nMaxEC=10\nMaxDC=4\nStartStateAI=0\nEndStateAI=10\n\
          StateAIAdvance=4\n[Sys]\nBehavesLike=Smoke\nHoldsWhat=Smk\nParticleCap=10\n\
          SpawnFrames=1\nLifetime=200\n",
@@ -265,8 +394,7 @@ fn update_scene(corpus: &Value, input: &Value) -> (Simulation, RuleSet, Option<u
         SOUNDS[1].1,
         int("cost", 2500),
         yes_no(flag("click_repairable", true)),
-    )))
-    .unwrap();
+    )));
     assert_eq!(
         rules.general.repair_percent.to_bits(),
         constant(corpus, "percent_15")
@@ -276,8 +404,13 @@ fn update_scene(corpus: &Value, input: &Value) -> (Simulation, RuleSet, Option<u
         constant(corpus, "rate_016")
     );
     let mut sim = Simulation::new();
-    sim.session.game_mode_nonzero = int("game_mode", 1) != 0;
-    sim.session.binary_frame = int("frame", 196) as u32;
+    sim.session.set_game_mode(
+        crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(
+            int("game_mode", 1) != 0,
+        ),
+    );
+    sim.session
+        .set_binary_frame_for_test(int("frame", 196) as u32);
     let owner = sim.interner.intern("AI");
     let mut house = HouseState::new(
         owner,
@@ -287,21 +420,21 @@ fn update_scene(corpus: &Value, input: &Value) -> (Simulation, RuleSet, Option<u
         int("balance", 5000),
         10,
     );
-    house.player_control = flag("player_control", false);
-    house.current_iq = int("current_iq", 2);
-    house.authored_iq = 2;
-    house.repair_start_latch = flag("latched", false);
+    house.set_player_control_for_test(flag("player_control", false));
+    house.set_current_iq_for_test(int("current_iq", 2));
+    house.set_authored_iq_for_test(2);
+    house.set_repair_start_latch_for_test(flag("latched", false));
     let timer = input["timer"].as_array().map_or([0, 0], |timer| {
         [timer[0].as_i64().unwrap(), timer[2].as_i64().unwrap()]
     });
-    house.repair_latch_timer = CdTimer::from_raw(timer[0] as i32, timer[1] as i32);
-    house.repair_delay = f64::from_bits(
+    house.set_repair_latch_timer_for_test(CdTimer::from_raw(timer[0] as i32, timer[1] as i32));
+    house.set_repair_delay_for_test(f64::from_bits(
         input["delay"]
             .as_u64()
             .unwrap_or_else(|| constant(corpus, "delay_02")),
-    );
-    sim.houses.insert(owner, house);
-    assert_eq!(sim.allocate_stable_id(), 1);
+    ));
+    sim.houses.register(house);
+    assert_eq!(sim.substrate.allocate_stable_id(), 1);
     let kind = sim.interner.intern("YAREFN");
     let health = int("health", 300);
     let mut building = GameEntity::new_at_frame_zero_for_test(
@@ -311,33 +444,42 @@ fn update_scene(corpus: &Value, input: &Value) -> (Simulation, RuleSet, Option<u
         0,
         0,
         owner,
-        Health { current: health },
+        Health::new(health),
         kind,
         EntityCategory::Structure,
         0,
         5,
         false,
     );
-    building.lifecycle.in_limbo = false;
-    building.in_playfield = true;
+    building.lifecycle.set_in_limbo_for_test(false);
+    building.set_in_playfield(true);
     building.estimated_health = EstimatedHealth::from_raw(int("estimate", health.into()));
-    building.repairing = flag("repairing", false);
-    building.has_been_captured = flag("captured", false);
-    building.ai_repairable = flag("ai_repairable", true);
-    building.was_attacked_by_enemy = flag("attacked", false);
-    building.building_damage_state_active = flag("damaged", health * 2 <= 1000);
+    building
+        .building
+        .repairing
+        .set_for_test(flag("repairing", false));
+    building
+        .building
+        .has_been_captured
+        .set_for_test(flag("captured", false));
+    building
+        .seldom
+        .ai_sell_repair
+        .set_ai_repairable_for_test(flag("ai_repairable", true));
+    building
+        .seldom
+        .ai_sell_repair
+        .set_was_attacked_by_enemy_for_test(flag("attacked", false));
+    building
+        .building_art
+        .set_damage_state_active_for_test(flag("damaged", health * 2 <= 1000));
     let mission = |key: &str, default: &str| match input[key].as_str().unwrap_or(default) {
         "guard" => MissionId::from_known(MissionType::Guard),
         "selling" => MissionId::from_known(MissionType::Selling),
-        "none" | "construction" => MissionId::NONE,
+        "construction" => MissionId::from_known(MissionType::Construction),
+        "none" => MissionId::NONE,
         other => panic!("mission {other}"),
     };
-    if input["mission"] == "construction" || input["queue"] == "construction" {
-        building.install_building_up(
-            BuildingUp::completing_in_ticks(2, sim.session.binary_frame as i32),
-            sim.session.binary_frame as i32,
-        );
-    }
     building.mission.apply_test_fixture(MissionTestFixture {
         current: mission("mission", "guard"),
         suspended: MissionId::NONE,
@@ -355,7 +497,7 @@ fn update_scene(corpus: &Value, input: &Value) -> (Simulation, RuleSet, Option<u
             .spawn_particle_system(
                 crate::rules::particle_system_type::ParticleSystemTypeId(0),
                 glam::IVec3::ZERO,
-                Some(1),
+                Some(crate::sim::combat::TargetKind::Entity(1)),
                 Some(1),
                 glam::IVec3::ZERO,
                 None,
@@ -366,11 +508,13 @@ fn update_scene(corpus: &Value, input: &Value) -> (Simulation, RuleSet, Option<u
             .entities
             .get_mut(1)
             .unwrap()
-            .damage_smoke_system_id = Some(smoke);
+            .seldom
+            .damage_smoke_system_id
+            .set_for_test(Some(smoke));
         smoke
     });
     sim.scenario_rng = SimRng::new(input["seed"].as_u64().unwrap_or(1));
-    sim.sound_events.clear();
+    sim.sound_events.clear_for_test();
     (sim, rules, smoke)
 }
 
@@ -399,17 +543,24 @@ fn update_repair_and_power_matches_the_original() {
             .entities
             .get(1)
             .unwrap()
-            .building_damage_state_active;
-        production::update_repair_and_power(&mut sim, &rules, 1);
+            .building_art
+            .damage_state_active();
+        production::update_repair_and_power(
+            &mut sim,
+            &rules,
+            1,
+            None,
+            &mut crate::sim::world::FrameEffects::default(),
+        );
         let owner = sim.interner.get("AI").unwrap();
         let building = sim.substrate.entities.get(1).unwrap();
         let house = &sim.houses[&owner];
         assert_eq!(
             json!([
-                building.health.current,
+                building.health.current(),
                 building.estimated_health.get(),
-                u8::from(building.repairing),
-                u8::from(building.building_damage_state_active),
+                u8::from(building.building.repairing.is_on()),
+                u8::from(building.building_art.damage_state_active()),
             ]),
             json!([
                 row["health"],
@@ -421,12 +572,12 @@ fn update_repair_and_power_matches_the_original() {
         );
         assert_eq!(
             json!([
-                house.economy.credits,
-                house.economy.spent_credits,
-                u8::from(house.repair_start_latch),
+                house.economy().credits(),
+                house.economy().spent_credits(),
+                u8::from(house.repair_start_latch()),
                 [
-                    house.repair_latch_timer.start_frame(),
-                    house.repair_latch_timer.duration()
+                    house.repair_latch_timer().start_frame(),
+                    house.repair_latch_timer().duration()
                 ],
             ]),
             json!([row["balance"], row["spent"], row["latched"], row["timer"]]),
@@ -439,7 +590,7 @@ fn update_repair_and_power_matches_the_original() {
         );
         if let Some(smoke) = smoke {
             assert_eq!(
-                u8::from(sim.particle_systems().get(smoke).unwrap().done_spawning),
+                u8::from(sim.particle_systems().get(smoke).unwrap().done_spawning()),
                 row["smoke_done"].as_u64().unwrap() as u8,
                 "{name}: smoke"
             );
@@ -451,7 +602,7 @@ fn update_repair_and_power_matches_the_original() {
             .any(|event| event[0] == "slot_anim");
         assert_eq!(
             native_anims,
-            damaged_before != building.building_damage_state_active,
+            damaged_before != building.building_art.damage_state_active(),
             "{name}: the slot anims follow the flag"
         );
         let selling = building.mission.effective().known() == Some(MissionType::Selling)
@@ -467,7 +618,7 @@ fn update_repair_and_power_matches_the_original() {
         );
         let native = native_sounds(row);
         if local_player(input) {
-            assert_eq!(sounds(&sim, owner), native, "{name}: sounds");
+            assert_eq!(sounds(&rules, &sim, owner), native, "{name}: sounds");
         } else {
             assert!(native.is_empty(), "{name}: not the local player");
         }
@@ -477,9 +628,8 @@ fn update_repair_and_power_matches_the_original() {
 }
 
 /// The `build` rows: a damaged building's build-up on each route, frame by
-/// frame [`production::update_repair_and_power`] in the object visit, then
-/// the build-up's step (`Simulation::tick_building_up`, after the object
-/// pass). VERA completes the build-up on the frame native calls
+/// frame through the ordinary object visit: body and Construction precede
+/// [`production::update_repair_and_power`]. VERA completes on the frame native calls
 /// Grand_Opening, and the repair starts on that frame, not before (native
 /// Get_Mission reads Guard there): after each frame the health, repair byte,
 /// balance, latch and its timer, the draws and the local player's sounds.
@@ -491,6 +641,10 @@ fn a_build_up_holds_the_repair_until_its_completion_frame() {
         let input = &row["input"];
         let name = input["name"].as_str().unwrap();
         let (mut sim, rules, _smoke) = update_scene(&corpus, input);
+        // Original build() calls prepare_update with mission=none before entry.
+        sim.substrate
+            .mission_assign_exact(1, MissionId::NONE, sim.session.binary_frame())
+            .unwrap();
         let owner = sim.interner.get("AI").unwrap();
         let control: [i32; 3] = serde_json::from_value(input["control"].clone()).unwrap();
         let start = input["frame"].as_i64().unwrap() as i32;
@@ -507,14 +661,42 @@ fn a_build_up_holds_the_repair_until_its_completion_frame() {
                 },
                 start,
             );
+        if input["route"] == "player" {
+            // The original inherited route supplies the successful yard BREAK.
+            sim.substrate
+                .entities
+                .get_mut(1)
+                .unwrap()
+                .begin_building_body(
+                    crate::sim::building_construction::BuildingBodyMode::Idle,
+                    start,
+                );
+        }
         for frame in row["frames"].as_array().unwrap() {
             let now = frame["frame"].as_u64().unwrap();
-            sim.session.binary_frame = now as u32;
-            sim.sound_events.clear();
-            let before = cursors(&sim);
-            production::update_repair_and_power(&mut sim, &rules, 1);
+            sim.session.set_binary_frame_for_test(now as u32);
+            sim.sound_events.clear_for_test();
+            let placed_before = sim
+                .substrate
+                .entities
+                .get(1)
+                .unwrap()
+                .building_art
+                .actually_placed();
+            sim.object_ai_visit_one(
+                1,
+                Some(&rules),
+                &mut super::techno_ai::ObjectAiCtx::default(),
+            );
             let after = cursors(&sim);
-            let completed = sim.tick_building_up() == [1];
+            let completed = !placed_before
+                && sim
+                    .substrate
+                    .entities
+                    .get(1)
+                    .unwrap()
+                    .building_art
+                    .actually_placed();
             assert_eq!(
                 completed, frame["grand_opening"],
                 "{name} {now}: the build-up completes"
@@ -523,13 +705,13 @@ fn a_build_up_holds_the_repair_until_its_completion_frame() {
             let house = &sim.houses[&owner];
             assert_eq!(
                 json!([
-                    building.health.current,
-                    u8::from(building.repairing),
-                    house.economy.credits,
-                    u8::from(house.repair_start_latch),
+                    building.health.current(),
+                    u8::from(building.building.repairing.is_on()),
+                    house.economy().credits(),
+                    u8::from(house.repair_start_latch()),
                     [
-                        house.repair_latch_timer.start_frame(),
-                        house.repair_latch_timer.duration()
+                        house.repair_latch_timer().start_frame(),
+                        house.repair_latch_timer().duration()
                     ],
                 ]),
                 json!([
@@ -544,17 +726,13 @@ fn a_build_up_holds_the_repair_until_its_completion_frame() {
             // The Guard mission's draws the fixture runs after completion
             // precede later frames' visits; the start's draw is the row's
             // first.
-            assert_eq!(
-                before == after,
-                frame["random_indices"]["before"] == frame["random_indices"]["after"],
-                "{name} {now}: draws"
-            );
-            if before != after {
-                assert_eq!(after, frame["random_indices"]["after"], "{name} {now}");
-            }
+            // Native's recorded before cursor is after the mission pieces.
+            // The production visit includes those pieces and repair, so its
+            // final cursor is the matching boundary, including Guard draws.
+            assert_eq!(after, frame["random_indices"]["after"], "{name} {now}");
             let native = native_sounds(frame);
             if local_player(input) {
-                assert_eq!(sounds(&sim, owner), native, "{name} {now}: sounds");
+                assert_eq!(sounds(&rules, &sim, owner), native, "{name} {now}: sounds");
             } else {
                 assert!(native.is_empty(), "{name} {now}: not the local player");
             }
@@ -571,14 +749,14 @@ fn the_auto_repair_latch_releases_on_the_original_timer() {
     for row in corpus()["release"].as_array().unwrap() {
         let input = &row["input"];
         let mut house = HouseState::new(Default::default(), 0, None, false, 0, 10);
-        house.repair_start_latch = input["latched"] == 1;
-        house.repair_latch_timer = CdTimer::from_raw(
+        house.set_repair_start_latch_for_test(input["latched"] == 1);
+        house.set_repair_latch_timer_for_test(CdTimer::from_raw(
             input["timer"][0].as_i64().unwrap() as i32,
             input["timer"][1].as_i64().unwrap() as i32,
-        );
+        ));
         house.release_repair_latch(input["frame"].as_u64().unwrap() as u32);
         assert_eq!(
-            u8::from(house.repair_start_latch),
+            u8::from(house.repair_start_latch()),
             row["latched"].as_u64().unwrap() as u8,
             "{}",
             input["name"]
@@ -601,7 +779,12 @@ fn retail_repair_keys_read_as_the_oracle_writes_them() {
     ))
     .unwrap();
     assert_eq!(
-        bits(without_key.general.difficulty_repair_delay),
+        bits(
+            without_key
+                .general
+                .difficulty_rows
+                .map(|row| row.repair_delay)
+        ),
         [constant(&corpus, "delay_02_default"); 3]
     );
     assert_eq!(
@@ -612,7 +795,10 @@ fn retail_repair_keys_read_as_the_oracle_writes_them() {
     let Some(ini) = crate::rules::retail_ini_fixture::retail_ini("rulesmd.ini") else {
         return;
     };
-    let rules = RuleSet::from_ini(&ini).unwrap();
+    let Some(soundmd) = crate::rules::retail_ini_fixture::retail_ini("soundmd.ini") else {
+        return;
+    };
+    let rules = rules_with_fixed_sounds(ini, soundmd);
     assert_eq!(rules.general.repair_step, 8);
     assert_eq!(
         rules.general.repair_percent.to_bits(),
@@ -623,7 +809,7 @@ fn retail_repair_keys_read_as_the_oracle_writes_them() {
         constant(&corpus, "rate_016")
     );
     assert_eq!(
-        bits(rules.general.difficulty_repair_delay),
+        bits(rules.general.difficulty_rows.map(|row| row.repair_delay)),
         [
             constant(&corpus, "delay_02"),
             constant(&corpus, "delay_02"),
@@ -638,8 +824,18 @@ fn retail_repair_keys_read_as_the_oracle_writes_them() {
     // SetDifficulty copies the house's row (HouseDifficulty order: 0 is a
     // Hard AI reading [Easy]).
     let mut house = HouseState::new(Default::default(), 0, None, false, 0, 10);
-    house.set_difficulty(HouseDifficulty::Easy, &rules.general, 1.0, true, 0, 0);
-    assert_eq!(house.repair_delay.to_bits(), constant(&corpus, "delay_05"));
+    house.set_difficulty(
+        HouseDifficulty::Easy,
+        &rules.general,
+        Default::default(),
+        crate::rules::rule_policy::RulePolicy::stock_multiplayer(),
+        0,
+        0,
+    );
+    assert_eq!(
+        house.repair_delay().to_bits(),
+        constant(&corpus, "delay_05")
+    );
 }
 
 /// The repair step's `ADD`s wrap and its clamp compares signed against the
@@ -668,7 +864,7 @@ fn the_repair_step_keeps_signed_adds_and_the_live_strength() {
         let mut sim = Simulation::new();
         let owner = sim.interner.intern("Americans");
         sim.houses
-            .insert(owner, HouseState::new(owner, 0, None, true, 1000, 10));
+            .register(HouseState::new(owner, 0, None, true, 1000, 10));
         let kind = sim.interner.intern("GAPOWR");
         let mut building = GameEntity::new_at_frame_zero_for_test(
             1,
@@ -677,7 +873,7 @@ fn the_repair_step_keeps_signed_adds_and_the_live_strength() {
             0,
             0,
             owner,
-            Health { current: actual },
+            Health::new(actual),
             kind,
             EntityCategory::Structure,
             0,
@@ -685,15 +881,21 @@ fn the_repair_step_keeps_signed_adds_and_the_live_strength() {
             false,
         );
         building.estimated_health = EstimatedHealth::from_raw(estimate);
-        building.repairing = true;
+        building.building.repairing.set_for_test(true);
         sim.substrate.entities.insert(building);
-        production::update_repair_and_power(&mut sim, &rules, 1);
+        production::update_repair_and_power(
+            &mut sim,
+            &rules,
+            1,
+            None,
+            &mut crate::sim::world::FrameEffects::default(),
+        );
         let building = sim.substrate.entities.get(1).unwrap();
         assert_eq!(
             (
-                building.health.current,
+                building.health.current(),
                 building.estimated_health.get(),
-                building.repairing
+                building.building.repairing.is_on()
             ),
             (expected_actual, expected_estimate, repairing),
             "strength={strength} actual={actual}"
@@ -701,7 +903,7 @@ fn the_repair_step_keeps_signed_adds_and_the_live_strength() {
     }
 }
 
-/// Each Selling visit stops a repair first (`BuildingClass::Sell`'s
+/// Each Selling visit stops a repair first (`BuildingClass::Mission_Selling`'s
 /// `ToggleRepair(0)`, `0x00449C41`): on the refinery dock scene's second
 /// refinery, damaged and paid for, a repair running when its owner's sale
 /// order arrives keeps running through the order's frame and stops at the
@@ -728,30 +930,44 @@ fn a_sale_s_first_visit_stops_the_repair() {
             .unwrap()
             .strength;
         let entity = s.sim.substrate.entities.get_mut(building).unwrap();
-        entity.health.current = strength / 2;
-        entity.repairing = repairing;
-        assert!(production::sell_back(
-            &mut s.sim,
-            &s.rules,
-            building,
-            production::SellOrder::Player
-        ));
+        entity.health.set_for_test(strength / 2);
+        entity.building.repairing.set_for_test(repairing);
+        let sale_order = crate::sim::command::CommandEnvelope::new(
+            s.sim.substrate.entities.get(building).unwrap().owner(),
+            s.sim.session.tick() + 1,
+            crate::sim::command::Command::SellBuilding {
+                entity_id: building,
+            },
+        );
         let mut frames = Vec::new();
-        for _ in 0..2 {
-            s.sim.sound_events.clear();
+        for index in 0..2 {
+            s.sim.sound_events.clear_for_test();
             let grid = s.sim.path_grid_snapshot();
-            s.sim
-                .advance_tick(&[], Some(&s.rules), grid.as_deref(), Some(overlay), 67);
+            let commands = if index == 0 {
+                std::slice::from_ref(&sale_order)
+            } else {
+                &[]
+            };
+            let tick =
+                s.sim
+                    .advance_tick(commands, Some(&s.rules), grid.as_deref(), Some(overlay), 67);
+            if index == 0 {
+                assert_eq!(tick.executed_commands, 1);
+            }
             let entity = s.sim.substrate.entities.get(building).unwrap();
             let clicks = s
                 .sim
                 .sound_events
                 .iter()
                 .filter(|event| {
-                    matches!(event, SimSoundEvent::VocAt { sound_id, .. } if sound_id == SOUNDS[0].1)
+                    matches!(event, SimSoundEvent::VocAt { sound_id, .. } if sound_id.name_in(&s.rules) == SOUNDS[0].1)
                 })
                 .count();
-            frames.push((entity.mission.handler_state(), entity.repairing, clicks));
+            frames.push((
+                entity.mission.handler_state(),
+                entity.building.repairing.is_on(),
+                clicks,
+            ));
         }
         let (order, visit) = (frames[0], frames[1]);
         assert_eq!(
@@ -765,4 +981,117 @@ fn a_sale_s_first_visit_stops_the_repair() {
             "repairing {repairing}: the first visit"
         );
     }
+}
+
+/// Ares 3.0 10014630 (hook 0x4509B4): with `[General]
+/// RepairStopOnInsufficientFunds=no` a human player's broke repair stays on
+/// and heals nothing; a computer house's stops as in stock.
+#[test]
+fn ares_broke_human_repair_stays_on_without_repair_stop() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    for (human, repairing) in [(true, true), (false, false)] {
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[General]\nRepairStep=4\nRepairStopOnInsufficientFunds=no\n[InfantryTypes]\n\
+             [VehicleTypes]\n[AircraftTypes]\n[BuildingTypes]\n0=GAPOWR\n\
+             [GAPOWR]\nStrength=1000\nCost=800\n",
+        ))
+        .unwrap();
+        let mut sim = Simulation::new();
+        let owner = sim.interner.intern("Americans");
+        sim.houses
+            .register(HouseState::new(owner, 0, None, human, 0, 10));
+        let kind = sim.interner.intern("GAPOWR");
+        let mut building = GameEntity::new_at_frame_zero_for_test(
+            1,
+            10,
+            10,
+            0,
+            0,
+            owner,
+            Health::new(500),
+            kind,
+            EntityCategory::Structure,
+            0,
+            5,
+            false,
+        );
+        building.building.repairing.set_for_test(true);
+        sim.substrate.entities.insert(building);
+        production::update_repair_and_power(
+            &mut sim,
+            &rules,
+            1,
+            None,
+            &mut crate::sim::world::FrameEffects::default(),
+        );
+        let building = sim.substrate.entities.get(1).unwrap();
+        assert_eq!(
+            (
+                building.health.current(),
+                building.building.repairing.is_on()
+            ),
+            (500, repairing),
+            "human={human}"
+        );
+    }
+}
+
+/// VERA Auto Repair asks which of a house's buildings want the Repair order
+/// ([`production::buildings_wanting_repair`]).
+#[test]
+fn buildings_wanting_repair_are_the_damaged_idle_ones_the_owner_can_pay_for() {
+    let Some(fixture) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+        return;
+    };
+    let rules = fixture.rules;
+    let strength = rules.object("GAPOWR").unwrap().strength;
+    let wanting = |credits: i32| {
+        let mut sim = Simulation::new();
+        let owner = sim.interner.intern("Americans");
+        let other = sim.interner.intern("Russians");
+        sim.houses
+            .register(HouseState::new(owner, 0, None, true, credits, 10));
+        sim.houses
+            .register(HouseState::new(other, 0, None, true, 1000, 10));
+        let kind = sim.interner.intern("GAPOWR");
+        // 1 damaged, 2 whole, 3 damaged and repairing, 4 another house's.
+        for (id, house, health) in [
+            (1, owner, strength / 2),
+            (2, owner, strength),
+            (3, owner, strength / 2),
+            (4, other, strength / 2),
+        ] {
+            sim.substrate
+                .entities
+                .insert(GameEntity::new_at_frame_zero_for_test(
+                    id,
+                    12 + id as u16 * 4,
+                    12,
+                    0,
+                    0,
+                    house,
+                    Health::new(health),
+                    kind,
+                    EntityCategory::Structure,
+                    0,
+                    5,
+                    false,
+                ));
+        }
+        sim.substrate
+            .entities
+            .get_mut(3)
+            .unwrap()
+            .building
+            .repairing
+            .set_for_test(true);
+        production::buildings_wanting_repair(&sim, &rules, owner)
+    };
+    assert_eq!(wanting(1000), [1]);
+    // A house that cannot pay one step gets none: the step would stop it.
+    assert!(wanting(0).is_empty());
+    // Building 3's running repair pays its step first; 1 needs a second.
+    let step = production::repair_step_cost(&rules, rules.object("GAPOWR").unwrap());
+    assert!(wanting(2 * step - 1).is_empty());
+    assert_eq!(wanting(2 * step), [1]);
 }

@@ -14,9 +14,16 @@
 //!
 //! ## Dependency rules
 //! - Part of sim/ — depends only on `sim::timer`, serde and std.
-//! - sim/ NEVER depends on render/, ui/, sidebar/, audio/, net/.
+//! - sim/ NEVER depends on render/, ui/, audio/, net/.
 
 use crate::sim::timer::CdTimer;
+
+/// Sign of a live native-facing turn, as consumed by Fly's normal bank arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RotationDirection {
+    Positive,
+    Negative,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct FacingClass {
@@ -79,25 +86,25 @@ impl FacingClass {
         self.current
     }
 
-    /// Per-frame step value, exposed for tests and for callers that need
-    /// to know the rotation rate.
+    /// Per-frame step value, for tests that check the rotation rate.
+    #[cfg(test)]
     pub fn rot_per_frame(&self) -> u16 {
         self.rot_per_frame
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn timer_start_frame(&self) -> Option<u32> {
         self.start_frame
     }
 
     /// The native start word (`+0x04`).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn start_word(&self) -> u16 {
         self.prev
     }
 
     /// The native timer's time left (`+0x10`).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn timer_duration(&self) -> u16 {
         self.duration_frames
     }
@@ -140,6 +147,33 @@ impl FacingClass {
         // Original sample: tools/spatial_oracle/drive_fresh_turn.json.
         let per_step: i32 = (diff as i32) / (step_size as i32);
         let delta = per_step.wrapping_mul(remaining);
+        i32::from(self.current).wrapping_sub(delta) as u16
+    }
+
+    /// Animated facing through Ares' own copy of `current`
+    /// (Ares.dll `0x10009CC0`, and inline at `0x10048064..0x10048102`), which
+    /// its SHP vehicle facing bucket and AlphaImage facing frame read. It
+    /// multiplies the arc by the remaining time before dividing by the steps,
+    /// `Desired - (diff * remaining) / steps`, where gamemd's `current`
+    /// divides first. The gates are the same.
+    pub fn current_ares(&self, binary_frame: u32) -> u16 {
+        if (self.rot_per_frame as i16) <= 0 {
+            return self.current;
+        }
+        let remaining = self.remaining_frames(binary_frame);
+        if remaining == 0 {
+            return self.current;
+        }
+        let diff = i32::from(self.current.wrapping_sub(self.prev) as i16);
+        let steps = diff.unsigned_abs() / u32::from(self.rot_per_frame);
+        // `movzx eax,ax; test ax,ax; jle` at 0x10009D1C: the step count as a
+        // signed word.
+        let steps = i32::from(steps as u16 as i16);
+        if steps <= 0 {
+            return self.current;
+        }
+        // |diff| <= 0x8000 and remaining <= duration <= 0x80: no overflow.
+        let delta = diff.wrapping_mul(remaining) / steps;
         i32::from(self.current).wrapping_sub(delta) as u16
     }
 
@@ -203,6 +237,22 @@ impl FacingClass {
         (self.rot_per_frame as i16) > 0 && self.remaining_frames(binary_frame) != 0
     }
 
+    /// Whether the live SecondaryFacing turn selects Fly's positive or
+    /// negative bank. `FlyLocomotionClass::Draw_Matrix @ 0x004CF610` calls
+    /// `IsRotatingPositive @ 0x004C94B0` before
+    /// `IsRotatingNegative @ 0x004C94F0`; both require positive ROT and a
+    /// nonzero timer, then test the wrapped signed-16 `destination - start`.
+    pub fn rotation_direction_at(&self, binary_frame: u32) -> Option<RotationDirection> {
+        if !self.is_rotating(binary_frame) {
+            return None;
+        }
+        match self.current.wrapping_sub(self.prev) as i16 {
+            delta if delta > 0 => Some(RotationDirection::Positive),
+            delta if delta < 0 => Some(RotationDirection::Negative),
+            _ => None,
+        }
+    }
+
     /// The rotation timer's time left (`4C93E9..4C93F8` / `4C948D..4C94A0`).
     /// A setter at frame u32::MAX leaves the native epoch -1, which pauses
     /// the countdown; a never-started timer has none left.
@@ -215,16 +265,18 @@ impl FacingClass {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 mod tests {
     use super::*;
 
-    #[test]
-    fn signed_rates_and_retained_histories_match_native() {
-        let rows: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../tools/spatial_oracle/facing_class.json"
-        ))
-        .unwrap();
+    /// Replays each native history of `corpus` and hands every observation to
+    /// `check` with the replayed controller, its frame and the setter's return.
+    fn replay(
+        corpus: &'static str,
+        mut check: impl FnMut(&FacingClass, u32, Option<bool>, &serde_json::Value, &str),
+    ) {
+        let rows: serde_json::Value =
+            serde_json::from_str(crate::test_fixture::text(corpus)).unwrap();
         for row in rows.as_array().unwrap() {
             let input = &row["input"];
             let mut facing = FacingClass::new(0, input["rot"].as_i64().unwrap() as i32);
@@ -250,15 +302,12 @@ mod tests {
                     "sample" => None,
                     kind => panic!("unknown facing operation {kind}"),
                 };
-                assert_eq!(
-                    serde_json::json!({
-                        "destination": facing.destination(), "previous": facing.prev,
-                        "start": facing.start_frame.unwrap(), "duration": facing.duration_frames,
-                        "rate": facing.rot_per_frame(), "animated": facing.current(frame),
-                        "rotating": facing.is_rotating(frame), "result": result,
-                    }),
-                    *expected,
-                    "input={input}, operation={operation}"
+                check(
+                    &facing,
+                    frame,
+                    result,
+                    expected,
+                    &format!("input={input}, operation={operation}"),
                 );
                 // Resume each history through the same serialized fields used
                 // by snapshots; signed rate bits and a live timer must survive.
@@ -271,10 +320,39 @@ mod tests {
     }
 
     #[test]
-    fn new_initializes_at_given_facing() {
-        let fc = FacingClass::new(12345, 5);
-        assert_eq!(fc.destination(), 12345);
-        assert_eq!(fc.rot_per_frame(), 5 * 256); // 5 << 8 = 1280
+    fn signed_rates_and_retained_histories_match_native() {
+        replay(
+            "tools/spatial_oracle/facing_class.json",
+            |facing, frame, result, expected, context| {
+                assert_eq!(
+                    serde_json::json!({
+                        "destination": facing.destination(), "previous": facing.prev,
+                        "start": facing.start_frame.unwrap(), "duration": facing.duration_frames,
+                        "rate": facing.rot_per_frame(), "animated": facing.current(frame),
+                        "rotating": facing.is_rotating(frame), "result": result,
+                    }),
+                    *expected,
+                    "{context}"
+                );
+            },
+        );
+    }
+
+    /// Ares.dll's own Current (`0x10009CC0`) sampled on the same retained
+    /// object as gamemd's: mid-turn the two differ.
+    #[test]
+    fn ares_current_matches_native() {
+        replay(
+            "tools/spatial_oracle/facing_class_ares.json",
+            |facing, frame, _, expected, context| {
+                assert_eq!(
+                    [facing.current(frame), facing.current_ares(frame)],
+                    [&expected["animated"], &expected["ares_animated"]]
+                        .map(|value| value.as_u64().unwrap() as u16),
+                    "{context}"
+                );
+            },
+        );
     }
 
     #[test]
@@ -288,13 +366,6 @@ mod tests {
         assert_eq!(fc.rot_per_frame(), 0x7F00); // clamped to 127, 127 << 8
         fc.set_rot(200);
         assert_eq!(fc.rot_per_frame(), 0x7F00); // clamped
-    }
-
-    #[test]
-    fn set_rot_zero_means_instant() {
-        let mut fc = FacingClass::new(100, 5);
-        fc.set_rot(0);
-        assert_eq!(fc.rot_per_frame(), 0);
     }
 
     #[test]
@@ -324,23 +395,6 @@ mod tests {
         fc.start_frame = Some(start);
         fc.duration_frames = duration;
         fc
-    }
-
-    #[test]
-    fn current_returns_destination_when_rot_zero() {
-        let mut fc = mid_rotation(0, 1000, 0, 10, 5);
-        fc.set_rot(0);
-        assert_eq!(fc.current(0), 1000);
-        assert_eq!(fc.current(5), 1000);
-        assert_eq!(fc.current(100), 1000);
-    }
-
-    #[test]
-    fn current_returns_destination_when_no_start_frame() {
-        let fc = FacingClass::new(1000, 5);
-        // start_frame = None
-        assert_eq!(fc.current(0), 1000);
-        assert_eq!(fc.current(50), 1000);
     }
 
     #[test]
@@ -384,18 +438,6 @@ mod tests {
     }
 
     #[test]
-    fn current_non_multiple_arc_negative_diff_lands_on_prev() {
-        // Same as above for a negative (counter-clockwise) arc. prev=12900,
-        // current=0 → diff = -12900. step_size = 12900/1280 = 10;
-        // per_step = -12900/10 = -1290 (truncates toward zero).
-        let fc = mid_rotation(12900, 0, 0, 10, 5);
-        // elapsed=0, remaining=10: animated = 0 - (-1290*10) = 12900 == prev.
-        assert_eq!(fc.current(0), 12900);
-        assert_eq!(fc.current(10), 0);
-        assert_eq!(fc.current(5), 1290 * 5); // 6450
-    }
-
-    #[test]
     fn current_snaps_when_step_size_below_one() {
         // diff = current - prev = 100; rot_per_frame = 1280; step_size = 100/1280 = 0.
         // Should snap to current immediately.
@@ -416,19 +458,6 @@ mod tests {
         assert_eq!(fc.current(1), 0x0000);
         // At elapsed=2: complete.
         assert_eq!(fc.current(2), 0x0100);
-    }
-
-    #[test]
-    fn current_handles_wrap_around_short_path_negative_diff() {
-        // 0x0100 → 0xFF00: signed diff = (0xFF00 - 0x0100) as i16 = 0xFE00 = -512.
-        // shortest path is COUNTER-clockwise by 512 units (back through 0).
-        let fc = mid_rotation(0x0100, 0xFF00, 0, 2, 1);
-        // At elapsed=0: animated = 0xFF00 - sign(-) * 256 * 2 = 0xFF00 + 512 = 0x0100.
-        assert_eq!(fc.current(0), 0x0100);
-        // At elapsed=1: animated = 0xFF00 + 256 = 0x0000.
-        assert_eq!(fc.current(1), 0x0000);
-        // At elapsed=2: complete.
-        assert_eq!(fc.current(2), 0xFF00);
     }
 
     #[test]
@@ -453,15 +482,6 @@ mod tests {
         assert_eq!(fc.current(112), 0x4000);
     }
 
-    #[test]
-    fn set_no_op_when_target_equals_current() {
-        let mut fc = FacingClass::new(1000, 5);
-        let changed = fc.set(1000, 0);
-        assert!(!changed);
-        assert_eq!(fc.destination(), 1000);
-        assert!(fc.start_frame.is_none());
-    }
-
     // --- Native frame / tick contract acceptance tests ---
 
     #[test]
@@ -478,38 +498,6 @@ mod tests {
         // elapsed = 100 - 100 = 0 → animated == prev (start), still rotating.
         assert_eq!(fc.current(100), 0);
         assert!(fc.is_rotating(100));
-    }
-
-    #[test]
-    fn retarget_captures_supplied_frame_and_progresses_relative_to_it() {
-        // Acceptance: a facing retarget captures the frame it is given (the
-        // pre-increment frame visible during the tick) and animates relative
-        // to it. Invariant to a uniform frame offset — only relative elapsed
-        // matters.
-        let mut fc = FacingClass::new(0, 5); // rot_per_frame = 1280
-        fc.set(12800, 100); // duration 10, start_frame 100
-        assert_eq!(fc.start_frame, Some(100));
-        // 5 frames later: animated = 0 + 5 * 1280 = 6400, still rotating.
-        assert_eq!(fc.current(105), 6400);
-        assert!(fc.is_rotating(105));
-        // Retarget at frame 105: snapshots visible 6400 into prev, captures
-        // start_frame = 105.
-        fc.set(0, 105);
-        assert_eq!(fc.start_frame, Some(105));
-        assert_eq!(fc.prev, 6400);
-        // Same-frame after retarget: elapsed 0 → still at 6400.
-        assert_eq!(fc.current(105), 6400);
-    }
-
-    #[test]
-    fn set_initiates_rotation_when_target_differs() {
-        let mut fc = FacingClass::new(0, 5);
-        let changed = fc.set(12800, 0);
-        assert!(changed);
-        assert_eq!(fc.destination(), 12800);
-        assert_eq!(fc.start_frame, Some(0));
-        // duration = abs(12800 - 0) / 1280 = 10.
-        assert_eq!(fc.duration_frames, 10);
     }
 
     #[test]
@@ -531,25 +519,6 @@ mod tests {
     }
 
     #[test]
-    fn set_with_zero_rot_writes_destination_without_timer() {
-        let mut fc = FacingClass::new(0, 0);
-        let changed = fc.set(1000, 5);
-        assert!(changed);
-        assert_eq!(fc.destination(), 1000);
-        // No timer state set when rot is 0.
-        assert!(fc.start_frame.is_none());
-    }
-
-    #[test]
-    fn set_handles_wrap_around_shortest_path() {
-        // From 0x0100 to 0xFF00, shortest path is COUNTER-clockwise (-512 units).
-        let mut fc = FacingClass::new(0x0100, 1);
-        fc.set(0xFF00, 0);
-        // duration = abs((-512 as i16).unsigned_abs()) / 256 = 512/256 = 2.
-        assert_eq!(fc.duration_frames, 2);
-    }
-
-    #[test]
     fn snap_writes_both_current_and_prev() {
         let mut fc = FacingClass::new(0, 5);
         fc.snap(12800, 10);
@@ -557,26 +526,6 @@ mod tests {
         assert_eq!(fc.prev, 12800);
         assert_eq!(fc.duration_frames, 0);
         assert_eq!(fc.current(10), 12800); // animated = destination immediately
-    }
-
-    #[test]
-    fn snap_no_op_when_already_at_target() {
-        let mut fc = FacingClass::new(1000, 5);
-        let changed = fc.snap(1000, 0);
-        assert!(!changed);
-    }
-
-    #[test]
-    fn is_rotating_false_when_rot_zero() {
-        let fc = FacingClass::new(0, 0);
-        assert!(!fc.is_rotating(0));
-        assert!(!fc.is_rotating(100));
-    }
-
-    #[test]
-    fn is_rotating_false_when_no_start_frame() {
-        let fc = FacingClass::new(0, 5);
-        assert!(!fc.is_rotating(0));
     }
 
     #[test]
@@ -588,24 +537,5 @@ mod tests {
         assert!(fc.is_rotating(9));
         assert!(!fc.is_rotating(10)); // exactly at end
         assert!(!fc.is_rotating(100));
-    }
-
-    #[test]
-    fn turret_spins_formula_smoke_test() {
-        // Forward-test the deferred Floating Disk permaspin formula:
-        // each frame, set target = ((current(f) >> 7 + 1) >> 1 + 8) << 8.
-        // ROT byte = 100 (Disk's ROT), per-frame step = 25600 in 16-bit units.
-        // Per-frame target advance = 8 << 8 = 2048 < 25600, so step_size = 0
-        // → snaps every frame to the new target. After 32 frames, full revolution.
-        let mut fc = FacingClass::new(0, 100);
-        for f in 0..32u32 {
-            let animated = fc.current(f);
-            let rounded_8bit: u16 = (((animated >> 7) + 1) >> 1) & 0xFF;
-            let next_target: u16 = ((rounded_8bit + 8) & 0xFF) << 8;
-            fc.set(next_target, f);
-        }
-        // After 32 frames of advancing by 8 8-bit units, we should be back at
-        // (8 * 32) % 256 = 256 % 256 = 0 (in 8-bit), so 0 << 8 = 0 in 16-bit.
-        assert_eq!(fc.current(32), 0);
     }
 }

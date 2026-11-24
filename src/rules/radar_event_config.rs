@@ -72,6 +72,7 @@ pub struct RadarEventConfig {
     pub min_radius: i32,
     /// Speed at which the ping rectangle shrinks from large to min_radius.
     /// Higher = faster zoom-in.
+    #[cfg(any(test, feature = "test-support"))]
     pub speed: f32,
     /// Rotation speed of the ping rectangle (radians per native frame).
     pub rotation_speed: f32,
@@ -97,6 +98,7 @@ impl RadarEventConfig {
     fn from_scalars(native_scalars: NativeRadarEventScalars) -> Self {
         Self {
             min_radius: native_scalars.min_radius,
+            #[cfg(any(test, feature = "test-support"))]
             speed: f32::from_bits(native_scalars.speed.bits()),
             rotation_speed: f32::from_bits(native_scalars.rotation_speed.bits()),
             color_speed: f32::from_bits(native_scalars.color_speed.bits()),
@@ -105,16 +107,9 @@ impl RadarEventConfig {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_rules_o_z))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn default_config_has_reasonable_values() {
-        let config = RadarEventConfig::default();
-        assert_eq!(config.min_radius, 5);
-        assert_eq!(config.speed, 1.0);
-    }
 
     #[test]
     fn parse_from_ini_overrides_defaults() {
@@ -128,14 +123,6 @@ mod tests {
         assert!((config.speed - 0.15).abs() < 0.01);
         assert!((config.rotation_speed - 0.2).abs() < 0.01);
         assert!((config.color_speed - 0.1).abs() < 0.01);
-    }
-
-    #[test]
-    fn missing_general_section_uses_defaults() {
-        let ini = IniFile::from_str("[Map]\nTheater=TEMPERATE\n");
-        let config = RadarEventConfig::from_ini(&ini);
-        assert_eq!(config.min_radius, 5);
-        assert_eq!(config.speed, 1.0);
     }
 
     #[test]

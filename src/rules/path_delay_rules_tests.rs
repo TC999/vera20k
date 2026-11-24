@@ -43,8 +43,8 @@ struct Corpus {
 }
 
 fn corpus() -> Corpus {
-    serde_json::from_str(include_str!(
-        "../../tools/spatial_oracle/path_delay_rules.json"
+    serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/path_delay_rules.json",
     ))
     .unwrap()
 }
@@ -162,10 +162,8 @@ fn retained_double_conversion_matches_all_eleven_original_sites() {
                 .map(|row| (&row.output_bits, row.ticks)),
         )
     {
-        let rules = GeneralRules {
-            path_delay: f64::from_bits(bits(raw_bits)),
-            ..GeneralRules::default()
-        };
+        let mut rules = GeneralRules::default();
+        rules.path_delay = f64::from_bits(bits(raw_bits));
         assert_eq!(rules.path_delay_ticks(), ticks, "raw double={raw_bits}");
     }
 }

@@ -12,23 +12,30 @@ fn active_walk_and_hover_queries_retain_committed_xyz_after_other_coordinate_wri
             y: 5 * 256 + 128,
             z: 416,
         };
-        loco.set_step_head(Some(head));
+        set_head(&mut loco, Some(head));
         e.locomotor = Some(loco);
-        e.position.exact_z_leptons = Some(0);
+        e.position.set_exact_z_leptons_for_test(Some(0));
         assert!(AtCoordQuery::from_entity(&e).unwrap().matches(head));
         assert!(
             !AtCoordQuery::from_entity(&e)
                 .unwrap()
                 .matches(DriveCoord { z: 0, ..head })
         );
-        e.position.exact_z_leptons = Some(832);
-        e.movement_target = None;
+        e.position.set_exact_z_leptons_for_test(Some(832));
         assert!(
             AtCoordQuery::from_entity(&e).unwrap().matches(head),
             "Stop/path retirement must not reconstruct Head_To"
         );
-        e.locomotor.as_mut().unwrap().set_step_head(None);
+        set_head(e.locomotor.as_mut().unwrap(), None);
         assert_eq!(AtCoordQuery::from_entity(&e).unwrap().head.z, 832);
+    }
+}
+
+/// Walk's head, or the Hover object's (whose writer is its ProcessMovement).
+fn set_head(loco: &mut crate::sim::movement::locomotor::LocomotorState, head: Option<DriveCoord>) {
+    match loco.hover_runtime_mut() {
+        Some(hover) => hover.set_head(head),
+        None => loco.set_step_head(head),
     }
 }
 
@@ -56,12 +63,12 @@ fn kind(value: &Value) -> LocomotorKind {
 
 #[test]
 fn coordinate_queries_match_original_heads_transforms_and_native_probes() {
-    let data: Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/locomotor_at_coord.json"
+    let data: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/locomotor_at_coord.json",
     ))
     .unwrap();
     let cases = data["cases"].as_array().unwrap();
-    assert_eq!(cases.len(), 336);
+    assert_eq!(cases.len(), 339);
     let mut drive_turns = BTreeSet::new();
     let mut ship_turns = BTreeSet::new();
     let mut probes = 0;
@@ -154,7 +161,7 @@ fn coordinate_queries_match_original_heads_transforms_and_native_probes() {
             );
         }
     }
-    assert_eq!(probes, 4164);
+    assert_eq!(probes, 4197);
     assert_eq!(drive_turns, (0..72).collect());
     assert_eq!(ship_turns, (0..64).collect());
     let false_queries = data["false_queries"].as_array().unwrap();

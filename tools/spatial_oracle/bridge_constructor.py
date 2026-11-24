@@ -26,6 +26,110 @@ MAP, DUMMY = 0x87F7E8, 0xABDC50
 
 
 class OriginalBridgeConstructor:
+    @classmethod
+    def on_map(cls, native_map, typ, requested):
+        """Bind the constructor owner to an already established native map VM.
+
+        Cells, resident TMPs, OverlayType, map bounds and RNG belong to the
+        supplied map owner. Only object storage and empty registry capacity are
+        supplied here; the same original constructor and Mark execute.
+        """
+        self = cls.__new__(cls)
+        self.uc, self.ptrs = native_map.uc, native_map.ptrs
+        self.kind, self.typ, self.requested = 'resident', typ, tuple(requested)
+        self.overlay_id = self.read_u32(typ + 0x294)
+        self.obj, self.coord = native_map.allocate(0xB0), native_map.allocate(4)
+        self.cell = self.ptrs[self.requested]
+        self.scenario = self.read_u32(0xA8B230)
+        self.uc.mem_write(self.coord, packed(*requested))
+        self.required = [0x5F3900, 0x410230, 0x68BCB0, 0x47C550]
+        return self
+
+    @staticmethod
+    def restore_bridge_data(native_map, coordinate, data):
+        """Original bridge-only saved-byte restoration in the identity pass."""
+        u = native_map.uc
+        sp = STACK_BASE + STACK_SIZE - 0x1000
+        u.reg_write(UC_X86_REG_ESP, sp)
+        from unicorn.x86_const import UC_X86_REG_EBX
+        u.reg_write(UC_X86_REG_EBX, data)
+        u.mem_write(sp + 0x18, packed(*coordinate))
+        run_checked(u, 0x5FD4F3, 0x5FD508, count=1000,
+                    required_addresses=(0x5657A0, 0x5FD502))
+
+    @staticmethod
+    def construct_authored(native_map, coordinate, overlay_id):
+        """Execute the original decoded OverlayPack admission/constructor slice.
+
+        Only decoded id/coordinate caller locals are supplied. Image/CellAnim,
+        mode/crate, native allocation, operator new and full constructor/Mark
+        all execute, including rejected membership.
+        """
+        from unicorn.x86_const import UC_X86_REG_EBP
+        u = native_map.uc
+        sp = STACK_BASE + STACK_SIZE - 0x1000
+        u.reg_write(UC_X86_REG_ESP, sp)
+        u.reg_write(UC_X86_REG_EBP, 0)
+        u.mem_write(sp + 0x14, dwords(overlay_id))
+        u.mem_write(sp + 0x18, packed(*coordinate))
+        receipt = dict(image=None, allocated=None, constructor=False, unlimbo=False, marks=[], hierarchy=[])
+        mark_return = []
+        def observe(_u, pc, _n, _d):
+            if mark_return and pc == mark_return[-1][0]:
+                _,pointer,row=mark_return.pop()
+                row.update(returned_low_byte=u.reg_read(UC_X86_REG_EAX)&255,marked_after=u.mem_read(pointer+0x74,1)[0])
+            if pc == 0x584550:
+                receiver=u.reg_read(UC_X86_REG_ECX)
+                roots=struct.unpack('<3I',u.mem_read(receiver+0x80,12))
+                counts=[struct.unpack('<I',u.mem_read(root+8,4))[0] for root in roots]
+                assert receiver==0x87F7E8 and counts==[256]*3,(coordinate,hex(receiver),counts)
+                receipt['hierarchy'].append(dict(receiver=f'{receiver:08X}',root_bucket_counts=counts))
+            if pc == 0x5FD44C:receipt['image'] = bool(u.reg_read(UC_X86_REG_EAX))
+            if pc == 0x5FD491:receipt['allocated'] = u.reg_read(UC_X86_REG_EAX) & 255
+            if pc == 0x5FC380:receipt['constructor'] = True
+            if pc == 0x5F4EC0:
+                receipt['unlimbo'] = True
+                pointer=u.reg_read(UC_X86_REG_ECX)
+                receipt['unlimbo_prior']=dict(game_active=u.mem_read(0xA8E9A0,1)[0],limbo=u.mem_read(pointer+0x81,1)[0],marked=u.mem_read(pointer+0x74,1)[0])
+            if pc == 0x5FC4A5:receipt['building_present'] = bool(u.reg_read(UC_X86_REG_EAX))
+            if pc == 0x5F5850:
+                pointer = u.reg_read(UC_X86_REG_ECX)
+                row=dict(limbo=u.mem_read(pointer+0x81,1)[0],marked=u.mem_read(pointer+0x74,1)[0])
+                receipt['marks'].append(row)
+                destination=struct.unpack('<I',u.mem_read(u.reg_read(UC_X86_REG_ESP),4))[0]
+                mark_return.append((destination,pointer,row))
+        hook = u.hook_add(UC_HOOK_CODE, observe)
+        # Full physical-map wall Mark can synchronously rebuild several
+        # hierarchy blocks. Retain the instruction bound and verify real
+        # receiver/root invariants before allowing this larger map budget.
+        run_checked(u, 0x5FD41A, 0x5FD508, count=10000000,timeout_us=120000000)
+        u.hook_del(hook)
+        return receipt
+
+    @staticmethod
+    def apply_authored_data(native_map, coordinate, data):
+        """Original unconditional second OverlayDataPack pass after identities."""
+        u = native_map.uc
+        sp = STACK_BASE + STACK_SIZE - 0x1000
+        u.reg_write(UC_X86_REG_ESP, sp)
+        u.mem_write(sp + 0x18, packed(*coordinate))
+        u.mem_write(sp + 0x13, bytes([data]))
+        run_checked(u, 0x5FD61A, 0x5FD646, count=1000,
+                    required_addresses=(0x568300, 0x5657A0, 0x5FD640))
+
+    @staticmethod
+    def empty_registries(u, allocate, capacity=1024, *, preserve=()):
+        """Original startup vector vtables with supplied spare storage.
+
+        Composed map owners may retain already-populated registries. No live
+        vector is erased when its address is explicitly preserved.
+        """
+        for registry, vtable in zip(REGISTRIES, (0x7E4F64, 0x7E91EC, 0x7E91EC, 0x7E91EC, 0x7E9D24)):
+            if registry not in preserve:
+                u.mem_write(registry, dwords(vtable, allocate(capacity * 4), capacity, 0, 0, 0))
+        if 0xB0F698 not in preserve:
+            u.mem_write(0xB0F698, dwords(0x7E91EC, allocate(capacity * 4), capacity, 0, 0, 0))
+
     def __init__(self, kind, overlay_id, requested=(16, 16)):
         self.kind, self.overlay_id, self.requested = kind, overlay_id, requested
         self.uc = u = Uc(UC_ARCH_X86, UC_MODE_32)
@@ -50,14 +154,10 @@ class OriginalBridgeConstructor:
         u.mem_write(DUMMY, bytes(0x200))
         u.mem_write(DUMMY + 0x38, dwords(0xffff))
         u.mem_write(DUMMY + 0x44, dwords(-1))
-        for n, registry in enumerate(REGISTRIES):
-            # Actual startup vtable stores:4E7AFD,7252ED,72536D,7253ED,4E68FD.
-            u.mem_write(registry, dwords((0x7E4F64, 0x7E91EC, 0x7E91EC, 0x7E91EC, 0x7E9D24)[n]))
-            u.mem_write(registry + 4, dwords(D + 0x30000 + n * 0x100, 16))
-            u.mem_write(registry + 16, dwords(0))
-        u.mem_write(0xB0F69C, dwords(D + 0x31000, 16))
-        u.mem_write(0xB0F698, dwords(0x7E91EC))  # Startup72586D.
-        u.mem_write(0xB0F6A8, dwords(0))
+        # Actual startup vtable stores:4E7AFD,7252ED,72536D,7253ED,4E68FD;
+        # queue startup72586D. Preserve this fixture's established addresses.
+        registry_storage = iter([D + 0x30000 + n * 0x100 for n in range(5)] + [D + 0x31000])
+        self.empty_registries(u, lambda _size: next(registry_storage), capacity=16)
         u.mem_write(0xA8B230, dwords(self.scenario))
         u.mem_write(self.scenario + 0x214, dwords(1000))
         u.mem_write(0xA8E9A0, b'\x01')
@@ -127,9 +227,38 @@ class OriginalBridgeConstructor:
     def read_u32(self, address):
         return struct.unpack('<I', self.uc.mem_read(address, 4))[0]
 
-    def run(self):
+    @staticmethod
+    def prepare_deferred_services(u):
+        """Supply the existing Windows SEH/IsBadReadPtr boundary for drains.
+
+        Original RTTI, deferred-queue operations and destructors still execute.
+        Reused by the natural-ore owner after original Overlay construction.
+        """
+        u.mem_map(0, 0x1000)
+        u.mem_write(0, dwords(-1))
+        pointer_probe = RET_MAGIC + 0x100
+        u.mem_write(0x7E115C, dwords(pointer_probe))
+
+        def pointer_service(_u, address, _size, _data):
+            if address != pointer_probe:
+                return
+            sp = u.reg_read(UC_X86_REG_ESP)
+            ret, pointer, length = struct.unpack('<3I', u.mem_read(sp, 12))
+            u.mem_read(pointer, length)  # Validate every supplied success.
+            u.reg_write(UC_X86_REG_EAX, 0)
+            u.reg_write(UC_X86_REG_ESP, sp + 12)
+            u.reg_write(UC_X86_REG_EIP, ret)
+
+        u.hook_add(UC_HOOK_CODE, pointer_service)
+
+    def construct(self):
+        """Execute construction independently of the optional queue drain."""
         returned = self.call(0x5FC380, self.obj, (self.typ, self.coord, -1), self.required)
         assert returned == self.obj
+        return returned
+
+    def run(self):
+        self.construct()
         u = self.uc
         b = u.mem_read(self.obj, 0xB0)
         result = dict(kind=self.kind, overlay_id=self.overlay_id, requested=self.requested,
@@ -162,19 +291,8 @@ class OriginalBridgeConstructor:
         frees = []
         # Original typeid uses Windows SEH and IsBadReadPtr during finalization.
         # Supply those OS facilities after the complete constructor has returned.
-        u.mem_map(0, 0x1000)
-        u.mem_write(0, dwords(-1))
-        pointer_probe = RET_MAGIC + 0x100
-        u.mem_write(0x7E115C, dwords(pointer_probe))
+        self.prepare_deferred_services(u)
         def external_services(_u, address, _size, _data):
-            if address == pointer_probe:
-                sp = u.reg_read(UC_X86_REG_ESP)
-                ret, pointer, length = struct.unpack('<3I', u.mem_read(sp, 12))
-                u.mem_read(pointer, length)  # Validate every supplied success.
-                u.reg_write(UC_X86_REG_EAX, 0)
-                u.reg_write(UC_X86_REG_ESP, sp + 12)
-                u.reg_write(UC_X86_REG_EIP, ret)
-                return
             if address != 0x7C8B3D:
                 return
             sp = u.reg_read(UC_X86_REG_ESP)
@@ -241,4 +359,5 @@ if __name__ == '__main__':
             'Empty Windows SEH chain supplied for original typeid during the post-constructor drain',
         ], substitutions=['7C8B3D external free and Windows IsBadReadPtr transport only during the post-constructor drain; no constructor call is substituted'],
         entry_points={'empty_initializer': 0x5FC310, 'constructor': 0x5FC380, 'mark': 0x5FC570, 'drain': 0x725C70,
-                      'overlay_destructor': 0x5FDF70, 'base_destructor': 0x5F3B80}))
+                      'overlay_destructor': 0x5FDF70, 'base_destructor': 0x5F3B80}),
+                   source_paths={'producer': Path(__file__)})

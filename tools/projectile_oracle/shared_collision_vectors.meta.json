@@ -1,16 +1,16 @@
 {
   "schema_version": 1,
-  "native_sha256": "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c",
   "unicorn_binding": "2.1.4",
   "unicorn_core": [
     2,
     1,
     33621247
   ],
-  "scope": "130 original Bullet468BB0 post-commit collision probes and reached receivers, including terrain/cliff/wall and aircraft/building cases. Not upstream trajectory, construction or downstream damage parity.",
+  "scope": "136 original Bullet468BB0 post-commit collision probes and reached receivers, including terrain/cliff/wall and aircraft/building cases. Not upstream trajectory, construction or downstream damage parity.",
   "assumptions": [
     "collision_fixture supplies synthetic cell table, Bullet/type/source/target/house/object layouts, map dimensions, levels, overlays, alliance masks and Rules fields. Unspecified fixture memory is zero-filled.",
     "Live FPCW and cached control822D80 are both0E7F. Native receiver trace and cell queries are observed in execution order. Retail foundation dimensions come from the verified image.",
+    "The appended retained OnBridge controls supply Bullet+8C separately from target+8C and cover native height<=-416, Flak height<0 and raw candidateZ<targetAimZ prerequisite; not stock trajectory admission.",
     "No assertion is made about whole-game RNG ordering, timers, detach effects or frame scheduling; this corpus observes only admission, coordinates, receiver visits and queries."
   ],
   "substitutions": [
@@ -29,5 +29,6 @@
     "building_coord": "0x00447AC0",
     "alliance": "0x004F9A50"
   },
-  "payload_sha256": "e138045c2094a0778f005fc648bd253a8877d6844c101c303731367bc845f24f"
+  "replay_command": "python -m tools.projectile_oracle.shared_collision",
+  "payload_sha256": "b43efec4dc44df9ff8bc4e53eed7d3a78c84b5ae99d7f31e1594081036b1a8b7"
 }

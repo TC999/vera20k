@@ -6,43 +6,120 @@ use crate::render::batch::SpriteInstance;
 use crate::render::shell_paint;
 use crate::render::skirmish_shell_chrome::{SkirmishShellChromeAtlas, SkirmishShellChromeEntry};
 use crate::ui::shell::geom::LOWER_STRIP_H;
-use crate::ui::shell::modal::BodyOkLayout;
 use crate::ui::skirmish_shell::{
-    COMBO_DROPDOWN_ROW_H, COMBO_FACE_H, ChooseMapModalButton, ChooseMapModalLayout, PLAYERS_RANGE,
-    RandomMapSetupControl, RandomMapSetupLayout, RandomMapSetupModalState, RectPx,
-    SETUP_COMBO_ROWS, SavedSeedBrowserState, SavedSeedControl, SavedSeedLayout,
-    SkirmishShellLayout, SkirmishShellState, random_map_setup_dropdown_rect, setup_combo_items,
+    ChooseMapModalLayout, RandomMapSetupLayout, RandomMapSetupModalState, RectPx,
+    SkirmishShellLayout,
 };
 
 use super::chrome::{
-    common_shell_origin, push_button_30, push_entry_native, push_lower_strip_instance,
-    push_ownerdraw_two_pixel_bevel_frame, push_rect_outline, push_right_panel_base_instances,
-    push_right_panel_button_shp, push_solid_rect,
+    common_shell_origin, push_entry_grown, push_lower_strip_instance, push_rect_outline,
+    push_right_panel_base_instances, push_solid_rect,
 };
 use super::controls::{ControlPaint, paint_control};
 use super::draw_order::{GenericBackgroundRole, generic_background_role};
 use super::{
-    OWNERDRAW_BEVEL_DARK_RGB_FROM_PACKED_00807A68,
-    OWNERDRAW_SELECTED_RGB_FROM_DAT_00AC4604_PACKED_000000FF,
-    SHELL_DROPDOWN_BG_RGB_PENDING_COMBODROPWIN_SOURCE_CAPTURE, SHELL_DROPDOWN_DEPTH,
-    SHELL_LABEL_TEXT_RGB, SHELL_MODAL_BG_RGB, SHELL_MODAL_PANEL_RGB, SHELL_PARENT_BACKGROUND_DEPTH,
+    OWNERDRAW_BEVEL_DARK_RGB_FROM_PACKED_00807A68, SHELL_DROPDOWN_DEPTH, SHELL_LABEL_TEXT_RGB,
+    SHELL_MODAL_BG_RGB, SHELL_MODAL_PANEL_RGB, SHELL_PARENT_BACKGROUND_DEPTH,
 };
-
-/// The five combo rows as hit-test controls, for the enabled/disabled lookup.
-const SETUP_COMBO_CONTROLS: [RandomMapSetupControl; 5] = [
-    RandomMapSetupControl::MapType0x405,
-    RandomMapSetupControl::Time0x3ea,
-    RandomMapSetupControl::Theater0x407,
-    RandomMapSetupControl::Size0x406,
-    RandomMapSetupControl::Resources0x408,
-];
-const PLAYERS_ROW: usize = 5;
 
 const VALIDATION_MODAL_SPRITE_DEPTHS: shell_paint::ModalDepths = shell_paint::ModalDepths {
     background: SHELL_DROPDOWN_DEPTH - 0.00014,
     button: SHELL_DROPDOWN_DEPTH - 0.00016,
     text: 0.0,
 };
+
+/// Ordinary saved-load F0: 559D60 -> 623230, mode-2 paint 621E90. The original
+/// copies its existing AlternateSurface backing, overlays the selected side's
+/// PUDLGBG frame, and paints the plain left/top Static. It neither regenerates a
+/// parent shell nor draws Cancel. Executed controls: saved_game_layout.json.
+pub(crate) fn render_saved_game_loading(
+    state: &mut crate::app::AppState,
+    encoder: &mut wgpu::CommandEncoder,
+    destination: &wgpu::Texture,
+) -> anyhow::Result<()> {
+    use super::in_game_shell::{
+        InGameShellFrame, ShellFrameArt, ShellFrameCursor, ShellFrameOverlay,
+    };
+    use crate::ui::shell::modal::{menu_area, message_box_parts};
+
+    // An in-match load paints over the match frame at its source size and
+    // zooms with it; a menu load paints over the menu at the window's size.
+    let frame = (state.render_width(), state.render_height());
+    let restored = state
+        .renderer
+        .shell_surface_presenter
+        .restore_cursor_free_composition(
+            &state.renderer.retail_screenshot_frame_cache,
+            &state.renderer.gpu.device,
+            encoder,
+            frame,
+            state.renderer.upscale_pass.as_ref(),
+        );
+    let art = match restored {
+        Ok(true) => ShellFrameArt::Retained,
+        Ok(false) => ShellFrameArt::Clear,
+        Err(error) => {
+            log::warn!("Saved-game progress has no compatible retained backing: {error:#}");
+            ShellFrameArt::Clear
+        }
+    };
+    let atlas = state
+        .frontend
+        .skirmish_shell_chrome
+        .as_ref()
+        .expect("loading shell chrome");
+    // 559D60 shows F0 before 69BB40 clears Session+30D8. An active load thus
+    // starts with its current side; a menu load starts with the neutral assets.
+    let in_match = state.frontend.screen == crate::ui::game_screen::GameScreen::InGame;
+    let side =
+        in_match.then(|| crate::app::presentation::sidebar_render::current_sidebar_theme(state));
+    let (width, height) = (frame.0 as i32, frame.1 as i32);
+    // F0 is CE's box: its body over a Cancel it keeps hidden.
+    let area = match in_match {
+        true => RectPx::new(0, 0, width, height),
+        false => menu_area(width, height),
+    };
+    let layout = message_box_parts(1, area);
+    let labels = [shell_paint::PaintLabel {
+        text: state
+            .csf_label("TXT_LOADING", "Mission is loading. Please wait...")
+            .into(),
+        rect: layout.body,
+        rgb: SHELL_LABEL_TEXT_RGB,
+        align: crate::ui::shell::geom::ShellAlign::NONE,
+        path_a_reveal: None,
+    }];
+    // A zoomed match's text is drawn in the window (`window_ui`).
+    let raster = crate::app::presentation::window_ui::shell_raster(state, false)
+        .unwrap_or(crate::render::bit_font::TextRaster::NATIVE);
+    let frame_raster = state.renderer.bit_font.set_raster(raster);
+    let modal = shell_paint::paint_modal_shp(
+        &state.renderer.bit_font,
+        atlas.mode_two_dialog_background(side),
+        shell_paint::ModalButtonFrames::default(),
+        layout.dialog,
+        &[],
+        &labels,
+        crate::ui::shell::geom::RETAIL_SCALE,
+        VALIDATION_MODAL_SPRITE_DEPTHS,
+    );
+    let painted = super::in_game_shell::render_shell_frame(
+        state,
+        encoder,
+        destination,
+        InGameShellFrame {
+            art: Vec::new(),
+            controls: modal.sprites,
+            texts: modal.text,
+            label: "Saved Game Loading F0",
+        },
+        art,
+        ShellFrameOverlay::default(),
+        ShellFrameCursor::Hidden,
+    );
+    state.renderer.bit_font.set_raster(frame_raster);
+    painted
+}
 
 /// Native owner-draw listboxes preserve a composed backing surface. On the
 /// exact-800 chooser that backing is the Customize Battle artwork; the solid
@@ -72,8 +149,9 @@ pub(super) fn choose_map_background_entry(
     layout: &ChooseMapModalLayout,
 ) -> Option<SkirmishShellChromeEntry> {
     // `0x0072E730` draws the small shape at 640 wide and the large one
-    // (loaded only at exactly 800) elsewhere.
-    match layout.screen.w {
+    // (loaded only at exactly 800) elsewhere. A stretched chooser is authored at
+    // 800, so it takes the large shape instead of falling back to a flat rect.
+    match layout.authored_width() {
         640 => atlas.choose_map_background_640_customize_battle,
         800 => atlas.choose_map_background_800_customize_battle,
         _ => None,
@@ -81,36 +159,45 @@ pub(super) fn choose_map_background_entry(
 }
 
 pub(super) fn shell_content_fallback_rect(layout: &SkirmishShellLayout) -> RectPx {
-    let (origin_x, origin_y) = common_shell_origin(layout);
-    let shell_h = if layout.screen.h > 767 {
-        600
-    } else {
-        layout.screen.h
-    };
+    let (origin_x, origin_y) = layout.shell_origin();
+    let strip_h = (LOWER_STRIP_H as f32 * layout.scale.factor()).round() as i32;
     RectPx::new(
         origin_x,
         origin_y,
         (layout.right_panel.top.x - origin_x).max(0),
-        (shell_h - LOWER_STRIP_H).max(0),
+        (layout.shell_height() - strip_h).max(0),
     )
 }
+
+/// VERA: how bright Choose Map draws its background art, so list text
+/// reads over it. gamemd draws it at full brightness, as the saved-seed
+/// browser on the same art still does.
+pub(super) const CHOOSE_MAP_BACKGROUND_BRIGHTNESS: f32 = 0.8;
 
 pub(super) fn push_choose_map_background_instances(
     out: &mut Vec<SpriteInstance>,
     atlas: &SkirmishShellChromeAtlas,
     shell_layout: &SkirmishShellLayout,
     modal_layout: &ChooseMapModalLayout,
+    brightness: f32,
 ) -> BackdropInteriorPaint {
     let background = choose_map_background_entry(atlas, modal_layout);
     let interior = backdrop_interior(background.is_some());
     if let Some(background) = background {
-        push_entry_native(
+        let (x, y) = modal_layout
+            .scale
+            .dialog_origin_or((modal_layout.screen.x, modal_layout.screen.y));
+        push_entry_grown(
             out,
             background,
-            modal_layout.screen.x,
-            modal_layout.screen.y,
+            x,
+            y,
+            modal_layout.scale,
             SHELL_PARENT_BACKGROUND_DEPTH,
         );
+        if let Some(art) = out.last_mut() {
+            art.tint = [brightness; 3];
+        }
     } else {
         let fallback = shell_content_fallback_rect(shell_layout);
         push_solid_rect(
@@ -131,69 +218,49 @@ pub(super) fn push_choose_map_background_instances(
     interior
 }
 
+/// Choose Map's own art beside its widgets ([`super::text::choose_map_paint`]).
 pub(super) fn push_choose_map_modal_control_instances(
     out: &mut Vec<SpriteInstance>,
     atlas: &SkirmishShellChromeAtlas,
+    font: &crate::render::bit_font::BitFont,
     layout: &ChooseMapModalLayout,
     interior: BackdropInteriorPaint,
-    shell: &SkirmishShellState,
+    search_display: &str,
     steady: bool,
 ) {
-    let Some(modal) = shell.choose_map_modal.as_ref() else {
-        return;
-    };
-    // Both lists are the shell list subclass (`0x00618D40`).
-    super::list::paint_list(
-        out,
-        atlas,
-        modal.mode_geometry(layout),
-        modal.mode_top_index,
-        modal.selected_mode_row(),
-        modal.mode_scroll.pressed_part(),
-        interior.paints_solid_fill(),
-    );
-    super::list::paint_list(
-        out,
-        atlas,
-        modal.map_geometry(layout),
-        modal.map_top_index,
-        modal.highlighted_filtered_index,
-        modal.map_scroll.pressed_part(),
-        interior.paints_solid_fill(),
-    );
-    // While a slide runs the column replaces the buttons and the preview
-    // static is validate-only (`0x00606800`).
-    if !steady {
-        return;
-    }
-    // The modal's right-column buttons are the same owner-draw type-1 class as the
-    // setup shell's Start/Choose/Back: SDBTNANM frame 2 idle, frame 4 pressed. They
-    // share the right-panel SDBTNANM cell geometry, so draw them through the same
-    // path rather than the gray 3-slice PCX (push_button_30).
-    for (button, id) in [
-        (layout.use_map_button, ChooseMapModalButton::UseMap0x6c5),
-        (layout.cancel_button, ChooseMapModalButton::Cancel0x5c0),
-        (
-            layout.create_random_map_button,
-            ChooseMapModalButton::CreateRandomMap0x583,
-        ),
-    ] {
-        push_right_panel_button_shp(
+    // VERA: the search box wears the list's frame, with a caret after its
+    // text. It has no focus to lose, so the caret does not blink.
+    if interior.paints_solid_fill() {
+        push_solid_rect(
             out,
             atlas,
-            button,
-            modal.pressed_button == Some(id),
-            !modal.button_enabled(id),
-            SHELL_DROPDOWN_DEPTH - 0.00011,
+            layout.map_search,
+            SHELL_MODAL_PANEL_RGB,
+            SHELL_DROPDOWN_DEPTH - 0.00010,
         );
     }
-    push_rect_outline(
-        out,
-        atlas,
-        layout.preview,
-        OWNERDRAW_BEVEL_DARK_RGB_FROM_PACKED_00807A68,
-        SHELL_DROPDOWN_DEPTH - 0.00012,
-    );
+    super::list::paint_list_frame(out, atlas, layout.map_search);
+    if let Some(caret) =
+        super::text::map_search_caret_rect(font, search_display, layout.map_search, layout.scale)
+    {
+        push_solid_rect(
+            out,
+            atlas,
+            caret,
+            SHELL_LABEL_TEXT_RGB,
+            SHELL_DROPDOWN_DEPTH - 0.00012,
+        );
+    }
+    // While a slide runs the preview static is validate-only (`0x00606800`).
+    if steady {
+        push_rect_outline(
+            out,
+            atlas,
+            layout.preview,
+            OWNERDRAW_BEVEL_DARK_RGB_FROM_PACKED_00807A68,
+            SHELL_DROPDOWN_DEPTH - 0.00012,
+        );
+    }
 }
 
 /// The empty backdrop `ShellMessageBox__Run` draws before its box
@@ -211,39 +278,33 @@ pub(super) fn push_message_box_backdrop_instances(
     push_lower_strip_instance(out, atlas, layout);
 }
 
-/// Use Map's two-button eject box.
-pub(super) fn push_eject_box_instances(
+/// VERA's download boxes show how much has arrived: an outlined bar under
+/// the box's text, filled in the label colour.
+pub(super) fn push_download_progress_bar(
     out: &mut Vec<SpriteInstance>,
     atlas: &SkirmishShellChromeAtlas,
-    screen: RectPx,
-    prompt: crate::ui::skirmish_shell::EjectPrompt,
+    body: RectPx,
+    (completed, total): (u64, u64),
+    depth: f32,
 ) {
-    let boxed = crate::ui::shell::modal::quit_confirm_layout(screen.w, screen.h);
-    let pressed = |button| prompt.pressed == Some(button);
-    let buttons = [
-        shell_paint::ModalButton {
-            rect: boxed.ok,
-            pressed: pressed(crate::ui::skirmish_shell::EjectPromptButton::Ok),
-            enabled: true,
-        },
-        shell_paint::ModalButton {
-            rect: boxed.cancel,
-            pressed: pressed(crate::ui::skirmish_shell::EjectPromptButton::Cancel),
-            enabled: true,
-        },
-    ];
-    out.extend(shell_paint::paint_modal_sprites(
-        atlas.validation_modal_background_pudlgbgn,
-        super::chrome::type3_button_frames(atlas),
-        boxed.dialog,
-        &buttons,
-        VALIDATION_MODAL_SPRITE_DEPTHS,
-    ));
+    let track = RectPx::new(body.x, body.y + body.h + 6, body.w, 10);
+    push_rect_outline(out, atlas, track, SHELL_LABEL_TEXT_RGB, depth);
+    let inner = track.w - 4;
+    let filled = (inner as u64 * completed.min(total) / total.max(1)) as i32;
+    if filled > 0 {
+        push_solid_rect(
+            out,
+            atlas,
+            RectPx::new(track.x + 2, track.y + 2, filled, track.h - 4),
+            SHELL_LABEL_TEXT_RGB,
+            depth,
+        );
+    }
 }
 
 /// The generic shell background (MNSCRNS/MNSCRNL through SHELL.PAL): the
 /// random-map dialog `0x105`'s and the empty backdrop's
-/// (`0x0072AB49..0x0072AB7E`).
+/// (`0x0072AB49..0x0072AB7E`), also selected for the RA2 skirmish skin.
 pub(super) fn generic_shell_background_entry(
     atlas: &SkirmishShellChromeAtlas,
     layout: &SkirmishShellLayout,
@@ -252,6 +313,36 @@ pub(super) fn generic_shell_background_entry(
         GenericBackgroundRole::Mnscrns640 => atlas.generic_background_640_mnscrns_shell,
         GenericBackgroundRole::MnscrnlLarge => atlas.generic_background_large_mnscrnl_shell,
     }
+}
+
+/// The offline Skirmish `0x102` backdrop selected by the atlas's shell style:
+/// YR's Cooperative setup art, or the shared RA2 MNSCRN pair.
+pub(super) fn offline_setup_background_entry(
+    atlas: &SkirmishShellChromeAtlas,
+    layout: &SkirmishShellLayout,
+) -> Option<SkirmishShellChromeEntry> {
+    let (index, pane) = match generic_background_role(layout) {
+        GenericBackgroundRole::Mnscrns640 => (0, [472.0, 448.0]),
+        GenericBackgroundRole::MnscrnlLarge => (1, [632.0, 568.0]),
+    };
+    atlas
+        .client_skirmish_background
+        .map(|mut background| {
+            // Fill the dialog's existing picture area. Center-crop the wide
+            // client artwork so the backdrop keeps its proportions.
+            let [width, height] = background.pixel_size;
+            let ratio = (pane[0] / width).max(pane[1] / height);
+            for (axis, shown) in [pane[0] / (width * ratio), pane[1] / (height * ratio)]
+                .into_iter()
+                .enumerate()
+            {
+                background.uv_origin[axis] += background.uv_size[axis] * (1.0 - shown) / 2.0;
+                background.uv_size[axis] *= shown;
+            }
+            background.pixel_size = pane;
+            background
+        })
+        .or(atlas.setup_backgrounds[index])
 }
 
 pub(super) fn push_generic_shell_background_instances(
@@ -263,7 +354,14 @@ pub(super) fn push_generic_shell_background_instances(
     let interior = backdrop_interior(background.is_some());
     if let Some(background) = background {
         let (x, y) = common_shell_origin(layout);
-        push_entry_native(out, background, x, y, SHELL_PARENT_BACKGROUND_DEPTH);
+        push_entry_grown(
+            out,
+            background,
+            x,
+            y,
+            layout.scale,
+            SHELL_PARENT_BACKGROUND_DEPTH,
+        );
     } else {
         let fallback = shell_content_fallback_rect(layout);
         push_solid_rect(
@@ -284,376 +382,67 @@ pub(super) fn push_generic_shell_background_instances(
     interior
 }
 
-/// Build child-control sprite instances for random-map dialog `0x105`.
+/// The random-map dialog `0x105`'s own art beside its widgets
+/// ([`super::text::random_map_paint`]): VERA's Advanced scrollbar, Ares'
+/// Urban Areas box and the progress bar while a map generates.
 pub(super) fn push_random_map_setup_modal_control_instances(
     out: &mut Vec<SpriteInstance>,
     atlas: &SkirmishShellChromeAtlas,
     layout: &RandomMapSetupLayout,
-    interior: BackdropInteriorPaint,
     modal: &RandomMapSetupModalState,
-    // The right column and the top panel paint only while no slide runs.
-    steady: bool,
+    // The Advanced scrollbar's widget.
+    scrollbar: Option<vera20k_gui::ScrollBarView>,
 ) {
+    use crate::ui::skirmish_shell::AdvancedField;
     let chrome = atlas.control_chrome();
-    // Rows 0..4 are combos; row 5 is the players trackbar. A collapsed combo
-    // occupies only its face, not the dropdown extent the resource reserves.
-    for (row, control) in SETUP_COMBO_ROWS.iter().enumerate() {
-        let rect = layout.control_rects[row];
-        let face = RectPx::new(rect.x, rect.y, rect.w, COMBO_FACE_H);
-        // Native owner-draw controls preserve their composed background. The
-        // solid plate is only needed when retail shell artwork is unavailable.
-        if interior.paints_solid_fill() {
-            push_solid_rect(
-                out,
-                atlas,
-                face,
-                SHELL_MODAL_PANEL_RGB,
-                SHELL_DROPDOWN_DEPTH - 0.00009,
-            );
-        }
-        push_ownerdraw_two_pixel_bevel_frame(out, atlas, face, SHELL_DROPDOWN_DEPTH - 0.000095);
+    // The native vertical scrollbar the dropdowns use, paging the seven
+    // reusable rows over every Advanced slider.
+    if let Some(bar) = scrollbar
+        .filter(|_| modal.advanced && modal.extras_page.is_none() && AdvancedField::PAGE_COUNT > 1)
+    {
         paint_control(
             out,
             &chrome,
-            ControlPaint::Combo {
-                rect: face,
-                swatch: None,
-                open: modal.open_combo == Some(*control),
-                disabled: !modal.is_enabled(SETUP_COMBO_CONTROLS[row]),
+            ControlPaint::ScrollBar {
+                scrollbar: bar.bar,
+                thumb: bar.thumb,
+                pressed_part: None,
             },
+            layout.scale,
         );
     }
-    let players = layout.control_rects[PLAYERS_ROW];
-    paint_control(
-        out,
-        &chrome,
-        ControlPaint::Trackbar {
-            rect: players,
-            thumb_left: PLAYERS_RANGE.thumb_left(modal.options.num_players, players.w),
-            plaque: true,
-        },
-    );
-
-    // Surprise Me and Generate are owner-draw type 3 for this dialog, so they
-    // take the MNBTTN modal button art rather than the generic PCX slices --
-    // the same art the message-box modals use. Native size, centred on the
-    // control rect.
-    let modal_button_frames = super::chrome::type3_button_frames(atlas);
-    let action_buttons: Vec<shell_paint::ModalButton> = [
-        (layout.randomize, RandomMapSetupControl::Randomize0x621),
-        (layout.generate, RandomMapSetupControl::Generate0x620),
-    ]
-    .into_iter()
-    .map(|(rect, control)| shell_paint::ModalButton {
-        rect,
-        pressed: modal.pressed_control == Some(control),
-        enabled: modal.is_enabled(control),
-    })
-    .collect();
-    if modal_button_frames.up.is_some() {
-        out.extend(shell_paint::paint_modal_sprites(
-            None,
-            modal_button_frames,
-            layout.dialog,
-            &action_buttons,
-            shell_paint::ModalDepths {
-                background: SHELL_DROPDOWN_DEPTH - 0.00011,
-                button: SHELL_DROPDOWN_DEPTH - 0.00011,
-                text: 0.0,
-            },
-        ));
-    } else {
-        // MNBTTN.SHP missing from the install: fall back to the generic slices
-        // rather than drawing nothing where a button belongs.
-        for button in &action_buttons {
-            push_button_30(
-                out,
-                atlas,
-                button.rect,
-                button.pressed,
-                !button.enabled,
-                SHELL_DROPDOWN_DEPTH - 0.00011,
-            );
-        }
-    }
-
-    for (rect, control) in [
-        (layout.use_map, RandomMapSetupControl::Ok0x6c5),
-        (layout.load, RandomMapSetupControl::Load0x6c2),
-        (layout.save, RandomMapSetupControl::Save0x6c3),
-        (layout.delete, RandomMapSetupControl::Delete0x6c4),
-        (layout.cancel, RandomMapSetupControl::Cancel0x5c0),
-    ]
-    .into_iter()
-    .filter(|_| steady)
-    {
-        push_right_panel_button_shp(
+    // Ares' Urban Areas box (control 5000 of Ares' dialog 261), drawn as the
+    // shell's own checkbox when Ares.dll is loaded; the Advanced view's
+    // seventh slider takes its place.
+    if modal.ares && !modal.advanced {
+        paint_control(
             out,
-            atlas,
-            rect,
-            modal.pressed_control == Some(control),
-            !modal.is_enabled(control),
-            SHELL_DROPDOWN_DEPTH - 0.00011,
+            &chrome,
+            ControlPaint::Checkbox {
+                checked: modal.options.urban_areas,
+                rect: layout.rect(5000),
+            },
+            layout.scale,
         );
     }
-
     // The preview `0x468` is an SS_BLACKRECT static in the top panel: black,
-    // with no frame of its own (retail `rmg-steady.png`).
-
-    // The progress widgets are hidden in the resource and shown only while the
+    // with no frame of its own (retail `rmg-steady.png`). The progress
+    // widgets are hidden in the resource and shown only while the
     // synchronous generate block owns the dialog.
     if modal.generating {
         push_solid_rect(
             out,
             atlas,
-            layout.progress_bar,
+            layout.rect(RandomMapSetupLayout::PROGRESS_BAR),
             SHELL_MODAL_PANEL_RGB,
             SHELL_DROPDOWN_DEPTH - 0.00013,
         );
         push_rect_outline(
             out,
             atlas,
-            layout.progress_bar,
+            layout.rect(RandomMapSetupLayout::PROGRESS_BAR),
             OWNERDRAW_BEVEL_DARK_RGB_FROM_PACKED_00807A68,
             SHELL_DROPDOWN_DEPTH - 0.00014,
-        );
-    }
-
-    // An open list paints last so it covers the rows beneath it.
-    if let Some(combo) = modal.open_combo {
-        let row = combo.row();
-        let items = setup_combo_items(combo);
-        let list = random_map_setup_dropdown_rect(layout, row, items.len());
-        push_solid_rect(
-            out,
-            atlas,
-            list,
-            SHELL_DROPDOWN_BG_RGB_PENDING_COMBODROPWIN_SOURCE_CAPTURE,
-            SHELL_DROPDOWN_DEPTH - 0.00015,
-        );
-        push_rect_outline(
-            out,
-            atlas,
-            list,
-            OWNERDRAW_BEVEL_DARK_RGB_FROM_PACKED_00807A68,
-            SHELL_DROPDOWN_DEPTH - 0.00016,
-        );
-        if let Some(selected) = modal.selected_item_index(combo) {
-            push_solid_rect(
-                out,
-                atlas,
-                RectPx::new(
-                    list.x,
-                    list.y + COMBO_DROPDOWN_ROW_H * selected as i32,
-                    list.w,
-                    COMBO_DROPDOWN_ROW_H,
-                ),
-                OWNERDRAW_SELECTED_RGB_FROM_DAT_00AC4604_PACKED_000000FF,
-                SHELL_DROPDOWN_DEPTH - 0.00017,
-            );
-        }
-    }
-}
-
-pub(super) fn push_validation_modal_instances(
-    out: &mut Vec<SpriteInstance>,
-    atlas: &SkirmishShellChromeAtlas,
-    layout: &BodyOkLayout,
-    pressed: bool,
-) {
-    let frames = super::chrome::type3_button_frames(atlas);
-    let button = shell_paint::ModalButton {
-        rect: layout.ok,
-        pressed,
-        enabled: true,
-    };
-    if atlas.validation_modal_background_pudlgbgn.is_none() {
-        push_solid_rect(
-            out,
-            atlas,
-            layout.dialog,
-            SHELL_MODAL_PANEL_RGB,
-            VALIDATION_MODAL_SPRITE_DEPTHS.background,
-        );
-        push_rect_outline(
-            out,
-            atlas,
-            layout.dialog,
-            OWNERDRAW_BEVEL_DARK_RGB_FROM_PACKED_00807A68,
-            SHELL_DROPDOWN_DEPTH - 0.00015,
-        );
-    }
-    out.extend(shell_paint::paint_modal_sprites(
-        atlas.validation_modal_background_pudlgbgn,
-        frames,
-        layout.dialog,
-        &[button],
-        VALIDATION_MODAL_SPRITE_DEPTHS,
-    ));
-}
-
-/// Build the sprite instances for the saved-seed browser.
-///
-/// It replaces the setup dialog on screen, so it redraws the same background
-/// and right-column chrome rather than layering over it.
-pub(super) fn push_saved_seed_modal_instances(
-    out: &mut Vec<SpriteInstance>,
-    atlas: &SkirmishShellChromeAtlas,
-    font: &crate::render::bit_font::BitFont,
-    layout: &SavedSeedLayout,
-    browser: &SavedSeedBrowserState,
-    interior: BackdropInteriorPaint,
-) {
-    push_saved_browser_modal_instances(out, atlas, font, layout, browser, interior, true);
-}
-
-/// Shared native list/editor/prompt painting; active-game callers supply
-/// SIDEBTTN from the side atlas and therefore omit the launcher column buttons.
-pub(super) fn push_saved_browser_modal_instances<I: Clone + PartialEq>(
-    out: &mut Vec<SpriteInstance>,
-    atlas: &SkirmishShellChromeAtlas,
-    font: &crate::render::bit_font::BitFont,
-    layout: &SavedSeedLayout,
-    browser: &SavedSeedBrowserState<I>,
-    interior: BackdropInteriorPaint,
-    column_buttons: bool,
-) {
-    use crate::ui::shell::list::{ShellListGeometry,ListScrollPart};
-    let pressed=match browser.pressed_control {
-        Some(SavedSeedControl::ScrollUp)=>Some(ListScrollPart::Up),
-        Some(SavedSeedControl::ScrollDown)=>Some(ListScrollPart::Down),
-        Some(SavedSeedControl::ScrollThumb)=>Some(ListScrollPart::Thumb),
-        Some(SavedSeedControl::ScrollTrack)=>Some(ListScrollPart::Track),
-        _=>None,
-    };
-    super::list::paint_list(out,atlas,
-        ShellListGeometry::new(layout.list,browser.entries.len(),browser.top_index),
-        browser.top_index,browser.selected,pressed,interior.paints_solid_fill());
-    // The name field is a plain sunken plate; Save is the only mode that has one.
-    if let Some(edit) = layout.name_edit {
-        push_solid_rect(
-            out,
-            atlas,
-            edit,
-            SHELL_MODAL_PANEL_RGB,
-            SHELL_DROPDOWN_DEPTH - 0.00010,
-        );
-        push_ownerdraw_two_pixel_bevel_frame(out, atlas, edit, SHELL_DROPDOWN_DEPTH - 0.00011);
-        if browser.description_edit.focused && browser.opened_at.elapsed().as_millis() % 2000 < 1000 {
-            let field = crate::ui::skirmish_shell::player_name_edit_text_rect(edit);
-            let editor = &browser.description_edit;
-            let start = editor.first_visible_unit.min(editor.caret);
-            let prefix = String::from_utf16_lossy(&editor.units[start..editor.caret]);
-            let x = field.x + font.text_width(&prefix) as i32;
-            if x < field.x + field.w {
-                push_solid_rect(out, atlas, RectPx::new(x, field.y + 2, 2, (field.h - 4).max(1)),
-                    SHELL_LABEL_TEXT_RGB, SHELL_DROPDOWN_DEPTH - 0.00012);
-            }
-        }
-
-    }
-    if column_buttons {
-        for (rect, control) in [
-            (layout.action, SavedSeedControl::Action),
-            (layout.back, SavedSeedControl::Back0x686),
-        ] {
-            let disabled = control == SavedSeedControl::Action && !browser.action_enabled();
-            push_right_panel_button_shp(
-                out,
-                atlas,
-                rect,
-                browser.pressed_control == Some(control),
-                disabled,
-                SHELL_DROPDOWN_DEPTH - 0.00012,
-            );
-        }
-    }
-    push_saved_browser_prompt_instances(out, atlas, layout, browser);
-}
-
-/// The browser's message box (PUDLGBGN and its buttons), when one is up.
-pub(super) fn push_saved_browser_prompt_instances<I: Clone + PartialEq>(
-    out: &mut Vec<SpriteInstance>,
-    atlas: &SkirmishShellChromeAtlas,
-    layout: &SavedSeedLayout,
-    browser: &SavedSeedBrowserState<I>,
-) {
-    if let Some(prompt) = browser.prompt.as_ref() {
-        let (dialog, _, yes, no) = prompt.layout(layout.screen.w as u32, layout.screen.h as u32);
-        let mut buttons = vec![shell_paint::ModalButton {
-            rect: yes, pressed: browser.pressed_control == Some(SavedSeedControl::Action), enabled: true,
-        }];
-        if let Some(rect) = no {
-            buttons.push(shell_paint::ModalButton {
-                rect, pressed: browser.pressed_control == Some(SavedSeedControl::Back0x686), enabled: true,
-            });
-        }
-        out.extend(shell_paint::paint_modal_sprites(
-            atlas.validation_modal_background_pudlgbgn,
-            super::chrome::type3_button_frames(atlas), dialog, &buttons, VALIDATION_MODAL_SPRITE_DEPTHS,
-        ));
-    }
-
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn choose_map_retail_art_preserves_listbox_backing() {
-        let interior = backdrop_interior(true);
-
-        assert_eq!(interior, BackdropInteriorPaint::PreserveBacking);
-        assert!(!interior.paints_solid_fill());
-    }
-
-    #[test]
-    fn choose_map_missing_art_uses_opaque_listbox_fallback() {
-        let interior = backdrop_interior(false);
-
-        assert_eq!(interior, BackdropInteriorPaint::OpaqueFallback);
-        assert!(interior.paints_solid_fill());
-    }
-
-    #[test]
-    fn choose_map_fallback_stops_before_800_rail_and_lower_strip() {
-        let layout = crate::ui::skirmish_shell::compute_layout(800, 600);
-
-        assert_eq!(
-            shell_content_fallback_rect(&layout),
-            RectPx::new(0, 0, 632, 568)
-        );
-    }
-
-    #[test]
-    fn choose_map_fallback_preserves_centered_1024_shell_geometry() {
-        let layout = crate::ui::skirmish_shell::compute_layout(1024, 768);
-
-        assert_eq!(
-            shell_content_fallback_rect(&layout),
-            RectPx::new(112, 84, 632, 568)
-        );
-    }
-
-    #[test]
-    fn random_map_retail_art_preserves_control_backing() {
-        let interior = backdrop_interior(true);
-
-        assert_eq!(interior, BackdropInteriorPaint::PreserveBacking);
-        assert!(!interior.paints_solid_fill());
-    }
-
-    #[test]
-    fn random_map_missing_art_uses_bounded_opaque_fallback() {
-        let layout = crate::ui::skirmish_shell::compute_layout(800, 600);
-        let interior = backdrop_interior(false);
-
-        assert_eq!(interior, BackdropInteriorPaint::OpaqueFallback);
-        assert!(interior.paints_solid_fill());
-        assert_eq!(
-            shell_content_fallback_rect(&layout),
-            RectPx::new(0, 0, 632, 568)
         );
     }
 }

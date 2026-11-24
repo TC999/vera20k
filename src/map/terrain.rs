@@ -8,16 +8,56 @@
 //! Screen position: `sx = (rx - ry) * 30`, `sy = (rx + ry) * 15 - z * 15`.
 //!
 //! ## Dependency rules
-//! - Part of map/ — depends on map/map_file for MapFile/MapCell.
+//! - Part of map/ — reads the normalized MapClass playfield owner.
 
+// Outside data reaches this module: it refuses bad input, never panics.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::indexing_slicing
+    )
+)]
+
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::BTreeMap;
 
-use crate::map::map_file::{MapFile, MapHeader};
 use crate::map::resolved_terrain::ResolvedTerrainGrid;
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 #[path = "terrain_bridge_click_tests.rs"]
 mod bridge_click_tests;
+
+#[cfg(all(test, tests_map))]
+mod plane_inverse_tests {
+    #[test]
+    fn plane_xyz_matches_original_tactical_body() {
+        let vectors = crate::test_fixture::json("tools/bridge_click_oracle/plane_vectors.json");
+        let mut count = 0;
+        for row in vectors["cases"].as_array().unwrap() {
+            if row["native_exit"] != "plane" {
+                continue; // Upper-window rejection is the caller's admission.
+            }
+            let world = &row["world_input"];
+            let actual = super::screen_to_plane_leptons(
+                world[0].as_i64().unwrap() as f32,
+                world[1].as_i64().unwrap() as f32,
+            );
+            let expected = &row["expected_xyz"];
+            assert_eq!(
+                actual.to_array(),
+                std::array::from_fn(|i| expected[i].as_i64().unwrap() as i32),
+                "{}",
+                row["name"],
+            );
+            count += 1;
+        }
+        assert_eq!(count, 22);
+    }
+}
 
 /// Isometric tile diamond width in pixels (RA2 standard).
 pub const TILE_WIDTH: f32 = 60.0;
@@ -31,7 +71,8 @@ pub const TILE_HEIGHT: f32 = 30.0;
 /// (Note: Tiberian Sun uses 24/2 = 12 — do NOT use TS values here.)
 pub const HEIGHT_STEP: f32 = 15.0;
 
-/// Tactical screen-to-cell inverse scan cap from gamemd.exe `0x006D6590`.
+/// Native tactical inverse scan cap (`ScreenPixelToCell @ 0x006D6590`).
+/// Higher VERA terrain extends this baseline using the live grid's level bound.
 pub const TACTICAL_INVERSE_MAX_SCAN_ATTEMPTS: usize = 180;
 
 /// Tactical bridge open-edge threshold. The binary uses strict `> 15`.
@@ -55,26 +96,53 @@ pub struct TacticalBridgeCell {
     pub direction_zero: bool,
 }
 
-/// The tactical inverse queries current CellClass flags at each candidate and
-/// neighbor, not a map-load bridge list (original6D6760..6D6888). This borrowed
-/// interface keeps the inverse independent of its real-cell storage owner.
-pub trait TacticalBridgeLookup: std::fmt::Debug {
+/// The tactical inverse reads each candidate's live Cell+11B level and
+/// Cell+140 flags, then the cardinal neighbors (original6D674C..6D6888).
+/// Keep both on the same borrowed authority across tile changes and restore.
+pub trait TacticalCellLookup: std::fmt::Debug {
+    fn cell_level(&self, rx: u16, ry: u16) -> Option<u8>;
     fn bridge_cell(&self, rx: u16, ry: u16) -> Option<TacticalBridgeCell>;
+    fn corrected_bridge_base_level(&self, _rx: u16, _ry: u16) -> Option<u8> {
+        None
+    }
+    /// Conservative upper bound on signed projection levels, including zero.
+    fn max_cell_level(&self) -> i8;
+    /// Conservative lower bound on live signed cell levels, including zero.
+    fn min_cell_level(&self) -> i8;
 }
 
-/// Native oracle fixtures supply literal cells; production uses the live grid.
-#[cfg(test)]
-impl TacticalBridgeLookup for BTreeMap<(u16, u16), TacticalBridgeCell> {
+/// Literal inputs to the native comparisons; production borrows its live grid.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug)]
+pub struct TacticalCellFixture<'a> {
+    pub levels: &'a BTreeMap<(u16, u16), u8>,
+    pub bridges: Option<&'a BTreeMap<(u16, u16), TacticalBridgeCell>>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl TacticalCellLookup for TacticalCellFixture<'_> {
+    fn cell_level(&self, rx: u16, ry: u16) -> Option<u8> {
+        self.levels.get(&(rx, ry)).copied()
+    }
     fn bridge_cell(&self, rx: u16, ry: u16) -> Option<TacticalBridgeCell> {
-        self.get(&(rx, ry)).copied()
+        self.bridges?.get(&(rx, ry)).copied()
+    }
+    fn max_cell_level(&self) -> i8 {
+        self.levels
+            .values()
+            .fold(0, |max, &level| max.max(level as i8))
+    }
+    fn min_cell_level(&self) -> i8 {
+        self.levels
+            .values()
+            .fold(0, |min, &level| min.min(level as i8))
     }
 }
 
 /// Inputs for the YR-shaped tactical screen-to-cell inverse.
 #[derive(Debug, Clone, Copy)]
 pub struct TacticalInverseContext<'a> {
-    pub height_map: &'a BTreeMap<(u16, u16), u8>,
-    pub bridge_cells: Option<&'a dyn TacticalBridgeLookup>,
+    pub cells: Option<&'a dyn TacticalCellLookup>,
     pub viewport_offset_x: f32,
     pub viewport_offset_y: f32,
 }
@@ -85,34 +153,14 @@ pub enum TacticalInverseResult {
     Fallback { rx: f32, ry: f32 },
 }
 
-/// Playable area bounds from map `[Map] LocalSize`, in our screen pixel space.
-///
-/// In RA2, cells outside LocalSize are hidden by permanent shroud/fog of war.
-/// We use this to clip terrain rendering so out-of-bounds cells (which are often
-/// tile_index=0 green grass filler) are not drawn.
-///
-/// LocalSize is in "cell unit" coordinates using the TS-scale pixel grid
-/// (CellSizeX=48, CellSizeY=24). We convert those pixel coords to our engine's
-/// coordinate system (CellSizeX=60, CellSizeY=30) which has the same isometric
-/// axes but different scale and offset.
-///
-/// Conversion from TS-scale pixel space to our screen space:
-///   our_x = ts_x * (60/48) - (Size.X - 1) * 30
-///   our_y = ts_y * (30/24) + (Size.X + 1) * 15
-///   (both scale factors are 1.25)
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LocalBounds {
-    pub pixel_x: f32,
-    pub pixel_y: f32,
-    pub pixel_w: f32,
-    pub pixel_h: f32,
-}
-
-/// Exact presentation projection of the current normalized MapClass
-/// playfield. Native `ComputeRadarMapBounds` enumerates mode-zero-valid cells;
-/// this mirrors that ownership instead of reconstructing a raw-header TS pixel
-/// rectangle. The extent is expressed in the flat (z=0) tile frame so terrain,
-/// overlays, radar events, viewport mapping, and click inverse share one space.
+/// Flat (z=0) tile-frame rectangle of the cells `IsCellInPlayfield` mode zero
+/// admits: the radar adapter for renderer fixtures without MapClass data.
+/// Native `ComputeRadarMapBounds` (`0x0065455B..0x00654572`) enumerates mode
+/// one, which `NativeRadarSurfaceGeometry::from_playfield` owns. This rectangle
+/// decides radar pixels only when that surface is absent, which needs a
+/// missing resolved terrain or playfield authority; a match binds both
+/// (`MinimapRenderer::new`, `reconcile_playfield`), so it is kept for the
+/// mapless fixtures alone.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PlayfieldPresentationGeometry {
     pub origin_x: f32,
@@ -124,7 +172,7 @@ pub struct PlayfieldPresentationGeometry {
 
 impl PlayfieldPresentationGeometry {
     /// Enumerate cells accepted by `MapClass::IsCellInPlayfield(0)` at
-    /// `0x00578460` and derive their isometric radar/scroll rectangle.
+    /// `0x00578460` and derive their isometric radar rectangle.
     pub fn from_grid(
         grid: &TerrainGrid,
         bounds: crate::map::playfield::PlayfieldBounds,
@@ -154,81 +202,6 @@ impl PlayfieldPresentationGeometry {
             world_height: max_y - min_y,
             valid_cell_count,
         })
-    }
-
-    /// Adapt the exact tile-frame rectangle to the existing tactical clamp
-    /// convention. That clamp subtracts half a tile from its X anchor, so the
-    /// stored anchor is the leftmost tile centre while width/height remain the
-    /// exact enumerated extent.
-    pub fn camera_local_bounds(self) -> LocalBounds {
-        LocalBounds {
-            pixel_x: self.origin_x + TILE_WIDTH / 2.0,
-            pixel_y: self.origin_y,
-            pixel_w: self.world_width,
-            pixel_h: self.world_height,
-        }
-    }
-}
-
-impl TerrainGrid {
-    /// Install camera authority derived from the current normalized playfield.
-    /// `None` intentionally removes the raw-header approximation.
-    pub fn install_playfield_local_bounds(
-        &mut self,
-        bounds: Option<crate::map::playfield::PlayfieldBounds>,
-    ) {
-        self.local_bounds = bounds
-            .and_then(|bounds| PlayfieldPresentationGeometry::from_grid(self, bounds))
-            .map(PlayfieldPresentationGeometry::camera_local_bounds);
-    }
-}
-
-/// InitialHeight constant — Y padding at top for elevation headroom.
-const TS_INITIAL_HEIGHT: f32 = 3.0;
-
-/// HeightAddition constant — extra rows below for tall terrain.
-const TS_HEIGHT_ADDITION: f32 = 5.0;
-
-/// TS-scale cell pixel dimensions (used for LocalSize conversion).
-const TS_CELL_SIZE_X: f32 = 48.0;
-const TS_CELL_SIZE_Y: f32 = 24.0;
-
-/// Scale factor from TS-scale pixels to our pixels (60/48 = 30/24 = 1.25).
-const TS_SCALE: f32 = TILE_WIDTH / TS_CELL_SIZE_X;
-
-impl LocalBounds {
-    /// Build from MapHeader LocalSize values.
-    ///
-    /// Converts the TS-scale LocalSize pixel rectangle to our engine's screen coordinates.
-    /// Formula: x = local_left * 48, y = (local_top - 3) * 24
-    /// Our offset: x -= (Size.X - 1) * 30, y += (Size.X + 1) * 15
-    pub fn from_header(header: &MapHeader) -> Self {
-        let size_x: f32 = header.width as f32;
-
-        // TS-scale pixel coordinates (no baseline — we handle offset ourselves).
-        let ts_x: f32 = header.local_left as f32 * TS_CELL_SIZE_X;
-        let ts_y: f32 = (header.local_top as f32 - TS_INITIAL_HEIGHT) * TS_CELL_SIZE_Y;
-        let ts_w: f32 = header.local_width as f32 * TS_CELL_SIZE_X;
-        let ts_h: f32 = (header.local_height as f32 + TS_HEIGHT_ADDITION) * TS_CELL_SIZE_Y;
-
-        // Convert to our coordinate system.
-        let our_x: f32 = ts_x * TS_SCALE - (size_x - 1.0) * (TILE_WIDTH / 2.0);
-        let our_y: f32 = ts_y * TS_SCALE + (size_x + 1.0) * (TILE_HEIGHT / 2.0);
-
-        LocalBounds {
-            pixel_x: our_x,
-            pixel_y: our_y,
-            pixel_w: ts_w * TS_SCALE,
-            pixel_h: ts_h * TS_SCALE,
-        }
-    }
-
-    /// Check if a screen position is within the playable area.
-    pub fn contains(&self, screen_x: f32, screen_y: f32) -> bool {
-        screen_x >= self.pixel_x
-            && screen_x < self.pixel_x + self.pixel_w
-            && screen_y >= self.pixel_y
-            && screen_y < self.pixel_y + self.pixel_h
     }
 }
 
@@ -269,8 +242,6 @@ pub struct TerrainCell {
     pub rx: u16,
     /// Isometric cell Y coordinate (preserved for lighting lookups).
     pub ry: u16,
-    /// True when the resolved terrain classifies the cell as water.
-    pub is_water: bool,
     /// Tile visual variant index: 0 = pristine, positive = suffix sibling.
     pub variant: u8,
     /// RGB color tint from map lighting. [1,1,1] = full brightness (default).
@@ -279,11 +250,6 @@ pub struct TerrainCell {
     pub radar_left: [u8; 3],
     /// Per-tile radar minimap color (right half of isometric diamond), from TMP header.
     pub radar_right: [u8; 3],
-    /// Mirrors `ResolvedTerrainCell.has_damaged_data` — true when this cell's
-    /// TMP sub-tile carries a baked damaged-variant pixel set. Cached at
-    /// `TerrainGrid` construction; treat as map-load-immutable. Drives the
-    /// per-frame variant-override decision in `build_visible_instances`.
-    pub has_damaged_data: bool,
 }
 
 /// Pre-computed terrain grid ready for rendering.
@@ -302,11 +268,12 @@ pub struct TerrainGrid {
     pub origin_x: f32,
     /// Minimum screen_y across all cells (world origin y).
     pub origin_y: f32,
-    /// Playable area bounds (from LocalSize). Used to clip overlays/entities too.
-    pub local_bounds: Option<LocalBounds>,
     /// Bridge middle tiles a live publication can write, for the atlas
     /// pre-load. None when the theater lacks BridgeMiddle1/2 or both sets.
     pub bridge_middle_tiles: Option<crate::map::theater::BridgeMiddleTiles>,
+    /// Tiles terrain deformation can write, for the atlas pre-load when the
+    /// rules switch it on ([`ResolvedTerrainGrid::deformation_atlas_tiles`]).
+    pub deformation_tiles: Vec<u16>,
 }
 
 /// Convert isometric cell coordinates to screen-space pixel position — **the
@@ -321,7 +288,8 @@ pub struct TerrainGrid {
 /// drawn on the cell's diamond centre, `iso_to_screen + (TILE_WIDTH/2,
 /// TILE_HEIGHT/2)` — see `util::lepton::lepton_to_screen`. Callers that want to
 /// place something on the middle of a cell rather than on its tile art must add
-/// that half-tile themselves, as the smudge, sparkle and target-line paths do.
+/// that half-tile themselves, as the sparkle and target-line paths do. The
+/// native smudge caller adds only half-width; see `render::smudge`.
 ///
 /// The `+ TILE_HEIGHT/2` in Y is a constant bias VERA carries on every world
 /// layer relative to the original's absolute tactical pixel; it is invisible
@@ -332,17 +300,6 @@ pub fn iso_to_screen(rx: u16, ry: u16, z: u8) -> (f32, f32) {
     let sy: f32 = (rx as f32 + ry as f32) * TILE_HEIGHT / 2.0 + TILE_HEIGHT / 2.0
         - f32::from(z as i8) * HEIGHT_STEP;
     (sx, sy)
-}
-
-/// Convert absolute lepton-world coords to screen pixels with sub-cell
-/// precision — **the entity frame**, the absolute-lepton twin of
-/// `util::lepton::lepton_to_screen`.
-///
-/// The shared projector preserves active YR's signed integer arithmetic and
-/// final `/ 256` truncation. The returned `f32`s therefore always represent
-/// whole native pixels; float conversion is only the render API boundary.
-pub fn lepton_to_screen(coords: glam::IVec3) -> (f32, f32) {
-    crate::util::lepton::absolute_leptons_to_screen(coords.x, coords.y, coords.z)
 }
 
 /// Convert screen-space pixel position back to isometric cell coordinates.
@@ -367,6 +324,33 @@ pub fn screen_to_iso(screen_x: f32, screen_y: f32) -> (f32, f32) {
     (rx, ry)
 }
 
+/// The separate Z=0 plane XYZ returned by Tactical6D2280, not the
+/// height/bridge Cell answer from6D6590. Input uses VERA world pixels.
+///
+/// Original ctor6D1DC5 stores matrix coefficients408888CE/410888CE:
+/// A=8947918/2^21, B=2*A. For map-sized integer pixels (|x|,|y| <=65536)
+/// both products/sums are exact in native53-bit precision. Its toward-zero
+/// f32 store then integer conversion equals truncating this exact rational:
+/// the result is below2^24, where every integer is representable. A normal
+/// nearest-rounded f32 store is wrong; consumed +/-2006 controls catch it.
+/// No x87 emulator or presentation write into simulation state is needed.
+/// Tools/bridge_click_oracle/plane_vectors.json executes the original body.
+///
+/// As with the shared Cell inverse, fractional camera/zoom pixels select the
+/// containing pixel; this presentation extension is not native parity proof.
+/// Arbitrary out-of-map/overflow pixel inputs are outside this numeric bound.
+pub fn screen_to_plane_leptons(world_x: f32, world_y: f32) -> glam::IVec3 {
+    let x = i64::from(world_x.floor() as i32);
+    let y = i64::from(world_y.floor() as i32) - i64::from(crate::util::lepton::WORLD_ROW_BIAS_PX);
+    const NUMERATOR: i64 = 0x88_88ce;
+    const DENOMINATOR: i64 = 1 << 21;
+    glam::IVec3::new(
+        ((x + 2 * y) * NUMERATOR / DENOMINATOR) as i32,
+        ((-x + 2 * y) * NUMERATOR / DENOMINATOR) as i32,
+        0,
+    )
+}
+
 /// Convert tactical/client pixels to isometric cell coordinates using the
 /// vertical scan shape verified from gamemd.exe `0x006D6590`.
 pub fn screen_to_cell_tactical_inverse(
@@ -383,18 +367,42 @@ pub fn screen_to_cell_tactical_inverse(
     let input_x = (screen_x - context.viewport_offset_x).floor();
     let input_y = (screen_y - context.viewport_offset_y).floor();
     let (fallback_rx, fallback_ry) = screen_to_iso(input_x, input_y);
-    let mut scan_y = input_y + TACTICAL_INVERSE_MAX_SCAN_ATTEMPTS as f32;
+    // VERA extension: ScreenPixelToCell @ 0x006D6590 starts 180 pixels
+    // below the cursor (0x006D668E), so it cannot reach higher terrain's
+    // unprojected cell. Keep 180 pixels as the minimum, but allow the native
+    // 60-pixel bridge lift above the live level bound even when the bridge's
+    // base still fits in the original window.
+    // The grid owns this bound and widens it after native level writes.
+    let terrain_lift = context
+        .cells
+        .map_or(0, |cells| cells.max_cell_level().max(0) as usize)
+        * HEIGHT_STEP as usize;
+    let scan_attempts = TACTICAL_INVERSE_MAX_SCAN_ATTEMPTS
+        .max(terrain_lift + TACTICAL_BRIDGE_EXTRA_HEIGHT_PX as usize);
+    // VERA terrain deformation: ground below Level 0 draws lower than flat
+    // ground, so its unprojected cell lies above the cursor. With any on the
+    // map the scan carries on through the cursor's own row and up by the
+    // deepest level; without any it stops a row below the cursor as native
+    // does.
+    let below_zero_rows = context.cells.map_or(0, |cells| {
+        usize::from(cells.min_cell_level().min(0).unsigned_abs()) * HEIGHT_STEP as usize
+    });
+    let scan_rows = if below_zero_rows == 0 {
+        scan_attempts
+    } else {
+        scan_attempts + 1 + below_zero_rows
+    };
+    let mut scan_y = input_y + scan_attempts as f32;
 
-    for _ in 0..TACTICAL_INVERSE_MAX_SCAN_ATTEMPTS {
+    for _ in 0..scan_rows {
         let (candidate_rx, candidate_ry) = screen_to_iso(input_x, scan_y);
         let Some((cell_rx, cell_ry)) = rounded_lookup_cell(candidate_rx, candidate_ry) else {
             scan_y -= 1.0;
             continue;
         };
         let terrain_z = context
-            .height_map
-            .get(&(cell_rx, cell_ry))
-            .copied()
+            .cells
+            .and_then(|cells| cells.cell_level(cell_rx, cell_ry))
             .unwrap_or(0);
         let mut adjusted_scan_y = scan_y - f32::from(terrain_z as i8) * HEIGHT_STEP;
 
@@ -443,7 +451,7 @@ fn apply_tactical_bridge_inverse(
     context: TacticalInverseContext<'_>,
     adjusted_scan_y: &mut f32,
 ) -> Option<TacticalInverseResult> {
-    let bridge_cells = context.bridge_cells?;
+    let bridge_cells = context.cells?;
     let bridge = bridge_cells.bridge_cell(cell_rx, cell_ry)?;
     if !bridge.structural {
         return None;
@@ -464,8 +472,8 @@ fn apply_tactical_bridge_inverse(
     let dir0_open_edge = bridge.direction_zero && !dir0.is_some_and(|b| b.structural);
     let dir6_open_edge = !bridge.direction_zero && !dir6.is_some_and(|b| b.structural);
 
-    let dir2_height = tactical_neighbor_height(context.height_map, cell_rx, cell_ry, DIR_EAST);
-    let dir4_height = tactical_neighbor_height(context.height_map, cell_rx, cell_ry, DIR_SOUTH);
+    let dir2_height = tactical_neighbor_height(bridge_cells, cell_rx, cell_ry, DIR_EAST);
+    let dir4_height = tactical_neighbor_height(bridge_cells, cell_rx, cell_ry, DIR_SOUTH);
     let terrain_z_i16 = i16::from(terrain_z as i8);
     let direct_y = if bridge.direction_zero {
         !dir4_is_bridge
@@ -484,9 +492,24 @@ fn apply_tactical_bridge_inverse(
     // adjustment. Using the deck's artwork origin displaced clicks by
     // (-30, -60) on a normal high bridge. Keep VERA's shared world-row bias.
     // Evidence: TACTICAL_BRIDGE_MOVE_CLICK_DIAGNOSIS_20260909.md.
-    let (tile_left, bridge_ref_y) = iso_to_screen(cell_rx, cell_ry, terrain_z);
-    let bridge_ref_x = tile_left + TILE_WIDTH / 2.0;
-    if bridge_ref_y <= input_y {
+    let (tile_left, ground_ref_y) = iso_to_screen(cell_rx, cell_ry, terrain_z);
+    // A deck held off its cell's ground picks by its own footprint, checked
+    // before the direct-neighbor shortcut can select the neighboring ground.
+    // A deck at gamemd's own ground + 4, as every retail one loads, takes
+    // gamemd's inverse unchanged (tools/bridge_click_oracle).
+    let fixed_base = bridge_cells
+        .corrected_bridge_base_level(cell_rx, cell_ry)
+        .filter(|&base| base != terrain_z);
+    if let Some(base) = fixed_base {
+        let lift = f32::from(base as i8) * HEIGHT_STEP + TACTICAL_BRIDGE_EXTRA_HEIGHT_PX;
+        let (rx, ry) = screen_to_iso(input_x, input_y + lift);
+        if rounded_lookup_cell(rx, ry) == Some((cell_rx, cell_ry)) {
+            return Some(TacticalInverseResult::Cell { rx, ry });
+        }
+    }
+    // The direct-neighbor branch still selects ground. Raising the deck
+    // must not make it select an unraised neighbor from far above the cell.
+    if ground_ref_y <= input_y {
         if direct_y {
             return Some(TacticalInverseResult::Cell {
                 rx: cell_rx as f32,
@@ -501,11 +524,16 @@ fn apply_tactical_bridge_inverse(
         }
     }
 
+    if fixed_base.is_some() {
+        return None;
+    }
+
     // Input and reference are whole pixels. Native 0x006D697D..0x006D69C0
     // divides signed dx by two toward zero, then compares strictly against 15.
     // Float division changes the result for odd dx at the railing boundary.
+    let bridge_ref_x = tile_left + TILE_WIDTH / 2.0;
     let input_x_delta = (input_x - bridge_ref_x) as i32;
-    let input_y_delta = (input_y - bridge_ref_y) as i32;
+    let input_y_delta = (input_y - ground_ref_y) as i32;
     let apply_extra_bridge_lift = if dir0_open_edge {
         input_y_delta - input_x_delta / 2 > TACTICAL_BRIDGE_EDGE_THRESHOLD_PX
     } else if dir6_open_edge {
@@ -514,14 +542,14 @@ fn apply_tactical_bridge_inverse(
         true
     };
     if apply_extra_bridge_lift {
-        *adjusted_scan_y =
-            scan_y - f32::from(terrain_z as i8) * HEIGHT_STEP - TACTICAL_BRIDGE_EXTRA_HEIGHT_PX;
+        let lift = f32::from(terrain_z as i8) * HEIGHT_STEP + TACTICAL_BRIDGE_EXTRA_HEIGHT_PX;
+        *adjusted_scan_y = scan_y - lift;
     }
     None
 }
 
 fn tactical_bridge_neighbor(
-    bridge_cells: &dyn TacticalBridgeLookup,
+    bridge_cells: &dyn TacticalCellLookup,
     rx: u16,
     ry: u16,
     direction: u8,
@@ -530,14 +558,9 @@ fn tactical_bridge_neighbor(
     bridge_cells.bridge_cell(nx, ny)
 }
 
-fn tactical_neighbor_height(
-    height_map: &BTreeMap<(u16, u16), u8>,
-    rx: u16,
-    ry: u16,
-    direction: u8,
-) -> u8 {
+fn tactical_neighbor_height(cells: &dyn TacticalCellLookup, rx: u16, ry: u16, direction: u8) -> u8 {
     tactical_cardinal_neighbor(rx, ry, direction)
-        .and_then(|pos| height_map.get(&pos).copied())
+        .and_then(|(rx, ry)| cells.cell_level(rx, ry))
         .unwrap_or(0)
 }
 
@@ -557,173 +580,10 @@ fn tactical_cardinal_neighbor(rx: u16, ry: u16, direction: u8) -> Option<(u16, u
     Some((nx as u16, ny as u16))
 }
 
-/// Convert screen-space pixel position to isometric cell, accounting for terrain elevation.
-///
-/// Iteratively refines the cell guess by looking up the actual terrain height at each
-/// candidate cell and re-solving with the corrected screen Y. This fixes the z=0
-/// assumption in `screen_to_iso` which causes clicks on elevated terrain to resolve
-/// to the wrong cell.
-///
-/// Converges in 1-3 iterations on typical RA2 terrain gradients.
-#[cfg(test)]
-pub fn screen_to_iso_with_height(
-    screen_x: f32,
-    screen_y: f32,
-    height_map: &BTreeMap<(u16, u16), u8>,
-) -> (f32, f32) {
-    screen_to_iso_with_height_and_bridges(screen_x, screen_y, height_map, None)
-}
-
-/// Convert screen coordinates to isometric cell coordinates, accounting for
-/// terrain height and optionally bridge deck height.
-///
-/// When `bridge_height_map` is provided and the resolved cell has a bridge deck,
-/// the bridge deck elevation is used instead of the ground elevation. This makes
-/// clicks on high bridge surfaces resolve to the correct cell.
-pub fn screen_to_iso_with_height_and_bridges(
-    screen_x: f32,
-    screen_y: f32,
-    height_map: &BTreeMap<(u16, u16), u8>,
-    bridge_height_map: Option<&BTreeMap<(u16, u16), u8>>,
-) -> (f32, f32) {
-    // First pass: resolve using ground height (existing behavior).
-    let (mut rx, mut ry) = screen_to_iso(screen_x, screen_y);
-    for _ in 0..3 {
-        let cell_rx: u16 = rx.round().max(0.0) as u16;
-        let cell_ry: u16 = ry.round().max(0.0) as u16;
-        let z: u8 = height_map.get(&(cell_rx, cell_ry)).copied().unwrap_or(0);
-        if z == 0 {
-            break;
-        }
-        let corrected_y: f32 = screen_y + f32::from(z as i8) * HEIGHT_STEP;
-        let (new_rx, new_ry) = screen_to_iso(screen_x, corrected_y);
-        if (new_rx - rx).abs() < 0.01 && (new_ry - ry).abs() < 0.01 {
-            break;
-        }
-        rx = new_rx;
-        ry = new_ry;
-    }
-
-    // Second pass: bridge deck click resolution. The bridge surface is elevated
-    // (deck_level = ground + 4), so the ground resolution above can shift the
-    // result by up to ~3 cells away from the actual bridge cell. We search a
-    // neighborhood around the ground-resolved cell for any bridge entries and
-    // test each at its deck height. The closest match wins.
-    if let Some(bridge_map) = bridge_height_map {
-        let cell_rx: u16 = rx.round().max(0.0) as u16;
-        let cell_ry: u16 = ry.round().max(0.0) as u16;
-        let mut best: Option<(f32, f32)> = None;
-        let mut best_dist: f32 = f32::MAX;
-        for dy in -3i32..=3 {
-            for dx in -3i32..=3 {
-                let bx_i: i32 = cell_rx as i32 + dx;
-                let by_i: i32 = cell_ry as i32 + dy;
-                if bx_i < 0 || by_i < 0 {
-                    continue;
-                }
-                let bx: u16 = bx_i as u16;
-                let by: u16 = by_i as u16;
-                if let Some(&bridge_z) = bridge_map.get(&(bx, by)) {
-                    let corrected_y: f32 = screen_y + f32::from(bridge_z as i8) * HEIGHT_STEP;
-                    let (new_rx, new_ry) = screen_to_iso(screen_x, corrected_y);
-                    let dist: f32 = (new_rx - bx as f32).abs() + (new_ry - by as f32).abs();
-                    if dist < 0.7 && dist < best_dist {
-                        best = Some((new_rx, new_ry));
-                        best_dist = dist;
-                    }
-                }
-            }
-        }
-        if let Some((brx, bry)) = best {
-            rx = brx;
-            ry = bry;
-        }
-    }
-
-    (rx, ry)
-}
-
-/// Build a TerrainGrid from a parsed map file.
-///
-/// Converts all map cells to screen coordinates, computes world bounds,
-/// and sorts by screen_y for correct draw order. Cells outside the
-/// LocalSize playable area are clipped (they are filler tiles hidden
-/// by shroud in the original RA2 engine).
-pub fn build_terrain_grid(map: &MapFile, local_bounds: Option<LocalBounds>) -> TerrainGrid {
-    let mut cells: Vec<TerrainCell> = Vec::with_capacity(map.cells.len());
-    let mut min_x: f32 = f32::MAX;
-    let mut min_y: f32 = f32::MAX;
-    let mut max_x: f32 = f32::MIN;
-    let mut max_y: f32 = f32::MIN;
-
-    for cell in &map.cells {
-        // This legacy direct path has no theater context, so retain its tile-0
-        // fallback while still presenting no-tile cells instead of dropping them.
-        let tile_id: u16 = if cell.tile_index == 0xFFFF || cell.tile_index < 0 {
-            0
-        } else {
-            cell.tile_index as u16
-        };
-        let sub_tile = if cell.tile_index == 0xFFFF || cell.tile_index < 0 {
-            0
-        } else {
-            cell.sub_tile
-        };
-
-        let (sx, sy): (f32, f32) = iso_to_screen(cell.rx, cell.ry, cell.z);
-
-        // Border filler cells (outside LocalSize) are kept: gamemd draws every
-        // allocated cell and hides the border purely by clamping the tactical
-        // camera to LocalSize. Dropping them while the fog still reveals them
-        // left revealed-but-undrawn holes — hard black cutouts with no shroud
-        // feathering — wherever a zoomed-out view reached the map border.
-        cells.push(TerrainCell {
-            screen_x: sx,
-            screen_y: sy,
-            tile_id,
-            sub_tile,
-            z: cell.z,
-            rx: cell.rx,
-            ry: cell.ry,
-            is_water: tile_id == 0,
-            variant: 0,
-            tint: [1.0, 1.0, 1.0],
-            radar_left: [0, 0, 0],
-            radar_right: [0, 0, 0],
-            has_damaged_data: false,
-        });
-
-        min_x = min_x.min(sx);
-        min_y = min_y.min(sy);
-        max_x = max_x.max(sx + TILE_WIDTH);
-        max_y = max_y.max(sy + TILE_HEIGHT);
-    }
-
-    // Sort by screen_y for back-to-front draw order.
-    cells.sort_by(|a, b| {
-        a.screen_y
-            .partial_cmp(&b.screen_y)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    TerrainGrid {
-        cells,
-        world_width: max_x - min_x,
-        world_height: max_y - min_y,
-        origin_x: min_x,
-        origin_y: min_y,
-        local_bounds,
-        bridge_middle_tiles: None,
-    }
-}
-
-/// Build a TerrainGrid from the resolved terrain stage.
-///
-/// Unlike `build_terrain_grid()`, this consumes the final LAT-adjusted tile
-/// choice and retains water classification from resolved terrain metadata.
+/// Build a TerrainGrid from the resolved terrain stage's final LAT-adjusted
+/// tile choice.
 pub fn build_terrain_grid_from_resolved(
     resolved: &ResolvedTerrainGrid,
-    local_bounds: Option<LocalBounds>,
     bridge_middle_tiles: Option<crate::map::theater::BridgeMiddleTiles>,
 ) -> TerrainGrid {
     let mut cells: Vec<TerrainCell> = Vec::with_capacity(resolved.cells().len());
@@ -735,8 +595,11 @@ pub fn build_terrain_grid_from_resolved(
     for cell in resolved.iter() {
         let (tile_id, sub_tile) = resolved.presentation_tile(cell);
         let (sx, sy) = iso_to_screen(cell.rx, cell.ry, cell.level);
-        // Filler cells kept — see build_terrain_grid: gamemd draws every
-        // allocated cell; only the camera clamp hides the border.
+        // Border filler cells (outside LocalSize) are kept: gamemd draws every
+        // allocated cell and hides the border purely by clamping the tactical
+        // camera to LocalSize. Dropping them while the fog still reveals them
+        // left revealed-but-undrawn holes — hard black cutouts with no shroud
+        // feathering — wherever a zoomed-out view reached the map border.
         cells.push(TerrainCell {
             screen_x: sx,
             screen_y: sy,
@@ -745,12 +608,10 @@ pub fn build_terrain_grid_from_resolved(
             z: cell.level,
             rx: cell.rx,
             ry: cell.ry,
-            is_water: cell.final_tile_index >= 0 && cell.is_water,
             variant: cell.variant,
             tint: [1.0, 1.0, 1.0],
             radar_left: cell.radar_left,
             radar_right: cell.radar_right,
-            has_damaged_data: cell.has_damaged_data,
         });
         min_x = min_x.min(sx);
         min_y = min_y.min(sy);
@@ -770,47 +631,122 @@ pub fn build_terrain_grid_from_resolved(
         world_height: max_y - min_y,
         origin_x: min_x,
         origin_y: min_y,
-        local_bounds,
         bridge_middle_tiles,
+        deformation_tiles: resolved.deformation_atlas_tiles(),
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
 
     #[test]
-    fn test_iso_to_screen_origin() {
-        // (0,0,0) → X = 0-30 = -30, Y = 0+15 = 15
-        let (sx, sy): (f32, f32) = iso_to_screen(0, 0, 0);
-        assert!((sx - (-30.0)).abs() < f32::EPSILON);
-        assert!((sy - 15.0).abs() < f32::EPSILON);
+    fn high_terrain_picking_tracks_live_level_bound() {
+        let cells = (0..32)
+            .flat_map(|ry| {
+                (0..32).map(move |rx| {
+                    let mut cell =
+                        crate::map::resolved_terrain::ResolvedTerrainCell::clear_for_test(rx, ry);
+                    cell.level = 12;
+                    cell
+                })
+            })
+            .collect();
+        let mut terrain = ResolvedTerrainGrid::from_cells(32, 32, cells);
+        let cell = terrain.native_cell_identity((16, 16));
+        // Use the production level writer: the raised cell needs a larger
+        // bound, and lowering it leaves a conservative bound behind.
+        for level in [12, 20, 12] {
+            terrain.write_native_cell_level(cell, level);
+            let (x, y) = iso_to_screen(16, 16, level);
+            let picked = screen_to_cell_tactical_inverse(
+                x + TILE_WIDTH / 2.0,
+                y + TILE_HEIGHT / 2.0,
+                TacticalInverseContext {
+                    cells: Some(&terrain),
+                    viewport_offset_x: 0.0,
+                    viewport_offset_y: 0.0,
+                },
+            );
+            assert_eq!(picked, TacticalInverseResult::Cell { rx: 16.0, ry: 16.0 });
+        }
     }
 
     #[test]
-    fn test_iso_to_screen_positive() {
-        // rx=10, ry=0, z=0 → sx = 300-30 = 270, sy = 150+15 = 165
-        let (sx, sy): (f32, f32) = iso_to_screen(10, 0, 0);
-        assert!((sx - 270.0).abs() < f32::EPSILON);
-        assert!((sy - 165.0).abs() < f32::EPSILON);
+    fn high_terrain_picking_reaches_the_bridge_deck() {
+        let levels = (0..32)
+            .flat_map(|ry| (0..32).map(move |rx| ((rx, ry), 12)))
+            .collect();
+        let bridges = (0..32)
+            .flat_map(|ry| {
+                (0..32).map(move |rx| {
+                    (
+                        (rx, ry),
+                        TacticalBridgeCell {
+                            structural: true,
+                            direction_zero: true,
+                        },
+                    )
+                })
+            })
+            .collect();
+        // The native bridge surface is four levels above its Cell level.
+        let (x, y) = iso_to_screen(16, 16, 16);
+        let picked = screen_to_cell_tactical_inverse(
+            x + TILE_WIDTH / 2.0,
+            y + TILE_HEIGHT / 2.0,
+            TacticalInverseContext {
+                cells: Some(&TacticalCellFixture {
+                    levels: &levels,
+                    bridges: Some(&bridges),
+                }),
+                viewport_offset_x: 0.0,
+                viewport_offset_y: 0.0,
+            },
+        );
+        assert_eq!(picked, TacticalInverseResult::Cell { rx: 16.0, ry: 16.0 });
     }
 
     #[test]
-    fn test_iso_to_screen_diagonal() {
-        // rx=5, ry=5, z=0 → sx = 0-30 = -30, sy = 150+15 = 165
-        let (sx, sy): (f32, f32) = iso_to_screen(5, 5, 0);
-        assert!((sx - (-30.0)).abs() < f32::EPSILON);
-        assert!((sy - 165.0).abs() < f32::EPSILON);
-    }
-
-    #[test]
-    fn test_iso_to_screen_elevation() {
-        // rx=0, ry=0, z=2 → sx = -30, sy = 15 - 30 = -15
-        let (sx, sy): (f32, f32) = iso_to_screen(0, 0, 2);
-        assert!((sx - (-30.0)).abs() < f32::EPSILON);
-        assert!((sy - (-15.0)).abs() < f32::EPSILON);
+    fn raised_bridge_picking_uses_the_deck_footprint() {
+        use crate::map::bridge_facts::{BridgeFlagStamp, BridgeStampFamily};
+        use crate::map::resolved_terrain::{ResolvedTerrainCell, test_flat_cell, test_grid};
+        let mut terrain = test_grid(24, 24, |rx, ry| ResolvedTerrainCell {
+            level: if (rx, ry) == (10, 8) { 6 } else { 0 },
+            ..test_flat_cell(rx, ry)
+        });
+        let anchor = (10, 10);
+        terrain.set_authored_high_bridge_deck(terrain.native_cell_identity((10, 10)), 10);
+        terrain.apply_runtime_bridge_mark_stamp(
+            BridgeFlagStamp::new(anchor, 0, true),
+            BridgeStampFamily::Nesw,
+        );
+        let pick = |x, y| {
+            let result = screen_to_cell_tactical_inverse(
+                x,
+                y,
+                TacticalInverseContext {
+                    cells: Some(&terrain),
+                    viewport_offset_x: 0.0,
+                    viewport_offset_y: 0.0,
+                },
+            );
+            let (TacticalInverseResult::Cell { rx, ry }
+            | TacticalInverseResult::Fallback { rx, ry }) = result;
+            rounded_lookup_cell(rx, ry)
+        };
+        assert_eq!(
+            pick(-30.0, 195.0),
+            Some((10, 11)),
+            "the raised deck's center"
+        );
+        assert_eq!(
+            pick(-30.0, 241.0),
+            Some((7, 8)),
+            "visible ground beyond the deck"
+        );
     }
 
     #[test]
@@ -821,32 +757,16 @@ mod tests {
     }
 
     #[test]
-    fn screen_to_cell_tactical_inverse_uses_vertical_height_scan() {
-        let mut height_map = BTreeMap::new();
-        height_map.insert((10, 5), 4);
-        let result = screen_to_cell_tactical_inverse(
-            150.0,
-            180.0,
-            TacticalInverseContext {
-                height_map: &height_map,
-                bridge_cells: None,
-                viewport_offset_x: 0.0,
-                viewport_offset_y: 0.0,
-            },
-        );
-
-        assert_eq!(result, TacticalInverseResult::Cell { rx: 9.5, ry: 4.5 });
-    }
-
-    #[test]
     fn screen_to_cell_tactical_inverse_returns_initial_fallback_on_scan_cap() {
         let height_map = BTreeMap::new();
         let result = screen_to_cell_tactical_inverse(
             -500.0,
             -500.0,
             TacticalInverseContext {
-                height_map: &height_map,
-                bridge_cells: None,
+                cells: Some(&crate::map::terrain::TacticalCellFixture {
+                    levels: &height_map,
+                    bridges: None,
+                }),
                 viewport_offset_x: 0.0,
                 viewport_offset_y: 0.0,
             },
@@ -857,117 +777,40 @@ mod tests {
     }
 
     #[test]
+    fn screen_to_cell_tactical_inverse_finds_ground_below_level_zero() {
+        // A pit at Level -3.
+        let levels: BTreeMap<_, _> = (8..=13u16)
+            .flat_map(|rx| (8..=13u16).map(move |ry| ((rx, ry), -3i8 as u8)))
+            .collect();
+        let inverse = |y| {
+            screen_to_cell_tactical_inverse(
+                0.0,
+                y,
+                TacticalInverseContext {
+                    cells: Some(&crate::map::terrain::TacticalCellFixture {
+                        levels: &levels,
+                        bridges: None,
+                    }),
+                    viewport_offset_x: 0.0,
+                    viewport_offset_y: 0.0,
+                },
+            )
+        };
+        // The centre of cell (10, 10) draws 45 pixels below its flat row.
+        assert_eq!(
+            inverse(375.0),
+            TacticalInverseResult::Cell { rx: 10.0, ry: 10.0 }
+        );
+        // Flat ground behind the pit resolves on its own row.
+        assert_eq!(
+            inverse(165.0),
+            TacticalInverseResult::Cell { rx: 4.5, ry: 4.5 }
+        );
+    }
+
+    #[test]
     fn tactical_cardinal_neighbor_rejects_direction_eight() {
         assert_eq!(tactical_cardinal_neighbor(10, 10, 8), None);
-    }
-
-    #[test]
-    fn tactical_bridge_edge_threshold_is_strict() {
-        let height_map = BTreeMap::from([((0, 0), 0)]);
-        let mut bridge_cells = BTreeMap::new();
-        bridge_cells.insert(
-            (0, 0),
-            TacticalBridgeCell {
-                structural: true,
-                direction_zero: true,
-            },
-        );
-        bridge_cells.insert(
-            (1, 0),
-            TacticalBridgeCell {
-                structural: true,
-                direction_zero: true,
-            },
-        );
-        bridge_cells.insert(
-            (0, 1),
-            TacticalBridgeCell {
-                structural: true,
-                direction_zero: true,
-            },
-        );
-
-        let mut adjusted = 90.0;
-        assert_eq!(
-            apply_tactical_bridge_inverse(
-                0.0,
-                30.0,
-                90.0,
-                0,
-                0,
-                0,
-                TacticalInverseContext {
-                    height_map: &height_map,
-                    bridge_cells: Some(&bridge_cells),
-                    viewport_offset_x: 0.0,
-                    viewport_offset_y: 0.0,
-                },
-                &mut adjusted,
-            ),
-            None
-        );
-        assert_eq!(adjusted, 90.0);
-
-        let mut adjusted = 90.0;
-        assert_eq!(
-            apply_tactical_bridge_inverse(
-                0.0,
-                31.0,
-                90.0,
-                0,
-                0,
-                0,
-                TacticalInverseContext {
-                    height_map: &height_map,
-                    bridge_cells: Some(&bridge_cells),
-                    viewport_offset_x: 0.0,
-                    viewport_offset_y: 0.0,
-                },
-                &mut adjusted,
-            ),
-            None
-        );
-        assert_eq!(adjusted, 30.0);
-    }
-
-    #[test]
-    fn test_local_bounds_from_header_dustbowl() {
-        // Dustbowl: Size=70x76, LocalSize=2,8,65,62
-        let header = MapHeader {
-            theater: "TEMPERATE".to_string(),
-            fill: "Clear".to_string(),
-            level: 0,
-            width: 70,
-            height: 76,
-            local_left: 2,
-            local_top: 8,
-            local_width: 65,
-            local_height: 62,
-        };
-        let bounds: LocalBounds = LocalBounds::from_header(&header);
-        // TS-scale pixel rect: x=2*48=96, y=(8-3)*24=120, w=65*48=3120, h=(62+5)*24=1608
-        // Our coords: x = 96*1.25 - 69*30 = -1950, y = 120*1.25 + 71*15 = 1215
-        // w = 3120*1.25 = 3900, h = 1608*1.25 = 2010
-        assert!((bounds.pixel_x - (-1950.0)).abs() < 1.0);
-        assert!((bounds.pixel_y - 1215.0).abs() < 1.0);
-        assert!((bounds.pixel_w - 3900.0).abs() < 1.0);
-        assert!((bounds.pixel_h - 2010.0).abs() < 1.0);
-    }
-
-    #[test]
-    fn test_local_bounds_contains() {
-        let bounds = LocalBounds {
-            pixel_x: -1950.0,
-            pixel_y: 1215.0,
-            pixel_w: 3900.0,
-            pixel_h: 2010.0,
-        };
-        assert!(bounds.contains(-1950.0, 1215.0)); // top-left (inclusive)
-        assert!(bounds.contains(0.0, 2000.0)); // center
-        assert!(!bounds.contains(-1951.0, 1215.0)); // just left
-        assert!(!bounds.contains(-1950.0, 1214.0)); // just above
-        assert!(!bounds.contains(1950.0, 1215.0)); // at right edge (exclusive)
-        assert!(!bounds.contains(-1950.0, 3225.0)); // at bottom edge (exclusive)
     }
 
     #[test]
@@ -1001,7 +844,7 @@ mod tests {
                 .map(|suffix| format!("clear01{}.urb", char::from(suffix)))
                 .collect::<Vec<_>>()
         );
-        let bounds = LocalBounds::from_header(&map.header);
+        let bounds = crate::map::playfield::PlayfieldBounds::from_map_header(&map.header);
         let mut selector_cache =
             crate::map::tile_variant_selector::TileVariantSelectorCache::default();
         let mut main_rng = crate::sim::rng::SimRng::new(0);
@@ -1025,17 +868,14 @@ mod tests {
             assert!(selector.generated_table());
             resolved
         };
-        let grid = build_terrain_grid_from_resolved(&resolved, Some(bounds), None);
+        let grid = build_terrain_grid_from_resolved(&resolved, None);
 
         const XMP29U2_NO_TILE: i32 = 0xFFFF;
         let in_bounds_sentinels: Vec<_> = map
             .cells
             .iter()
             .filter(|cell| cell.tile_index == XMP29U2_NO_TILE)
-            .filter(|cell| {
-                let (sx, sy) = iso_to_screen(cell.rx, cell.ry, cell.z);
-                bounds.contains(sx, sy)
-            })
+            .filter(|cell| bounds.contains_geometry_packed(i32::from(cell.rx), i32::from(cell.ry)))
             .collect();
         assert_eq!(
             map.cells
@@ -1044,8 +884,10 @@ mod tests {
                 .count(),
             164
         );
-        assert_eq!(in_bounds_sentinels.len(), 125);
-        assert_eq!(grid.cells.len(), 6_160);
+        assert_eq!(in_bounds_sentinels.len(), 108);
+        // The map load allocates more cells than the IsoMapPack holds; every
+        // allocated cell reaches presentation.
+        assert_eq!(grid.cells.len(), resolved.iter().count());
 
         let needed = HashSet::from([crate::map::theater::TileKey {
             tile_id: clear_tile_id,
@@ -1147,308 +989,7 @@ mod tests {
         }
         assert!(
             high_suffix_sentinels > 0,
-            "at least one of the 125 visible ClearTile fallbacks must select e/f/g"
+            "at least one in-playfield ClearTile fallback must select e/f/g"
         );
-    }
-
-    #[test]
-    fn gsi_04_03c_terrain_instances_have_one_ordinary_bucket() {
-        // Create a small grid manually.
-        let grid: TerrainGrid = TerrainGrid {
-            cells: vec![
-                TerrainCell {
-                    screen_x: 0.0,
-                    screen_y: 0.0,
-                    tile_id: 0,
-                    sub_tile: 0,
-                    z: 0,
-                    rx: 1,
-                    ry: 0,
-                    is_water: false,
-                    variant: 0,
-                    tint: [1.0, 1.0, 1.0],
-                    radar_left: [0, 0, 0],
-                    radar_right: [0, 0, 0],
-                    has_damaged_data: false,
-                },
-                TerrainCell {
-                    screen_x: 5000.0,
-                    screen_y: 5000.0,
-                    tile_id: 0,
-                    sub_tile: 0,
-                    z: 0,
-                    rx: 100,
-                    ry: 100,
-                    is_water: false,
-                    variant: 0,
-                    tint: [1.0, 1.0, 1.0],
-                    radar_left: [0, 0, 0],
-                    radar_right: [0, 0, 0],
-                    has_damaged_data: false,
-                },
-            ],
-            world_width: 5060.0,
-            world_height: 5030.0,
-            origin_x: 0.0,
-            origin_y: 0.0,
-            local_bounds: None,
-            bridge_middle_tiles: None,
-        };
-
-        // Camera at origin, 1024x768 viewport — only first cell should be visible.
-        let result: crate::render::terrain_instances::TerrainInstances =
-            crate::render::terrain_instances::build_visible_instances(
-                &grid, None, 0.0, 0.0, 1024.0, 768.0, None, None,
-            );
-        assert_eq!(result.normal.len(), 1);
-    }
-
-    #[test]
-    fn terrain_tile_instances_consume_per_cell_lighting() {
-        let grid: TerrainGrid = TerrainGrid {
-            cells: vec![
-                TerrainCell {
-                    screen_x: 0.0,
-                    screen_y: 0.0,
-                    tile_id: 0,
-                    sub_tile: 0,
-                    z: 0,
-                    rx: 1,
-                    ry: 0,
-                    is_water: false,
-                    variant: 0,
-                    tint: [1.0, 1.0, 1.0],
-                    radar_left: [0, 0, 0],
-                    radar_right: [0, 0, 0],
-                    has_damaged_data: false,
-                },
-                TerrainCell {
-                    screen_x: 60.0,
-                    screen_y: 0.0,
-                    tile_id: 0,
-                    sub_tile: 0,
-                    z: 4,
-                    rx: 2,
-                    ry: 0,
-                    is_water: false,
-                    variant: 0,
-                    tint: [1.0, 1.0, 1.0],
-                    radar_left: [0, 0, 0],
-                    radar_right: [0, 0, 0],
-                    has_damaged_data: false,
-                },
-            ],
-            world_width: 120.0,
-            world_height: 30.0,
-            origin_x: 0.0,
-            origin_y: 0.0,
-            local_bounds: None,
-            bridge_middle_tiles: None,
-        };
-        let lights = crate::map::lighting::build_cell_light_grid_from_heights(
-            [((1, 0), 0), ((2, 0), 4)],
-            &crate::map::lighting::LightingConfig::default(),
-        );
-
-        let result = crate::render::terrain_instances::build_visible_instances(
-            &grid,
-            Some(&lights),
-            0.0,
-            0.0,
-            1024.0,
-            768.0,
-            None,
-            None,
-        );
-
-        assert_eq!(result.normal.len(), 2);
-        assert!((result.normal[0].tint[0] - 0.95).abs() < 0.001);
-        assert!((result.normal[1].tint[0] - 0.982).abs() < 0.001);
-    }
-
-    fn live_tile_grid() -> TerrainGrid {
-        TerrainGrid {
-            cells: vec![TerrainCell {
-                screen_x: 0.0,
-                screen_y: 0.0,
-                tile_id: 100,
-                sub_tile: 3,
-                z: 4,
-                rx: 0,
-                ry: 0,
-                is_water: false,
-                variant: 2,
-                tint: [1.0; 3],
-                radar_left: [0; 3],
-                radar_right: [0; 3],
-                has_damaged_data: false,
-            }],
-            world_width: TILE_WIDTH,
-            world_height: TILE_HEIGHT,
-            origin_x: 0.0,
-            origin_y: 0.0,
-            local_bounds: None,
-            bridge_middle_tiles: None,
-        }
-    }
-
-    /// Draws the level-4 grid cell against a live cell holding `live` (tile,
-    /// subtile, level, Recalc variant), with an atlas holding `resident`
-    /// tiles. Returns every lookup and the drawn (screen y, z_adjust).
-    fn draw_live_tile(
-        live: (i32, u8, u8, u8),
-        resident: &[u16],
-    ) -> (Vec<(u16, u8, u8)>, Vec<(f32, f32)>) {
-        let mut cell = crate::map::resolved_terrain::test_flat_cell(0, 0);
-        (
-            cell.final_tile_index,
-            cell.final_sub_tile,
-            cell.level,
-            cell.variant,
-        ) = live;
-        let terrain =
-            crate::map::resolved_terrain::ResolvedTerrainGrid::from_cells(1, 1, vec![cell]);
-        let calls = std::cell::RefCell::new(Vec::new());
-        let lookup = |tid: u16, sub: u8, var: u8| -> Option<TilePlacement> {
-            calls.borrow_mut().push((tid, sub, var));
-            resident.contains(&tid).then_some(TilePlacement {
-                uv_origin: [0.0, 0.0],
-                uv_size: [1.0, 1.0],
-                pixel_size: [TILE_WIDTH, TILE_HEIGHT],
-                draw_offset: [0.0, 0.0],
-            })
-        };
-        let drawn = crate::render::terrain_instances::build_visible_instances(
-            &live_tile_grid(),
-            None,
-            0.0,
-            0.0,
-            1024.0,
-            768.0,
-            Some(&lookup),
-            Some(&terrain),
-        )
-        .normal
-        .iter()
-        .map(|instance| (instance.position[1], instance.z_adjust))
-        .collect();
-        (calls.into_inner(), drawn)
-    }
-
-    #[test]
-    fn draw_reads_the_live_tile_and_level_a_publication_wrote() {
-        let rows = crate::render::native_z::TILE_HEIGHT_ROWS as f32;
-        // Unchanged cell: grid position (level 4) and its Recalc file.
-        assert_eq!(
-            draw_live_tile((100, 3, 4, 2), &[100]),
-            (vec![(100, 3, 2)], vec![(0.0, -rows - 2.0 * rows)])
-        );
-        // A collapse flood writes a new tile and level 0; Recalc picked file 1.
-        assert_eq!(
-            draw_live_tile((203, 3, 0, 1), &[100, 203]),
-            (vec![(203, 3, 1)], vec![(4.0 * HEIGHT_STEP, -rows)])
-        );
-    }
-
-    #[test]
-    fn draw_keeps_the_grid_tile_when_the_live_tile_is_not_resident() {
-        let rows = crate::render::native_z::TILE_HEIGHT_ROWS as f32;
-        assert_eq!(
-            draw_live_tile((203, 3, 0, 1), &[100]),
-            (
-                vec![(203, 3, 1), (100, 3, 2)],
-                vec![(0.0, -rows - 2.0 * rows)]
-            )
-        );
-    }
-
-    #[test]
-    fn test_screen_to_iso_with_height_flat_terrain() {
-        // On flat terrain (z=0 everywhere), result matches plain screen_to_iso.
-        let height_map: BTreeMap<(u16, u16), u8> = BTreeMap::new();
-        let (rx, ry) = screen_to_iso_with_height(300.0, 150.0, &height_map);
-        let (rx0, ry0) = screen_to_iso(300.0, 150.0);
-        assert!((rx - rx0).abs() < 0.01);
-        assert!((ry - ry0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_screen_to_iso_with_height_elevated() {
-        // Cell (10, 5) at z=4:
-        //   iso_to_screen = ((10-5)*30-30, (10+5)*15+15-4*15) = (120, 165)
-        //   Tile center = (120+30, 165+15) = (150, 180)
-        let mut height_map: BTreeMap<(u16, u16), u8> = BTreeMap::new();
-        for rx in 8..=12 {
-            for ry in 3..=7 {
-                height_map.insert((rx, ry), 4);
-            }
-        }
-        let (rx, ry) = screen_to_iso_with_height(150.0, 180.0, &height_map);
-        assert!((rx - 10.0).abs() < 0.6, "rx={rx}, expected ~10");
-        assert!((ry - 5.0).abs() < 0.6, "ry={ry}, expected ~5");
-    }
-
-    #[test]
-    fn test_screen_to_iso_with_height_convergence() {
-        // Verify the function converges and doesn't overshoot on steep terrain.
-        let mut height_map: BTreeMap<(u16, u16), u8> = BTreeMap::new();
-        // A ridge: cells with ry < 10 are at z=6, ry >= 10 at z=0.
-        for rx in 0..30 {
-            for ry in 0..10 {
-                height_map.insert((rx, ry), 6);
-            }
-        }
-        // Click on the elevated part: cell (15, 5) at z=6.
-        // iso_to_screen = ((15-5)*30-30, (15+5)*15+15-6*15) = (270, 225)
-        // Center: (270+30, 225+15) = (300, 240).
-        let (rx, ry) = screen_to_iso_with_height(300.0, 240.0, &height_map);
-        assert!((rx - 15.0).abs() < 0.6, "rx={rx}, expected ~15");
-        assert!((ry - 5.0).abs() < 0.6, "ry={ry}, expected ~5");
-    }
-
-    #[test]
-    fn lepton_to_screen_zero_matches_iso_origin() {
-        let (sx, sy) = lepton_to_screen(glam::IVec3::ZERO);
-        assert_eq!(sx, 0.0);
-        assert_eq!(sy, TILE_HEIGHT / 2.0);
-    }
-
-    #[test]
-    fn lepton_to_screen_integer_cell_lands_at_iso_center() {
-        // 4 cells east, 2 cells south = (4*256, 2*256, 0).
-        let (sx, sy) = lepton_to_screen(glam::IVec3::new(4 * 256, 2 * 256, 0));
-        assert_eq!(sx, (4.0 - 2.0) * TILE_WIDTH / 2.0);
-        assert_eq!(sy, (4.0 + 2.0) * TILE_HEIGHT / 2.0 + TILE_HEIGHT / 2.0);
-    }
-
-    #[test]
-    fn lepton_to_screen_sub_cell_offset_is_iso_subdivided() {
-        // Sub-cell offset of (128, 0) — native truncates the complete Y
-        // numerator from 7.5 to 7 before VERA's common +15 row bias.
-        let (sx, sy) = lepton_to_screen(glam::IVec3::new(128, 0, 0));
-        assert_eq!((sx, sy), (15.0, 22.0));
-    }
-
-    #[test]
-    fn lepton_to_screen_negative_coords_use_signed_truncation() {
-        let (sx, sy) = lepton_to_screen(glam::IVec3::new(-50, 0, 0));
-        assert_eq!((sx, sy), (-5.0, 13.0));
-    }
-
-    #[test]
-    fn adjust_for_z_lepton_projection_matches_retail_fixtures_and_boundary() {
-        let (_, baseline) = lepton_to_screen(glam::IVec3::ZERO);
-        for (z, expected_lift) in [
-            (104, 15.0),
-            (208, 30.0),
-            (256, 37.0),
-            (727, 104.0),
-            (728, 105.0),
-            (1_500, 216.0),
-            (-400, -56.0),
-        ] {
-            let (_, projected) = lepton_to_screen(glam::IVec3::new(0, 0, z));
-            assert_eq!(baseline - projected, expected_lift, "z={z}");
-        }
     }
 }

@@ -25,8 +25,8 @@
 //! hard-stops the loop (`VocHandle::StopAndClear @ 0x00405D40`) and clears the
 //! latch, so the next loop starts in the same call; every decay releases it
 //! (`SoundEvent::Release @ 0x00406060`, the loop plays out its `decay` tail)
-//! and clears the latch. The draw is simulation state whatever the sound
-//! settings: it precedes `VocClass::PlayAt`'s sound-enabled test. A gattling
+//! and clears the latch. The process Main draw precedes `VocClass::PlayAt`'s
+//! sound-enabled test, whatever the settings. Main is outside Scenario/hash/save. A gattling
 //! type plays no per-shot report (`TechnoClass::Fire`, `0x006FF349`).
 //!
 //! The dead latch `+0x4D4` is only ever written 0 in YR (`0x006F30EE`,
@@ -84,7 +84,7 @@ pub struct GattlingState {
 
 /// What a charge did beyond the stage and value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) struct Increase {
+pub struct Increase {
     /// The stage rose: the loop is hard-stopped.
     pub stage_up: bool,
     /// The report branch ran: its draw picked `item` from the `Report=` list
@@ -94,7 +94,7 @@ pub(crate) struct Increase {
 
 /// One report pick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Report {
+pub struct Report {
     pub weapon_index: i32,
     pub item: u32,
 }
@@ -112,8 +112,8 @@ impl GattlingState {
 
     /// `+0x4B8`: set once a report loop started, until the next decay,
     /// stage-up or Limbo.
-    #[cfg(test)]
-    pub(crate) fn report_latch(&self) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn report_latch(&self) -> bool {
         self.report_latch
     }
 
@@ -154,47 +154,74 @@ impl GattlingState {
 
     /// `IncreaseGattlingStage(ticks) @ 0x0070DE70`.
     ///
+    /// `ares_cycle` is `None` for gamemd's body and, in an Ares game, the
+    /// type's `Gattling.Cycle`: TechnoClass_UpdateGattling_Cycle (Ares.dll
+    /// 1004B6C0, hook 0x70DEBA) replaces the cap test, so a cyclic type at
+    /// the cap restarts at stage 0 with the loop hard-stopped (`0x405D40` on
+    /// `+0x4A4`) and the latch clear, and the stage test reads the value the
+    /// hook leaves (`[esp+0x10]`) rather than the one the call started from.
+    ///
     /// `report_count(i)` is `GetWeapon(i)->WeaponType->Report.Count`, `None`
     /// when slot `i` names no WeaponType. `next_random` is `g_MainRng.Next()`,
-    /// called at most once.
+    /// called at most once. `stop` and `next_random` both get `caller`, so a
+    /// Stop that delivers sound and the Main draw after it can each borrow
+    /// the one simulation in turn.
     ///
     /// RESIDUAL: native faults at `0x0070DF8A` when the latch is clear and
     /// `GetWeapon(2 * stage)` names no WeaponType (a stage past the authored
     /// weapons); VERA plays nothing and leaves the latch clear. Unreachable
     /// with retail data.
-    pub(crate) fn increase(
+    pub fn increase<C>(
         &mut self,
         table: &GattlingStages,
         elite: bool,
         ticks: i32,
+        ares_cycle: Option<bool>,
         report_count: impl Fn(i32) -> Option<i32>,
-        next_random: impl FnOnce() -> u32,
+        caller: &mut C,
+        mut stop: impl FnMut(&mut C),
+        next_random: impl FnOnce(&mut C) -> u32,
     ) -> Increase {
         let stages = table.weapon_stages();
         // The cap is tested before the add (`JGE`), against the value as
         // it was; the stage test below reads that same value.
         let before = self.value;
-        if before < table.threshold(stages, elite) {
+        let below_cap = before < table.threshold(stages, elite);
+        if below_cap {
             self.value = before.wrapping_add(table.rate_up().wrapping_mul(ticks));
         }
+        let tested = match ares_cycle {
+            None => before,
+            Some(cyclic) => {
+                if !below_cap && cyclic {
+                    self.value = 0;
+                    self.stage = 0;
+                    stop(caller); // AudioController::DTOR_1 on +0x4A4.
+                    self.report_latch = false;
+                }
+                self.value
+            }
+        };
         let mut effects = Increase::default();
         let mut stage = self.stage;
         if stage >= 0
             && stage < stages.wrapping_sub(1)
-            && table.threshold(stage + 1, elite) <= before
+            && table.threshold(stage + 1, elite) <= tested
         {
             stage += 1;
             self.stage = stage;
             self.report_latch = false;
             effects.stage_up = true;
+            stop(caller); // 70DF74: stage-change Stop405D40.
         }
         if !self.report_latch {
             let weapon_index = stage.wrapping_mul(2);
             // `JLE` at `0x0070DF92`: an empty or negative count skips the
             // draw and leaves the latch clear.
             if let Some(count) = report_count(weapon_index).filter(|&count| count > 0) {
+                stop(caller); // 70DF9C: report-entry Stop405D40, before Main.
                 // `DIV`: unsigned.
-                let item = next_random() % count as u32;
+                let item = next_random(caller) % count as u32;
                 self.report_latch = true;
                 effects.report = Some(Report { weapon_index, item });
             }
@@ -202,13 +229,20 @@ impl GattlingState {
         effects
     }
 
-    /// `UpdateGattlingStage(ticks) @ 0x0070E000`. Returns whether a loop was
-    /// live (the latch was set) and is released.
-    pub(crate) fn update(&mut self, table: &GattlingStages, elite: bool, ticks: i32) -> bool {
+    /// `UpdateGattlingStage(ticks) @ 0x0070E000`. Returns whether the report
+    /// latch was set. Release is reached unconditionally before owner writes.
+    pub(crate) fn update(
+        &mut self,
+        table: &GattlingStages,
+        elite: bool,
+        ticks: i32,
+        release: impl FnOnce(),
+    ) -> bool {
         // The release and the latch clear come first, unconditionally. The
         // handle holds a loop only while the latch is set: every writer that
         // clears the latch also stops or releases the handle.
         let released = self.report_latch;
+        release(); // Update70E000: Release406060 precedes the latch/value writes.
         self.report_latch = false;
         let step = table.rate_down().wrapping_mul(ticks);
         let value = self.value.wrapping_sub(step);
@@ -221,14 +255,15 @@ impl GattlingState {
     }
 
     /// TechnoClass::Limbo's `+0x4A4` release and latch clear (`0x006F6C6B`,
-    /// `0x006F6C76`). Returns whether a loop was live.
-    pub(crate) fn limbo(&mut self) -> bool {
+    /// `0x006F6C76`). Returns the prior report latch; Release is unconditional.
+    pub(crate) fn limbo(&mut self, release: impl FnOnce()) -> bool {
+        release(); // 6F6C6B: release before 6F6C76 clears the latch.
         std::mem::take(&mut self.report_latch)
     }
 
     /// A state from its native fields, for fixtures and native payloads.
-    #[cfg(test)]
-    pub(crate) fn from_fields(stage: i32, value: i32, report_latch: bool) -> Self {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn from_fields(stage: i32, value: i32, report_latch: bool) -> Self {
         Self {
             stage,
             value,
@@ -267,6 +302,40 @@ pub(crate) fn unit_fire_tail(outcome: UnitFireOutcome) -> StageCall {
     }
 }
 
+/// `TechnoClass+0x148`, the voxel turret's animation counter. The
+/// constructor zeroes it (`0x006F2BE2`); the unit firing update
+/// (`0x007370D5`, `0x007370F2`, `0x0073713A`, [`unit_turret_anim_advances`])
+/// and the building's attack (`0x0044B23C`, `0x0044B713`) and Gattling block
+/// (`0x0043FE88`, `0x0043FF8B`) advance it. Only the draws read it
+/// (`UnitClass::DrawVoxelBody @ 0x0073B500`: while the body's HVA frame is 0
+/// the turret's frame is this modulo its frame count; the building's voxel
+/// draw `0x0043DA80`, emitted by `emit_building_turret_vxl`).
+///
+/// Not folded into `world_hash`: its one reader is presentation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct TurretAnimCounter {
+    frame: i32,
+}
+
+impl TurretAnimCounter {
+    /// The counter.
+    pub const fn frame(self) -> i32 {
+        self.frame
+    }
+
+    /// `+0x148 += 1`, wrapping.
+    pub(crate) fn advance(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
+    }
+
+    /// Install a fixture's counter.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_for_test(&mut self, frame: i32) {
+        self.frame = frame;
+    }
+}
+
 /// Whether the unit update advances `+0x148`, the turret animation counter
 /// (`0x007370D5`, `0x007370F2`, `0x0073713A`): a gattling type while its
 /// value is positive after the tail, any other type on OK and REARM.
@@ -287,8 +356,7 @@ pub(crate) fn unit_turret_anim_advances(
 
 /// `TechnoClass::IsElite @ 0x00750010`, which picks the elite thresholds.
 pub(crate) fn is_elite(entity: &crate::sim::game_entity::GameEntity) -> bool {
-    crate::sim::combat::veterancy::rank_from_u16(entity.veterancy())
-        == crate::sim::combat::veterancy::VeterancyRank::Elite
+    entity.veterancy.rank_kind() == crate::sim::combat::veterancy::VeterancyRank::Elite
 }
 
 /// The loop-handle owner of a techno's gattling report (`TechnoClass+0x4A4`):
@@ -296,11 +364,13 @@ pub(crate) fn is_elite(entity: &crate::sim::game_entity::GameEntity) -> bool {
 /// other owner key.
 const GATTLING_SOUND_TAG: u64 = 1 << 61;
 
-pub(crate) const fn gattling_sound_owner(techno: u64) -> u64 {
+pub const fn gattling_sound_owner(techno: u64) -> u64 {
     techno | GATTLING_SOUND_TAG
 }
 
-pub(crate) const fn gattling_sound_techno(owner: u64) -> Option<u64> {
+/// The techno whose +4A4 handle this owner names. Its AI owns positional
+/// updates, so the client must not re-drive it again at the frame tail.
+pub const fn gattling_sound_techno(owner: u64) -> Option<u64> {
     if owner & GATTLING_SOUND_TAG != 0 {
         Some(owner & !GATTLING_SOUND_TAG)
     } else {
@@ -316,13 +386,19 @@ impl crate::sim::world::Simulation {
         id: u64,
         outcome: UnitFireOutcome,
         rules: &crate::rules::ruleset::RuleSet,
+        effects: &mut crate::sim::world::FrameEffects<'_>,
     ) {
         let Some((is_gattling, slot0)) = self.substrate.entities.get(id).and_then(|entity| {
             let obj = self.object_type(entity.type_ref(), rules)?;
             Some((
                 obj.is_gattling,
-                crate::sim::combat::combat_weapon::weapon_for_index(obj, entity.veterancy(), 0)
-                    .is_some(),
+                crate::sim::combat::combat_weapon::weapon_for_index(
+                    obj,
+                    entity.veterancy.rank(),
+                    0,
+                )
+                .and_then(|record| record.weapon_id)
+                .is_some(),
             ))
         }) else {
             return;
@@ -336,23 +412,24 @@ impl crate::sim::world::Simulation {
         };
         if is_gattling {
             match unit_fire_tail(outcome) {
-                StageCall::Increase => self.gattling_increase(id, rules, 1),
-                StageCall::Update => self.gattling_update(id, rules, 1),
+                StageCall::Increase => self.gattling_increase(id, rules, 1, effects),
+                StageCall::Update => self.gattling_update(id, rules, 1, effects),
             }
         }
-        if let Some(entity) = self.substrate.entities.get_mut(id)
-            && unit_turret_anim_advances(is_gattling, outcome, entity.gattling.value())
-        {
-            entity.turret_anim_frame = entity.turret_anim_frame.wrapping_add(1);
+        if let Some(entity) = self.substrate.entities.get_mut_if(id, |entity| {
+            unit_turret_anim_advances(is_gattling, outcome, entity.gattling.value())
+        }) {
+            entity.turret_anim_frame.advance();
         }
     }
 
     /// `IncreaseGattlingStage(ticks)` on one techno, with its report.
-    pub(crate) fn gattling_increase(
+    pub fn gattling_increase(
         &mut self,
         id: u64,
         rules: &crate::rules::ruleset::RuleSet,
         ticks: i32,
+        frame_effects: &mut crate::sim::world::FrameEffects<'_>,
     ) {
         let Some(entity) = self.substrate.entities.get(id) else {
             return;
@@ -360,51 +437,59 @@ impl crate::sim::world::Simulation {
         let Some(obj) = self.object_type(entity.type_ref(), rules) else {
             return;
         };
-        let veterancy = entity.veterancy();
+        let veterancy = entity.veterancy.rank();
         let elite = is_elite(entity);
         let world = Self::movement_sound_world(entity);
         let mut state = entity.gattling;
         let weapon = |index: i32| {
             crate::sim::combat::combat_weapon::weapon_for_index(obj, veterancy, index)
-                .map(|(weapon_id, _)| rules.weapon(weapon_id))
+                .and_then(|record| record.weapon_id)
+                .map(|weapon_id| rules.weapon(weapon_id))
         };
-        let main_rng = &mut self.main_rng;
+        let owner = gattling_sound_owner(id);
+        let ares_cycle = rules.ares().then(|| obj.techno_combat().gattling_cyclic());
         let effects = state.increase(
             &obj.gattling_stages,
             elite,
             ticks,
+            ares_cycle,
             |index| weapon(index).map(|weapon| weapon.map_or(0, |weapon| weapon.report_count())),
-            || main_rng.next_u32(),
+            self,
+            |sim| {
+                // Native70DF74 and70DF9C finish Stop405D40, including the
+                // driver endpoint and handle clear, before Report's65C780.
+                // Source: tools/input_oracle/gattling_loop.json.
+                sim.sound_events
+                    .emit(crate::sim::world::SimSoundEvent::GattlingLoopStop { owner });
+                frame_effects.flush_sound(sim, rules);
+            },
+            |sim| sim.main_rng.next_u32(),
         );
         if let Some(entity) = self.substrate.entities.get_mut(id) {
             entity.gattling = state;
-        }
-        let owner = gattling_sound_owner(id);
-        if effects.stage_up {
-            self.sound_events
-                .push(crate::sim::world::SimSoundEvent::GattlingLoopStop { owner });
         }
         if let Some(report) = effects.report
             && let Some(sound) = weapon(report.weapon_index)
                 .flatten()
                 .and_then(|weapon| weapon.report_item(report.item as usize))
         {
-            let sound_id = self.interner.intern(sound);
             self.sound_events
-                .push(crate::sim::world::SimSoundEvent::GattlingLoop {
+                .emit(crate::sim::world::SimSoundEvent::GattlingLoop {
                     owner,
-                    sound_id,
+                    sound_id: rules.sound_name(sound),
                     world,
                 });
+            frame_effects.flush_sound(self, rules);
         }
     }
 
     /// `UpdateGattlingStage(ticks)` on one techno.
-    pub(crate) fn gattling_update(
+    pub fn gattling_update(
         &mut self,
         id: u64,
         rules: &crate::rules::ruleset::RuleSet,
         ticks: i32,
+        frame_effects: &mut crate::sim::world::FrameEffects<'_>,
     ) {
         let Some(entity) = self.substrate.entities.get(id) else {
             return;
@@ -413,33 +498,48 @@ impl crate::sim::world::Simulation {
             return;
         };
         let elite = is_elite(entity);
-        let Some(entity) = self.substrate.entities.get_mut(id) else {
-            return;
-        };
-        if entity.gattling.update(&obj.gattling_stages, elite, ticks) {
+        let mut state = entity.gattling;
+        state.update(&obj.gattling_stages, elite, ticks, || {
+            // Update70E013 reaches Release406060 before latch/value writes,
+            // including an already cleared handle. The sound owner validates
+            // Type0/stale handles. Source: gattling_loop.json's Unit release.
             self.sound_events
-                .push(crate::sim::world::SimSoundEvent::GattlingLoopRelease {
+                .emit(crate::sim::world::SimSoundEvent::GattlingLoopRelease {
                     owner: gattling_sound_owner(id),
                 });
+            frame_effects.flush_sound(self, rules);
+        });
+        if let Some(entity) = self.substrate.entities.get_mut(id) {
+            entity.gattling = state;
         }
     }
 
     /// TechnoClass::Limbo's `+0x4A4` release and latch clear.
-    pub(crate) fn gattling_limbo(&mut self, id: u64) {
-        if self
-            .substrate
-            .entities
-            .get_mut(id)
-            .is_some_and(|entity| entity.gattling.limbo())
-        {
+    pub(crate) fn gattling_limbo(
+        &mut self,
+        id: u64,
+        mut context: crate::sim::world::UninitContext<'_>,
+    ) {
+        let Some(entity) = self.substrate.entities.get(id) else {
+            return;
+        };
+        let mut state = entity.gattling;
+        state.limbo(|| {
+            // TechnoLimbo6F6C6B releases4A4 before6F6C76 clears the latch.
+            // Nested cleanup retains the frame rules even when it needs none.
             self.sound_events
-                .push(crate::sim::world::SimSoundEvent::GattlingLoopRelease {
+                .emit(crate::sim::world::SimSoundEvent::GattlingLoopRelease {
                     owner: gattling_sound_owner(id),
                 });
+            let rules = context.rules();
+            context.effects().flush_sound(self, rules);
+        });
+        if let Some(entity) = self.substrate.entities.get_mut(id) {
+            entity.gattling = state;
         }
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_combat_d_z))]
 #[path = "gattling_tests.rs"]
 mod tests;

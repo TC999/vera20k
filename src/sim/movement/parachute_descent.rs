@@ -1,42 +1,37 @@
-//! Parachute descent: the falling state of paradropped infantry.
+//! ObjectClass falling: parachutes and dropped bombs share one state owner.
 //!
 //! As in gamemd, a falling object's height is its Location Z
 //! (`position.exact_z_leptons`). `ObjectClass::AI`'s falling block moves it
 //! ([`Simulation::advance_fall`](crate::sim::world::Simulation::advance_fall)):
 //! - each frame the Z moves by the FallRate: `Location.Z = GetZ() + FallRate`
-//! - the FallRate starts at 0 and drops by one a frame (integer DEC) to
-//!   `Rules.ParachuteMaxFallRate` (default `-3`), so it ramps 0,-1,-2,-3,-3,...
+//! - an attached Anim's retained Object+84 flag selects integer DEC, capped
+//!   by `Rules.ParachuteMaxFallRate` (default `-3`); a new Object starts at 0
 //! - the fall grounds when GetHeight is at most 0, and SetHeight(0) puts the
 //!   object on the ground or deck
 //! - the infantry keeps its base locomotor and body sequence during descent
 //!
-//! This module keeps the FallRate and the canopy.
+//! Free fall uses trunc(FallRate - 1.4), capped by NoParachuteMaxFallRate.
+//! Landing retains the rate and attached-Anim/bomb bytes. The last normal
+//! Anim detach clears +84; a later fall then uses free-fall acceleration.
+//! A grounded bomb enters the synchronous C4 receiver with its current Health
+//! and both force flags.
 //!
 //! ## Dependency rules
 //! - Part of sim/ — depends on sim/game_entity, sim/entity_store, sim/locomotor.
-//! - sim/ NEVER depends on render/, ui/, sidebar/, audio/, net/.
+//! - sim/ NEVER depends on render/, ui/, audio/, net/.
 
-use crate::sim::debug_event_log::DebugEventKind;
 use crate::sim::entity_store::EntityStore;
-
-/// Per-entity parachute descent state. Set by [`begin_parachute_descent`],
-/// cleared on landing. This mirrors gamemd's object-level falling state:
-/// normal paradropped infantry keep their base locomotor and body animation.
-/// The height is the object's Location Z, not part of this state.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ParachuteDescentState {
-    /// `ObjectClass+0x2C` FallRate in leptons per frame; negative falls.
-    /// Starts at 0; decrements by 1 per frame; clamps to `Rules.ParachuteMaxFallRate`.
-    pub rate: i32,
-}
+use crate::sim::world::FrameEffects;
+use crate::sim::world::ObjectSubstrate;
 
 /// Begin parachute descent for an entity at world Z `drop_z` (leptons).
 /// Returns `true` on success.
 ///
 /// `ObjectClass::Paradrop @ 0x005F5940` raises the falling byte (`+0x8D`,
 /// `0x005F5965`) and places the object at the drop coordinate: Unlimbo
-/// (`vt+0xD8`), then SetLocation (`vt+0x1B4`, `0x005F5A50`). The FallRate
-/// starts at 0, so the ramp begins on the first frame.
+/// (`vt+0xD8`), then SetLocation (`vt+0x1B4`, `0x005F5A50`). It preserves
+/// the FallRate; only a new Object starts at 0. The caller's subsequent Anim
+/// attachment owns the +84 acceleration flag.
 ///
 /// The caller positions the entity's XY. Reveal keeps this Z as the Unlimbo
 /// coordinate's.
@@ -45,15 +40,7 @@ pub fn begin_parachute_descent(entities: &mut EntityStore, entity_id: u64, drop_
         return false;
     };
 
-    entity.position.exact_z_leptons = Some(drop_z);
-    entity.parachute_state = Some(ParachuteDescentState { rate: 0 });
-
-    entity.push_debug_event(
-        0,
-        DebugEventKind::SpecialMovementStart {
-            kind: "Parachute".into(),
-        },
-    );
+    entity.begin_parachute_fall(drop_z);
     true
 }
 
@@ -65,6 +52,95 @@ const PARACHUTE_ANIM_Z_LIFT_LEPTONS: i32 = 0x4B;
 const PARACHUTE_ANIM_DRAW_FLAGS: u32 = 0x600;
 
 impl crate::sim::world::Simulation {
+    /// ObjectAI5F3F11..5F405B inside MissionAI, before mission dispatch and
+    /// the locomotor. The landing callback precedes canopy wind-down and the
+    /// forced C4 receiver. No fall-specific RNG, timer or detach calls occur;
+    /// the synchronous production receiver owns all ordinary death effects.
+    pub(crate) fn object_ai_fall(
+        &mut self,
+        id: u64,
+        rules: &crate::rules::ruleset::RuleSet,
+        registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
+        effects: &mut FrameEffects<'_>,
+    ) -> Result<(bool, bool), crate::sim::world::FrameAdvanceError> {
+        if self
+            .substrate
+            .entities
+            .get(id)
+            .is_none_or(|e| !e.is_falling_down())
+        {
+            return Ok((false, false));
+        }
+        let old_layer = self.entity_display_layer(id, rules);
+        let landed = self.advance_fall(id, rules.general.parachute_max_fall_rate, rules, effects);
+        let mut changed = false;
+        if landed {
+            changed =
+                self.per_cell_process(id, super::PerCellReason::Arrival, rules, registry, effects)?;
+            Self::wind_down_parachute_anim(&mut self.substrate, id);
+            //5F3FA4..5F3FFA: PerCell can Limbo the object. The landing
+            // frame updates and retains FallRate only after that callback.
+            if let Some(entity) = self.substrate.entities.get_mut(id)
+                && !entity.lifecycle.in_limbo()
+            {
+                entity.advance_fall_rate(
+                    rules.general.parachute_max_fall_rate,
+                    rules.general.no_parachute_max_fall_rate,
+                    self.interner
+                        .try_resolve(entity.type_ref())
+                        .and_then(|_| self.interner.object_type(entity.type_ref(), rules)),
+                    rules.ares(),
+                    rules.ares_form(),
+                );
+            }
+        }
+        if self
+            .substrate
+            .entities
+            .get(id)
+            .is_some_and(|e| e.lifecycle.in_limbo())
+        {
+            self.substrate.display.remove(id);
+            return Ok((landed, changed));
+        }
+        let new_layer = self.entity_display_layer(id, rules);
+        if old_layer != new_layer
+            && let Some(layer) = new_layer
+        {
+            //5F4001..5F400E: resubmit only when the live layer changed.
+            Self::submit_object_display(&mut self.substrate, id, layer);
+        }
+        if let Some(health) = self
+            .substrate
+            .entities
+            .get(id)
+            .filter(|e| {
+                !e.lifecycle.in_limbo()
+                    && !e.is_falling_down()
+                    && e.was_dropped_as_bomb()
+                    && e.health.current() > 0
+            })
+            .map(|e| e.health.current())
+        {
+            //5F402B copies current Health+6C into a local packet (not Strength).
+            let c4 = self.interner.intern(&rules.bridge_warheads.c4_name);
+            let hit = crate::sim::combat::EntityDamageEvent::direct_receiver(
+                id,
+                health,
+                0,
+                crate::sim::combat::RAD_NO_ATTACKER,
+                None,
+                c4,
+                crate::sim::combat::ReceiverCallFlags {
+                    ignore_defenses: true,
+                    arg6: true,
+                },
+            );
+            self.commit_direct_damage_receiver(rules, registry, hit, effects);
+        }
+        Ok((landed, changed))
+    }
+
     /// Construct the falling object's canopy.
     ///
     /// gamemd-derived, the virtual `ObjectClass::Paradrop @ 0x005F5940`. It
@@ -77,25 +153,67 @@ impl crate::sim::world::Simulation {
     /// its owner (`AnimClass::SetOwnerObject @ 0x00424B50`), so the canopy
     /// rides the descent. `Rules+0xBBC` is `[General] Parachute=`.
     ///
+    /// The NPSE hook at the `Parachute=` read (`0x5F5ADD` -> cave
+    /// `0xC2B0E4`..`0xC2FA8A`) branches the canopy: a type whose `IsBomb=`
+    /// flag is set takes `Rules+0xBB8` (`BombParachute=`), infantry keeps
+    /// `Parachute=`, and anything else takes the new `[General]
+    /// VehicleParachute=` (Rules+0x400) when it is set and `Parachute=`
+    /// otherwise. VERA has no parachuted bullets and no `IsBomb=` type flag,
+    /// so the canopy here is the infantry/non-infantry branch; the bomb arms
+    /// stay native-only (see the module residual).
+    ///
     /// VERA keeps no `Object+0x88`: the canopy is found again as the owner's
     /// attached anim of the parachute type.
     ///
     /// RESIDUAL: a bullet takes `Rules+0xBB8` (`BombParachute=`) at the
     /// uncopied coordinate instead; VERA has no parachuted bullets.
     ///
-    /// DRIFT: after the attach native copies the owner's drawer (`vtable+0x1E4`)
-    /// to the anim's `+0xD4` and the owner cell's ground Z adjust (`+0x10A`) to
-    /// `+0xFC`, the pair `set_cell_anim_draw_authority` models for cell anims.
-    /// They are not stored here; the presentation consequence is recorded at
-    /// `build_parachute_instances`.
+    /// Native copies the owner's drawer (`vtable+0x1E4`) to Anim+0xD4; the
+    /// House remap below retains that selection. It also copies the owner's
+    /// Cell+0x10A light intensity to Anim+0xFC, separately from the instance
+    /// ZAdjust at+0x100. Publish the read at this producer boundary; the
+    /// existing lighting owner samples it before later relights.
     pub(crate) fn attach_parachute_anim(
         &mut self,
         rules: &crate::rules::ruleset::RuleSet,
         owner_id: u64,
     ) -> Option<crate::sim::anim_class::AnimId> {
-        let type_name = self
-            .interner
-            .intern(rules.general.parachute_shp.as_deref()?);
+        let owner = self.substrate.entities.get(owner_id)?;
+        let object = self.interner.try_resolve(owner.type_ref()).and_then(|_| {
+            self.interner
+                .object_type_in_category(owner.type_ref(), owner.category().into(), rules)
+        });
+        // Ares 3.0 10047C60 (hook 0x5F5ADD), before the canopy type: an
+        // `IsBomb` Foot sets IsABomb (+8F), so it lands as a bomb.
+        if rules.ares_form()
+            && owner.category().is_foot()
+            && object.is_some_and(|object| object.techno_combat().roles().is_bomb())
+        {
+            self.substrate
+                .entities
+                .get_mut(owner_id)?
+                .mark_parachuted_bomb();
+        }
+        let owner = self.substrate.entities.get(owner_id)?;
+        let owner_house = owner.owner();
+        let side = self
+            .houses
+            .get(&owner_house)
+            .map(|house| house.side_index())
+            .unwrap_or(-1);
+        let country = self
+            .houses
+            .get(&owner_house)
+            .and_then(|house| house.country())
+            .map(|country| self.interner.resolve(country));
+        let Some(canopy) = parachute_anim_name(rules, owner, object, side, country) else {
+            self.substrate
+                .entities
+                .get_mut(owner_id)?
+                .clear_parachute_animation();
+            return None;
+        };
+        let type_name = self.interner.intern(canopy);
         let mut coord = self.anim_owner_coords(owner_id)?;
         coord.z = coord.z.wrapping_add(PARACHUTE_ANIM_Z_LIFT_LEPTONS);
         let (rx, ry, sub_x, sub_y, level) = coord.to_cell_sub_z();
@@ -105,16 +223,39 @@ impl crate::sim::world::Simulation {
             draw_flags: PARACHUTE_ANIM_DRAW_FLAGS,
             z_adjust: 0,
             reverse: false,
+            owner: None,
             ..crate::sim::components::AnimClassSpawnDescriptor::new(
                 type_name, rx, ry, sub_x, sub_y, level,
             )
         };
         match self.spawn_anim_at_world(rules, descriptor, coord) {
             Ok(anim_id) => {
+                // Object::Paradrop5F5AF1 publishes +88 before5F5AFE binds
+                // the Anim owner. Keep a single held identity, not a type scan.
+                self.substrate
+                    .entities
+                    .hold_parachute_animation(owner_id, anim_id)?;
                 self.set_anim_owner_object(anim_id, Some(owner_id), rules);
+                // Native Paradrop calls SetOwnerObject, then GetRemapColour
+                // through the owner's vtable and stores that ConvertClass at
+                // Anim+0xD4 (`ObjectClass::Paradrop @ 0x005F5940`,
+                // `0x005F5AFE..0x005F5B19`). Freeze the same house selection
+                // on the attached canopy after construction.
+                self.substrate
+                    .anims
+                    .set_anim_house_remap(anim_id, owner_house);
+                let owner = self.substrate.entities.get(owner_id)?;
+                self.retain_anim_cell_light(
+                    anim_id,
+                    Some((owner.position.rx(), owner.position.ry())),
+                );
                 Some(anim_id)
             }
             Err(error) => {
+                self.substrate
+                    .entities
+                    .get_mut(owner_id)?
+                    .clear_parachute_animation();
                 // An art type that never bound draws nothing natively either.
                 log::debug!("parachute anim did not construct: {error}");
                 None
@@ -134,23 +275,78 @@ impl crate::sim::world::Simulation {
     /// leaves at the last one. Retail `PARACH.SHP` has 140 frames and loops
     /// 20..39, so that is about a hundred frames of the canopy collapsing on
     /// the landed object.
-    pub(crate) fn wind_down_parachute_anim(
-        &mut self,
-        rules: &crate::rules::ruleset::RuleSet,
-        owner_id: u64,
-    ) {
-        let Some(type_name) = rules.general.parachute_shp.as_deref() else {
-            return;
-        };
-        let Some(type_id) = self.interner.get(type_name) else {
-            return;
-        };
-        for anim in self.substrate.anims.values_mut() {
-            if anim.owner_entity == Some(owner_id) && anim.type_id == type_id {
-                anim.runtime.loop_remaining = 0;
-            }
+    pub(crate) fn wind_down_parachute_anim(substrate: &mut ObjectSubstrate, owner_id: u64) {
+        // ObjectClass::AI5F3F93..5F3FA4 reads held +88, even after
+        // SetOwnerObject detached the canopy or the type's INI changed.
+        if let Some(anim_id) = substrate
+            .entities
+            .get(owner_id)
+            .and_then(|owner| owner.parachute_animation())
+            && let Some(anim) = substrate.anims.get_mut(anim_id)
+        {
+            anim.end_loops();
         }
     }
+}
+
+/// The canopy a dropped object gets. Without NPatch, or for infantry, use
+/// `[General] Parachute=`; other objects with NPatch take the NPSE
+/// `[General] VehicleParachute=` when it is set and `Parachute=` otherwise
+/// (`ObjectClass::Paradrop`'s hook `0x5F5ADD` -> cave `0xC2B0E4`:
+/// `0xC2FA75..0xC2FA8A`). The cave's first arm sends an object whose type
+/// has NPSE's `IsBomb=` flag to `BombParachute=` (`0xC2B0FC..0xC2B103`);
+/// The NPSE-specific `BombParachute=` selection remains a residual.
+fn parachute_anim_name<'r>(
+    rules: &'r crate::rules::ruleset::RuleSet,
+    entity: &crate::sim::game_entity::GameEntity,
+    object: Option<&'r crate::rules::object_type::ObjectType>,
+    side: i32,
+    country: Option<&str>,
+) -> Option<&'r str> {
+    // ObjectClass_SpawnParachuted_Animation (installed Ares 3.0 DLL10047C60),
+    // hook5F5ADD replaces `mov edx,[ecx+0xBBC]`
+    // and resumes5F5AE3 with the chosen type in EDX. Foot types take
+    // TechnoTypeExt+F0 before Country's GetParachuteAnim1001BBC0.
+    if rules.ares()
+        && entity.category().is_foot()
+        && let Some(canopy) =
+            object.and_then(|object| object.techno_combat().presentation().parachute_anim())
+    {
+        return Some(canopy);
+    }
+    // `GetParachuteAnim @ 0x1001BBC0` answers the country's own
+    // `[Country] Parachute.Anim=` first; a never-set or `none` field is the
+    // null pointer there and defers to the side.
+    if let Some(country) = country
+        && let Some(canopy) = rules.country_parachute_anim(country)
+    {
+        return Some(canopy);
+    }
+    // Ares `[Side] Parachute.Anim=` wins over both the stock canopy and the
+    // NPSE non-infantry branch; an unset key leaves that existing owner, and
+    // `none` falls through to `Find("PARACH")`
+    // (`HouseTypeExt::GetParachuteAnim @ 0x1001BBC0`).
+    if let Some(override_) = rules.side_parachute_override(side) {
+        return Some(override_.unwrap_or("PARACH"));
+    }
+    let canopy = if !crate::rules::NPATCH_ENABLED
+        || entity.category() == crate::map::entities::EntityCategory::Infantry
+    {
+        rules.general.parachute_shp.as_deref()
+    } else {
+        rules
+            .general
+            .vehicle_parachute
+            .as_deref()
+            .or(rules.general.parachute_shp.as_deref())
+    };
+    // Under Ares a house with no side (`0x1001BBD7`), or no canopy from its
+    // side and `[General] Parachute=` (`0x1002E0FA`), gets `Find("PARACH")`
+    // (`0x1001BC09`) rather than none.
+    if rules.ares() && (side < 0 || canopy.is_none()) {
+        return Some("PARACH");
+    }
+    canopy
 }
 
 impl crate::sim::world::Simulation {
@@ -159,444 +355,80 @@ impl crate::sim::world::Simulation {
     ///
     /// - `Location.Z = GetZ() + FallRate` (`0x005F3F2C..0x005F3F60`). On the
     ///   first frame the FallRate is 0, so the object hangs for a frame.
+    /// - A marked object leaves its cell through its own Mark (`vt+0x124` at
+    ///   `0x005F3F46`) before that write and marks again after it
+    ///   (`0x005F3F58`). A paratrooper's layer is Ground at any height (Foot
+    ///   `vt+0x78` = `0x004DB7E0` asks the locomotor; Walk's `0x0075C7E0`
+    ///   returns Ground), so every fall frame prepends it to its cell's list
+    ///   again and recalculates the cell.
     /// - GetHeight at most 0 (`0x005F3F6A`) grounds it: SetHeight(0)
     ///   (`0x005F3F7A`) puts it on the ground or deck, and the falling byte
     ///   clears (`0x005F3F86`).
-    /// - Otherwise a parachute's FallRate drops by one, no lower than
-    ///   `Rules+0x7B8` (`0x005F3FBC..0x005F3FFA`). Native also updates it on
-    ///   the grounding frame and keeps it after the fall; VERA drops it with
-    ///   the falling state. Only DropIn's fall (`0x005F4160`), which does not
-    ///   reset the rate, would start from a kept one, and VERA's DropIn grounds
-    ///   a standing object instead (DRIFT at `drop_in_bridge_member`).
+    /// - An airborne object updates its retained rate here. On landing,
+    ///   `object_ai_fall` first runs PerCell and canopy wind-down, then updates
+    ///   the rate unless that callback put the object in Limbo (5F3FA4).
     ///
-    /// RESIDUAL: while the object is on the map, native removes it from its
-    /// cell and marks it again around the Z write (`vt+0x124` at `0x005F3F46`
-    /// and `0x005F3F58`). FootClass::Mark (`0x004D3780`) re-adds it through
-    /// Place_Down (`0x005683C0`) and AddContent (`0x0047E8A0`), at the head of
-    /// its cell's list; VERA leaves it where Reveal put it. Trigger: another
-    /// object entering the cell during a fall. Effect: that cell's list order,
-    /// which first-object reads and list walks follow. Frequency: rare.
-    /// Native also resubmits the object when its display layer (`vt+0x78`)
-    /// changes (`0x004A9720` at `0x005F400E`). A ground mover's layer does not
-    /// read the height, so only a falling Jumpjet (a paradropped Rocketeer)
-    /// could change layer; VERA does not resubmit it.
-    pub(crate) fn advance_fall(&mut self, stable_id: u64, max_fall_rate: i32) -> bool {
+    /// Native rate controls are executed in drop_as_bomb.json.
+    pub(crate) fn advance_fall(
+        &mut self,
+        stable_id: u64,
+        max_fall_rate: i32,
+        rules: &crate::rules::ruleset::RuleSet,
+        effects: &mut FrameEffects<'_>,
+    ) -> bool {
+        let Some(entity) = self.substrate.entities.get(stable_id) else {
+            return false;
+        };
+        let Some(rate) = entity.is_falling_down().then(|| entity.fall_rate()) else {
+            return false;
+        };
+        let z = crate::sim::movement::ground_pose::object_world_z_leptons(
+            entity,
+            self.resolved_terrain.as_ref(),
+        )
+        .wrapping_add(rate);
+        let marked = entity.lifecycle.cell_marked();
+        let mut context = crate::sim::world::UninitContext::new(rules).with_effects(effects);
+        if marked {
+            self.unmark_entity_remove(stable_id, context.reborrow());
+        }
+        if let Some(entity) = self.substrate.entities.get_mut(stable_id) {
+            entity.position.put_z(z);
+        }
+        if marked {
+            self.mark_entity_put(stable_id, context);
+        }
         let terrain = self.resolved_terrain.as_ref();
         let Some(entity) = self.substrate.entities.get_mut(stable_id) else {
             return false;
         };
-        let Some(rate) = entity.parachute_state.as_ref().map(|state| state.rate) else {
-            return false;
-        };
-        entity.position.exact_z_leptons = Some(
-            crate::sim::movement::ground_pose::object_world_z_leptons(entity, terrain)
-                .wrapping_add(rate),
-        );
         if crate::sim::movement::air_movement::current_fly_height(entity, terrain) > 0 {
-            if let Some(state) = entity.parachute_state.as_mut() {
-                // Integer DEC, then clamp toward the more-negative bound.
-                state.rate = (state.rate - 1).max(max_fall_rate);
+            if !entity.lifecycle.in_limbo() {
+                entity.advance_fall_rate(
+                    max_fall_rate,
+                    rules.general.no_parachute_max_fall_rate,
+                    self.interner
+                        .try_resolve(entity.type_ref())
+                        .and_then(|_| self.interner.object_type(entity.type_ref(), rules)),
+                    rules.ares(),
+                    rules.ares_form(),
+                );
             }
             return false;
         }
-        // Descent does not displace the locomotor, so there is no piggyback
-        // to unwind here.
-        entity.parachute_state = None;
-        entity.push_debug_event(self.session.tick as u32, DebugEventKind::SpecialMovementEnd);
-        self.set_object_height(stable_id, 0);
+        // SetHeight(0) (`0x005F3F7A`) runs before the falling byte clears
+        // (`0x005F3F86`). Descent does not displace the locomotor, so there
+        // is no piggyback to unwind here.
+        self.set_object_height(stable_id, 0, rules, effects);
+        let Some(entity) = self.substrate.entities.get_mut(stable_id) else {
+            return true;
+        };
+        entity.finish_fall();
         true
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::rules::locomotor_type::{LocomotorKind, SpeedType};
-    use crate::sim::animation::{Animation, SequenceKind};
-    use crate::sim::entity_store::EntityStore;
-    use crate::sim::game_entity::GameEntity;
-    use crate::sim::movement::locomotor::{LocomotorState, MovementLayer};
-    use crate::sim::world::Simulation;
-
-    fn make_walk_loco() -> LocomotorState {
-        let mut loco = LocomotorState::for_test_kind(LocomotorKind::Walk);
-        loco.speed_type = SpeedType::Foot;
-        loco
-    }
-
-    /// Build an infantry entity with a Walk locomotor and a Stand animation,
-    /// inserted into `entities`. Returns the entity id.
-    fn insert_test_infantry(entities: &mut EntityStore, id: u64) -> u64 {
-        let mut e = GameEntity::test_default(id, "E1", "Americans", 10, 10);
-        e.locomotor = Some(make_walk_loco());
-        e.animation = Some(Animation::new(SequenceKind::Stand));
-        entities.insert(e);
-        id
-    }
-
-    #[test]
-    fn test_begin_attaches_state_at_the_drop_z_and_keeps_locomotor_identity() {
-        let mut entities = EntityStore::new();
-        let id = insert_test_infantry(&mut entities, 1);
-        entities.get_mut(id).unwrap().position.exact_z_leptons = Some(52);
-
-        assert!(begin_parachute_descent(&mut entities, id, 1200));
-
-        let entity = entities.get(id).expect("should exist");
-        assert_eq!(
-            entity.position.exact_z_leptons,
-            Some(1200),
-            "the drop coordinate's Z replaces the passenger's old one"
-        );
-        let state = entity
-            .parachute_state
-            .as_ref()
-            .expect("parachute state must be attached");
-        assert_eq!(
-            state.rate, 0,
-            "rate must start at 0 (3-tick ramp begins next tick)"
-        );
-
-        let loco = entity.locomotor.as_ref().expect("has loco");
-        assert!(
-            !loco.is_overridden(),
-            "ordinary paradropped infantry keep their base locomotor"
-        );
-        assert_eq!(loco.kind, LocomotorKind::Walk);
-        assert_eq!(
-            loco.layer,
-            MovementLayer::Ground,
-            "object-level falling state must not rewrite locomotor layer"
-        );
-    }
-
-    #[test]
-    fn test_body_sequence_preserved_on_begin() {
-        let mut entities = EntityStore::new();
-        let id = insert_test_infantry(&mut entities, 1);
-
-        begin_parachute_descent(&mut entities, id, 1200);
-
-        let anim = entities
-            .get(id)
-            .expect("alive")
-            .animation
-            .as_ref()
-            .expect("has anim");
-        assert_eq!(
-            anim.sequence,
-            SequenceKind::Stand,
-            "normal paradrops render the attached PARACH anim, not body Paradrop frames"
-        );
-    }
-
-    #[test]
-    fn test_begin_works_without_locomotor() {
-        let mut entities = EntityStore::new();
-        let mut e = GameEntity::test_default(1, "E1", "Americans", 5, 5);
-        // No locomotor.
-        e.animation = Some(Animation::new(SequenceKind::Stand));
-        entities.insert(e);
-
-        assert!(begin_parachute_descent(&mut entities, 1, 1200));
-
-        let entity = entities.get(1).expect("alive");
-        assert!(entity.parachute_state.is_some());
-    }
-
-    #[test]
-    fn test_begin_returns_false_for_missing_entity() {
-        let mut entities = EntityStore::new();
-        assert!(!begin_parachute_descent(&mut entities, 999, 1200));
-    }
-
-    // -------------------------------------------------------------------
-    // The falling block on a mapless fixture, whose ground is 0 everywhere,
-    // so the Location Z is the height.
-    // -------------------------------------------------------------------
-
-    /// Default INI value per `[General] ParachuteMaxFallRate=-3`.
-    const RULES_PARACHUTE_MAX_FALL_RATE: i32 = -3;
-
-    /// A mapless simulation with one infantry falling from `drop_z`.
-    fn falling(drop_z: i32) -> (Simulation, u64) {
-        let mut sim = Simulation::new();
-        let id = insert_test_infantry(&mut sim.substrate.entities, 1);
-        assert!(begin_parachute_descent(
-            &mut sim.substrate.entities,
-            id,
-            drop_z
-        ));
-        (sim, id)
-    }
-
-    fn fall(sim: &mut Simulation, id: u64) -> bool {
-        sim.advance_fall(id, RULES_PARACHUTE_MAX_FALL_RATE)
-    }
-
-    fn z(sim: &Simulation, id: u64) -> i32 {
-        sim.substrate
-            .entities
-            .get(id)
-            .unwrap()
-            .position
-            .exact_z_leptons
-            .expect("a falling object keeps its Location Z")
-    }
-
-    fn rate(sim: &Simulation, id: u64) -> i32 {
-        sim.substrate
-            .entities
-            .get(id)
-            .unwrap()
-            .parachute_state
-            .as_ref()
-            .expect("descending")
-            .rate
-    }
-
-    #[test]
-    fn test_3tick_rate_ramp() {
-        // Rate sequence over 6 ticks must be exactly [0, -1, -2, -3, -3, -3].
-        // Sample BEFORE each tick (= rate-in for that tick).
-        let (mut sim, id) = falling(1200);
-
-        let mut observed: Vec<i32> = Vec::new();
-        for _ in 0..6 {
-            observed.push(rate(&sim, id));
-            fall(&mut sim, id);
-        }
-
-        assert_eq!(
-            observed,
-            vec![0, -1, -2, -3, -3, -3],
-            "3-tick ramp must be 0,-1,-2,-3,-3,-3 (NOT instant -3)"
-        );
-    }
-
-    #[test]
-    fn test_descent_distance_first_4_ticks() {
-        // Total descent over the first N ticks (deltas vs initial):
-        //   tick 1: 0  (rate was 0 at integration)
-        //   tick 2: 1  (rate was -1 at integration)
-        //   tick 3: 3  (rate was -2 at integration)
-        //   tick 4: 6  (rate was -3 at integration)
-        let (mut sim, id) = falling(1200);
-
-        for (i, expected_delta) in [0, 1, 3, 6].into_iter().enumerate() {
-            fall(&mut sim, id);
-            assert_eq!(
-                1200 - z(&sim, id),
-                expected_delta,
-                "after tick {} the object should be {expected_delta} leptons lower",
-                i + 1
-            );
-        }
-    }
-
-    #[test]
-    fn test_steady_state_rate() {
-        // After enough ticks past the ramp, rate stays clamped at -3.
-        let (mut sim, id) = falling(1200);
-
-        for _ in 0..10 {
-            fall(&mut sim, id);
-        }
-        assert_eq!(
-            rate(&sim, id),
-            RULES_PARACHUTE_MAX_FALL_RATE,
-            "steady-state rate must equal ParachuteMaxFallRate"
-        );
-    }
-
-    #[test]
-    fn test_landing_inclusive_zero() {
-        // Drop Z = 6 leptons → tick 4 moves the object to height 0 → landing
-        // triggers (inclusive bound). `parachute_state` must be cleared.
-        let (mut sim, id) = falling(6);
-
-        let landed: Vec<bool> = (0..4).map(|_| fall(&mut sim, id)).collect();
-
-        assert_eq!(landed, vec![false, false, false, true]);
-        let entity = sim.substrate.entities.get(id).expect("alive");
-        assert!(
-            entity.parachute_state.is_none(),
-            "landing at height 0 must trigger cleanup"
-        );
-    }
-
-    #[test]
-    fn test_landing_sets_height_zero_no_overshoot() {
-        // Drop Z = 5 leptons. The ramp is 0,-1,-2,-3, so three ticks leave
-        // the object 2 up and the fourth moves it to -1, below ground. That
-        // tick lands it and SetHeight(0) puts it back on the ground.
-        let (mut sim, id) = falling(5);
-
-        for _ in 0..3 {
-            fall(&mut sim, id);
-        }
-        assert_eq!(z(&sim, id), 2);
-        assert_eq!(rate(&sim, id), -3, "the next tick would move it to -1");
-
-        assert!(fall(&mut sim, id), "the overshooting tick lands");
-        let entity = sim.substrate.entities.get(id).expect("alive");
-        assert!(entity.parachute_state.is_none());
-        assert_eq!(entity.position.exact_z_leptons, Some(0), "SetHeight(0)");
-    }
-
-    #[test]
-    fn test_clamp_at_max_fall_rate_default() {
-        // Rate must never exceed (be more-negative than) ParachuteMaxFallRate.
-        let (mut sim, id) = falling(1200);
-
-        for _ in 0..50 {
-            fall(&mut sim, id);
-            if let Some(state) = sim
-                .substrate
-                .entities
-                .get(id)
-                .and_then(|e| e.parachute_state.as_ref())
-            {
-                assert!(
-                    state.rate >= RULES_PARACHUTE_MAX_FALL_RATE,
-                    "rate {} must not exceed (more-negative than) max {}",
-                    state.rate,
-                    RULES_PARACHUTE_MAX_FALL_RATE
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_clamp_with_custom_max_fall_rate() {
-        // Mod-friendliness: a non-default `parachute_max_fall_rate` must be
-        // respected. With max = -1, rate ramp is 0 → -1 → -1 → -1.
-        let (mut sim, id) = falling(1200);
-
-        let mut observed: Vec<i32> = Vec::new();
-        for _ in 0..4 {
-            observed.push(rate(&sim, id));
-            sim.advance_fall(id, -1);
-        }
-        assert_eq!(
-            observed,
-            vec![0, -1, -1, -1],
-            "with max=-1, rate must clamp at -1 after the first decrement"
-        );
-    }
-
-    #[test]
-    fn test_body_sequence_preserved_on_landing() {
-        // Normal paradropped infantry do not switch to the body Paradrop
-        // sequence, so landing should not rewrite the body animation either.
-        let (mut sim, id) = falling(6);
-        let sequence = |sim: &Simulation| {
-            sim.substrate
-                .entities
-                .get(id)
-                .unwrap()
-                .animation
-                .as_ref()
-                .unwrap()
-                .sequence
-        };
-        assert_eq!(sequence(&sim), SequenceKind::Stand);
-
-        for _ in 0..4 {
-            fall(&mut sim, id);
-        }
-
-        assert_eq!(
-            sequence(&sim),
-            SequenceKind::Stand,
-            "landing must preserve the unchanged body sequence"
-        );
-    }
-
-    #[test]
-    fn test_body_sequence_preserved_if_externally_changed() {
-        // If some other system changed the sequence during descent (e.g., a
-        // death anim took over), don't overwrite on landing.
-        let (mut sim, id) = falling(6);
-
-        // Mid-descent, externally change to Die1 (simulating shot down in air).
-        for _ in 0..2 {
-            fall(&mut sim, id);
-        }
-        sim.substrate
-            .entities
-            .get_mut(id)
-            .unwrap()
-            .animation
-            .as_mut()
-            .unwrap()
-            .switch_to(SequenceKind::Die1);
-
-        // Continue ticking through landing.
-        for _ in 0..4 {
-            fall(&mut sim, id);
-        }
-
-        let anim = sim
-            .substrate
-            .entities
-            .get(id)
-            .unwrap()
-            .animation
-            .as_ref()
-            .unwrap();
-        assert_eq!(
-            anim.sequence,
-            SequenceKind::Die1,
-            "must NOT overwrite Die1 with Stand on landing"
-        );
-    }
-
-    #[test]
-    fn test_locomotor_identity_preserved_through_landing() {
-        let (mut sim, id) = falling(6);
-
-        for _ in 0..4 {
-            fall(&mut sim, id);
-        }
-
-        let loco = sim
-            .substrate
-            .entities
-            .get(id)
-            .unwrap()
-            .locomotor
-            .as_ref()
-            .unwrap();
-        assert!(
-            !loco.is_overridden(),
-            "object-level falling must not leave a locomotor override"
-        );
-        assert_eq!(
-            loco.kind,
-            LocomotorKind::Walk,
-            "must preserve base Walk locomotor"
-        );
-    }
-
-    #[test]
-    fn test_works_without_animation() {
-        // begin and the fall must not panic when entity.animation is None.
-        let (mut sim, id) = falling(6);
-        sim.substrate.entities.get_mut(id).unwrap().animation = None;
-
-        for _ in 0..10 {
-            fall(&mut sim, id);
-        }
-        let entity = sim.substrate.entities.get(id).unwrap();
-        assert!(
-            entity.parachute_state.is_none(),
-            "should land cleanly without an animation field"
-        );
-    }
-}
-
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 mod canopy_tests {
     use super::*;
     use crate::rules::art_data::ArtRegistry;
@@ -612,18 +444,26 @@ mod canopy_tests {
         ))
         .expect("rules");
         let mut art = ArtRegistry::from_ini(&IniFile::from_str(
-            "[PARACH]\nRate=900\nLoopStart=2\nLoopEnd=5\nLoopCount=-1\n",
+            "[PARACH]\nRate=900\nLoopStart=2\nLoopEnd=5\nLoopCount=-1\n\
+             [VEHCHUTE]\nRate=900\nLoopStart=2\nLoopEnd=5\nLoopCount=-1\n",
         ));
         art.bind_anim_frame_count_for_test("PARACH", 6);
+        art.bind_anim_frame_count_for_test("VEHCHUTE", 8);
         // Synthetic fixture supplies ART directly, without native read-admission replay.
         rules.install_art_fixture(art);
 
         let mut sim = Simulation::new();
         sim.interner = crate::sim::intern::test_interner();
-        let id = sim.allocate_stable_id();
+        let id = sim.substrate.allocate_stable_id();
         sim.substrate
             .entities
             .insert(GameEntity::test_default(id, "E1", "Americans", 10, 11));
+        sim.substrate
+            .entities
+            .get_mut(id)
+            .unwrap()
+            .lifecycle
+            .set_in_limbo_for_test(false);
         assert!(begin_parachute_descent(
             &mut sim.substrate.entities,
             id,
@@ -635,15 +475,78 @@ mod canopy_tests {
     /// `0x005F5A9D..0x005F5B03`: the object's coordinate plus 75 leptons of Z,
     /// the constructor row, then `SetOwnerObject(object)`.
     #[test]
+    fn landing_targets_the_held_canopy_and_old_expiry_keeps_its_replacement() {
+        let (mut sim, rules, id) = fixture();
+        let first = sim.attach_parachute_anim(&rules, id).unwrap();
+        let current = sim.attach_parachute_anim(&rules, id).unwrap();
+        assert_eq!(
+            sim.entities().get(id).unwrap().parachute_animation(),
+            Some(current)
+        );
+        Simulation::wind_down_parachute_anim(&mut sim.substrate, id);
+        assert_eq!(sim.anim(current).unwrap().runtime().loop_remaining, 0);
+        assert_eq!(
+            sim.anim(first).unwrap().runtime().loop_remaining,
+            u8::MAX,
+            "same owner and type do not make the old Anim the held canopy"
+        );
+        sim.notify_anim_pointer_expired(first);
+        assert_eq!(
+            sim.entities().get(id).unwrap().parachute_animation(),
+            Some(current)
+        );
+        sim.notify_anim_pointer_expired(current);
+        assert_eq!(sim.entities().get(id).unwrap().parachute_animation(), None);
+        assert!(
+            sim.entities().get(id).unwrap().is_parachuted(),
+            "the physical +84 flag is independent of the +88 reference"
+        );
+    }
+
+    #[test]
+    fn canopy_identity_roundtrips_and_reenters_the_expiry_index() {
+        let (mut sim, rules, id) = fixture();
+        let canopy = sim.attach_parachute_anim(&rules, id).unwrap();
+        // Entity serde is the production snapshot payload. Keep this regression
+        // on the new retained field rather than synthetic envelope metadata.
+        let bytes = serde_json::to_vec(sim.entities().get(id).unwrap()).unwrap();
+        let expected = sim.state_hash();
+        sim.notify_anim_pointer_expired(canopy);
+        assert_ne!(sim.state_hash(), expected);
+        let restored: GameEntity = serde_json::from_slice(&bytes).unwrap();
+        sim.substrate.entities.insert(restored);
+        assert_eq!(sim.state_hash(), expected);
+        assert_eq!(
+            sim.entities().get(id).unwrap().parachute_animation(),
+            Some(canopy)
+        );
+        sim.notify_anim_pointer_expired(canopy);
+        assert_eq!(
+            sim.entities().get(id).unwrap().parachute_animation(),
+            None,
+            "the anim-holder index notes a restored entity's held canopy"
+        );
+    }
+
+    /// `0x005F5A9D..0x005F5B03`: the object's coordinate plus 75 leptons of Z,
+    /// the constructor row, then `SetOwnerObject(object)`.
+    #[test]
     fn the_canopy_is_built_75_leptons_above_the_falling_object_and_rides_it() {
         let (mut sim, rules, id) = fixture();
         let anim_id = sim.attach_parachute_anim(&rules, id).expect("canopy");
         let anim = sim.anim(anim_id).unwrap();
-        assert_eq!(sim.interner.resolve(anim.type_id), "PARACH");
-        assert_eq!((anim.draw_flags, anim.z_adjust), (0x600, 0));
-        assert_eq!(anim.owner_entity, Some(id));
+        assert_eq!(sim.interner.resolve(anim.type_id()), "PARACH");
+        assert_eq!((anim.draw_flags(), anim.z_adjust()), (0x600, 0));
+        assert_eq!(anim.owner_entity(), Some(id));
         assert_eq!(
-            anim.world_coord,
+            anim.remap(),
+            Some(crate::sim::anim_class::AnimRemap::House(
+                sim.entities().get(id).unwrap().owner()
+            )),
+            "Paradrop copies the owner's ConvertClass to Anim+0xD4"
+        );
+        assert_eq!(
+            anim.world_coord(),
             AnimWorldCoord { x: 0, y: 0, z: 75 },
             "stored owner-relative: only the lift"
         );
@@ -659,11 +562,24 @@ mod canopy_tests {
 
         // A few frames of descent: the canopy comes down with the object.
         for _ in 0..6 {
-            sim.advance_fall(id, -3);
+            sim.advance_fall(
+                id,
+                -3,
+                crate::rules::ruleset::RuleSet::empty_for_test(),
+                &mut crate::sim::world::FrameEffects::default(),
+            );
         }
         let lower = sim.anim_owner_coords(id).unwrap().z;
         assert!(lower < 600);
         assert_eq!(sim.anim_absolute_coord(anim_id).unwrap().z, lower + 75);
+        let cell = sim.entities().get(id).unwrap().position;
+        assert!(
+            matches!(sim.lighting_sources.pending().as_ref(),
+            [crate::sim::light_sources::LightingEvent::RetainAnimIntensity {
+                anim, cell: Some(sampled),
+            }] if *anim == anim_id && *sampled == (cell.rx(), cell.ry())),
+            "Paradrop samples once at attachment; descent never resamples"
+        );
     }
 
     /// `0x005F3F9D`: landing zeroes the canopy's remaining loops; it is not
@@ -672,14 +588,49 @@ mod canopy_tests {
     fn landing_winds_the_canopy_down_instead_of_removing_it() {
         let (mut sim, rules, id) = fixture();
         let anim_id = sim.attach_parachute_anim(&rules, id).expect("canopy");
-        assert_eq!(sim.anim(anim_id).unwrap().runtime.loop_remaining, u8::MAX);
+        assert_eq!(sim.anim(anim_id).unwrap().runtime().loop_remaining, u8::MAX);
 
-        sim.wind_down_parachute_anim(&rules, id);
+        crate::sim::world::Simulation::wind_down_parachute_anim(&mut sim.substrate, id);
 
         let anim = sim.anim(anim_id).expect("still in the store");
-        assert_eq!(anim.runtime.loop_remaining, 0);
-        assert!(!anim.runtime.inactive);
-        assert_eq!(anim.owner_entity, Some(id));
+        assert_eq!(anim.runtime().loop_remaining, 0);
+        assert!(!anim.runtime().inactive);
+        assert_eq!(anim.owner_entity(), Some(id));
+    }
+
+    /// Ares `HouseTypeExt::GetParachuteAnim @ 0x1001BBC0`: a Side's explicit
+    /// `Parachute.Anim=none` falls back to `PARACH`, not to no canopy.
+    #[test]
+    fn ares_side_parachute_none_falls_back_to_parach() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        let processed = crate::rules::native_processing::RulesLayerStack::new(IniFile::from_str(
+            "[General]\nParachute=OTHER\n[Sides]\nGDI=x\nNod=x\nThirdSide=x\nFourth=x\n\
+             [Fourth]\nParachute.Anim=none\n",
+        ))
+        .process()
+        .expect("side rules");
+        let rules = RuleSet::from_processed_rules(&processed).expect("side projection");
+        let entity = GameEntity::test_default(1, "E1", "Americans", 10, 11);
+        assert_eq!(
+            parachute_anim_name(&rules, &entity, None, 3, None),
+            Some("PARACH")
+        );
+        // A house with no side skips `[General] Parachute=`, and an unset
+        // side with no `[General] Parachute=` also gets `PARACH`.
+        assert_eq!(
+            parachute_anim_name(&rules, &entity, None, -1, None),
+            Some("PARACH")
+        );
+        assert_eq!(
+            parachute_anim_name(&rules, &entity, None, 0, None),
+            Some("OTHER")
+        );
+        let mut empty = rules.clone();
+        empty.general.parachute_shp = None;
+        assert_eq!(
+            parachute_anim_name(&empty, &entity, None, 0, None),
+            Some("PARACH")
+        );
     }
 
     #[test]
@@ -687,7 +638,125 @@ mod canopy_tests {
         let (mut sim, mut rules, id) = fixture();
         rules.general.parachute_shp = None;
         assert_eq!(sim.attach_parachute_anim(&rules, id), None);
-        sim.wind_down_parachute_anim(&rules, id);
+        crate::sim::world::Simulation::wind_down_parachute_anim(&mut sim.substrate, id);
         assert_eq!(sim.substrate.anims.iter().count(), 0);
+    }
+
+    /// The production attachment and wind-down honor the compiled capability,
+    /// even when a caller supplies an extension name directly on GeneralRules.
+    #[test]
+    fn vehicle_parachute_selection_and_landing_respect_the_capability() {
+        let (mut sim, mut rules, id) = fixture();
+        rules.general.vehicle_parachute = Some("VEHCHUTE".to_string());
+        let anim_id = sim.attach_parachute_anim(&rules, id).expect("canopy");
+        let expected = if crate::rules::NPATCH_ENABLED {
+            "VEHCHUTE"
+        } else {
+            "PARACH"
+        };
+        assert_eq!(
+            sim.interner.resolve(sim.anim(anim_id).unwrap().type_id()),
+            expected
+        );
+        crate::sim::world::Simulation::wind_down_parachute_anim(&mut sim.substrate, id);
+        assert_eq!(sim.anim(anim_id).unwrap().runtime().loop_remaining, 0);
+
+        // Infantry keeps Parachute next to the vehicle's custom canopy;
+        // an unset vehicle pointer falls back to it (NPSE C2FA75/C2F939).
+        let infantry = sim.substrate.allocate_stable_id();
+        sim.substrate.entities.insert(
+            crate::sim::game_entity::GameEntity::test_default_of_category(
+                infantry,
+                "E1",
+                "Americans",
+                12,
+                10,
+                crate::map::entities::EntityCategory::Infantry,
+            ),
+        );
+        sim.substrate
+            .entities
+            .get_mut(infantry)
+            .unwrap()
+            .lifecycle
+            .set_in_limbo_for_test(false);
+        let anim_id = sim.attach_parachute_anim(&rules, infantry).expect("canopy");
+        assert_eq!(
+            sim.interner.resolve(sim.anim(anim_id).unwrap().type_id()),
+            "PARACH"
+        );
+
+        // Without the key the vehicle falls back to `Parachute=`.
+        rules.general.vehicle_parachute = None;
+        let vehicle_id = sim.substrate.allocate_stable_id();
+        sim.substrate
+            .entities
+            .insert(crate::sim::game_entity::GameEntity::test_default(
+                vehicle_id,
+                "E1",
+                "Americans",
+                14,
+                10,
+            ));
+        sim.substrate
+            .entities
+            .get_mut(vehicle_id)
+            .unwrap()
+            .lifecycle
+            .set_in_limbo_for_test(false);
+        let fallback = sim
+            .attach_parachute_anim(&rules, vehicle_id)
+            .expect("canopy");
+        assert_eq!(
+            sim.interner.resolve(sim.anim(fallback).unwrap().type_id()),
+            "PARACH"
+        );
+    }
+
+    /// NPSE ReadGeneral C31005..C31017 allocates the named AnimType and
+    /// retains its pointer on an empty read; FindOrAllocate clears `none`.
+    #[test]
+    fn vehicle_parachute_reader_admits_the_asset_and_retains_layered_values() {
+        use crate::rules::native_processing::{RulesLayerKind, RulesLayerStack};
+
+        let mut layers =
+            RulesLayerStack::new(IniFile::from_str("[General]\nVehicleParachute=vehchute\n"));
+        let art = IniFile::from_str("[vehchute]\nRate=900\nLoopCount=-1\n");
+        let rules =
+            RuleSet::from_processed_rules(&layers.process_with_fixed_art(&art).unwrap()).unwrap();
+        assert_eq!(
+            rules.general.vehicle_parachute.as_deref(),
+            crate::rules::NPATCH_ENABLED.then_some("VEHCHUTE")
+        );
+        assert_eq!(
+            rules
+                .anim_type_names
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("vehchute")),
+            crate::rules::NPATCH_ENABLED,
+            "a canopy referenced only by this key must be allocated and read"
+        );
+        assert_eq!(
+            crate::rules::effect_asset_catalog::anim_class_roots(&rules)
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("vehchute")),
+            crate::rules::NPATCH_ENABLED,
+            "the production loader must bind the custom canopy"
+        );
+        layers.push(
+            RulesLayerKind::GameMode,
+            IniFile::from_str("[General]\nVehicleParachute=\n"),
+        );
+        let rules = RuleSet::from_rules_layers(&layers).unwrap();
+        assert_eq!(
+            rules.general.vehicle_parachute.as_deref(),
+            crate::rules::NPATCH_ENABLED.then_some("VEHCHUTE")
+        );
+        layers.push(
+            RulesLayerKind::Scenario,
+            IniFile::from_str("[General]\nVehicleParachute=<none>\n"),
+        );
+        let rules = RuleSet::from_rules_layers(&layers).unwrap();
+        assert_eq!(rules.general.vehicle_parachute, None);
     }
 }

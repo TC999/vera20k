@@ -92,7 +92,7 @@ fn root<H: OrdinaryDamageHost>(
     }
     if collapsed {
         //57C990/57C870 and57DC20/57DAF0 scan after sibling callbacks. Membership is
-        // live, and the untagged575EE0 traversal still performs cell lookups.
+        // live; 575EE0 performs every cell lookup and raises event31 on Tags.
         let first = endpoint(host, point, -along.0, -along.1, family);
         let last = endpoint(host, point, along.0, along.1, family);
         host.notify_span(first, last)?;
@@ -206,6 +206,6 @@ fn propagate<H: OrdinaryBridgeHost>(
     recalc_and_occupants(host, [center, negative, positive], u8::from(collapsed))
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 #[path = "ordinary_damage_tests.rs"]
 mod tests;

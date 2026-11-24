@@ -10,18 +10,185 @@
 
 use crate::app::types::HoverTargetKind;
 use crate::map::entities::EntityCategory;
-use crate::map::terrain::TacticalBridgeLookup;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::entity_store::EntityStore;
 use crate::sim::intern::InternedId;
+use crate::sim::occupancy::CellObjectMember;
 use crate::sim::vision::FogState;
+use crate::sim::world::ControlProjection;
+
+/// Selection uses the last prepared presentation sample, not a temporary
+/// mutation of authoritative entities. Native callers/tests retain raw geometry.
+pub(crate) trait PickSource: Copy {
+    fn entities(&self) -> &EntityStore;
+    /// Type facts are supplied by the live presentation view. Bare stores used
+    /// for Tactical6DA380 fixtures have no rules and leave Display's gate open.
+    fn type_invisible(&self, _entity: &crate::sim::game_entity::GameEntity) -> bool {
+        false
+    }
+    /// A Building whose type has `InvisibleInGame=` (Type+0x1701).
+    /// `AppendVisibleBuildingSelectables @ 0x006D9CE0` never registers one
+    /// (0x006D9D5E..0x006D9D6C), so neither the point pick's anchor pass nor
+    /// the band scan meets it.
+    fn invisible_in_game_building(&self, _entity: &crate::sim::game_entity::GameEntity) -> bool {
+        false
+    }
+    fn screen_position(&self, entity: &crate::sim::game_entity::GameEntity) -> (f32, f32) {
+        crate::render::locomotor_visual::screen_position(entity)
+    }
+    /// The cell's ground-list head the point picker falls back to. A bare
+    /// EntityStore has no cell lists.
+    fn first_ground_cell_object(&self, _cell: (u16, u16)) -> Option<CellObjectMember> {
+        None
+    }
+    /// The cell's first Building (`Look_up_building_in_cell @ 0x0047C520`)
+    /// when the session plays with FogOfWar (Scenario bit `0x1000`). A bare
+    /// EntityStore has neither.
+    fn fog_of_war_cell_building(&self, _cell: (u16, u16)) -> Option<u64> {
+        None
+    }
+    /// Has the presentation left this object out of the draw plan? No pick
+    /// may find what is not drawn. Only VERA's translucent fog does this;
+    /// native draws every object and lets the A buffer darken it.
+    fn conceals(&self, _entity: &crate::sim::game_entity::GameEntity) -> bool {
+        false
+    }
+    /// `HouseClass::IsHumanPlayer @ 0x0050B6F0` of the object's owning house,
+    /// the one owner test on the band path. `DisplayClass::BandBox_LeftUp @
+    /// 0x004AB9B0` hands the per-object callback `0x004AC2B0` to the band
+    /// walk (`0x004ABCE6` → `0x006D9FF0`, which normalises the rectangle and
+    /// calls `Tactical::Select_These @ 0x006DA5C0` at `0x006DA05A`). The walk
+    /// calls that callback for every live drawn object inside the rectangle
+    /// (`0x006DA67E..0x006DA684`, `0x006DA729`), and the callback
+    /// asks `+0x3C` GetOwningHouse (`0x004AC2B5`) then `0x50B6F0` of it
+    /// (`0x004AC2BE..0x004AC2C5`) before the selectability virtuals `+0x138`
+    /// and `+0x13C`, the limbo byte `+0x81` and `Select` `+0x14C`. The
+    /// callback-less arm of Select_These asks the same question
+    /// (`0x006DA6B3..0x006DA6C7`). Nothing on this path compares the owner
+    /// with the local player's House pointer, so a campaign House flagged
+    /// `PlayerControl=yes` (SOV04's Germans, Premier Romanov's owner)
+    /// band-selects exactly like the player's own House.
+    ///
+    /// Band and shift-click use ControlProjection::can_order (0x0050B6F0).
+    /// TypeSelect uses ControlProjection::can_select, including the narrower
+    /// mode-zero PlayerControl test (0x00732580, 0x00732770, 0x006DA770).
+    /// A bare EntityStore leaves the caller's exact-owner fallback in place.
+    fn selection_control(&self) -> Option<ControlProjection<'_>> {
+        None
+    }
+}
+impl PickSource for &EntityStore {
+    fn entities(&self) -> &EntityStore {
+        self
+    }
+}
+
+pub(crate) trait PickWorld: PickSource {
+    fn simulation(&self) -> &crate::sim::world::Simulation;
+    /// The rules the Ground draw order reads (`Simulation::ground_draw_order`).
+    fn rules(&self) -> Option<&RuleSet> {
+        None
+    }
+}
+impl PickSource for &crate::sim::world::Simulation {
+    fn entities(&self) -> &EntityStore {
+        crate::sim::world::Simulation::entities(self)
+    }
+    fn first_ground_cell_object(&self, cell: (u16, u16)) -> Option<CellObjectMember> {
+        crate::sim::world::Simulation::first_ground_cell_object(self, cell)
+    }
+    fn fog_of_war_cell_building(&self, cell: (u16, u16)) -> Option<u64> {
+        if !self.session().game_options().fog_of_war {
+            return None;
+        }
+        self.occupancy().first_building_on_layer(
+            cell.0,
+            cell.1,
+            crate::sim::movement::locomotor::MovementLayer::Ground,
+        )
+    }
+    fn selection_control(&self) -> Option<ControlProjection<'_>> {
+        Some(self.control_projection())
+    }
+}
+impl PickWorld for &crate::sim::world::Simulation {
+    fn simulation(&self) -> &crate::sim::world::Simulation {
+        self
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PresentedWorld<'a> {
+    pub sim: &'a crate::sim::world::Simulation,
+    pub rules: Option<&'a RuleSet>,
+    /// [`crate::app::presentation::instances::translucent_fog_viewer`].
+    pub translucent_viewer: Option<InternedId>,
+}
+impl PickSource for PresentedWorld<'_> {
+    fn type_invisible(&self, entity: &crate::sim::game_entity::GameEntity) -> bool {
+        self.rules
+            .and_then(|rules| self.sim.object_type(entity.type_ref(), rules))
+            .is_some_and(|object| object.invisible)
+    }
+    fn invisible_in_game_building(&self, entity: &crate::sim::game_entity::GameEntity) -> bool {
+        entity.category() == EntityCategory::Structure
+            && self
+                .rules
+                .and_then(|rules| self.sim.object_type(entity.type_ref(), rules))
+                .is_some_and(|object| object.invisible_in_game)
+    }
+    fn entities(&self) -> &EntityStore {
+        self.sim.entities()
+    }
+    fn screen_position(&self, entity: &crate::sim::game_entity::GameEntity) -> (f32, f32) {
+        let (x, y) = crate::render::locomotor_visual::screen_position(entity);
+        (x, y - f32::from(entity.ion_blast_lift_pixels()))
+    }
+    fn first_ground_cell_object(&self, cell: (u16, u16)) -> Option<CellObjectMember> {
+        self.sim.first_ground_cell_object(cell)
+    }
+    fn fog_of_war_cell_building(&self, cell: (u16, u16)) -> Option<u64> {
+        PickSource::fog_of_war_cell_building(&self.sim, cell)
+    }
+    fn conceals(&self, entity: &crate::sim::game_entity::GameEntity) -> bool {
+        self.translucent_viewer.is_some_and(|viewer| {
+            crate::app::presentation::instances::translucent_fog_conceals(
+                self.sim,
+                viewer,
+                &entity.position,
+                entity.owner(),
+            )
+        })
+    }
+    fn selection_control(&self) -> Option<ControlProjection<'_>> {
+        Some(self.sim.control_projection())
+    }
+}
+impl PickWorld for PresentedWorld<'_> {
+    fn simulation(&self) -> &crate::sim::world::Simulation {
+        self.sim
+    }
+    fn rules(&self) -> Option<&RuleSet> {
+        self.rules
+    }
+}
+pub(crate) fn presented<'a>(
+    state: &'a crate::app::AppState,
+    sim: &'a crate::sim::world::Simulation,
+) -> PresentedWorld<'a> {
+    PresentedWorld {
+        sim,
+        rules: state.rules(),
+        translucent_viewer: crate::app::presentation::instances::translucent_fog_viewer(state, sim),
+    }
+}
 
 /// Elliptical distance threshold for picking objects at a screen point.
 /// `dx*dx + 0.5*dy*dy < 200` with 0.5 Y-weight compensating for isometric projection.
 /// Max horizontal reach: sqrt(200) ≈ 14px, max vertical reach: sqrt(400) = 20px.
 const PICK_DISTANCE_THRESHOLD: f32 = 200.0;
 /// The simulation's house table, as the picker needs it: owner → player state.
-type HouseStates = std::collections::BTreeMap<InternedId, crate::sim::house_state::HouseState>;
+type HouseStates = crate::sim::houses::Houses;
 
 /// Ordered calls into the native selection vector. `clear` runs first,
 /// `deselect` removes exact members without disturbing survivors, and `select`
@@ -57,166 +224,220 @@ fn pick_distance_sq(dx: f32, dy: f32) -> f32 {
     dx * dx + PICK_Y_WEIGHT * dy * dy
 }
 
-pub(crate) fn pick_enemy_target_stable_id(
-    sim: &crate::sim::world::Simulation,
-    world_x: f32,
-    world_y: f32,
-    friendly_owner: &str,
-    ignore_visibility: bool,
-    rules: Option<&RuleSet>,
-    height_map: &std::collections::BTreeMap<(u16, u16), u8>,
-    bridge_cells: Option<&dyn TacticalBridgeLookup>,
-) -> Option<u64> {
-    hover_target_at_point(
-        sim,
-        world_x,
-        world_y,
-        friendly_owner,
-        ignore_visibility,
-        rules,
-        height_map,
-        bridge_cells,
-    )
-    .and_then(|hover| match hover.kind {
-        HoverTargetKind::EnemyUnit | HoverTargetKind::EnemyStructure => Some(hover.stable_id),
-        _ => None,
-    })
-}
-
-/// Force-fire: pick any entity under cursor (including friendlies).
-pub(crate) fn pick_any_target_stable_id(
-    sim: &crate::sim::world::Simulation,
-    world_x: f32,
-    world_y: f32,
-    ignore_visibility: bool,
-    rules: Option<&RuleSet>,
-    height_map: &std::collections::BTreeMap<(u16, u16), u8>,
-    bridge_cells: Option<&dyn TacticalBridgeLookup>,
-) -> Option<u64> {
-    // Use empty owner so everything is considered "enemy" in hover logic.
-    hover_target_at_point(
-        sim,
-        world_x,
-        world_y,
-        "",
-        ignore_visibility,
-        rules,
-        height_map,
-        bridge_cells,
-    )
-    .filter(|hover| hover.kind != HoverTargetKind::HiddenEnemy)
-    .map(|hover| hover.stable_id)
-}
-
-pub(crate) fn hover_target_at_point(
-    sim: &crate::sim::world::Simulation,
+/// The object under the cursor that DetermineAction sees, for the cursor and
+/// the click. ProcessClickCoords692515 calls TacticalPick6DA380 once before
+/// passing that same identity to DetermineAction and LeftUp693271/69328B:
+/// a Techno classified for the local player, or a Terrain object.
+pub(crate) fn hover_object_at_point(
+    source: impl PickWorld,
     world_x: f32,
     world_y: f32,
     local_owner: &str,
     ignore_visibility: bool,
-    rules: Option<&RuleSet>,
-    height_map: &std::collections::BTreeMap<(u16, u16), u8>,
-    bridge_cells: Option<&dyn TacticalBridgeLookup>,
-) -> Option<HoverTargetKindWithId> {
-    let local_owner_id: InternedId = sim.interner.get(local_owner).unwrap_or_default();
-    let mut best: Option<(u64, f32)> = None;
-    for entity in sim.entities().values() {
-        let is_structure = entity.category == EntityCategory::Structure;
-        let type_str = sim.interner.resolve(entity.type_ref());
-        let owner_str = sim.interner.resolve(entity.owner());
-        let (sx, sy) = if is_structure {
-            crate::render::locomotor_visual::screen_position(entity)
-        } else {
-            crate::app::presentation::instances::interpolated_screen_position_entity(entity)
-        };
-        // Hit test: structures use foundation cells, mobile units use elliptical distance.
-        if is_structure {
-            let foundation = rules
-                .and_then(|r| r.object(type_str))
-                .map(|o| o.foundation.as_str())
-                .unwrap_or("1x1");
-            if !click_hits_foundation(
-                world_x,
-                world_y,
-                entity.position.rx,
-                entity.position.ry,
-                foundation,
-                height_map,
-                bridge_cells,
-            ) {
-                continue;
+) -> Option<HoverObject> {
+    hover_object_in_frame(
+        source,
+        None,
+        world_x,
+        world_y,
+        local_owner,
+        ignore_visibility,
+    )
+}
+
+/// [`hover_object_at_point`], scoring only the objects whose span in `frame`
+/// lies near the point ([`may_pick`]), without reading the others. `frame`
+/// is captured from `source`'s world; the pick finds the same object.
+fn hover_object_in_frame(
+    source: impl PickWorld,
+    frame: Option<&crate::app::presentation::frame::PresentationFrame>,
+    world_x: f32,
+    world_y: f32,
+    local_owner: &str,
+    ignore_visibility: bool,
+) -> Option<HoverObject> {
+    use crate::app::presentation::display_members::ObjectKind;
+    let sim = source.simulation();
+    let fog = (!ignore_visibility).then_some(sim.fog());
+    let pick = |order: &mut dyn Iterator<Item = &u64>| {
+        pick_object_at_point(
+            source,
+            order,
+            fog,
+            sim.interner().get(local_owner),
+            world_x,
+            world_y,
+            sim.resolved_terrain(),
+        )
+    };
+    let picked = match frame {
+        Some(frame) => {
+            let picked = pick(
+                &mut frame
+                    .display_members(sim)
+                    .objects()
+                    .iter()
+                    .filter(|member| match member.kind {
+                        ObjectKind::Record { span, .. } => may_pick(span, world_x, world_y),
+                        ObjectKind::Bullet | ObjectKind::Debris => false,
+                    })
+                    .map(|member| &member.id),
+            );
+            // The cross-check picks again over every drawn object: debug
+            // builds only.
+            if cfg!(debug_assertions) {
+                let unfiltered = pick(
+                    &mut crate::app::presentation::instances::display_draw_ids(sim, source.rules())
+                        .iter(),
+                );
+                assert_eq!(
+                    picked, unfiltered,
+                    "the pick's pre-filter passed by the object at {world_x}, {world_y}"
+                );
             }
-        } else {
-            let dx = sx - world_x;
-            let dy = sy - world_y;
-            if pick_distance_sq(dx, dy) >= PICK_DISTANCE_THRESHOLD {
-                continue;
-            }
+            picked
         }
-        // Distance for tie-breaking (prefer closest to anchor point).
-        let dx = sx - world_x;
-        let dy = sy - world_y;
-        let dist_sq = dx * dx + dy * dy;
-        let is_friendly = sim.fog.is_friendly(local_owner, owner_str);
-        let is_visible = ignore_visibility
-            || (sim
-                .fog
-                .is_cell_revealed(local_owner_id, entity.position.rx, entity.position.ry)
-                && !sim.fog.is_cell_gap_covered(
-                    local_owner_id,
-                    entity.position.rx,
-                    entity.position.ry,
-                ));
-        let kind = if is_friendly {
-            if is_structure {
-                HoverTargetKind::FriendlyStructure
-            } else {
-                HoverTargetKind::FriendlyUnit
-            }
-        } else if !is_visible {
-            HoverTargetKind::HiddenEnemy
-        } else if is_structure {
-            HoverTargetKind::EnemyStructure
-        } else {
-            HoverTargetKind::EnemyUnit
-        };
-        match best {
-            Some((_, best_dist_sq)) if dist_sq >= best_dist_sq => {}
-            _ => best = Some((encode_hover_kind_with_id(kind, entity.stable_id()), dist_sq)),
+        None => pick(
+            &mut crate::app::presentation::instances::display_draw_ids(sim, source.rules()).iter(),
+        ),
+    };
+    let stable_id = match picked? {
+        CellObjectMember::Entity(id) => id,
+        CellObjectMember::Terrain(id) => return Some(HoverObject::Terrain(id)),
+    };
+    hover_object_by_id(sim, stable_id, local_owner)
+}
+
+/// Whether an object whose span is `span` can win the pick at `x`, `y`: its
+/// pick point lies in the span, and `dx² + 0.5·dy² < 200`
+/// ([`PICK_DISTANCE_THRESHOLD`]) needs `|dx|` under 14.2 and `|dy|` under 20.
+fn may_pick(span: crate::app::presentation::display_members::ScreenSpan, x: f32, y: f32) -> bool {
+    (span.x - x).abs() < 15.0 && y > span.top - 21.0 && y < span.bottom + 21.0
+}
+
+/// [`hover_object_at_point`] at the cursor for the local player: the one
+/// TacticalPick of a frame, whose target both the cursor's action and the
+/// hover health bar read. With the world home the frame is the home
+/// world's, so the pick asks only the objects near the cursor.
+pub(crate) fn cursor_hover_object(state: &crate::app::AppState) -> Option<HoverObject> {
+    let host = &state.match_state.sim_runtime;
+    let sim = &host.runtime()?.simulation;
+    let frame = (!host.is_lent()).then(|| host.frame()).flatten();
+    let owner = crate::app::input::commands::preferred_local_owner_name(state)?;
+    let (world_x, world_y) = crate::app::match_runtime::sim_tick::screen_point_to_world(
+        state,
+        state.match_state.input.cursor_x,
+        state.match_state.input.cursor_y,
+    );
+    tactical_hover_object_at_point(
+        presented(state, sim),
+        frame,
+        world_x,
+        world_y,
+        &owner,
+        state.match_state.sandbox_full_visibility,
+        crate::app::input::campaign_input::is_locked(state),
+    )
+}
+
+/// Live tactical hover admission, separate from raw geometric picking.
+/// ScrollClass::UpdateMouseScrolling (0x00692F30, gate 0x00692F3D) skips
+/// TacticalPick while input is locked. All frame hover consumers share this
+/// gate, including health bars, even while the hidden pointer keeps moving.
+/// Native Display (0x004AAEEC) sets Techno+0x431 and Techno AI (0x006F9E65)
+/// clears it. This immediate suppression does not retain that old flag until
+/// its object's next AI visit; lock/pause transition timing remains a residual.
+fn tactical_hover_object_at_point(
+    source: impl PickWorld,
+    frame: Option<&crate::app::presentation::frame::PresentationFrame>,
+    world_x: f32,
+    world_y: f32,
+    local_owner: &str,
+    ignore_visibility: bool,
+    input_locked: bool,
+) -> Option<HoverObject> {
+    if input_locked {
+        return None;
+    }
+    hover_object_in_frame(
+        source,
+        frame,
+        world_x,
+        world_y,
+        local_owner,
+        ignore_visibility,
+    )
+}
+
+/// Classify an identity already picked by a retained input source (radar or
+/// tactical). Do not perform another geometric pick at its coordinates.
+pub(crate) fn hover_object_by_id(
+    sim: &crate::sim::world::Simulation,
+    stable_id: u64,
+    local_owner: &str,
+) -> Option<HoverObject> {
+    let entity = sim.entities().get(stable_id)?;
+    let is_structure = entity.category() == EntityCategory::Structure;
+    // What_Action asks the actor's house, here the local player's
+    // (HouseClass::Is_Ally_ByObject4F9A90 at 7003C4).
+    let is_friendly = crate::map::houses::is_allied_with(
+        sim.house_alliances().as_map(),
+        local_owner,
+        sim.interner().resolve(entity.owner()),
+    );
+    let kind = match (is_friendly, is_structure) {
+        (true, true) => HoverTargetKind::FriendlyStructure,
+        (true, false) => HoverTargetKind::FriendlyUnit,
+        (false, true) => HoverTargetKind::EnemyStructure,
+        (false, false) => HoverTargetKind::EnemyUnit,
+    };
+    Some(HoverObject::Techno(HoverTargetKindWithId {
+        kind,
+        stable_id,
+    }))
+}
+
+/// The Techno [`hover_object_at_point`] finds, for consumers that answer a
+/// Terrain object under the cursor as its cell.
+pub(crate) fn hover_target_at_point(
+    source: impl PickWorld,
+    world_x: f32,
+    world_y: f32,
+    local_owner: &str,
+    ignore_visibility: bool,
+) -> Option<HoverTargetKindWithId> {
+    hover_object_at_point(source, world_x, world_y, local_owner, ignore_visibility)?.techno()
+}
+
+/// What [`hover_object_at_point`] found under the cursor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HoverObject {
+    Techno(HoverTargetKindWithId),
+    /// A Terrain object, reached only through the clicked cell's list.
+    Terrain(u64),
+}
+
+impl HoverObject {
+    pub(crate) fn techno(self) -> Option<HoverTargetKindWithId> {
+        match self {
+            Self::Techno(target) => Some(target),
+            Self::Terrain(_) => None,
         }
     }
-    best.map(|(encoded, _)| decode_hover_kind_with_id(encoded))
+
+    /// The object's id in the shared runtime-object namespace.
+    pub(crate) fn id(self) -> u64 {
+        match self {
+            Self::Techno(target) => target.stable_id,
+            Self::Terrain(id) => id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HoverTargetKindWithId {
     pub(crate) kind: HoverTargetKind,
     pub(crate) stable_id: u64,
-}
-
-fn encode_hover_kind_with_id(kind: HoverTargetKind, stable_id: u64) -> u64 {
-    let kind_bits = match kind {
-        HoverTargetKind::FriendlyUnit => 1u64,
-        HoverTargetKind::FriendlyStructure => 2,
-        HoverTargetKind::EnemyUnit => 3,
-        HoverTargetKind::EnemyStructure => 4,
-        HoverTargetKind::HiddenEnemy => 5,
-    };
-    (stable_id << 3) | kind_bits
-}
-
-fn decode_hover_kind_with_id(encoded: u64) -> HoverTargetKindWithId {
-    let kind = match encoded & 0b111 {
-        1 => HoverTargetKind::FriendlyUnit,
-        2 => HoverTargetKind::FriendlyStructure,
-        3 => HoverTargetKind::EnemyUnit,
-        4 => HoverTargetKind::EnemyStructure,
-        _ => HoverTargetKind::HiddenEnemy,
-    };
-    HoverTargetKindWithId {
-        kind,
-        stable_id: encoded >> 3,
-    }
 }
 
 #[cfg(test)]
@@ -228,12 +449,8 @@ pub(crate) fn compute_click_selection_snapshot(
     local_owner: Option<&str>,
     world_x: f32,
     world_y: f32,
-    click_radius: f32,
     additive: bool,
     rules: Option<&RuleSet>,
-    houses: Option<&HouseStates>,
-    height_map: &std::collections::BTreeMap<(u16, u16), u8>,
-    bridge_cells: Option<&dyn TacticalBridgeLookup>,
     interner: Option<&crate::sim::intern::StringInterner>,
 ) -> Option<SelectionMutation> {
     compute_click_selection_snapshot_with_playfield(
@@ -244,52 +461,41 @@ pub(crate) fn compute_click_selection_snapshot(
         local_owner,
         world_x,
         world_y,
-        click_radius,
         additive,
         rules,
-        houses,
-        height_map,
-        bridge_cells,
         interner,
         false,
+        None,
     )
 }
 
 pub(crate) fn compute_click_selection_snapshot_with_playfield(
-    entities: &EntityStore,
+    source: impl PickSource,
     encounter_order: &[u64],
     current_selection: &[u64],
     fog: Option<&FogState>,
     local_owner: Option<&str>,
     world_x: f32,
     world_y: f32,
-    click_radius: f32,
     additive: bool,
     rules: Option<&RuleSet>,
-    houses: Option<&HouseStates>,
-    height_map: &std::collections::BTreeMap<(u16, u16), u8>,
-    bridge_cells: Option<&dyn TacticalBridgeLookup>,
     interner: Option<&crate::sim::intern::StringInterner>,
     require_playfield_membership: bool,
+    terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
 ) -> Option<SelectionMutation> {
+    let entities = source.entities();
     let Some(picked_sid) = pick_entity_at_point(
-        entities,
+        source,
         encounter_order,
         fog,
         local_owner,
         world_x,
         world_y,
-        click_radius,
-        rules,
-        houses,
-        height_map,
-        bridge_cells,
         interner,
+        terrain,
     ) else {
         // Non-shift click clears selection; shift-click with no hit keeps it.
-        return if additive {
-            None
-        } else if current_selection.is_empty() {
+        return if additive || current_selection.is_empty() {
             None
         } else {
             Some(SelectionMutation {
@@ -301,56 +507,53 @@ pub(crate) fn compute_click_selection_snapshot_with_playfield(
 
     let picked = entities.get(picked_sid)?;
     let type_str = interner.map_or("", |i| i.resolve(picked.type_ref()));
-    // With no selection, DisplayDetermineAction69261B ->692762..692778
-    // refuses ACTION_SELECT for retained Techno+3D4. A nonempty selection
-    // delegates to WhatActionOnObject; its source/target and modifier gates
-    // differ. Don't apply this leaf to that path or forced/type selection.
-    let admitted = (!current_selection.is_empty() || !picked.is_mission_only())
+    // A nonempty selection delegates to WhatActionOnObject; its source/target
+    // and modifier gates differ. Don't apply the no-selection leaf to that
+    // path or forced/type selection.
+    let player = local_owner.and_then(|owner| interner.and_then(|i| i.get(owner)));
+    let admitted = (!current_selection.is_empty()
+        || !no_selection_refuses_select(picked, fog, player))
         && static_selection_gate(picked, type_str, rules, require_playfield_membership);
     // A shift-click adds when the selection it is joining is the local player's,
-    // whatever was clicked. The native ACTION_SELECT arm asks
+    // whatever was clicked. The native toggle-select arm (action 8,
+    // `cmp ebx, 8` at 0x004ABD24; the ordinary ACTION_SELECT arm at
+    // 0x004ABDC5..0x004ABE4A is the one that clears first) asks
     // `HouseClass__IsHumanPlayer(CurrentObjects[0]->Owner)` — 0x004ABD42 loads
     // `CurrentObjects[0]`, calls its owner virtual `+0x3C`, and 0x004ABD50 calls
-    // 0x0050B6F0, whose real test is `house == g_PlayerPtr`; a false answer at
-    // 0x004ABD57 jumps to the replace path. It is a test on what is ALREADY
-    // selected, never on whether the clicked object matches it.
+    // 0x0050B6F0 (`house == g_PlayerPtr` in a nonzero game mode, 0x0050B716;
+    // the House's IsHuman/PlayerControl bytes in a campaign, 0x0050B6F9 and
+    // 0x0050B703); a false answer at 0x004ABD57 jumps to the replace path. It
+    // is a test on what is ALREADY selected, never on whether the clicked
+    // object matches it.
     //
     // Enemy clicks genuinely reach this arm. `TechnoClass__What_Action_OnObject`
-    // 0x006FFEC0 short-circuits to ACTION_SELECT at 0x00700107 whenever the
+    // 0x006FFEC0 short-circuits to toggle-select (`mov eax, 8` at 0x00700107)
+    // whenever the
     // Shift pair `DAT_00A8EC08`/`0C` is down and the Ctrl pair is not — gated on
     // `IsHumanPlayer` of the SELECTED object's owner `[ESI+0x21C]`, with no test
     // on the clicked object at all.
     //
     // That first test is only half the decision. The arm's add branch calls the
-    // clicked object's vtable `+0x14C` Select (TechnoClass vtable base
-    // 0x007F4960, slot 0x007F4AAC = `TechnoClass__Select` 0x006FBFA0), which
-    // always reaches `ObjectClass__Select` 0x005F4520. With a non-empty
-    // selection that body compares `IsHumanPlayer` of the NEW object against
-    // `IsHumanPlayer` of `CurrentObjects[0]` (0x005F45D2/0x005F45DF): differing
-    // answers fall to `Unselect_All_With_Mode_Reset` 0x0048DC90 at 0x005F45F8,
-    // and equal answers keep the selection only when that answer was true
-    // (0x005F45EF/0x005F45F6). So the selection survives a shift-click only when
-    // BOTH sides are the local player's — shift-clicking an enemy while your own
-    // army is selected drains the army and leaves the enemy alone selected.
+    // clicked object's vtable `+0x14C` Select (`TechnoClass__Select`
+    // 0x006FBFA0, 0x004ABDBA), whose `ObjectClass__Select` 0x005F4520 runs
+    // `Unselect_All_With_Mode_Reset` 0x0048DC90 (0x005F45AF..0x005F45F8) when
+    // the new object is not the player's. The selection ledger owns that Select
+    // (`resolve_selection_mutation`): shift-clicking an enemy while your own
+    // army is selected drains the army and leaves the enemy alone selected,
+    // and an enemy that Select refuses leaves the army selected.
+    // Residual: a pick this gate refuses answers no snapshot, so it starts no
+    // action-line timer; native starts it after the toggle arm (0x004ABFAE).
+    // Visible only as a missing line flash on such a refused Shift-click.
     //
     // VERA-internal: gamemd always has a `g_PlayerPtr`, so it has no answer for
     // "the local house is unknown". Sandbox and test callers pass no owner, and
     // those keep the ordinary add/toggle rather than being forced down the
     // replace path. gamemd equivalent UNCHECKED because the state cannot arise —
     // both production call sites always pass a resolved owner and interner.
-    let owner_is_local = |entity: &crate::sim::game_entity::GameEntity| -> bool {
-        match (local_owner, interner) {
-            (Some(owner), Some(names)) => names.resolve(entity.owner()).eq_ignore_ascii_case(owner),
-            _ => true,
-        }
-    };
-    let selection_is_local = current_selection
-        .first()
-        .and_then(|id| entities.get(*id))
-        .is_some_and(|first| owner_is_local(first));
-    let picked_is_local = owner_is_local(picked);
+    let selection_is_local =
+        first_selected_is_players(source, current_selection, local_owner, interner);
 
-    if !additive || current_selection.is_empty() || !selection_is_local || !picked_is_local {
+    if !additive || current_selection.is_empty() || !selection_is_local {
         return Some(SelectionMutation {
             clear: true,
             select: admitted.then_some(picked_sid).into_iter().collect(),
@@ -370,6 +573,28 @@ pub(crate) fn compute_click_selection_snapshot_with_playfield(
     }
 }
 
+/// BandBox_LeftUp's toggle arm (action 8) runs only while the first selected
+/// object's House passes IsHumanPlayer (`0x004ABD35..0x004ABD57`,
+/// `0x0050B6F0`); otherwise the click becomes action 7, which unselects all
+/// (`0x004ABE4A`) before it selects, with or without T held (`0x004ABE67`).
+fn first_selected_is_players(
+    source: impl PickSource,
+    current_selection: &[u64],
+    local_owner: Option<&str>,
+    interner: Option<&crate::sim::intern::StringInterner>,
+) -> bool {
+    current_selection
+        .first()
+        .and_then(|id| source.entities().get(*id))
+        .is_some_and(|entity| match (local_owner, interner) {
+            (Some(owner), Some(names)) => source
+                .selection_control()
+                .map(|control| control.can_order(entity.owner()))
+                .unwrap_or_else(|| names.resolve(entity.owner()).eq_ignore_ascii_case(owner)),
+            _ => true,
+        })
+}
+
 /// Did the band box catch anything at all?
 ///
 /// gamemd asks this before it clears the selection, and the question is far
@@ -384,78 +609,114 @@ pub(crate) fn compute_click_selection_snapshot_with_playfield(
 /// filter: an object without map presence is never in the drawn-object list, so
 /// a passenger inside a transport cannot make a rectangle "non-empty".
 ///
-/// The list is **partly** visibility-filtered, and the asymmetry is native:
-/// mobile objects append themselves from inside their own draw routine, so an
-/// object the shroud hides is never registered, while buildings are appended in
-/// bulk from the whole building array with no visibility test at all. A building
-/// under unexplored shroud therefore does make a rectangle non-empty, and an
-/// enemy unit under it does not.
+/// The list is not shroud-filtered. Mobile objects append themselves from
+/// inside their own draw routine (`UnitClass::DrawIt` registers at
+/// `0x0073CF6B`), which the object loop `0x006D8DB0` reaches with no shroud
+/// test, the shroud only masking their pixels; buildings are appended in bulk
+/// from the whole building array. A rectangle over black shroud therefore
+/// catches an enemy beneath it and replaces the selection. The loop's FogOfWar
+/// test, `MapClass::IsFogged @ 0x005865E0`, always answers no, so FogOfWar
+/// changes nothing here.
 ///
-/// The registration helper has exactly four call sites, and every one of them is
-/// the same virtual — the per-class "draw extras" override — reached once from
-/// the vehicle version, twice from the infantry version (its two draw paths) and
-/// once from the aircraft version. Nothing outside a draw routine registers an
-/// object, so the shroud filter above is complete: there is no second, unfiltered
-/// path by which a hidden enemy could enter the list.
+/// The registration helper (`0x006D9EF0`) is called only from draw routines:
+/// `UnitClass::DrawIt`, `InfantryClass::DrawIt` (its two draw paths),
+/// `AircraftClass::Draw_It` and the VeinholeMonster's draw (`0x0074D558`,
+/// Tiberian Sun content). Nothing outside a draw routine registers an object.
 pub(crate) fn band_rect_contains_drawn_object(
-    entities: &EntityStore,
+    source: impl PickSource,
     encounter_order: &[u64],
-    fog: Option<&FogState>,
-    local_owner: Option<&str>,
     min_x: f32,
     min_y: f32,
     max_x: f32,
     max_y: f32,
-    interner: Option<&crate::sim::intern::StringInterner>,
 ) -> bool {
-    let local_owner_id = local_owner.and_then(|o| interner.and_then(|i| i.get(o)));
+    let entities = source.entities();
     encounter_order.iter().any(|id| {
         let Some(entity) = entities.get(*id) else {
             return false;
         };
-        if !entity.lifecycle.object_alive || entity.lifecycle.in_limbo {
+        if !entity.lifecycle.object_alive() || entity.lifecycle.in_limbo() {
             return false;
         }
-        let (sx, sy) =
-            crate::app::presentation::instances::interpolated_screen_position_entity(entity);
+        let (sx, sy) = source.screen_position(entity);
         if !(sx >= min_x && sx <= max_x && sy >= min_y && sy <= max_y) {
             return false;
         }
-        if entity.category == EntityCategory::Structure {
-            // Bulk-registered, shroud or no shroud.
-            return true;
+        if entity.category() == EntityCategory::Structure {
+            // Bulk-registered, shroud or no shroud, frozen in fog or not:
+            // AppendVisibleBuildingSelectables 0x006D9CE0 tests only +0x90,
+            // +0x74 and InvisibleInGame (Type+0x1701, 0x006D9D5E..0x006D9D6C).
+            // Translucent fog leaves that alone; a frozen building's
+            // FoggedObject still draws in both fog modes.
+            return !source.invisible_in_game_building(entity);
         }
-        let owner_str = interner.map_or("", |i| i.resolve(entity.owner()));
-        is_drawn_for_local_owner(fog, local_owner, owner_str, entity, local_owner_id)
+        !source.conceals(entity)
     })
 }
 
-/// Would the local player see this object drawn right now?
+/// Whether `Tactical::PickObjectAtScreenPoint @ 0x006DA380` considers a
+/// Techno under the cursor: alive and out of limbo, and, unless the player
+/// owns it (`+0x41A`), not cloaked (CloakState 2) or with the cell of its
+/// GetCoords (`0x006DA425`) under the player's sensors. `+0x41A` is the owned-by-the-local-player byte
+/// (`TechnoClass::PointerExpired @ 0x007077C0` clears it with `pOwner`), so
+/// an ally's cloaked object is not exempt. `DisplayClass::ProcessClickCoords`
+/// asks the cloak test again of the object it returns (`0x00692529..0x0069257F`),
+/// and that one object is what both DetermineAction and BandBox_LeftUp get
+/// (`ScrollClass::HandleMouseMessage`, `0x00693271` → `0x0069328B`). So an
+/// unsensed submerged submarine is no object to hover, click or select.
+///
+/// Without fog (sandbox full visibility) or a known player, only the first
+/// part applies. ProcessClickCoords also drops its chosen nonlocal object's
+/// TypeInvisible (`+0xC9A`, `0x0069256B..0x0069257F`) after the scan; that
+/// gate is applied after the winner below. Building's InvisibleInGame can
+/// derive this byte too. Tooltips retain their separately repeated gate.
+pub(crate) fn pick_admits_object(
+    entity: &crate::sim::game_entity::GameEntity,
+    fog: Option<&FogState>,
+    player: Option<InternedId>,
+) -> bool {
+    if !entity.lifecycle.object_alive() || entity.lifecycle.in_limbo() {
+        return false;
+    }
+    let (Some(fog), Some(player)) = (fog, player) else {
+        return true;
+    };
+    //6DA3FF reads retained Techno+41A. Its owner classifies this at
+    // InitManagers6F3F43 and ChangeOwner70173B; save/load preserves the byte.
+    entity.seldom.discovery.owned_by_current_house()
+        || !entity
+            .cloak
+            .as_ref()
+            .is_some_and(|cloak| cloak.is_fully_cloaked())
+        || fog.senses_object_for_house(player, entity)
+}
+
+/// Would the local player see this object drawn right now? Presentation's
+/// screen-selection rule ([`crate::app::presentation::instances::object_shown_to_local_owner`]).
 ///
 /// Deliberately distinct from the eligibility gate's visibility tail: with no
 /// fog state at all (the sandbox full-visibility switch) everything is drawn,
 /// where the eligibility gate falls back to an owner test.
 fn is_drawn_for_local_owner(
-    fog: Option<&FogState>,
+    fog: Option<(&FogState, &crate::map::houses::HouseAllianceMap)>,
     local_owner: Option<&str>,
     entity_owner: &str,
     entity: &crate::sim::game_entity::GameEntity,
     local_owner_id: Option<InternedId>,
 ) -> bool {
-    let Some(local_owner) = local_owner else {
-        return true;
-    };
-    let Some(fog) = fog else {
+    let Some((fog, alliances)) = fog else {
         // Sandbox full visibility: everything is drawn.
         return true;
     };
-    if fog.is_friendly(local_owner, entity_owner) {
-        return true;
-    }
-    let owner_id = local_owner_id.unwrap_or_default();
-    let pos = &entity.position;
-    fog.is_cell_revealed(owner_id, pos.rx, pos.ry)
-        && !fog.is_cell_gap_covered(owner_id, pos.rx, pos.ry)
+    crate::app::presentation::instances::object_shown_to_local_owner(
+        local_owner,
+        local_owner_id,
+        fog,
+        alliances,
+        &entity.position,
+        entity_owner,
+        false,
+    )
 }
 
 /// Resolve a band-box release into the selection snapshot to commit.
@@ -475,7 +736,7 @@ pub(crate) fn compute_box_selection_snapshot(
     preflight_order: &[u64],
     encounter_order: &[u64],
     current_selection: &[u64],
-    fog: Option<&FogState>,
+    fog: Option<(&FogState, &crate::map::houses::HouseAllianceMap)>,
     local_owner: Option<&str>,
     min_x: f32,
     min_y: f32,
@@ -506,11 +767,11 @@ pub(crate) fn compute_box_selection_snapshot(
 }
 
 pub(crate) fn compute_box_selection_snapshot_with_playfield(
-    entities: &EntityStore,
+    source: impl PickSource,
     preflight_order: &[u64],
     encounter_order: &[u64],
     current_selection: &[u64],
-    fog: Option<&FogState>,
+    fog: Option<(&FogState, &crate::map::houses::HouseAllianceMap)>,
     local_owner: Option<&str>,
     min_x: f32,
     min_y: f32,
@@ -522,23 +783,13 @@ pub(crate) fn compute_box_selection_snapshot_with_playfield(
     interner: Option<&crate::sim::intern::StringInterner>,
     require_playfield_membership: bool,
 ) -> Option<SelectionMutation> {
-    if !band_rect_contains_drawn_object(
-        entities,
-        preflight_order,
-        fog,
-        local_owner,
-        min_x,
-        min_y,
-        max_x,
-        max_y,
-        interner,
-    ) {
+    if !band_rect_contains_drawn_object(source, preflight_order, min_x, min_y, max_x, max_y) {
         return None;
     }
     let candidates = entities_in_rect(
-        entities,
+        source,
         encounter_order,
-        fog,
+        fog.map(|(fog, _)| fog),
         local_owner,
         min_x,
         min_y,
@@ -572,54 +823,26 @@ pub(crate) fn compute_box_selection_snapshot_with_playfield(
     })
 }
 
-/// Resolve one short TypeSelect release. Seeds retain current selection order
-/// and expand each selected type through its deploy/undeploy links. Screen
-/// escalation happens in the same invocation when no visible unselected match
-/// exists, including the all-visible-already-selected case.
-#[cfg(test)]
-pub(crate) fn compute_type_select_tap(
-    entities: &EntityStore,
-    screen_order: &[u64],
-    map_order: &[u64],
-    current_selection: &[u64],
-    fog: Option<&FogState>,
-    local_owner: Option<&str>,
-    rules: Option<&RuleSet>,
-    interner: Option<&crate::sim::intern::StringInterner>,
-    across_map: bool,
-) -> TypeSelectTapResult {
-    compute_type_select_tap_with_playfield(
-        entities,
-        screen_order,
-        map_order,
-        current_selection,
-        fog,
-        local_owner,
-        rules,
-        interner,
-        across_map,
-        false,
-    )
-}
-
 pub(crate) fn compute_type_select_tap_with_playfield(
-    entities: &EntityStore,
+    source: impl PickSource,
     screen_order: &[u64],
     map_order: &[u64],
     current_selection: &[u64],
-    fog: Option<&FogState>,
+    fog: Option<(&FogState, &crate::map::houses::HouseAllianceMap)>,
     local_owner: Option<&str>,
     rules: Option<&RuleSet>,
     interner: Option<&crate::sim::intern::StringInterner>,
     across_map: bool,
     require_playfield_membership: bool,
 ) -> TypeSelectTapResult {
+    let entities = source.entities();
+    let control = source.selection_control();
     let mut mutation = SelectionMutation::default();
     let mut selected = current_selection.to_vec();
     if selected.len() == 1 {
+        // `Tactical::Unselect_If_Not_Owned @ 0x006DA770`.
         let nonlocal = entities.get(selected[0]).is_some_and(|entity| {
-            let owner = interner.map_or("", |i| i.resolve(entity.owner()));
-            local_owner.is_some_and(|local| !owner.eq_ignore_ascii_case(local))
+            !type_select_owner_admits(control.as_ref(), local_owner, entity, interner)
         });
         if nonlocal {
             mutation.deselect.push(selected[0]);
@@ -627,37 +850,29 @@ pub(crate) fn compute_type_select_tap_with_playfield(
         }
     }
 
-    let mut seeds: Vec<InternedId> = Vec::new();
+    let mut seeds: Vec<TypeSelectionSeed> = Vec::new();
     for id in selected.iter().copied() {
         let Some(entity) = entities.get(id) else {
             continue;
         };
-        let own = interner.map_or("", |i| i.resolve(entity.type_ref()));
-        push_exact_seed(&mut seeds, entity.type_ref());
-        if let Some(object) = rules.and_then(|r| r.object(own)) {
-            if let Some(deploys_into) = object.deploys_into.as_deref() {
-                if let Some(type_ref) = interner.and_then(|i| i.get(deploys_into)) {
-                    push_exact_seed(&mut seeds, type_ref);
-                }
-            }
-            if let Some(undeploys_into) = object.undeploys_into.as_deref() {
-                if let Some(type_ref) = interner.and_then(|i| i.get(undeploys_into)) {
-                    push_exact_seed(&mut seeds, type_ref);
-                }
-            }
-        }
+        push_type_select_entity_seeds(&mut seeds, entity, rules, interner);
     }
     if seeds.is_empty() {
+        // `TypeSelectCommand::ExecuteTap @ 0x00732950` has no seedless return:
+        // no screen object matches, so the scope byte B0FE64 turns to the map
+        // (0x00732AAD), and a held-T click or band that follows selects across
+        // the map (`TypeSelect__SelectExactTypeBatch` reads it at 0x007327D3).
         return TypeSelectTapResult {
             mutation,
             outcome: crate::app::types::TypeSelectOutcome::Empty,
-            across_map: false,
+            across_map: true,
         };
     }
 
     if !across_map {
         let visible = type_select_candidates(
-            entities,
+            source,
+            control.as_ref(),
             screen_order,
             &seeds,
             fog,
@@ -684,7 +899,8 @@ pub(crate) fn compute_type_select_tap_with_playfield(
     }
 
     let map_candidates = type_select_candidates(
-        entities,
+        source,
+        control.as_ref(),
         map_order,
         &seeds,
         None,
@@ -708,23 +924,95 @@ pub(crate) fn compute_type_select_tap_with_playfield(
     }
 }
 
-fn push_exact_seed(seeds: &mut Vec<InternedId>, seed: InternedId) {
-    if !seeds.contains(&seed) {
+/// Ares GetSelectionGroupID1003DB30/1003DB50 and strcmpi10003990, used by
+/// IDMatches732C30 ->1004A490, click/band4ABD6C..4ABE58 ->10041760 and
+/// PlayerOwnedAliveAndNamed7327AA ->10041CD0. The rules owner provides the
+/// same key for all these callers; ownership, scope and admission stay here.
+type TypeSelectionSeed = (InternedId, EntityCategory);
+
+fn type_selection_matches(
+    left: TypeSelectionSeed,
+    right: TypeSelectionSeed,
+    rules: Option<&RuleSet>,
+    interner: Option<&crate::sim::intern::StringInterner>,
+) -> bool {
+    if let (Some(rules), Some(interner)) = (rules, interner)
+        && rules.ares()
+    {
+        return rules
+            .type_selection_key(left.1.into(), interner.resolve(left.0))
+            .eq_ignore_ascii_case(
+                rules.type_selection_key(right.1.into(), interner.resolve(right.0)),
+            );
+    }
+    left.0 == right.0
+}
+
+fn push_type_select_seed(
+    seeds: &mut Vec<TypeSelectionSeed>,
+    seed: TypeSelectionSeed,
+    rules: Option<&RuleSet>,
+    interner: Option<&crate::sim::intern::StringInterner>,
+) {
+    if !seeds
+        .iter()
+        .any(|&existing| type_selection_matches(existing, seed, rules, interner))
+    {
         seeds.push(seed);
     }
 }
 
+/// One object's TypeSelect seeds: its exact `(type, category)` and, while
+/// `General/TypeSelectUseDeploy` admits it, the types it deploys into and
+/// undeploys into (`TypeSelectCommand::ExecuteTap @ 0x00732950` seeds the walk
+/// this way). Shared by the T tap and VERA's right-click-orders double-click.
+fn push_type_select_entity_seeds(
+    seeds: &mut Vec<TypeSelectionSeed>,
+    entity: &crate::sim::game_entity::GameEntity,
+    rules: Option<&RuleSet>,
+    interner: Option<&crate::sim::intern::StringInterner>,
+) {
+    let own = interner.map_or("", |i| i.resolve(entity.type_ref()));
+    push_type_select_seed(
+        seeds,
+        (entity.type_ref(), entity.category()),
+        rules,
+        interner,
+    );
+    if rules.is_none_or(RuleSet::type_select_uses_deploy)
+        && let Some(object) = rules.and_then(|r| r.object(own))
+    {
+        if let Some(deploys_into) = object.deploys_into.as_deref()
+            && let Some(type_ref) = interner.and_then(|i| i.get(deploys_into))
+        {
+            push_type_select_seed(
+                seeds,
+                (type_ref, EntityCategory::Structure),
+                rules,
+                interner,
+            );
+        }
+        if let Some(undeploys_into) = object.undeploys_into.as_deref()
+            && let Some(type_ref) = interner.and_then(|i| i.get(undeploys_into))
+        {
+            push_type_select_seed(seeds, (type_ref, EntityCategory::Unit), rules, interner);
+        }
+    }
+}
+
 fn type_select_candidates(
-    entities: &EntityStore,
+    source: impl PickSource,
+    control: Option<&ControlProjection<'_>>,
     source_order: &[u64],
-    seeds: &[InternedId],
-    fog: Option<&FogState>,
+    seeds: &[TypeSelectionSeed],
+    fog: Option<(&FogState, &crate::map::houses::HouseAllianceMap)>,
     local_owner: Option<&str>,
     rules: Option<&RuleSet>,
     interner: Option<&crate::sim::intern::StringInterner>,
     screen_only: bool,
     require_playfield_membership: bool,
 ) -> Vec<u64> {
+    let entities = source.entities();
     let local_owner_id = local_owner.and_then(|owner| interner.and_then(|i| i.get(owner)));
     source_order
         .iter()
@@ -732,25 +1020,53 @@ fn type_select_candidates(
             let entity = entities.get(*id)?;
             let owner = interner.map_or("", |i| i.resolve(entity.owner()));
             let type_id = interner.map_or("", |i| i.resolve(entity.type_ref()));
-            if !entity.lifecycle.object_alive
-                || local_owner.is_some_and(|local| !owner.eq_ignore_ascii_case(local))
-                || !seeds.contains(&entity.type_ref())
+            if !entity.lifecycle.object_alive()
+                || !type_select_owner_admits(control, local_owner, entity, interner)
+                || !seeds.iter().any(|&seed| {
+                    type_selection_matches(
+                        seed,
+                        (entity.type_ref(), entity.category()),
+                        rules,
+                        interner,
+                    )
+                })
                 || (screen_only
-                    && entity.category != EntityCategory::Structure
+                    && entity.category() != EntityCategory::Structure
                     && !is_drawn_for_local_owner(fog, local_owner, owner, entity, local_owner_id))
             {
                 return None;
             }
-            let dynamic = can_be_selected_now(entity, entities, rules, interner)
+            let dynamic = selection_dynamic_prefix(entity, entities, rules, interner)
                 && type_is_selectable(type_id, rules)
-                && (!require_playfield_membership || entity.in_playfield);
-            let undeploying_building_fallback = entity.category == EntityCategory::Structure
-                && rules
-                    .and_then(|r| r.object(type_id))
-                    .is_some_and(|object| object.undeploys_into.is_some());
-            (dynamic || undeploying_building_fallback).then_some(*id)
+                && (!require_playfield_membership || entity.in_playfield());
+            // The ID match's independent building arm (732C61..732C83)
+            // admits UndeploysInto even when the dynamic virtual refuses it.
+            let structure_admission = entity.category() == EntityCategory::Structure
+                && rules.is_some_and(|rules| rules.structure_type_selectable(type_id));
+            (dynamic || structure_admission).then_some(*id)
         })
         .collect()
+}
+
+/// The owner arm of the T key's predicates, asked of the object's House
+/// ([ControlProjection::can_select]). A world without a local player
+/// keeps every owner, as the headless fixtures always have; a source without
+/// a house table falls back to exact local-owner identity.
+fn type_select_owner_admits(
+    control: Option<&ControlProjection<'_>>,
+    local_owner: Option<&str>,
+    entity: &crate::sim::game_entity::GameEntity,
+    interner: Option<&crate::sim::intern::StringInterner>,
+) -> bool {
+    local_owner.is_none_or(|local| {
+        control
+            .map(|control| control.can_select(entity.owner()))
+            .unwrap_or_else(|| {
+                interner
+                    .map_or("", |i| i.resolve(entity.owner()))
+                    .eq_ignore_ascii_case(local)
+            })
+    })
 }
 
 fn type_select_final_admissions(
@@ -772,35 +1088,8 @@ fn type_select_final_admissions(
         .collect()
 }
 
-/// Exact-type group mutation used while TypeSelect is held over one picked
-/// object. Link types and the dynamic CanBeSelectedNow virtual are deliberately
-/// absent from this path.
-#[cfg(test)]
-pub(crate) fn compute_type_select_click_mutation(
-    entities: &EntityStore,
-    scope_order: &[u64],
-    current_selection: &[u64],
-    clicked_id: u64,
-    additive: bool,
-    local_owner: Option<&str>,
-    rules: Option<&RuleSet>,
-    interner: Option<&crate::sim::intern::StringInterner>,
-) -> SelectionMutation {
-    compute_type_select_click_mutation_with_playfield(
-        entities,
-        scope_order,
-        current_selection,
-        clicked_id,
-        additive,
-        local_owner,
-        rules,
-        interner,
-        false,
-    )
-}
-
 pub(crate) fn compute_type_select_click_mutation_with_playfield(
-    entities: &EntityStore,
+    source: impl PickSource,
     scope_order: &[u64],
     current_selection: &[u64],
     clicked_id: u64,
@@ -810,14 +1099,19 @@ pub(crate) fn compute_type_select_click_mutation_with_playfield(
     interner: Option<&crate::sim::intern::StringInterner>,
     require_playfield_membership: bool,
 ) -> SelectionMutation {
-    let Some(clicked) = entities.get(clicked_id) else {
+    let Some(clicked) = source.entities().get(clicked_id) else {
         return SelectionMutation::default();
     };
-    let clicked_type = clicked.type_ref();
+    let clicked_type = (clicked.type_ref(), clicked.category());
+    let control = source.selection_control();
+    let additive = additive
+        && (current_selection.is_empty()
+            || first_selected_is_players(source, current_selection, local_owner, interner));
     if additive && current_selection.contains(&clicked_id) {
         return SelectionMutation {
-            deselect: exact_type_group(
-                entities,
+            deselect: matching_type_group(
+                source,
+                control.as_ref(),
                 scope_order,
                 clicked_type,
                 local_owner,
@@ -834,8 +1128,9 @@ pub(crate) fn compute_type_select_click_mutation_with_playfield(
     }
     SelectionMutation {
         clear: !additive,
-        select: exact_type_group(
-            entities,
+        select: matching_type_group(
+            source,
+            control.as_ref(),
             scope_order,
             clicked_type,
             local_owner,
@@ -848,45 +1143,84 @@ pub(crate) fn compute_type_select_click_mutation_with_playfield(
     }
 }
 
-/// Held TypeSelect bandbox: anchors inside the rectangle contribute their own
-/// exact type IDs; those IDs are then expanded over the current screen/map
-/// scope without deploy-link or dynamic-gate expansion.
-#[cfg(test)]
-pub(crate) fn compute_type_select_box_mutation(
-    entities: &EntityStore,
+/// VERA right-click orders: a double-click on an object selects every object
+/// of its type that the local player controls and that the screen currently
+/// shows, the T key's screen pass applied to the object under the cursor
+/// instead of the current selection.
+///
+/// `None` unless the click found an object the local player controls and the
+/// selection gates admit, so ground, an enemy and a refused object all keep
+/// the ordinary click's meaning. There is no map fallback: a type with one
+/// on-screen member keeps just that member selected, where the T tap would
+/// widen the scope to the whole map. VERA-only, reached only under the
+/// `RightClickOrders` option.
+pub(crate) fn compute_double_click_type_select_with_playfield(
+    source: impl PickSource,
+    click_order: &[u64],
     screen_order: &[u64],
-    scope_order: &[u64],
-    current_selection: &[u64],
-    fog: Option<&FogState>,
+    fog: Option<(&FogState, &crate::map::houses::HouseAllianceMap)>,
     local_owner: Option<&str>,
-    min_x: f32,
-    min_y: f32,
-    max_x: f32,
-    max_y: f32,
-    additive: bool,
+    world_x: f32,
+    world_y: f32,
     rules: Option<&RuleSet>,
     interner: Option<&crate::sim::intern::StringInterner>,
-) -> SelectionMutation {
-    compute_type_select_box_mutation_with_playfield(
-        entities,
+    require_playfield_membership: bool,
+    terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
+) -> Option<SelectionMutation> {
+    let clicked_id = pick_entity_at_point(
+        source,
+        click_order,
+        fog.map(|(fog, _)| fog),
+        local_owner,
+        world_x,
+        world_y,
+        interner,
+        terrain,
+    )?;
+    let entities = source.entities();
+    let control = source.selection_control();
+    let clicked = entities.get(clicked_id)?;
+    if !type_select_owner_admits(control.as_ref(), local_owner, clicked, interner) {
+        return None;
+    }
+    let type_id = interner.map_or("", |i| i.resolve(clicked.type_ref()));
+    if !static_selection_gate(clicked, type_id, rules, require_playfield_membership) {
+        return None;
+    }
+    let mut seeds = Vec::new();
+    push_type_select_entity_seeds(&mut seeds, clicked, rules, interner);
+    let visible = type_select_candidates(
+        source,
+        control.as_ref(),
         screen_order,
-        scope_order,
-        current_selection,
+        &seeds,
         fog,
         local_owner,
-        min_x,
-        min_y,
-        max_x,
-        max_y,
-        additive,
         rules,
         interner,
-        false,
-    )
+        true,
+        require_playfield_membership,
+    );
+    let select = type_select_final_admissions(
+        entities,
+        &visible,
+        rules,
+        interner,
+        require_playfield_membership,
+    );
+    if select.is_empty() {
+        // Never let a double-click select less than its first click would.
+        return None;
+    }
+    Some(SelectionMutation {
+        clear: true,
+        select,
+        ..Default::default()
+    })
 }
 
 pub(crate) fn compute_type_select_box_mutation_with_playfield(
-    entities: &EntityStore,
+    source: impl PickSource,
     screen_order: &[u64],
     scope_order: &[u64],
     current_selection: &[u64],
@@ -901,25 +1235,36 @@ pub(crate) fn compute_type_select_box_mutation_with_playfield(
     interner: Option<&crate::sim::intern::StringInterner>,
     require_playfield_membership: bool,
 ) -> SelectionMutation {
+    let entities = source.entities();
     let mut represented_types = Vec::new();
     for &id in screen_order {
         let Some(entity) = entities.get(id) else {
             continue;
         };
-        let (sx, sy) =
-            crate::app::presentation::instances::interpolated_screen_position_entity(entity);
-        if !entity.lifecycle.object_alive || sx < min_x || sx > max_x || sy < min_y || sy > max_y {
+        let (sx, sy) = source.screen_position(entity);
+        if !entity.lifecycle.object_alive()
+            || sx < min_x
+            || sx > max_x
+            || sy < min_y
+            || sy > max_y
+            || source.conceals(entity)
+        {
             continue;
         }
-        if !represented_types.contains(&entity.type_ref()) {
-            represented_types.push(entity.type_ref());
-        }
+        push_type_select_seed(
+            &mut represented_types,
+            (entity.type_ref(), entity.category()),
+            rules,
+            interner,
+        );
     }
 
+    let control = source.selection_control();
     let mut select = Vec::new();
     for type_ref in represented_types {
-        select.extend(exact_type_group(
-            entities,
+        select.extend(matching_type_group(
+            source,
+            control.as_ref(),
             scope_order,
             type_ref,
             local_owner,
@@ -937,10 +1282,11 @@ pub(crate) fn compute_type_select_box_mutation_with_playfield(
     }
 }
 
-fn exact_type_group(
-    entities: &EntityStore,
+fn matching_type_group(
+    source: impl PickSource,
+    control: Option<&ControlProjection<'_>>,
     source_order: &[u64],
-    type_ref: InternedId,
+    type_ref: TypeSelectionSeed,
     local_owner: Option<&str>,
     rules: Option<&RuleSet>,
     interner: Option<&crate::sim::intern::StringInterner>,
@@ -950,13 +1296,17 @@ fn exact_type_group(
     source_order
         .iter()
         .filter_map(|id| {
-            let entity = entities.get(*id)?;
-            let owner = interner.map_or("", |i| i.resolve(entity.owner()));
+            let entity = source.entities().get(*id)?;
             let type_id = interner.map_or("", |i| i.resolve(entity.type_ref()));
-            if !entity.lifecycle.object_alive
-                || entity.lifecycle.in_limbo
-                || entity.type_ref() != type_ref
-                || local_owner.is_some_and(|local| !owner.eq_ignore_ascii_case(local))
+            if !entity.lifecycle.object_alive()
+                || entity.lifecycle.in_limbo()
+                || !type_selection_matches(
+                    (entity.type_ref(), entity.category()),
+                    type_ref,
+                    rules,
+                    interner,
+                )
+                || !type_select_owner_admits(control, local_owner, entity, interner)
                 || (selecting
                     && !static_selection_gate(entity, type_id, rules, require_playfield_membership))
             {
@@ -968,7 +1318,7 @@ fn exact_type_group(
 }
 
 fn entities_in_rect(
-    entities: &EntityStore,
+    source: impl PickSource,
     encounter_order: &[u64],
     _fog: Option<&FogState>,
     local_owner: Option<&str>,
@@ -981,20 +1331,22 @@ fn entities_in_rect(
     interner: Option<&crate::sim::intern::StringInterner>,
     require_playfield_membership: bool,
 ) -> Vec<u64> {
+    let entities = source.entities();
+    let control = source.selection_control();
     encounter_order
         .iter()
         .filter_map(|entity| {
             let entity = entities.get(*entity)?;
             // Rectangle first, the way the native walk does it: the per-object
             // filter only runs for objects the box actually covers.
-            let (sx, sy) =
-                crate::app::presentation::instances::interpolated_screen_position_entity(entity);
+            let (sx, sy) = source.screen_position(entity);
             if !(sx >= min_x && sx <= max_x && sy >= min_y && sy <= max_y) {
                 return None;
             }
             let owner_str = interner.map_or("", |i| i.resolve(entity.owner()));
             let type_str = interner.map_or("", |i| i.resolve(entity.type_ref()));
             if !is_local_band_candidate(
+                control.as_ref(),
                 local_owner,
                 owner_str,
                 entity,
@@ -1004,7 +1356,7 @@ fn entities_in_rect(
             ) {
                 return None;
             }
-            if !can_be_selected_now(entity, entities, rules, interner) {
+            if !selection_dynamic_prefix(entity, entities, rules, interner) {
                 return None;
             }
             Some(entity.stable_id())
@@ -1012,7 +1364,12 @@ fn entities_in_rect(
         .collect()
 }
 
-/// The band-box-only half of the eligibility chain.
+/// Shared prefix of Techno6FC030, used by band, TypeSelect and N/M.
+/// Its final virtual+138 call belongs to `Simulation::object_is_selectable`.
+/// N/M invokes that owner during its candidate walk; every selection mutation
+/// invokes it at final admission. The older band/type candidate builders lack
+/// world context for the disguise branch and retain that candidate-tail gap
+/// until their held migration resumes.
 ///
 /// A single click reaches an object through a shorter chain than a band box
 /// does: only the band path asks `CanBeSelectedNow`, which refuses an object
@@ -1033,54 +1390,74 @@ fn entities_in_rect(
 /// mind-controlled unit is a different field in the original and is
 /// deliberately not tested here.
 ///
-/// One native clause is approximated rather than reproduced, because VERA has
-/// no matching state: the native bunker test reads one link field. VERA splits
-/// the link into an approach marker and an installed link, and only the
-/// installed link is treated as linked.
+/// Native +2E4 is the occupant on a Building and the installed-in link on a
+/// Foot. The Foot approach marker remains separate from its installed link.
 ///
-/// The powered-down clause reads byte `+0x1C8`, and it is NOT a deploy-transition
-/// flag. An exhaustive instruction search finds exactly three writers —
-/// `TechnoClass__Constructor` 0x006F2C9A initialises it,
-/// `TechnoClass__OnDeployBegin` 0x0070FD62 raises it, and
-/// `TechnoClass__OnUndeployComplete` 0x0070FC6D/0x0070FC7A clear it — and
-/// neither handler has a vtable or DATA reference. Their only callers are
-/// `HouseClass__LostPoweredCenter`, `HouseClass__Removed_From_Game`,
-/// `UnitClass__PerCellProcess` and `HouseClass__RobotTanksBackOnline`. So it is
-/// a *latch* held for as long as a Robot Tank is offline for want of a Robot
-/// Control Center — never raised by an infantry deploy toggle or an ordinary MCV
-/// deploy. VERA previously refused every mid-deploy object here, which is a gate
-/// gamemd does not have: it silently dropped GIs out of a box dragged over them
-/// during their deploy animation. That gate is gone; the offline latch itself
-/// waits on the Robot Control Center mechanism, which has no owner yet.
-fn can_be_selected_now(
+/// The powered-down clause reads byte `+0x1C8` (`0x006FC041`), and it is NOT a
+/// deploy-transition flag. An exhaustive instruction search finds exactly three
+/// writers — the `TechnoClass` constructor (`0x006F2C9A`), Deactivate
+/// (`0x0070FD62`, Ghidra's `OnDeployBegin`) and Reactivate
+/// (`0x0070FC6D`/`0x0070FC7A`, Ghidra's `OnUndeployComplete`), reached only from
+/// `HouseClass::LostPoweredCenter`, `Removed_From_Game`,
+/// `UnitClass::Per_Cell_Process` and `RobotTanksBackOnline`. So it is a *latch*
+/// held for as long as a Robot Tank is offline for want of a Robot Control
+/// Center (`GameEntity::deactivated`, owned by `sim::powered_unit`), never
+/// raised by an infantry deploy toggle or an ordinary MCV deploy: a GI in its
+/// deploy animation stays band-selectable.
+pub(crate) fn selection_dynamic_prefix(
     entity: &crate::sim::game_entity::GameEntity,
     entities: &EntityStore,
     rules: Option<&RuleSet>,
     interner: Option<&crate::sim::intern::StringInterner>,
 ) -> bool {
-    // BuildingClass answers false on the ordinary dynamic selection virtual.
-    // TypeSelect owns the verified UndeploysInto fallback separately.
-    if entity.category == EntityCategory::Structure {
+    // BuildingClass::CanBeSelectedNow459C00 calls the existing type query
+    // Is1x1WithUndeploy465D40 before the shared Techno6FC030 prefix below.
+    let building = entity.category() == EntityCategory::Structure;
+    // Ares 3.0 10013CF0 (hook 0x00459C03): `MassSelectable=` overrides
+    // that answer ([`ObjectType::band_selectable`]).
+    if building
+        && !rules
+            .zip(interner)
+            .and_then(|(rules, interner)| rules.object(interner.resolve(entity.type_ref())))
+            .is_some_and(|object| object.band_selectable())
+    {
         return false;
     }
-    if entity.slave.owner().is_some() {
+    if entity.seldom.slave.owner().is_some() || entity.deactivated.is_offline() {
         return false;
     }
-    if entity.bunker_link.installed_in().is_some() {
+    let bunker_linked = if building {
+        entity.bunker.occupant().is_some()
+    } else {
+        entity.bunker.link().installed_in().is_some()
+    };
+    if bunker_linked {
         return false;
     }
-    if entity.dock_entered_with.is_some()
-        && building_covers_cell(
-            entities,
-            rules,
-            interner,
-            entity.position.rx,
-            entity.position.ry,
-        )
+    if entity.seldom.tether.partner().is_some()
+        && building_covers_cell(entities, entity.position.rx(), entity.position.ry())
     {
         return false;
     }
     true
+}
+
+/// Techno virtual+64, original6F32D0. Discovery is retained +41B, not the
+/// current fog tile or viewport. House50B6F0 owns campaign/current-house policy.
+/// This gate does not read Alive, Foot+6AD or Techno+270; later virtuals do.
+pub(crate) fn is_local_player_selectable_object(
+    interner: &crate::sim::intern::StringInterner,
+    control: &ControlProjection<'_>,
+    rules: Option<&RuleSet>,
+    entity: &crate::sim::game_entity::GameEntity,
+) -> bool {
+    entity.health.current() > 0
+        && !entity.lifecycle.in_limbo()
+        && entity.in_playfield()
+        && entity.category() != EntityCategory::Structure
+        && entity.seldom.discovery.discovered_by_current_house()
+        && type_is_selectable(interner.resolve(entity.type_ref()), rules)
+        && control.can_order(entity.owner())
 }
 
 /// Does a building's footprint cover this cell? The native lookup asks the cell
@@ -1092,92 +1469,97 @@ fn can_be_selected_now(
 /// occupier is cleared the moment the building leaves the map, so a dead
 /// refinery must not keep the miner standing on its pad out of a band box.
 ///
-/// The footprint is treated as the plain `Foundation=` rectangle. `Foundation=`
-/// is not free-form — it resolves through a fixed table — and every value that
-/// appears in stock `artmd.ini` is a plain `WxH` name, so the rectangle covers
-/// stock play. The table also carries named entries the stock art never selects
-/// (`3x3Refinery`); whether their native occupancy is the full rectangle is
-/// UNCHECKED, so a mod that selects one is the residual here, not stock YR.
-fn building_covers_cell(
-    entities: &EntityStore,
-    rules: Option<&RuleSet>,
-    interner: Option<&crate::sim::intern::StringInterner>,
-    rx: u16,
-    ry: u16,
-) -> bool {
+/// Read the existing marked-footprint owner. Bounding rectangles must not hide
+/// tethered units standing in a hole of an Ares custom foundation.
+fn building_covers_cell(entities: &EntityStore, rx: u16, ry: u16) -> bool {
     entities.values().any(|candidate| {
-        if candidate.category != EntityCategory::Structure
-            || candidate.lifecycle.in_limbo
-            || !candidate.lifecycle.object_alive
+        if candidate.category() != EntityCategory::Structure
+            || candidate.lifecycle.in_limbo()
+            || !candidate.lifecycle.object_alive()
         {
             return false;
         }
-        let type_str = interner.map_or("", |i| i.resolve(candidate.type_ref()));
-        let foundation = rules
-            .and_then(|r| r.object(type_str))
-            .map(|o| o.foundation.as_str())
-            .unwrap_or("1x1");
-        let (fw, fh) = crate::rules::foundation::foundation_dimensions(foundation);
-        let brx = candidate.position.rx;
-        let bry = candidate.position.ry;
-        rx >= brx && rx < brx.saturating_add(fw) && ry >= bry && ry < bry.saturating_add(fh)
+        candidate.footprint_contains_cell((rx, ry))
     })
 }
 
-/// Check if a world-space click point falls on a building's foundation cells.
-/// The building occupies cells `(rx..rx+fw, ry..ry+fh)`. We convert the click
-/// to cell coords and check containment. This matches the original engine which
-/// uses the foundation footprint, not the visual sprite bounds.
-fn click_hits_foundation(
-    world_x: f32,
-    world_y: f32,
-    entity_rx: u16,
-    entity_ry: u16,
-    foundation: &str,
-    height_map: &std::collections::BTreeMap<(u16, u16), u8>,
-    bridge_cells: Option<&dyn TacticalBridgeLookup>,
-) -> bool {
-    let (fw, fh) = crate::rules::foundation::foundation_dimensions(foundation);
-    let (click_rx, click_ry) = crate::app::match_runtime::sim_tick::world_point_to_cell(
-        world_x,
-        world_y,
-        height_map,
-        bridge_cells,
-    );
-    let crx = click_rx as i32;
-    let cry = click_ry as i32;
-    let brx = entity_rx as i32;
-    let bry = entity_ry as i32;
-    crx >= brx && crx < brx + fw as i32 && cry >= bry && cry < bry + fh as i32
-}
-
-pub(crate) fn pick_entity_at_point(
-    entities: &EntityStore,
-    encounter_order: &[u64],
+/// The entity [`pick_object_at_point`] finds; a Terrain object counts as no
+/// entity.
+pub(crate) fn pick_entity_at_point<'a>(
+    source: impl PickSource,
+    encounter_order: impl IntoIterator<Item = &'a u64>,
     fog: Option<&FogState>,
     local_owner: Option<&str>,
     world_x: f32,
     world_y: f32,
-    click_radius: f32,
-    rules: Option<&RuleSet>,
-    _houses: Option<&HouseStates>,
-    height_map: &std::collections::BTreeMap<(u16, u16), u8>,
-    bridge_cells: Option<&dyn TacticalBridgeLookup>,
     interner: Option<&crate::sim::intern::StringInterner>,
+    terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
 ) -> Option<u64> {
-    // Elliptical pick distance: dx² + 0.5*dy² < 200, with the 0.5 Y-weight
-    // compensating for isometric projection.
-    // The click_radius parameter is kept for API compatibility but not used.
-    let _ = click_radius;
-    let local_owner_id = local_owner.and_then(|o| interner.and_then(|i| i.get(o)));
-    if let (Some(fog), Some(owner_id)) = (fog, local_owner_id) {
-        let (rx, ry) = crate::app::match_runtime::sim_tick::world_point_to_cell(
-            world_x,
-            world_y,
-            height_map,
-            bridge_cells,
-        );
-        if !fog.is_cell_revealed(owner_id, rx, ry) || fog.is_cell_gap_covered(owner_id, rx, ry) {
+    let player = local_owner.and_then(|o| interner.and_then(|i| i.get(o)));
+    match pick_object_at_point(
+        source,
+        encounter_order,
+        fog,
+        player,
+        world_x,
+        world_y,
+        terrain,
+    )? {
+        CellObjectMember::Entity(id) => Some(id),
+        CellObjectMember::Terrain(_) => None,
+    }
+}
+
+/// `Tactical::PickObjectAtScreenPoint @ 0x006DA380`, with the cloak test
+/// ProcessClickCoords repeats on its result (`0x00692529..0x0069257F`).
+///
+/// A shrouded clicked cell picks nothing (`DisplayClass::ProcessClickCoords @
+/// 0x00692300`, `0x00692480`). Neither does one whose first Building is
+/// frozen in FogOfWar (Building `+0x6E7`, `0x006924A4..0x006924FA`), so the
+/// live building and any unit on that cell stay out of reach. That arm's
+/// IsFogged for a cell without a Building is `0x005865E0`, which always
+/// answers false. Otherwise the nearest admitted
+/// registered object wins on `ftol(dx² + 0.5·dy²) < 200`, the first in
+/// `encounter_order` on a tie. With none, the pick is the head of the clicked
+/// cell's ground list (`CellClass+0xE4`, `0x006DA4B8..0x006DA4FB`): a
+/// building over its whole foundation, a unit standing beyond the ellipse, or
+/// a Terrain object. The bridge-deck list (`+0xE8`) is never read. An
+/// unadmitted head picks nothing; the pick never looks behind it. An object
+/// VERA's translucent fog leaves undrawn ([`PickSource::conceals`]) is not
+/// admitted either. An InvisibleInGame building is never registered
+/// ([`PickSource::invisible_in_game_building`]): only the cell fallback can
+/// reach one, and the TypeInvisible gate below then refuses it.
+///
+/// Residual: the anchor pass scores only entities. Native also scores a
+/// registered Terrain object whose type has `IsVeinhole=` (`+0x2B4`);
+/// VERA reaches one only through its cell.
+pub(crate) fn pick_object_at_point<'a>(
+    source: impl PickSource,
+    encounter_order: impl IntoIterator<Item = &'a u64>,
+    fog: Option<&FogState>,
+    player: Option<InternedId>,
+    world_x: f32,
+    world_y: f32,
+    terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
+) -> Option<CellObjectMember> {
+    let entities = source.entities();
+    let cells = terrain.map(|terrain| terrain as &dyn crate::map::terrain::TacticalCellLookup);
+    let click_cell =
+        crate::app::match_runtime::sim_tick::world_point_to_cell(world_x, world_y, cells);
+    if let (Some(fog), Some(player)) = (fog, player) {
+        let (rx, ry) = click_cell;
+        if crate::app::presentation::instances::cell_visibility_for_local_owner(
+            Some(player),
+            Some(fog),
+            rx,
+            ry,
+            false,
+            terrain,
+        ) == crate::app::presentation::instances::CellVisibilityState::Shrouded
+            || source
+                .fog_of_war_cell_building(click_cell)
+                .is_some_and(|building| fog.is_object_fogged(player, building))
+        {
             return None;
         }
     }
@@ -1187,97 +1569,110 @@ pub(crate) fn pick_entity_at_point(
         let Some(entity) = entities.get(stable_id) else {
             continue;
         };
-        if !entity.lifecycle.object_alive || entity.lifecycle.in_limbo {
-            continue;
-        }
-        let owner_str = interner.map_or("", |i| i.resolve(entity.owner()));
-        if entity.category != EntityCategory::Structure
-            && !is_drawn_for_local_owner(fog, local_owner, owner_str, entity, local_owner_id)
-        {
-            continue;
-        }
-        // `Tactical::PickObjectAtScreenPoint @ 0x006DA380` admits a
-        // render-tracked object only when
-        //   `InLimbo == 0 && (+0x41A != 0 || CloakState != 2
-        //                     || SensorCountForHouse(itsCell, PlayerPtr->ArrayIndex))`.
-        // `+0x41A` is the owned-by-the-local-player byte — `TechnoClass::
-        // PointerExpired @ 0x007077C0` clears it together with `pOwner` — so
-        // being merely allied does NOT exempt a cloaked object. The same filter
-        // guards `DisplayClass::DetermineAction @ 0x00692610` and the
-        // object-name-under-cursor helper, which is why an unsensed submerged
-        // submarine cannot be moused over at all and no explicit attack order
-        // against it can be issued.
-        if let (Some(fog_state), Some(owner_id)) = (fog, local_owner_id)
-            && entity.owner() != owner_id
-            && entity
-                .cloak
-                .as_ref()
-                .is_some_and(|cloak| cloak.is_fully_cloaked())
-            && !fog_state.has_sensor_for_house(owner_id, entity.position.rx, entity.position.ry)
-        {
-            continue;
-        }
-        let (sx, sy) =
-            crate::app::presentation::instances::interpolated_screen_position_entity(entity);
+        // Native6DA380 tests lifecycle/cloak after the clicked Cell gate;
+        // it does not repeat a raw anchor-cell shroud or discovery test.
+        // VERA-only order: the distance test comes first, and only an
+        // object that would become the nearest asks the admission tests.
+        // They only read, so the winner is the same.
+        let (sx, sy) = source.screen_position(entity);
         let distance = pick_distance_sq(sx - world_x, sy - world_y) as i32;
         if distance < PICK_DISTANCE_THRESHOLD as i32
             && best.is_none_or(|(_, best_distance)| distance < best_distance)
+            && pick_admits_object(entity, fog, player)
+            && !source.conceals(entity)
+            && !source.invisible_in_game_building(entity)
         {
             best = Some((entity.stable_id(), distance));
         }
     }
 
-    if let Some((stable_id, _)) = best {
-        return Some(stable_id);
-    }
-
-    // Cell/foundation occupancy is consulted only when the tracked-anchor pass
-    // found nothing. Preserve encounter order when a malformed overlap exists.
-    entities.values().find_map(|entity| {
-        if entity.category != EntityCategory::Structure
-            || !entity.lifecycle.object_alive
-            || entity.lifecycle.in_limbo
-        {
-            return None;
+    let picked = if let Some((stable_id, _)) = best {
+        Some(CellObjectMember::Entity(stable_id))
+    } else {
+        match source.first_ground_cell_object(click_cell)? {
+            CellObjectMember::Entity(id) => entities
+                .get(id)
+                .filter(|entity| {
+                    pick_admits_object(entity, fog, player) && !source.conceals(entity)
+                })
+                .map(|_| CellObjectMember::Entity(id)),
+            terrain => Some(terrain),
         }
-        let type_str = interner.map_or("", |i| i.resolve(entity.type_ref()));
-        let foundation = rules
-            .and_then(|r| r.object(type_str))
-            .map(|o| o.foundation.as_str())
-            .unwrap_or("1x1");
-        click_hits_foundation(
-            world_x,
-            world_y,
-            entity.position.rx,
-            entity.position.ry,
-            foundation,
-            height_map,
-            bridge_cells,
-        )
-        .then_some(entity.stable_id())
-    })
+    }?;
+    // DisplayClass::ProcessClickCoords @0x00692300, 0x0069252D..0x00692585:
+    // after Tactical::PickObjectAtScreenPoint6DA380 and its cell fallback,
+    // TypeInvisible+0xC9A clears the winner unless Techno+0x41A is set.
+    // Source: retail gamemd.exe instructions. Never retry objects behind it.
+    match picked {
+        CellObjectMember::Entity(id) => {
+            let entity = entities.get(id)?;
+            (entity.seldom.discovery.owned_by_current_house()
+                || !source.type_invisible(entity) && !faded_out_unsensed(entity, fog, player))
+            .then_some(picked)
+        }
+        CellObjectMember::Terrain(_) => Some(picked),
+    }
+}
+
+/// ProcessClickCoords' Building arm (`0x00692585..0x006925E6`): a nonlocal
+/// Building faded out (`+0x6ED` 15) is no object unless the player's sensors
+/// cover the cell of its GetCoords (vt+0x48, `CellClass::SensorCountForHouse
+/// @ 0x004870D0`). DetermineAction (`0x006926DB..0x0069272C`) and
+/// BandBox_LeftUp (`0x004ABE18..0x004ABE48`, through vt+0x328) repeat this
+/// test on the object it returns.
+fn faded_out_unsensed(
+    entity: &crate::sim::game_entity::GameEntity,
+    fog: Option<&FogState>,
+    player: Option<InternedId>,
+) -> bool {
+    entity.category() == EntityCategory::Structure
+        && entity.building_cloak_stage() == 15
+        && fog
+            .zip(player)
+            .is_some_and(|(fog, player)| !fog.senses_object_for_house(player, entity))
+}
+
+/// With nothing selected, DetermineAction (`0x00692610`, its no-selection arm
+/// from `0x00692673`) refuses ACTION_SELECT for a picked Building frozen in
+/// FogOfWar (`+0x6E7`, `0x0069274C..0x00692760`) and for a Techno that
+/// retains `+0x3D4` (`0x00692762..0x00692778`). The click and the cursor
+/// share this leaf. A fogged building's own cell already picks nothing; this
+/// reaches the one picked through its anchor from a neighbouring cell.
+pub(crate) fn no_selection_refuses_select(
+    entity: &crate::sim::game_entity::GameEntity,
+    fog: Option<&FogState>,
+    player: Option<InternedId>,
+) -> bool {
+    (entity.category() == EntityCategory::Structure
+        && fog
+            .zip(player)
+            .is_some_and(|(fog, player)| fog.is_object_fogged(player, entity.stable_id())))
+        || entity.is_mission_only()
 }
 
 /// Final object admission shared by selection callers. Ownership and the
 /// band/TypeSelect dynamic virtual are caller gates: an ordinary discovered
-/// nonlocal click may reach this gate, while band and TypeSelect collect only
-/// exact-local candidates. Newly selected objects still have to be alive,
-/// present, statically selectable, and outside active warp-out.
+/// nonlocal click may reach this gate, the band collects the candidates whose
+/// House `IsHumanPlayer` admits ([ControlProjection::can_order]), and
+/// TypeSelect collects only exact-local candidates. Newly selected objects
+/// still have to be alive, present, statically selectable, and outside
+/// active warp-out.
 fn static_selection_gate(
     entity: &crate::sim::game_entity::GameEntity,
     entity_type: &str,
     rules: Option<&RuleSet>,
     require_playfield_membership: bool,
 ) -> bool {
-    entity.lifecycle.object_alive
+    entity.lifecycle.object_alive()
         // `0x006F32D3`: no Health — a crashing aircraft falls alive at 0.
-        && entity.health.current > 0
-        && !entity.lifecycle.in_limbo
+        && entity.health.current() > 0
+        && !entity.lifecycle.in_limbo()
         && !entity.is_warped_out()
-        // `TechnoClass::Select @ 0x006F32D0` requires the stored +0x3D5
-        // membership byte. The app supplies the live MapClass authority gate;
+        // The mouse/type caller's aggregate admission includes +0x3D5.
+        // This helper is not the complete virtual+64; see its owner above.
+        // The app supplies the live MapClass authority gate;
         // headless selection fixtures leave it disabled.
-        && (!require_playfield_membership || entity.in_playfield)
+        && (!require_playfield_membership || entity.in_playfield())
         && type_is_selectable(entity_type, rules)
 }
 
@@ -1285,7 +1680,13 @@ fn type_is_selectable(entity_type: &str, rules: Option<&RuleSet>) -> bool {
     rules.is_none_or(|r| r.object(entity_type).is_none_or(|obj| obj.selectable))
 }
 
+/// The band callback `0x004AC2B0` in VERA's order: the owning House's
+/// `IsHumanPlayer` (`0x004AC2BE`, see [ControlProjection::can_order])
+/// and then the static admission. A world without a local player keeps the
+/// band open to every owner, as the headless fixtures always have; a source
+/// without a house table falls back to exact local-owner identity.
 fn is_local_band_candidate(
+    control: Option<&ControlProjection<'_>>,
     local_owner: Option<&str>,
     entity_owner: &str,
     entity: &crate::sim::game_entity::GameEntity,
@@ -1293,93 +1694,127 @@ fn is_local_band_candidate(
     rules: Option<&RuleSet>,
     require_playfield_membership: bool,
 ) -> bool {
-    local_owner.is_none_or(|local| entity_owner.eq_ignore_ascii_case(local))
-        && static_selection_gate(entity, entity_type, rules, require_playfield_membership)
+    local_owner.is_none_or(|local| {
+        control
+            .map(|control| control.can_order(entity.owner()))
+            .unwrap_or_else(|| entity_owner.eq_ignore_ascii_case(local))
+    }) && static_selection_gate(entity, entity_type, rules, require_playfield_membership)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app_input_d_z))]
+#[path = "entity_pick_reveal_tests.rs"]
+mod reveal_tests;
+
+#[cfg(all(test, tests_app_input_d_z))]
+#[path = "entity_pick_building_type_select_tests.rs"]
+mod building_type_select_tests;
+
+#[cfg(all(test, tests_app_input_d_z))]
+#[path = "entity_pick_group_as_tests.rs"]
+mod group_as_tests;
+
+#[cfg(all(test, tests_app_input_d_z))]
+#[path = "entity_pick_invisible_tests.rs"]
+mod invisible_tests;
+
+#[cfg(all(test, tests_app_input_d_z))]
+#[path = "entity_pick_band_owner_tests.rs"]
+mod band_owner_tests;
+
+#[cfg(all(test, tests_app_input_d_z))]
+#[path = "entity_pick_double_click_tests.rs"]
+mod double_click_tests;
+
+#[cfg(all(test, tests_app_input_d_z))]
 mod tests {
     use super::*;
-    use crate::rules::ini_parser::IniFile;
-    use crate::sim::components::Health;
+
+    use crate::sim::combat::Health;
     use crate::sim::game_entity::GameEntity;
     use crate::sim::intern::StringInterner;
 
-    fn store_with_structure(alive: bool, in_limbo: bool) -> (EntityStore, StringInterner) {
-        let mut interner = StringInterner::new();
-        let owner = interner.intern("Americans");
-        let type_ref = interner.intern("NAREFN");
-        let mut entities = EntityStore::new();
-        let mut building = GameEntity::new_at_frame_zero_for_test(
-            1,
-            10,
-            10,
-            0,
-            0,
-            owner,
-            Health { current: 1000 },
-            type_ref,
-            EntityCategory::Structure,
-            0,
-            5,
-            false,
-        );
-        building.lifecycle.object_alive = alive;
-        building.lifecycle.in_limbo = in_limbo;
-        entities.insert(building);
-        (entities, interner)
-    }
-
-    /// A dead building no longer occupies its cell.
-    ///
-    /// The native own-cell lookup answers with whatever currently occupies the
-    /// cell, and a destroyed building has already been taken off the map — so a
-    /// miner left standing where a refinery used to be must be band-selectable
-    /// again, exactly as it is when it drives clear of a live one.
     #[test]
-    fn destroyed_and_limboed_buildings_stop_covering_their_cell() {
-        let (entities, interner) = store_with_structure(true, false);
-        assert!(building_covers_cell(
-            &entities,
-            None,
-            Some(&interner),
-            10,
-            10
-        ));
-        // A cell outside the footprint is never covered.
-        assert!(!building_covers_cell(
-            &entities,
-            None,
-            Some(&interner),
-            11,
-            10
-        ));
+    fn locked_tactical_hover_cannot_repick_health_bars() {
+        use crate::app::presentation::ui_overlays::{health_bar_drawable, health_hover_target};
+        use crate::rules::ini_parser::IniFile;
+        use crate::sim::world::Simulation;
 
-        let (dead, interner) = store_with_structure(false, false);
-        assert!(!building_covers_cell(&dead, None, Some(&interner), 10, 10));
-
-        let (limboed, interner) = store_with_structure(true, true);
-        assert!(!building_covers_cell(
-            &limboed,
-            None,
-            Some(&interner),
-            10,
-            10
-        ));
-    }
-
-    fn item83_rules() -> RuleSet {
-        RuleSet::from_ini(&IniFile::from_str(
-            "[InfantryTypes]\n0=E1\n\n\
-             [VehicleTypes]\n0=AMCV\n1=NOSEL\n\n\
-             [AircraftTypes]\n\n\
-             [BuildingTypes]\n0=GACNST\n\n\
-             [AMCV]\nStrength=1000\nArmor=heavy\nSpeed=4\nDeploysInto=GACNST\n\n\
-             [GACNST]\nStrength=1000\nArmor=concrete\nUndeploysInto=AMCV\n\n\
-             [E1]\nStrength=100\nArmor=none\nSpeed=4\n\n\
-             [NOSEL]\nStrength=100\nArmor=light\nSpeed=4\nSelectable=no\n",
+        let rules = RuleSet::from_ini(&IniFile::from_str(
+            "[BuildingTypes]\n0=VISIBLE\n[VISIBLE]\nStrength=100\n",
         ))
-        .expect("item83 rules")
+        .unwrap();
+        let mut sim = Simulation::new();
+        sim.resolve_type_handles(&rules);
+        let first = sim
+            .spawn_object("VISIBLE", "Player", 10, 10, 0, &rules)
+            .unwrap();
+        let second = sim
+            .spawn_object("VISIBLE", "Player", 20, 20, 0, &rules)
+            .unwrap();
+        // The frame's records answer for its local player.
+        let player = sim.interner().get("Player");
+        sim.session_mut_for_test()
+            .set_current_house_for_test(player);
+        let frame = |sim: &Simulation| {
+            crate::app::presentation::frame::PresentationFrame::of_test(sim, &rules)
+        };
+        let point = |sim: &Simulation, id| {
+            crate::render::locomotor_visual::screen_position(sim.entities().get(id).unwrap())
+        };
+        let pick = |sim: &Simulation, id| {
+            let (x, y) = point(sim, id);
+            tactical_hover_object_at_point(
+                sim,
+                Some(&frame(sim)),
+                x,
+                y,
+                "Player",
+                true,
+                sim.session().input_locked(),
+            )
+        };
+        assert_eq!(health_hover_target(pick(&sim, first)), Some(first));
+        sim.session_mut_for_test().set_input_locked_for_test(true);
+        assert_eq!(pick(&sim, first), None);
+        assert_eq!(
+            pick(&sim, second),
+            None,
+            "hidden pointer cannot acquire another object"
+        );
+        assert!(!health_bar_drawable(
+            &sim,
+            frame(&sim).object(second).unwrap(),
+            health_hover_target(pick(&sim, second)),
+            Some("Player"),
+            rules.ares(),
+        ));
+        sim.entity_mut_for_test(first)
+            .unwrap()
+            .seldom
+            .selection
+            .set_selected_for_test(true);
+        assert!(
+            health_bar_drawable(
+                &sim,
+                frame(&sim).object(first).unwrap(),
+                health_hover_target(pick(&sim, first)),
+                Some("Player"),
+                rules.ares(),
+            ),
+            "the lock removes hover, not selected health bars"
+        );
+        let (x, y) = point(&sim, second);
+        assert_eq!(
+            health_hover_target(hover_object_at_point(&sim, x, y, "Player", true)),
+            Some(second),
+            "non-input geometric picking remains available",
+        );
+        sim.session_mut_for_test().set_input_locked_for_test(false);
+        assert_eq!(
+            health_hover_target(pick(&sim, second)),
+            Some(second),
+            "unlock uses the current point"
+        );
     }
 
     fn item83_entity(
@@ -1398,442 +1833,664 @@ mod tests {
             0,
             0,
             owner,
-            Health { current: 100 },
+            Health::new(100),
             type_ref,
             category,
             0,
             5,
             category == EntityCategory::Aircraft,
         );
-        entity.lifecycle.object_alive = true;
-        entity.lifecycle.in_limbo = false;
-        entity.selected = selected;
+        entity.lifecycle.set_object_alive_for_test(true);
+        entity.lifecycle.set_in_limbo_for_test(false);
+        entity.seldom.selection.set_selected_for_test(selected);
         entity
     }
 
-    /// `CanBeSelectedNow`'s byte `+0x1C8` is the Robot-Tank-offline latch, not a
-    /// deploy-transition flag: its only writers are `TechnoClass__OnDeployBegin`
-    /// 0x0070FD62 and `TechnoClass__OnUndeployComplete` 0x0070FC6D/0x0070FC7A,
-    /// reached only from the powered-center and robot-tank paths. A GI part-way
-    /// through its deploy toggle therefore stays band-selectable in gamemd, and
-    /// must here too.
+    /// The pick asks its admission tests only of an object near enough to
+    /// win; an object far from the point costs only its distance.
     #[test]
-    fn item83_a_deploying_object_is_still_band_selectable() {
-        use crate::sim::deploy::DeployPhase;
-        let rules = item83_rules();
-        let mut interner = StringInterner::new();
-        let owner = interner.intern("Americans");
-        let type_ref = interner.intern("GI");
-        let mut entity = item83_entity(1, 5, 5, owner, type_ref, EntityCategory::Infantry, false);
-        let entities = EntityStore::new();
+    fn a_pick_asks_admission_only_near_the_point() {
+        use crate::sim::world::Simulation;
 
-        assert!(
-            can_be_selected_now(&entity, &entities, Some(&rules), Some(&interner)),
-            "an idle object is selectable"
+        #[derive(Clone, Copy)]
+        struct Counting<'a> {
+            sim: &'a Simulation,
+            asked: &'a std::cell::Cell<u32>,
+        }
+        impl PickSource for Counting<'_> {
+            fn entities(&self) -> &EntityStore {
+                self.sim.entities()
+            }
+            fn conceals(&self, _entity: &GameEntity) -> bool {
+                self.asked.set(self.asked.get() + 1);
+                false
+            }
+        }
+
+        let mut sim = Simulation::new();
+        let viewer = sim.intern("viewer");
+        let typ = sim.intern("INIT");
+        for (id, rx) in [(1, 10), (2, 30), (3, 50)] {
+            sim.entities_mut_for_test().insert(item83_entity(
+                id,
+                rx,
+                10,
+                viewer,
+                typ,
+                EntityCategory::Infantry,
+                false,
+            ));
+        }
+        let asked = std::cell::Cell::new(0);
+        let source = Counting {
+            sim: &sim,
+            asked: &asked,
+        };
+        let (x, y) =
+            crate::render::locomotor_visual::screen_position(sim.entities().get(1).unwrap());
+        assert_eq!(
+            pick_object_at_point(source, &[1, 2, 3], None, None, x, y, None),
+            Some(CellObjectMember::Entity(1))
         );
-        for phase in [
-            DeployPhase::Deploying { ticks_remaining: 3 },
-            DeployPhase::Undeploying { ticks_remaining: 3 },
-        ] {
-            entity.deploy_state = Some(phase);
-            assert!(
-                can_be_selected_now(&entity, &entities, Some(&rules), Some(&interner)),
-                "gamemd has no deploy-transition clause here"
+        assert_eq!(asked.get(), 1);
+    }
+
+    #[test]
+    fn hover_and_click_match_original_weighted_pick_and_encounter_ties() {
+        use crate::sim::world::Simulation;
+
+        // These points are declared native registration inputs, not a second
+        // projection implementation. The ordinary retail scene is exercised
+        // separately by the bunker entry regression.
+        #[derive(Clone, Copy)]
+        struct Registrations<'a> {
+            sim: &'a Simulation,
+            points: [(f32, f32); 2],
+        }
+        impl PickSource for Registrations<'_> {
+            fn entities(&self) -> &EntityStore {
+                self.sim.entities()
+            }
+            fn screen_position(&self, entity: &GameEntity) -> (f32, f32) {
+                self.points[entity.stable_id() as usize - 1]
+            }
+        }
+        impl PickWorld for Registrations<'_> {
+            fn simulation(&self) -> &Simulation {
+                self.sim
+            }
+        }
+
+        let corpus = crate::test_fixture::json("tools/spatial_oracle/pointer_pick.json");
+        for row in corpus["controls"].as_array().unwrap() {
+            let mut sim = Simulation::new();
+            let viewer = sim.intern("viewer");
+            let typ = sim.intern("INIT");
+            for id in [1, 2] {
+                sim.entities_mut_for_test().insert(item83_entity(
+                    id,
+                    10,
+                    10,
+                    viewer,
+                    typ,
+                    EntityCategory::Infantry,
+                    false,
+                ));
+            }
+            let order: Vec<_> = row["registration_order"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_u64().unwrap() + 1)
+                .collect();
+            for &id in &order {
+                sim.resubmit_entity_display_for_test(id);
+            }
+            let point = |value: &serde_json::Value| {
+                (
+                    value[0].as_f64().unwrap() as f32,
+                    value[1].as_f64().unwrap() as f32,
+                )
+            };
+            let source = Registrations {
+                sim: &sim,
+                points: [point(&row["positions"][0]), point(&row["positions"][1])],
+            };
+            let (x, y) = point(&row["cursor"]);
+            let expected = Some(row["picked"].as_u64().unwrap() + 1);
+            assert_eq!(
+                pick_entity_at_point(
+                    source,
+                    &order,
+                    None,
+                    Some("viewer"),
+                    x,
+                    y,
+                    Some(sim.interner()),
+                    None,
+                ),
+                expected,
+                "click: {}",
+                row["name"]
+            );
+            assert_eq!(
+                hover_target_at_point(source, x, y, "viewer", true).map(|hover| hover.stable_id),
+                expected,
+                "hover: {}",
+                row["name"]
             );
         }
     }
 
     #[test]
-    fn item83_type_select_seeds_own_deploy_and_undeploy_then_escalates_same_call() {
-        let rules = item83_rules();
-        let mut interner = StringInterner::new();
-        let owner = interner.intern("Americans");
-        let amcv = interner.intern("AMCV");
-        let gacnst = interner.intern("GACNST");
-        let soviet = interner.intern("Soviet");
-        let mut entities = EntityStore::new();
-        entities.insert(item83_entity(
+    fn cell_fallback_keeps_the_post_pick_cloak_gate() {
+        use crate::sim::cloak_disguise::CloakRuntime;
+        use crate::sim::world::Simulation;
+
+        let mut sim = Simulation::new();
+        let viewer = sim.intern("viewer");
+        let other = sim.intern("other");
+        let typ = sim.intern("GAPOWR");
+        *sim.fog_mut_for_test() = FogState::new(32, 32);
+        sim.fog_mut_for_test().reveal_all_for_owner(viewer);
+        let mut building = item83_entity(1, 10, 10, other, typ, EntityCategory::Structure, false);
+        building.cloak = Some(Box::new(CloakRuntime::new(0)));
+        let (x, y) = crate::render::locomotor_visual::screen_position(&building);
+        sim.entities_mut_for_test().insert(building);
+        sim.occupancy_mut().add(
+            10,
+            10,
             1,
+            crate::sim::movement::locomotor::MovementLayer::Ground,
+            None,
+            crate::sim::occupancy::CellListInsertion::AppendBuilding,
+        );
+        sim.resubmit_entity_display_for_test(1);
+        // Outside the tracked-anchor ellipse but inside this foundation.
+        // ProcessClickCoords692529..69257F repeats the cloak gate after the
+        // chosen fallback; sharing the picker must preserve hover's refusal.
+        for (cloak_state, expected) in [(0, Some(1)), (2, None)] {
+            sim.entity_mut_for_test(1)
+                .unwrap()
+                .cloak
+                .as_mut()
+                .unwrap()
+                .set_state_for_test(cloak_state);
+            assert_eq!(
+                pick_entity_at_point(
+                    &sim,
+                    &[1],
+                    Some(sim.fog()),
+                    Some("viewer"),
+                    x + 20.,
+                    y,
+                    Some(sim.interner()),
+                    None,
+                ),
+                expected
+            );
+            assert_eq!(
+                hover_target_at_point(&sim, x + 20., y, "viewer", false)
+                    .map(|hover| hover.stable_id),
+                expected
+            );
+        }
+    }
+
+    /// Under FogOfWar, ProcessClickCoords skips the pick on a cell whose
+    /// Building is frozen in fog (`0x006924A4..0x006924FA`); the fog flag
+    /// alone, without the Scenario FogOfWar bit, does not. From a neighbouring
+    /// cell the anchor ellipse still finds it, and with nothing selected
+    /// DetermineAction refuses to select it (`0x0069274C..0x00692760`). The
+    /// band preflight registers it whatever the fog mode (`0x006D9CE0`).
+    #[test]
+    fn a_building_frozen_in_fog_of_war_refuses_the_pick_on_its_cell() {
+        use crate::sim::world::Simulation;
+
+        let mut sim = Simulation::new();
+        let viewer = sim.intern("viewer");
+        let other = sim.intern("other");
+        let typ = sim.intern("GAPOWR");
+        *sim.fog_mut_for_test() = FogState::new(32, 32);
+        // Explored, out of current sight: translucent fog conceals it.
+        for rx in 8..14 {
+            for ry in 8..14 {
+                sim.fog_mut_for_test()
+                    .set_ground_bits_for_test(viewer, rx, ry, 0x08);
+            }
+        }
+        let building = item83_entity(1, 10, 10, other, typ, EntityCategory::Structure, false);
+        let (x, y) = crate::render::locomotor_visual::screen_position(&building);
+        sim.entities_mut_for_test().insert(building);
+        sim.occupancy_mut().add(
             10,
             10,
-            owner,
-            amcv,
-            EntityCategory::Unit,
-            true,
-        ));
-        entities.insert(item83_entity(
+            1,
+            crate::sim::movement::locomotor::MovementLayer::Ground,
+            None,
+            crate::sim::occupancy::CellListInsertion::AppendBuilding,
+        );
+        sim.resubmit_entity_display_for_test(1);
+        for (fog_of_war, fogged) in [(true, false), (true, true), (false, true)] {
+            sim.session_mut_for_test()
+                .game_options_mut_for_test()
+                .fog_of_war = fog_of_war;
+            sim.fog_mut_for_test()
+                .set_object_fogged_for_test(viewer, 1, fogged);
+            let case = format!("fog_of_war={fog_of_war} fogged={fogged}");
+            // On the anchor and beyond the ellipse on the same foundation.
+            for point_x in [x, x + 20.] {
+                assert_eq!(
+                    hover_target_at_point(&sim, point_x, y, "viewer", false)
+                        .map(|hover| hover.stable_id),
+                    (!(fog_of_war && fogged)).then_some(1),
+                    "{case} x={point_x}"
+                );
+            }
+            // Inside the ellipse, on the cell below the foundation.
+            let below = (x, y + 18.);
+            assert_eq!(
+                hover_target_at_point(&sim, below.0, below.1, "viewer", false)
+                    .map(|hover| hover.stable_id),
+                Some(1),
+                "{case}"
+            );
+            let click = compute_click_selection_snapshot_with_playfield(
+                &sim,
+                &[1],
+                &[],
+                Some(sim.fog()),
+                Some("viewer"),
+                below.0,
+                below.1,
+                false,
+                None,
+                Some(sim.interner()),
+                false,
+                None,
+            )
+            .unwrap();
+            assert_eq!(
+                click.select,
+                if fogged { vec![] } else { vec![1] },
+                "{case}"
+            );
+            for translucent_viewer in [None, Some(viewer)] {
+                let source = PresentedWorld {
+                    sim: &sim,
+                    rules: None,
+                    translucent_viewer,
+                };
+                let (bx, by) = source.screen_position(sim.entities().get(1).unwrap());
+                assert!(
+                    band_rect_contains_drawn_object(
+                        source,
+                        &[1],
+                        bx - 1.,
+                        by - 1.,
+                        bx + 1.,
+                        by + 1.
+                    ),
+                    "{case} {translucent_viewer:?}"
+                );
+            }
+        }
+    }
+
+    /// Draw plan, screen selection and pickers share one visibility rule
+    /// (#617): own and allied units always show; an enemy shows in current
+    /// sight, and never under a hostile gap. On explored ground out of sight,
+    /// VERA's translucent fog with FogOfWar takes an enemy out of the draw
+    /// plan, so no point pick, band preflight or type-select box finds it;
+    /// the retail fog keeps it pickable, as native does
+    /// (`0x006924A4..0x006924FA`). A hostile gap hides an enemy from the point
+    /// pick only: AddSelectable (`0x006D9EF0`) tests no shroud, so the band
+    /// box and the type-select box still catch it.
+    #[test]
+    fn translucent_fog_hides_from_the_pickers_what_it_hides_from_the_draw_plan() {
+        use crate::app::presentation::instances::{
+            TacticalEntityPurpose, tactical_entity_admission, translucent_fog_conceals,
+        };
+        use crate::sim::world::Simulation;
+
+        let mut sim = Simulation::new();
+        let viewer = sim.intern("Americans");
+        let ally = sim.intern("British");
+        let enemy = sim.intern("Russians");
+        let typ = sim.intern("MTNK");
+        // The viewer's House, whose objects the T key's owner test admits.
+        sim.houses_mut_for_test()
+            .register(crate::sim::house_state::HouseState::new(
+                viewer, 0, None, true, 0, 10,
+            ));
+        sim.session_mut_for_test()
+            .game_options_mut_for_test()
+            .fog_of_war = true;
+        sim.house_alliances_mut_for_test()
+            .insert("AMERICANS".into(), ["BRITISH".into()].into());
+        *sim.fog_mut_for_test() = FogState::new(40, 16);
+        // Explored, out of current sight, except the seen enemy's cell; a
+        // hostile gap then covers the last enemy.
+        for rx in 8..30 {
+            for ry in 8..12 {
+                sim.fog_mut_for_test()
+                    .set_ground_bits_for_test(viewer, rx, ry, 0x08);
+            }
+        }
+        sim.fog_mut_for_test()
+            .mark_visible_for_owner(viewer, 21, 10);
+        let (alliances, interner) = (sim.house_alliances().clone(), sim.interner().clone());
+        crate::sim::vision::apply_gap_generators(
+            sim.fog_mut_for_test(),
+            &alliances,
+            &[(enemy, 25, 10, 1)],
+            &interner,
+        );
+        // (id, cell x, owner, shown by retail fog, shown by translucent fog)
+        let cases = [
+            (1, 9, viewer, true, true),
+            (2, 13, ally, true, true),
+            (3, 17, enemy, true, false),
+            (4, 21, enemy, true, true),
+            (5, 25, enemy, false, false),
+        ];
+        for &(id, rx, owner, ..) in &cases {
+            sim.entities_mut_for_test().insert(item83_entity(
+                id,
+                rx,
+                10,
+                owner,
+                typ,
+                EntityCategory::Unit,
+                false,
+            ));
+            sim.resubmit_entity_display_for_test(id);
+        }
+        let all: Vec<u64> = cases.iter().map(|case| case.0).collect();
+        let frame = crate::app::presentation::frame::PresentationFrame::of_test(
+            &sim,
+            RuleSet::empty_for_test(),
+        );
+        for (id, _, _, retail, translucent) in cases {
+            let entity = sim.entities().get(id).unwrap();
+            assert_eq!(
+                !translucent_fog_conceals(&sim, viewer, &entity.position, entity.owner()),
+                translucent
+            );
+            let screen_selected = tactical_entity_admission(
+                TacticalEntityPurpose::ScreenSelection,
+                frame.object(id).unwrap(),
+                Some(viewer),
+                sim.fog(),
+                false,
+                0,
+                0,
+                Default::default(),
+            )
+            .is_some();
+            assert!(screen_selected, "{id}");
+            for (translucent_viewer, shown) in [(None, retail), (Some(viewer), translucent)] {
+                let caught = translucent_viewer.is_none() || translucent;
+                let source = PresentedWorld {
+                    sim: &sim,
+                    rules: None,
+                    translucent_viewer,
+                };
+                let case = format!("{id} {translucent_viewer:?}");
+                let (x, y) = source.screen_position(entity);
+                let picked = hover_target_at_point(source, x, y, "Americans", false)
+                    .map(|hover| hover.stable_id);
+                assert_eq!(picked, shown.then_some(id), "{case}");
+                let band =
+                    band_rect_contains_drawn_object(source, &[id], x - 1., y - 1., x + 1., y + 1.);
+                assert_eq!(band, caught, "{case}");
+                // An MTNK in the box selects the viewer's own MTNKs.
+                let typed = compute_type_select_box_mutation_with_playfield(
+                    source,
+                    &[id],
+                    &all,
+                    &[],
+                    None,
+                    Some("Americans"),
+                    x - 1.,
+                    y - 1.,
+                    x + 1.,
+                    y + 1.,
+                    false,
+                    None,
+                    Some(sim.interner()),
+                    false,
+                );
+                assert_eq!(
+                    typed.select,
+                    if caught { vec![1] } else { vec![] },
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    /// With no registered object near the point, the pick is the head of the
+    /// clicked cell's ground list (`0x006DA4B8..0x006DA4FB`): a unit standing
+    /// beyond the ellipse, ahead of the building whose foundation it stands
+    /// on (AddContent `0x0047E8A0` prepends it), or a Terrain object, which
+    /// only the object pick returns.
+    /// An empty selection, or a lone enemy the tap drops, leaves no seed, and
+    /// the seedless tap turns the scope to the map (0x00732AAD).
+    #[test]
+    fn a_seedless_type_select_tap_turns_the_scope_to_the_map() {
+        use crate::sim::world::Simulation;
+
+        let mut sim = Simulation::new();
+        let me = sim.intern("me");
+        let enemy = sim.intern("enemy");
+        let tank = sim.intern("HTNK");
+        for (id, owner) in [(1, me), (2, enemy)] {
+            sim.entities_mut_for_test().insert(item83_entity(
+                id,
+                10 + id as u16,
+                10,
+                owner,
+                tank,
+                EntityCategory::Unit,
+                false,
+            ));
+        }
+        for selection in [&[][..], &[2]] {
+            let tap = compute_type_select_tap_with_playfield(
+                sim.entities(),
+                &[1, 2],
+                &[1, 2],
+                selection,
+                None,
+                Some("me"),
+                None,
+                Some(sim.interner()),
+                false,
+                false,
+            );
+            assert_eq!(tap.outcome, crate::app::types::TypeSelectOutcome::Empty);
+            assert!(tap.across_map, "selection {selection:?}");
+        }
+    }
+
+    /// Asked with its frame, the pick scores only the objects near the
+    /// point: one just inside the ellipse across or up and down is still
+    /// picked, and one just outside it is not, as without the frame.
+    #[test]
+    fn the_frame_pick_keeps_an_object_just_inside_the_ellipse() {
+        use crate::app::presentation::frame::PresentationFrame;
+        use crate::sim::world::Simulation;
+
+        let mut sim = Simulation::new();
+        let viewer = sim.intern("viewer");
+        let typ = sim.intern("HTNK");
+        let unit = item83_entity(1, 10, 10, viewer, typ, EntityCategory::Unit, false);
+        let (x, y) = crate::render::locomotor_visual::screen_position(&unit);
+        sim.entities_mut_for_test().insert(unit);
+        sim.resubmit_entity_display_for_test(1);
+        let frame = PresentationFrame::of_test(&sim, RuleSet::empty_for_test());
+        let picked = |frame, dx: f32, dy: f32| {
+            hover_object_in_frame(&sim, frame, x + dx, y + dy, "viewer", true)
+                .and_then(HoverObject::techno)
+                .map(|hover| hover.stable_id)
+        };
+        // 14.1² is 198.8 and 0.5·19.9² is 198.0, under 200; 14.2² is 201.6
+        // and 0.5·20² is 200.
+        for (dx, dy, found) in [
+            (14.1, 0., Some(1)),
+            (-14.1, 0., Some(1)),
+            (0., 19.9, Some(1)),
+            (0., -19.9, Some(1)),
+            (14.2, 0., None),
+            (0., -20., None),
+        ] {
+            assert_eq!(picked(Some(&frame), dx, dy), found, "{dx}, {dy}");
+            assert_eq!(picked(None, dx, dy), found, "{dx}, {dy}");
+        }
+    }
+
+    #[test]
+    fn the_point_pick_falls_back_to_the_clicked_cells_ground_list_head() {
+        use crate::sim::movement::locomotor::MovementLayer;
+        use crate::sim::occupancy::CellListInsertion;
+        use crate::sim::terrain_object::TerrainObjectState;
+        use crate::sim::world::Simulation;
+
+        let mut sim = Simulation::new();
+        let viewer = sim.intern("viewer");
+        let typ = sim.intern("HTNK");
+        let building_type = sim.intern("GAPOWR");
+        let unit = item83_entity(1, 10, 10, viewer, typ, EntityCategory::Unit, false);
+        let (x, y) = crate::render::locomotor_visual::screen_position(&unit);
+        sim.entities_mut_for_test().insert(unit);
+        sim.entities_mut_for_test().insert(item83_entity(
             2,
-            11,
-            10,
-            owner,
-            gacnst,
-            EntityCategory::Structure,
-            true,
-        ));
-        entities.insert(item83_entity(
-            3,
-            12,
-            10,
-            owner,
-            amcv,
-            EntityCategory::Unit,
-            false,
-        ));
-        entities.insert(item83_entity(
-            4,
-            13,
-            10,
-            owner,
-            gacnst,
+            9,
+            9,
+            viewer,
+            building_type,
             EntityCategory::Structure,
             false,
         ));
-        entities.insert(item83_entity(
-            5,
-            30,
-            30,
-            owner,
-            amcv,
-            EntityCategory::Unit,
-            false,
-        ));
-        entities.insert(item83_entity(
-            6,
-            14,
-            10,
-            soviet,
-            amcv,
-            EntityCategory::Unit,
-            false,
-        ));
-
-        let screen = [1, 2, 4, 6, 3];
-        let map = [1, 2, 3, 4, 5, 6];
-        let first = compute_type_select_tap(
-            &entities,
-            &screen,
-            &map,
-            &[1, 2],
-            None,
-            Some("Americans"),
-            Some(&rules),
-            Some(&interner),
-            false,
-        );
-        assert_eq!(first.outcome, crate::app::types::TypeSelectOutcome::Screen);
-        assert_eq!(first.mutation.select, [1, 2, 4, 3]);
-        assert!(!first.across_map);
-
-        let second = compute_type_select_tap(
-            &entities,
-            &screen,
-            &map,
-            &[1, 2, 4, 3],
-            None,
-            Some("Americans"),
-            Some(&rules),
-            Some(&interner),
-            false,
-        );
-        assert_eq!(second.outcome, crate::app::types::TypeSelectOutcome::Map);
-        assert_eq!(second.mutation.select, [1, 2, 3, 4, 5]);
-        assert!(second.across_map);
-    }
-
-    #[test]
-    fn item83_empty_outcome_precedes_an_existing_across_map_scope() {
-        let entities = EntityStore::new();
-        let tap = compute_type_select_tap(
-            &entities,
-            &[],
-            &[],
-            &[],
-            None,
-            Some("Americans"),
-            None,
-            None,
-            true,
-        );
-
-        assert_eq!(tap.outcome, crate::app::types::TypeSelectOutcome::Empty);
-        assert_eq!(tap.outcome.csf_key(), "MSG:NothingSelected");
-    }
-
-    #[test]
-    fn item83_visible_warp_out_match_holds_screen_scope_before_final_admission() {
-        use crate::sim::movement::teleport_movement::{TeleportPhase, TeleportState};
-
-        let rules = item83_rules();
-        let mut interner = StringInterner::new();
-        let owner = interner.intern("Americans");
-        let amcv = interner.intern("AMCV");
-        let mut entities = EntityStore::new();
-        entities.insert(item83_entity(
-            1,
-            10,
-            10,
-            owner,
-            amcv,
-            EntityCategory::Unit,
-            true,
-        ));
-        let mut warp_out = item83_entity(2, 11, 10, owner, amcv, EntityCategory::Unit, false);
-        warp_out.teleport_state = Some(TeleportState {
-            phase: TeleportPhase::Relocate,
-            target_rx: 20,
-            target_ry: 20,
-            being_warped_ticks: 0,
-        });
-        entities.insert(warp_out);
-        entities.insert(item83_entity(
-            3,
-            30,
-            30,
-            owner,
-            amcv,
-            EntityCategory::Unit,
-            false,
-        ));
-
-        let tap = compute_type_select_tap(
-            &entities,
-            &[1, 2],
-            &[1, 2, 3],
-            &[1],
-            None,
-            Some("Americans"),
-            Some(&rules),
-            Some(&interner),
-            false,
-        );
-
-        assert_eq!(tap.outcome, crate::app::types::TypeSelectOutcome::Screen);
-        assert!(!tap.across_map);
+        for (id, insertion) in [
+            (2, CellListInsertion::AppendBuilding),
+            (1, CellListInsertion::PrependNonBuilding),
+        ] {
+            sim.occupancy_mut()
+                .add(10, 10, id, MovementLayer::Ground, None, insertion);
+        }
+        sim.resubmit_entity_display_for_test(1);
+        // dx = 20 scores 400, outside the anchor ellipse's 200.
+        let (x, y) = (x + 20., y);
         assert_eq!(
-            tap.mutation.select,
-            [1],
-            "warp-out holds screen scope but fails final admission; off-screen stays out"
+            crate::app::match_runtime::sim_tick::world_point_to_cell(x, y, None),
+            (10, 10)
         );
-    }
-
-    #[test]
-    fn item83_held_click_uses_exact_type_without_deploy_link_and_deselects_group() {
-        let rules = item83_rules();
-        let mut interner = StringInterner::new();
-        let owner = interner.intern("Americans");
-        let amcv = interner.intern("AMCV");
-        let gacnst = interner.intern("GACNST");
-        let mut entities = EntityStore::new();
-        entities.insert(item83_entity(
-            1,
-            10,
-            10,
-            owner,
-            amcv,
-            EntityCategory::Unit,
-            true,
-        ));
-        entities.insert(item83_entity(
-            2,
-            11,
-            10,
-            owner,
-            gacnst,
-            EntityCategory::Structure,
-            false,
-        ));
-        entities.insert(item83_entity(
-            3,
-            12,
-            10,
-            owner,
-            amcv,
-            EntityCategory::Unit,
-            true,
-        ));
-        let scope = [1, 2, 3];
-
-        let replace = compute_type_select_click_mutation(
-            &entities,
-            &scope,
-            &[1, 3],
-            1,
-            false,
-            Some("Americans"),
-            Some(&rules),
-            Some(&interner),
-        );
-        assert!(replace.clear);
-        assert_eq!(replace.select, [1, 3]);
-        assert!(!replace.select.contains(&2));
-
-        let add = compute_type_select_click_mutation(
-            &entities,
-            &scope,
-            &[2],
-            1,
-            true,
-            Some("Americans"),
-            Some(&rules),
-            Some(&interner),
-        );
-        assert!(!add.clear);
-        assert_eq!(add.select, [1, 3]);
-
-        let deselect = compute_type_select_click_mutation(
-            &entities,
-            &scope,
-            &[1, 3],
-            1,
-            true,
-            Some("Americans"),
-            Some(&rules),
-            Some(&interner),
-        );
-        assert_eq!(deselect.deselect, [1, 3]);
-    }
-
-    #[test]
-    fn item83_held_band_unions_each_represented_exact_type_in_scope() {
-        let rules = item83_rules();
-        let mut interner = StringInterner::new();
-        let owner = interner.intern("Americans");
-        let amcv = interner.intern("AMCV");
-        let gacnst = interner.intern("GACNST");
-        let mut entities = EntityStore::new();
-        entities.insert(item83_entity(
-            1,
-            10,
-            10,
-            owner,
-            amcv,
-            EntityCategory::Unit,
-            false,
-        ));
-        entities.insert(item83_entity(
-            2,
-            11,
-            10,
-            owner,
-            gacnst,
-            EntityCategory::Structure,
-            false,
-        ));
-        entities.insert(item83_entity(
-            3,
-            30,
-            30,
-            owner,
-            amcv,
-            EntityCategory::Unit,
-            false,
-        ));
-        entities.insert(item83_entity(
-            4,
-            31,
-            30,
-            owner,
-            gacnst,
-            EntityCategory::Structure,
-            false,
-        ));
-        let (ax, ay) = crate::render::locomotor_visual::screen_position(entities.get(1).unwrap());
-        let (bx, by) = crate::render::locomotor_visual::screen_position(entities.get(2).unwrap());
-        let mutation = compute_type_select_box_mutation(
-            &entities,
-            &[1, 2],
-            &[1, 2, 3, 4],
-            &[],
-            None,
-            Some("Americans"),
-            ax.min(bx) - 1.0,
-            ay.min(by) - 1.0,
-            ax.max(bx) + 1.0,
-            ay.max(by) + 1.0,
-            false,
-            Some(&rules),
-            Some(&interner),
-        );
-        assert!(mutation.clear);
-        assert_eq!(mutation.select, [1, 3, 2, 4]);
-
-        let additive = compute_type_select_box_mutation(
-            &entities,
-            &[1, 2],
-            &[1, 2, 3, 4],
-            &[1],
-            None,
-            Some("Americans"),
-            ax.min(bx) - 1.0,
-            ay.min(by) - 1.0,
-            ax.max(bx) + 1.0,
-            ay.max(by) + 1.0,
-            true,
-            Some(&rules),
-            Some(&interner),
-        );
-        assert!(!additive.clear);
-        assert_eq!(additive.select, [3, 2, 4]);
-    }
-
-    #[test]
-    fn item83_held_band_enemy_anchor_seeds_local_exact_type_batch() {
-        let rules = item83_rules();
-        let mut interner = StringInterner::new();
-        let local_owner = interner.intern("Americans");
-        let enemy_owner = interner.intern("Soviet");
-        let amcv = interner.intern("AMCV");
-        let mut entities = EntityStore::new();
-        entities.insert(item83_entity(
-            1,
-            10,
-            10,
-            enemy_owner,
-            amcv,
-            EntityCategory::Unit,
-            false,
-        ));
-        entities.insert(item83_entity(
-            2,
-            30,
-            30,
-            local_owner,
-            amcv,
-            EntityCategory::Unit,
-            false,
-        ));
-        let (x, y) = crate::app::presentation::instances::interpolated_screen_position_entity(
-            entities.get(1).unwrap(),
-        );
-
-        let mutation = compute_type_select_box_mutation(
-            &entities,
-            &[1],
-            &[1, 2],
-            &[],
-            None,
-            Some("Americans"),
-            x - 1.0,
-            y - 1.0,
-            x + 1.0,
-            y + 1.0,
-            false,
-            Some(&rules),
-            Some(&interner),
-        );
-
-        assert!(mutation.clear);
+        let pick = |sim: &Simulation, x, y| {
+            pick_entity_at_point(
+                sim,
+                &[2, 1],
+                None,
+                Some("viewer"),
+                x,
+                y,
+                Some(sim.interner()),
+                None,
+            )
+        };
+        assert_eq!(pick(&sim, x, y), Some(1));
         assert_eq!(
-            mutation.select,
-            [2],
-            "enemy anchor contributes only its type; the batch admits only the local match"
+            hover_target_at_point(&sim, x, y, "viewer", true).map(|hover| hover.stable_id),
+            Some(1)
         );
+
+        let tree_type = sim.intern("TREE01");
+        let terrain = sim.terrain_objects_mut_for_test();
+        terrain.cell_index_mut_for_test().insert((12, 12), 50);
+        terrain
+            .objects_mut_for_test()
+            .insert(50, TerrainObjectState::for_test(50, tree_type, 12, 12));
+        let half = crate::util::fixed_math::SimFixed::from_num(128);
+        let (x, y) = crate::util::lepton::lepton_to_screen(12, 12, half, half, 0);
+        assert_eq!(
+            hover_object_at_point(&sim, x, y, "viewer", true),
+            Some(HoverObject::Terrain(50))
+        );
+        assert_eq!(hover_target_at_point(&sim, x, y, "viewer", true), None);
+        assert_eq!(pick(&sim, x, y), None);
+    }
+
+    #[test]
+    fn both_pointer_queries_use_retained_local_ownership_for_cloak_admission() {
+        use crate::sim::cloak_disguise::CloakRuntime;
+        use crate::sim::world::Simulation;
+
+        //6DA3FF and69252D read retained Techno+41A, independently of the
+        // current owner pointer. These explicit retained-byte controls cover
+        // the reader, not a claim that each prior has a natural producer.
+        for (same_owner, retained_owned, sensed, cloak_state, admitted) in [
+            (false, true, false, 2, true),
+            (true, false, false, 2, false),
+            (false, false, true, 2, true),
+            (false, false, false, 2, false),
+            (false, false, false, 0, true),
+        ] {
+            let mut sim = Simulation::new();
+            let viewer = sim.intern("viewer");
+            let other = sim.intern("other");
+            let typ = sim.intern("HTNK");
+            sim.session_mut_for_test()
+                .set_current_house_for_test(Some(viewer));
+            *sim.fog_mut_for_test() = FogState::new(32, 32);
+            sim.fog_mut_for_test()
+                .reveal_cells_for_owner(viewer, [(10, 10)]);
+            if sensed {
+                sim.fog_mut_for_test().increment_sensor_at(viewer, 10, 10);
+            }
+            let owner = if same_owner { viewer } else { other };
+            let mut entity = item83_entity(1, 10, 10, owner, typ, EntityCategory::Unit, false);
+            entity
+                .seldom
+                .discovery
+                .set_owned_by_current_house_for_test(retained_owned);
+            let mut cloak = CloakRuntime::new(0);
+            cloak.set_state_for_test(cloak_state);
+            entity.cloak = Some(Box::new(cloak));
+            let world = crate::render::locomotor_visual::screen_position(&entity);
+            sim.entities_mut_for_test().insert(entity);
+            sim.resubmit_entity_display_for_test(1);
+            let order =
+                crate::app::presentation::instances::tactical_entity_encounter_order(&sim, None);
+
+            let expected = admitted.then_some(1);
+            assert_eq!(
+                pick_entity_at_point(
+                    sim.entities(),
+                    &order,
+                    Some(sim.fog()),
+                    Some("viewer"),
+                    world.0,
+                    world.1,
+                    Some(sim.interner()),
+                    None,
+                ),
+                expected,
+                "pointer: owner equality{same_owner}, retained{retained_owned}, sensor{sensed}, cloak{cloak_state}"
+            );
+            assert_eq!(
+                hover_target_at_point(&sim, world.0, world.1, "viewer", false)
+                    .map(|target| target.stable_id),
+                expected,
+                "hover: owner equality{same_owner}, retained{retained_owned}, sensor{sensed}, cloak{cloak_state}"
+            );
+        }
     }
 
     #[test]
     fn mission_only_empty_selection_click_matches_native_flag_gate() {
-        let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-            "../../../tools/spatial_oracle/aircraft_mission_only.json"
+        let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/aircraft_mission_only.json",
         ))
         .unwrap();
         let mut interner = StringInterner::new();
@@ -1844,7 +2501,7 @@ mod tests {
             let mut plane =
                 item83_entity(1, 10, 10, owner, type_ref, EntityCategory::Aircraft, false);
             if row["mission_only"].as_bool().unwrap() {
-                plane.mark_mission_only();
+                plane.seldom.mission_only.mark();
             }
             let (x, y) = crate::render::locomotor_visual::screen_position(&plane);
             entities.insert(plane);
@@ -1856,11 +2513,7 @@ mod tests {
                 Some("Americans"),
                 x,
                 y,
-                30.0,
                 false,
-                None,
-                None,
-                &std::collections::BTreeMap::new(),
                 None,
                 Some(&interner),
             )
@@ -1870,411 +2523,136 @@ mod tests {
     }
 
     #[test]
-    fn item83_picker_uses_global_distance_ties_and_never_clicks_through_rejection() {
-        let rules = item83_rules();
-        let mut interner = StringInterner::new();
-        let owner = interner.intern("Americans");
-        let unit_type = interner.intern("AMCV");
-        let building_type = interner.intern("GACNST");
-        let noselect = interner.intern("NOSEL");
-        let soviet = interner.intern("Soviet");
-        let mut entities = EntityStore::new();
-        entities.insert(item83_entity(
-            1,
-            10,
-            10,
-            owner,
-            unit_type,
-            EntityCategory::Unit,
-            false,
-        ));
-        entities.insert(item83_entity(
+    fn native_bunker_install_head_allows_tank_click_and_force_attack() {
+        use crate::sim::command::Command;
+        use crate::sim::docking::bunker_link::BunkerLink;
+        use crate::sim::world::Simulation;
+        use crate::util::fixed_math::SimFixed;
+
+        let Some(retail) = crate::rules::retail_ini_fixture::retail_battle_rules() else {
+            return;
+        };
+        let native: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/locomotor_force_track.bunker_install.json",
+        ))
+        .unwrap();
+        let row = native["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["input"]["name"] == "same_raw_cell")
+            .unwrap();
+        let mut sim = Simulation::new();
+        let owner = sim.intern("Americans");
+        let tank_type = sim.intern("LTNK");
+        let bunker_type = sim.intern("NATBNK");
+        let mut at = |id, type_ref, category, coords: &serde_json::Value| {
+            let xyz: [i32; 3] = std::array::from_fn(|i| coords[i].as_i64().unwrap() as i32);
+            let mut entity = item83_entity(
+                id,
+                (xyz[0] / 256) as u16,
+                (xyz[1] / 256) as u16,
+                owner,
+                type_ref,
+                category,
+                false,
+            );
+            entity
+                .position
+                .set_sub_x_for_test(SimFixed::from_num(xyz[0] % 256));
+            entity
+                .position
+                .set_sub_y_for_test(SimFixed::from_num(xyz[1] % 256));
+            entity.position.set_exact_z_leptons_for_test(Some(xyz[2]));
+            entity.set_in_playfield(true);
+            sim.entities_mut_for_test().insert(entity);
+        };
+        at(
             2,
-            10,
-            10,
-            owner,
-            building_type,
+            bunker_type,
             EntityCategory::Structure,
-            false,
-        ));
-        let (x, y) = crate::render::locomotor_visual::screen_position(entities.get(1).unwrap());
-        let heights = std::collections::BTreeMap::new();
-        assert_eq!(
+            &row["input"]["building_location"],
+        );
+        at(
+            1,
+            tank_type,
+            EntityCategory::Unit,
+            &row["output"]["force_coordinate"],
+        );
+        at(
+            3,
+            tank_type,
+            EntityCategory::Unit,
+            &serde_json::json!([4352, 2816, 312]),
+        );
+        sim.entity_mut_for_test(1)
+            .unwrap()
+            .bunker
+            .set_bunker_link_for_test(BunkerLink::Installed(2));
+        sim.entity_mut_for_test(2)
+            .unwrap()
+            .bunker
+            .set_bunker_occupant_for_test(Some(1));
+
+        let pick = |sim: &Simulation, point: (f32, f32)| {
             pick_entity_at_point(
-                &entities,
+                sim.entities(),
                 &[2, 1],
                 None,
                 Some("Americans"),
-                x,
-                y,
-                30.0,
-                Some(&rules),
-                None,
-                &heights,
-                None,
-                Some(&interner),
-            ),
-            Some(2),
-            "an earlier structure wins an equal global tracked-anchor score"
-        );
-
-        entities.get_mut(2).unwrap().type_ref = noselect;
-        let rejected = compute_click_selection_snapshot(
-            &entities,
-            &[2, 1],
-            &[1],
-            None,
-            Some("Americans"),
-            x,
-            y,
-            30.0,
-            false,
-            Some(&rules),
-            None,
-            &heights,
-            None,
-            Some(&interner),
-        )
-        .expect("the chosen target still owns the click");
-        assert!(rejected.clear);
-        assert!(
-            rejected.select.is_empty(),
-            "must not retry the valid unit behind it"
-        );
-
-        let nonlocal = entities.get_mut(2).unwrap();
-        nonlocal.type_ref = building_type;
-        nonlocal.owner = soviet;
-        let nonlocal_click = compute_click_selection_snapshot(
-            &entities,
-            &[2, 1],
-            &[1],
-            None,
-            Some("Americans"),
-            x,
-            y,
-            30.0,
-            true,
-            Some(&rules),
-            None,
-            &heights,
-            None,
-            Some(&interner),
-        )
-        .expect("discovered nonlocal object owns the click");
-        // ObjectClass__Select drains the selection whenever the two sides
-        // disagree on IsHumanPlayer, so a shift-click on an enemy leaves the
-        // enemy alone selected. See the `selection_is_local` comment.
-        assert!(
-            nonlocal_click.clear,
-            "a shift-click on an enemy drains the local group"
-        );
-        assert_eq!(nonlocal_click.select, [2]);
-
-        // Both sides non-local also drains: equal IsHumanPlayer answers keep the
-        // selection only when that answer was true. This is the case the old
-        // owner-match predicate got wrong -- it saw two Soviets and added.
-        let enemy_group = compute_click_selection_snapshot(
-            &entities,
-            &[2, 1],
-            &[2],
-            None,
-            Some("Americans"),
-            x,
-            y,
-            30.0,
-            true,
-            Some(&rules),
-            None,
-            &heights,
-            None,
-            Some(&interner),
-        )
-        .expect("discovered nonlocal object owns the click");
-        assert!(
-            enemy_group.clear,
-            "an enemy group is replaced rather than extended"
-        );
-    }
-
-    /// The ordinary additive path, with a real local owner supplied — the
-    /// existing coverage passes `None` for the owner and so routes around the
-    /// `IsHumanPlayer` pair entirely.
-    #[test]
-    fn item83_shift_click_adds_only_while_both_sides_are_the_local_player() {
-        let rules = item83_rules();
-        let mut interner = StringInterner::new();
-        let americans = interner.intern("Americans");
-        let soviets = interner.intern("Soviet");
-        let unit_type = interner.intern("GI");
-        let mut entities = EntityStore::new();
-        entities.insert(item83_entity(
-            1,
-            5,
-            5,
-            americans,
-            unit_type,
-            EntityCategory::Infantry,
-            true,
-        ));
-        entities.insert(item83_entity(
-            2,
-            9,
-            9,
-            americans,
-            unit_type,
-            EntityCategory::Infantry,
-            false,
-        ));
-        let heights: std::collections::BTreeMap<(u16, u16), u8> = std::collections::BTreeMap::new();
-        let (x, y) = {
-            let target = entities.get(2).unwrap();
-            crate::render::locomotor_visual::screen_position(target)
-        };
-
-        // Both local: adds without clearing.
-        let added = compute_click_selection_snapshot(
-            &entities,
-            &[2, 1],
-            &[1],
-            None,
-            Some("Americans"),
-            x,
-            y,
-            30.0,
-            true,
-            Some(&rules),
-            None,
-            &heights,
-            None,
-            Some(&interner),
-        )
-        .expect("the local object owns the click");
-        assert!(!added.clear, "two local objects build one group");
-        assert_eq!(added.select, [2]);
-
-        // Flip the clicked object to an enemy: the same gesture now drains.
-        entities.get_mut(2).unwrap().owner = soviets;
-        let drained = compute_click_selection_snapshot(
-            &entities,
-            &[2, 1],
-            &[1],
-            None,
-            Some("Americans"),
-            x,
-            y,
-            30.0,
-            true,
-            Some(&rules),
-            None,
-            &heights,
-            None,
-            Some(&interner),
-        )
-        .expect("the enemy object owns the click");
-        assert!(drained.clear, "an enemy joins alone");
-        assert_eq!(drained.select, [2]);
-    }
-
-    #[test]
-    fn item83_two_ordinary_clicks_never_enter_the_type_select_group_path() {
-        let rules = item83_rules();
-        let mut interner = StringInterner::new();
-        let owner = interner.intern("Americans");
-        let amcv = interner.intern("AMCV");
-        let mut entities = EntityStore::new();
-        entities.insert(item83_entity(
-            1,
-            10,
-            10,
-            owner,
-            amcv,
-            EntityCategory::Unit,
-            false,
-        ));
-        entities.insert(item83_entity(
-            2,
-            14,
-            10,
-            owner,
-            amcv,
-            EntityCategory::Unit,
-            false,
-        ));
-        let (x, y) = crate::render::locomotor_visual::screen_position(entities.get(1).unwrap());
-        let heights = std::collections::BTreeMap::new();
-
-        for current in [&[][..], &[1][..]] {
-            let mutation = compute_click_selection_snapshot(
-                &entities,
-                &[1, 2],
-                current,
-                None,
-                Some("Americans"),
-                x,
-                y,
-                30.0,
-                false,
-                Some(&rules),
-                None,
-                &heights,
-                None,
-                Some(&interner),
+                point.0,
+                point.1,
+                Some(sim.interner()),
+                sim.resolved_terrain(),
             )
-            .expect("ordinary click mutation");
-            assert!(mutation.clear);
-            assert_eq!(mutation.select, [1]);
-            assert!(!mutation.select.contains(&2));
-        }
-    }
-
-    #[test]
-    fn item83_held_deselect_preserves_map_scope_until_short_release_tap() {
-        use std::time::{Duration, Instant};
-        use winit::keyboard::KeyCode;
-
-        let rules = item83_rules();
-        let mut interner = StringInterner::new();
-        let owner = interner.intern("Americans");
-        let amcv = interner.intern("AMCV");
-        let gacnst = interner.intern("GACNST");
-        let mut entities = EntityStore::new();
-        entities.insert(item83_entity(
-            1,
-            10,
-            10,
-            owner,
-            amcv,
-            EntityCategory::Unit,
-            true,
-        ));
-        entities.insert(item83_entity(
-            2,
-            30,
-            30,
-            owner,
-            amcv,
-            EntityCategory::Unit,
-            true,
-        ));
-        entities.insert(item83_entity(
-            3,
-            11,
-            10,
-            owner,
-            gacnst,
-            EntityCategory::Structure,
-            false,
-        ));
-        entities.insert(item83_entity(
-            4,
-            31,
-            30,
-            owner,
-            gacnst,
-            EntityCategory::Structure,
-            false,
-        ));
-        let screen = [1, 3];
-        let map = [1, 2, 3, 4];
-
-        let mut input = crate::app::types::TypeSelectInputState::default();
-        input.finish_tap(crate::app::types::TypeSelectOutcome::Map, true);
-        let pressed_at = Instant::now();
-        input.press(KeyCode::KeyT, pressed_at, false);
-
-        let deselect = compute_type_select_click_mutation(
-            &entities,
-            &map,
-            &[1, 2],
-            1,
-            true,
-            Some("Americans"),
-            Some(&rules),
-            Some(&interner),
-        );
-        assert_eq!(deselect.deselect, [1, 2]);
-        input.note_successful_selection_mutation(false);
-        assert!(
-            input.across_map,
-            "held deselect resets SelectionMode but preserves AcrossMap"
-        );
-
-        let second_scope = if input.across_map {
-            map.as_slice()
-        } else {
-            screen.as_slice()
         };
-        let held = compute_type_select_click_mutation(
-            &entities,
-            second_scope,
-            &[],
-            1,
-            false,
-            Some("Americans"),
-            Some(&rules),
-            Some(&interner),
-        );
+        // Original6D461A registers buildings before mobile drawing6D465F;
+        // 6DA47C keeps the first equal score. Preserve that existing policy.
+        // The native ForceTrack head is supplied as a parked pose here; this
+        // checks its input consumers, not Drive Process completion/rendering.
+        let native_position = sim.entities().get(1).unwrap().position;
+        let point =
+            crate::render::locomotor_visual::screen_position(sim.entities().get(1).unwrap());
+        assert_eq!(pick(&sim, point), Some(1));
+        sim.entity_mut_for_test(1).unwrap().position = sim.entities().get(2).unwrap().position;
+        let old_point =
+            crate::render::locomotor_visual::screen_position(sim.entities().get(1).unwrap());
         assert_eq!(
-            held.select,
-            [1, 2],
-            "a second held action still consumes the preserved map scope"
+            pick(&sim, old_point),
+            Some(2),
+            "raw-location overlap reproduces the wrong pick"
         );
-        input.note_successful_selection_mutation(false);
-        assert!(input.release(KeyCode::KeyT, pressed_at + Duration::from_millis(500)));
-
-        input.prepare_tap_scope();
-        assert!(
-            !input.across_map,
-            "mode reset forces the release tap back to screen"
-        );
-        let tap = compute_type_select_tap(
-            &entities,
-            &screen,
-            &map,
-            &held.select,
+        sim.entity_mut_for_test(1).unwrap().position = native_position;
+        let selection = compute_click_selection_snapshot_with_playfield(
+            sim.entities(),
+            &[2, 1],
+            &[],
             None,
             Some("Americans"),
-            Some(&rules),
-            Some(&interner),
-            input.across_map,
+            point.0,
+            point.1,
+            false,
+            Some(&retail.rules),
+            Some(sim.interner()),
+            true,
+            sim.resolved_terrain(),
+        )
+        .unwrap();
+        assert_eq!(selection.select, [1]);
+        assert!(sim.apply_command(
+            "Americans",
+            &Command::Attack {
+                attacker_id: selection.select[0],
+                target_id: 3,
+            },
+            Some(&retail.rules)
+        ));
+        let tank = sim.entities().get(1).unwrap();
+        assert_eq!(tank.bunker.link().installed_in(), Some(2));
+        assert_eq!(
+            tank.attack_target.target(),
+            Some(crate::sim::combat::TargetKind::Entity(3))
         );
-        assert_eq!(tap.outcome, crate::app::types::TypeSelectOutcome::Screen);
-        assert_eq!(tap.mutation.select, [1, 3]);
-        assert!(
-            !tap.mutation.select.contains(&4),
-            "off-screen linked type stays out"
-        );
-    }
-
-    #[test]
-    fn techno_playfield_stored_membership_gates_local_mobile_selection() {
-        let mut entity = GameEntity::test_default(1, "MTNK", "Americans", 5, 5);
-        entity.lifecycle.object_alive = true;
-        entity.lifecycle.in_limbo = false;
-        entity.in_playfield = false;
-        assert!(!static_selection_gate(&entity, "MTNK", None, true));
-        entity.in_playfield = true;
-        assert!(static_selection_gate(&entity, "MTNK", None, true));
-        entity.in_playfield = false;
-        assert!(
-            static_selection_gate(&entity, "MTNK", None, false),
-            "headless fixtures without MapClass authority preserve prior admission"
-        );
-    }
-
-    /// `TechnoClass::IsLocalPlayerSelectableObject @ 0x006F32D0` refuses an
-    /// object with no Health first (`0x006F32D3`): a crashing aircraft is
-    /// alive at Health 0 and cannot be picked or banded.
-    #[test]
-    fn an_object_without_health_is_not_selectable() {
-        let mut entity = GameEntity::test_default(1, "ORCA", "Americans", 5, 5);
-        entity.lifecycle.object_alive = true;
-        entity.lifecycle.in_limbo = false;
-        entity.in_playfield = true;
-        assert!(static_selection_gate(&entity, "ORCA", None, true));
-        entity.health.current = 0;
-        entity.crashing = true;
-        assert!(!static_selection_gate(&entity, "ORCA", None, true));
+        assert_eq!(sim.entities().get(2).unwrap().bunker.occupant(), Some(1));
     }
 }

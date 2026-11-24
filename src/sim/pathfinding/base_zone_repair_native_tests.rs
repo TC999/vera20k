@@ -6,8 +6,8 @@ use crate::rules::locomotor_type::MovementZone;
 
 #[test]
 fn retained_base_repair_matches_native_selectors_and_adoption_without_live_publication() {
-    let corpus: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/base_zone_repair.json"
+    let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/base_zone_repair.json",
     ))
     .unwrap();
     let cases = corpus["cases"].as_array().unwrap();
@@ -39,10 +39,10 @@ fn retained_base_repair_matches_native_selectors_and_adoption_without_live_publi
             let i = (ny * i32::from(width) + nx) as usize;
             classes[i] = values[0].as_u64().unwrap() as u8;
             levels[i] = values[1].as_u64().unwrap() as u8;
-            ids[i] = values[2].as_u64().unwrap() as u16;
+            ids[i] = values[2].as_u64().unwrap() as ZoneId;
         };
         put(target, &input["target"]);
-        for ((dx, dy, _), value) in super::super::zone_build::NEIGHBORS
+        for ((dx, dy), value) in crate::util::direction::DIRECTION_DELTAS
             .iter()
             .zip(input["neighbors"].as_array().unwrap())
         {
@@ -64,7 +64,7 @@ fn retained_base_repair_matches_native_selectors_and_adoption_without_live_publi
             .as_array()
             .unwrap()
             .iter()
-            .map(|value| value.as_u64().unwrap() as u16)
+            .map(|value| value.as_u64().unwrap() as ZoneId)
             .collect();
         for row in &mut base.raw_zone_ids_by_row {
             *row = row0.clone();
@@ -78,7 +78,7 @@ fn retained_base_repair_matches_native_selectors_and_adoption_without_live_publi
             );
             *zones.map_mut(movement).unwrap() = map;
         }
-        if let Some(cell) = terrain.cell_mut(x as u16, y as u16) {
+        if let Some(cell) = terrain.cell_mut_for_test(x as u16, y as u16) {
             cell.level = 20;
             cell.zone_type = zone_class::OUTSIDE;
             cell.outside_playfield = true;
@@ -110,7 +110,7 @@ fn retained_base_repair_matches_native_selectors_and_adoption_without_live_publi
             assert_eq!(outcome, ZoneRepairOutcome::FullRebuild, "{label}");
             continue; // Native golden stops before the separate full rebuild.
         }
-        let cluster = case["target_after"][2].as_u64().unwrap() as u16;
+        let cluster = case["target_after"][2].as_u64().unwrap() as ZoneId;
         let expected = if input["target"][0] == zone_class::OUTSIDE {
             ZoneRepairOutcome::SentinelNoOp
         } else {

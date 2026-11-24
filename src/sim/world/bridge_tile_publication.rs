@@ -9,9 +9,14 @@ use crate::map::iso_tile_flood::{self, IsoTileFloodHost};
 impl LivePublication<'_> {
     /// Original568E40/569760 and573540/570050 raw Cell+11B stores. Preserve
     /// the completed write before another callback can fail. These stores do
-    /// not invoke47D2B0: cached class/height, cost rows and zone IDs stay intact.
+    /// not invoke47D2B0: cached class/height and zone IDs stay intact.
     pub(super) fn write_raw_bridge_level(&mut self, cell: Cell, level: u8) -> Result<(), String> {
         let sim = &mut self.sim;
+        let before = sim.resolved_terrain.as_ref().and_then(|terrain| {
+            let Cell::Real(index) = cell else { return None };
+            let resolved = &terrain.cells()[index];
+            Some(((resolved.rx, resolved.ry), resolved.level))
+        });
         let terrain = sim
             .resolved_terrain
             .as_mut()
@@ -22,12 +27,15 @@ impl LivePublication<'_> {
         };
         let resolved = &terrain.cells()[index];
         let coord = (resolved.rx, resolved.ry);
+        if before.is_some_and(|(_, old)| old != level) {
+            sim.publish_cell_lighting_levels([coord]);
+        }
         self.retain_real_write(cell);
         let sim = &mut self.sim;
         crate::sim::world::navigation::NavigationCaches {
-            terrain_costs: &mut sim.terrain_costs,
             zones: &mut sim.zone_grid,
             path: &mut sim.path_grid,
+            overlays: sim.overlay_grid.as_ref(),
             playfield_bounds: sim.playfield_bounds,
         }
         .publish_current_path_cell(
@@ -126,30 +134,32 @@ impl LivePublication<'_> {
             return Ok(());
         }
 
+        let footprint = |(x, y): CellCoord| match axis {
+            Axis::NS => [(x, y), (x, y.wrapping_sub(1)), (x, y.wrapping_add(1))],
+            Axis::EW => [(x.wrapping_sub(1), y), (x, y), (x.wrapping_add(1), y)],
+        };
+        let other_center = match axis {
+            Axis::NS => (requested.0.wrapping_sub(1), requested.1),
+            Axis::EW => (requested.0, requested.1.wrapping_sub(1)),
+        };
+        // Recursion can replace the tile under either footprint. Preserve the
+        // live deck levels without changing which cells the callbacks visit.
+        let centers = [requested, other_center];
+        let decks = centers
+            .map(|center| footprint(center).map(|coord| (coord, self.corrected_deck_at(coord))));
         self.perpendicular(requested, axis, phase, direction, family);
         // Native rereads the retained receiver's +11A after recursion. Fallout
-        // uses the stack coordinate, with the half-footprint adjustment below.
+        // uses the stack coordinate with the resulting half-footprint adjustment.
         let sub = self.subtile(retained);
-        let center = match axis {
-            Axis::NS => (requested.0.wrapping_sub(i16::from(sub & 1)), requested.1),
-            Axis::EW => (requested.0, requested.1.wrapping_sub(i16::from(sub >= 5))),
-        };
-        let footprint = match axis {
-            Axis::NS => [
-                center,
-                (center.0, center.1.wrapping_sub(1)),
-                (center.0, center.1.wrapping_add(1)),
-            ],
-            Axis::EW => [
-                (center.0.wrapping_sub(1), center.1),
-                center,
-                (center.0.wrapping_add(1), center.1),
-            ],
-        };
-        for coord in footprint {
+        let half = usize::from(match axis {
+            Axis::NS => sub & 1 != 0,
+            Axis::EW => sub >= 5,
+        });
+        for (coord, deck) in decks[half] {
             let cell = self.lookup(coord);
-            self.fallout(cell);
+            self.fallout(cell, deck);
         }
+        let center = centers[half];
         // All three synchronous callbacks precede a fresh level lookup.
         let sample = self.lookup(center);
         let level = i32::from(self.level(sample)) - 4;
@@ -179,10 +189,7 @@ impl IsoTileFloodHost for LiveTileFlood<'_, '_> {
                 "dummy tile write is outside the admitted stock middle-bridge closure".into(),
             );
         };
-        let registry = self
-            .publication
-            .registry
-            .ok_or("missing live bridge overlay registry")?;
+        let registry = self.publication.rules.overlay_registry();
         let coord = self.publication.real_coord(cell).unwrap();
         let overlay = self
             .publication
@@ -207,10 +214,7 @@ impl IsoTileFloodHost for LiveTileFlood<'_, '_> {
             // The original47D2B0 immediate dummy guard has no side effects.
             return Ok(());
         };
-        let registry = self
-            .publication
-            .registry
-            .ok_or("missing live bridge overlay registry")?;
+        let registry = self.publication.rules.overlay_registry();
         let coord = self.publication.real_coord(cell).unwrap();
         let sim = &mut self.publication.sim;
         let overlay = sim
@@ -219,15 +223,22 @@ impl IsoTileFloodHost for LiveTileFlood<'_, '_> {
             .and_then(|grid| grid.finalized_map_cell(coord.0, coord.1))
             .ok_or("missing live bridge overlay cell")?;
         let terrain = sim.resolved_terrain.as_mut().unwrap();
-        let outcome = terrain
-            .recalc_resident_bridge_cell(
-                index,
-                overlay,
-                level_override,
-                registry,
-                sim.playfield_bounds,
-            )
-            .map_err(|error| error.to_string())?;
+        let previous_level = terrain.cells()[index].level;
+        let outcome = terrain.recalc_resident_bridge_cell(
+            index,
+            overlay,
+            level_override,
+            registry,
+            sim.playfield_bounds,
+        );
+        let level = terrain.cells()[index].level;
+        if level != previous_level {
+            sim.lighting_sources
+                .publish(crate::sim::light_sources::LightingEvent::CellLevels {
+                    cells: vec![(coord, level)],
+                });
+        }
+        let outcome = outcome.map_err(|error| error.to_string())?;
         // Original47D2B0 publishes Map+68 class/height and Map+70 height
         // before returning to the next ordered repair callback. Publication
         // must survive a later presentation failure and must not rebuild IDs.
@@ -239,9 +250,9 @@ impl IsoTileFloodHost for LiveTileFlood<'_, '_> {
             outcome.finalized,
         );
         crate::sim::world::navigation::NavigationCaches {
-            terrain_costs: &mut sim.terrain_costs,
             zones: &mut sim.zone_grid,
             path: &mut sim.path_grid,
+            overlays: sim.overlay_grid.as_ref(),
             playfield_bounds: sim.playfield_bounds,
         }
         .publish_recalculated_cell(
@@ -252,12 +263,11 @@ impl IsoTileFloodHost for LiveTileFlood<'_, '_> {
             coord,
         )?;
         self.publication.retain_real_write(cell);
-        self.publication
-            .sim
-            .resolved_terrain
+        let sim = &mut self.publication.sim;
+        sim.resolved_terrain
             .as_mut()
             .unwrap()
-            .refresh_resident_bridge_presentation(index)
+            .refresh_resident_bridge_presentation(index, &mut || sim.main_rng.next_u32())
             .map_err(|error| error.to_string())?;
         self.publication.retain_real_write(cell);
         Ok(())

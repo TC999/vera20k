@@ -5,20 +5,20 @@
 //!      scripted skirmish drives every retasking command site (Move / Stop /
 //!      Attack / ForceAttack / ForceAttackCell / AttackMove) and asserts the
 //!      end-of-run `state_hash()` equals the committed baseline. At the slice's
-//!      introduction, this exposed wrong `DockTeardown` subsets and dropped
-//!      legacy-field clears. Later hash-schema changes require a separately
-//!      proven composition-only re-baseline.
+//!      introduction, this exposed wrong aircraft dock teardown subsets and dropped
+//!      legacy-field clears. Changes require causal behavior or hash-composition
+//!      evidence before updating the Rust regression receipt.
 //!   2. The verb-write + retaliation-gate tripwires (added below the gate).
+//!
+//! The `tools/spatial_oracle/*_replay/` and `foot_bridge_layer*.replay.json`
+//! receipts cited below left the tree; `git show 1b1a8b43e:<path>` retrieves them.
 
 use super::*;
 use crate::map::entities::{EntityCategory, MapEntity};
 use crate::rules::ini_parser::IniFile;
 use crate::rules::ruleset::RuleSet;
-use crate::sim::combat::AttackTarget;
 use crate::sim::command::{Command, CommandEnvelope};
-use crate::sim::components::OrderIntent;
 use crate::sim::mission::{MissionId, MissionType};
-use crate::sim::pathfinding::PathGrid;
 use crate::sim::replay::{ReplayHeader, ReplayLog, ReplayRunner};
 
 fn slice6_rules() -> RuleSet {
@@ -43,9 +43,6 @@ fn slice6_rules() -> RuleSet {
     let art = IniFile::from_str(crate::rules::retail_ini_fixture::GI_ART_EXCERPT);
     let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
     rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
-    rules.bind_animation_sequences(
-        &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art),
-    );
     rules
 }
 
@@ -72,14 +69,18 @@ fn unit(owner: &str, type_id: &str, cx: u16, cy: u16, cat: EntityCategory) -> Ma
         facing: 64,
         category: cat,
         sub_cell: 0,
-        veterancy: 0,
+        veterancy: Some(0),
         high: false,
         mission: None,
         recruitable_a: true,
         recruitable_b: true,
-        structure_upgrades: [None, None, None],
+        group: -1,
+        follows: None,
+        structure_columns: Default::default(),
         structure_ai_sellable: false,
         structure_ai_repairable: false,
+        structure_online: true,
+        trigger_tag: None,
     }
 }
 
@@ -88,7 +89,7 @@ fn unit(owner: &str, type_id: &str, cx: u16, cy: u16, cat: EntityCategory) -> Ma
 // See docs/research/TRACK_PROCESS_REPLAY_REGRESSION_NOTES.md, PR415 attribution.
 // Infantry ctor 517BBD supplies PrimaryFacing ROT 127 (asserted below).
 // 2026-09-23 Drive/Ship Process path request (behavior, not composition):
-// Drive/Ship orders from every producer (player, pursuit, rally, miners) are
+// Drive/Ship orders from every producer (player, Approach, rally, miners) are
 // accepted by the Unit setter without an order-time A*, PowerOn or redirect.
 // This fixture has no native zone topology, so the first Process searches in
 // the legacy inline lane, not the Find_Path owner. The pins move with that
@@ -199,22 +200,284 @@ fn unit(owner: &str, type_id: &str, cx: u16, cy: u16, cat: EntityCategory) -> Ma
 // all819 frame rows, all three RNG states and ordered raw draw callers.
 // Incoming main preserves candidate state; its source-line changes remain
 // recorded. This Rust replay pin does not establish native whole-world parity.
-const SLICE6_BASELINE_HASH: u64 = 0x77B7FEF300222AB2;
+// Incoming-main integration: v24 diagnostics match all main actor fields and
+// all three RNG streams at all 17 boundaries except tank 1 MissionCom: Stop
+// clears TarCom/NavCom at frame10 without queuing Stop13; Attack retains its
+// frame5 timer and ends with11 visits instead of5. Frames0..9 hashes match
+// exactly; final changed fields are only current/start/dispatch/counter.
+// Native Event IDLE: tools/spatial_oracle/fv_cell_attack/paid_conditional*.json.
+// Native Hover host (snapshot 269): the locomotor fold drops the three
+// SimFixed Hover copies and hashes the whole HoverLocomotionClass object in
+// place of its head. Ceremony: this change with the old composition (three
+// zero words, head only; probe not committed) printed the previous pin, so
+// no hashed state moved. Previous: 0x38A2_A509_33EC_5219.
+// 2026-09-30 one FootClass::Mark owner (#922): Mark no longer writes the
+// AircraftTracker, which native Mark never touches, so a ground object keeps
+// its constructor-seeded enter order (its stable id) where the old lifecycle
+// Mark reset it to 0 on every Foot and Building Mark. Ceremony, rerun after
+// merging main: this change with only that reset restored printed the old
+// value for all three replay pins (bridge, global, slice 6), with the RNG pins
+// above unchanged (the probe patch was not committed). Previous:
+// 0x3983_6E86_AD68_DCF0.
+// 2026-10-01 Drive/Ship legacy lane removal (behavior, fixture inputs): a
+// Drive/Ship visit always runs the native Process, whose Find_Path reads map
+// cells, zones and Map Size, so the fixture now supplies a clear 64x64 map
+// (`arena_fixture::supply_native_map`). With those inputs the E1 also leaves
+// the Walk fixture fallback for native Walk admission. The RNG stream pins,
+// mission counters and per-frame replay equality are unchanged. Previous:
+// 0x9703_A2A8_E0FF_2C81.
+// 2026-10-01 Walk route owner (hash composition only): Walk keeps no
+// MovementTarget route cells and no locomotor sub-cell destination, both of
+// which the state hash folded. Ceremony: main and this change, each with only
+// those fields dropped from the hash (probe not committed), printed the same
+// value for all three replay pins (bridge, global, slice 6). Previous: 0xBB09_43C9_DBB1_8884.
+// Historical retained-path integration compared all17 main7412/candidate
+// observations after omitting newly retained actor fields and RNG source
+// locations; gameplay observations matched and only hash composition moved.
+// That pre-#962/#963 candidate pin was 0x2A95_6763_E046_638A. The bounded Rust
+// receipt remains tools/spatial_oracle/astar_path_finishing_replay/receipt.json.
+// Main963 retained-path composition: the same-binary control reproduces
+// 0x5BA5_F8CB_B5F7_2FF5 by omitting only navigation history, House threat, Foot530
+// and cached Techno508 hash feeds. All17 control/current observations
+// match exactly except tick hashes, including full actor state and all
+// three RNG streams/draws/caller positions. The temporary gate was removed.
+// Rust-only receipt: tools/spatial_oracle/astar_path_finishing_replay/main963/receipt.json.
+// 2026-10-01 Stop through the Unit setter (#952): tank 1's Stop at frame 10
+// now takes Unit 0x00741970's one-word PathHead clear (Path[0] = -1,
+// 741C4F..741C78) and keeps the stale suffix behind it, where the old second
+// body exhausted the queue. Both leave no remaining direction; the hash folds
+// the queue's cursor and bytes. Previous: 0xCA13_8857_9211_B978.
+// 2026-10-01 Every Foot's route has one owner (hash composition only):
+// MovementTarget keeps no route cells, layers or cursor. Ceremony: main
+// 80b56aa1 with only those fields dropped from the hash (probe not committed)
+// printed this value; the bridge and global pins did not move. Previous:
+// 0xD06C_DAC2_416D_EDE1.
+// 2026-10-02 Building body has one retained owner (hash composition):
+// same-binary control restores only the former two absent Up/Down
+// folds and reproduces the preceding pin. All819 control/current
+// boundaries match after only tick hashes are omitted: full actors,
+// commands, lifecycle/Logic and three RNG streams/draws/callers.
+// Rust-only receipt: tools/spatial_oracle/building_construction_replay/receipt.json.
+// Previous: 0x67C241E9F79C8F43. Native proof is the separate construction corpus.
+// 2026-10-02 Engineer/House retained state (Rust-only hash composition):
+// The same-binary four-feed control reproduces the preceding main pin.
+// All819 complete current/control boundaries match except tick hashes,
+// including House/Factory state and three full RNG streams/draws/callers.
+// Scope and receipt: tools/spatial_oracle/engineer_repair_replay/receipt.json.
+// 2026-10-02 Unit deployment/body ownership: snapshot280 replaces the legacy
+// DeployPhase hash with Techno130/134, adds Unit6E0, and advances the existing
+// Foot538 counter for voxel Units. Mission, health and all three RNG pins
+// remain unchanged. The same-binary hash control reproduces incoming
+// 1AD1402910CE62D8; all 17 off/on boundaries differ only in tick hash. Receipt:
+// tools/spatial_oracle/unit_simple_deploy_replay/receipt.json. This is Rust
+// attribution; unit_simple_deploy separately pins native body cadence.
+// Shared Techno Door hash composition after main339b57d18 integration:
+// one diagnostic binary restores incoming B20E11E0579BC4E4 when only the Door
+// hash feed is omitted. Behavior and RNG assertions reach the final pin in
+// both modes. The temporary control is removed; native expected values stay
+// unchanged. Receipt: tools/spatial_oracle/anytown_damage/unit_unlimbo.md.
+// 2026-10-02 IFV owner migration: u8 last-shot hashing becomes signed i32
+// current-weapon hashing and the redundant None override feed is removed.
+// All 17 recorded boundaries retain gameplay/RNG after guarded field migration;
+// tools/spatial_oracle/ifv_turret_replay/receipt.json records this Rust attribution.
+// Shared Door composition after main1009: same test binary, 17 complete
+// off/on boundaries equal except tick_result.state_hash. Omitting only Door
+// restores incoming main; the temporary control is removed. Bounded Rust
+// attribution: tools/spatial_oracle/anytown_damage/unit_unlimbo.md.
+// Snapshot286: the entity-level absent Teleport tag is removed; the complete
+//class payload owns its fold. Restoring only that old0 tag recovers the prior
+//hash exactly, with all existing pose/gameplay and absolute RNG tripwires intact.
+// See tools/spatial_oracle/infantry_teleport_destination.md. Rust hash ratchet only.
+// Snapshot288: the complete Drive/Ship payload owns its retained Option fold.
+// Same-binary old-feed control recovers43BC438F280E7D17; all17 complete rows
+// match except state_hash, including all3 RNG states. Control removed.
+// Rust attribution: tools/spatial_oracle/drive_instance_replay/other/slice6/receipt.json.
+// Barracks output after main7e9: shared TechnoUnlimbo6F6DAA retains the
+// constructor facing Some(0); private Foot6B3/Factory5D feeds enter the hash.
+// The Drive/Ship payload migration remains. All618 same-binary Rust rows
+// match except tick_result.state_hash; the control recovers incoming pins.
+// tools/spatial_oracle/factory_infantry_output_replay/main7e9/receipt.json.
+// Rocket locomotor port: the entity-level absent rocket_state tag is removed;
+// the Rocket payload owns its fold. Restoring only that old 0 tag recovers
+// incoming 0xF008D6D1349CCD9C in the same test binary. Control removed.
+// Snapshot303: HoverAttack, target_pad and pad_index leave the hash. A control
+// binary (main with a hash that skips only those fields) gives this value in
+// the same test, with every tripwire above green. Control removed.
+// Snapshot306: the legacy CellClass counters, flags, occlusion caches and
+// visibility marks leave the hash (the ground bits stay), and SightAdmission
+// drops fog_of_war. A control binary (main with a hash that skips only those
+// fields) gives this value in the same test, with every tripwire above green.
+// Control removed.
+// Snapshot307: the session's LocalSize copy leaves the hash. A control binary
+// (main with a hash that skips only that tuple) gives this value in the same
+// test, with every tripwire above green. Control removed.
+// Snapshot318 hashes MoveSound's signed i32 countdown instead of u8. The
+// fixture's vectors are empty, but qualifying Foot visits retain countdown3
+// while inactive (4DAA87; foot_move_sound.json empty_qualifies). No sound is
+// selected and no Main draw is paid. This remains a Rust regression pin.
+// Snapshot320 retains native Techno constructor disguise identity/timer state
+// for every actor, replacing the absent component. These fixtures acquire no
+// disguise; their gameplay and absolute RNG pins remain the independent gates.
+// Snapshot324 replaces the disabled/fired trigger-latch fold with retained
+// definition/live-instance/registration/attachment/dispatch state. This fixture
+// has no authored Tags; replay, retasking and all three RNG gates precede this
+// structural Rust hash pin and remain unchanged.
+// Snapshot332 drops the C4 walk-up intent, whose empty value every entity's
+// fold hashed. This fixture orders no C4; replay, retasking and all three RNG
+// gates remain unchanged.
+// Infantry Approach: the GI's Attack now walks him to a cell in M60 range of
+// the tank (pinned in the loop) instead of the tank's own cell, so his NavCom
+// and path change. Replay, retasking and all three RNG gates remain unchanged.
+// 2026-10-14: hash composition and coverage only. state_hash folds
+// through the pinned StateHasher instead of std's DefaultHasher (a
+// temporary control folding the finished replay through DefaultHasher
+// still gave the previous 0xC4B5_83A9_D807_77FD), fog grids and entities fold
+// as per-House and per-entity digests, cell grids and footprint lists
+// fold as packed byte records, and the edge cache also covers
+// uninitialized cells: code that writes no simulation state.
+// Snapshot349 drops the move-order adapter (`MovementTarget`, #689), whose
+// presence and speed stamp every entity's fold hashed. Hash composition
+// only: a control binary (main with a hash that skips only that fold)
+// gives this value in the same test, with every tripwire above green.
+// Control removed. Previous: 0xA729_2F39_E67E_51D9.
+// Snapshot350 drops the locomotor's altitude copy (#692), which every
+// locomotor's fold hashed. Hash composition only: a control binary (main
+// with a hash that skips only that fold) gives this value in the same
+// test, with every tripwire above green.
+// Control removed. Previous: 0xE3F1_10CD_1C40_81A1.
+// Snapshot377 retains raw Type Sight and native250/254/260 admission.
+// The exact-zero gate70AF87 replaces frame-produced empty source caches and
+// default fog owner planes. This is a Rust state ratchet; retask behavior,
+// per-frame replay and absolute RNG tripwires remain independent.
+// Snapshot385 retains native Drive+64 in the existing payload hash, including
+// its false value. This Rust ratchet includes that state byte; the fixture
+// keeps its separate replay, gameplay and absolute RNG expectations.
+// Foot4DA886, reached by Infantry51BC9F as well as Unit73647B, now advances
+// the moving E1's existing+538 counter seven times in this fixture. That
+// retained counter already hashes; this Rust replay ratchet moves without
+// a schema or RNG change. It is not a native whole-world golden.
+// The synthetic vehicle's absent Crusher/SpeedType now resolves to Wheel.
+// Its retained locomotor/rules hash changes; mission and RNG pins do not.
+// Snapshot419 drops the Drive/Ship head-to and handoff occupation
+// footprints, which only the removed vehicle-occupation index read and every
+// retained Drive/Ship runtime's fold hashed. Hash composition only: a
+// temporary control feeding the hasher what those fields held at the end
+// (the stopped tank's head-to cell 5,4 and handoff cell 4,4, ground plane)
+// gave the previous value in the same test binary, with every tripwire above
+// green. Control removed. Previous: 0xD310_CFBA_7572_D1FA.
+// Snapshot 428 drops the Infantry terminal policy, which every entity's fold
+// hashed (absent for each here). Hash composition only: a temporary control
+// feeding the hasher that absent policy gave the previous value in the same
+// test binary, with every tripwire above green. Control removed.
+// Previous: 0x5788_A215_EFC5_0407.
+// Snapshot 443 hashes the exact session mode, mode class, network MaxAhead
+// and map start header in place of the mode-nonzero bool. Hash composition
+// only: a temporary control hashing the bool gave the previous value in the
+// same test binary, with every tripwire above green. Control removed.
+// Previous: 0x000C_DEC1_A4D5_BC42.
+// Snapshot 449 hashes the Techno disguise firing blink timer (+1EC/+1F4,
+// #2183), which every entity carries. Hash composition only: a temporary
+// control on #2183's merge without that hash gave the previous value, with
+// every tripwire above green. Control removed.
+// Previous: 0xDE7B_17EE_FC74_D0AF.
+// Unit Is_Ready_To_Commence's moving defer (`0x007442C2..0x00744327`) now
+// reads GetHeight: the tank's Attack stays queued behind its Move while it
+// drives (pinned in the loop), so its MissionCom differs. All three RNG
+// streams and the per-frame replay are unchanged. Previous:
+// 0xF35B_3382_2DEF_1F00.
+// #2543 removed the entity hash's determines_waypoint_edge input with the
+// frozen type fact it read; every object here hashed it as false. Hash
+// composition only: a temporary control restoring that false gave the
+// previous value, with every tripwire above green. Control removed.
+// Previous: 0x51BE_2569_5006_2383.
+// 2026-10-24 shared ammo/reload: entity hashing now includes count
+// presence, signed unlimited ammo and the raw constructor reload clock.
+// Against raw c753af366, all 17 recorded non-hash observations, RNG
+// draws/caller sequences and the other 12 final hash domains matched
+// after the new zero clock; backtrace line shifts mapped to unchanged
+// source. This remains a Rust regression pin, not a native game golden.
+// Previous: 0x619E_E645_0B3E_881C.
+// Hash composition includes constructor planning registration and the shared ammo reload clock.
+// The native-speed migration (60da53f9c) hashes binary64 Foot/Drive fractions.
+// A temporary projection to the old fixed fields recovers the previous pin,
+// including Stop's rounded fixed0.3; gameplay and absolute RNG checks hold.
+// #3099 adds the permanent-stealth grant byte for every entity, false here.
+// Omitting only that hash fold recovers 0x5725_6E95_8F9E_04F8; the unchanged
+// replay, gameplay and absolute RNG assertions pass with either composition.
+// #3234 removed the entity hash's sensor deposit, a None byte for every object
+// here. It sat in the same run of zero bytes as that grant byte, so the pin
+// returns to the value above. Hash composition only: a temporary control
+// restoring the byte gave the previous value, with every tripwire above green.
+// Control removed. Previous: 0x00C5_304C_C361_38CE.
+// The dynamic terrain cells now fold without their presentation-only tile
+// variant, render offset and radar colours (tag v2): hash composition only.
+// A temporary control restoring the v1 fold gave the previous value, with
+// every tripwire above green. Control removed. Previous: 0x5725_6E95_8F9E_04F8.
+// #3710 folds the game options' room bans (all off here): hash composition
+// only. A temporary control omitting that fold gave the previous value, with
+// every tripwire above green. Control removed. Previous: 0xD3E2_D02E_809A_1CCD.
+// An Ares game also folds two retained Ares states for every actor here:
+// AttachEffectClass::Update10058E00 (TechnoClass_Update hook 0x6F9E50 ->
+// 1004B320) settles the type-effect state at Disabled on each actor's first
+// update, since no type sets AttachEffect.Duration, and RecalculateStats
+// 100460A0's attached-cloak byte folds even while false. Hash composition
+// only: a temporary control skipping just those two folds in an Ares game
+// gave the stock value, every per-frame replay diagnostic field matched
+// the stock game's, and every tripwire above stayed green. Control removed.
+// An Ares game now also folds each Unit's TechnoExt AltOccupation (hooks
+// 0x7441B6/0x744216): hash composition only. A temporary control skipping
+// that fold gave the previous value, with every tripwire above green.
+// Control removed. Previous: 0xF21F_9A9D_57BE_D7E7.
+// Both games now fold each entity's UpdateVisceroid direction (UnitClass+0x6D4,
+// `idle_wander`): hash composition only. A temporary control skipping that fold
+// gave the previous values in both games. Control removed. Previous:
+// 0x5171_FBD3_06C4_D828 (Ares), 0xD8C3_5827_8CA8_5375 (stock).
+// An Ares game no longer folds RecalculateStats100460A0's attached-cloak
+// byte while it is false: the byte moved into the object's Ares part, which a
+// game without Ares never writes, so the fold asks first. Hash composition
+// only, in an Ares game alone: the stock value above is unchanged, and the
+// tripwires below stayed green in both games.
+// Previous Ares: 0x7D9F_30F7_1CBF_1016.
+fn slice6_baseline_hash(ares: bool) -> u64 {
+    if ares {
+        0x949A_7C55_B2F8_4F0B
+    } else {
+        // The Ground display set's order changed (`DisplayLayers::submit`).
+        0x3A0E_D950_8413_8E77
+    }
+}
 
 #[test]
 fn replay_hash_stable_through_slice6() {
     let rules = slice6_rules();
-    let grid = PathGrid::new(64, 64);
     let mut sim = Simulation::new();
+    sim.hash_state_every(std::num::NonZeroU64::MIN);
+    crate::sim::arena_fixture::supply_native_map(&mut sim);
+    let grid = (*sim.path_grid_snapshot().unwrap()).clone();
     // id 1: Americans MTNK (the unit we retask). id 2: enemy MTNK (Soviet, hostile
     // by default — no alliance entry). id 3: Americans E1 (second attacker).
-    sim.spawn_from_map(
-        &[
-            unit("Americans", "MTNK", 3, 3, EntityCategory::Unit),
-            unit("Soviet", "MTNK", 25, 3, EntityCategory::Unit),
-            unit("Americans", "E1", 5, 5, EntityCategory::Infantry),
-        ],
-        Some(&rules),
+    let mut diagnostic = super::global_parity_harness_tests::replay_diagnostic_file("slice6");
+    let mut seed = || {
+        sim.spawn_from_map(
+            &[
+                unit("Americans", "MTNK", 3, 3, EntityCategory::Unit),
+                unit("Soviet", "MTNK", 25, 3, EntityCategory::Unit),
+                unit("Americans", "E1", 5, 5, EntityCategory::Infantry),
+            ],
+            Some(&rules),
+        )
+    };
+    let (_, seed_draws) = if diagnostic.is_some() {
+        crate::sim::rng::trace_draws(seed)
+    } else {
+        (seed(), Vec::new())
+    };
+    super::global_parity_harness_tests::record_replay_diagnostic(
+        &mut diagnostic,
+        &sim,
+        None,
+        &[],
+        &seed_draws,
     );
 
     // (execute_tick, command) — apply_due_commands fires each when self.session.tick+1 == tick.
@@ -225,16 +488,14 @@ fn replay_hash_stable_through_slice6() {
                 entity_id: 1,
                 target_rx: 10,
                 target_ry: 10,
-                queue: false,
             },
         ),
         (
             3,
             Command::AttackMove {
                 entity_id: 1,
-                target_rx: 15,
-                target_ry: 3,
-                queue: false,
+                target: None,
+                destination: Some(crate::sim::combat::TargetKind::Cell(15, 3)),
             },
         ),
         (
@@ -247,7 +508,7 @@ fn replay_hash_stable_through_slice6() {
         ),
         (
             7,
-            Command::ForceAttack {
+            Command::Attack {
                 attacker_id: 1,
                 target_id: 2,
             },
@@ -264,9 +525,9 @@ fn replay_hash_stable_through_slice6() {
 
     let mut log = ReplayLog::new(ReplayHeader {
         version: 1,
-        pixel_conversion_bounds: sim.session.pixel_conversion_bounds,
+        pixel_conversion_bounds: sim.session.pixel_conversion_bounds(),
         tick_hz: 15,
-        seed: sim.session.seed,
+        seed: sim.session.seed(),
         map_name: "slice6_retask".to_string(),
         rules_hash: rules.simulation_config_hash(),
     });
@@ -283,7 +544,19 @@ fn replay_hash_stable_through_slice6() {
             .filter(|(t, _)| *t == tick + 1)
             .map(|(t, c)| cmd_envelope(&sim, "Americans", *t, c.clone()))
             .collect();
-        let result = sim.advance_tick(&due, Some(&rules), Some(&grid), None, 67);
+        let mut advance = || sim.advance_tick(&due, Some(&rules), Some(&grid), None, 67);
+        let (result, draws) = if diagnostic.is_some() {
+            crate::sim::rng::trace_draws(advance)
+        } else {
+            (advance(), Vec::new())
+        };
+        super::global_parity_harness_tests::record_replay_diagnostic(
+            &mut diagnostic,
+            &sim,
+            Some(&result),
+            &due,
+            &draws,
+        );
         assert!(result.frame_committed, "retask frame {tick} must commit");
         assert_eq!(
             result.executed_commands,
@@ -314,34 +587,82 @@ fn replay_hash_stable_through_slice6() {
         }
 
         if tick >= 10 {
+            // The GI's Attack (tick 9) takes Infantry Approach (`0x00522340`
+            // into the Foot body): a cell within M60 range of the tank, not
+            // the tank's own cell.
+            let gi = sim.substrate.entities.get(3).unwrap();
+            let Some(crate::sim::components::NavTargetRef::Cell { rx, ry }) =
+                gi.navigation.nav_com()
+            else {
+                panic!("the GI approaches a cell: {:?}", gi.navigation.nav_com());
+            };
+            let aim = crate::sim::movement::ground_pose::position_world_coord(
+                &sim.substrate.entities.get(2).unwrap().position,
+            );
+            let dx = i64::from(rx) * 256 + 128 - i64::from(aim.x);
+            let dy = i64::from(ry) * 256 + 128 - i64::from(aim.y);
+            assert!(
+                dx * dx + dy * dy <= 1280 * 1280,
+                "({rx}, {ry}) beyond the fixture's M60 Range=5"
+            );
+
+            // Unit Is_Ready_To_Commence's moving defer (`0x007442C2..
+            // 0x00744327`): the ForceAttackCell (frame 5) and Attack (frame 7)
+            // orders queue Attack while the tank drives the segment it had
+            // committed toward its Move destination, on Move, with no `+0xB8`
+            // bypass. So Attack stays queued, behind the Move committed at
+            // frame 1, and Stop keeps it there.
             let tank = sim.substrate.entities.get(1).expect("retasked tank lives");
-            let drive = tank.drive_locomotion.as_ref().expect("Drive owner");
+            assert_eq!(
+                tank.mission.current(),
+                MissionId::from_known(MissionType::Move)
+            );
+            assert_eq!(
+                tank.mission.queued(),
+                MissionId::from_known(MissionType::Attack)
+            );
+            assert_eq!(tank.mission.mission_start_frame(), 1);
+            assert_eq!(tank.mission.movement_bypass_latch(), 0);
+            assert!(
+                !sim.mission_ready_to_commence(1, &rules),
+                "the queued Attack waits for the drive to stop"
+            );
+            let drive = tank
+                .locomotor
+                .as_ref()
+                .and_then(|l| l.selected_drive_runtime())
+                .and_then(|r| r.retained())
+                .expect("Drive owner");
             if tick == 10 {
-                stopped_head = drive.head_to;
+                stopped_head = drive.head_to();
                 assert!(
                     stopped_head.is_some(),
                     "Stop must exercise an already committed segment"
                 );
             }
             assert!(
-                tank.navigation.nav_com.is_none(),
+                tank.navigation.nav_com().is_none(),
                 "Stop clears owner NavCom"
             );
             assert!(
-                drive.destination.is_none(),
+                drive.destination().is_none(),
                 "Stop clears the class destination"
             );
             assert!(
-                drive.head_to.is_none() || drive.head_to == stopped_head,
+                drive.head_to().is_none() || drive.head_to() == stopped_head,
                 "Stop must not select a new head from abandoned orders"
             );
-            assert_eq!(
-                tank.navigation.path_replay.cursor as usize,
-                tank.navigation.path_replay.directions.len(),
-                "Stop exhausts the abandoned direction suffix"
+            // The Unit setter's one-word PathHead clear (Path[0] = -1,
+            // 741C4F..741C78): the stale suffix behind it is never read.
+            assert!(
+                tank.navigation
+                    .path_replay()
+                    .remaining_directions()
+                    .is_empty(),
+                "Stop clears the live path head"
             );
             assert!(
-                tank.attack_target.is_none(),
+                tank.attack_target.target().is_none(),
                 "Stop retires the previous attack"
             );
         }
@@ -350,6 +671,7 @@ fn replay_hash_stable_through_slice6() {
     // Unlike the old single-run hash gate, execute every recorded command a
     // second time through ReplayRunner and compare each committed frame.
     let mut replay = Simulation::new();
+    crate::sim::arena_fixture::supply_native_map(&mut replay);
     replay.spawn_from_map(
         &[
             unit("Americans", "MTNK", 3, 3, EntityCategory::Unit),
@@ -389,15 +711,16 @@ fn replay_hash_stable_through_slice6() {
                 .get(id)
                 .expect("actor lives")
                 .health
-                .current,
+                .current(),
             health,
             "retask window must not turn into a combat/death fixture"
         );
     }
+    super::global_parity_harness_tests::print_replay_summary("slice6", &sim);
     assert_eq!(
         [1, 2, 3].map(|id| sim.substrate.entities.get(id).unwrap().mission.ai_counter()),
-        [5, 16, 7],
-        "Unit/Infantry Commence precedes the Techno counter increment"
+        [15, 16, 7],
+        "the tank's Move counts every visit since frame 1; Unit/Infantry Commence precedes the Techno counter increment"
     );
     // Original Unit736473 / Infantry51BC51 Commence clears C4 before
     // Techno6FA64E increments it; the mission_counter corpus pins that owner.
@@ -425,55 +748,7 @@ fn replay_hash_stable_through_slice6() {
     );
     assert_eq!(
         sim.state_hash(),
-        SLICE6_BASELINE_HASH,
-        "Slice 6 scripted-retask state hash drifted; establish native behavior or composition provenance before rebaselining"
+        slice6_baseline_hash(rules.ares()),
+        "scripted-retask state drifted: establish the changed behavior, RNG producer, or hash composition before updating"
     );
-}
-
-#[test]
-fn slice6_move_command_retasks_via_mission_substrate_and_clears_state() {
-    // A Move command must route through the compatibility boundary: the mission
-    // substrate's `current` becomes Move (checked BEFORE any tick-tail shadow
-    // refresh) AND the legacy conflicting fields are cleared.
-    let rules = slice6_rules();
-    let grid = PathGrid::new(64, 64);
-    let mut sim = Simulation::new();
-    sim.install_fixture_path_grid(Some(&grid));
-    sim.spawn_from_map(
-        &[unit("Americans", "MTNK", 3, 3, EntityCategory::Unit)],
-        Some(&rules),
-    );
-    // Seed a conflicting prior order the Move must tear down.
-    {
-        let e = sim.substrate.entities.get_mut(1).expect("unit");
-        e.attack_target = Some(AttackTarget::new(2));
-        e.order_intent = Some(OrderIntent::Guard {
-            anchor_rx: 3,
-            anchor_ry: 3,
-        });
-    }
-
-    let issued = sim.apply_command(
-        "Americans",
-        &Command::Move {
-            entity_id: 1,
-            target_rx: 10,
-            target_ry: 10,
-            queue: false,
-        },
-        Some(&rules),
-    );
-    assert!(issued, "move command should issue");
-
-    let e = sim.substrate.entities.get(1).expect("unit");
-    assert_eq!(
-        e.mission.queued(),
-        MissionId::from_known(MissionType::Move),
-        "the command queued Move through the exact authority (host promotes later)"
-    );
-    assert!(
-        e.attack_target.is_none(),
-        "Move tore down the attack target"
-    );
-    assert!(e.order_intent.is_none(), "Move tore down the order intent");
 }

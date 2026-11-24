@@ -44,9 +44,9 @@ use super::harvest_field_oracle_tests::{registry, row_scene_with};
 use super::refinery_dock_oracle_tests::{Scene, cell};
 use crate::rules::ini_parser::IniFile;
 use crate::sim::combat::TargetKind;
-use crate::sim::components::NavTargetRef;
+use crate::sim::components::{DriveCoord, NavTargetRef};
 use crate::sim::miner::{CargoBale, ResourceType};
-use crate::sim::mission::authority::EntityReadyInputProvider;
+use crate::sim::mission::authority::LiveReadyInputProvider;
 use crate::sim::mission::{MissionId, MissionType};
 use crate::sim::rng::SimRng;
 use crate::sim::slave_manager::{DeployCellSearch, ManagerState, SlaveLink, SlaveNode, SlaveState};
@@ -60,9 +60,6 @@ use std::collections::BTreeMap;
 
 /// Rows whose inputs the Rust scene does not reproduce.
 const SKIPPED: &[&str] = &[
-    // IncomeMult 0.9: VERA's integer credit fold pays 90 where the native
-    // float product truncates to 89 (the economy owner's recorded residual).
-    "dep_income_mult",
     // A supplied Unlimbo refusal on an open cell: the Rust Unlimbo places it.
     "d_unlimbo_refused",
     // FindDeployCell's supplied Find_Nearby_Passable_Cell miss: the scene's
@@ -82,7 +79,7 @@ fn slave_rules(input: &Value) -> String {
         "[InfantryTypes]\n0=SLAV\n\
          [SLAV]\nStrength=125\nStorage={}\nHarvestRate={}\nSpeed=4\nSlaved=yes\n\
          MovementZone=Infantry\nLocomotor={{4A582744-9839-11D1-B709-00A024DDAFD1}}\n\
-         [YAREFN]\nFoundation=2x2\nStrength=2000\nEnslaves=SLAV\nSlavesNumber=0\n\
+         [YAREFN]\nStrength=2000\nEnslaves=SLAV\nSlavesNumber=0\n\
          SlaveRegenRate={}\nSlaveReloadRate={}\nDeployFacing=0\nUndeploysInto=SMIN\n\
          [SMIN]\nStrength=2000\nSpeed=3\nROT=5\nEnslaves=SLAV\nSlavesNumber=0\nDeploysInto=YAREFN\n\
          ResourceGatherer=yes\nResourceDestination=yes\nMovementZone=Crusher\n\
@@ -97,18 +94,17 @@ fn slave_rules(input: &Value) -> String {
 }
 
 /// The Do_Action sequences the slave machine requests; any non-zero count.
+/// Die1/Die2 are retail `[SlaveSequence]`'s, so a killed slave plays a death
+/// (a death without frames revives at Health 1, `0x0051D70F`).
 const SLAVE_SEQUENCE: &str = "[SlavSequence]\nReady=0,1,1\nGuard=0,1,1\nWalk=8,6,6\n\
-    Shovel=56,4,4\nCheer=100,8,0,E\n";
+    Shovel=56,4,4\nCarry=228,6,6\nCheer=100,8,0,E\nDie1=86,15,0\nDie2=101,15,0\n";
 
 const YAREFN_NW: (u16, u16) = (12, 12);
 /// The oracle's regen spare (`slave_address(7)`).
 const SPARE: u64 = 7;
 
-fn corpus() -> Value {
-    serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/slave_manager.json"
-    ))
-    .unwrap()
+fn corpus() -> &'static Value {
+    crate::test_fixture::json("tools/spatial_oracle/slave_manager.json")
 }
 
 fn mission(name: &str) -> MissionType {
@@ -167,12 +163,15 @@ impl SlaveScene {
 }
 
 pub(super) fn row_scene(input: &Value) -> SlaveScene {
-    row_scene_edited(input, |_| {})
+    row_scene_edited(input, |_, _| {})
 }
 
 /// [`row_scene`] on rules text that `edit` changes after the slave types are
 /// added.
-pub(super) fn row_scene_edited(input: &Value, edit: impl FnOnce(&mut String)) -> SlaveScene {
+pub(super) fn row_scene_edited(
+    input: &Value,
+    edit: impl FnOnce(&mut String, &mut IniFile),
+) -> SlaveScene {
     let mut input = input.clone();
     if input.get("ore").is_none() {
         input["ore"] = serde_json::json!([]);
@@ -187,11 +186,20 @@ pub(super) fn row_scene_edited(input: &Value, edit: impl FnOnce(&mut String)) ->
     if let Some(fields) = input.as_object_mut() {
         fields.remove("harvester");
     }
-    let mut scene = row_scene_with(&input, |text| {
+    let mut scene = row_scene_with(&input, |text, art| {
         *text = text.replacen("2=GAOREP\n", "2=GAOREP\n3=YAREFN\n", 1);
         *text = text.replacen("1=MTNK\n", "1=MTNK\n2=SMIN\n", 1);
         text.push_str(&slave_rules(&input));
-        edit(text);
+        if let Some(mult) = input["income_mult"].as_f64() {
+            text.push_str(&format!(
+                "[Countries]\n0=Americans\n[Americans]\nIncomeMult={mult}\n"
+            ));
+        }
+        art.merge(&IniFile::from_str("[YAREFN]\nFoundation=2x2\n"));
+        art.merge(&IniFile::from_str(&format!(
+            "[SLAV]\nSequence=SlavSequence\n{SLAVE_SEQUENCE}"
+        )));
+        edit(text, art);
     });
     // The oracle's Rules+0x1780.. (ReadRange leptons), KickFrameDelay and
     // ApproachTargetResetMultiplier.
@@ -207,18 +215,9 @@ pub(super) fn row_scene_edited(input: &Value, edit: impl FnOnce(&mut String)) ->
     general.slave_miner_scan_correction = ranges[3] * 256;
     general.slave_miner_kick_frame_delay = input["kick_delay"].as_i64().unwrap_or(150) as i32;
     general.approach_target_reset_multiplier = input["approach_reset"].as_i64().unwrap_or(1) as i32;
-    let sequences = crate::rules::infantry_sequence::parse_infantry_sequence_registry(
-        &IniFile::from_str(SLAVE_SEQUENCE),
-    );
-    let mut catalog = scene.rules.animation_sequences().clone();
-    catalog.insert(
-        "SLAV".to_string(),
-        crate::rules::infantry_sequence::build_sequence_set(&sequences["SLAVSEQUENCE"]),
-    );
-    scene.rules.replace_animation_sequences_for_test(catalog);
     let rules = &scene.rules;
     let sim = &mut scene.sim;
-    let frame = sim.session.binary_frame;
+    let frame = sim.session.binary_frame();
     let refinery = sim
         .spawn_object("YAREFN", "Americans", YAREFN_NW.0, YAREFN_NW.1, 0, rules)
         .expect("slave refinery");
@@ -235,9 +234,14 @@ pub(super) fn row_scene_edited(input: &Value, edit: impl FnOnce(&mut String)) ->
             .spawn_object_with_overlay_registry("SMIN", "Americans", 15, 15, 0, rules, registry())
             .unwrap_or_else(|| panic!("slave miner for {}", input["name"]));
         let entity = sim.substrate.entities.get_mut(smin).unwrap();
-        entity.mcv_deploy_pending = input["deploy_pending"] == true;
+        entity
+            .seldom
+            .mcv_deploy_pending
+            .set_for_test(input["deploy_pending"] == true);
         if let Some((nx, ny)) = input.get("owner_nav").map(cell) {
-            entity.navigation.nav_com = Some(NavTargetRef::cell(nx, ny));
+            entity
+                .navigation
+                .set_nav_com_for_test(Some(NavTargetRef::cell(nx, ny)));
         }
         smin
     } else {
@@ -248,9 +252,8 @@ pub(super) fn row_scene_edited(input: &Value, edit: impl FnOnce(&mut String)) ->
         sim.spawn_object("GAOREP", "Americans", 16, 16, 0, rules)
             .expect("footprint blocker");
     }
-    // VERA publishes neither the Construction mission nor a BState: a
-    // building that builds up carries `building_up`, which stands for both
-    // (`GameEntity::constructing_or_selling`, `slave_manager_step`).
+    // Supply the original body state and mission through their owners.
+    // Construction and BState0 are distinct inputs to the manager.
     let owner_mission = input["owner_mission"].as_str().unwrap_or("guard");
     if owner_mission == "construction" || input["bstate"].as_i64() == Some(0) {
         sim.substrate
@@ -263,12 +266,13 @@ pub(super) fn row_scene_edited(input: &Value, edit: impl FnOnce(&mut String)) ->
             );
     }
     let owner_mission = match owner_mission {
-        "construction" => MissionType::Guard,
+        "construction" => MissionType::Construction,
         other => mission(other),
     };
     // The MissionClass start frame (`+0xC0`) the row supplies.
     let started = (i64::from(frame) + input["mission_start"].as_i64().unwrap_or(0)) as u32;
-    sim.mission_assign_exact(master, MissionId::from_known(owner_mission), started)
+    sim.substrate
+        .mission_assign_exact(master, MissionId::from_known(owner_mission), started)
         .unwrap();
     let mut slaves = BTreeMap::new();
     let mut nodes = Vec::new();
@@ -281,11 +285,11 @@ pub(super) fn row_scene_edited(input: &Value, edit: impl FnOnce(&mut String)) ->
         let timer = node["timer"].as_array().map_or((0, 0), |t| {
             (t[0].as_i64().unwrap() as i32, t[1].as_i64().unwrap() as i32)
         });
-        nodes.push(SlaveNode {
+        nodes.push(SlaveNode::for_test(
             slave,
-            state: slave_state(node["state"].as_u64().unwrap()),
-            timer: CdTimer::from_raw(frame as i32 + timer.0, timer.1),
-        });
+            slave_state(node["state"].as_u64().unwrap()),
+            CdTimer::from_raw(frame as i32 + timer.0, timer.1),
+        ));
     }
     let manager_state = manager_state(input["manager_state"].as_u64().unwrap_or(5));
     let manager_frame = match input["manager_frame_ago"].as_i64() {
@@ -323,32 +327,46 @@ fn place_slave(
     node: &Value,
     master: u64,
 ) -> u64 {
-    let frame = sim.session.binary_frame;
+    let frame = sim.session.binary_frame();
     let (x, y) = node.get("cell").map_or((15, 15), cell);
     let id = sim
-        .construct_object_limbo_at_height("SLAV", "Americans", x, y, 0, 0, rules)
+        .construct_object_limbo_at_height(
+            "SLAV",
+            "Americans",
+            x,
+            y,
+            0,
+            0,
+            rules,
+            &mut crate::sim::world::FrameEffects::default(),
+        )
         .expect("slave");
-    // The oracle supplies the cell's centre as every slave's coordinate.
+    // make_slave supplies Object+9C's full XYZ after construction, including
+    // held slaves. The constructor's zero Location is a separate input.
     {
         let entity = sim.substrate.entities.get_mut(id).unwrap();
-        entity.position.sub_x = SimFixed::from_num(128);
-        entity.position.sub_y = SimFixed::from_num(128);
+        entity.position.put_location(DriveCoord {
+            x: i32::from(x) * 256 + 128,
+            y: i32::from(y) * 256 + 128,
+            z: 0,
+        });
     }
     if node["limbo"] != true {
         let outcome = sim.try_reveal_entity_with_context(
             id,
             RevealRequest {
-                position: RevealPosition {
-                    rx: x,
-                    ry: y,
-                    z: 0,
-                    sub_x: SimFixed::from_num(128),
-                    sub_y: SimFixed::from_num(128),
-                },
+                position: RevealPosition::new(
+                    x,
+                    y,
+                    0,
+                    None,
+                    SimFixed::from_num(128),
+                    SimFixed::from_num(128),
+                ),
                 placement: PlacementEvidence::MarkSucceeded,
                 logic_eligible: true,
             },
-            UninitContext::with_rules(rules),
+            UninitContext::new(rules),
         );
         assert!(
             matches!(outcome, RevealOutcome::Revealed { .. }),
@@ -356,7 +374,8 @@ fn place_slave(
         );
     }
     let current = mission(node["mission"].as_str().unwrap_or("guard"));
-    sim.mission_assign_exact(id, MissionId::from_known(current), frame)
+    sim.substrate
+        .mission_assign_exact(id, MissionId::from_known(current), frame)
         .unwrap();
     if let Some(queued) = node["queued"].as_str() {
         sim.mission_queue_exact(
@@ -364,14 +383,14 @@ fn place_slave(
             MissionId::from_known(mission(queued)),
             0,
             frame,
-            &EntityReadyInputProvider,
+            &LiveReadyInputProvider { rules },
         )
         .unwrap();
     }
     let entity = sim.substrate.entities.get_mut(id).unwrap();
     // The oracle writes the row's health to both Strength and EstimatedHealth.
     let health = node["health"].as_i64().unwrap_or(125) as i32;
-    entity.health.current = health;
+    entity.health.set_for_test(health);
     entity.estimated_health.reset(health);
     if let Some(doing) = node["doing"].as_i64() {
         entity
@@ -380,7 +399,9 @@ fn place_slave(
             .unwrap();
     }
     if let Some((nx, ny)) = node.get("nav").map(cell) {
-        entity.navigation.nav_com = Some(NavTargetRef::cell(nx, ny));
+        entity
+            .navigation
+            .set_nav_com_for_test(Some(NavTargetRef::cell(nx, ny)));
     }
     let storage = node["storage"].as_array();
     let mut cargo = Vec::new();
@@ -388,12 +409,13 @@ fn place_slave(
         let count = storage.map_or(0, |s| s[slot].as_f64().unwrap() as usize);
         for _ in 0..count {
             cargo.push(CargoBale {
+                tiberium_type: crate::rules::tiberium_type::TiberiumTypeId(slot as u8),
                 resource_type: kind,
                 value,
             });
         }
     }
-    entity.slave = SlaveLink::for_test(Some(master), cargo);
+    entity.seldom.slave = SlaveLink::for_test(Some(master), cargo);
     id
 }
 
@@ -450,15 +472,15 @@ fn compare_state(s: &SlaveScene, row: &Value, context: &str) {
         .slave_manager
         .as_ref()
         .unwrap();
-    let frame = sim.session.binary_frame as i64;
+    let frame = sim.session.binary_frame() as i64;
     let nodes: Vec<Value> = manager
         .nodes()
         .iter()
         .map(|node| {
             serde_json::json!({
-                "slave": node.slave.map(|id| s.index_of(id)),
-                "state": node.state as u8,
-                "timer": [node.timer.start_frame(), node.timer.duration()],
+                "slave": node.slave().map(|id| s.index_of(id)),
+                "state": node.state() as u8,
+                "timer": [node.timer().start_frame(), node.timer().duration()],
             })
         })
         .collect();
@@ -497,22 +519,22 @@ fn compare_state(s: &SlaveScene, row: &Value, context: &str) {
             expected["queued"].as_i64().unwrap(),
             "{context}: owner queued mission"
         );
-        let nav = match owner.navigation.nav_com {
+        let nav = match owner.navigation.nav_com() {
             Some(NavTargetRef::Cell { rx, ry }) => serde_json::json!([rx, ry]),
             None => Value::Null,
             Some(other) => panic!("{context}: owner NavCom {other:?}"),
         };
         assert_eq!(nav, expected["nav"], "{context}: owner NavCom");
         assert_eq!(
-            u64::from(owner.mcv_deploy_pending),
+            u64::from(owner.seldom.mcv_deploy_pending.is_pending()),
             expected["deploy_pending"].as_u64().unwrap(),
             "{context}: owner deploy pending"
         );
     }
-    // The refinery: the Selling a relocation queues (`+0xB4`) is VERA's
-    // started undeploy (`building_down`), and its ArchiveTarget. The
-    // relocation's `+0x4F8` (the undeploy voice's silencer) has no VERA
-    // counterpart (`slave_manager::relocate_refinery`).
+    // The refinery: the relocation's queued Selling selector (`+0xB4`),
+    // independent of an already-current Selling mission, and its ArchiveTarget. The
+    // relocation's +4F8 voice suppression is retained by the Techno owner;
+    // its complete reader/voice controls live in slave_miner_pack_voice.json.
     if !native["building"].is_null() && holder == s.refinery {
         let refinery = sim.substrate.entities.get(s.refinery).unwrap();
         let expected = &native["building"];
@@ -522,9 +544,14 @@ fn compare_state(s: &SlaveScene, row: &Value, context: &str) {
             other => panic!("{context}: refinery queued mission {other}"),
         };
         assert_eq!(
-            refinery.building_down.is_some(),
+            refinery.mission.queued().known() == Some(MissionType::Selling),
             queued,
             "{context}: refinery Selling (undeploy)"
+        );
+        assert_eq!(
+            refinery.deploy_voice_suppressed(),
+            expected["silent"].as_u64().unwrap() != 0,
+            "{context}: original relocation silencer"
         );
         let archive = match refinery.archive_target() {
             Some(TargetKind::Cell(x, y)) => serde_json::json!([x, y]),
@@ -536,7 +563,7 @@ fn compare_state(s: &SlaveScene, row: &Value, context: &str) {
     let mut compared: Vec<(u64, u64)> = s.slaves.iter().map(|(i, id)| (*i, *id)).collect();
     // A slave the call created stands for the oracle's supplied spare.
     for node in manager.nodes() {
-        if let Some(id) = node.slave
+        if let Some(id) = node.slave()
             && !s.slaves.values().any(|known| *known == id)
         {
             compared.push((SPARE, id));
@@ -564,7 +591,7 @@ fn compare_state(s: &SlaveScene, row: &Value, context: &str) {
                 "{context}: queued"
             );
         }
-        let nav = match entity.navigation.nav_com {
+        let nav = match entity.navigation.nav_com() {
             Some(NavTargetRef::Cell { rx, ry }) => serde_json::json!([rx, ry]),
             None => Value::Null,
             Some(other) => panic!("{context}: NavCom {other:?}"),
@@ -583,6 +610,7 @@ fn compare_state(s: &SlaveScene, row: &Value, context: &str) {
         );
         let count = |kind| {
             entity
+                .seldom
                 .slave
                 .cargo()
                 .iter()
@@ -596,7 +624,7 @@ fn compare_state(s: &SlaveScene, row: &Value, context: &str) {
             "{context}: Storage"
         );
         assert_eq!(
-            i64::from(entity.health.current),
+            i64::from(entity.health.current()),
             expected["health"][0].as_i64().unwrap(),
             "{context}: Strength"
         );
@@ -606,12 +634,12 @@ fn compare_state(s: &SlaveScene, row: &Value, context: &str) {
             "{context}: EstimatedHealth"
         );
         assert_eq!(
-            entity.slave.owner() == Some(holder),
+            entity.seldom.slave.owner() == Some(holder),
             expected["owner"].as_bool().unwrap(),
             "{context}: SlaveOwner"
         );
         assert_eq!(
-            u64::from(entity.lifecycle.in_limbo),
+            u64::from(entity.lifecycle.in_limbo()),
             expected["limbo"].as_u64().unwrap(),
             "{context}: limbo"
         );
@@ -650,7 +678,7 @@ fn compare_state(s: &SlaveScene, row: &Value, context: &str) {
     }
     let owner = sim.interner.get("Americans").unwrap();
     assert_eq!(
-        i64::from(sim.houses[&owner].economy.credits),
+        i64::from(sim.houses[&owner].economy().credits()),
         native["balance"].as_i64().unwrap(),
         "{context}: balance"
     );
@@ -691,40 +719,45 @@ fn ai_update_matches_the_original_node_machine() {
         let mut s = row_scene(&row["input"]);
         s.scene
             .sim
-            .slave_ai_update(s.master, &s.scene.rules, Some(registry()));
+            .slave_ai_update(
+                s.master,
+                &s.scene.rules,
+                Some(registry()),
+                &mut crate::sim::world::FrameEffects::default(),
+            )
+            .unwrap();
         compare_state(&s, row, &name);
     }
 }
 
+/// The building's (`manager`) and the Slave Miner's (`unit_manager`) states,
+/// and state 5 with no ore within `SlaveMinerShortScan` (`relocation`): the
+/// relocation test and, when it passes, the archive, the undeploy (Selling)
+/// and state 6.
 #[test]
-fn manager_machine_matches_the_original_building_owner_states() {
+fn manager_machine_matches_the_original_owner_states_and_relocation() {
     let corpus = corpus();
-    for (row, name) in rows(&corpus, "manager") {
-        let mut s = row_scene(&row["input"]);
-        s.scene
-            .sim
-            .slave_manager_step(s.master, &s.scene.rules, Some(registry()));
-        compare_state(&s, row, &name);
-    }
-}
-
-/// State 5 with no ore within `SlaveMinerShortScan`: the relocation test
-/// and, when it passes, the archive, the undeploy (Selling) and state 6.
-#[test]
-fn manager_machine_matches_the_original_slave_refinery_relocation() {
-    let corpus = corpus();
-    for (row, name) in rows(&corpus, "relocation") {
-        let mut s = row_scene(&row["input"]);
-        // A supplied Find_Nearby_Passable_Cell miss: the scene's open ground
-        // would offer a cell, so the search is denied the zone map it needs
-        // and FindDeployCell answers the same (0,0) (read at 0x006B00F0).
-        if row["input"]["passable"] == serde_json::json!([null]) {
-            s.scene.sim.zone_grid = None;
+    for group in ["manager", "unit_manager", "relocation"] {
+        for (row, name) in rows(&corpus, group) {
+            let mut s = row_scene(&row["input"]);
+            // A supplied relocation Find_Nearby_Passable_Cell miss: the scene's
+            // open ground would offer a cell, so the search is denied the zone
+            // map it needs and FindDeployCell answers the same (0,0) (read at
+            // 0x006B00F0).
+            if group == "relocation" && row["input"]["passable"] == serde_json::json!([null]) {
+                s.scene.sim.zone_grid = None;
+            }
+            s.scene
+                .sim
+                .slave_manager_step(
+                    s.master,
+                    &s.scene.rules,
+                    Some(registry()),
+                    &mut crate::sim::world::FrameEffects::default(),
+                )
+                .unwrap();
+            compare_state(&s, row, &name);
         }
-        s.scene
-            .sim
-            .slave_manager_step(s.master, &s.scene.rules, Some(registry()));
-        compare_state(&s, row, &name);
     }
 }
 
@@ -735,7 +768,11 @@ fn placed_hand_off_matches_the_original() {
     for (row, name) in rows(&corpus, "building_helper") {
         let mut s = row_scene(&row["input"]);
         assert_eq!(row["input"]["helper"], "placed_hand_off", "{name}");
-        s.scene.sim.slave_manager_hand_off(s.master, &s.scene.rules);
+        s.scene.sim.slave_manager_hand_off(
+            s.master,
+            &s.scene.rules,
+            &mut crate::sim::world::FrameEffects::default(),
+        );
         compare_state(&s, row, &name);
     }
 }
@@ -745,9 +782,12 @@ fn deploy_slaves_matches_the_original_unlimbo_and_scatter() {
     let corpus = corpus();
     for (row, name) in rows(&corpus, "deploy") {
         let mut s = row_scene(&row["input"]);
-        s.scene
-            .sim
-            .deploy_slaves(s.master, &s.scene.rules, Some(registry()));
+        s.scene.sim.deploy_slaves(
+            s.master,
+            &s.scene.rules,
+            Some(registry()),
+            &mut crate::sim::world::FrameEffects::default(),
+        );
         compare_state(&s, row, &name);
     }
 }
@@ -758,12 +798,18 @@ fn slave_mission_harvest_matches_the_original_dig() {
     for (row, name) in rows(&corpus, "slave_harvest") {
         let mut s = row_scene(&row["input"]);
         let slave = s.slaves[&0];
-        let (delay, guard) =
-            s.scene
-                .sim
-                .infantry_mission_harvest(slave, &s.scene.rules, Some(registry()));
+        let (delay, guard) = s
+            .scene
+            .sim
+            .infantry_mission_harvest(
+                slave,
+                &s.scene.rules,
+                Some(registry()),
+                &mut crate::sim::world::FrameEffects::default(),
+            )
+            .unwrap();
         if guard {
-            let frame = s.scene.sim.session.binary_frame;
+            let frame = s.scene.sim.session.binary_frame();
             s.scene
                 .sim
                 .mission_queue_exact(
@@ -771,7 +817,9 @@ fn slave_mission_harvest_matches_the_original_dig() {
                     MissionId::from_known(MissionType::Guard),
                     0,
                     frame,
-                    &EntityReadyInputProvider,
+                    &LiveReadyInputProvider {
+                        rules: crate::rules::ruleset::RuleSet::empty_for_test(),
+                    },
                 )
                 .unwrap();
         }
@@ -796,18 +844,6 @@ fn slave_deposit_matches_the_original_payment() {
 }
 
 #[test]
-fn manager_machine_matches_the_original_slave_miner_states() {
-    let corpus = corpus();
-    for (row, name) in rows(&corpus, "unit_manager") {
-        let mut s = row_scene(&row["input"]);
-        s.scene
-            .sim
-            .slave_manager_step(s.master, &s.scene.rules, Some(registry()));
-        compare_state(&s, row, &name);
-    }
-}
-
-#[test]
 fn slave_miner_helpers_match_the_original() {
     let corpus = corpus();
     for (row, name) in rows(&corpus, "unit_helper") {
@@ -816,16 +852,30 @@ fn slave_miner_helpers_match_the_original() {
         let sim = &mut s.scene.sim;
         match row["input"]["helper"].as_str().unwrap() {
             "should_recall" => {
-                let answer = sim.should_recall_slaves(master, rules, Some(registry()));
+                let answer = sim
+                    .should_recall_slaves(master, rules, Some(registry()))
+                    .unwrap();
                 assert_eq!(
                     u64::from(answer),
                     row["answer"].as_u64().unwrap(),
                     "{name}: ShouldRecallSlaves"
                 );
             }
-            "begin_hunt" => sim.begin_slave_hunt(master, rules),
-            "reset" => sim.reset_slave_manager(master, rules),
-            "handle_returned" => sim.handle_returned_slaves(master, rules),
+            "begin_hunt" => sim.begin_slave_hunt(
+                master,
+                rules,
+                &mut crate::sim::world::FrameEffects::default(),
+            ),
+            "reset" => sim.reset_slave_manager(
+                master,
+                rules,
+                &mut crate::sim::world::FrameEffects::default(),
+            ),
+            "handle_returned" => sim.handle_returned_slaves(
+                master,
+                rules,
+                &mut crate::sim::world::FrameEffects::default(),
+            ),
             other => panic!("{name}: helper {other}"),
         }
         compare_state(&s, row, &name);
@@ -838,12 +888,17 @@ fn slave_miner_kick_matches_the_original_guard_and_area_guard() {
     for (row, name) in rows(&corpus, "unit_mission") {
         let mut s = row_scene(&row["input"]);
         let mission = mission(row["input"]["owner_mission"].as_str().unwrap());
-        let kicked = s.scene.sim.slave_master_mission_kick(
-            s.master,
-            mission,
-            &s.scene.rules,
-            Some(registry()),
-        );
+        let kicked = s
+            .scene
+            .sim
+            .slave_master_mission_kick(
+                s.master,
+                mission,
+                &s.scene.rules,
+                Some(registry()),
+                &mut crate::sim::world::FrameEffects::default(),
+            )
+            .unwrap();
         assert_eq!(
             kicked.is_some(),
             row["kicked"].as_bool().unwrap(),
@@ -948,5 +1003,5 @@ fn replay_covers_every_row() {
     .map(|group| corpus[*group].as_array().unwrap().len())
     .sum();
     assert_eq!(total, 104);
-    assert_eq!(SKIPPED.len(), 4);
+    assert_eq!(SKIPPED.len(), 3);
 }

@@ -1,7 +1,7 @@
 #[test]
 fn native_bridge_base_edges_match_original_executable() {
-    let corpus: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/bridge_base_edges.json"
+    let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/bridge_base_edges.json",
     ))
     .unwrap();
     let cases = corpus["cases"].as_array().unwrap();
@@ -34,7 +34,7 @@ fn native_bridge_base_edges_match_original_executable() {
             .as_array()
             .unwrap()
             .iter()
-            .map(|n| n.as_u64().unwrap() as u16)
+            .map(|n| n.as_u64().unwrap() as ZoneId)
             .collect();
         let size = (
             case["size"][0].as_i64().unwrap() as i32,

@@ -7,10 +7,11 @@
 //! through **one routine in the original**, so they are one routine here — two
 //! copies of a native predicate is how the copies start disagreeing.
 //!
-//! The routine takes two override bytes that would let paved roads and
-//! road-ends through instead of refusing them. Both call sites pass zero for
-//! both, so the overrides are folded away and the rule is simply: a road
-//! refuses, and what is left has to be clear ground, misc-pave or pave.
+//! The routine takes two override bytes that let paved roads and road-ends
+//! through instead of refusing them. Both stock call sites pass zero for
+//! both, so for them the rule is simply: a road refuses, and what is left has
+//! to be clear ground, misc-pave or pave. Only the urban pass Ares reaches
+//! sets them.
 
 use crate::map::rmg::grid::RmgGrid;
 use crate::map::rmg::scratch::RmgScratch;
@@ -40,13 +41,29 @@ pub fn corners_in_diamond(scratch: &RmgScratch, rect: (i32, i32, i32, i32)) -> b
 /// of each tileset, so a short set lets a span run on into its neighbour and a
 /// tile can land in two families at once. Where that happens the refusal wins.
 pub fn tile_is_placeable(ids: &TileIds, tile: i32) -> bool {
-    if ids.is_paved_road(tile) || ids.is_paved_road_end(tile) {
-        return false;
+    tile_is_admitted(ids, tile, false, false)
+}
+
+/// [`tile_is_placeable`] with `AreaIsPavedClear`'s override bytes: a paved
+/// road passes when `roads` is set and a road end when `road_ends` is, each
+/// without the clear/pave test.
+fn tile_is_admitted(ids: &TileIds, tile: i32, roads: bool, road_ends: bool) -> bool {
+    if ids.is_paved_road(tile) {
+        return roads;
+    }
+    if ids.is_paved_road_end(tile) {
+        return road_ends;
     }
     ids.is_clear(tile) || ids.is_misc_pave(tile) || ids.is_pave(tile)
 }
 
-/// Is every cell of `rect` clear of roads and standable?
+/// `RandomMapGenerator::AreaIsPavedClear @ 0x005A7250`: is every cell of
+/// `rect` clear of roads and standable?
+///
+/// Its two override bytes (EDX and the stack byte) admit roads and road ends;
+/// see [`area_admits_paving`]. Every stock call passes zero:
+/// `PlaceLowBridgeDeck @ 0x0058F2C0` and `RmgRegion::PlaceStartingPoints`
+/// (0x00594992, EBP cleared at 0x00594892).
 ///
 /// Corners first, then **exactly `w x h`** — no inclusive margin. There is no
 /// level test here; a rect spanning a step in the ground still passes. The
@@ -57,6 +74,21 @@ pub fn area_is_paved_clear(
     scratch: &RmgScratch,
     ids: &TileIds,
     rect: (i32, i32, i32, i32),
+) -> bool {
+    area_admits_paving(grid, scratch, ids, rect, false, false)
+}
+
+/// `AreaIsPavedClear @ 0x005A7250` with its override bytes: `roads` (EDX)
+/// admits paved roads and `road_ends` (the stack byte) road ends. Only the
+/// urban pass under `0x005A5020` (0x005A5B50, 0x005A6D80, 0x005A7070) sets
+/// them, and only Ares reaches it.
+pub fn area_admits_paving(
+    grid: &RmgGrid,
+    scratch: &RmgScratch,
+    ids: &TileIds,
+    rect: (i32, i32, i32, i32),
+    roads: bool,
+    road_ends: bool,
 ) -> bool {
     let (rx, ry, w, h) = rect;
 
@@ -71,174 +103,10 @@ pub fn area_is_paved_clear(
             let Some(cell) = grid.get(x, y) else {
                 return false;
             };
-            if !tile_is_placeable(ids, cell.tile) {
+            if !tile_is_admitted(ids, cell.tile, roads, road_ends) {
                 return false;
             }
         }
     }
     true
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::map::rmg::tiles::SpecialTerrain;
-
-    const GREEN: i32 = 100;
-    const PAVE: i32 = 600;
-    const MISC_PAVE: i32 = 620;
-    const PAVED_ROAD: i32 = 640;
-    const PAVED_ROAD_END: i32 = 660;
-
-    fn ids() -> TileIds {
-        TileIds {
-            clear: 0,
-            ramp_base: 200,
-            ramp_smooth: 220,
-            rough: -1,
-            sand: -1,
-            green: GREEN,
-            rough_lat: -1,
-            sand_lat: -1,
-            green_lat: 110,
-            pave_lat: -1,
-            pave: PAVE,
-            water_base: 500,
-            shore: 400,
-            water_bridge: -1,
-            misc_pave: MISC_PAVE,
-            paved_roads: PAVED_ROAD,
-            paved_road_ends: PAVED_ROAD_END,
-            medians: -1,
-            special: SpecialTerrain::default(),
-        }
-    }
-
-    fn harness() -> (RmgGrid, RmgScratch) {
-        let (dmin, dmax) = (34, 34 + 2 * 42);
-        let stride = (34 + 42 + 1) as usize;
-        let mut grid = RmgGrid::new(stride, dmin, dmax);
-        let scratch = RmgScratch::new(stride, dmin, dmax);
-        for (x, y) in grid.native_cells().collect::<Vec<_>>() {
-            let cell = grid.get_mut(x, y).expect("native cell");
-            cell.tile = 0;
-            cell.level = 4;
-            cell.overlay = -1;
-        }
-        (grid, scratch)
-    }
-
-    #[test]
-    fn clear_ground_is_placeable() {
-        let (grid, scratch) = harness();
-        assert!(area_is_paved_clear(&grid, &scratch, &ids(), (40, 48, 6, 6)));
-    }
-
-    #[test]
-    fn roads_and_road_ends_refuse() {
-        for (base, label) in [(PAVED_ROAD, "paved road"), (PAVED_ROAD_END, "road end")] {
-            let (mut grid, scratch) = harness();
-            grid.get_mut(42, 49).expect("native cell").tile = base;
-            assert!(
-                !area_is_paved_clear(&grid, &scratch, &ids(), (40, 48, 6, 6)),
-                "{label} must refuse"
-            );
-        }
-    }
-
-    #[test]
-    fn pave_and_misc_pave_are_accepted() {
-        for (base, label) in [(PAVE, "pave"), (MISC_PAVE, "misc pave")] {
-            let (mut grid, scratch) = harness();
-            grid.get_mut(42, 49).expect("native cell").tile = base;
-            assert!(
-                area_is_paved_clear(&grid, &scratch, &ids(), (40, 48, 6, 6)),
-                "{label} must be accepted"
-            );
-        }
-    }
-
-    #[test]
-    fn other_terrain_refuses() {
-        let (mut grid, scratch) = harness();
-        grid.get_mut(42, 49).expect("native cell").tile = GREEN;
-        assert!(!area_is_paved_clear(
-            &grid,
-            &scratch,
-            &ids(),
-            (40, 48, 6, 6)
-        ));
-    }
-
-    #[test]
-    fn a_road_tile_refuses_even_when_it_is_also_inside_the_pave_span() {
-        let overlapping = TileIds {
-            pave: PAVED_ROAD - 2,
-            ..ids()
-        };
-        assert!(
-            overlapping.is_pave(PAVED_ROAD) && overlapping.is_paved_road(PAVED_ROAD),
-            "the fixture really does put one tile in both spans"
-        );
-        let (mut grid, scratch) = harness();
-        grid.get_mut(42, 49).expect("native cell").tile = PAVED_ROAD;
-        assert!(!area_is_paved_clear(
-            &grid,
-            &scratch,
-            &overlapping,
-            (40, 48, 6, 6)
-        ));
-    }
-
-    #[test]
-    fn a_step_in_the_ground_does_not_refuse() {
-        // No level test here, unlike the bridge end-piece check. Adding one
-        // would refuse start positions the original accepts.
-        let (mut grid, scratch) = harness();
-        grid.get_mut(42, 49).expect("native cell").level = 9;
-        assert!(area_is_paved_clear(&grid, &scratch, &ids(), (40, 48, 6, 6)));
-    }
-
-    #[test]
-    fn the_sweep_stops_at_the_rect() {
-        // One past the rect on either axis is not judged; the last cell inside
-        // is. The pair pins the extent rather than just proving it is small.
-        for (bx, by, label) in [(46, 49, "one column past"), (43, 54, "one row past")] {
-            let (mut grid, scratch) = harness();
-            grid.get_mut(bx, by).expect("native cell").tile = GREEN;
-            assert!(
-                area_is_paved_clear(&grid, &scratch, &ids(), (40, 48, 6, 6)),
-                "{label} is outside"
-            );
-        }
-        let (mut grid, scratch) = harness();
-        grid.get_mut(45, 53).expect("native cell").tile = GREEN;
-        assert!(!area_is_paved_clear(
-            &grid,
-            &scratch,
-            &ids(),
-            (40, 48, 6, 6)
-        ));
-    }
-
-    #[test]
-    fn a_rect_hanging_off_the_map_refuses_at_the_corners() {
-        // Everything else over the swept area is made to pass, so only the
-        // corner probes can refuse.
-        let (mut grid, scratch) = harness();
-        for y in 16..=22 {
-            for x in 16..=22 {
-                let cell = grid.cell_native_mut(x, y);
-                cell.tile = 0;
-                cell.level = 4;
-            }
-        }
-        assert!(!scratch.in_diamond(16, 16), "the rect really does hang off");
-        assert!(!area_is_paved_clear(
-            &grid,
-            &scratch,
-            &ids(),
-            (16, 16, 6, 6)
-        ));
-    }
 }

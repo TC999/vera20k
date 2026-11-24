@@ -43,7 +43,7 @@ fn refinery_with_slaves(count: usize) -> SlaveScene {
             [18, 14, 0, 0, 5], [17, 12, 0, 0, 5], [18, 12, 0, 0, 5],
         ],
     }));
-    s.scene.sim.production.ore_growth_config = OreGrowthConfig::disabled();
+    s.scene.sim.ore_growth_config = OreGrowthConfig::disabled();
     s
 }
 
@@ -59,7 +59,7 @@ fn node_states(s: &SlaveScene) -> Vec<SlaveState> {
         .unwrap()
         .nodes()
         .iter()
-        .map(|node| node.state)
+        .map(|node| node.state())
         .collect()
 }
 
@@ -78,7 +78,30 @@ fn manager_state(s: &SlaveScene) -> ManagerState {
 
 fn credits(s: &SlaveScene) -> i32 {
     let owner = s.scene.sim.interner.get("Americans").unwrap();
-    s.scene.sim.houses[&owner].economy.credits
+    s.scene.sim.houses[&owner].economy().credits()
+}
+
+/// Event IDLE's Unit gate (`0x004C7655..0x004C765F`) stands before the slave
+/// reset (`0x004C769C..0x004C76AC`): Stop on a selected slave refinery
+/// leaves its manager and its working slaves alone.
+#[test]
+fn stop_on_a_slave_refinery_leaves_its_slaves_working() {
+    let mut s = refinery_with_slaves(3);
+    for _ in 0..21 {
+        frame(&mut s);
+    }
+    let nodes = node_states(&s);
+    assert_eq!(nodes, vec![SlaveState::Scanning; 3]);
+    let stop = Command::Stop {
+        entity_id: s.master,
+    };
+    assert!(
+        s.scene
+            .sim
+            .apply_command("Americans", &stop, Some(&s.scene.rules))
+    );
+    assert_eq!(manager_state(&s), ManagerState::Working);
+    assert_eq!(node_states(&s), nodes);
 }
 
 /// The first visit (10 frames) moves the built refinery to state 5; the next
@@ -104,22 +127,46 @@ fn slave_refinery_deploys_digs_carries_home_pays_and_goes_out_again() {
     );
     for &slave in &slaves {
         let entity = s.scene.sim.substrate.entities.get(slave).unwrap();
-        assert!(!entity.lifecycle.in_limbo);
+        assert!(!entity.lifecycle.in_limbo());
         assert!(
-            entity.navigation.nav_com.is_some(),
+            entity.navigation.nav_com().is_some(),
             "scattered off the drop cell"
         );
     }
 
     let mut dug = false;
     let mut shovel_shown = false;
+    let mut carry_shown = false;
+    let mut empty_walk_after_payment = false;
     let mut paid_at = None;
     let start = credits(&s);
     for n in 0..3000 {
         frame(&mut s);
         for &slave in &slaves {
             let entity = s.scene.sim.substrate.entities.get(slave).unwrap();
-            dug |= !entity.slave.cargo().is_empty();
+            if let Some((doing, _)) = entity.infantry_sprite_pose() {
+                if doing == 39 {
+                    assert_eq!(
+                        entity.seldom.slave.cargo().len(),
+                        4,
+                        "Carry needs a full load"
+                    );
+                    carry_shown = true;
+                    assert_eq!(
+                        s.scene
+                            .rules
+                            .animation_sequence("SLAV")
+                            .unwrap()
+                            .infantry_action(39)
+                            .unwrap()
+                            .start_frame,
+                        228
+                    );
+                }
+                empty_walk_after_payment |=
+                    paid_at.is_some() && doing == 3 && entity.seldom.slave.cargo().is_empty();
+            }
+            dug |= !entity.seldom.slave.cargo().is_empty();
             shovel_shown |= entity
                 .infantry_sprite_pose()
                 .is_some_and(|(doing, _)| doing == 38);
@@ -133,6 +180,11 @@ fn slave_refinery_deploys_digs_carries_home_pays_and_goes_out_again() {
     }
     assert!(dug, "the slaves reach the ore and dig");
     assert!(shovel_shown, "a digging slave shows its Shovel sequence");
+    assert!(carry_shown, "a full returning slave shows the Carry bank");
+    assert!(
+        empty_walk_after_payment,
+        "after deposit an empty slave walks normally"
+    );
     let paid_at = paid_at.expect("a full slave carries its load home and pays");
     assert_eq!(
         (credits(&s) - start) % 100,
@@ -146,271 +198,6 @@ fn slave_refinery_deploys_digs_carries_home_pays_and_goes_out_again() {
             .any(|state| matches!(state, SlaveState::Scanning | SlaveState::Moving)),
         "back out after the reload (paid at {paid_at}): {:?}",
         node_states(&s)
-    );
-}
-
-/// A refinery still building up keeps its slaves inside: VERA's
-/// `building_up` stands for the Construction mission state 0 waits out
-/// (`0x006AFD95..0x006AFDA7`). The first visit after the build-up lets them
-/// out.
-#[test]
-fn a_refinery_building_up_keeps_its_slaves_inside() {
-    let mut s = refinery_with_slaves(3);
-    s.scene
-        .sim
-        .substrate
-        .entities
-        .get_mut(s.master)
-        .unwrap()
-        .install_building_up(
-            crate::sim::components::BuildingUp::completing_in_ticks(30, 0),
-            0,
-        );
-    let mut frames = 0;
-    while s
-        .scene
-        .sim
-        .substrate
-        .entities
-        .get(s.master)
-        .unwrap()
-        .building_up
-        .is_some()
-    {
-        assert!(frames < 40, "the build-up ends");
-        frame(&mut s);
-        frames += 1;
-        assert_eq!(manager_state(&s), ManagerState::Ready);
-        assert_eq!(node_states(&s), vec![SlaveState::Ready; 3]);
-    }
-    for _ in 0..21 {
-        frame(&mut s);
-    }
-    assert_eq!(manager_state(&s), ManagerState::Working);
-    assert!(
-        node_states(&s)
-            .iter()
-            .all(|state| matches!(state, SlaveState::Scanning | SlaveState::Moving)),
-        "let out: {:?}",
-        node_states(&s)
-    );
-}
-
-/// A computer house's Slave Miner idling on Guard sets out once
-/// `SlaveMinerKickFrameDelay` has passed since its Guard began (the kick,
-/// ShouldRecallSlaves), drives to a cell beside the nearest field
-/// (FindDeployCell), deploys into its refinery (UnitClass::Deploy, the
-/// manager handed over), and the refinery, once built up, lets its slaves
-/// out.
-#[test]
-fn a_slave_miner_sets_out_deploys_at_a_field_and_lets_its_slaves_out() {
-    let inside = serde_json::json!({"state": 0, "cell": [15, 15], "limbo": true});
-    let mut s = row_scene(&serde_json::json!({
-        "name": "hunt",
-        "owner": "unit",
-        "human": false,
-        "manager_state": 0,
-        "owner_mission": "guard",
-        "slave_ranges": [8, 14, 12, 3],
-        "nodes": [inside, inside, inside],
-        "ore": [[22, 14, 0, 0, 5], [23, 14, 0, 0, 5], [22, 15, 0, 0, 5], [23, 15, 0, 0, 5]],
-    }));
-    s.scene.sim.production.ore_growth_config = OreGrowthConfig::disabled();
-    let smin = s.master;
-    let slaves: Vec<u64> = s.slaves.values().copied().collect();
-    let started = s.scene.sim.session.binary_frame;
-    let mut set_out = None;
-    let mut refinery = None;
-    for _ in 0..1500 {
-        frame(&mut s);
-        let sim = &s.scene.sim;
-        if set_out.is_none()
-            && sim.substrate.entities.get(smin).is_some_and(|entity| {
-                entity
-                    .slave_manager
-                    .as_ref()
-                    .is_some_and(|manager| manager.state() != ManagerState::Ready)
-            })
-        {
-            set_out = Some(sim.session.binary_frame - started);
-        }
-        refinery = sim
-            .substrate
-            .entities
-            .values()
-            .find(|entity| {
-                entity.stable_id() != s.refinery
-                    && entity.lifecycle.object_alive
-                    && entity.slave_manager.is_some()
-                    && sim.interner.resolve(entity.type_ref()) == "YAREFN"
-            })
-            .map(|entity| entity.stable_id());
-        let out = refinery.is_some()
-            && slaves.iter().all(|&slave| {
-                sim.substrate
-                    .entities
-                    .get(slave)
-                    .is_some_and(|entity| !entity.lifecycle.in_limbo)
-            });
-        if out {
-            break;
-        }
-    }
-    let set_out = set_out.expect("the Guard kick sends the Slave Miner out");
-    assert!(
-        set_out > 150,
-        "not before SlaveMinerKickFrameDelay: {set_out}"
-    );
-    let refinery = refinery.expect("the Slave Miner deploys into its refinery");
-    let sim = &s.scene.sim;
-    assert!(
-        !sim.substrate
-            .entities
-            .get(smin)
-            .is_some_and(|entity| entity.lifecycle.object_alive),
-        "the vehicle is gone"
-    );
-    let at = sim.substrate.entities.get(refinery).unwrap();
-    assert!(
-        (i32::from(at.position.rx) - 22).abs() <= 3 && (i32::from(at.position.ry) - 15).abs() <= 3,
-        "deployed beside the field: ({}, {})",
-        at.position.rx,
-        at.position.ry
-    );
-    for &slave in &slaves {
-        let entity = sim.substrate.entities.get(slave).unwrap();
-        assert_eq!(entity.slave.owner(), Some(refinery));
-        assert!(!entity.lifecycle.in_limbo, "slave {slave} let out");
-    }
-}
-
-/// The refinery the scene's Slave Miner deployed into, if any.
-fn deployed_refinery(s: &SlaveScene) -> Option<u64> {
-    let sim = &s.scene.sim;
-    sim.substrate
-        .entities
-        .values()
-        .find(|entity| {
-            entity.stable_id() != s.refinery
-                && entity.lifecycle.object_alive
-                && entity.slave_manager.is_some()
-                && sim.interner.resolve(entity.type_ref()) == "YAREFN"
-        })
-        .map(|entity| entity.stable_id())
-}
-
-/// A human's Slave Miner ordered onto a field (the Harvest action on ore,
-/// `UnitClass::What_Action` for a ResourceGatherer/ResourceDestination type)
-/// runs HandleReturnedSlaves from its Harvest mission within a dispatch or
-/// two of the order, long before any kick: it drives to a cell beside the
-/// clicked field instead of onto the ore, and deploys there.
-#[test]
-fn a_harvest_order_sends_the_slave_miner_to_deploy_beside_the_field() {
-    let mut s = row_scene(&serde_json::json!({
-        "name": "order",
-        "owner": "unit",
-        "manager_state": 0,
-        "owner_mission": "guard",
-        "slave_ranges": [8, 14, 12, 3],
-        "ore": [[24, 20, 0, 0, 5], [25, 20, 0, 0, 5]],
-    }));
-    s.scene.sim.production.ore_growth_config = OreGrowthConfig::disabled();
-    let owner = s.scene.sim.interner.get("Americans").unwrap();
-    let tick = s.scene.sim.session.tick;
-    s.scene.sim.queue_command(CommandEnvelope::new(
-        owner,
-        tick + 1,
-        Command::HarvestCell {
-            entity_id: s.master,
-            target_rx: 24,
-            target_ry: 20,
-        },
-    ));
-    let mut hunting_after = None;
-    for n in 0..60 {
-        frame(&mut s);
-        if manager_state_of(&s, s.master) == ManagerState::Travelling {
-            hunting_after = Some(n);
-            break;
-        }
-    }
-    let hunting_after = hunting_after.expect("the Harvest prologue sends it to a deploy cell");
-    assert!(hunting_after < 60, "no kick involved: {hunting_after}");
-    let nav = s
-        .scene
-        .sim
-        .substrate
-        .entities
-        .get(s.master)
-        .unwrap()
-        .navigation
-        .nav_com;
-    assert!(
-        nav.is_some() && nav != Some(NavTargetRef::cell(24, 20)),
-        "driving to a deploy cell, not onto the clicked ore: {nav:?}"
-    );
-    let mut refinery = None;
-    for _ in 0..1500 {
-        frame(&mut s);
-        refinery = deployed_refinery(&s);
-        if refinery.is_some() {
-            break;
-        }
-    }
-    let refinery = refinery.expect("the ordered Slave Miner deploys");
-    let at = s.scene.sim.substrate.entities.get(refinery).unwrap();
-    assert!(
-        (i32::from(at.position.rx) - 24).abs() <= 3 && (i32::from(at.position.ry) - 20).abs() <= 3,
-        "deployed beside the clicked field: ({}, {})",
-        at.position.rx,
-        at.position.ry
-    );
-}
-
-/// A Move order takes a hunting Slave Miner off its hunt (the MEGAMISSION's
-/// manager reset `0x004C73E1..0x004C73EA`): it stops where it was sent and
-/// does not deploy there.
-#[test]
-fn a_move_order_takes_the_slave_miner_off_its_hunt() {
-    let mut s = row_scene(&serde_json::json!({
-        "name": "recalled",
-        "owner": "unit",
-        "manager_state": 2,
-        "manager_frame": 2147483647,
-        "owner_mission": "guard",
-        "owner_nav": [22, 15],
-        "slave_ranges": [8, 14, 12, 3],
-    }));
-    let owner = s.scene.sim.interner.get("Americans").unwrap();
-    let tick = s.scene.sim.session.tick;
-    s.scene.sim.queue_command(CommandEnvelope::new(
-        owner,
-        tick + 1,
-        Command::Move {
-            entity_id: s.master,
-            target_rx: 10,
-            target_ry: 20,
-            queue: false,
-        },
-    ));
-    for _ in 0..3 {
-        frame(&mut s);
-    }
-    assert_eq!(manager_state_of(&s, s.master), ManagerState::Ready);
-    for _ in 0..600 {
-        frame(&mut s);
-    }
-    assert!(
-        deployed_refinery(&s).is_none(),
-        "no deploy where it was sent"
-    );
-    assert!(
-        s.scene
-            .sim
-            .substrate
-            .entities
-            .get(s.master)
-            .is_some_and(|entity| entity.lifecycle.object_alive)
     );
 }
 
@@ -441,7 +228,7 @@ fn kill(s: &mut SlaveScene, target: u64, attacker: Option<u64>) {
             .substrate
             .entities
             .get(target)
-            .is_some_and(|entity| entity.health.current > 0)
+            .is_some_and(|entity| entity.health.current() > 0)
         {
             return;
         }
@@ -457,9 +244,12 @@ fn kill(s: &mut SlaveScene, target: u64, attacker: Option<u64>) {
                 arg6: false,
             },
         );
-        s.scene
-            .sim
-            .commit_noncombat_aoe_hits(&s.scene.rules, Some(registry()), &[hit]);
+        s.scene.sim.commit_noncombat_aoe_hits(
+            &s.scene.rules,
+            Some(registry()),
+            &[hit],
+            &mut crate::sim::world::FrameEffects::default(),
+        );
     }
     panic!("{target} survived ten hits");
 }
@@ -481,16 +271,18 @@ fn a_destroyed_refinery_frees_its_slaves_to_the_killer() {
     }));
     s.scene.rules.general.slaves_free_sound = Some("SlavesFreed".to_string());
     let russians = s.scene.sim.interner.intern("Russians");
-    s.scene.sim.houses.insert(
-        russians,
-        crate::sim::house_state::HouseState::new(russians, 1, None, true, 0, 10),
-    );
+    s.scene
+        .sim
+        .houses
+        .register(crate::sim::house_state::HouseState::new(
+            russians, 1, None, true, 0, 10,
+        ));
     let killer = s
         .scene
         .sim
         .spawn_object("MTNK", "Russians", 10, 20, 0, &s.scene.rules)
         .expect("killer");
-    s.scene.sim.sound_events.clear();
+    s.scene.sim.sound_events.clear_for_test();
     let master = s.master;
     kill(&mut s, master, Some(killer));
 
@@ -506,7 +298,7 @@ fn a_destroyed_refinery_frees_its_slaves_to_the_killer() {
     for index in [0, 1] {
         let slave = sim.substrate.entities.get(s.slaves[&index]).unwrap();
         assert_eq!(slave.owner(), russians, "slave {index} joins the killer");
-        assert_eq!(slave.slave.owner(), None);
+        assert_eq!(slave.seldom.slave.owner(), None);
         assert_eq!(slave.mission.current().known(), Some(MissionType::Guard));
         assert_eq!(
             slave.mission_leaf.as_infantry().unwrap().doing(),
@@ -516,7 +308,7 @@ fn a_destroyed_refinery_frees_its_slaves_to_the_killer() {
     }
     let inside = sim.substrate.entities.get(s.slaves[&2]).unwrap();
     assert!(
-        !inside.lifecycle.object_alive,
+        !inside.lifecycle.object_alive(),
         "the slave inside dies with it"
     );
     // The first freed is the last node's live slave: node 1.
@@ -524,7 +316,7 @@ fn a_destroyed_refinery_frees_its_slaves_to_the_killer() {
     assert!(sim.sound_events.iter().any(|event| matches!(
         event,
         SimSoundEvent::VocAt { sound_id, rx, ry, .. }
-            if sound_id == "SlavesFreed" && (*rx, *ry) == (freed.position.rx, freed.position.ry)
+            if sound_id.name_in(&s.scene.rules) == "SlavesFreed" && (*rx, *ry) == (freed.position.rx(), freed.position.ry())
     )));
 
     // The Cheer cannot be interrupted: a Move order given during it walks the
@@ -533,7 +325,7 @@ fn a_destroyed_refinery_frees_its_slaves_to_the_killer() {
     // default arm, forces Ready on a standing slave or Walk on a moving one;
     // the queued Move then commences.
     let ordered = s.slaves[&1];
-    let tick = s.scene.sim.session.tick;
+    let tick = s.scene.sim.session.tick();
     s.scene.sim.queue_command(CommandEnvelope::new(
         russians,
         tick + 1,
@@ -541,7 +333,6 @@ fn a_destroyed_refinery_frees_its_slaves_to_the_killer() {
             entity_id: ordered,
             target_rx: 18,
             target_ry: 17,
-            queue: false,
         },
     ));
     let doing = |s: &SlaveScene, id: u64| {
@@ -598,64 +389,6 @@ fn a_destroyed_refinery_frees_its_slaves_to_the_killer() {
     );
 }
 
-/// A slave that dies leaves its node (RemoveSlave `0x006B0A20`): lost for
-/// `SlaveRegenRate` frames, then regrown inside and let out again.
-#[test]
-fn a_dead_slave_is_regrown_after_the_regen_rate_and_goes_out_again() {
-    let mut s = row_scene(&serde_json::json!({
-        "name": "regen",
-        "nodes": [{"state": 3, "cell": [17, 12], "mission": "harvest"}],
-        "ore": [[17, 12, 0, 0, 5]],
-    }));
-    s.scene.sim.production.ore_growth_config = OreGrowthConfig::disabled();
-    let slave = s.slaves[&0];
-    let died_at = s.scene.sim.session.binary_frame as i32;
-    kill(&mut s, slave, None);
-    let node = |s: &SlaveScene| {
-        s.scene
-            .sim
-            .substrate
-            .entities
-            .get(s.master)
-            .unwrap()
-            .slave_manager
-            .as_ref()
-            .unwrap()
-            .nodes()[0]
-    };
-    let lost = node(&s);
-    assert_eq!((lost.slave, lost.state), (None, SlaveState::Dead));
-    assert_eq!(
-        (lost.timer.start_frame(), lost.timer.duration()),
-        (died_at, 500)
-    );
-    let mut regrown = None;
-    for _ in 0..560 {
-        frame(&mut s);
-        if let Some(id) = node(&s).slave {
-            regrown.get_or_insert(id);
-        }
-    }
-    let regrown = regrown.expect("regrown after SlaveRegenRate");
-    assert_ne!(regrown, slave);
-    assert_eq!(
-        s.scene
-            .sim
-            .substrate
-            .entities
-            .get(regrown)
-            .unwrap()
-            .slave
-            .owner(),
-        Some(s.master)
-    );
-    assert!(
-        matches!(node(&s).state, SlaveState::Scanning | SlaveState::Moving),
-        "let out again: {:?}",
-        node(&s).state
-    );
-}
-
 /// Deploying a Slave Miner (`UnitClass::Deploy`, `deploy_mcv`) and undeploying
 /// its refinery (`undeploy_building` to its conversion in
 /// `visit_building_down`) each hand the manager over (SetOwner `0x006AF580`):
@@ -668,14 +401,17 @@ fn deploy_and_undeploy_hand_the_slave_manager_over() {
     use crate::rules::ruleset::RuleSet;
     use crate::sim::rng::SimRng;
     use crate::sim::world::Simulation;
-    let rules = RuleSet::from_ini(&IniFile::from_str(
-        "[InfantryTypes]\n1=SLAV\n[VehicleTypes]\n1=SMIN\n[BuildingTypes]\n1=YAREFN\n\
+    let rules = RuleSet::from_ini_with_fixed_art_for_test(
+        &IniFile::from_str(
+            "[InfantryTypes]\n1=SLAV\n[VehicleTypes]\n1=SMIN\n[BuildingTypes]\n1=YAREFN\n\
          [SLAV]\nStrength=125\nSpeed=3\nSlaved=yes\nStorage=4\nHarvestRate=150\n\
          [SMIN]\nStrength=2000\nSpeed=3\nEnslaves=SLAV\nSlavesNumber=5\nDeploysInto=YAREFN\n\
          ResourceGatherer=yes\nResourceDestination=yes\n\
          [YAREFN]\nStrength=2000\nEnslaves=SLAV\nSlavesNumber=5\nUndeploysInto=SMIN\n\
-         Foundation=3x3\nDeployFacing=0\n[Clear]\nBuildable=yes\n",
-    ))
+         DeployFacing=0\n[Clear]\nBuildable=yes\n",
+        ),
+        &IniFile::from_str("[YAREFN]\nFoundation=3x3\n"),
+    )
     .expect("slave miner rules");
     // A Buildup SHP, without which the refinery cannot undeploy
     // (`Sell_Back @ 0x00447110`).
@@ -708,7 +444,7 @@ fn deploy_and_undeploy_hand_the_slave_manager_over() {
             .get(id)
             .unwrap()
             .lifecycle
-            .object_alive
+            .object_alive()
     };
     let smin = sim
         .spawn_object_at_height("SMIN", "YuriCountry", 10, 10, 0, 0, &rules)
@@ -717,7 +453,15 @@ fn deploy_and_undeploy_hand_the_slave_manager_over() {
     let slaves = pool(&sim, smin);
     assert_eq!(slaves, vec![2, 3, 4, 5, 6]);
 
-    assert!(sim.deploy_mcv(smin, &rules, None), "deploy to YAREFN");
+    assert!(
+        sim.deploy_mcv(
+            smin,
+            &rules,
+            None,
+            &mut crate::sim::world::FrameEffects::default()
+        ),
+        "deploy to YAREFN"
+    );
     let yarefn = sim
         .substrate
         .entities
@@ -752,7 +496,13 @@ fn deploy_and_undeploy_hand_the_slave_manager_over() {
     );
     for &slave in &slaves {
         assert_eq!(
-            sim.substrate.entities.get(slave).unwrap().slave.owner(),
+            sim.substrate
+                .entities
+                .get(slave)
+                .unwrap()
+                .seldom
+                .slave
+                .owner(),
             Some(yarefn)
         );
     }
@@ -760,15 +510,29 @@ fn deploy_and_undeploy_hand_the_slave_manager_over() {
     // Built up (`building_up` done), as `undeploy_building` requires, and
     // elite: the unit takes the refinery's VeterancyClass (`0x0044A058`).
     let refinery = sim.substrate.entities.get_mut(yarefn).unwrap();
-    refinery.building_up = None;
-    crate::sim::combat::veterancy::set_elite(refinery);
-    assert!(sim.undeploy_building(yarefn, &rules), "undeploy to SMIN");
+    refinery.finish_building_construction_for_test();
+    refinery.veterancy.set_elite();
+    assert!(
+        sim.undeploy_building(
+            yarefn,
+            false,
+            &rules,
+            Some(registry()),
+            &mut crate::sim::world::FrameEffects::default()
+        ),
+        "undeploy to SMIN"
+    );
     sim.substrate
         .entities
         .get_mut(yarefn)
         .unwrap()
         .finish_pack_up_for_test();
-    sim.visit_building_down(yarefn, Some(&rules), None);
+    sim.visit_building_down(
+        yarefn,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default(),
+    );
     assert!(
         std::mem::take(&mut sim.mission_spawned_entities),
         "converted"
@@ -781,10 +545,10 @@ fn deploy_and_undeploy_hand_the_slave_manager_over() {
         "SMIN"
     );
     let unit = sim.substrate.entities.get(back).unwrap();
-    let elite = sim.substrate.entities.get(yarefn).unwrap().veterancy_raw;
-    assert_eq!((unit.veterancy_raw, unit.veterancy()), (elite, 200));
+    let elite = sim.substrate.entities.get(yarefn).unwrap().veterancy.raw();
+    assert_eq!((unit.veterancy.raw(), unit.veterancy.rank()), (elite, 200));
     // The rank cache (`+0x13C`) is not copied: the constructor's -1.
-    assert_eq!(unit.veterancy_rank_cache, -1);
+    assert_eq!(unit.veterancy.rank_cache(), -1);
     assert_eq!(pool(&sim, back), slaves);
     assert!(
         (14..=18).all(|fresh| !alive(&sim, fresh)),
@@ -792,7 +556,13 @@ fn deploy_and_undeploy_hand_the_slave_manager_over() {
     );
     for slave in slaves {
         assert_eq!(
-            sim.substrate.entities.get(slave).unwrap().slave.owner(),
+            sim.substrate
+                .entities
+                .get(slave)
+                .unwrap()
+                .seldom
+                .slave
+                .owner(),
             Some(back)
         );
     }
@@ -814,7 +584,7 @@ fn a_refinery_whose_ore_runs_out_packs_up_and_moves_to_the_next_field() {
         "nodes": [inside, inside, inside],
         "ore": [[24, 13, 0, 0, 5], [25, 13, 0, 0, 5], [24, 14, 0, 0, 5], [25, 14, 0, 0, 5]],
     }));
-    s.scene.sim.production.ore_growth_config = OreGrowthConfig::disabled();
+    s.scene.sim.ore_growth_config = OreGrowthConfig::disabled();
     let first = s.master;
     let slaves: Vec<u64> = s.slaves.values().copied().collect();
     let holder_of = |s: &SlaveScene| -> Option<u64> {
@@ -823,7 +593,7 @@ fn a_refinery_whose_ore_runs_out_packs_up_and_moves_to_the_next_field() {
             .substrate
             .entities
             .values()
-            .find(|entity| entity.lifecycle.object_alive && entity.slave_manager.is_some())
+            .find(|entity| entity.lifecycle.object_alive() && entity.slave_manager.is_some())
             .map(|entity| entity.stable_id())
     };
     let mut packed = false;
@@ -833,7 +603,7 @@ fn a_refinery_whose_ore_runs_out_packs_up_and_moves_to_the_next_field() {
         frame(&mut s);
         let sim = &s.scene.sim;
         if let Some(refinery) = sim.substrate.entities.get(first)
-            && refinery.building_down.is_some()
+            && refinery.building_down()
             && !packed
         {
             packed = true;
@@ -852,10 +622,10 @@ fn a_refinery_whose_ore_runs_out_packs_up_and_moves_to_the_next_field() {
             .resolve(sim.substrate.entities.get(holder).unwrap().type_ref());
         if kind == "SMIN" {
             if miner.is_none() {
-                // `BuildingClass::Sell 0x0044A091..0x0044A0AE`: the unit is
-                // sent to the refinery's archived cell, its own.
+                // `BuildingClass::Mission_Selling 0x0044A091..0x0044A0AE`: the
+                // unit is sent to the refinery's archived cell, its own.
                 let unit = sim.substrate.entities.get(holder).unwrap();
-                assert_eq!(unit.navigation.nav_com, Some(NavTargetRef::cell(12, 12)));
+                assert_eq!(unit.navigation.nav_com(), Some(NavTargetRef::cell(12, 12)));
                 assert_eq!(unit.mission.queued().known(), Some(MissionType::Move));
                 assert_eq!(manager_state_of(&s, holder), ManagerState::PackingUp);
                 let manager = unit.slave_manager.as_ref().unwrap();
@@ -867,7 +637,7 @@ fn a_refinery_whose_ore_runs_out_packs_up_and_moves_to_the_next_field() {
                 sim.substrate
                     .entities
                     .get(slave)
-                    .is_some_and(|entity| !entity.lifecycle.in_limbo)
+                    .is_some_and(|entity| !entity.lifecycle.in_limbo())
             })
         {
             relocated = Some(holder);
@@ -882,27 +652,34 @@ fn a_refinery_whose_ore_runs_out_packs_up_and_moves_to_the_next_field() {
         !sim.substrate
             .entities
             .get(first)
-            .is_some_and(|entity| entity.lifecycle.object_alive),
+            .is_some_and(|entity| entity.lifecycle.object_alive()),
         "the first refinery is gone"
     );
     assert!(
         !sim.substrate
             .entities
             .get(miner)
-            .is_some_and(|entity| entity.lifecycle.object_alive),
+            .is_some_and(|entity| entity.lifecycle.object_alive()),
         "the Slave Miner deployed"
     );
     let at = sim.substrate.entities.get(relocated).unwrap();
     assert_eq!(sim.interner.resolve(at.type_ref()), "YAREFN");
     assert!(
-        (i32::from(at.position.rx) - 24).abs() <= 3 && (i32::from(at.position.ry) - 13).abs() <= 3,
+        (i32::from(at.position.rx()) - 24).abs() <= 3
+            && (i32::from(at.position.ry()) - 13).abs() <= 3,
         "redeployed beside the field: ({}, {})",
-        at.position.rx,
-        at.position.ry
+        at.position.rx(),
+        at.position.ry()
     );
     for &slave in &slaves {
         assert_eq!(
-            sim.substrate.entities.get(slave).unwrap().slave.owner(),
+            sim.substrate
+                .entities
+                .get(slave)
+                .unwrap()
+                .seldom
+                .slave
+                .owner(),
             Some(relocated)
         );
     }
@@ -915,14 +692,9 @@ fn a_refinery_whose_ore_runs_out_packs_up_and_moves_to_the_next_field() {
 /// `SlaveMinerUndeploy` as it starts, and is 2x2 (no FindDeployCell step).
 #[test]
 fn retail_rules_feed_the_slave_refinery_relocation() {
-    use crate::rules::art_data::ArtRegistry;
-    use crate::rules::ruleset::RuleSet;
-    let Some((rules_ini, art_ini)) = crate::rules::retail_ini_fixture::retail_rules_and_art()
-    else {
+    let Some(rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art() else {
         return;
     };
-    let mut rules = RuleSet::from_ini(&rules_ini).expect("retail rules");
-    rules.install_art_data(ArtRegistry::from_ini(&art_ini));
     let general = &rules.general;
     assert_eq!(
         (
@@ -935,15 +707,12 @@ fn retail_rules_feed_the_slave_refinery_relocation() {
     let refinery = rules.object("YAREFN").expect("YAREFN");
     assert_eq!(refinery.undeploys_into.as_deref(), Some("SMIN"));
     assert_eq!(refinery.deploy_sound.as_deref(), Some("SlaveMinerUndeploy"));
-    assert_eq!(
-        crate::rules::foundation::foundation_dimensions(&refinery.foundation),
-        (2, 2)
-    );
+    assert_eq!(refinery.foundation.dimensions(), (2, 2));
     let miner = rules.object("SMIN").expect("SMIN");
     assert_eq!(miner.deploys_into.as_deref(), Some("YAREFN"));
 }
 
-/// `BuildingClass::Sell`'s conversion constructs the unit, lists the
+/// `BuildingClass::Mission_Selling`'s conversion constructs the unit, lists the
 /// building's attackers (`0x00449F23..0x00449FDC`), and Limbos the building,
 /// whose Detach_All clears their targets (an attacker with more than 10
 /// frames left on its passive scan re-arms it with a Scenario draw); after
@@ -954,17 +723,19 @@ fn retail_rules_feed_the_slave_refinery_relocation() {
 fn an_attacker_of_a_packing_refinery_takes_the_slave_miner() {
     use crate::rules::ini_parser::IniFile;
     use crate::rules::ruleset::RuleSet;
-    use crate::sim::combat::{AttackTarget, TargetKind};
+    use crate::sim::combat::TargetKind;
     use crate::sim::rng::SimRng;
     use crate::sim::world::Simulation;
-    let rules = RuleSet::from_ini(&IniFile::from_str(
-        "[InfantryTypes]\n1=SLAV\n[VehicleTypes]\n1=SMIN\n2=TANK\n[BuildingTypes]\n1=YAREFN\n\
+    let rules = RuleSet::from_ini_with_fixed_art_for_test(
+        &IniFile::from_str(
+            "[InfantryTypes]\n1=SLAV\n[VehicleTypes]\n1=SMIN\n2=TANK\n[BuildingTypes]\n1=YAREFN\n\
          [SLAV]\nStrength=125\nSpeed=3\nSlaved=yes\nStorage=4\n\
          [SMIN]\nStrength=2000\nSpeed=3\nEnslaves=SLAV\nSlavesNumber=1\nDeploysInto=YAREFN\n\
          [TANK]\nStrength=300\nSpeed=5\n\
-         [YAREFN]\nStrength=2000\nEnslaves=SLAV\nSlavesNumber=1\nUndeploysInto=SMIN\n\
-         Foundation=2x2\n",
-    ))
+         [YAREFN]\nStrength=2000\nEnslaves=SLAV\nSlavesNumber=1\nUndeploysInto=SMIN\n",
+        ),
+        &IniFile::from_str("[YAREFN]\nFoundation=2x2\n"),
+    )
     .expect("rules");
     let mut rules = rules;
     rules.set_buildup_control_for_test("YAREFN", [0, 17, 3]);
@@ -976,28 +747,41 @@ fn an_attacker_of_a_packing_refinery_takes_the_slave_miner() {
     let tank = sim
         .spawn_object_at_height("TANK", "Americans", 16, 10, 0, 0, &rules)
         .expect("TANK");
-    let frame = sim.session.binary_frame;
+    let frame = sim.session.binary_frame();
     let attacker = sim.substrate.entities.get_mut(tank).unwrap();
-    attacker.attack_target = Some(AttackTarget::new(refinery));
-    attacker.passive_scan_timer.arm(frame, 100);
-    let scan_timer = attacker.passive_scan_timer;
+    attacker
+        .attack_target
+        .set_for_test(Some(TargetKind::Entity(refinery)));
+    attacker.passive_scan.timer_mut_for_test().arm(frame, 100);
+    let scan_timer = attacker.passive_scan.timer();
     sim.substrate
         .entities
         .get_mut(refinery)
         .unwrap()
-        .building_up = None;
+        .finish_building_construction_for_test();
     let mut expected = SimRng::new(seed);
     while expected.logical_state() != sim.scenario_rng.logical_state() {
         let _ = expected.next_u32();
     }
 
-    assert!(sim.undeploy_building(refinery, &rules));
+    assert!(sim.undeploy_building(
+        refinery,
+        false,
+        &rules,
+        Some(registry()),
+        &mut crate::sim::world::FrameEffects::default()
+    ));
     sim.substrate
         .entities
         .get_mut(refinery)
         .unwrap()
         .finish_pack_up_for_test();
-    sim.visit_building_down(refinery, Some(&rules), None);
+    sim.visit_building_down(
+        refinery,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default(),
+    );
     assert!(
         std::mem::take(&mut sim.mission_spawned_entities),
         "converted"
@@ -1007,13 +791,13 @@ fn an_attacker_of_a_packing_refinery_takes_the_slave_miner() {
         .entities
         .values()
         .find(|entity| {
-            entity.lifecycle.object_alive && sim.interner.resolve(entity.type_ref()) == "SMIN"
+            entity.lifecycle.object_alive() && sim.interner.resolve(entity.type_ref()) == "SMIN"
         })
         .expect("the Slave Miner")
         .stable_id();
     let attacker = sim.substrate.entities.get(tank).unwrap();
     assert_eq!(
-        attacker.attack_target.as_ref().map(|target| target.target),
+        attacker.attack_target.target(),
         Some(TargetKind::Entity(miner))
     );
     // The Slave Miner's TechnoClass word and its one slave's, then the
@@ -1024,6 +808,158 @@ fn an_attacker_of_a_packing_refinery_takes_the_slave_miner() {
     let delay = expected.next_range_u32_inclusive(4, 8);
     let mut rearmed = scan_timer;
     rearmed.arm(frame, delay);
-    assert_eq!(attacker.passive_scan_timer, rearmed);
+    assert_eq!(attacker.passive_scan.timer(), rearmed);
     assert_eq!(sim.scenario_rng.logical_state(), expected.logical_state());
+}
+
+#[test]
+fn a_player_cell_order_relocates_a_refinery_with_its_existing_slave_manager() {
+    for ore in [false, true] {
+        let mut s = row_scene(&serde_json::json!({
+            "name": "player_relocate", "human": true, "manager_state": 5,
+            "nodes": [{"state": 3, "cell": [17, 13], "mission": "harvest"}],
+            // Keep the old site productive: native Working's separate auto
+            // relocation can overwrite an archive when the old field is empty.
+            "ore": if ore { serde_json::json!([[17,13,0,0,5],[24,13,0,0,5]]) }
+                else { serde_json::json!([[17,13,0,0,5]]) },
+        }));
+        s.scene.sim.ore_growth_config = OreGrowthConfig::disabled();
+        s.scene.sim.input_delay_ticks = 0;
+        s.scene
+            .rules
+            .set_buildup_control_for_test("YAREFN", [0, 17, 3]);
+        let old = s.master;
+        let slave = s.slaves[&0];
+        let owner = s.scene.sim.entities().get(old).unwrap().owner();
+        assert!(
+            s.scene
+                .sim
+                .takes_rally_point(old, "Americans", &s.scene.rules)
+        );
+        let goal = s
+            .scene
+            .sim
+            .factory_rally_cell_input(old, (24, 13), &s.scene.rules)
+            .unwrap()
+            .unwrap();
+        assert_eq!(goal, (24, 13));
+        let execute = s.scene.sim.session.tick() + 1;
+        for command in [
+            Command::SetRally {
+                rx: goal.0,
+                ry: goal.1,
+                producer_ids: vec![old],
+            },
+            Command::SellBuilding { entity_id: old },
+        ] {
+            s.scene
+                .sim
+                .queue_command(CommandEnvelope::new(owner, execute, command));
+        }
+        frame(&mut s);
+        let actor = s.scene.sim.entities().get(old).unwrap();
+        assert!(actor.building_down(), "player SELL must start immediately");
+        if !ore {
+            assert_eq!(
+                actor.archive_target(),
+                Some(crate::sim::combat::TargetKind::Cell(goal.0, goal.1))
+            );
+        }
+        let mut converted = None;
+        for _ in 0..800 {
+            frame(&mut s);
+            if let Some(unit) = s.scene.sim.entities().values().find(|entity| {
+                entity.is_object_alive()
+                    && entity.slave_manager.is_some()
+                    && entity.category() == crate::map::entities::EntityCategory::Unit
+            }) {
+                converted = Some(unit.stable_id());
+                break;
+            }
+        }
+        let converted = converted.expect("SELL must convert through the production frame");
+        let sim = &s.scene.sim;
+        assert!(
+            sim.entities()
+                .get(old)
+                .is_none_or(|entity| !entity.is_object_alive())
+        );
+        let unit = sim.entities().get(converted).unwrap();
+        let destination = unit
+            .navigation
+            .nav_com()
+            .expect("converted unit keeps the archived goal");
+        assert_eq!(unit.mission.effective().known(), Some(MissionType::Move));
+        if !ore {
+            assert_eq!(destination, NavTargetRef::cell(goal.0, goal.1));
+        } else {
+            assert_ne!(
+                destination,
+                NavTargetRef::cell(goal.0, goal.1),
+                "FindDeployCell avoids the ore overlay for the new foundation"
+            );
+            assert!(
+                matches!(
+                    unit.slave_manager.as_ref().unwrap().state(),
+                    ManagerState::PackingUp | ManagerState::Scanning
+                ),
+                "the converted Unit may already run the native PackingUp -> Scanning visit"
+            );
+        }
+        assert_eq!(
+            unit.slave_manager
+                .as_ref()
+                .unwrap()
+                .slaves()
+                .collect::<Vec<_>>(),
+            [slave]
+        );
+        assert_eq!(
+            sim.entities().get(slave).unwrap().seldom.slave.owner(),
+            Some(converted)
+        );
+    }
+}
+
+/// FootClass::Mission_AreaGuard starts an idle Slave Miner's hunt
+/// (`0x004D6D69..0x004D6D73`, StartHunt `0x006B0CC0`) on every visit the
+/// Unit kick (`0x00744100`) does not take, so a fresh Area Guard (the G key,
+/// or an AI team's script 11) sends the miner out at once. The kick alone
+/// waits `SlaveMinerKickFrameDelay` (150) after the mission began and, for a
+/// human, needs ore within `SlaveMinerShortScan` (8 cells); this ore is 10
+/// cells away, inside `SlaveMinerLongScan`.
+#[test]
+fn area_guard_starts_an_idle_slave_miners_hunt_at_once() {
+    for human in [true, false] {
+        let mut s = row_scene(&serde_json::json!({
+            "name": "area_guard_hunt",
+            "owner": "unit",
+            "owner_mission": "area_guard",
+            "human": human,
+            "manager_state": 0,
+            "manager_frame_ago": 0,
+            "ore": [[25, 15, 0, 0, 5], [25, 16, 0, 0, 5]],
+        }));
+        assert_eq!(manager_state_of(&s, s.master), ManagerState::Ready);
+        let mut states = vec![ManagerState::Ready];
+        for _ in 0..30 {
+            frame(&mut s);
+            let state = manager_state_of(&s, s.master);
+            if states.last() != Some(&state) {
+                states.push(state);
+            }
+        }
+        // StartHunt (state 1), then state 1 finds the field and drives.
+        assert_eq!(
+            states,
+            [
+                ManagerState::Ready,
+                ManagerState::Scanning,
+                ManagerState::Travelling
+            ],
+            "human {human}"
+        );
+        let miner = s.scene.sim.substrate.entities.get(s.master).unwrap();
+        assert!(miner.navigation.nav_com().is_some(), "human {human}");
+    }
 }

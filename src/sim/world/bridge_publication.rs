@@ -8,10 +8,10 @@
 
 use super::*;
 use crate::map::cell_index::NativeCellIdentity as Cell;
-use crate::map::resolved_terrain::DynamicTerrainCellState;
 use crate::sim::bridge_state::Phase;
 use crate::sim::bridge_state::publication::{self, BridgePublicationHost, CellCoord};
 use crate::sim::bridge_state::ramp_repair::Family;
+use crate::sim::world::FrameEffects;
 
 #[path = "bridge_rim_publication.rs"]
 mod rim_publication;
@@ -37,10 +37,15 @@ mod ordinary_publication;
 pub(crate) use ordinary_publication::{damage_ordinary, repair_from_engineer};
 
 #[cfg(test)]
+pub(in crate::sim::world) use ordinary_publication::tests::{
+    ready_engineer, ready_repair_fixture, repair_frame,
+};
+
+#[cfg(all(test, tests_sim_world_a_b))]
 #[path = "bridge_pavement_publication_tests.rs"]
 mod pavement_tests;
 
-#[cfg(test)]
+#[cfg(test)] // shared by test groups
 #[path = "bridge_publication_tests.rs"]
 mod tests;
 
@@ -65,9 +70,9 @@ impl BodyResult {
 pub(super) fn run_state_machine(
     sim: &mut Simulation,
     rules: &RuleSet,
-    registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
     input: CellCoord,
     family: Family,
+    frame_effects: &mut FrameEffects<'_>,
 ) -> BodyResult {
     let terrain = sim
         .resolved_terrain
@@ -78,8 +83,8 @@ pub(super) fn run_state_machine(
         let mut host = LivePublication {
             sim,
             rules,
-            registry,
             collapsed: false,
+            frame_effects: frame_effects.reborrow(),
         };
         let returned = publication::advance_bridgehead(&mut host, input, family);
         return BodyResult {
@@ -95,10 +100,7 @@ pub(super) fn run_state_machine(
             None => return BodyResult::no_change(),
         }
     };
-    let overlay = match anchor {
-        Cell::Real(index) => terrain.cells()[index].bridge_facts.overlay_id,
-        Cell::Dummy => terrain.shared_cell_dummy().overlay_fields().0,
-    };
+    let overlay = sim.cell_overlay(anchor).overlay_id;
     // Residual: ApplyDamageToCell 0x00587180 also admits a state machine by
     // a middle tile, and neither driver tests the anchor overlay before its
     // +11E switch. This gate keeps the pre-existing concrete behavior for
@@ -114,8 +116,8 @@ pub(super) fn run_state_machine(
     let mut host = LivePublication {
         sim,
         rules,
-        registry,
         collapsed: false,
+        frame_effects: frame_effects.reborrow(),
     };
     let returned = publication::advance_body_at_anchor(&mut host, input, anchor, family);
     BodyResult {
@@ -130,15 +132,15 @@ pub(super) fn run_state_machine(
 pub(super) fn update_adjacent_bridges(
     sim: &mut Simulation,
     rules: &RuleSet,
-    registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
     input: CellCoord,
     family: Family,
+    frame_effects: &mut FrameEffects<'_>,
 ) -> bool {
     let mut host = LivePublication {
         sim,
         rules,
-        registry,
         collapsed: false,
+        frame_effects: frame_effects.reborrow(),
     };
     rim_publication::update(&mut host, input, family);
     host.collapsed
@@ -147,8 +149,8 @@ pub(super) fn update_adjacent_bridges(
 struct LivePublication<'a> {
     sim: &'a mut Simulation,
     rules: &'a RuleSet,
-    registry: Option<&'a crate::map::overlay_types::OverlayTypeRegistry>,
     collapsed: bool,
+    frame_effects: FrameEffects<'a>,
 }
 
 impl LivePublication<'_> {
@@ -179,13 +181,10 @@ impl LivePublication<'_> {
                 terrain.capture_real_cell_bridge_flags_0x1180();
         }
         let resolved = &terrain.cells()[index];
-        let coord = (resolved.rx, resolved.ry);
         self.sim
             .real_cell_bridge_flags_0x1180
             .set_allocated_cell(index, resolved.bridge_facts.raw_flags);
-        self.sim
-            .dynamic_terrain_cells
-            .insert(coord, DynamicTerrainCellState::capture(resolved));
+        self.sim.dynamic_terrain_cells.record(resolved);
     }
 }
 
@@ -202,7 +201,7 @@ impl BridgePublicationHost for LivePublication<'_> {
         self.terrain().native_cell_flags(cell)
     }
     fn state(&self, cell: Cell) -> u8 {
-        self.terrain().native_cell_state(cell)
+        self.sim.cell_overlay(cell).overlay_data
     }
     fn write_flags(&mut self, cell: Cell, flags: u32) {
         self.sim
@@ -213,19 +212,16 @@ impl BridgePublicationHost for LivePublication<'_> {
         self.retain_real_write(cell);
     }
     fn write_state(&mut self, cell: Cell, state: u8) {
-        if let Some((x, y)) = self.real_coord(cell)
-            && let (Some(grid), Some(terrain)) = (
-                self.sim.overlay_grid.as_mut(),
-                self.sim.resolved_terrain.as_mut(),
-            )
-        {
-            grid.write_literal_bridge_state(terrain, x, y, state);
-        } else {
-            self.sim
-                .resolved_terrain
-                .as_mut()
-                .unwrap()
-                .write_native_cell_state(cell, state);
+        match self.real_coord(cell) {
+            Some((x, y)) => {
+                if let Some(grid) = self.sim.overlay_grid.as_mut() {
+                    grid.write_literal_bridge_state(x, y, state);
+                }
+            }
+            None => self
+                .terrain()
+                .shared_cell_dummy()
+                .write_overlay_state(state),
         }
         self.retain_real_write(cell);
     }
@@ -238,27 +234,41 @@ impl BridgePublicationHost for LivePublication<'_> {
         self.retain_real_write(cell);
     }
     fn clear_overlay(&mut self, cell: Cell) {
-        self.sim
-            .resolved_terrain
-            .as_mut()
-            .unwrap()
-            .clear_native_cell_overlay(cell);
-        if let Some((x, y)) = self.real_coord(cell) {
-            if let Some(grid) = self.sim.overlay_grid.as_mut() {
-                grid.clear_literal_bridge_identity(x, y);
+        match self.real_coord(cell) {
+            Some((x, y)) => {
+                if let Some(grid) = self.sim.overlay_grid.as_mut() {
+                    grid.clear_literal_overlay_identity(x, y);
+                }
             }
+            None => self
+                .terrain()
+                .shared_cell_dummy()
+                .write_overlay_identity(-1),
         }
         self.retain_real_write(cell);
     }
-    fn fallout(&mut self, cell: Cell) {
+    fn corrected_deck_at(&self, (x, y): CellCoord) -> Option<i16> {
+        let terrain = self.terrain();
+        let index = terrain.native_fixed_cell_index(x, y)?;
+        terrain.corrected_high_bridge_deck_at(Cell::Real(index))
+    }
+    fn fallout(&mut self, cell: Cell, corrected_deck_level: Option<i16>) {
         self.collapsed = true;
-        let (x, y) = self.coord(cell);
-        blow_up_bridge_cell_fallout(self.sim, self.rules, x as u16, y as u16, self.registry);
+        let point = self.coord(cell);
+        publish_bridge_cell_fallout(
+            self.sim,
+            self.rules,
+            PendingBridgeCell {
+                point,
+                corrected_deck_level,
+            },
+            Some(self.rules.overlay_registry()),
+            &mut self.frame_effects,
+        );
     }
     fn radar(&mut self, cell: Cell) {
         let (x, y) = self.coord(cell);
-        self.sim
-            .mark_radar_terrain_dirty_cells([(x as u16, y as u16)]);
+        self.sim.dirty_cells.mark_radar([(x as u16, y as u16)]);
     }
     fn perpendicular(
         &mut self,
@@ -307,7 +317,11 @@ impl BridgePublicationHost for LivePublication<'_> {
         rim_publication::update(self, coord, family);
     }
     fn zones(&mut self, query: CellCoord) {
-        let _ = invalidate_bridge_zones(self.sim, query);
+        let _ = invalidate_bridge_zones(
+            &self.sim.resolved_terrain,
+            &mut self.sim.bridge_state,
+            query,
+        );
         publish_bridge_navigation(self.sim, self.rules);
     }
     fn tile(&self, cell: Cell) -> i32 {

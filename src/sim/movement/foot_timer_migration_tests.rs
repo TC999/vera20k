@@ -2,23 +2,22 @@
 //! path_delay_rules and track_blocked_timers corpora, not full fresh movement.
 //! In particular Ship's current fresh admission adapter does not prove code2.
 
-use super::locomotor::{LocomotorState, MovementLayer};
-use super::{DestinationTiming, MovementConfig, issue_direct_move, issue_move_command};
+use super::DestinationTiming;
+use super::locomotor::LocomotorState;
 use crate::map::entities::EntityCategory;
 use crate::rules::ini_parser::IniFile;
 use crate::rules::locomotor_type::LocomotorKind;
 use crate::rules::ruleset::RuleSet;
-use crate::sim::components::{
-    DriveCoord, DriveLocomotionRuntime, FootPathQueue, Health, MovementTarget,
-    ShipLocomotionRuntime,
-};
+use crate::sim::combat::Health;
+use crate::sim::components::{DriveCoord, FootPathQueue};
 use crate::sim::game_entity::GameEntity;
+use crate::sim::movement::{DriveLocomotionRuntime, ShipLocomotionRuntime};
 use crate::sim::occupancy::OccupancyGrid;
 use crate::sim::pathfinding::PathGrid;
 use crate::sim::snapshot::GameSnapshot;
 use crate::sim::timer::CdTimer;
 use crate::sim::world::Simulation;
-use crate::util::fixed_math::{SIM_ZERO, SimFixed};
+use crate::util::fixed_math::SimFixed;
 use serde_json::Value;
 
 fn rules(path_delay: &str, blockage: &str, walk: bool) -> RuleSet {
@@ -46,7 +45,7 @@ fn fixture(kind: LocomotorKind) -> Simulation {
         0,
         0,
         owner,
-        Health { current: 100 },
+        Health::new(100),
         type_ref,
         if kind == LocomotorKind::Walk {
             EntityCategory::Infantry
@@ -57,16 +56,28 @@ fn fixture(kind: LocomotorKind) -> Simulation {
         5,
         false,
     );
-    entity.position.sub_x = SimFixed::from_num(128);
-    entity.position.sub_y = SimFixed::from_num(128);
-    entity.lifecycle.object_alive = true;
-    entity.lifecycle.in_limbo = false;
-    entity.lifecycle.cell_marked = true;
+    entity.position.set_sub_x_for_test(SimFixed::from_num(128));
+    entity.position.set_sub_y_for_test(SimFixed::from_num(128));
+    entity.lifecycle.set_object_alive_for_test(true);
+    entity.lifecycle.set_in_limbo_for_test(false);
+    entity.lifecycle.set_cell_marked_for_test(true);
     entity.locomotor = Some(LocomotorState::for_test_kind(kind));
-    entity.drive_accelerates = false;
+    entity.mover_facts.set_drive_accelerates_for_test(false);
     match kind {
-        LocomotorKind::Drive => entity.drive_locomotion = Some(DriveLocomotionRuntime::default()),
-        LocomotorKind::Ship => entity.ship_locomotion = Some(ShipLocomotionRuntime::default()),
+        LocomotorKind::Drive => assert!(
+            entity
+                .locomotor
+                .as_mut()
+                .unwrap()
+                .install_drive_state_for_test(Some(DriveLocomotionRuntime::default()))
+        ),
+        LocomotorKind::Ship => assert!(
+            entity
+                .locomotor
+                .as_mut()
+                .unwrap()
+                .install_ship_state_for_test(Some(ShipLocomotionRuntime::default()))
+        ),
         LocomotorKind::Walk => {}
         _ => unreachable!(),
     }
@@ -76,8 +87,12 @@ fn fixture(kind: LocomotorKind) -> Simulation {
 }
 
 fn timer_pair(entity: &GameEntity) -> (CdTimer, CdTimer, u32) {
-    let path = &entity.navigation.path_runtime;
-    (path.movement_timer, path.blocked_timer, path.retries_left)
+    let path = entity.navigation.path_runtime();
+    (
+        path.movement_timer(),
+        path.blocked_timer(),
+        path.retries_left(),
+    )
 }
 
 fn json_i32(value: &Value) -> i32 {
@@ -86,12 +101,11 @@ fn json_i32(value: &Value) -> i32 {
 
 #[test]
 fn accepted_direct_and_regular_orders_keep_signed_rules_delays_and_retry_word() {
-    let native: Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/path_delay_rules.json"
+    let native: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/path_delay_rules.json",
     ))
     .unwrap();
     let rows = native["blockage_path_delay"].as_array().unwrap();
-    let grid = PathGrid::new(20, 20);
     for raw in ["0", "-1", "65536", "2147483648", "4294967295"] {
         let expected = rows
             .iter()
@@ -105,36 +119,27 @@ fn accepted_direct_and_regular_orders_keep_signed_rules_delays_and_retry_word() 
         ] {
             let rules = rules("0.01", raw, kind == LocomotorKind::Walk);
             for frame in [123, u32::MAX, i32::MAX as u32] {
-                for command in 0..3 {
+                for command in 0..2 {
                     let mut sim = fixture(kind);
                     let entity = sim.substrate.entities.get_mut(1).unwrap();
-                    let path_runtime = &mut entity.navigation.path_runtime;
-                    path_runtime.movement_timer = CdTimer::from_raw(17, -9);
-                    path_runtime.blocked_timer = CdTimer::from_raw(19, 42);
-                    path_runtime.path_blocked = true;
-                    path_runtime.retries_left = u32::MAX;
-                    let timing = DestinationTiming::from_rules(frame, Some(&rules));
+                    let path_runtime = entity.navigation.path_runtime_mut();
+                    path_runtime.set_movement_timer_for_test(CdTimer::from_raw(17, -9));
+                    path_runtime.set_blocked_timer_for_test(CdTimer::from_raw(19, 42));
+                    path_runtime.set_path_blocked_for_test(true);
+                    path_runtime.set_retries_left_for_test(u32::MAX);
+                    let timing = DestinationTiming::from_rules(frame, &rules);
                     match command {
                         0 => timing.accept(sim.substrate.entities.get_mut(1).unwrap()),
-                        1 => assert!(issue_direct_move(
-                            &mut sim.substrate.entities,
-                            1,
-                            (10, 8),
-                            SimFixed::from_num(165),
-                            timing,
-                        )),
-                        2 => assert!(issue_move_command(
-                            &mut sim.substrate.entities,
-                            &grid,
-                            1,
-                            (10, 8),
-                            SimFixed::from_num(165),
-                            false,
-                            None,
-                            None,
-                            None,
-                            timing,
-                        )),
+                        1 => {
+                            sim.session.set_binary_frame_for_test(frame);
+                            sim.assign_destination_represented(
+                                1,
+                                Some(crate::sim::components::NavTargetRef::cell(10, 8)),
+                                &rules,
+                                &mut crate::sim::world::FrameEffects::default(),
+                            )
+                            .unwrap();
+                        }
                         _ => unreachable!(),
                     }
                     let entity = sim.substrate.entities.get(1).unwrap();
@@ -147,7 +152,7 @@ fn accepted_direct_and_regular_orders_keep_signed_rules_delays_and_retry_word() 
                         ),
                         "{kind:?} command={command} frame={frame} BlockagePathDelay={raw}"
                     );
-                    assert!(!entity.navigation.path_runtime.path_blocked);
+                    assert!(!entity.navigation.path_runtime().path_blocked());
                 }
             }
         }
@@ -156,26 +161,15 @@ fn accepted_direct_and_regular_orders_keep_signed_rules_delays_and_retry_word() 
 
 fn install_stationary_path_request(sim: &mut Simulation) {
     let entity = sim.substrate.entities.get_mut(1).unwrap();
-    entity.navigation.path_replay = FootPathQueue {
-        directions: vec![0, 0],
-        cursor: 0,
-        reference_cell: Some((8, 8)),
-    };
-    entity.movement_target = Some(MovementTarget {
-        path: vec![(8, 8), (8, 7), (8, 6)],
-        path_layers: vec![MovementLayer::Ground; 3],
-        next_index: 1,
-        final_goal: Some((8, 6)),
-        speed: SIM_ZERO,
-        current_speed: SIM_ZERO,
-        ..Default::default()
-    });
+    entity
+        .navigation
+        .set_path_replay_for_test(FootPathQueue::for_test(vec![0, 0], 0, Some((8, 8))));
 }
 
 #[test]
 fn ordinary_drive_and_ship_process_do_not_age_native_waiting_timer_fields() {
-    let native: Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/track_blocked_timers.json"
+    let native: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/track_blocked_timers.json",
     ))
     .unwrap();
     let rules = rules("0.01", "65536", false);
@@ -216,14 +210,14 @@ fn ordinary_drive_and_ship_process_do_not_age_native_waiting_timer_fields() {
                 json_i32(&call["after"]["blocked_timer"][2]),
             );
             let entity = sim.substrate.entities.get_mut(1).unwrap();
-            let path_runtime = &mut entity.navigation.path_runtime;
-            path_runtime.movement_timer = expected_movement;
-            path_runtime.blocked_timer = expected_blocked;
-            path_runtime.path_blocked = true;
-            path_runtime.retries_left = 0x8000_0001;
+            let path_runtime = entity.navigation.path_runtime_mut();
+            path_runtime.set_movement_timer_for_test(expected_movement);
+            path_runtime.set_blocked_timer_for_test(expected_blocked);
+            path_runtime.set_path_blocked_for_test(true);
+            path_runtime.set_retries_left_for_test(0x8000_0001);
             assert!(!expected_movement.expired(frame), "native wait branch");
-            sim.session.binary_frame = frame as u32;
-            sim.session.tick = u64::from(frame as u32);
+            sim.session.set_binary_frame_for_test(frame as u32);
+            sim.session.set_tick_for_test(u64::from(frame as u32));
             // Speed0 isolates timer ownership from paid coordinates. The live
             // Process corridor still sees an ordinary path request. This does
             // not claim execution of the corpus's supplied code2 callbacks.
@@ -247,8 +241,8 @@ fn ordinary_drive_and_ship_process_do_not_age_native_waiting_timer_fields() {
 
 #[test]
 fn rules_driven_sentinel_timers_survive_snapshot_and_same_frame_process() {
-    let native: Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/path_delay_rules.json"
+    let native: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/path_delay_rules.json",
     ))
     .unwrap();
     let expected_path = native["path_delay"]
@@ -263,17 +257,19 @@ fn rules_driven_sentinel_timers_survive_snapshot_and_same_frame_process() {
     for kind in [LocomotorKind::Drive, LocomotorKind::Ship] {
         let mut sim = fixture(kind);
         install_stationary_path_request(&mut sim);
-        sim.session.binary_frame = u32::MAX;
-        sim.session.tick = u64::from(u32::MAX);
-        let timing = MovementConfig::from_rules(u32::MAX, Some(&rules));
-        assert_eq!(timing.path_delay_ticks, expected_path);
+        sim.session.set_binary_frame_for_test(u32::MAX);
+        sim.session.set_tick_for_test(u64::from(u32::MAX));
+        assert_eq!(rules.general.path_delay_ticks(), expected_path);
         let entity = sim.substrate.entities.get_mut(1).unwrap();
-        DestinationTiming::from_rules(u32::MAX, Some(&rules)).accept(entity);
+        DestinationTiming::from_rules(u32::MAX, &rules).accept(entity);
         entity
             .navigation
-            .path_runtime
-            .start_movement(u32::MAX, timing.path_delay_ticks);
-        entity.navigation.path_runtime.retries_left = 0x8000_0001;
+            .path_runtime_mut()
+            .start_movement(u32::MAX, expected_path);
+        entity
+            .navigation
+            .path_runtime_mut()
+            .set_retries_left_for_test(0x8000_0001);
         let expected = timer_pair(entity);
         assert_eq!(expected.0, CdTimer::from_raw(-1, expected_path));
         assert_eq!(expected.1, CdTimer::from_raw(-1, 65536));
@@ -285,7 +281,7 @@ fn rules_driven_sentinel_timers_survive_snapshot_and_same_frame_process() {
         assert_eq!(restored.state_hash(), sim.state_hash());
         for frame in [u32::MAX, u32::MAX, 0, 0] {
             for instance in [&mut sim, &mut restored] {
-                instance.session.binary_frame = frame;
+                instance.session.set_binary_frame_for_test(frame);
                 instance
                     .process_ground_locomotor_for_test(1, Some(&rules), Some(&grid), None)
                     .unwrap();
@@ -294,16 +290,16 @@ fn rules_driven_sentinel_timers_survive_snapshot_and_same_frame_process() {
                 assert_eq!(
                     entity
                         .navigation
-                        .path_runtime
-                        .movement_timer
+                        .path_runtime()
+                        .movement_timer()
                         .remaining(frame as i32),
                     expected_path
                 );
                 assert_eq!(
                     entity
                         .navigation
-                        .path_runtime
-                        .blocked_timer
+                        .path_runtime()
+                        .blocked_timer()
                         .remaining(frame as i32),
                     65536
                 );
@@ -318,8 +314,8 @@ fn paid_walk_progress_clears_only_blocked_latch_and_retains_timer_words() {
     let rules = rules("0.01", "65536", true);
     let grid = PathGrid::new(20, 20);
     let mut sim = fixture(LocomotorKind::Walk);
-    sim.session.binary_frame = 107;
-    sim.session.tick = 107;
+    sim.session.set_binary_frame_for_test(107);
+    sim.session.set_tick_for_test(107);
     let entity = sim.substrate.entities.get_mut(1).unwrap();
     entity.body_facing.snap(0x4000, 0);
     entity
@@ -331,25 +327,19 @@ fn paid_walk_progress_clears_only_blocked_latch_and_retains_timer_words() {
             y: 8 * 256 + 128,
             z: 0,
         }));
-    entity.movement_target = Some(MovementTarget {
-        path: vec![(8, 8), (9, 8)],
-        path_layers: vec![MovementLayer::Ground; 2],
-        next_index: 1,
-        final_goal: Some((9, 8)),
-        speed: SimFixed::from_num(165),
-        current_speed: SimFixed::from_num(165),
-        move_dir_x: SimFixed::from_num(256),
-        move_dir_y: SIM_ZERO,
-        move_dir_len: SimFixed::from_num(256),
-        ..Default::default()
-    });
     entity
         .navigation
-        .path_runtime
+        .path_runtime_mut()
         .start_blocked(101, rules.general.blockage_path_delay_ticks);
-    entity.navigation.path_runtime.path_blocked = true;
-    entity.navigation.path_runtime.retries_left = 0x8000_0001;
-    let expected_blocked = entity.navigation.path_runtime.blocked_timer;
+    entity
+        .navigation
+        .path_runtime_mut()
+        .set_path_blocked_for_test(true);
+    entity
+        .navigation
+        .path_runtime_mut()
+        .set_retries_left_for_test(0x8000_0001);
+    let expected_blocked = entity.navigation.path_runtime().blocked_timer();
     let before = super::ground_pose::position_world_xy(&entity.position);
     sim.process_ground_locomotor_for_test(1, Some(&rules), Some(&grid), None)
         .unwrap();
@@ -360,14 +350,14 @@ fn paid_walk_progress_clears_only_blocked_latch_and_retains_timer_words() {
         "paid Walk step reached"
     );
     assert_eq!(
-        (entity.position.rx, entity.position.ry),
+        (entity.position.rx(), entity.position.ry()),
         (8, 8),
         "no boundary receiver needed"
     );
-    assert!(!entity.navigation.path_runtime.path_blocked);
+    assert!(!entity.navigation.path_runtime().path_blocked());
     assert_eq!(
-        entity.navigation.path_runtime.blocked_timer,
+        entity.navigation.path_runtime().blocked_timer(),
         expected_blocked
     );
-    assert_eq!(entity.navigation.path_runtime.retries_left, 0x8000_0001);
+    assert_eq!(entity.navigation.path_runtime().retries_left(), 0x8000_0001);
 }

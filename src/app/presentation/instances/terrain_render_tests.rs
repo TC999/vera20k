@@ -1,17 +1,34 @@
-//! Native retained Terrain coordinates through Render and static DrawIt.
+//! Native retained Terrain coordinates through static and animated DrawIt.
 //! The corpus stops at the shape sink; this compares instance inputs, not pixels.
 
-use super::native_static_terrain_instances;
+use super::{native_terrain_instance, terrain_draw_frame};
+use crate::render::native_z::ZGradient;
 use crate::render::overlay_atlas::OverlaySpriteEntry;
+use crate::render::terrain_draw::TerrainPiece;
+
+/// Terrain DrawIt (0x71C1B0): a static type draws frame 1 below 2 health and
+/// frame 0 otherwise; an animated type draws its stage whatever its health.
+#[test]
+fn terrain_draw_frame_follows_health_and_stage() {
+    assert_eq!(terrain_draw_frame(None, 2), 0);
+    assert_eq!(terrain_draw_frame(None, 1), 1);
+    assert_eq!(terrain_draw_frame(Some(7), 1), 7);
+    // TerrainAI71C7DD and DrawIt71C208 retain the full Stage. A 514-frame
+    // animated spawner reaches256 before its midpoint257 resets the stage.
+    assert_eq!(terrain_draw_frame(Some(256), 1), 256);
+}
 
 #[test]
 fn terrain_retained_xyz_projection_and_piece_z_match_original_render() {
-    let native: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../../tools/spatial_oracle/terrain_render.json"
+    let native: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/terrain_render.json",
     ))
     .unwrap();
-    let rows = native["rows"].as_array().unwrap();
-    assert_eq!(rows.len(), 82);
+    let static_rows = native["rows"].as_array().unwrap();
+    let animated_rows = native["animated_rows"].as_array().unwrap();
+    assert_eq!(static_rows.len(), 82);
+    assert_eq!(animated_rows.len(), 44);
+    let rows = static_rows.iter().chain(animated_rows);
     // Zero stored offsets isolate the original pre-shape draw point. Actual
     // image/canvas offsets have their separate production atlas comparisons.
     let sprite = OverlaySpriteEntry {
@@ -20,6 +37,8 @@ fn terrain_retained_xyz_projection_and_piece_z_match_original_render() {
         pixel_size: [1.0; 2],
         offset_x: 0.0,
         offset_y: 0.0,
+        draw_point_offset: [0; 2],
+        extended: false,
     };
     for row in rows {
         let draws = row["draws"].as_array().unwrap();
@@ -45,15 +64,26 @@ fn terrain_retained_xyz_projection_and_piece_z_match_original_render() {
             ],
             "{row}: original projection"
         );
-        let pieces = native_static_terrain_instances(
-            &sprite,
-            &sprite,
-            [point.0, point.1],
-            lift,
-            0.3,
-            [1.0; 3],
-            Default::default(),
-        );
+        let draw_point = [
+            point.0,
+            point.1
+                - if row.get("animation").is_some() {
+                    16.0
+                } else {
+                    0.0
+                },
+        ];
+        let pieces = [TerrainPiece::Body, TerrainPiece::Shadow].map(|piece| {
+            native_terrain_instance(
+                &sprite,
+                piece,
+                draw_point,
+                lift,
+                0.3,
+                [1.0; 3],
+                Default::default(),
+            )
+        });
         let dirty_translation =
             row["viewport_y"].as_i64().unwrap() - row["dirty_y"].as_i64().unwrap();
         for (piece, draw) in pieces.iter().zip(draws) {
@@ -70,7 +100,7 @@ fn terrain_retained_xyz_projection_and_piece_z_match_original_render() {
                 "{row}: shared body/shadow point"
             );
             assert_eq!(
-                i64::from(piece.z_gradient),
+                ZGradient::from_index(piece.z_gradient) as i64,
                 draw["gradient"].as_i64().unwrap(),
                 "{row}: gradient"
             );

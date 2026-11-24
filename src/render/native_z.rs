@@ -11,14 +11,14 @@
 //! fractional ordering are not an exact native u16 source. TREE reads a mixed
 //! compatibility destination by rounding its value on the native axis.
 //!
-//! Evidence (read-only Ghidra, 2026-09-07, `docs/research/ZBUFFER_DEPTH_SYSTEM.md`
-//! sections 1, 2, 4):
+//! Evidence (gamemd instructions):
 //! - `Standard_SHP_blitter @ 0x004373B0` (`0x004374BB..0x004375A7`): the two
 //!   seeding paths below, then the per-row step applied after each row
 //!   (`0x00437921..0x0043793f`).
 //! - `Extended_SHP_blitter @ 0x00437A10`: ordinary gradients without a
-//!   second shape; with one, constant raw bottom seed (no gradient), minus
-//!   the per-pixel signed z-shape byte in the leaf (`0x004990E0`).
+//!   second shape; with one, a constant seed minus the per-pixel signed
+//!   z-shape byte. Top-seeded gradients keep their quantisation; only the
+//!   bottom-seeded building gradient bypasses it (`0x00437BAB..0x00437C72`).
 //! - `TMP_TileBlitter @ 0x00547CF0`: `DAT_00AA1104 = (u16)(DefaultZ + YOrigin
 //!   - y - tileH) - tileH * heightLevel / 2`, per pixel `base + zdata <= zbuf`.
 //! - `TechnoClass_DrawSHP @ 0x00705E00`: CC stack slot 7 = a7 - 2
@@ -30,13 +30,95 @@
 //!   (`BuildingClass_DrawBody 0x0043D836..0x0043D84D`).
 //! - Gradient table `g_ZGradientTable @ 0x00817710`.
 
-/// `g_ZBuffer + 0x24`: row seed constant; distinct from empty stored Z.
+/// `g_ZBuffer + 0x24`: the row seed a new Z buffer starts from
+/// (`0x007BCA2C`); distinct from empty stored Z. [`ZSeed`] moves it as the
+/// view scrolls.
 pub const DEFAULT_Z: i32 = 0x8000;
+
+/// gamemd's row seed from frame to frame. The Z buffer keeps its pixels while
+/// the view scrolls, so the seed scrolls with them and a world row keeps its
+/// Z. The quantised walks (`0x00437527..0x00437585`, `0x00437BBA`,
+/// `0x00437C45`: Moderate and Vertical step 3) round from the seed, so a
+/// sprite's occlusion line on a cliff or ramp holds still while the view
+/// scrolls, where a seed fixed to the screen moves it by up to 2 px.
+///
+/// - `TacticalClass_Draw @ 0x006D3D10` takes the view's move since its last
+///   draw (`0x006D3D55..0x006D3D80`). A move as wide or as tall as the view
+///   (`0x006D3D8A..0x006D3DAE`), or a complete redraw asked for since
+///   (`GScreenClass::Flag_To_Redraw(1) @ 0x004F42F0`, read at `0x006D3DBB`),
+///   zeroes it (`0x006D3DC6`).
+/// - `ZBufferClass::Pan @ 0x007BCB50` (`0x006D401B`) takes what is left: the
+///   seed falls by the rows the view moved down (`0x007BCD14`).
+/// - A radar click puts it back to [`DEFAULT_Z`] (`0x00653EBA`), and so does
+///   the new Z buffer a change of the view's size makes
+///   (`Set_View_Dimensions`, `0x004A8A48`).
+///
+/// RESIDUAL: of the complete redraws, the camera jumps' are modelled
+/// ([`ZSeed::complete_redraw`]). The others, such as a lighting change
+/// (`0x0053ADE7`) or a lightning storm (`0x0053A711`), keep the seed only if
+/// they fall on a frame the view scrolls; VERA pans it, which moves the
+/// quantised phase by that frame's rows mod 3.
+#[derive(Debug, Default)]
+pub struct ZSeed {
+    /// The view the last frame drew: left, top, width and height in world
+    /// pixels.
+    view: Option<[i32; 4]>,
+    /// Rows the seed has panned: it is `DEFAULT_Z - pan`.
+    pan: i32,
+    /// A complete redraw is due, so the next frame does not pan.
+    redraw: bool,
+}
+
+impl ZSeed {
+    /// The rows panned for a frame drawing `view` (left, top, width and height
+    /// in world pixels; the top is the Z buffer's row 0).
+    pub fn frame(&mut self, view: [i32; 4]) -> i32 {
+        let [left, top, width, height] = view;
+        let redraw = std::mem::take(&mut self.redraw);
+        match self.view {
+            Some([last_left, last_top, last_width, last_height])
+                if [last_width, last_height] == [width, height] =>
+            {
+                let [dx, dy] = [left.wrapping_sub(last_left), top.wrapping_sub(last_top)];
+                if !redraw && dx.wrapping_abs() < width && dy.wrapping_abs() < height {
+                    self.pan = self.pan.wrapping_add(dy);
+                }
+            }
+            Some(_) => self.pan = 0,
+            None => {}
+        }
+        self.view = Some(view);
+        self.pan
+    }
+
+    /// Rows the seed has panned as of the last frame.
+    pub fn pan(&self) -> i32 {
+        self.pan
+    }
+
+    /// The seed as of the last frame.
+    pub fn seed(&self) -> i32 {
+        DEFAULT_Z.wrapping_sub(self.pan)
+    }
+
+    /// `GScreenClass::Flag_To_Redraw(1)`: the next frame redraws the whole
+    /// view and does not pan.
+    pub fn complete_redraw(&mut self) {
+        self.redraw = true;
+    }
+
+    /// A radar click: a complete redraw from [`DEFAULT_Z`]
+    /// (`0x00653EA5..0x00653EBA`).
+    pub fn reset(&mut self) {
+        self.pan = 0;
+        self.redraw = true;
+    }
+}
 
 /// Lossless GPU storage of the native u16 Z-buffer word. The original leaves
 /// compare their signed candidate first, then write its low16 bits. Hardware
 /// comparisons alone only establish that behavior for in-range candidates.
-/// See TERRAIN_STATIC_BODY_SHADOW_NATIVE_2026_09_09.md and native_z.wgsl.
+/// See native_z.wgsl.
 pub const STORED_DEPTH_CLEAR: f32 = 1.0;
 
 /// Original ctor 007BCA08 and active dirty clear 007BCFB0 store 0xffff;
@@ -57,10 +139,6 @@ pub fn stored_z(depth: f32) -> u16 {
 /// `TechnoClass_DrawSHP` pushes `a7 - 2` as the CC_Draw_Shape Z term
 /// (`0x00706430`, `0x00706505`, `0x007065D4`). Every SHP object draw carries it.
 pub const SHP_DRAW_Z_ADJUST_PX: i32 = -2;
-
-/// `BuildingClass_DrawBody @ 0x0043D9C9` pushes `-1 - AdjustForZ(Z)` as the
-/// bib's a7; the bib body then carries `-1 - 2` on top of the lift cancel.
-pub const BIB_Z_ADJUST_PX: i32 = -1;
 
 /// Terrain height levels project 15 screen rows apart. Raw object Z instead
 /// uses `native_x87::adjust_for_z_standard` (the active 104-lepton ground
@@ -151,13 +229,85 @@ pub const Z_GRADIENT_ZSHAPE_FLAG: u32 = 0x100;
 pub const Z_GRADIENT_ZSHAPE_CLIP_FLAG: u32 = 0x200;
 
 /// Unit final-composite split (`0x0073B140`, Unit vtable +0x55C).
-/// Only the voxel sprite shader consumes this bit. All body parts retain
+/// It rides with [`Z_GRADIENT_VOXEL_VIEW_CLIP_FLAG`]. All body parts retain
 /// one native composite rectangle; its last 16 rows use gradient 2/FootZ,
 /// while preceding rows use gradient 0/FootZ-5. Shadows do not carry it.
 pub const Z_GRADIENT_VOXEL_BRIDGE_SPLIT_FLAG: u32 = 0x400;
 
+/// A voxel body's final composite reaches the screen through Bit_Blit
+/// (`0x0073B140` and TechnoClass::Render `0x00706ED0`, both via `0x004AF2A0`),
+/// which clips its destination rectangle to the tactical view before seeding
+/// (`0x00437461`, then `0x004374BB..0x004375A7` read the clipped rectangle).
+/// A bottom-seeded walk then depends on the clipped bottom row. A turreted
+/// SHP Unit's body and turret reach the screen through the same composite
+/// (`0x0073C7AC..0x0073CDF9`), so the SHP shader takes this bit too, but
+/// only without [`Z_GRADIENT_LINEAR_SHAPE_FLAG`], whose channel bits share
+/// it ([`unit_composite`]). A frame drawn straight to the screen carries
+/// [`Z_GRADIENT_RAW_FRAME_FLAG`] instead.
+pub const Z_GRADIENT_VOXEL_VIEW_CLIP_FLAG: u32 = 0x1000;
+
+/// Whether a packed gradient is a Unit final composite's
+/// ([`pack_voxel_z_gradient`]), whose blit `fx_params.w` clips to the view.
+pub const fn unit_composite(packed_gradient: u32) -> bool {
+    packed_gradient & (Z_GRADIENT_LINEAR_SHAPE_FLAG | Z_GRADIENT_VOXEL_VIEW_CLIP_FLAG)
+        == Z_GRADIENT_VOXEL_VIEW_CLIP_FLAG
+}
+
+/// A raw SHP frame (format bit 0x02 clear). CC_Draw_Shape hands it to
+/// Bit_Blit (`0x004AF126 -> 0x004373B0`), which clips the rectangle to the
+/// view (`0x00437461`) and seeds either gradient kind from the clipped one
+/// (`0x0043751A`, `0x0043754A`). The RLE walker seeds a top-seeded entry
+/// from the clipped top too (`0x00437BAB`), but entry 2 from the whole
+/// rectangle (`0x00437C39`): [`shp_seed_rows`]. Only a gradient-2 frame
+/// needs the flag; `fx_params.w` holds the view's height
+/// (`render::draw_state::DrawState`).
+pub const Z_GRADIENT_RAW_FRAME_FLAG: u32 = 0x4000;
+
+/// The flag an SHP frame's format adds to its gradient word; `extended` is
+/// format bit 0x02.
+pub const fn shp_frame_flag(extended: bool) -> u32 {
+    if extended {
+        0
+    } else {
+        Z_GRADIENT_RAW_FRAME_FLAG
+    }
+}
+
+/// The world rows `[top, bottom)` an SHP blit over rows `rows` seeds its Z
+/// walk from, in a view over rows `view` (`CameraUniform::view_rows`): a
+/// top-seeded entry from the top clipped to the view, a raw frame from both
+/// ends clipped ([`Z_GRADIENT_RAW_FRAME_FLAG`]), the RLE walker's entry 2
+/// from the whole rectangle. Mirrors native_z.wgsl `shp_seed_rows`.
+pub fn shp_seed_rows(rows: [i32; 2], packed_gradient: u32, view: [i32; 2]) -> [i32; 2] {
+    let raw = packed_gradient & Z_GRADIENT_RAW_FRAME_FLAG != 0;
+    let mut rows = rows;
+    if raw || ZGradient::from_index(packed_gradient).entry().top_seeded {
+        rows[0] = rows[0].max(view[0]);
+    }
+    if raw {
+        rows[1] = rows[1].min(view[1]);
+    }
+    rows
+}
+
+/// Encoded overlay depth file: geometry was clipped on the CPU and the
+/// optional surface reads signed raw bytes by linear address. Bits12..13
+/// select one of four RGBA channels; high16 stores the native row stride.
+pub const Z_GRADIENT_LINEAR_SHAPE_FLAG: u32 = 0x800;
+
+pub fn pack_overlay_z_gradient(gradient: ZGradient, slope: u8, stride: u16) -> u32 {
+    debug_assert!((1..=4).contains(&slope));
+    pack_z_gradient(gradient, true)
+        | Z_GRADIENT_LINEAR_SHAPE_FLAG
+        | (u32::from(slope - 1) << 12)
+        | (u32::from(stride) << 16)
+}
+
+/// A Unit body's final composite (`0x0073B140`), voxel or turreted SHP:
+/// clipped to the view, and split when `bridge_split`.
 pub const fn pack_voxel_z_gradient(gradient: ZGradient, bridge_split: bool) -> u32 {
     gradient as u32
+        | Z_GRADIENT_VOXEL_VIEW_CLIP_FLAG
         | if bridge_split {
             Z_GRADIENT_VOXEL_BRIDGE_SPLIT_FLAG
         } else {
@@ -177,9 +327,9 @@ pub struct VoxelDepthRegion {
 /// CPU description of the voxel shader's per-fragment region selection.
 /// `rect` is [world top, height], `clip` is [world top, exclusive bottom].
 /// Eligibility uses the original height; clipping happens afterwards in
-/// each Standard_SHP_blitter call (0x0073B2FE, 0x00437461). This does not
-/// choose the gameplay/type predicate or move the parent's painter position.
-#[cfg(test)]
+/// each Standard_SHP_blitter call (0x0073B2FE, 0x00437461), split or not.
+/// This does not choose the gameplay/type predicate or move the parent's
+/// painter position.
 pub fn voxel_depth_region(
     rect: [i32; 2],
     packed_gradient: u32,
@@ -203,6 +353,9 @@ pub fn voxel_depth_region(
                 gradient = ZGradient::Vertical;
             }
         }
+    }
+    if packed_gradient & (Z_GRADIENT_VOXEL_BRIDGE_SPLIT_FLAG | Z_GRADIENT_VOXEL_VIEW_CLIP_FLAG) != 0
+    {
         let bottom = (top + height).min(clip[1]);
         top = top.max(clip[0]);
         height = bottom - top;
@@ -213,6 +366,94 @@ pub fn voxel_depth_region(
         gradient,
         z_adjust,
     })
+}
+
+/// Whether an SHP blit over `rect` ([world top, height]) can reach a negative
+/// signed candidate, whatever rectangle a z-shape or view clip cuts it to and
+/// whatever its z-shape bytes. Z rows count from `z_origin_row`. Conservative:
+/// each row's candidate is at least its own row's unstepped seed
+/// `(DEFAULT_Z - screen_row) & 0xFFFF` plus `z_adjust`, less the rect's height
+/// in steps, three of quantisation and 127 of z-shape; a seed that wraps
+/// inside the rect puts small seeds beside large ones.
+pub(crate) fn shp_candidate_may_be_negative(
+    rect: [i32; 2],
+    z_adjust: i32,
+    z_origin_row: i32,
+) -> bool {
+    let [top, height] = rect.map(i64::from);
+    // The bottom-seeded entry adds one (`sprite_seed_z`).
+    let first = i64::from(DEFAULT_Z) - (top - i64::from(z_origin_row)) + 1;
+    let last = first - height - 1;
+    first.div_euclid(0x1_0000) != last.div_euclid(0x1_0000)
+        || last.rem_euclid(0x1_0000) + i64::from(z_adjust) - height - 3 - 127 < 0
+}
+
+/// Conservative signed candidate envelope for a posed voxel body. Within
+/// each native region the existing row kernel is monotone, so its two ends
+/// suffice. Split and clip boundaries may seed independent regions.
+/// None means that no valid bounded range was established, not safe hardware Z.
+/// Z rows count from `z_origin_row` (`CameraUniform::native_z_origin_row`).
+pub(crate) fn voxel_depth_range(
+    rect: [i32; 2],
+    packed_gradient: u32,
+    z_adjust: i32,
+    z_origin_row: i32,
+    clip: [i32; 2],
+) -> Option<[i32; 2]> {
+    let [top, height] = rect;
+    if height <= 0 {
+        return None;
+    }
+    let bottom = top.checked_add(height)?;
+    // Moderate gradient row accumulation multiplies by two.
+    height.checked_mul(2)?;
+    // Guard malformed/overflowing presentation inputs before the i32 kernel.
+    z_adjust.checked_add(i32::from(u16::MAX))?;
+    z_adjust.checked_sub(5)?.checked_sub(height)?;
+    let split = bottom.checked_sub(16)?;
+    let probes = [
+        top,
+        bottom - 1,
+        split.checked_sub(1)?,
+        split,
+        clip[0],
+        clip[1].checked_sub(1)?,
+    ];
+    let count = if packed_gradient & Z_GRADIENT_VOXEL_BRIDGE_SPLIT_FLAG != 0 {
+        probes.len()
+    } else if packed_gradient & Z_GRADIENT_VOXEL_VIEW_CLIP_FLAG != 0 {
+        // One region; the clip may move its top and bottom.
+        probes.len()
+    } else {
+        1
+    };
+    let mut range: Option<[i32; 2]> = None;
+    for &world_row in &probes[..count] {
+        let Some(region) = voxel_depth_region(rect, packed_gradient, z_adjust, world_row, clip)
+        else {
+            continue;
+        };
+        let screen_top = region.top.checked_sub(z_origin_row)?;
+        // sprite_seed_z computes DEFAULT_Z-height-screen_top before its u16 cast.
+        DEFAULT_Z
+            .checked_sub(region.height)?
+            .checked_sub(screen_top)?
+            .checked_add(1)?;
+        for row in [0, region.height - 1] {
+            let value = sprite_row_z(
+                region.gradient,
+                screen_top,
+                region.height,
+                region.z_adjust,
+                row,
+            );
+            range = Some(match range {
+                Some([min, max]) => [min.min(value), max.max(value)],
+                None => [value, value],
+            });
+        }
+    }
+    range
 }
 
 pub const fn pack_building_z_gradient(zshape: bool, extended: bool) -> u32 {
@@ -262,7 +503,6 @@ pub fn sprite_seed_z(
 
 /// Z of row `row` (0 = top) of a blit seeded by [`sprite_seed_z`]. The walker
 /// steps after each row (`0x00437921`), so row `k` has absorbed `k` increments.
-#[cfg(test)]
 pub fn sprite_row_z(
     gradient: ZGradient,
     screen_top: i32,
@@ -276,14 +516,19 @@ pub fn sprite_row_z(
     seed + entry.step_dir * steps
 }
 
-/// Constant seed of an extended SHP blit with a second shape (BUILDNGZ).
-/// `Extended_SHP_blitter @ 0x00437C39..0x00437C72` bypasses gradient
-/// quantisation; `0x00437E67..0x00437EA7` advances shape rows without stepping Z.
+/// Constant seed of an extended SHP blit with a second shape.
+/// `437BAB..437BD9` keeps top-gradient quantisation; `437C39..437C72`
+/// bypasses it for the bottom gradient. `437E67..437EA7` advances shape rows
+/// without stepping Z. Consumed original controls: ore_shape_clip.json.
 /// The per-pixel leaf then subtracts the signed shape byte. Raw SHP frames
 /// use the standard walker and do not consume the second shape.
 #[cfg(test)]
-pub fn zshape_seed_z(screen_top: i32, height: i32, z_adjust: i32) -> i32 {
-    ((DEFAULT_Z - height - screen_top + 1) & 0xFFFF) + z_adjust
+pub fn zshape_seed_z(gradient: ZGradient, screen_top: i32, height: i32, z_adjust: i32) -> i32 {
+    if gradient.entry().top_seeded {
+        sprite_seed_z(gradient, screen_top, height, z_adjust).0
+    } else {
+        ((DEFAULT_Z - height - screen_top + 1) & 0xFFFF) + z_adjust
+    }
 }
 
 /// Tile base Z (`DAT_00AA1104`). `screen_top` is the diamond top row on
@@ -299,7 +544,7 @@ pub fn tile_base_z(screen_top: i32, height_level: i32) -> i32 {
 /// result anchors on the ground-projected row: every native class folds
 /// `-AdjustForZ(Location.Z)` into its adjustment, cancelling the screen lift.
 /// `class_term` is the remaining class constant (`SHP_DRAW_Z_ADJUST_PX`,
-/// `NormalZAdjust`, bib `-1`, anim `ZAdjust`, ...).
+/// `NormalZAdjust`, anim `ZAdjust`, ...).
 pub fn ground_anchored_z_adjust(height_level: i32, class_term: i32) -> i32 {
     class_term - HEIGHT_LEVEL_PX * height_level
 }
@@ -308,21 +553,31 @@ pub fn ground_anchored_z_adjust(height_level: i32, class_term: i32) -> i32 {
 /// foundation shift (`BuildingClass_DrawBody 0x0043D6EF..0x0043D77A`).
 pub const ZSHAPE_ANCHOR: (i32, i32) = (0xC6, 0x1BE);
 
+/// The same point for a remembered building under fog of war:
+/// FoggedObjectClass::DrawAll adds (0x90, 0xAC) to ZShapePointMove
+/// (`0x004D1DBD`, `0x004D1DCE`) and passes it from the same draw point.
+pub const FOGGED_ZSHAPE_ANCHOR: (i32, i32) = (0x90, 0xAC);
+
 /// `BuildingClass_DrawBody @ 0x0043D787`: a foundation width of 8 or more
 /// draws without a z-shape (`CMP EAX, 8 / JL`).
 pub const ZSHAPE_MAX_FOUNDATION_WIDTH: u16 = 7;
 
-/// World-pixel origin of the z-shape canvas for one building.
+/// World-pixel origin of the z-shape frame for one building.
 ///
-/// The body pushes `(0xC6, 0x1BE) + ZShapePointMove - CellToPixel((W-1)*256,
-/// (H-1)*256)` as the z-shape offset; the extended blitter reads z-shape pixel
-/// `p` for screen pixel `draw_point - offset + p`. `draw_point` is the point
-/// `CC_Draw_Shape` centres the body on (VERA's building anchor), in world
-/// pixels.
+/// The body pushes `anchor + ZShapePointMove - CellToPixel((W-1)*256,
+/// (H-1)*256)` as the z-shape offset, `anchor` being [`ZSHAPE_ANCHOR`] or
+/// [`FOGGED_ZSHAPE_ANCHOR`]; the extended blitter reads pixel `p` of the
+/// z-shape's frame for screen pixel `draw_point - offset - frame + p`, where
+/// `frame` is that frame's offset in its canvas: CC_Draw_Shape subtracts it
+/// (`0x004AF08E..0x004AF0CB`) where a canvas placement would add it.
+/// `draw_point` is the point `CC_Draw_Shape` centres the body on (VERA's
+/// building anchor), in world pixels.
 pub fn zshape_origin(
+    anchor: (i32, i32),
     draw_point: (i32, i32),
     foundation: (u16, u16),
     point_move: (i32, i32),
+    frame: (i32, i32),
 ) -> (i32, i32) {
     let w = i32::from(foundation.0.max(1)) - 1;
     let h = i32::from(foundation.1.max(1)) - 1;
@@ -333,10 +588,57 @@ pub fn zshape_origin(
         (w + h) * HEIGHT_LEVEL_PX,
     );
     let offset = (
-        ZSHAPE_ANCHOR.0 + point_move.0 - far_corner.0,
-        ZSHAPE_ANCHOR.1 + point_move.1 - far_corner.1,
+        anchor.0 + point_move.0 - far_corner.0,
+        anchor.1 + point_move.1 - far_corner.1,
     );
-    (draw_point.0 - offset.0, draw_point.1 - offset.1)
+    (
+        draw_point.0 - offset.0 - frame.0,
+        draw_point.1 - offset.1 - frame.1,
+    )
+}
+
+/// The source columns the view's left edge, at world column `view_left`,
+/// clips off a body's rect from world column `left` (WGSL `round` ties to
+/// even). The RLE ZReadWrite leaf (`0x004990E0`) skips them a token at a
+/// time; [`zshape_skip_overshoot`] gives what that leaves behind per row.
+pub fn zshape_lead_skip(view_left: i32, left: f32) -> f32 {
+    view_left
+        .saturating_sub(left.round_ties_even() as i32)
+        .max(0) as f32
+}
+
+/// The source columns the RLE ZReadWrite leaf (`0x004990E0`) leaves a body's
+/// z-shape pointer behind by in one frame row (`row`, its palette indices),
+/// skipped `skip` columns in from the left ([`zshape_lead_skip`]). The leaf
+/// skips a token at a time (`0x00499141..0x00499154`); a skip that ends inside
+/// a transparent run moves dest, Z and A on to the run's end
+/// (`0x0049915D..0x0049918F`) but not the z-shape pointer (ECX), which drawn
+/// pixels and later runs advance (`0x00499234`, `0x004991C7`): the rest of
+/// the row reads its shape that many columns back. A transparent span is
+/// taken as runs of 255 from its start, as retail frames encode it. The skip
+/// table carries the result per row (`render::zshape_skips`).
+///
+/// RESIDUAL: a mod frame that splits its spans otherwise overshoots
+/// differently, and ore on a slope (the linear shape, its quad already clipped
+/// on the CPU) keeps no overshoot: where the view's left edge cuts them, their
+/// depth can sit up to a run's worth of shape columns off.
+pub fn zshape_skip_overshoot(row: &[u8], skip: usize) -> u8 {
+    let width = row.len();
+    if skip == 0 || skip >= width || row[skip - 1] != 0 {
+        return 0;
+    }
+    // The transparent span the skip ends in, and the run of it the skip's
+    // last token covers.
+    let start = row[..skip - 1]
+        .iter()
+        .rposition(|&index| index != 0)
+        .map_or(0, |drawn| drawn + 1);
+    let run_end = (start + ((skip - 1 - start) / 255 + 1) * 255).min(width);
+    let end = row[skip..run_end]
+        .iter()
+        .position(|&index| index != 0)
+        .map_or(run_end, |drawn| skip + drawn);
+    (end - skip) as u8
 }
 
 /// `FUN_0045E8F0`: every non-zero BUILDNGZ byte is remapped by `-0x41` and
@@ -364,8 +666,90 @@ pub fn depth_for_native_z(z: i32, camera_y: i32, origin_y: f32, world_height: f3
     depth_for_row((DEFAULT_Z - z + camera_y) as f32, origin_y, world_height)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_render_a_r))]
 mod tests {
+    /// The two cases of depth_gpu_tests
+    /// `building_zshape_trails_a_left_edge_skip_that_ends_inside_a_run`, as
+    /// the table computes them, and the skips that leave nothing behind.
+    #[test]
+    fn a_skip_ending_inside_a_transparent_run_trails_to_the_runs_end() {
+        use super::zshape_skip_overshoot;
+        // A 4-column run cut 2 in: the pointer trails by 2 to column 4.
+        assert_eq!(zshape_skip_overshoot(&[0, 0, 0, 0, 33, 33, 33, 33], 2), 2);
+        // A 300-column run encodes as 255 + 45: the skip ends 245 short of
+        // the first token's end.
+        let mut row = vec![0; 320];
+        row[300..].fill(33);
+        assert_eq!(zshape_skip_overshoot(&row, 10), 245);
+        // A drawn pixel before the skip starts the span and its runs there.
+        row[4] = 33;
+        assert_eq!(zshape_skip_overshoot(&row, 10), 250);
+        // A skip that ends on a drawn pixel, or outside the frame, trails nothing.
+        assert_eq!(zshape_skip_overshoot(&[33, 0, 0, 33], 1), 0);
+        assert_eq!(zshape_skip_overshoot(&[0, 0, 33], 3), 0);
+        assert_eq!(zshape_skip_overshoot(&[0, 0, 33], 0), 0);
+    }
+
+    #[test]
+    fn voxel_candidate_envelope_covers_existing_regions_and_shader_clip_boundaries() {
+        for rect in [[43, 15], [43, 48], [-10, 64]] {
+            for gradient in [
+                pack_voxel_z_gradient(ZGradient::Flat, false),
+                pack_voxel_z_gradient(ZGradient::Vertical, false),
+                pack_voxel_z_gradient(ZGradient::Vertical, true),
+            ] {
+                for clip in [[0, 96], [48, 62], [-5, 10], [200, 300]] {
+                    for camera in [0, -32725] {
+                        let range = voxel_depth_range(rect, gradient, -65, camera, clip);
+                        for world_row in rect[0]..rect[0] + rect[1] {
+                            if let Some(region) =
+                                voxel_depth_region(rect, gradient, -65, world_row, clip)
+                            {
+                                let value = sprite_row_z(
+                                    region.gradient,
+                                    region.top - camera,
+                                    region.height,
+                                    region.z_adjust,
+                                    world_row - region.top,
+                                );
+                                let [min, max] = range.expect("an admitted region has an envelope");
+                                assert!(
+                                    min <= value && value <= max,
+                                    "{rect:?}/{gradient}/{clip:?}/{world_row}: {range:?} misses{value}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(voxel_depth_range([43, 15], 0, -65, 0, [0, 96]).unwrap()[0] >= 0);
+        assert!(voxel_depth_range([43, 15], 0, -65, -32725, [-32725, -32629]).unwrap()[1] < 0);
+        assert_eq!(voxel_depth_range([i32::MAX, 15], 0, -65, 0, [0, 96]), None);
+    }
+
+    /// TacticalClass_Draw 0x006D3D8A..0x006D3DC6 and Pan 0x007BCD14: small
+    /// moves pan the seed; a move as tall as the view, a complete redraw or
+    /// a radar click does not, and a new view size starts it over.
+    #[test]
+    fn the_seed_pans_with_small_moves_alone() {
+        let mut seed = ZSeed::default();
+        let view = |left, top| [left, top, 800, 600];
+        assert_eq!(seed.frame(view(0, 1000)), 0);
+        assert_eq!(seed.frame(view(30, 1010)), 10);
+        assert_eq!(seed.frame(view(30, 1609)), 609);
+        assert_eq!(seed.frame(view(30, 2209)), 609, "a whole view's move");
+        assert_eq!(seed.frame(view(-770, 2210)), 609, "a whole view's width");
+        seed.complete_redraw();
+        assert_eq!(seed.frame(view(-770, 2215)), 609);
+        assert_eq!(seed.frame(view(-770, 2205)), 599);
+        assert_eq!(seed.seed(), DEFAULT_Z - 599);
+        seed.reset();
+        assert_eq!(seed.frame(view(-770, 2200)), 0);
+        assert_eq!(seed.frame(view(-770, 2201)), 1);
+        assert_eq!(seed.frame([-770, 2202, 800, 599]), 0, "a new view size");
+    }
+
     #[test]
     fn native_stored_depth_preserves_every_word_and_distinguishes_empty_from_seed() {
         assert_eq!(stored_z(STORED_DEPTH_CLEAR), EMPTY_Z);
@@ -377,8 +761,8 @@ mod tests {
 
     #[test]
     fn original_extended_row_walk_matches_all_clipped_fixture_rows() {
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../tools/terrain_draw_oracle/fixtures/rows.json"
+        let fixture: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/terrain_draw_oracle/fixtures/rows.json",
         ))
         .unwrap();
         let cases = fixture["cases"].as_array().unwrap();
@@ -445,6 +829,8 @@ mod tests {
                 .gradient,
             ZGradient::Vertical
         );
+        // An unsplit body is one Bit_Blit, clipped to the view before its
+        // seed (0x00437461); a shadow's plain gradient is not.
         let ordinary = voxel_depth_region(
             [-4, 32],
             pack_voxel_z_gradient(ZGradient::Moderate, false),
@@ -453,103 +839,54 @@ mod tests {
             [0, 24],
         )
         .unwrap();
-        assert_eq!(ordinary.top, -4);
-        assert_eq!(ordinary.height, 32);
+        assert_eq!(ordinary.top, 0);
+        assert_eq!(ordinary.height, 24);
         assert_eq!(ordinary.gradient, ZGradient::Moderate);
         assert_eq!(ordinary.z_adjust, 7);
-    }
-
-    #[test]
-    fn gradient_table_matches_the_bytes_at_0x00817710() {
-        let t = GRADIENT_TABLE;
+        let shadow = voxel_depth_region([-4, 32], ZGradient::Moderate as u32, 7, 6, [0, 24]);
         assert_eq!(
-            (
-                t[0].increment,
-                t[0].threshold,
-                t[0].step_dir,
-                t[0].top_seeded
-            ),
-            (1, 1, -1, true)
+            shadow.map(|region| [region.top, region.height]),
+            Some([-4, 32])
         );
-        assert_eq!(
-            (
-                t[1].increment,
-                t[1].threshold,
-                t[1].step_dir,
-                t[1].top_seeded
-            ),
-            (2, 3, -1, true)
-        );
-        assert_eq!(
-            (
-                t[2].increment,
-                t[2].threshold,
-                t[2].step_dir,
-                t[2].top_seeded
-            ),
-            (1, 3, 1, false)
-        );
-    }
-
-    #[test]
-    fn flat_gradient_walks_one_unit_nearer_per_row_from_the_top() {
-        // Top row Z is the ground Z of that screen row; each row down is nearer.
-        let top = DEFAULT_Z - 100;
-        assert_eq!(sprite_row_z(ZGradient::Flat, 100, 20, 0, 0), top);
-        assert_eq!(sprite_row_z(ZGradient::Flat, 100, 20, 0, 7), top - 7);
-        assert_eq!(sprite_row_z(ZGradient::Flat, 100, 20, -2, 0), top - 2);
-    }
-
-    #[test]
-    fn moderate_gradient_quantises_the_seed_and_steps_two_per_three_rows() {
-        let seed = ((DEFAULT_Z - 101) / 3) * 3;
-        assert_eq!(sprite_row_z(ZGradient::Moderate, 101, 30, 0, 0), seed);
-        assert_eq!(sprite_row_z(ZGradient::Moderate, 101, 30, 0, 1), seed);
-        assert_eq!(sprite_row_z(ZGradient::Moderate, 101, 30, 0, 2), seed - 1);
-        assert_eq!(sprite_row_z(ZGradient::Moderate, 101, 30, 0, 3), seed - 2);
-        assert_eq!(sprite_row_z(ZGradient::Moderate, 101, 30, 0, 6), seed - 4);
-    }
-
-    #[test]
-    fn vertical_gradient_anchors_on_the_bottom_row_and_climbs_nearer_upward() {
-        // Height 30 (divisible by 3): accum starts at 3 -> reset to 0 and seed +1.
-        let raw = DEFAULT_Z - 30 - 100 + 1 - 2;
-        let seed = (raw / 3) * 3 - 10 + 1;
-        assert_eq!(sprite_seed_z(ZGradient::Vertical, 100, 30, -2), (seed, 0));
-        assert_eq!(sprite_row_z(ZGradient::Vertical, 100, 30, -2, 0), seed);
-        assert_eq!(sprite_row_z(ZGradient::Vertical, 100, 30, -2, 2), seed);
-        assert_eq!(sprite_row_z(ZGradient::Vertical, 100, 30, -2, 3), seed + 1);
-        assert_eq!(sprite_row_z(ZGradient::Vertical, 100, 30, -2, 29), seed + 9);
-        // The bottom row sits within one quantum of the ground Z of that row.
-        let bottom_ground = DEFAULT_Z - (100 + 29);
-        assert!((sprite_row_z(ZGradient::Vertical, 100, 30, 0, 29) - bottom_ground).abs() <= 3);
-    }
-
-    #[test]
-    fn vertical_gradient_height_not_divisible_by_three_keeps_the_partial_accumulator() {
-        // Height 31: accum = 3 - 1 = 2, so the first step lands after one row.
-        let raw = DEFAULT_Z - 31 - 100 + 1;
-        let seed = (raw / 3) * 3 - 10;
-        assert_eq!(sprite_seed_z(ZGradient::Vertical, 100, 31, 0), (seed, 2));
-        assert_eq!(sprite_row_z(ZGradient::Vertical, 100, 31, 0, 0), seed);
-        assert_eq!(sprite_row_z(ZGradient::Vertical, 100, 31, 0, 1), seed + 1);
-        assert_eq!(sprite_row_z(ZGradient::Vertical, 100, 31, 0, 3), seed + 1);
-        assert_eq!(sprite_row_z(ZGradient::Vertical, 100, 31, 0, 4), seed + 2);
     }
 
     #[test]
     fn building_shape_uses_unquantised_bottom_seed_and_raw_frames_only_clip() {
         // Regression derived from the 437C39..437C72 arithmetic, not a
         // captured parity golden. A neutral shape must have one Z at all rows.
-        assert_eq!(zshape_seed_z(100, 30, -2), DEFAULT_Z - 131);
+        assert_eq!(
+            zshape_seed_z(ZGradient::Vertical, 100, 30, -2),
+            DEFAULT_Z - 131
+        );
         assert_ne!(
-            zshape_seed_z(100, 30, -2),
+            zshape_seed_z(ZGradient::Vertical, 100, 30, -2),
             sprite_row_z(ZGradient::Vertical, 100, 30, -2, 0),
         );
-        assert_eq!(zshape_seed_z(85, 30, -17), zshape_seed_z(100, 30, -2));
+        assert_eq!(
+            zshape_seed_z(ZGradient::Vertical, 85, 30, -17),
+            zshape_seed_z(ZGradient::Vertical, 100, 30, -2)
+        );
         assert_eq!(pack_building_z_gradient(true, true), 0x302);
         assert_eq!(pack_building_z_gradient(true, false), 0x202);
         assert_eq!(pack_building_z_gradient(false, true), 2);
+    }
+
+    #[test]
+    fn shape_seeds_match_original_gradient_branches() {
+        let native = crate::test_fixture::json("tools/spatial_oracle/ore_shape_clip.json");
+        for row in native["shape_seeds"].as_array().unwrap() {
+            let value = |key: &str| row[key].as_i64().unwrap() as i32;
+            assert_eq!(
+                zshape_seed_z(
+                    ZGradient::from_index(value("gradient") as u32),
+                    value("screen_top"),
+                    value("height"),
+                    value("z_adjust")
+                ),
+                value("seed"),
+                "{row}"
+            );
+        }
     }
 
     #[test]
@@ -562,14 +899,6 @@ mod tests {
         assert_eq!(lifted, ground);
         // Odd levels truncate the half unit toward zero.
         assert_eq!(tile_base_z(400 - 15, 1), DEFAULT_Z - 385 - 30 - 15);
-    }
-
-    #[test]
-    fn flat_tile_zdata_makes_lower_rows_nearer() {
-        // Retail CLEAR01.TEM Z-data runs 29 at the top row to 1..3 at the
-        // bottom, so `base + zdata` decreases down the tile: nearer.
-        let base = tile_base_z(200, 0);
-        assert!(base + 29 > base + 1);
     }
 
     #[test]
@@ -586,17 +915,22 @@ mod tests {
     fn zshape_origin_shifts_down_and_across_with_the_foundation() {
         // 1x1: the canvas anchor lands on the draw point.
         assert_eq!(
-            zshape_origin((1000, 500), (1, 1), (0, 0)),
+            zshape_origin(ZSHAPE_ANCHOR, (1000, 500), (1, 1), (0, 0), (0, 0)),
             (1000 - 0xC6, 500 - 0x1BE)
         );
         // 3x3: far corner (2,2) cells -> (0, 60) px, so the canvas drops 60 rows.
         assert_eq!(
-            zshape_origin((1000, 500), (3, 3), (0, 0)),
+            zshape_origin(ZSHAPE_ANCHOR, (1000, 500), (3, 3), (0, 0), (0, 0)),
             (1000 - 0xC6, 500 - 0x1BE + 60)
         );
         // 4x2 (GAWEAP-like) with ZShapePointMove=30,15.
-        let (x, y) = zshape_origin((1000, 500), (4, 2), (30, 15));
+        let (x, y) = zshape_origin(ZSHAPE_ANCHOR, (1000, 500), (4, 2), (30, 15), (0, 0));
         assert_eq!((x, y), (1000 - (0xC6 + 30 - 60), 500 - (0x1BE + 15 - 60)));
+        // A frame set into its canvas moves the other way.
+        assert_eq!(
+            zshape_origin(ZSHAPE_ANCHOR, (1000, 500), (1, 1), (0, 0), (5, -3)),
+            (1000 - 0xC6 - 5, 500 - 0x1BE + 3)
+        );
     }
 
     #[test]

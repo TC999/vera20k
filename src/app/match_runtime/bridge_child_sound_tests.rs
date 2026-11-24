@@ -1,39 +1,46 @@
 //! Selected bridge landing child Report reader and destruction composition.
 
 use super::*;
-use crate::audio::arbiter::{ArbiterAction, EntryFacts, PlayRequest, SoundArbiter};
+use crate::audio::arbiter::{
+    ArbiterAction, EntryFacts, HandleOwner, PlayRequest, PlayoutEnd, SoundArbiter, TestPlayback,
+};
 use crate::rules::{
-    art_data::ArtRegistry, retail_ini_fixture::retail_ini, sound_ini::SoundRegistry,
+    native_processing::RulesLayerStack,
+    retail_ini_fixture::{art_registry, retail_ini, retail_rules_and_art},
+    sound_ini::SoundRegistry,
 };
 use crate::util::fixed_math::SimFixed;
 
 #[test]
 fn retail_landing_child_reports_release_instead_of_cutting_samples() {
-    let (Some(ini), Some(art), Some(sound)) = (
-        retail_ini("rulesmd.ini"),
-        retail_ini("artmd.ini"),
-        retail_ini("soundmd.ini"),
-    ) else {
+    let (Some((ini, art)), Some(sound)) = (retail_rules_and_art(), retail_ini("soundmd.ini"))
+    else {
         return;
     };
-    let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
-    rules.install_art_data(ArtRegistry::from_ini(&art));
     let registry = SoundRegistry::from_ini(&sound);
-    let native: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tools/rules_oracle/bridge_child_sound.json"
+    let mut rules = RuleSet::from_processed_rules(
+        &RulesLayerStack::new(ini)
+            .process_with_fixed_art_and_sounds(&art, &registry)
+            .unwrap(),
+    )
+    .unwrap();
+    rules.install_art_data(art_registry(&art));
+    let native: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/rules_oracle/bridge_child_sound.json",
     ))
     .unwrap();
-    let art_native: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tools/rules_oracle/bridge_anim_inputs.json"
+    let art_native: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/rules_oracle/bridge_anim_inputs.json",
     ))
     .unwrap();
     for report in native["anim_reports"].as_array().unwrap() {
         let name = report["name"].as_str().unwrap();
         let config = rules.art().anim_runtime_config(name).unwrap();
-        // Native resolves Report with case-insensitive Voc FindByName;
-        // ArtRegistry stores the same identity in uppercase.
+        // None of these sets StartSound=, so the start slot holds Report=,
+        // resolved with case-insensitive Voc FindByName; ArtRegistry stores
+        // the same identity in uppercase.
         assert_eq!(
-            config.report,
+            config.start_sound,
             report["report_name"].as_str().map(str::to_ascii_uppercase)
         );
         assert!(config.stop_sound.is_none());
@@ -97,7 +104,7 @@ fn retail_landing_child_reports_release_instead_of_cutting_samples() {
             .unwrap();
         rules.bind_anim_frame_count_for_test(name, frames as i32);
         let mut sim = Simulation::new();
-        let type_id = sim.interner.intern(name);
+        let type_id = sim.intern(name);
         let id = sim
             .spawn_combat_explosion_anim(
                 &rules,
@@ -113,23 +120,29 @@ fn retail_landing_child_reports_release_instead_of_cutting_samples() {
         // Exercise natural expiry; this test does not certify the native
         // child's entire timer/Middle/Scenario RNG trajectory.
         for frame in 0..100 {
-            sim.session.binary_frame = frame;
-            sim.visit_anim(id, &rules, None);
-            if sim.substrate.pending_delete.contains(&id) {
+            sim.session_mut_for_test().set_binary_frame_for_test(frame);
+            sim.visit_anim(
+                id,
+                &rules,
+                None,
+                &mut crate::sim::world::FrameEffects::default(),
+            )
+            .unwrap();
+            if sim.pending_delete().contains_object(&id) {
                 break;
             }
         }
-        assert!(sim.substrate.pending_delete.contains(&id), "{name}");
-        assert!(!sim.anim(id).unwrap().in_logic_vector, "{name}");
-        let events = std::mem::take(&mut sim.sound_events);
+        assert!(sim.pending_delete().contains_object(&id), "{name}");
+        assert!(!sim.anim(id).unwrap().in_logic_vector(), "{name}");
+        let events = sim.take_sound_events_for_test();
         let mut output = SoundEventQueue::default();
-        dispatch_sim_sound_events(events, &sim, &rules, None, None, &mut |_| true, &mut output);
+        dispatch_sim_sound_events(events, &sim, &rules, None, &mut |_| true, &mut output, None);
         let events = output.drain();
         assert!(
             matches!(events.as_slice(), [
             GameSoundEvent::AnimationStarted { anim_id, sound_id, .. },
             GameSoundEvent::AnimationReleased { anim_id: released },
-        ] if *anim_id == id && *released == id && sound_id.eq_ignore_ascii_case(sound_name)),
+        ] if *anim_id == id && *released == id && sound_id.name_in(&rules).eq_ignore_ascii_case(sound_name)),
             "{name}: {events:?}"
         );
         // Original406060 leaves every byte of the selected playing event
@@ -149,27 +162,41 @@ fn retail_landing_child_reports_release_instead_of_cutting_samples() {
                     facts: EntryFacts::from(entry),
                     volume_linear: entry.volume_linear,
                     pan: 0x2000,
-                    predelay_ms: 0,
                 },
                 0,
             )
             .unwrap();
-        arbiter.set_loop_handle(id, Some(playing), &sound_name.to_ascii_uppercase());
-        assert!(arbiter.update_tick(100).iter().any(|action| matches!(
-            action, ArbiterAction::Start { event, sustaining: false, .. } if *event == playing
-        )));
+        arbiter.set_loop_handle(
+            HandleOwner::Positional(id),
+            Some(playing),
+            &sound_name.to_ascii_uppercase(),
+        );
+        assert!(
+            arbiter
+                .update_tick(100, &mut TestPlayback::default())
+                .iter()
+                .any(|action| matches!(
+                    action, ArbiterAction::Start { event, .. } if *event == playing
+                ))
+        );
         let GameSoundEvent::AnimationReleased { anim_id } = events[1] else {
             unreachable!("ordered app event checked above")
         };
-        arbiter.release_owner(anim_id);
+        arbiter.release_owner(HandleOwner::Positional(anim_id));
         assert!(arbiter.loop_handle_owners().is_empty());
-        assert!(arbiter.update_tick(200).iter().all(|action| !matches!(
-            action, ArbiterAction::Stop { event } if *event == playing
-        )));
+        assert!(
+            arbiter
+                .update_tick(200, &mut TestPlayback::default())
+                .iter()
+                .all(|action| !matches!(
+                    action, ArbiterAction::Stop { event } if *event == playing
+                ))
+        );
         assert_eq!(arbiter.live_event_count(), 1);
         assert_eq!(arbiter.busy_channel_count(), 1);
-        arbiter.notify_playout_ended(playing);
-        arbiter.update_tick(240);
+        let token = arbiter.event_token(playing).unwrap();
+        arbiter.notify_playout_ended(token, PlayoutEnd::default(), 200);
+        arbiter.update_tick(240, &mut TestPlayback::default());
         assert_eq!(arbiter.live_event_count(), 0);
         assert_eq!(arbiter.busy_channel_count(), 0);
     }

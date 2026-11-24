@@ -1,104 +1,42 @@
 //! World placement corridors of Walk75AEC0: boundary75C117 and completion75BD7D.
 //! walk_step owns the paid numeric approach; this owner supplies synchronous
 //! Mark/PerCell placement before the pass tail.
-use super::{ground_pose, locomotor::MovementLayer};
-use crate::map::overlay_types::OverlayTypeRegistry;
+use super::ground_pose;
+use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
-use crate::sim::{components::DriveCoord, world::Simulation};
+use crate::sim::{
+    components::DriveCoord,
+    world::{FrameEffects, Simulation},
+};
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 #[path = "walk_completion_tests.rs"]
 mod tests;
 
 impl Simulation {
-    /// EventClass4C7467 assigns TarCom before4C747C applies the Attack
-    /// payload's null destination. WalkStop keeps an already accepted head;
-    /// retain its execution adapter until the ordinary completion callback.
-    pub(crate) fn finish_ordered_walk_attack(&mut self, id: u64, rules: Option<&RuleSet>) {
-        if self.set_walk_null_destination(id, rules) {
-            super::retain_committed_movement(
-                self.substrate
-                    .entities
-                    .get_mut(id)
-                    .expect("accepted Walk actor"),
-            );
-        }
-    }
-
-    /// Shared ordinary Infantry51AA40(NULL,true)->Foot4D94B0->Walk75ADA0
-    /// state writes. NavQueue(+598) is a different owner and is not erased.
-    /// MovementTarget continuation/finalization belongs to the caller.
-    pub(crate) fn set_walk_null_destination(&mut self, id: u64, rules: Option<&RuleSet>) -> bool {
-        let Some(actor) = self.substrate.entities.get(id) else {
-            return false;
-        };
-        if !actor
-            .locomotor
-            .as_ref()
-            .is_some_and(|loco| loco.kind == crate::rules::locomotor_type::LocomotorKind::Walk)
-        {
-            return false;
-        }
-        let human = self
-            .houses
-            .get(&actor.owner())
-            .is_some_and(|h| h.is_controlled_by_human(self.session.game_mode_nonzero));
-        if human
-            && actor
-                .mission_leaf
-                .as_infantry()
-                .is_some_and(|leaf| (27..=30).contains(&leaf.doing()))
-        {
-            return false;
-        }
-        // 51AC25..51AD17: an Enter with no live radio contact skips the
-        // setter's head write. 65AE30 answers whether any contact is nonnull;
-        // with a null destination, 40DD70 then returns null without messaging.
-        let clear_head = (actor.mission.effective().raw() != 7
-            && actor.mission.queued().raw() != 7)
-            || !actor.radio_contacts.is_empty();
-        let actor = self
-            .substrate
-            .entities
-            .get_mut(id)
-            .expect("same setter actor");
-        if clear_head {
-            actor.navigation.path_replay.clear_live_head();
-        }
-        super::navcom::publish_null_nav_com(actor);
-        self.walk_stop_moving(id, rules)
-            .unwrap_or_else(|cause| panic!("Walk NULL destination {id}: {cause}"));
-        super::DestinationTiming::from_rules(self.session.binary_frame, rules).accept(
-            self.substrate
-                .entities
-                .get_mut(id)
-                .expect("same setter actor"),
-        );
-        true
-    }
-
     /// Walk75BE42..75BF64 runs after PerCell and reloads the live destination.
     /// The Infantry setter may refuse; the separate speed/Stop suffix still runs.
     /// Original executable comparison: tools/spatial_oracle/walk_completion.
     pub(crate) fn finish_walk_navigation(
         &mut self,
         id: u64,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
+        effects: &mut FrameEffects<'_>,
     ) -> Result<(), String> {
         let Some(actor) = self.substrate.entities.get(id) else {
             return Ok(());
         };
-        if !actor.lifecycle.object_alive
-            || actor.lifecycle.in_limbo
-            || actor.is_falling_down()
+        if !actor.lifecycle.object_alive() || actor.lifecycle.in_limbo() || actor.is_falling_down()
         {
             return Ok(());
         }
-        let Some(loco) = actor
-            .locomotor
-            .as_ref()
-            .filter(|l| l.kind == crate::rules::locomotor_type::LocomotorKind::Walk)
-        else {
+        let Some(loco) = actor.locomotor.as_ref().filter(|l| {
+            matches!(
+                l.active_kind(),
+                crate::rules::locomotor_type::LocomotorKind::Walk
+                    | crate::rules::locomotor_type::LocomotorKind::Mech
+            )
+        }) else {
             return Ok(());
         };
         let destination = loco.walk_destination();
@@ -106,15 +44,21 @@ impl Simulation {
             // Foot+4C may supply a retained head or Tube exit after PerCell;
             // the physical XYZ alone is not the navigation coordinate owner.
             let current = self.foot_navigation_coordinate(id)?;
-            (current.x / 256) as i16 == (destination.x / 256) as i16
-                && (current.y / 256) as i16 == (destination.y / 256) as i16
+            let position =
+                if loco.active_kind() == crate::rules::locomotor_type::LocomotorKind::Mech {
+                    // 5B12FF tests the physical cell before the Foot's navigation Z.
+                    ground_pose::position_world_coord(&actor.position)
+                } else {
+                    current
+                };
+            super::foot_path::coord_cell(position) == super::foot_path::coord_cell(destination)
                 && current.z.wrapping_sub(destination.z).wrapping_abs()
                     < 2 * crate::util::lepton::GROUND_LEVEL_HEIGHT_LEPTONS
         } else {
             true
         };
         if arrived {
-            self.set_walk_null_destination(id, rules);
+            self.assign_null_destination(id, rules, Some(rules.overlay_registry()), effects);
             if let Some(actor) = self.substrate.entities.get_mut(id) {
                 //75BF38 invokes Foot4D3710(0.0), independently of setter admission.
                 actor
@@ -124,22 +68,7 @@ impl Simulation {
                     loco.set_step_head(None);
                 }
             }
-            self.walk_stop_moving(id, rules)?;
-        } else if let Some(destination) = destination
-            && let Some(target) = self
-                .substrate
-                .entities
-                .get_mut(id)
-                .and_then(|actor| actor.movement_target.as_mut())
-            && target.next_index >= target.path.len()
-        {
-            //75BF64 retains a changed destination, even in the same cell when
-            //the height differs. Preserve Foot queue/reference/timers while
-            //retiring only the exhausted route into the existing search request.
-            target.path.clear();
-            target.path_layers.clear();
-            target.next_index = 0;
-            target.final_goal = Some(((destination.x / 256) as u16, (destination.y / 256) as u16));
+            self.walk_stop_moving(id, rules, effects)?;
         }
         Ok(())
     }
@@ -150,70 +79,74 @@ impl Simulation {
         &mut self,
         id: u64,
         coord: DriveCoord,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
+        effects: &mut FrameEffects<'_>,
     ) {
         let Some(old_cell) = self
             .substrate
             .entities
             .get(id)
-            .map(|e| (e.position.rx, e.position.ry))
+            .map(|e| (e.position.rx(), e.position.ry()))
         else {
             return;
         };
-        self.foot_mark_remove(id, rules, registry);
+        self.foot_mark_remove(id, rules, registry, effects);
+        //75C12E: SetLocation (vt+0x1B4).
+        ground_pose::foot_set_location(
+            &mut self.substrate.entities,
+            id,
+            coord,
+            rules,
+            &self.interner,
+        );
         let Some(e) = self.substrate.entities.get_mut(id) else {
             return;
         };
-        put_walk_coords(&mut e.position, coord);
-        let cell = (e.position.rx, e.position.ry);
-        let active_layer = e
-            .movement_target
-            .as_ref()
-            .map(|t| t.layer_at(t.next_index))
-            .unwrap_or_else(|| {
-                if e.on_bridge {
-                    MovementLayer::Bridge
-                } else {
-                    MovementLayer::Ground
-                }
-            });
+        let cell = (e.position.rx(), e.position.ry());
         // Recalc may replace the canonical PathGrid. Read its current cell
         // flags after REMOVE, then SetHeight samples current resolved terrain.
         let update = super::movement_bridge::resolve_cell_transition_bridge_state(
             &mut e.position,
             self.path_grid.as_deref(),
+            self.resolved_terrain.as_ref(),
             old_cell,
             cell,
-            e.on_bridge,
+            e.on_bridge.get(),
         );
         super::movement_bridge::apply_bridge_layer_state(
             &mut e.locomotor,
             &mut e.on_bridge,
-            active_layer,
             update,
         );
-        ground_pose::set_height(
-            &mut e.position,
-            e.on_bridge,
+        let on_bridge = e.on_bridge();
+        e.position.set_height(
+            on_bridge,
             0,
             self.resolved_terrain.as_ref(),
             self.path_grid.as_deref(),
         );
         // OccupancyGrid is a list projection, not an independent subcell
         // reservation chooser. The current coordinate supplies its slot.
-        e.sub_cell = Some(crate::sim::cell_kernel::infantry_preferred_spot(
-            crate::sim::cell_kernel::CellQueryPoint {
-                x: coord.x,
-                y: coord.y,
-            },
-        ));
-        e.navigation.path_runtime.path_blocked = false;
-        self.foot_mark_put(id, rules, registry);
+        if e.locomotor
+            .as_ref()
+            .is_some_and(|l| l.active_kind() == crate::rules::locomotor_type::LocomotorKind::Walk)
+        {
+            e.seldom
+                .sub_cell
+                .hold(crate::sim::cell_kernel::infantry_preferred_spot(
+                    crate::sim::cell_kernel::CellQueryPoint {
+                        x: coord.x,
+                        y: coord.y,
+                    },
+                ));
+            e.navigation.path_runtime_mut().clear_blockage();
+        }
+        self.foot_mark_put(id, rules, registry, effects);
         //75C1EA: the boundary placement tail clears +68A after Mark(PUT).
         //This is not the post-PerCell dead/limbo/falling exit at75C1F1.
         if let Some(e) = self.substrate.entities.get_mut(id) {
-            e.navigation.path_runtime.clear_scold_latch();
+            e.navigation.path_runtime_mut().clear_scold_latch();
         }
     }
 
@@ -221,10 +154,11 @@ impl Simulation {
         &mut self,
         id: u64,
         head: DriveCoord,
-        rules: Option<&RuleSet>,
+        rules: &RuleSet,
         registry: Option<&OverlayTypeRegistry>,
+        effects: &mut FrameEffects<'_>,
     ) -> Result<bool, crate::sim::world::FrameAdvanceError> {
-        self.foot_mark_remove(id, rules, registry);
+        self.foot_mark_remove(id, rules, registry, effects);
         let Some(e) = self.substrate.entities.get_mut(id) else {
             return Ok(false);
         };
@@ -233,86 +167,102 @@ impl Simulation {
             .as_ref()
             .and_then(|l| l.step_head())
             .unwrap_or(head);
-        let old_head = e.locomotor.as_ref().and_then(|l| l.step_head());
-        super::path_markers::consume_walk_path_replay(&mut e.navigation.path_replay);
-        put_walk_coords(&mut e.position, head);
-        e.navigation.path_replay.reference_cell =
-            Some((e.position.rx as i16, e.position.ry as i16));
-        if let Some(target) = e.movement_target.as_mut() {
-            //75BD97 consumes the completed path entry without turning toward
-            //its successor. Walk turns only when that head is accepted
-            //(75BC97) or paid (75C035), through the body FacingClass owner.
-            //The generic mover's heading/direction caches do not own Walk.
-            target.next_index += 1;
-        }
+        super::path_markers::consume_walk_path_replay(e.navigation.path_replay_mut());
+        //75BDC0: SetLocation (vt+0x1B4) at the completed head.
+        ground_pose::foot_set_location(
+            &mut self.substrate.entities,
+            id,
+            head,
+            rules,
+            &self.interner,
+        );
+        let Some(e) = self.substrate.entities.get_mut(id) else {
+            return Ok(false);
+        };
+        e.navigation
+            .path_replay_mut()
+            .rebase((e.position.rx() as i16, e.position.ry() as i16));
         //Infantry+1CC=5F5FA0; marked is already false, so the SetHeight0
         //receiver samples current ground+OnBridge without nested Mark calls.
-        ground_pose::set_height(
-            &mut e.position,
-            e.on_bridge,
+        let on_bridge = e.on_bridge();
+        e.position.set_height(
+            on_bridge,
             0,
             self.resolved_terrain.as_ref(),
             self.path_grid.as_deref(),
         );
-        let current = ground_pose::position_world_coord(&e.position);
-        let owner = e.owner();
-        if let Some(old) = old_head {
-            super::walk_head::raw_at(
-                &mut self.substrate.raw_cell_occupation,
-                owner,
-                old,
-                false,
-                self.resolved_terrain.as_ref(),
-                self.path_grid.as_deref(),
-            );
-        }
-        if let Some(loco) = e.locomotor.as_mut() {
-            loco.set_step_head(None);
-            loco.subcell_dest = Some((e.position.sub_x, e.position.sub_y));
-        }
         //75BE11 clears only the paid-step latch before head retirement/PerCell.
-        e.navigation.path_runtime.path_blocked = false;
-        e.sub_cell = Some(super::bump_crush::priority_sub_cell(
-            e.position.sub_x,
-            e.position.sub_y,
-        ));
-        super::walk_head::raw_at(
-            &mut self.substrate.raw_cell_occupation,
-            owner,
-            current,
-            true,
-            self.resolved_terrain.as_ref(),
-            self.path_grid.as_deref(),
-        );
+        e.navigation.path_runtime_mut().clear_blockage();
+        let mech = e
+            .locomotor
+            .as_ref()
+            .is_some_and(|l| l.active_kind() == crate::rules::locomotor_type::LocomotorKind::Mech);
+        if !mech {
+            let (sub_x, sub_y) = (e.position.sub_x(), e.position.sub_y());
+            e.seldom.sub_cell.hold_offset(sub_x, sub_y);
+        }
+        //75BE18: FindSubCellDest(null) retires the head, clearing its raw
+        //bits and marking the Foot's own.
+        self.walk_find_sub_cell_dest(id, None, rules, registry, effects)
+            .map_err(|cause| crate::sim::world::FrameAdvanceError {
+                tick: self.session.tick(),
+                binary_frame: self.session.binary_frame(),
+                entity_id: id,
+                cause,
+            })?;
+        //75BE20..75BE2F calls Foot4D3710(0.0) for the -1 path head BEFORE
+        //PerCell can conceal a boarding passenger and skip the finish suffix.
+        //An intermediate head retains its fraction. Native execution controls:
+        //tools/spatial_oracle/foot_speed_owner.walk_arrival.json (Steam gamemd).
+        if let Some(e) = self.substrate.entities.get_mut(id)
+            && e.navigation.path_replay().remaining_directions().is_empty()
+        {
+            e.foot_speed
+                .set_speed_fraction(crate::util::fixed_math::SIM_ZERO);
+        }
+        // Mech 5B12A1..5B136C enables Unit raw occupation and settles
+        // navigation before Per_Cell_Process. Walk settles after the callback.
+        if mech {
+            if let Some(actor) = self.substrate.entities.get_mut(id) {
+                actor.foot_occupation_enabled.resume();
+            }
+            self.finish_walk_navigation(id, rules, effects)
+                .map_err(|cause| crate::sim::world::FrameAdvanceError {
+                    tick: self.session.tick(),
+                    binary_frame: self.session.binary_frame(),
+                    entity_id: id,
+                    cause,
+                })?;
+        }
         //75BE3C: Per_Cell_Process(2); 75BE42..75BE69 then leaves at 75C1F1
         //for a dead, limboed or falling owner.
-        let changed =
-            self.per_cell_process(id, super::per_cell::PerCellReason::Arrival, rules, registry)?;
+        let changed = self.per_cell_process(
+            id,
+            super::per_cell::PerCellReason::Arrival,
+            rules,
+            registry,
+            effects,
+        )?;
         if !self.track_survives(id) {
             return Ok(changed);
         }
-        self.finish_walk_navigation(id, rules).map_err(|cause| {
-            crate::sim::world::FrameAdvanceError {
-                tick: self.session.tick,
-                binary_frame: self.session.binary_frame,
-                entity_id: id,
-                cause,
-            }
-        })?;
-        self.foot_mark_put(id, rules, registry);
+        if mech {
+            self.mech_crush_ahead(id, rules);
+        } else {
+            self.finish_walk_navigation(id, rules, effects)
+                .map_err(|cause| crate::sim::world::FrameAdvanceError {
+                    tick: self.session.tick(),
+                    binary_frame: self.session.binary_frame(),
+                    entity_id: id,
+                    cause,
+                })?;
+        }
+        self.foot_mark_put(id, rules, registry, effects);
         //75BF77 follows the final Mark(PUT). The earlier post-PerCell exits
         //jump to75C1F1 and must retain the byte on a surviving object.
         if let Some(e) = self.substrate.entities.get_mut(id) {
-            e.navigation.path_runtime.clear_scold_latch();
+            e.navigation.path_runtime_mut().clear_scold_latch();
         }
         Ok(changed)
     }
-}
-
-fn put_walk_coords(position: &mut crate::sim::components::Position, coord: DriveCoord) {
-    position.rx = (coord.x / 256) as u16;
-    position.ry = (coord.y / 256) as u16;
-    position.sub_x = crate::util::fixed_math::SimFixed::from_num(coord.x % 256);
-    position.sub_y = crate::util::fixed_math::SimFixed::from_num(coord.y % 256);
-    position.exact_z_leptons = Some(coord.z);
 }

@@ -13,9 +13,8 @@ use crate::map::playfield::PlayfieldBounds;
 use crate::map::preview::DecodedPreview;
 use crate::map::waypoints::Waypoint;
 use crate::skirmish_launch::{LaunchCountry, SkirmishLaunchMode, SkirmishLaunchSession};
-use crate::ui::shell::geom::RectPx;
+use crate::ui::shell::geom::{RectPx, SHELL_BASE_H, SHELL_BASE_W, ShellScale};
 
-const NATIVE_START_LIMIT: u32 = 8;
 const PREVIEW_SCALE: i64 = 1_000;
 const MARKER_FRACTION_SCALE: i64 = 1_000_000;
 const MMPB_OFFSET_X: i64 = -3;
@@ -30,11 +29,6 @@ const NARROW_ART_SIZE: [i32; 2] = [640, 480];
 const WIDE_ART_SIZE: [i32; 2] = [800, 600];
 
 /// Skirmish mode whose briefing block sits lower on the loading screen.
-const COOPERATIVE_MODE_OVERRIDE_FILE: &str = "MPCoopMD.ini";
-
-/// Bitmap the random-map setup dialog writes and the preview source the
-/// random-map loading branch consumes.
-pub(crate) const RANDOM_MAP_PREVIEW_FILE: &str = "RandMap.img";
 
 /// Loading-art viewport size for the current screen width.
 pub(crate) const fn loading_art_viewport_size(render_width: u32) -> [i32; 2] {
@@ -42,6 +36,30 @@ pub(crate) const fn loading_art_viewport_size(render_width: u32) -> [i32; 2] {
         NARROW_ART_SIZE
     } else {
         WIDE_ART_SIZE
+    }
+}
+
+/// The mapping the loading screen paints in. gamemd centers the art viewport in
+/// the window and draws it 1:1; a window the shell family fits instead scales the
+/// authored dialog to fit it, centred, so every authored rect maps through this
+/// scale. `RETAIL_SCALE` leaves every path exactly as gamemd has it.
+pub(crate) fn loading_screen_scale(fill_window: bool, render_size: [u32; 2]) -> ShellScale {
+    if fill_window {
+        crate::ui::shell::geom::shell_scale(render_size[0] as i32, render_size[1] as i32)
+    } else {
+        crate::ui::shell::geom::RETAIL_SCALE
+    }
+}
+
+/// The size the loading layers are authored in: the live window at retail, and the
+/// dialog a scaled page grows into the window. Every layer's geometry — the
+/// narrow/wide art branch, the centered origin and each rect — is computed from
+/// this size first, then mapped through the scale, so the two paths cannot drift.
+pub(crate) fn loading_authored_size(render_size: [u32; 2], scale: ShellScale) -> [u32; 2] {
+    if scale.is_unscaled() {
+        render_size
+    } else {
+        [SHELL_BASE_W as u32, SHELL_BASE_H as u32]
     }
 }
 
@@ -75,6 +93,13 @@ impl MmpbRegionRect {
             width,
             height,
         }
+    }
+
+    /// The region a stretched page draws its preview into: the native rect grown
+    /// by the layout's scale. Identity on the retail mapping.
+    pub(crate) fn scaled(self, scale: ShellScale) -> Self {
+        let rect = scale.scale_rect(RectPx::new(self.x, self.y, self.width, self.height));
+        Self::new(rect.x, rect.y, rect.w, rect.h)
     }
 }
 
@@ -126,6 +151,7 @@ pub(crate) struct MmpbMarkerAnchor {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum LoadingParticipantId {
     Local,
+    Human(usize),
     Opponent(usize),
 }
 
@@ -156,89 +182,34 @@ pub(crate) struct PreparedLoadingPreview {
     pub fit: PreviewAspectFit,
 }
 
-/// Static CSF keys selected from the resolved local country.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Owned CSF labels selected from stock literals or the retained Country.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LoadingCountryTextKeys {
-    pub country_name: &'static str,
-    pub special_unit: &'static str,
-    pub load_brief: &'static str,
+    pub country_name: String,
+    pub special_unit: String,
+    pub load_brief: String,
 }
-
-const COUNTRY_TEXT_KEYS: [LoadingCountryTextKeys; 10] = [
-    LoadingCountryTextKeys {
-        country_name: "Name:Americans",
-        special_unit: "Name:Para",
-        load_brief: "LoadBrief:USA",
-    },
-    LoadingCountryTextKeys {
-        country_name: "Name:Alliance",
-        special_unit: "Name:BEAGLE",
-        load_brief: "LoadBrief:Korea",
-    },
-    LoadingCountryTextKeys {
-        country_name: "Name:French",
-        special_unit: "Name:GTGCAN",
-        load_brief: "LoadBrief:French",
-    },
-    LoadingCountryTextKeys {
-        country_name: "Name:Germans",
-        special_unit: "Name:TNKD",
-        load_brief: "LoadBrief:Germans",
-    },
-    LoadingCountryTextKeys {
-        country_name: "Name:British",
-        special_unit: "Name:SNIPE",
-        load_brief: "LoadBrief:British",
-    },
-    LoadingCountryTextKeys {
-        country_name: "Name:Africans",
-        special_unit: "Name:DTRUCK",
-        load_brief: "LoadBrief:Lybia",
-    },
-    LoadingCountryTextKeys {
-        country_name: "Name:Arabs",
-        special_unit: "Name:DESO",
-        load_brief: "LoadBrief:Iraq",
-    },
-    LoadingCountryTextKeys {
-        country_name: "Name:Confederation",
-        special_unit: "Name:TERROR",
-        load_brief: "LoadBrief:Cuba",
-    },
-    LoadingCountryTextKeys {
-        country_name: "Name:Russians",
-        special_unit: "Name:TTNK",
-        load_brief: "LoadBrief:Russia",
-    },
-    LoadingCountryTextKeys {
-        country_name: "Name:YuriCountry",
-        special_unit: "Name:YURI",
-        load_brief: "LoadBrief:YuriCountry",
-    },
-];
 
 pub(crate) const LOADING_TEXT_KEY: &str = "GUI:LoadingEx";
 
 /// Resolve the verified country-dependent key row without inventing fallback text.
-pub(crate) const fn loading_country_text_keys(country: LaunchCountry) -> LoadingCountryTextKeys {
-    COUNTRY_TEXT_KEYS[match country {
-        LaunchCountry::America => 0,
-        LaunchCountry::Korea => 1,
-        LaunchCountry::France => 2,
-        LaunchCountry::Germany => 3,
-        LaunchCountry::GreatBritain => 4,
-        LaunchCountry::Libya => 5,
-        LaunchCountry::Iraq => 6,
-        LaunchCountry::Cuba => 7,
-        LaunchCountry::Russia => 8,
-        LaunchCountry::Yuri => 9,
-    }]
+pub(crate) fn loading_country_text_keys(country: LaunchCountry) -> Option<LoadingCountryTextKeys> {
+    crate::rules::country_loading::stock_country_loading(usize::from(country.raw_index())).map(
+        |row| {
+            let [name, special, brief] = row.labels();
+            LoadingCountryTextKeys {
+                country_name: name.into(),
+                special_unit: special.into(),
+                load_brief: brief.into(),
+            }
+        },
+    )
 }
 
 /// Localized strings retained by the immutable loading composition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LocalizedLoadingTextSnapshot {
-    pub keys: LoadingCountryTextKeys,
+    pub keys: Option<LoadingCountryTextKeys>,
     pub country_name: Option<String>,
     pub special_unit: Option<String>,
     pub load_brief: Option<String>,
@@ -262,14 +233,22 @@ pub(crate) fn localize_loading_text(
     csf: &CsfFile,
     country: LaunchCountry,
 ) -> LocalizedLoadingTextSnapshot {
-    let keys = loading_country_text_keys(country);
+    localize_country_keys(csf, loading_country_text_keys(country))
+}
+
+fn localize_country_keys(
+    csf: &CsfFile,
+    keys: Option<LoadingCountryTextKeys>,
+) -> LocalizedLoadingTextSnapshot {
+    let text = |key: &str| (!key.is_empty()).then(|| csf.text(key).into_owned());
     LocalizedLoadingTextSnapshot {
+        country_name: keys.as_ref().and_then(|keys| text(&keys.country_name)),
+        special_unit: keys
+            .as_ref()
+            .and_then(|keys| text(&keys.special_unit))
+            .map(|text| native_uppercase_special_unit(&text)),
+        load_brief: keys.as_ref().and_then(|keys| text(&keys.load_brief)),
         keys,
-        country_name: Some(csf.text(keys.country_name).into_owned()),
-        special_unit: Some(native_uppercase_special_unit(
-            csf.text(keys.special_unit).as_ref(),
-        )),
-        load_brief: Some(csf.text(keys.load_brief).into_owned()),
         loading: Some(csf.text(LOADING_TEXT_KEY).into_owned()),
     }
 }
@@ -287,12 +266,15 @@ pub(crate) struct LoadingTextRects {
 ///
 /// The Cooperative briefing Y only exists in the 800 table: gamemd's Cooperative
 /// branch collapses to the same values as the plain branch at exactly 640 wide.
+/// The tables are authored numbers, so a stretched page maps them through its
+/// scale after the offset, keeping the copy on the art it labels.
 pub(crate) fn loading_text_rects(
     render_size: [u32; 2],
     mode: &SkirmishLaunchMode,
+    scale: ShellScale,
 ) -> LoadingTextRects {
-    let [width, _] = render_size;
-    let table = if width == NARROW_LOADING_SCREEN_WIDTH {
+    let authored = loading_authored_size(render_size, scale);
+    let table = if authored[0] == NARROW_LOADING_SCREEN_WIDTH {
         LoadingTextRects {
             country_name: RectPx::new(385, 436, 200, 20),
             special_unit: RectPx::new(16, 72, 200, 20),
@@ -300,9 +282,7 @@ pub(crate) fn loading_text_rects(
             loading: RectPx::new(16, 235, 200, 20),
         }
     } else {
-        let cooperative = mode
-            .override_file
-            .eq_ignore_ascii_case(COOPERATIVE_MODE_OVERRIDE_FILE);
+        let cooperative = mode.class == crate::skirmish_modes::MpModeClass::Cooperative;
         LoadingTextRects {
             country_name: RectPx::new(540, 310, 200, 20),
             special_unit: RectPx::new(20, 90, 200, 20),
@@ -311,12 +291,13 @@ pub(crate) fn loading_text_rects(
         }
     };
 
-    let [dx, dy] = loading_base_origin(render_size);
+    let [dx, dy] = loading_base_origin(authored);
+    let place = |rect: RectPx| scale.scale_rect(rect.translate(dx, dy));
     LoadingTextRects {
-        country_name: table.country_name.translate(dx, dy),
-        special_unit: table.special_unit.translate(dx, dy),
-        load_brief: table.load_brief.translate(dx, dy),
-        loading: table.loading.translate(dx, dy),
+        country_name: place(table.country_name),
+        special_unit: place(table.special_unit),
+        load_brief: place(table.load_brief),
+        loading: place(table.loading),
     }
 }
 
@@ -342,11 +323,44 @@ pub(crate) enum LoadingCompositionLayer {
 /// Immutable CPU-side input for every selected-map loading presentation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LoadingCompositionSnapshot {
+    /// The mapping [`Self::text_rects`] and the preview region were placed in, so
+    /// the paint path scales the art it draws beside them the same way.
+    pub scale: ShellScale,
     pub preview: Option<PreparedLoadingPreview>,
     pub markers: Vec<MmpbMarkerRecord>,
     pub text: LocalizedLoadingTextSnapshot,
     pub text_rects: LoadingTextRects,
     pub layers: Vec<LoadingCompositionLayer>,
+}
+
+impl LoadingCompositionSnapshot {
+    /// Ares553820/553B3B/553E54 use the actual retained Country label records,
+    /// keeping the shared localization, special uppercase and layout owners.
+    pub(crate) fn bind_country_loading(
+        &mut self,
+        loading: &crate::rules::country_loading::AresCountryLoading,
+        csf: Option<&CsfFile>,
+    ) {
+        let [name, special, brief] = loading.labels();
+        let keys = LoadingCountryTextKeys {
+            country_name: name.into(),
+            special_unit: special.into(),
+            load_brief: brief.into(),
+        };
+        self.text = if let Some(csf) = csf {
+            localize_country_keys(csf, Some(keys))
+        } else {
+            LocalizedLoadingTextSnapshot {
+                keys: Some(keys),
+                country_name: None,
+                special_unit: None,
+                load_brief: None,
+                loading: None,
+            }
+        };
+        self.layers =
+            composition_layers(self.preview.is_some(), !self.markers.is_empty(), &self.text);
+    }
 }
 
 /// Build a complete selected-map snapshot after the map's initial parse.
@@ -355,10 +369,14 @@ pub(crate) fn build_loading_composition(
     session: &SkirmishLaunchSession,
     csf: Option<&CsfFile>,
     render_size: [u32; 2],
+    scale: ShellScale,
     assignments: &[LoadingStartAssignment],
 ) -> LoadingCompositionSnapshot {
-    let region = mmpb_region_rect(render_size[0]);
-    let prefix = native_loading_waypoint_prefix(&map.waypoints);
+    let region = mmpb_region_rect(loading_authored_size(render_size, scale)[0]).scaled(scale);
+    let slot_limit = crate::map::waypoints::multiplayer_start_slot_limit(
+        crate::map::waypoints::skirmish_player_capacity(&map.ini),
+    );
+    let prefix = native_loading_waypoint_prefix(&map.waypoints, slot_limit);
     let bounds = projected_playfield_bounds(map);
 
     let mut markers = Vec::new();
@@ -371,13 +389,13 @@ pub(crate) fn build_loading_composition(
             let fit = aspect_fit_preview(region, preview.width, preview.height)?;
             let mut image = preview.clone();
             if let Some(bounds) = bounds {
-                burn_black_start_indicators(&mut image, &prefix, bounds);
+                burn_black_start_indicators(&mut image, &prefix, bounds, 0);
                 markers = build_mmpb_marker_records(&prefix, assignments, bounds, region, fit);
             }
             Some(PreparedLoadingPreview { image, region, fit })
         });
 
-    finish_loading_composition(session, csf, render_size, preview, markers)
+    finish_loading_composition(session, csf, render_size, scale, preview, markers)
 }
 
 /// Build the snapshot for a random-map seed load.
@@ -400,26 +418,33 @@ pub(crate) fn build_random_map_loading_composition(
     session: &SkirmishLaunchSession,
     csf: Option<&CsfFile>,
     render_size: [u32; 2],
+    scale: ShellScale,
     preview_image: Option<DecodedPreview>,
     launch_map: &MapFile,
     active_scenario_waypoints: &HashMap<u32, Waypoint>,
     assignments: &[LoadingStartAssignment],
 ) -> LoadingCompositionSnapshot {
-    let region = mmpb_region_rect(render_size[0]);
+    let region = mmpb_region_rect(loading_authored_size(render_size, scale)[0]).scaled(scale);
     let mut markers = Vec::new();
     let preview = preview_image
         .filter(valid_preview_buffer)
         .and_then(|mut image| {
             let fit = aspect_fit_preview(region, image.width, image.height)?;
-            let prefix = native_loading_waypoint_prefix(active_scenario_waypoints);
+            // The active array holds only the staged starts, so every staging
+            // slot is a start slot.
+            let prefix = native_loading_waypoint_prefix(
+                active_scenario_waypoints,
+                crate::map::preview::START_STAGING_SLOTS as u32,
+            );
             if let Some(bounds) = projected_playfield_bounds(launch_map) {
-                burn_black_start_indicators(&mut image, &prefix, bounds);
+                let halvings = random_map_preview_halvings(image.width, bounds);
+                burn_black_start_indicators(&mut image, &prefix, bounds, halvings);
                 markers = build_mmpb_marker_records(&prefix, assignments, bounds, region, fit);
             }
             Some(PreparedLoadingPreview { image, region, fit })
         });
 
-    finish_loading_composition(session, csf, render_size, preview, markers)
+    finish_loading_composition(session, csf, render_size, scale, preview, markers)
 }
 
 /// Attach the map-independent layers — the four localized text strings and their
@@ -428,17 +453,29 @@ fn finish_loading_composition(
     session: &SkirmishLaunchSession,
     csf: Option<&CsfFile>,
     render_size: [u32; 2],
+    scale: ShellScale,
     preview: Option<PreparedLoadingPreview>,
     markers: Vec<MmpbMarkerRecord>,
 ) -> LoadingCompositionSnapshot {
-    let country = session.local.country;
+    let country = session.local_slot().country;
     let text = csf.map_or_else(
         || LocalizedLoadingTextSnapshot::missing(country),
         |csf| localize_loading_text(csf, country),
     );
-    let text_rects = loading_text_rects(render_size, &session.mode);
+    let text_rects = loading_text_rects(render_size, &session.mode, scale);
+    // Original RA2 bakes the selected country's flag into the skirmish loading
+    // background SHP itself; the engine draws no minimap in the `mmpb` region —
+    // that is a Yuri's Revenge addition. Drop the map preview and its
+    // assigned-start markers under `-ra2` so only the authored flag shows.
+    // Campaign loads use a separate presentation and never reach this path.
+    let (preview, markers) = if crate::util::ra2_launch::enabled() {
+        (None, Vec::new())
+    } else {
+        (preview, markers)
+    };
     let layers = composition_layers(preview.is_some(), !markers.is_empty(), &text);
     LoadingCompositionSnapshot {
+        scale,
         preview,
         markers,
         text,
@@ -494,9 +531,66 @@ pub(crate) fn projected_playfield_bounds(map: &MapFile) -> Option<ProjectedPlayf
     })
 }
 
-/// Reproduce the valid-count-then-numeric-prefix behavior over waypoint indices 0..7.
-pub(crate) fn native_loading_waypoint_prefix(waypoints: &HashMap<u32, Waypoint>) -> Vec<Waypoint> {
-    let valid_count = (0..NATIVE_START_LIMIT)
+/// `ComputeScenarioHeaderFromMap 0x0058B820` over a generated map: the
+/// leading defined start waypoints 0..7 (the loop stops at the first
+/// undefined one, `0x0058B858`) give the staged pairs through the same
+/// `0x006D62E0` projection divided by 60 and 30, and the playfield cells give
+/// the minimum and span (`0x0058B91F..0x0058BA14`). The cells are the start
+/// waypoints by slot, as the `'W'` sender reads them (`0x005E7F38..`).
+/// RESIDUAL: native gates the bounds with `IsCellInPlayfield` mode 1
+/// (`0x0058B953`, level and slope aware); this reuses the compositor's mode-0
+/// bounds, which can differ by a unit at the playfield's edge.
+pub(crate) fn scenario_start_staging(
+    map: &MapFile,
+    start_waypoints: &[(u8, u16, u16)],
+) -> crate::map::preview::ScenarioStartStaging {
+    use crate::map::preview::{START_STAGING_SLOTS, ScenarioStartStaging};
+    let mut staging = ScenarioStartStaging::default();
+    let cell = |slot: usize| {
+        start_waypoints
+            .iter()
+            .find(|(index, _, _)| usize::from(*index) == slot)
+            .map(|&(_, rx, ry)| (rx, ry))
+    };
+    for slot in 0..START_STAGING_SLOTS {
+        if let Some((rx, ry)) = cell(slot) {
+            staging.cells[slot] = (rx as i16, ry as i16);
+        }
+    }
+    for slot in 0..START_STAGING_SLOTS {
+        let Some((rx, ry)) = cell(slot) else {
+            break;
+        };
+        let point = project_cell(rx, ry);
+        staging.pairs[slot] = (point.x, point.y);
+        staging.count += 1;
+    }
+    // The minimum starts at 10000 and the maximum at 0 (0x0058B929).
+    let bounds = projected_playfield_bounds(map).unwrap_or(ProjectedPlayfieldBounds {
+        min_x: 10_000,
+        min_y: 10_000,
+        extent_x: -10_000,
+        extent_y: -10_000,
+    });
+    staging.start_x = bounds.min_x;
+    staging.start_y = bounds.min_y;
+    staging.width = bounds.extent_x;
+    staging.height = bounds.extent_y;
+    staging
+}
+
+/// Reproduce the valid-count-then-numeric-prefix behavior over waypoint indices
+/// `0..slot_limit`.
+///
+/// gamemd's compositor `FUN_00640A40` visits waypoints 0..7. VERA extension: a
+/// map that declares 9–30 starts, or a random map staged for more than eight
+/// players, passes its larger start-slot count (the limit Gather uses), so
+/// every start gets its marker. Ordinary maps pass 8 and play as gamemd.
+pub(crate) fn native_loading_waypoint_prefix(
+    waypoints: &HashMap<u32, Waypoint>,
+    slot_limit: u32,
+) -> Vec<Waypoint> {
+    let valid_count = (0..slot_limit)
         .filter(|index| waypoints.contains_key(index))
         .count() as u32;
     (0..valid_count)
@@ -589,25 +683,42 @@ pub(crate) fn build_mmpb_marker_records(
 
 /// Burn clipped opaque-black `4x4` source rectangles before preview aspect fitting.
 ///
+/// VERA extension: on a `RandMap.img` written at half size `halvings` times
+/// ([`random_map_preview_halvings`]) each rectangle and its place shrink the
+/// same way; at zero this is the native burn.
+///
 /// Returns the number of indicators that wrote at least one in-bounds pixel.
 pub(crate) fn burn_black_start_indicators(
     preview: &mut DecodedPreview,
     prefix: &[Waypoint],
     bounds: ProjectedPlayfieldBounds,
+    halvings: u32,
 ) -> usize {
     if !valid_preview_buffer(preview) {
         return 0;
     }
+    let size = (START_INDICATOR_SIZE >> halvings).max(1);
     let mut written = 0;
     for waypoint in prefix {
         let point = project_waypoint(*waypoint);
-        let x = (i64::from(point.x) - i64::from(bounds.min_x)) * 2 - 1;
-        let y = i64::from(point.y) - i64::from(bounds.min_y) - 1;
-        if fill_black_rect_clipped(preview, x, y) {
+        let x = ((i64::from(point.x) - i64::from(bounds.min_x)) * 2 - 1) >> halvings;
+        let y = (i64::from(point.y) - i64::from(bounds.min_y) - 1) >> halvings;
+        if fill_black_rect_clipped(preview, x, y, size) {
             written += 1;
         }
     }
     written
+}
+
+/// VERA: how many times a random map's preview was halved to fit a room's
+/// preview transfer (`shell_random_map::write_random_map_preview_to_dir`):
+/// the full preview is twice the projected width across. Zero for every size
+/// the original game makes.
+fn random_map_preview_halvings(width: u32, bounds: ProjectedPlayfieldBounds) -> u32 {
+    let full = i64::from(bounds.extent_x) * 2;
+    (0..8)
+        .take_while(|halvings| full >> (halvings + 1) >= i64::from(width))
+        .count() as u32
 }
 
 fn valid_preview_buffer(preview: &DecodedPreview) -> bool {
@@ -625,16 +736,16 @@ fn valid_preview_buffer(preview: &DecodedPreview) -> bool {
         && preview.height != 0
 }
 
-fn fill_black_rect_clipped(preview: &mut DecodedPreview, x: i64, y: i64) -> bool {
+fn fill_black_rect_clipped(preview: &mut DecodedPreview, x: i64, y: i64, size: i64) -> bool {
     let width = i64::from(preview.width);
     let height = i64::from(preview.height);
     let mut wrote = false;
-    for offset_y in 0..START_INDICATOR_SIZE {
+    for offset_y in 0..size {
         let pixel_y = y + offset_y;
         if !(0..height).contains(&pixel_y) {
             continue;
         }
-        for offset_x in 0..START_INDICATOR_SIZE {
+        for offset_x in 0..size {
             let pixel_x = x + offset_x;
             if !(0..width).contains(&pixel_x) {
                 continue;
@@ -698,12 +809,17 @@ fn composition_layers(
     layers
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 mod tests {
     use super::*;
 
     fn mode(override_file: &str) -> SkirmishLaunchMode {
         SkirmishLaunchMode {
+            class: if override_file.eq_ignore_ascii_case("MPCoopMD.ini") {
+                crate::skirmish_modes::MpModeClass::Cooperative
+            } else {
+                crate::skirmish_modes::MpModeClass::Battle
+            },
             id: 0,
             ui_name_key: String::new(),
             tooltip_key: String::new(),
@@ -804,7 +920,7 @@ mod tests {
             (4, waypoint(4, 4, 4)),
             (5, waypoint(5, 5, 5)),
         ]);
-        let prefix = native_loading_waypoint_prefix(&waypoints);
+        let prefix = native_loading_waypoint_prefix(&waypoints, 8);
         assert_eq!(
             prefix
                 .iter()
@@ -812,39 +928,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 1]
         );
-    }
-
-    #[test]
-    fn marker_records_preserve_start_participant_and_color_identity() {
-        let prefix = [waypoint(0, 0, 0), waypoint(1, 1, 0)];
-        let assignments = [
-            LoadingStartAssignment {
-                start_index: 1,
-                participant: LoadingParticipantId::Local,
-                color_priority: 7,
-            },
-            LoadingStartAssignment {
-                start_index: 0,
-                participant: LoadingParticipantId::Opponent(0),
-                color_priority: 2,
-            },
-        ];
-        let bounds = ProjectedPlayfieldBounds {
-            min_x: 250,
-            min_y: 0,
-            extent_x: 20,
-            extent_y: 20,
-        };
-        let region = mmpb_region_rect(640);
-        let fit = aspect_fit_preview(region, 100, 100).expect("valid fit");
-        let markers = build_mmpb_marker_records(&prefix, &assignments, bounds, region, fit);
-        assert_eq!(markers.len(), 2);
-        assert_eq!(markers[0].start_index, 0);
-        assert_eq!(markers[0].participant, LoadingParticipantId::Opponent(0));
-        assert_eq!(markers[0].color_priority, 2);
-        assert_eq!(markers[1].start_index, 1);
-        assert_eq!(markers[1].participant, LoadingParticipantId::Local);
-        assert_eq!(markers[1].color_priority, 7);
     }
 
     #[test]
@@ -865,9 +948,62 @@ mod tests {
                 extent_x: 1,
                 extent_y: 1,
             },
+            0,
         );
         assert_eq!(written, 1);
         assert_eq!(preview.rgba, [0, 0, 0, 255].repeat(9));
+    }
+
+    /// VERA: a random map's preview written at half size takes its black
+    /// squares at half size and half the distance, so a start in its right
+    /// half still gets one.
+    #[test]
+    fn a_halved_random_map_preview_takes_halved_start_squares() {
+        let start = waypoint(0, 0, 0);
+        let point = project_waypoint(start);
+        let bounds = ProjectedPlayfieldBounds {
+            min_x: point.x - 10,
+            min_y: point.y - 2,
+            extent_x: 12,
+            extent_y: 8,
+        };
+        assert_eq!(random_map_preview_halvings(24, bounds), 0);
+        assert_eq!(random_map_preview_halvings(12, bounds), 1);
+        let mut preview = DecodedPreview {
+            width: 12,
+            height: 4,
+            rgba: vec![255; 12 * 4 * 4],
+        };
+        let halvings = random_map_preview_halvings(preview.width, bounds);
+        assert_eq!(
+            burn_black_start_indicators(&mut preview, &[start], bounds, halvings),
+            1
+        );
+        // Full size puts the square at (19, 1); half size at (9, 0), 2x2.
+        let black: Vec<(u32, u32)> = (0..preview.height)
+            .flat_map(|y| (0..preview.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| preview.rgba[((y * preview.width + x) * 4) as usize] == 0)
+            .collect();
+        assert_eq!(black, [(9, 0), (10, 0), (9, 1), (10, 1)]);
+    }
+
+    #[test]
+    fn allocated_country_has_no_stock_text_identity() {
+        let csf = test_csf(&[
+            ("Name:YuriCountry", "Yuri"),
+            ("Name:YURI", "Yuri Clone"),
+            ("LoadBrief:YuriCountry", "A stock briefing"),
+            ("GUI:LoadingEx", "Loading..."),
+        ]);
+        for index in [10, 13, 14] {
+            let country = LaunchCountry::from_country_index(index);
+            let text = localize_loading_text(&csf, country);
+            assert!(text.keys.is_none());
+            assert!(text.country_name.is_none());
+            assert!(text.special_unit.is_none());
+            assert!(text.load_brief.is_none());
+            assert_eq!(text.loading.as_deref(), Some("Loading..."));
+        }
     }
 
     #[test]
@@ -886,7 +1022,7 @@ mod tests {
         ];
         let briefs = countries
             .map(loading_country_text_keys)
-            .map(|keys| keys.load_brief);
+            .map(|keys| keys.unwrap().load_brief);
         assert_eq!(
             briefs,
             [
@@ -923,23 +1059,26 @@ mod tests {
         use crate::skirmish_launch::{
             LaunchStartPosition, LaunchTeam, SkirmishLaunchOptions, SkirmishLocalSlot,
         };
-        SkirmishLaunchSession {
-            mode: mode("MPBattleMD.ini"),
-            selected_map_file: Some(RANDMAP_SED_FIXTURE.to_owned()),
-            player_name: "Player".to_owned(),
-            local: SkirmishLocalSlot {
-                country: LaunchCountry::America,
-                country_random: false,
-                color_index: 0,
-                color_random: false,
-                start_position: LaunchStartPosition::Position(0),
-                team: LaunchTeam::None,
-            },
-            opponents: Vec::new(),
-            pre_fill_house_roster:
-                crate::skirmish_launch::PreFillHouseRoster::from_compact_skirmish(0),
-            options: SkirmishLaunchOptions::default(),
-        }
+        SkirmishLaunchSession::from_rows(
+            mode("MPBattleMD.ini"),
+            Some(RANDMAP_SED_FIXTURE.to_owned()),
+            vec![crate::skirmish_launch::SkirmishHumanSlot {
+                raw_slot_index: Some(0),
+                name: "Player".to_owned(),
+                slot: SkirmishLocalSlot {
+                    country: LaunchCountry::America,
+                    country_random: false,
+                    color_index: 0,
+                    color_random: false,
+                    start_position: LaunchStartPosition::Position(0),
+                    team: LaunchTeam::None,
+                },
+                role: crate::skirmish_launch::LaunchHumanRole::from_observer(false),
+            }],
+            0,
+            Vec::new(),
+            SkirmishLaunchOptions::default(),
+        )
     }
 
     const RANDMAP_SED_FIXTURE: &str = "RandMap.Sed";
@@ -955,77 +1094,19 @@ mod tests {
     }
 
     #[test]
-    fn text_rects_shift_by_exactly_the_shared_base_origin() {
-        // The split-anchor bug this guards: the text layers moved with the
-        // window while the art and the progress row stayed at (0,0).
-        let battle = mode("MPBattleMD.ini");
-        let anchored = loading_text_rects([800, 600], &battle);
-        let maximized = loading_text_rects([1024, 768], &battle);
-        let [dx, dy] = loading_base_origin([1024, 768]);
-
-        assert_eq!(
-            maximized.country_name,
-            anchored.country_name.translate(dx, dy)
-        );
-        assert_eq!(
-            maximized.special_unit,
-            anchored.special_unit.translate(dx, dy)
-        );
-        assert_eq!(maximized.load_brief, anchored.load_brief.translate(dx, dy));
-        assert_eq!(maximized.loading, anchored.loading.translate(dx, dy));
-    }
-
-    #[test]
-    fn gsi_03_09_missing_random_preview_keeps_text_without_markers() {
-        let csf = test_csf(&[
-            ("Name:Americans", "America"),
-            ("Name:Para", "paradrop"),
-            ("LoadBrief:USA", "A briefing."),
-            ("GUI:LoadingEx", "Loading..."),
-        ]);
-        let map = crate::map::rmg::emit::empty_map_file(
-            &crate::map::rmg::RmgOptions::default(),
-            32,
-            32,
-        );
-        let composition = build_random_map_loading_composition(
-            &test_launch_session(),
-            Some(&csf),
-            [800, 600],
-            None,
-            &map,
-            &map.waypoints,
-            &[],
-        );
-
-        assert_eq!(composition.text.country_name.as_deref(), Some("America"));
-        assert_eq!(composition.text.special_unit.as_deref(), Some("PARADROP"));
-        assert_eq!(composition.text.load_brief.as_deref(), Some("A briefing."));
-        assert_eq!(composition.text.loading.as_deref(), Some("Loading..."));
-        assert_eq!(
-            composition.text_rects,
-            loading_text_rects([800, 600], &mode("MPBattleMD.ini"))
-        );
-        assert!(composition.preview.is_none());
-        assert!(composition.markers.is_empty());
-    }
-
-    #[test]
     fn gsi_03_09_random_preview_aspect_fits_without_invented_starts() {
         let image = DecodedPreview {
             width: 200,
             height: 80,
             rgba: vec![255; 200 * 80 * 4],
         };
-        let map = crate::map::rmg::emit::empty_map_file(
-            &crate::map::rmg::RmgOptions::default(),
-            32,
-            32,
-        );
+        let map =
+            crate::map::rmg::emit::empty_map_file(&crate::map::rmg::RmgOptions::default(), 32, 32);
         let composition = build_random_map_loading_composition(
             &test_launch_session(),
             None,
             [800, 600],
+            crate::ui::shell::geom::RETAIL_SCALE,
             Some(image),
             &map,
             &map.waypoints,
@@ -1044,6 +1125,48 @@ mod tests {
     }
 
     #[test]
+    fn start_staging_counts_the_leading_starts_and_keeps_every_cell() {
+        use crate::map::map_file::MapCell;
+
+        let mut map = crate::map::rmg::emit::empty_map_file(
+            &crate::map::rmg::RmgOptions::default(),
+            100,
+            100,
+        );
+        let empty = scenario_start_staging(&map, &[(0, 70, 70)]);
+        assert_eq!(
+            (empty.start_x, empty.start_y, empty.width, empty.height),
+            (10_000, 10_000, -10_000, -10_000)
+        );
+        let cell = |rx, ry| MapCell {
+            legacy_ice_byte: 0,
+            rx,
+            ry,
+            tile_index: 0,
+            sub_tile: 0,
+            z: 0,
+        };
+        map.cells = vec![cell(60, 60), cell(60, 140), cell(140, 60)];
+        // Slot 2 is undefined: the count and pairs stop there, the cells do not.
+        let staging = scenario_start_staging(&map, &[(3, 100, 100), (0, 70, 70), (1, 90, 80)]);
+        assert_eq!(staging.count, 2);
+        assert_eq!(staging.pairs[0], (256, 70));
+        assert_eq!(staging.pairs[2], (0, 0));
+        assert_eq!(staging.pairs[3], (0, 0));
+        assert_eq!(staging.cells[..4], [(70, 70), (90, 80), (0, 0), (100, 100)]);
+        let bounds = projected_playfield_bounds(&map).expect("inside cells");
+        assert_eq!(
+            (
+                staging.start_x,
+                staging.start_y,
+                staging.width,
+                staging.height
+            ),
+            (bounds.min_x, bounds.min_y, bounds.extent_x, bounds.extent_y)
+        );
+    }
+
+    #[test]
     fn loading_composition_ignores_size_filler_outside_normalized_local_size() {
         use crate::map::map_file::MapCell;
 
@@ -1053,6 +1176,7 @@ mod tests {
             100,
         );
         let cell = |rx, ry| MapCell {
+            legacy_ice_byte: 0,
             rx,
             ry,
             tile_index: 0,
@@ -1075,13 +1199,27 @@ mod tests {
 
         let baseline_bounds =
             projected_playfield_bounds(&map).expect("inside cells establish bounds");
-        let baseline = build_loading_composition(&map, &session, None, [800, 600], &assignments);
+        let baseline = build_loading_composition(
+            &map,
+            &session,
+            None,
+            [800, 600],
+            crate::ui::shell::geom::RETAIL_SCALE,
+            &assignments,
+        );
 
         // (55,55) is inside the RMG Size diamond (104 < x+y) but below the
         // normalized LocalSize near edge (114 < x+y), so native mode zero skips it.
         map.cells.push(cell(55, 55));
         assert_eq!(projected_playfield_bounds(&map), Some(baseline_bounds));
-        let with_filler = build_loading_composition(&map, &session, None, [800, 600], &assignments);
+        let with_filler = build_loading_composition(
+            &map,
+            &session,
+            None,
+            [800, 600],
+            crate::ui::shell::geom::RETAIL_SCALE,
+            &assignments,
+        );
         assert_eq!(with_filler.markers, baseline.markers);
 
         // A genuinely in-playfield cell still extends both projected bounds and
@@ -1089,7 +1227,14 @@ mod tests {
         map.cells.push(cell(150, 60));
         let extended_bounds = projected_playfield_bounds(&map).expect("inside extender");
         assert_ne!(extended_bounds, baseline_bounds);
-        let with_inside = build_loading_composition(&map, &session, None, [800, 600], &assignments);
+        let with_inside = build_loading_composition(
+            &map,
+            &session,
+            None,
+            [800, 600],
+            crate::ui::shell::geom::RETAIL_SCALE,
+            &assignments,
+        );
         assert_ne!(with_inside.markers[0].anchor, baseline.markers[0].anchor);
     }
 
@@ -1104,6 +1249,7 @@ mod tests {
         );
         map.cells = vec![
             MapCell {
+                legacy_ice_byte: 0,
                 rx: 60,
                 ry: 60,
                 tile_index: 0,
@@ -1111,6 +1257,7 @@ mod tests {
                 z: 0,
             },
             MapCell {
+                legacy_ice_byte: 0,
                 rx: 60,
                 ry: 140,
                 tile_index: 0,
@@ -1118,6 +1265,7 @@ mod tests {
                 z: 0,
             },
             MapCell {
+                legacy_ice_byte: 0,
                 rx: 140,
                 ry: 60,
                 tile_index: 0,
@@ -1158,6 +1306,7 @@ mod tests {
             &session,
             Some(&csf),
             [800, 600],
+            crate::ui::shell::geom::RETAIL_SCALE,
             Some(image),
             &map,
             &map.waypoints,
@@ -1169,8 +1318,10 @@ mod tests {
             preview
                 .image
                 .rgba
-                .chunks_exact(4)
-                .filter(|pixel| *pixel == [0, 0, 0, 255])
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|pixel| **pixel == [0, 0, 0, 255])
                 .count(),
             3 * 4 * 4,
             "both assigned starts and the unassigned start are burned black"
@@ -1214,9 +1365,10 @@ mod tests {
         );
         assert_eq!(
             crate::app::loading::progress_row::LoadingProgressRowSnapshot::from_launch_session(
-                &session
+                &session,
+                crate::rules::skirmish_colors::SkirmishColorMode::VANILLA,
             )
-            .label,
+            .local_label(),
             "Player"
         );
     }
@@ -1226,11 +1378,16 @@ mod tests {
         let battle = mode("MPBattleMD.ini");
         let cooperative = mode("MPCoopMD.ini");
         assert_eq!(
-            loading_text_rects([640, 480], &cooperative).load_brief,
+            loading_text_rects(
+                [640, 480],
+                &cooperative,
+                crate::ui::shell::geom::RETAIL_SCALE
+            )
+            .load_brief,
             RectPx::new(16, 126, 318, 104)
         );
         assert_eq!(
-            loading_text_rects([800, 600], &battle),
+            loading_text_rects([800, 600], &battle, crate::ui::shell::geom::RETAIL_SCALE),
             LoadingTextRects {
                 country_name: RectPx::new(540, 310, 200, 20),
                 special_unit: RectPx::new(20, 90, 200, 20),
@@ -1239,12 +1396,81 @@ mod tests {
             }
         );
         assert_eq!(
-            loading_text_rects([1024, 768], &cooperative).load_brief,
+            loading_text_rects(
+                [1024, 768],
+                &cooperative,
+                crate::ui::shell::geom::RETAIL_SCALE
+            )
+            .load_brief,
             RectPx::new(132, 464, 398, 130)
         );
         assert_eq!(
-            loading_text_rects([799, 600], &battle).country_name,
+            loading_text_rects([799, 600], &battle, crate::ui::shell::geom::RETAIL_SCALE)
+                .country_name,
             RectPx::new(540, 310, 200, 20)
+        );
+    }
+
+    #[test]
+    fn a_stretched_loading_screen_grows_one_authored_dialog_into_the_window() {
+        use crate::app::loading::campaign_presentation::CampaignLoadingLayout;
+        use crate::app::loading::progress_row::{
+            LoadingProgressRowPlacement, layout_loading_progress_row,
+        };
+
+        let battle = mode("MPBattleMD.ini");
+        let scale = crate::ui::shell::geom::shell_scale(1600, 1200);
+        let authored =
+            loading_text_rects([800, 600], &battle, crate::ui::shell::geom::RETAIL_SCALE);
+
+        // Every layer places itself in the 800x600 dialog, then maps through the
+        // page scale, so the copy stays on the art it labels at any window size.
+        assert_eq!(
+            loading_text_rects([1600, 1200], &battle, scale),
+            LoadingTextRects {
+                country_name: RectPx::new(1080, 620, 400, 40),
+                special_unit: RectPx::new(40, 180, 400, 40),
+                load_brief: RectPx::new(40, 316, 796, 260),
+                loading: RectPx::new(40, 600, 400, 40),
+            }
+        );
+        assert_eq!(
+            mmpb_region_rect(800).scaled(scale),
+            MmpbRegionRect::new(998, 758, 432, 332)
+        );
+        let row = layout_loading_progress_row(
+            LoadingProgressRowPlacement::StandardSkirmish {
+                render_size: [1600, 1200],
+                participants: 8,
+            },
+            [80, 5],
+            Some([47, 23]),
+            [0, 12],
+            scale,
+            0,
+        );
+        assert_eq!(row.bar_origin, [48, 664]);
+        assert_eq!(row.icon_origin, Some([234, 646]));
+        assert_eq!(row.label_rect, RectPx::new(348, 656, 490, 24));
+        let authored_chrome = CampaignLoadingLayout::for_authored_size([800, 600]);
+        let chrome = authored_chrome.scaled(scale);
+        assert_eq!(chrome.title, RectPx::new(0, 0, 1600, 80));
+        assert_eq!(chrome.body, RectPx::new(0, 80, 1600, 1040));
+        assert_eq!(chrome.bar, RectPx::new(0, 1120, 1600, 80));
+        assert_eq!(chrome.progress_point, [328, 1134]);
+
+        // gamemd's own mapping is untouched by the fit: the same dialog is
+        // centered at 1:1 and the identity scale leaves each layer where it is.
+        let centered =
+            loading_text_rects([1600, 1200], &battle, crate::ui::shell::geom::RETAIL_SCALE);
+        assert_eq!(
+            centered.country_name,
+            authored.country_name.translate(400, 300)
+        );
+        assert_eq!(centered.load_brief, authored.load_brief.translate(400, 300));
+        assert_eq!(
+            CampaignLoadingLayout::for_authored_size([1600, 1200]).title,
+            RectPx::new(400, 300, 800, 40)
         );
     }
 
@@ -1278,6 +1504,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ares_country_loading_uses_retained_labels_instead_of_the_stock_slot() {
+        let _ares = crate::rules::ares_switch::read_ares_way(true);
+        let csf = test_csf(&[
+            ("Name:Arabs", "Iraq"),
+            ("Name:DESO", "Desolator"),
+            ("LoadBrief:Iraq", "Stock brief"),
+            (LOADING_TEXT_KEY, "Loading..."),
+            ("Name:Fixture", "Custom country"),
+            ("Unit:Fixture", "Custom unit"),
+            ("Brief:Fixture", "Custom brief"),
+        ]);
+        let mut session = test_launch_session();
+        session.humans[0].slot.country = LaunchCountry::Iraq;
+        let mut composition = finish_loading_composition(
+            &session,
+            Some(&csf),
+            [800, 600],
+            crate::ui::shell::geom::RETAIL_SCALE,
+            None,
+            Vec::new(),
+        );
+        assert_eq!(composition.text.country_name.as_deref(), Some("Iraq"));
+        let ini = crate::rules::ini_parser::IniFile::from_str(
+            "[Countries]\n0=A\n1=B\n2=C\n3=D\n4=E\n5=F\n6=CUSTOM\n[CUSTOM]\nFile.LoadScreen=ls800fixture.shp\nLoadScreenText.Name=Name:Fixture\nLoadScreenText.SpecialName=Unit:Fixture\nLoadScreenText.Brief=Brief:Fixture\n",
+        );
+        let mut owner =
+            crate::rules::process_owner::NativeRulesProcessOwner::from_cold_start_sources(
+                ini,
+                None,
+                crate::rules::ini_parser::IniFile::empty(),
+                std::sync::Arc::new(crate::rules::sound_ini::SoundRegistry::default()),
+                std::sync::Arc::new(crate::rules::sound_ini::EvaRegistry::default()),
+            )
+            .unwrap();
+        owner.read_multiplayer_country(&crate::rules::ini_parser::IniFile::empty(), 6);
+        owner.refresh_multiplayer_country_bodies();
+        let (retained, _) = owner.country_loading(LaunchCountry::Iraq.index()).unwrap();
+        composition.bind_country_loading(retained, Some(&csf));
+        assert_eq!(
+            composition.text.country_name.as_deref(),
+            Some("Custom country")
+        );
+        assert_eq!(
+            composition.text.special_unit.as_deref(),
+            Some("CUSTOM UNIT")
+        );
+        assert_eq!(composition.text.load_brief.as_deref(), Some("Custom brief"));
+        assert_eq!(composition.text.loading.as_deref(), Some("Loading..."));
+        assert_eq!(
+            retained.background_file(true).as_deref(),
+            Some("ls800fixture.shp")
+        );
+        assert_eq!(
+            retained.background_file(false).as_deref(),
+            Some("ls800fixture.shp")
+        );
+    }
+
     fn test_csf(entries: &[(&str, &str)]) -> CsfFile {
         const HEADER_MAGIC: u32 = 0x4353_4620;
         const LABEL_MAGIC: u32 = 0x4C42_4C20;
@@ -1305,5 +1590,79 @@ mod tests {
             );
         }
         CsfFile::from_bytes(&data).expect("valid test CSF")
+    }
+
+    #[test]
+    fn more_than_eight_starts_get_a_marker_each() {
+        use crate::map::map_file::MapCell;
+        use crate::rules::ini_parser::IniFile;
+
+        let cell = |rx, ry| MapCell {
+            legacy_ice_byte: 0,
+            rx,
+            ry,
+            tile_index: 0,
+            sub_tile: 0,
+            z: 0,
+        };
+        let starts: HashMap<u32, Waypoint> = (0..30)
+            .map(|index| (index, waypoint(index, 70 + index as i16, 70)))
+            .collect();
+        let assignments: Vec<_> = (0..30)
+            .map(|index| LoadingStartAssignment {
+                start_index: index,
+                participant: LoadingParticipantId::Opponent(index as usize),
+                color_priority: index as u8,
+            })
+            .collect();
+        let image = DecodedPreview {
+            width: 300,
+            height: 100,
+            rgba: vec![255; 300 * 100 * 4],
+        };
+        let map = |declaration: &str| {
+            let mut map = crate::map::rmg::emit::empty_map_file(
+                &crate::map::rmg::RmgOptions::default(),
+                100,
+                100,
+            );
+            map.cells = vec![cell(60, 60), cell(60, 140), cell(140, 60)];
+            let keys: String = (0..30)
+                .map(|index| format!("{index}={}\n", 70_070 + index))
+                .collect();
+            map.ini = IniFile::from_str(&format!("[Basic]\n{declaration}[Waypoints]\n{keys}"));
+            map.waypoints = starts.clone();
+            map.preview.decoded = Some(image.clone());
+            map
+        };
+        let selected = |declaration| {
+            build_loading_composition(
+                &map(declaration),
+                &test_launch_session(),
+                None,
+                [800, 600],
+                crate::ui::shell::geom::RETAIL_SCALE,
+                &assignments,
+            )
+            .markers
+            .len()
+        };
+        // A map declaring thirty starts marks all thirty; an ordinary map keeps
+        // gamemd's eight.
+        assert_eq!(selected("MaxPlayers=30\n"), 30);
+        assert_eq!(selected(""), 8);
+        // A random map staged for thirty players marks every staged start.
+        let random = build_random_map_loading_composition(
+            &test_launch_session(),
+            None,
+            [800, 600],
+            crate::ui::shell::geom::RETAIL_SCALE,
+            Some(image.clone()),
+            &map(""),
+            &starts,
+            &assignments,
+        );
+        assert_eq!(random.markers.len(), 30);
+        assert_eq!(random.markers[29].color_priority, 29);
     }
 }

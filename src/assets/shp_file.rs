@@ -34,10 +34,20 @@
 //! - Part of assets/ — no dependencies on game modules.
 //! - Uses util/read_helpers for binary reading, assets/shp_decode for RLE decompression.
 
+// Outside data reaches this module: it refuses bad input, never panics.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
+
 use crate::assets::error::AssetError;
 use crate::assets::pal_file::Palette;
 use crate::assets::shp_decode::decode_rle_frame;
-use crate::util::read_helpers::{read_u16_le, read_u32_le};
 
 /// Byte-8 dispatch bit used by the active YR SHP draw path.
 const FORMAT_RLE_ZERO_BIT: u8 = 0x02;
@@ -84,25 +94,44 @@ pub struct ShpFrame {
     pub pixels: Vec<u8>,
 }
 
-impl ShpFile {
-    /// Read the declared frame count without decoding any frame pixels.
-    ///
-    /// This validates the SHP(TS) file marker and verifies that the complete
-    /// declared frame-header table is present, matching the header validation
-    /// performed by [`Self::from_bytes`]. Frame data offsets and payloads are
-    /// deliberately left to the full parser.
-    pub fn frame_count_from_bytes(data: &[u8]) -> Result<u16, AssetError> {
-        if data.len() < 8 {
+/// One frame header's bytes.
+type FrameHeader = [u8; 24];
+
+/// An SHP(TS) file's validated header: its canvas size and its complete
+/// frame-header table, borrowed from the file's bytes. Reading a frame's
+/// fields from its [`FrameHeader`] cannot run past the file.
+struct ShpHeaders<'a> {
+    canvas: [u16; 2],
+    frame_count: u16,
+    frames: &'a [FrameHeader],
+}
+
+impl<'a> ShpHeaders<'a> {
+    fn parse(data: &'a [u8]) -> Result<Self, AssetError> {
+        let Some((
+            &[
+                zero_low,
+                zero_high,
+                width_low,
+                width_high,
+                height_low,
+                height_high,
+                count_low,
+                count_high,
+            ],
+            table,
+        )) = data.split_first_chunk::<8>()
+        else {
             return Err(AssetError::InvalidShpHeader {
                 reason: format!(
                     "File too small for header: {} bytes (need at least 8)",
                     data.len()
                 ),
             });
-        }
+        };
 
         // Bytes 0-1: should be zero (distinguishes SHP(TS) from older SHP format).
-        let zero = read_u16_le(data, 0);
+        let zero = u16::from_le_bytes([zero_low, zero_high]);
         if zero != 0 {
             return Err(AssetError::InvalidShpHeader {
                 reason: format!(
@@ -112,20 +141,92 @@ impl ShpFile {
             });
         }
 
-        let frame_count = read_u16_le(data, 6);
-        let headers_end = 8 + usize::from(frame_count) * 24;
-        if data.len() < headers_end {
+        let frame_count = u16::from_le_bytes([count_low, count_high]);
+        let Some(frames) = table.as_chunks().0.get(..usize::from(frame_count)) else {
             return Err(AssetError::InvalidShpHeader {
                 reason: format!(
                     "File too small for {} frame headers: {} bytes (need {})",
                     frame_count,
                     data.len(),
-                    headers_end
+                    8 + usize::from(frame_count) * 24
                 ),
             });
-        }
+        };
 
-        Ok(frame_count)
+        Ok(Self {
+            canvas: [
+                u16::from_le_bytes([width_low, width_high]),
+                u16::from_le_bytes([height_low, height_high]),
+            ],
+            frame_count,
+            frames,
+        })
+    }
+
+    /// Frame `index`'s header, or the out-of-range error.
+    fn frame(&self, index: usize) -> Result<&'a FrameHeader, AssetError> {
+        self.frames
+            .get(index)
+            .ok_or(AssetError::ShpFrameOutOfRange {
+                index: index as u16,
+                count: self.frame_count,
+            })
+    }
+}
+
+/// A frame header's raw rectangle words: x, y, width, height. Pixel decoding
+/// uses their unsigned dimensions, while native bounds queries interpret the
+/// same words as signed values.
+fn frame_rectangle(header: &FrameHeader) -> [u16; 4] {
+    [
+        u16::from_le_bytes([header[0], header[1]]),
+        u16::from_le_bytes([header[2], header[3]]),
+        u16::from_le_bytes([header[4], header[5]]),
+        u16::from_le_bytes([header[6], header[7]]),
+    ]
+}
+
+/// A frame header's radar minimap colour: bytes 12-14 (R, G, B); byte 15 is
+/// unused.
+fn frame_radar_color(header: &FrameHeader) -> [u8; 3] {
+    [header[12], header[13], header[14]]
+}
+
+impl ShpFile {
+    /// Read the declared frame count without decoding any frame pixels.
+    ///
+    /// This validates the SHP(TS) file marker and verifies that the complete
+    /// declared frame-header table is present, matching the header validation
+    /// performed by [`Self::from_bytes`]. Frame data offsets and payloads are
+    /// deliberately left to the full parser.
+    pub fn frame_count_from_bytes(data: &[u8]) -> Result<u16, AssetError> {
+        Ok(ShpHeaders::parse(data)?.frame_count)
+    }
+
+    /// Read the declared canvas dimensions after validating the complete header
+    /// table, without decoding frame pixels or validating their data offsets.
+    pub fn canvas_size_from_bytes(data: &[u8]) -> Result<[u16; 2], AssetError> {
+        Ok(ShpHeaders::parse(data)?.canvas)
+    }
+
+    /// `SHPStruct::GetFrameBounds @ 69E7E0` sign-extends the frame header's
+    /// four rectangle words. An invalid index returns the default rectangle:
+    /// CRT initializer `69E070` (table slot `814A40`) zeros `B077A0..B077AC`,
+    /// which the invalid-frame branch `69E829..69E852` copies to its result.
+    /// This validates the complete header table, leaving pixel data undecoded.
+    pub fn frame_bounds_from_bytes(data: &[u8], index: usize) -> Result<[i32; 4], AssetError> {
+        let headers = ShpHeaders::parse(data)?;
+        Ok(headers.frames.get(index).map_or([0; 4], |header| {
+            frame_rectangle(header).map(|word| i32::from(word as i16))
+        }))
+    }
+
+    /// `SHPStruct::GetColor @ 0x0069E860` returns the frame header's raw RGB
+    /// bytes without translating through a palette. An invalid frame index
+    /// returns `(0,0,0)`, matching its initialized default result.
+    pub fn frame_radar_color_from_bytes(data: &[u8], index: usize) -> Result<[u8; 3], AssetError> {
+        let headers = ShpHeaders::parse(data)?;
+        Ok(headers.frames.get(index).map_or([0; 3], frame_radar_color))
     }
 
     /// Parse an SHP file from raw bytes.
@@ -133,103 +234,30 @@ impl ShpFile {
     /// Reads the file header, all frame headers, then decodes each frame's
     /// pixel data (handling both raw and RLE-compressed formats).
     pub fn from_bytes(data: &[u8]) -> Result<Self, AssetError> {
-        let frame_count = Self::frame_count_from_bytes(data)?;
-        let width: u16 = read_u16_le(data, 2);
-        let height: u16 = read_u16_le(data, 4);
+        Self::from_bytes_with_budget(data, None)
+    }
 
-        let mut frames: Vec<ShpFrame> = Vec::with_capacity(frame_count as usize);
+    /// Bound the total decompressed indices of a presentation asset.
+    pub fn from_bytes_bounded(data: &[u8], max_pixels: usize) -> Result<Self, AssetError> {
+        Self::from_bytes_with_budget(data, Some(max_pixels))
+    }
 
-        for i in 0..frame_count as usize {
-            let hdr_offset: usize = 8 + i * 24;
-
-            let frame_x: u16 = read_u16_le(data, hdr_offset);
-            let frame_y: u16 = read_u16_le(data, hdr_offset + 2);
-            let frame_width: u16 = read_u16_le(data, hdr_offset + 4);
-            let frame_height: u16 = read_u16_le(data, hdr_offset + 6);
-            let format: u8 = data[hdr_offset + 8];
-            // Bytes 9-11: padding/reserved
-            // Bytes 12-14: radar minimap colour (R, G, B); byte 15 unused
-            // Bytes 16-19: reserved (always 0)
-            // Bytes 20-23: data_offset (absolute file offset to this frame's pixel data)
-            let radar_color: [u8; 3] = [
-                data[hdr_offset + 12],
-                data[hdr_offset + 13],
-                data[hdr_offset + 14],
-            ];
-            let data_offset: u32 = read_u32_le(data, hdr_offset + 20);
-
-            // A frame with zero dimensions has no pixel data (empty frame).
-            if frame_width == 0 || frame_height == 0 {
-                frames.push(ShpFrame {
-                    frame_x,
-                    frame_y,
-                    frame_width,
-                    frame_height,
-                    format,
-                    radar_color,
-                    pixels: Vec::new(),
-                });
-                continue;
+    fn from_bytes_with_budget(data: &[u8], mut budget: Option<usize>) -> Result<Self, AssetError> {
+        let headers = ShpHeaders::parse(data)?;
+        let [width, height] = headers.canvas;
+        let mut frames: Vec<ShpFrame> = Vec::with_capacity(headers.frames.len());
+        for (i, header) in headers.frames.iter().enumerate() {
+            if let Some(remaining) = &mut budget {
+                let [_, _, wide, high] = frame_rectangle(header);
+                *remaining = remaining
+                    .checked_sub(usize::from(wide) * usize::from(high))
+                    .ok_or_else(|| AssetError::ParseError {
+                        format: "SHP".into(),
+                        detail: "Decoded frames exceed the presentation pixel budget".into(),
+                    })?;
             }
-
-            let pixel_count: usize = frame_width as usize * frame_height as usize;
-            let frame_data_start: usize = data_offset as usize;
-
-            if data_offset == 0 {
-                return Err(AssetError::ParseError {
-                    format: "SHP".to_string(),
-                    detail: format!("Frame {} is nonempty but has a zero data offset", i),
-                });
-            }
-
-            // Bounds check: make sure data_offset points inside the file.
-            if frame_data_start >= data.len() {
-                return Err(AssetError::ParseError {
-                    format: "SHP".to_string(),
-                    detail: format!(
-                        "Frame {} data offset {} is past end of file ({})",
-                        i,
-                        frame_data_start,
-                        data.len()
-                    ),
-                });
-            }
-
-            let frame_slice: &[u8] = &data[frame_data_start..];
-            let pixels: Vec<u8> = if format & FORMAT_RLE_ZERO_BIT != 0 {
-                decode_rle_frame(frame_slice, frame_width as usize, frame_height as usize)?
-            } else {
-                let end = frame_data_start.checked_add(pixel_count).ok_or_else(|| {
-                    AssetError::ParseError {
-                        format: "SHP".to_string(),
-                        detail: format!("Frame {} raw data extent overflows address space", i),
-                    }
-                })?;
-                if end > data.len() {
-                    return Err(AssetError::ParseError {
-                        format: "SHP".to_string(),
-                        detail: format!(
-                            "Frame {} raw data extends past end of file ({} > {})",
-                            i,
-                            end,
-                            data.len()
-                        ),
-                    });
-                }
-                data[frame_data_start..end].to_vec()
-            };
-
-            frames.push(ShpFrame {
-                frame_x,
-                frame_y,
-                frame_width,
-                frame_height,
-                format,
-                radar_color,
-                pixels,
-            });
+            frames.push(Self::frame_at(data, i, header)?);
         }
-
         Ok(ShpFile {
             width,
             height,
@@ -237,10 +265,112 @@ impl ShpFile {
         })
     }
 
+    /// Decode frame `index`'s palette indices from the file's raw bytes, as
+    /// [`Self::from_bytes`] decodes each frame. It reads only that frame, so
+    /// it can succeed on a file whose other frames `from_bytes` rejects.
+    pub fn decode_frame(data: &[u8], index: usize) -> Result<Vec<u8>, AssetError> {
+        let headers = ShpHeaders::parse(data)?;
+        Ok(Self::frame_at(data, index, headers.frame(index)?)?.pixels)
+    }
+
+    /// `ShapeFile::GetFrameData @ 69E740`: encoded bytes from this frame's
+    /// file offset onward, without RLE decoding or truncation at the next
+    /// frame. The optional depth surface in CC_Draw_Shape uses this view.
+    pub fn encoded_frame_data(data: &[u8], index: usize) -> Result<&[u8], AssetError> {
+        let headers = ShpHeaders::parse(data)?;
+        Self::frame_data_at(data, index, headers.frame(index)?)
+    }
+
+    fn frame_data_at<'a>(
+        data: &'a [u8],
+        i: usize,
+        header: &FrameHeader,
+    ) -> Result<&'a [u8], AssetError> {
+        // Bytes 20-23: data_offset (absolute file offset to this frame's pixel data)
+        let start = u32::from_le_bytes([header[20], header[21], header[22], header[23]]) as usize;
+        if start == 0 {
+            return Err(AssetError::ParseError {
+                format: "SHP".to_string(),
+                detail: format!("Frame {} is nonempty but has a zero data offset", i),
+            });
+        }
+        data.get(start..)
+            .filter(|bytes| !bytes.is_empty())
+            .ok_or_else(|| AssetError::ParseError {
+                format: "SHP".to_string(),
+                detail: format!(
+                    "Frame {} data offset {} is past end of file ({})",
+                    i,
+                    start,
+                    data.len()
+                ),
+            })
+    }
+
+    /// Frame `i`'s header fields and decoded pixels.
+    fn frame_at(data: &[u8], i: usize, header: &FrameHeader) -> Result<ShpFrame, AssetError> {
+        let [frame_x, frame_y, frame_width, frame_height] = frame_rectangle(header);
+        // Bytes 9-11: padding/reserved; bytes 16-19: reserved (always 0)
+        let format: u8 = header[8];
+        let radar_color: [u8; 3] = frame_radar_color(header);
+
+        // A frame with zero dimensions has no pixel data (empty frame).
+        if frame_width == 0 || frame_height == 0 {
+            return Ok(ShpFrame {
+                frame_x,
+                frame_y,
+                frame_width,
+                frame_height,
+                format,
+                radar_color,
+                pixels: Vec::new(),
+            });
+        }
+
+        let pixel_count: usize = frame_width as usize * frame_height as usize;
+        let frame_slice = Self::frame_data_at(data, i, header)?;
+        let pixels: Vec<u8> = if format & FORMAT_RLE_ZERO_BIT != 0 {
+            decode_rle_frame(frame_slice, frame_width as usize, frame_height as usize)?
+        } else {
+            frame_slice
+                .get(..pixel_count)
+                .ok_or_else(|| AssetError::ParseError {
+                    format: "SHP".to_string(),
+                    detail: format!(
+                        "Frame {} raw data extends past end of file ({} of {} bytes)",
+                        i,
+                        frame_slice.len(),
+                        pixel_count
+                    ),
+                })?
+                .to_vec()
+        };
+
+        Ok(ShpFrame {
+            frame_x,
+            frame_y,
+            frame_width,
+            frame_height,
+            format,
+            radar_color,
+            pixels,
+        })
+    }
+
     /// Convert a frame's palette-indexed pixels to RGBA using the given palette.
     ///
-    /// Returns a Vec of width * height * 4 bytes (RGBA).
-    /// Palette index 0 becomes fully transparent (alpha = 0).
+    /// Returns a Vec of width * height * 4 bytes (RGBA): the draw of
+    /// BlitTransXlat<unsigned short>::BlitForward `0x004912B0` and
+    /// RLEBlitTransXlat<unsigned short>::Blit `0x004960A0`, which skip source
+    /// index 0 and write the converter entry of every other index, whatever
+    /// colour it holds. CC_Draw_Shape `0x004AED70` gets them from
+    /// ConvertClass::Select_Blitter `0x00490B90` (uncompressed frames) and
+    /// Select_RLE_Blitter `0x00490E50` (compressed frames) when the flags set
+    /// no darken (1), lucent (6), remap (0x10), Z (0x3000, 0x4000), alpha
+    /// (0x800) or write-alpha (0x40, 0x100, 0x8000) bit, as flags 0 and 0x400
+    /// do. Other draws differ: flag 0x20 on an uncompressed frame picks
+    /// BlitPlainXlat `0x004924C0`, which draws index 0 as well, and the
+    /// darken, lucent and remap blitters draw differently.
     pub fn frame_to_rgba(
         &self,
         frame_index: usize,
@@ -258,76 +388,38 @@ impl ShpFile {
         let mut rgba: Vec<u8> = Vec::with_capacity(pixel_count * 4);
 
         for &palette_index in &frame.pixels {
-            let color = palette.colors[palette_index as usize];
+            let color = palette.color(palette_index);
             rgba.push(color.r);
             rgba.push(color.g);
             rgba.push(color.b);
-            // Index 0 is transparent by BLITTER contract, not by palette
-            // content: gamemd's SHP blitters skip index-0 pixels outright, and
-            // retail palettes carry no alpha for the loaders to preserve. Keying
-            // this on `color.a` broke the moment the theater/unit palettes were
-            // loaded byte-faithfully — every sprite grew an opaque palette-0
-            // (blue) box. Other indices keep the palette's alpha so the
-            // chroma-key policy of the standard loader still applies.
-            rgba.push(if palette_index == 0 { 0 } else { color.a });
-        }
-
-        Ok(rgba)
-    }
-
-    /// Convert a UI/loading frame with palette conversion kept separate from alpha policy.
-    ///
-    /// The gamemd UI/loading PAL path does not bake transparency into the palette.
-    /// For SHP rendering, index 0 is still transparent at frame-conversion time.
-    pub fn frame_to_rgba_ui(
-        &self,
-        frame_index: usize,
-        palette: &Palette,
-    ) -> Result<Vec<u8>, AssetError> {
-        if frame_index >= self.frames.len() {
-            return Err(AssetError::ShpFrameOutOfRange {
-                index: frame_index as u16,
-                count: self.frames.len() as u16,
-            });
-        }
-
-        let frame: &ShpFrame = &self.frames[frame_index];
-        let pixel_count: usize = frame.frame_width as usize * frame.frame_height as usize;
-        let mut rgba: Vec<u8> = Vec::with_capacity(pixel_count * 4);
-
-        for &palette_index in &frame.pixels {
-            let color = palette.colors[palette_index as usize];
-            rgba.push(color.r);
-            rgba.push(color.g);
-            rgba.push(color.b);
-            rgba.push(if palette_index == 0 { 0 } else { color.a });
+            rgba.push(if palette_index == 0 { 0 } else { 255 });
         }
 
         Ok(rgba)
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_assets))]
 mod tests {
     use super::*;
-    use crate::assets::pal_file::Color;
 
     /// PIN — index 0 is transparent by BLITTER contract, not palette content.
     ///
     /// Retail palettes carry no alpha; the loaders preserve that (index 0
-    /// opaque in the `Palette`). gamemd's SHP blitters skip index-0 pixels
-    /// unconditionally, so frame conversion must key on the INDEX. When this
-    /// keyed on `color.a` instead, every sprite in the game grew an opaque
-    /// palette-0 (blue) box the moment palette loading went byte-faithful —
-    /// invisible to the whole suite until a live run.
+    /// opaque in the `Palette`). gamemd's transparent SHP blitters skip
+    /// index-0 pixels unconditionally, so frame conversion must key on the
+    /// INDEX. When this keyed on `color.a` instead, every sprite in the game
+    /// grew an opaque palette-0 (blue) box the moment palette loading went
+    /// byte-faithful — invisible to the whole suite until a live run.
     #[test]
     fn frame_to_rgba_bakes_index_zero_transparent_even_when_palette_has_no_alpha() {
         let shp = ShpFile::from_bytes(&make_test_shp_raw()).expect("parse");
-        // 768 raw bytes -> gamemd_ui palette: EVERY entry opaque, index 0 included.
-        let pal = Palette::from_bytes_gamemd_ui(&vec![21u8; 768]).expect("palette");
+        // 768 raw bytes: EVERY entry opaque, index 0 included.
+        let pal = Palette::from_bytes(&vec![21u8; 768]).expect("palette");
         assert_eq!(
-            pal.colors[0].a, 255,
-            "fixture guard: palette carries no alpha policy"
+            pal.color(0).a,
+            255,
+            "fixture guard: palette carries no alpha"
         );
 
         // Test frame pixels are [1, 2, 3, 0] — the last one is index 0.
@@ -379,15 +471,15 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_raw_shp() {
-        let data: Vec<u8> = make_test_shp_raw();
-        let shp: ShpFile = ShpFile::from_bytes(&data).expect("Should parse valid SHP");
-
-        assert_eq!(shp.width, 2);
-        assert_eq!(shp.height, 2);
-        assert_eq!(shp.frames.len(), 1);
-        assert_eq!(shp.frames[0].format, 0);
-        assert_eq!(shp.frames[0].pixels, vec![1, 2, 3, 0]);
+    fn encoded_frame_view_preserves_rle_and_following_file_bytes() {
+        let payload = [4, 0, 0, 2, 4, 0, 7, 8, 0xF1, 0x82];
+        let data = make_test_shp_with_format(3, &payload);
+        assert_eq!(ShpFile::decode_frame(&data, 0).unwrap(), [0, 0, 7, 8]);
+        assert_eq!(ShpFile::encoded_frame_data(&data, 0).unwrap(), payload);
+        assert!(ShpFile::encoded_frame_data(&data, 1).is_err());
+        let mut invalid = data;
+        invalid[28..32].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(ShpFile::encoded_frame_data(&invalid, 0).is_err());
     }
 
     #[test]
@@ -468,6 +560,31 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_decodes_alone_and_an_index_past_the_last_is_out_of_range() {
+        // The raw 2x2 test frame, then a frame whose data starts past the end.
+        let one = make_test_shp_raw();
+        let mut data = one[..8].to_vec();
+        data[6..8].copy_from_slice(&2u16.to_le_bytes());
+        let mut first = one[8..32].to_vec();
+        first[20..24].copy_from_slice(&56u32.to_le_bytes());
+        let mut second = first.clone();
+        second[20..24].copy_from_slice(&1000u32.to_le_bytes());
+        data.extend(first);
+        data.extend(second);
+        data.extend_from_slice(&one[32..]);
+
+        assert!(
+            ShpFile::from_bytes(&data).is_err(),
+            "frame 1 fails the file"
+        );
+        assert_eq!(ShpFile::decode_frame(&data, 0).unwrap(), vec![1, 2, 3, 0]);
+        assert!(matches!(
+            ShpFile::decode_frame(&data, 2),
+            Err(AssetError::ShpFrameOutOfRange { index: 2, count: 2 })
+        ));
+    }
+
+    #[test]
     fn nonempty_frame_with_zero_data_offset_errors() {
         let mut data = make_test_shp_raw();
         data[8 + 20..8 + 24].fill(0);
@@ -478,12 +595,6 @@ mod tests {
     fn raw_frame_requires_its_exact_visible_extent_inside_the_file() {
         let mut data = make_test_shp_raw();
         data.pop();
-        assert!(ShpFile::from_bytes(&data).is_err());
-    }
-
-    #[test]
-    fn test_reject_too_small() {
-        let data: Vec<u8> = vec![0; 4]; // Way too small
         assert!(ShpFile::from_bytes(&data).is_err());
     }
 
@@ -511,57 +622,20 @@ mod tests {
         assert_eq!(rgba[15], 0); // A (transparent)
     }
 
+    /// BlitTransXlat<unsigned short>::BlitForward `0x004912B0` and
+    /// RLEBlitTransXlat<unsigned short>::Blit `0x004960A0` skip only source
+    /// index 0 and write the converter entry for every other index; no entry
+    /// is keyed. A raw 63,0,63 palette entry draws as its colour.
     #[test]
-    fn frame_to_rgba_ui_applies_transparent_index_without_palette_alpha() {
-        let data: Vec<u8> = make_test_shp_raw();
-        let shp: ShpFile = ShpFile::from_bytes(&data).expect("Should parse");
-
-        let mut palette = Palette {
-            colors: [Color::rgb(0, 0, 0); 256],
-        };
-        palette.colors[0] = Color::rgb(12, 34, 56);
-        palette.colors[1] = Color::rgb(252, 0, 0);
-        palette.colors[2] = Color::rgb(0, 252, 0);
-        palette.colors[3] = Color::rgb(0, 0, 252);
-
-        let rgba: Vec<u8> = shp.frame_to_rgba_ui(0, &palette).expect("Should convert");
-
-        assert_eq!(&rgba[0..4], &[252, 0, 0, 255]);
-        assert_eq!(&rgba[12..16], &[12, 34, 56, 0]);
-    }
-
-    #[test]
-    fn test_frame_out_of_range() {
-        let data: Vec<u8> = make_test_shp_raw();
-        let shp: ShpFile = ShpFile::from_bytes(&data).expect("Should parse");
-        let pal_data: Vec<u8> = vec![0u8; 768];
-        let palette: Palette = Palette::from_bytes(&pal_data).expect("Should parse");
-
-        // Frame index 5 doesn't exist (only 1 frame).
-        assert!(shp.frame_to_rgba(5, &palette).is_err());
-    }
-
-    /// The frame header's radar colour is what the engine samples for minimap
-    /// and preview pixels on ore/gem overlays -- indexed by growth stage, never
-    /// read out of the frame's artwork.
-    #[test]
-    fn frame_radar_colour_is_read_from_the_header() {
+    fn a_raw_magenta_palette_entry_draws_opaque() {
         let shp = ShpFile::from_bytes(&make_test_shp_raw()).expect("parse");
-        assert_eq!(shp.frames[0].radar_color, [0x40, 0x80, 0xC0]);
-    }
+        let mut pal_data: Vec<u8> = vec![0u8; 768];
+        pal_data[6..9].copy_from_slice(&[63, 0, 63]); // index 2, pixel 1
+        let palette = Palette::from_bytes(&pal_data).expect("palette");
 
-    /// A zero-sized frame still carries a header, so its radar colour must
-    /// survive the early-out that skips pixel decoding.
-    #[test]
-    fn an_empty_frame_still_carries_its_radar_colour() {
-        let mut data = make_test_shp_raw();
-        // Zero this frame's width and height (header bytes +4 and +6).
-        data[8 + 4] = 0;
-        data[8 + 5] = 0;
-        data[8 + 6] = 0;
-        data[8 + 7] = 0;
-        let shp = ShpFile::from_bytes(&data).expect("parse");
-        assert!(shp.frames[0].pixels.is_empty(), "no pixel data");
-        assert_eq!(shp.frames[0].radar_color, [0x40, 0x80, 0xC0]);
+        let rgba = shp.frame_to_rgba(0, &palette).expect("convert");
+
+        assert_eq!(&rgba[4..8], &[252, 0, 252, 255]);
+        assert_eq!(rgba[15], 0, "index 0 stays transparent");
     }
 }

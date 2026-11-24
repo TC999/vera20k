@@ -1,5 +1,5 @@
 use super::*;
-use crate::sim::components::{DriveCoord, MovementTarget, NavTargetRef};
+use crate::sim::components::{DriveCoord, NavTargetRef};
 use crate::sim::movement::locomotor::LocomotorState;
 use crate::util::fixed_math::SimFixed;
 use serde_json::Value;
@@ -35,17 +35,19 @@ pub(crate) fn apply_air_state(entity: &mut GameEntity, input: &Value) {
         );
     } else {
         let state = loco.jumpjet_runtime_mut().unwrap();
-        state.destination = destination;
-        state.moving = moving;
-        state.phase = input["phase"].as_i64().unwrap() as i32;
+        *state = state
+            .clone()
+            .with_destination_for_test(destination)
+            .with_moving_for_test(moving)
+            .with_phase_for_test(input["phase"].as_i64().unwrap() as i32);
     }
     entity.locomotor = Some(loco);
 }
 
 #[test]
 fn air_motion_matches_original_queries_independently_of_orders_and_restore() {
-    let rows: Vec<Value> = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/air_locomotor_moving.json"
+    let rows: Vec<Value> = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/air_locomotor_moving.json",
     ))
     .unwrap();
     assert_eq!(rows.len(), 44);
@@ -55,9 +57,14 @@ fn air_motion_matches_original_queries_independently_of_orders_and_restore() {
         let expected = row["moving"].as_bool().unwrap();
         for has_order in [false, true] {
             for powered in [false, true] {
-                entity.movement_target = has_order.then(MovementTarget::default);
-                entity.navigation.nav_com = has_order.then(|| NavTargetRef::cell(15, 15));
-                entity.locomotor.as_mut().unwrap().powered = powered;
+                entity
+                    .navigation
+                    .set_nav_com_for_test(has_order.then(|| NavTargetRef::cell(15, 15)));
+                entity
+                    .locomotor
+                    .as_mut()
+                    .unwrap()
+                    .set_powered_for_test(powered);
                 assert_eq!(
                     is_moving(&entity),
                     Some(expected),

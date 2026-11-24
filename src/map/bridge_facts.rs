@@ -28,11 +28,7 @@ pub(crate) const RETAINED_CELLCLASS_BRIDGE_FLAG_MASK: u32 =
 /// neighbour carries it with the span axis bit `0x800`, or an E/W one without.
 /// A missing neighbour answers nothing. The OnBridge (`+0x8C`) exemption
 /// before the test belongs to the caller.
-pub(crate) fn near_bridge(
-    own: u32,
-    [south, north, east, west]: [Option<u32>; 4],
-    mask: u32,
-) -> bool {
+pub fn near_bridge(own: u32, [south, north, east, west]: [Option<u32>; 4], mask: u32) -> bool {
     let span = |flags: Option<u32>, axis: bool| {
         flags.is_some_and(|flags| {
             flags & mask != 0 && (flags & BRIDGE_FLAG_DIRECTION_ZERO != 0) == axis
@@ -95,13 +91,6 @@ impl BridgeFlags {
     pub fn structural(self) -> bool {
         self.has(BRIDGE_FLAG_STRUCTURAL)
     }
-    /// `0x200` — native bridge-entry flag, also required along traversable
-    /// deck lanes by 0x004D9E08. The stamp sets Anchor/Forward1/Opposite and
-    /// clears Forward2; this is not merely an along-span endpoint marker.
-    #[inline]
-    pub fn bridgehead(self) -> bool {
-        self.has(BRIDGE_FLAG_TRANSITION)
-    }
 }
 
 #[derive(
@@ -146,6 +135,8 @@ pub struct BridgeFlagStamp {
     pub set: bool,
 }
 
+type BridgeStampSlots = [(BridgeStampSlot, Option<(i32, i32)>); 6];
+
 impl BridgeFlagStamp {
     pub const fn new(anchor: (u16, u16), direction: u8, set: bool) -> Self {
         Self {
@@ -157,7 +148,7 @@ impl BridgeFlagStamp {
 
     /// Exact setter visitation order: anchor, three forward cells, opposite,
     /// then the direction-6 extra cell.
-    pub(crate) fn slots(self) -> Option<[(BridgeStampSlot, Option<(i32, i32)>); 6]> {
+    pub(crate) fn slots(self) -> Option<BridgeStampSlots> {
         let _ = crate::util::direction::direction_delta(self.direction)?;
         let anchor = self.anchor;
         let f1 = packed_step(anchor, self.direction)?;
@@ -248,14 +239,15 @@ pub struct BridgeAnchorRelation {
 )]
 pub struct BridgeCellFacts {
     pub raw_flags: u32,
-    pub state_byte: u8,
-    pub overlay_id: Option<u8>,
     pub family: BridgeStampFamily,
     pub direction: Option<u8>,
     pub anchor: Option<BridgeAnchorRelation>,
     /// Literal CellClass+0x2C. Native47E040 preserves this on Anchor/Forward3;
     /// the derived self relation above must not replace a retained pointer.
     pub native_anchor: Option<crate::map::cell_index::NativeCellIdentity>,
+    /// Signed whole-level deck elevation established at the self-anchor.
+    /// The terrain bridge publisher retains it through collapse and repair.
+    pub(crate) fixed_deck_level: Option<i16>,
 }
 
 impl BridgeCellFacts {
@@ -267,10 +259,15 @@ impl BridgeCellFacts {
         self.has_flag(BRIDGE_FLAG_STRUCTURAL)
     }
 
+    /// `0x200` — native bridge-entry flag, also required along traversable
+    /// deck lanes by 0x004D9E08 (`TEST EDI,0x200` on CellClass+0x140). The
+    /// stamp sets Anchor/Forward1/Opposite and clears Forward2; this is not
+    /// merely an along-span endpoint marker.
     pub fn has_transition_flag(self) -> bool {
         self.has_flag(BRIDGE_FLAG_TRANSITION)
     }
 
+    #[cfg(test)]
     pub fn is_anchor_self(self) -> bool {
         self.has_flag(BRIDGE_FLAG_ANCHOR_SELF)
     }
@@ -286,7 +283,7 @@ pub fn high_bridge_stamp_for_overlay(id: u8) -> Option<(BridgeStampFamily, u8)> 
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn stamp_set_bridge_direction(
     cells: &mut [BridgeCellFacts],
     width: u16,
@@ -349,14 +346,12 @@ fn stamp_intact(cell: &mut BridgeCellFacts, slot: BridgeStampSlot, relation: Bri
             cell.raw_flags |=
                 BRIDGE_FLAG_ANCHOR_SELF | BRIDGE_FLAG_TRANSITION | BRIDGE_FLAG_EXTRA_SIDE;
             set_direction_zero_flag(cell, direction_zero);
-            write_default_state(cell, relation.direction);
             attach(cell, relation);
         }
         BridgeStampSlot::Forward1 => {
             cell.raw_flags &= !BRIDGE_FLAG_DESTROYED_OR_RAMP;
             cell.raw_flags |= BRIDGE_FLAG_TRANSITION | BRIDGE_FLAG_EXTRA_SIDE;
             set_direction_zero_flag(cell, direction_zero);
-            write_default_state(cell, relation.direction);
             attach(cell, relation);
         }
         BridgeStampSlot::Forward2 => {
@@ -365,7 +360,6 @@ fn stamp_intact(cell: &mut BridgeCellFacts, slot: BridgeStampSlot, relation: Bri
             cell.raw_flags &= !(BRIDGE_FLAG_TRANSITION | BRIDGE_FLAG_DESTROYED_OR_RAMP);
             cell.raw_flags |= BRIDGE_FLAG_EXTRA_SIDE;
             set_direction_zero_flag(cell, direction_zero);
-            write_default_state(cell, relation.direction);
             attach(cell, relation);
         }
         BridgeStampSlot::Forward3 => {
@@ -375,7 +369,6 @@ fn stamp_intact(cell: &mut BridgeCellFacts, slot: BridgeStampSlot, relation: Bri
             cell.raw_flags &= !BRIDGE_FLAG_DESTROYED_OR_RAMP;
             cell.raw_flags |= BRIDGE_FLAG_TRANSITION | BRIDGE_FLAG_EXTRA_SIDE;
             set_direction_zero_flag(cell, direction_zero);
-            write_default_state(cell, relation.direction);
             attach(cell, relation);
         }
         BridgeStampSlot::ExtraDir6 => {
@@ -396,7 +389,6 @@ fn stamp_destroy(cell: &mut BridgeCellFacts, slot: BridgeStampSlot, direction: u
                 | BRIDGE_FLAG_EXTRA_SIDE);
             cell.raw_flags |= BRIDGE_FLAG_DESTROYED_OR_RAMP;
             set_direction_zero_flag(cell, direction == 0);
-            cell.state_byte = 0;
             detach(cell);
         }
         BridgeStampSlot::Forward1 | BridgeStampSlot::Forward2 | BridgeStampSlot::Opposite => {
@@ -404,7 +396,6 @@ fn stamp_destroy(cell: &mut BridgeCellFacts, slot: BridgeStampSlot, direction: u
                 !(BRIDGE_FLAG_TRANSITION | BRIDGE_FLAG_DIRECTION_ZERO | BRIDGE_FLAG_EXTRA_SIDE);
             cell.raw_flags |= BRIDGE_FLAG_DESTROYED_OR_RAMP;
             set_direction_zero_flag(cell, direction == 0);
-            cell.state_byte = 0;
             detach(cell);
         }
         BridgeStampSlot::Forward3 => {
@@ -429,8 +420,11 @@ fn detach(cell: &mut BridgeCellFacts) {
     cell.anchor = None;
 }
 
-fn write_default_state(cell: &mut BridgeCellFacts, direction: u8) {
-    cell.state_byte = if direction == 0 { 0 } else { 9 };
+/// The `CellClass+0x11E` byte a constructing `SetBridgeDirection_NESW @
+/// 0x0047E040` or `_NWSE @ 0x0047E470` stores on its anchor, Forward1,
+/// Forward2 and Opposite visits: 0 for direction 0, else 9.
+pub const fn bridge_setter_state(direction: u8) -> u8 {
+    if direction == 0 { 0 } else { 9 }
 }
 
 fn set_direction_zero_flag(cell: &mut BridgeCellFacts, set: bool) {
@@ -441,7 +435,7 @@ fn set_direction_zero_flag(cell: &mut BridgeCellFacts, set: bool) {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn stamp_slots(anchor: (u16, u16), direction: u8) -> [(BridgeStampSlot, Option<(u16, u16)>); 6] {
     let f1 = step(anchor, direction);
     let f2 = f1.and_then(|cell| step(cell, direction));
@@ -463,7 +457,7 @@ fn stamp_slots(anchor: (u16, u16), direction: u8) -> [(BridgeStampSlot, Option<(
     ]
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn index(width: u16, height: u16, rx: u16, ry: u16) -> Option<usize> {
     if rx >= width || ry >= height {
         return None;
@@ -471,7 +465,7 @@ fn index(width: u16, height: u16, rx: u16, ry: u16) -> Option<usize> {
     Some(ry as usize * width as usize + rx as usize)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn step(cell: (u16, u16), direction: u8) -> Option<(u16, u16)> {
     let (dx, dy) = crate::util::direction::direction_delta(direction)?;
     let rx = cell.0 as i32 + dx;
@@ -482,9 +476,23 @@ fn step(cell: (u16, u16), direction: u8) -> Option<(u16, u16)> {
     Some((rx as u16, ry as u16))
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod tests {
     use super::*;
+    use crate::rules::overlay_types::is_bridge_overlay_index;
+
+    #[test]
+    fn high_bridge_stamps_start_only_at_the_four_anchor_overlays() {
+        for id in [0x18, 0x19, 0xED, 0xEE] {
+            assert!(high_bridge_stamp_for_overlay(id).is_some());
+            assert!(is_bridge_overlay_index(id));
+        }
+        for id in [0x4A, 0x7A, 0xCD, 0xE9] {
+            assert!(high_bridge_stamp_for_overlay(id).is_none());
+        }
+        assert!(is_bridge_overlay_index(0x4A));
+        assert!(is_bridge_overlay_index(0xCD));
+    }
 
     fn facts_at(cells: &[BridgeCellFacts], width: u16, rx: u16, ry: u16) -> BridgeCellFacts {
         cells[ry as usize * width as usize + rx as usize]
@@ -559,47 +567,6 @@ mod tests {
     }
 
     #[test]
-    fn stamp_intact_writes_default_state_bytes_before_overlay_data_overwrite() {
-        let width = 12;
-        let mut cells = vec![BridgeCellFacts::default(); 12 * 12];
-        stamp_set_bridge_direction(
-            &mut cells,
-            width as u16,
-            12,
-            (5, 5),
-            BridgeStampFamily::Nesw,
-            6,
-            true,
-        );
-
-        for (rx, ry) in [(5, 5), (4, 5), (3, 5), (6, 5)] {
-            assert_eq!(facts_at(&cells, width as u16, rx, ry).state_byte, 9);
-        }
-        assert_eq!(facts_at(&cells, width as u16, 2, 5).state_byte, 0);
-        assert_eq!(facts_at(&cells, width as u16, 7, 5).state_byte, 0);
-    }
-
-    #[test]
-    fn stamp_intact_sets_0x80_only_on_anchor() {
-        let width = 12;
-        let mut cells = vec![BridgeCellFacts::default(); 12 * 12];
-        stamp_set_bridge_direction(
-            &mut cells,
-            width as u16,
-            12,
-            (5, 5),
-            BridgeStampFamily::Nesw,
-            0,
-            true,
-        );
-
-        assert!(facts_at(&cells, width as u16, 5, 5).has_flag(BRIDGE_FLAG_ANCHOR_SELF));
-        for (rx, ry) in [(5, 4), (5, 3), (5, 2), (5, 6)] {
-            assert!(!facts_at(&cells, width as u16, rx, ry).has_flag(BRIDGE_FLAG_ANCHOR_SELF));
-        }
-    }
-
-    #[test]
     fn stamp_destroy_emits_destroy_flags_only_on_anchor_forward1_forward2_opposite() {
         let width = 12;
         let mut cells = vec![BridgeCellFacts::default(); 12 * 12];
@@ -627,52 +594,6 @@ mod tests {
         }
         assert!(!facts_at(&cells, width as u16, 2, 5).has_flag(BRIDGE_FLAG_DESTROYED_OR_RAMP));
         assert!(!facts_at(&cells, width as u16, 7, 5).has_flag(BRIDGE_FLAG_DESTROYED_OR_RAMP));
-    }
-
-    #[test]
-    fn bridge_flags_newtype_matches_const_predicates() {
-        // Single-source check: the typed newtype must agree bit-for-bit with the
-        // `BridgeCellFacts` predicate path for the same raw flag word, across
-        // each individual bit and a combined word.
-        for raw in [
-            0u32,
-            BRIDGE_FLAG_ANCHOR_SELF,
-            BRIDGE_FLAG_STRUCTURAL,
-            BRIDGE_FLAG_TRANSITION,
-            BRIDGE_FLAG_ANCHOR_SELF | BRIDGE_FLAG_STRUCTURAL | BRIDGE_FLAG_TRANSITION,
-            BRIDGE_FLAG_STRUCTURAL | BRIDGE_FLAG_FORWARD_SIDE,
-        ] {
-            let flags = BridgeFlags(raw);
-            let facts = BridgeCellFacts {
-                raw_flags: raw,
-                ..BridgeCellFacts::default()
-            };
-            assert_eq!(
-                flags.anchor(),
-                facts.is_anchor_self(),
-                "anchor raw={raw:#x}"
-            );
-            assert_eq!(
-                flags.structural(),
-                facts.has_structural_bridge(),
-                "structural raw={raw:#x}"
-            );
-            assert_eq!(
-                flags.bridgehead(),
-                facts.has_transition_flag(),
-                "bridgehead raw={raw:#x}"
-            );
-        }
-    }
-
-    #[test]
-    fn high_bridge_stamp_classifier_ignores_low_bridge_ids() {
-        for id in [0x18, 0x19, 0xED, 0xEE] {
-            assert!(high_bridge_stamp_for_overlay(id).is_some());
-        }
-        for id in [0x4A, 0x7A, 0xCD, 0xE9] {
-            assert_eq!(high_bridge_stamp_for_overlay(id), None);
-        }
     }
 
     #[test]

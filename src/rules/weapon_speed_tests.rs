@@ -15,8 +15,8 @@ fn cached_ini(sections: &Value) -> IniFile {
     ini
 }
 
-fn scalar_corpus() -> Value {
-    serde_json::from_str(include_str!("../../tools/rules_oracle/weapon_speed.json")).unwrap()
+fn scalar_corpus() -> &'static Value {
+    crate::test_fixture::json("tools/rules_oracle/weapon_speed.json")
 }
 
 #[test]
@@ -44,7 +44,15 @@ fn retained_weapon_speed_matches_original_reader_controls() {
         }
         let mut pass = IniFile::empty();
         pass.replace_first_section(section);
-        processor.apply_pass(&pass, &IniFile::empty()).unwrap();
+        processor
+            .apply_pass(
+                &pass,
+                &IniFile::empty(),
+                &crate::rules::sound_ini::EvaRegistry::default(),
+                false,
+                &crate::rules::sound_ini::SoundRegistry::default(),
+            )
+            .unwrap();
         assert_eq!(
             processor.families[&RulesTypeFamily::Weapon][index]
                 .weapon
@@ -58,8 +66,8 @@ fn retained_weapon_speed_matches_original_reader_controls() {
 #[test]
 fn full_process_speed_uses_prior_gravity_across_absent_sections_and_owner_handoff() {
     use crate::sim::projectile::launch::{LaunchSpeedProjectile, weapon_launch_speed};
-    let native: Value = serde_json::from_str(include_str!(
-        "../../tools/rules_oracle/weapon_speed_order.json"
+    let native: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/rules_oracle/weapon_speed_order.json",
     ))
     .unwrap();
     let mut first_pass_hashes = Vec::new();
@@ -71,9 +79,16 @@ fn full_process_speed_uses_prior_gravity_across_absent_sections_and_owner_handof
         );
         if let Some(gravity) = sequence["cold_audio_visual"]["authored_gravity"].as_i64() {
             let cold = IniFile::from_str(&format!("[AudioVisual]\nGravity={gravity}\n"));
-            state = process_native_rules_cold_start(state, &cold, &IniFile::empty(), None)
-                .unwrap()
-                .into_registry_state_discarding_events();
+            state = process_native_rules_cold_start(
+                state,
+                &cold,
+                &IniFile::empty(),
+                None,
+                &crate::rules::sound_ini::EvaRegistry::default(),
+                &crate::rules::sound_ini::SoundRegistry::default(),
+            )
+            .unwrap()
+            .into_registry_state_discarding_events();
         }
         for (index, row) in sequence["rows"].as_array().unwrap().iter().enumerate() {
             let mut pass = cached_ini(&row["cached_sections"]);
@@ -108,7 +123,8 @@ fn full_process_speed_uses_prior_gravity_across_absent_sections_and_owner_handof
                     weapon.speed,
                     projectile.map(|projectile| LaunchSpeedProjectile {
                         rot: projectile.rot,
-                        floater: projectile.floater
+                        floater: projectile.floater,
+                        gravity: projectile.gravity()
                     }),
                     rules.general.gravity,
                     500
@@ -166,10 +182,14 @@ fn retail_ifv_speed_passes_production_cold_start_and_scenario_rules_owner() {
         None,
         art,
         std::sync::Arc::default(),
+        Default::default(),
     )
     .unwrap();
     let (rules, _, _, _) = owner
-        .load_noncampaign_scenario(None, &IniFile::empty())
+        .load_scenario(
+            crate::rules::process_owner::NativeScenarioRulesPrefix::NonCampaign(None),
+            &IniFile::empty(),
+        )
         .unwrap()
         .into_parts();
     let native = scalar_corpus();

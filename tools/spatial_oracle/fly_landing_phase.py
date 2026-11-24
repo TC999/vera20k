@@ -7,9 +7,9 @@ This corpus covers ordinary landings and successful retry searches, not a comple
 from pathlib import Path
 import struct
 
-from unicorn import UC_HOOK_CODE
-from unicorn.x86_const import UC_X86_REG_ESP
-from tools.native_oracle import SCRATCH, run_checked, finish_vectors, provenance
+from unicorn import UC_HOOK_CODE, UC_HOOK_MEM_READ, UC_HOOK_MEM_WRITE
+from unicorn.x86_const import UC_X86_REG_ESP, UC_X86_REG_EIP
+from tools.native_oracle import SCRATCH, run_checked, finish_vectors, provenance, OracleError
 from tools.spatial_oracle.aircraft_fire_location import Fixture, OWNER, TYPE, SCENARIO, BLOCKER, cell, dwords
 from tools.spatial_oracle.crate_ground_membership import LAYERS
 from tools.spatial_oracle.map_queries import packed
@@ -18,6 +18,152 @@ LOCO, HOUSE, AIR_BUFFERS, RULES, DISPLAY_BUFFERS = [
     SCRATCH + n for n in (0x20000, 0x22000, 0x30000, 0x40000, 0x60000)
 ]
 AIR_TRACKER = 0x887888
+
+
+def initialize_air_tracker(u, sp, *, buffers, extent, capacity=16, stride=64,
+                           construct=True):
+    """Bind this owner's original tracker startup and spare-capacity storage.
+
+    ``construct=False`` preserves entry_discovery's legacy supplied zero
+    headers. Composed histories and Fly use the actual constructor prefix;
+    original Add/Remove/Update own all subsequent membership and cached cells.
+    """
+    assert capacity * 4 <= stride
+    u.mem_write(0x87F914, dwords(*extent))
+    if construct:
+        u.reg_write(UC_X86_REG_ESP, sp)
+        run_checked(u, 0x412870, 0x4128D6, count=10000)
+    for bucket in range(400):
+        u.mem_write(AIR_TRACKER + bucket * 24 + 4,
+                    dwords(buffers + bucket * stride, capacity))
+        if not construct:
+            u.mem_write(AIR_TRACKER + bucket * 24 + 0x10, dwords(0))
+
+
+def air_query_controls():
+    """Small populated412B40/4137A0 controls consumed by DistributedFire.
+
+    Shares the actual tracker startup and existing Aircraft/Cell machine owner.
+    Bucket tokens are supplied, never dereferenced as actors by these queries.
+    No membership/lifecycle, complete scan or off-map packed16 wrap claim.
+    """
+    cases = [
+        dict(name='radius_zero', map_extent=[64,64], center_cell=[20,20], radius_cells=0,
+             buckets=[(126,[41,7]), (127,[100]), (146,[3])]),
+        dict(name='radius_one', map_extent=[64,64], center_cell=[20,20], radius_cells=1,
+             buckets=[(126,[41,7]), (127,[100]), (146,[3])]),
+        dict(name='interior_cardinals_corners', map_extent=[64,64], center_cell=[20,20], radius_cells=14,
+             buckets=[(126,[41,7]), (84,[2]), (110,[3]), (120,[4]), (127,[5]), (146,[6]), (210,[8])]),
+        dict(name='nonsquare_nondivisible', map_extent=[127,95], center_cell=[60,45], radius_cells=11,
+             buckets=[(230,[41,7]), (210,[2]), (231,[3]), (250,[4]), (229,[5]), (188,[6])]),
+        dict(name='lower_edge', map_extent=[64,64], center_cell=[0,0], radius_cells=7,
+             buckets=[(0,[41,7]), (1,[2]), (20,[3]), (21,[4]), (42,[5])]),
+        dict(name='upper_edge', map_extent=[64,64], center_cell=[63,63], radius_cells=7,
+             buckets=[(399,[41,7]), (398,[2]), (379,[3]), (378,[4])]),
+        dict(name='retained_order_duplicate_tokens', map_extent=[128,128], center_cell=[64,64], radius_cells=14,
+             buckets=[(210,[9,2]), (211,[9]), (209,[3]), (230,[4])]),
+    ]
+    return [air_query(case) for case in cases]
+
+
+def air_query(case):
+    f = Fixture({})
+    u = f.u
+    spans = ((0x412870,0x4128E2), (0x4129C0,0x413483), (0x4137A0,0x4137FB),
+             (0x413A30,0x413ABE), (0x486840,0x486890), (0x7E17AC,0x7E17CC),
+             (0x7E4EEC,0x7E4F3C))
+    original = [bytes(u.mem_read(a,b-a)) for a,b in spans]
+    initialize_air_tracker(u, f.sp, buffers=AIR_BUFFERS, extent=case['map_extent'])
+    # Original initializer has also constructed current-vector+2580. Supply
+    # spare backing, preserving its original vtable/flags/count/growth. No
+    # allocator or query callback is replaced by this bounded kernel fixture.
+    current = AIR_TRACKER + 0x2580
+    current_buffer, current_capacity = SCRATCH + 0x50000, 1024
+    u.mem_write(current+4, dwords(current_buffer, current_capacity))
+    buckets = []
+    for bucket, ids in case['buckets']:
+        if not 0 <= bucket < 400 or not 0 < len(ids) <= 16:
+            raise OracleError('Invalid supplied AirTracker bucket')
+        u.mem_write(AIR_BUFFERS + bucket*64, dwords(*ids))
+        u.mem_write(AIR_TRACKER + bucket*24 + 16, dwords(len(ids)))
+        buckets.append(dict(bucket=bucket, ids=ids))
+    x,y = case['center_cell']
+    query_cell = cell(x,y)
+    u.mem_write(query_cell, dwords(0x7E4EEC))
+    u.mem_write(query_cell+0x11B, b'\0\0')
+    u.mem_write(0x89E7C0, dwords(104))
+    before_cell = bytes(u.mem_read(query_cell,0x160))
+    before_rng = bytes(u.mem_read(SCENARIO+0x218,0x3F4))
+    bucket_order, copied, visits = [], [], []
+
+    def observe_read(machine, _access, address, size, _value, _data):
+        pc = machine.reg_read(UC_X86_REG_EIP)
+        # Only original copy-body count loads: no generic vector accessor's
+        # repeated bounds reads. Empty vectors therefore remain observable.
+        if (0x412B40 <= pc < 0x413483 or pc == 0x4129CE) and size == 4:
+            offset = address - AIR_TRACKER - 16
+            if 0 <= offset < 400*24 and offset % 24 == 0:
+                bucket_order.append(offset//24)
+
+    def observe(machine, pc, _size, _data):
+        if pc in (0x65C640,0x65C660,0x65C780,0x65C7E0):
+            raise OracleError('AirTracker query unexpectedly used RNG')
+        if pc in (0x412B40,0x4137A0,0x486840,0x413A30):
+            visits.append(f'{pc:08X}')
+
+    def observe_copy(_machine, _access, address, size, value, _data):
+        if current_buffer <= address < current_buffer + current_capacity*4:
+            if size != 4 or (address-current_buffer) % 4:
+                raise OracleError('AirTracker emitted a partial current-vector write')
+            copied.append(value)
+
+    read_hook = u.hook_add(UC_HOOK_MEM_READ, observe_read)
+    code_hook = u.hook_add(UC_HOOK_CODE, observe)
+    write_hook = u.hook_add(UC_HOOK_MEM_WRITE, observe_copy)
+    f.call(0x412B40, AIR_TRACKER, [query_cell,case['radius_cells']])
+    if u.reg_read(UC_X86_REG_ESP) != f.sp + 12:
+        raise OracleError('AirTracker query did not unwind its original two arguments')
+    u.hook_del(write_hook)
+    count = int.from_bytes(u.mem_read(current+16,4),'little')
+    if not 0 <= count < current_capacity:
+        raise OracleError('AirTracker query exceeded supplied spare capacity')
+    retained = list(struct.unpack('<'+'I'*count, u.mem_read(current_buffer, count*4)))
+    if copied != retained:
+        raise OracleError('AirTracker append observations disagree with native current vector')
+    drained = []
+    for _ in range(count+1):
+        value = f.call(0x4137A0, AIR_TRACKER, [])
+        if u.reg_read(UC_X86_REG_ESP) != f.sp + 4:
+            raise OracleError('AirTracker front query did not unwind its caller frame')
+        if value == 0:
+            break
+        drained.append(value)
+    remaining = int.from_bytes(u.mem_read(current+16,4),'little')
+    u.hook_del(read_hook)
+    u.hook_del(code_hook)
+    if drained != retained or remaining != 0:
+        raise OracleError('AirTracker front drain did not preserve copied order')
+    if bytes(u.mem_read(query_cell,0x160)) != before_cell:
+        raise OracleError('AirTracker query changed its source Cell')
+    if bytes(u.mem_read(SCENARIO+0x218,0x3F4)) != before_rng:
+        raise OracleError('AirTracker query changed Scenario RNG')
+    if original != [bytes(u.mem_read(a,b-a)) for a,b in spans]:
+        raise OracleError('AirTracker query changed original instructions/vtables')
+    return dict(name=case['name'], input=dict(map_extent=case['map_extent'],
+                center_cell=case['center_cell'],radius_cells=case['radius_cells'],buckets=buckets),
+                copied_bucket_order=bucket_order,copied_ids=copied,drained_ids=drained,
+                remaining_count=remaining,original_bytes_unchanged=True,
+                source_cell_unchanged=True,scenario_rng_unchanged=True,visited_boundaries=visits)
+
+
+def initialize_display_layers(u, sp, *, buffers, capacity=16, stride=0x100):
+    """Original five-layer startup before atexit, with caller-owned buffers."""
+    assert capacity * 4 <= stride
+    u.reg_write(UC_X86_REG_ESP, sp)
+    run_checked(u, 0x4A8630, 0x4A866D, count=100)
+    for layer in range(5):
+        u.mem_write(LAYERS + 24 * layer + 4,
+                    dwords(buffers + layer * stride, capacity))
 
 
 def fixture(case):
@@ -65,11 +211,7 @@ def fixture(case):
 
     # Original tracker-vector startup, stopping immediately before CRT atexit.
     # Preallocated storage avoids allocator growth; the actual Add/Remove run.
-    u.mem_write(0x87F914, dwords(128, 128))
-    u.reg_write(UC_X86_REG_ESP, f.sp)
-    run_checked(u, 0x412870, 0x4128D6, count=10000)
-    for bucket in range(400):
-        u.mem_write(AIR_TRACKER + bucket * 24 + 4, dwords(AIR_BUFFERS + bucket * 64, 16))
+    initialize_air_tracker(u, f.sp, buffers=AIR_BUFFERS, extent=(128, 128))
     if case.get("air_registered", True):
         f.call(0x4134A0, AIR_TRACKER, [OWNER])
     else:
@@ -90,10 +232,7 @@ def fixture(case):
 
     # Retain a registration from before the supplied physical descent. No
     # fake GetLayer return is used: the original submit reads actual object Z.
-    u.reg_write(UC_X86_REG_ESP, f.sp)
-    run_checked(u, 0x4A8630, 0x4A866D, count=100)
-    for layer in range(5):
-        u.mem_write(LAYERS + 24 * layer + 4, dwords(DISPLAY_BUFFERS + layer * 0x100, 16))
+    initialize_display_layers(u, f.sp, buffers=DISPLAY_BUFFERS)
     u.mem_write(OWNER + 0xA4, dwords(case.get('registration_z', 900)))
     u.mem_write(OWNER + 0x74, b'\0')
     f.call(0x4D3780, OWNER, [1])

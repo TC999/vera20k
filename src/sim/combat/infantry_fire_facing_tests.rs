@@ -50,18 +50,19 @@ fn infantry_orders_leave_facing_to_fire_start() {
 
 #[test]
 fn infantry_fire_start_heading_matches_original_code_vectors() {
-    let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/infantry_fire_start.json"
+    let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/infantry_fire_start.json",
     ))
     .unwrap();
-    assert_eq!(rows.len(), 59);
+    assert_eq!(rows.len(), 69);
     let rules = infantry_fire_frame_rules();
     let mut compared = 0;
     // Compare the shared heading writer for standing, prone and deployed starts.
     // Secondary-action admission and the supplied native legality results are
     // outside this comparison; the corpus retains them as explicit witnesses.
     for row in rows.iter().filter(|r| {
-        r["fire_error"] == 0
+        r["airstrike_control"].is_null()
+            && r["fire_error"] == 0
             && r["pending"] == 0
             && r["has_target"] == true
             && r["weapon_slot"] == 0
@@ -72,10 +73,10 @@ fn infantry_fire_start_heading_matches_original_code_vectors() {
             let pos = &mut store.get_mut(id).unwrap().position;
             let x = row[key][0].as_i64().unwrap() as i32;
             let y = row[key][1].as_i64().unwrap() as i32;
-            pos.rx = (x / 256) as u16;
-            pos.ry = (y / 256) as u16;
-            pos.sub_x = SimFixed::from_num(x % 256);
-            pos.sub_y = SimFixed::from_num(y % 256);
+            pos.set_rx_for_test((x / 256) as u16);
+            pos.set_ry_for_test((y / 256) as u16);
+            pos.set_sub_x_for_test(SimFixed::from_num(x % 256));
+            pos.set_sub_y_for_test(SimFixed::from_num(y % 256));
         }
         let firer = store.get_mut(1).unwrap();
         let mut body = FacingClass::new(
@@ -89,11 +90,17 @@ fn infantry_fire_start_heading_matches_original_code_vectors() {
             );
         }
         firer.body_facing = body;
-        firer.infantry.as_mut().unwrap().is_prone = row["prone"] == 1;
+        firer
+            .infantry
+            .as_mut()
+            .unwrap()
+            .set_is_prone_for_test(row["prone"] == 1);
         if row["deployed"] == true {
             firer.mission_leaf.set_infantry_doing_verified(28).unwrap();
         }
-        firer.attack_target = Some(AttackTarget::new(2));
+        firer
+            .attack_target
+            .set_for_test(Some(TargetKind::Entity(2)));
         let result = visit(&mut store, &rules, 100);
         let firer = store.get(1).unwrap();
         let expected = row["facing"].as_u64().unwrap() as u16;
@@ -106,17 +113,77 @@ fn infantry_fire_start_heading_matches_original_code_vectors() {
 }
 
 #[test]
+fn airstrike_primary_fire_keeps_the_existing_secondary_action() {
+    let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/infantry_fire_start.json",
+    ))
+    .unwrap();
+    let rules = infantry_fire_frame_rules();
+    let mut compared = 0;
+    for row in rows.iter().filter(|row| {
+        row["airstrike_link"] == true
+            && row["weapon_slot"] == 0
+            && matches!(row["current_doing"].as_i64(), Some(40 | 41))
+    }) {
+        let mut store = pair();
+        let firer = store.get_mut(1).unwrap();
+        firer.seldom.airstrike.set_test_link(Some(1));
+        firer
+            .mission_leaf
+            .set_infantry_doing_verified(row["current_doing"].as_i64().unwrap() as i32)
+            .unwrap();
+        firer
+            .attack_target
+            .set_for_test(Some(TargetKind::Entity(2)));
+        set_infantry_stage(&mut store, 1, row["initial_stage"].as_i64().unwrap() as i32);
+        let result = visit(&mut store, &rules, 100);
+        let firer = store.get(1).unwrap();
+        assert_eq!(
+            i64::from(firer.mission_leaf.as_infantry().unwrap().doing()),
+            row["action"].as_i64().unwrap(),
+            "{}",
+            row["name"]
+        );
+        assert_eq!(
+            i64::from(firer.native_stage().value()),
+            row["stage_after"].as_i64().unwrap(),
+            "{}",
+            row["name"]
+        );
+        assert!(
+            !row["calls"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|call| call == "do_action")
+        );
+        assert!(result.consequences.fire_events().is_empty());
+        compared += 1;
+    }
+    assert_eq!(compared, 2);
+}
+
+#[test]
 fn infantry_refused_or_reloading_does_not_snap() {
     let rules = infantry_fire_frame_rules();
     for out_of_range in [false, true] {
         let mut store = pair();
-        let attack = AttackTarget::new(2);
+        let attack = TargetKind::Entity(2);
         if out_of_range {
-            store.get_mut(2).unwrap().position.rx = 50;
+            store.get_mut(2).unwrap().position.set_rx_for_test(50);
         } else {
-            store.get_mut(1).unwrap().rearm_timer = crate::sim::timer::CdTimer::started(100, 20);
+            store
+                .get_mut(1)
+                .unwrap()
+                .seldom
+                .rearm_timer
+                .set_for_test(crate::sim::timer::CdTimer::started(100, 20));
         }
-        store.get_mut(1).unwrap().attack_target = Some(attack);
+        store
+            .get_mut(1)
+            .unwrap()
+            .attack_target
+            .set_for_test(Some(attack));
         assert!(
             visit(&mut store, &rules, 100)
                 .consequences
@@ -129,8 +196,8 @@ fn infantry_refused_or_reloading_does_not_snap() {
 
 #[test]
 fn infantry_fire_speed_refusal_matches_original_threshold() {
-    let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/infantry_fire_speed.json"
+    let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/infantry_fire_speed.json",
     ))
     .unwrap();
     let rules = infantry_fire_frame_rules();
@@ -141,7 +208,9 @@ fn infantry_fire_speed_refusal_matches_original_threshold() {
         firer.foot_speed.set_speed_fraction(SimFixed::from_bits(
             row["fixed_bits"].as_i64().unwrap() as i32,
         ));
-        firer.attack_target = Some(AttackTarget::new(2));
+        firer
+            .attack_target
+            .set_for_test(Some(TargetKind::Entity(2)));
         let result = visit(&mut store, &rules, 100);
         let firer = store.get(1).unwrap();
         let refused = row["refused"].as_bool().unwrap();
@@ -167,14 +236,18 @@ fn infantry_fire_speed_refusal_matches_original_threshold() {
 fn infantry_speed_refusal_at_fire_frame_clears_firing_latch() {
     let rules = infantry_fire_frame_rules();
     let mut store = pair();
-    store.get_mut(1).unwrap().attack_target = Some(AttackTarget::new(2));
+    store
+        .get_mut(1)
+        .unwrap()
+        .attack_target
+        .set_for_test(Some(TargetKind::Entity(2)));
     visit(&mut store, &rules, 100);
     let body = store.get(1).unwrap().body_facing;
     set_infantry_stage(&mut store, 1, 2);
     let firer = store.get_mut(1).unwrap();
     assert!(firer.mission_leaf.foot_firing_sequence_latch() != 0);
-    // Isolate the live Foot predicate from the older movement-target shortcut.
-    assert!(firer.movement_target.is_none());
+    // The live Foot speed alone refuses the fire frame: the locomotor is still.
+    assert!(crate::sim::movement::motion_query::is_moving(&firer) != Some(true));
     firer.foot_speed.set_speed_fraction(SimFixed::ONE);
     let result = visit(&mut store, &rules, 101);
     let firer = store.get(1).unwrap();
@@ -188,44 +261,65 @@ fn infantry_speed_refusal_at_fire_frame_clears_firing_latch() {
 /// `[RocketeerSequence]`) hovering at 500 over (5, 5), firing at a GI three
 /// cells off.
 fn rocketeer_pair() -> (EntityStore, RuleSet) {
-    let mut rules = RuleSet::from_ini(&IniFile::from_str(
-        "[InfantryTypes]\n0=JJ\n1=E2\n\
+    let art_ini = IniFile::from_str(
+        "[ROCK]\nSequence=RocketeerSequence\nFireUp=2\n\
+         [RocketeerSequence]\nReady=0,1,1\nGuard=0,1,1\nWalk=8,6,6\nFireUp=164,6,6\n\
+         Fly=292,6,6\nHover=292,6,6\nFireFly=370,6,6\n",
+    );
+    let mut rules = RuleSet::from_ini_with_fixed_art_for_test(
+        &IniFile::from_str(
+            "[InfantryTypes]\n0=JJ\n1=E2\n\
          [JJ]\nStrength=125\nArmor=flak\nSpeed=9\nImage=ROCK\nPrimary=M60\nJumpJet=yes\n\
          BalloonHover=yes\nLocomotor={92612C46-F71F-11d1-AC9F-006008055BB5}\n\
          SpeedType=Hover\nMovementZone=Fly\nJumpjetSpeed=30\nJumpjetHeight=500\n\
          [E2]\nStrength=125\nArmor=flak\nSpeed=4\n\
          [M60]\nDamage=25\nROF=20\nRange=5\nWarhead=SA\n\
          [SA]\nVerses=100%,100%,100%,90%,70%,0%,100%,25%,25%,0%,0%\n",
-    ))
+        ),
+        &art_ini,
+    )
     .unwrap();
-    let art_ini = IniFile::from_str(
-        "[ROCK]\nSequence=RocketeerSequence\nFireUp=2\n\
-         [RocketeerSequence]\nReady=0,1,1\nGuard=0,1,1\nWalk=8,6,6\nFireUp=164,6,6\n\
-         Fly=292,6,6\nHover=292,6,6\nFireFly=370,6,6\n",
-    );
     rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art_ini));
-    let registry = crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art_ini);
-    rules.replace_animation_sequences_for_test(
-        crate::rules::animation_sequence::build_animation_sequence_catalog(&rules, Some(&registry)),
-    );
     let mut store = EntityStore::new();
     let mut firer = make_infantry_entity(1, "JJ", 5, 5, 125);
     firer.body_facing = FacingClass::new(0x4000, 127);
     // Object5F6B90 requires +74 as well as the height for the Hover remap.
-    firer.lifecycle.cell_marked = true;
-    firer.position.exact_z_leptons = Some(500);
+    firer.lifecycle.set_cell_marked_for_test(true);
+    firer.position.set_exact_z_leptons_for_test(Some(500));
     let mut locomotor = crate::sim::movement::locomotor::LocomotorState::from_object_type(
         rules.object("JJ").unwrap(),
         0,
     );
-    locomotor.altitude = SimFixed::from_num(500);
     let runtime = locomotor.jumpjet_runtime_mut().unwrap();
-    runtime.phase = crate::sim::movement::jumpjet_flight::STATE_HOLD;
-    runtime.moving = true;
+    *runtime = runtime
+        .clone()
+        .with_phase_for_test(crate::sim::movement::jumpjet_movement::jumpjet_flight::STATE_HOLD)
+        .with_moving_for_test(true);
     firer.locomotor = Some(locomotor);
     store.insert(firer);
     store.insert(make_infantry_entity(2, "E2", 8, 5, 125));
     (store, rules)
+}
+
+#[test]
+fn jumpjet_fire_precedes_airstrike_retained_action() {
+    use crate::sim::movement::infantry_action::DO_FIRE_FLY;
+    let (mut store, rules) = rocketeer_pair();
+    let firer = store.get_mut(1).unwrap();
+    firer.seldom.airstrike.set_test_link(Some(1));
+    firer.mission_leaf.set_infantry_doing_verified(40).unwrap();
+    firer
+        .attack_target
+        .set_for_test(Some(TargetKind::Entity(2)));
+    set_infantry_stage(&mut store, 1, 5);
+    let result = visit(&mut store, &rules, 100);
+    let firer = store.get(1).unwrap();
+    assert_eq!(
+        firer.mission_leaf.as_infantry().unwrap().doing(),
+        DO_FIRE_FLY
+    );
+    assert_eq!(firer.native_stage().value(), 0);
+    assert!(result.consequences.fire_events().is_empty());
 }
 
 /// A Rocketeer's FireFly refused at its fire frame (here by I4, the speed
@@ -235,7 +329,11 @@ fn rocketeer_pair() -> (EntityStore, RuleSet) {
 fn a_rocketeer_refused_at_its_fire_frame_hovers() {
     use crate::sim::movement::infantry_action::{DO_FIRE_FLY, DO_HOVER};
     let (mut store, rules) = rocketeer_pair();
-    store.get_mut(1).unwrap().attack_target = Some(AttackTarget::new(2));
+    store
+        .get_mut(1)
+        .unwrap()
+        .attack_target
+        .set_for_test(Some(TargetKind::Entity(2)));
     visit(&mut store, &rules, 100);
     let doing = |store: &EntityStore| {
         store
@@ -266,10 +364,14 @@ fn a_rocketeer_refused_at_its_fire_frame_hovers() {
 fn firing_latch_keeps_start_facing_when_target_moves() {
     let rules = infantry_fire_frame_rules();
     let mut store = pair();
-    store.get_mut(1).unwrap().attack_target = Some(AttackTarget::new(2));
+    store
+        .get_mut(1)
+        .unwrap()
+        .attack_target
+        .set_for_test(Some(TargetKind::Entity(2)));
     visit(&mut store, &rules, 100);
     let facing = store.get(1).unwrap().body_facing;
-    store.get_mut(2).unwrap().position.rx = 2;
+    store.get_mut(2).unwrap().position.set_rx_for_test(2);
     set_infantry_stage(&mut store, 1, 2);
     let result = visit(&mut store, &rules, 101);
     assert_eq!(result.consequences.fire_events().len(), 1);
@@ -278,14 +380,14 @@ fn firing_latch_keeps_start_facing_when_target_moves() {
         result.consequences.fire_events()[0].facing,
         (facing.current(101) >> 8) as u8
     );
-    assert_eq!(store.get(2).unwrap().health.current, 100);
+    assert_eq!(store.get(2).unwrap().health.current(), 100);
 }
 
 fn production_rules(fire_up: u32) -> RuleSet {
     // The receiver-only fixture has the default Sight=1. Give this full-frame
     // scenario the retail GI sight/locomotor inputs so its target three cells
     // away is visible through the ordinary fog update and firing gates.
-    let mut rules = RuleSet::from_ini(&IniFile::from_str(
+    let rules_ini = &IniFile::from_str(
         "[InfantryTypes]\n0=E1\n1=E2\n[BuildingTypes]\n0=TARGET\n\
          [E1]\nStrength=125\nArmor=flak\nSpeed=4\nSight=5\nImage=GI\nPrimary=M60\n\
          Locomotor={4A582744-9839-11d1-B709-00A024DDAFD1}\nMovementZone=Infantry\n\
@@ -293,16 +395,13 @@ fn production_rules(fire_up: u32) -> RuleSet {
          [TARGET]\nStrength=125\nArmor=flak\nFoundation=2x3\n\
          [M60]\nDamage=25\nROF=20\nRange=5\nWarhead=SA\n\
          [SA]\nVerses=100%,100%,100%,90%,70%,0%,100%,25%,25%,0%,0%\n",
-    ))
-    .unwrap();
+    );
     let art_ini = IniFile::from_str(&format!(
         "[GI]\nFireUp={fire_up}\nPrimaryFireFLH=80,20,40\nSequence=GISequence\n\
          [GISequence]\nReady=0,1,1\nGuard=0,1,1\nFireUp=8,6,6\n",
     ));
+    let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&rules_ini, &art_ini).unwrap();
     rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art_ini));
-    rules.bind_animation_sequences(
-        &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art_ini),
-    );
     rules
 }
 
@@ -313,10 +412,10 @@ fn production_pair(rules: &RuleSet) -> (Simulation, u64, u64) {
     // turn. Supply both live House owners instead of a null-house fixture.
     for name in ["Americans", "Russians"] {
         let owner = sim.interner.intern(name);
-        sim.houses.insert(
-            owner,
-            crate::sim::house_state::HouseState::new(owner, 0, None, true, 0, 10),
-        );
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                owner, 0, None, true, 0, 10,
+            ));
     }
     let firer = sim.spawn_object("E1", "Americans", 5, 5, 0, rules).unwrap();
     let target = sim.spawn_object("E2", "Russians", 8, 5, 0, rules).unwrap();
@@ -331,7 +430,7 @@ fn production_pair(rules: &RuleSet) -> (Simulation, u64, u64) {
 fn restore_production_pair(sim: &Simulation, rules: &RuleSet) -> Simulation {
     let bytes = GameSnapshot::save(sim, 0, 0, "fire_facing", 0);
     let mut restored = GameSnapshot::load(&bytes).unwrap().sim;
-    restored.retain_in_scenario_process_state_from(sim);
+    restored.retain_process_state_for_load(crate::sim::world::SnapshotProcessState::Live(sim));
     restored.restore_after_snapshot_load().unwrap();
     // Terrain is rebuilt from map inputs by the load workflow, not serialized
     // with the entities. Damage must see the same subcell/ground context.
@@ -340,6 +439,25 @@ fn restore_production_pair(sim: &Simulation, rules: &RuleSet) -> Simulation {
         crate::sim::pathfinding::terrain_speed::TerrainSpeedConfig::default(),
         rules,
     );
+    // Complete original LoadContent's hierarchy publication after terrain
+    // and saved Cell state are bound; a decoded base is not a live graph.
+    if sim.zone_grid.is_some() {
+        assert!(
+            restored
+                .zone_grid
+                .as_ref()
+                .unwrap()
+                .is_native_load_pending()
+        );
+        assert!(restored.rebuild_dynamic_navigation(rules));
+        assert!(
+            !restored
+                .zone_grid
+                .as_ref()
+                .unwrap()
+                .is_native_load_pending()
+        );
+    }
     restored
 }
 
@@ -348,12 +466,12 @@ fn production_zero_delay_shot_and_restore_use_new_heading() {
     let rules = production_rules(0);
     let (mut sim, firer, target) = production_pair(&rules);
     let source = &sim.substrate.entities.get(firer).unwrap().position;
-    let source_x = i32::from(source.rx) * 256 + source.sub_x.to_num::<i32>();
-    let source_y = i32::from(source.ry) * 256 + source.sub_y.to_num::<i32>();
+    let source_x = i32::from(source.rx()) * 256 + source.sub_x().to_num::<i32>();
+    let source_y = i32::from(source.ry()) * 256 + source.sub_y().to_num::<i32>();
     sim.advance_tick(&[], Some(&rules), None, None, 67);
     let entity = sim.substrate.entities.get(firer).unwrap();
     assert!(sim.fog.is_cell_visible(entity.owner(), 8, 5));
-    let facing = entity.body_facing.current(sim.session.binary_frame);
+    let facing = entity.body_facing.current(sim.session.binary_frame());
     assert_eq!(facing, 0x3FFF, "native eastward direction");
     let event = sim
         .fire_events
@@ -373,12 +491,13 @@ fn production_zero_delay_shot_and_restore_use_new_heading() {
             matrix: facing,
         },
         0,
+        crate::util::flh_transform::FlhBasis::Locomotor(None),
     )
     .expect("bounded FLH");
     assert_eq!(event.fire_coord.x, source_x + delta.0);
     assert_eq!(event.fire_coord.y, source_y + delta.1);
     assert_eq!(
-        sim.substrate.entities.get(target).unwrap().health.current,
+        sim.substrate.entities.get(target).unwrap().health.current(),
         100
     );
 
@@ -396,8 +515,8 @@ fn production_zero_delay_shot_and_restore_use_new_heading() {
 
 #[test]
 fn cell_and_building_fire_headings_match_original_coordinate_getters() {
-    let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/infantry_fire_start.json"
+    let rows: Vec<serde_json::Value> = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/infantry_fire_start.json",
     ))
     .unwrap();
     let rules = production_rules(2);
@@ -405,17 +524,26 @@ fn cell_and_building_fire_headings_match_original_coordinate_getters() {
     for row in rows.iter().filter(|row| row["target_kind"] != "object") {
         let mut store = EntityStore::new();
         let mut firer = make_infantry_entity(1, "E1", 5, 5, 125);
-        firer.position.sub_x = SimFixed::from_num(row["source"][0].as_i64().unwrap() as i32 % 256);
-        firer.position.sub_y = SimFixed::from_num(row["source"][1].as_i64().unwrap() as i32 % 256);
-        firer.attack_target = Some(if row["target_kind"] == "cell" {
-            AttackTarget::for_cell(8, 5)
-        } else {
-            let mut target = make_structure_entity(2, "TARGET", 8, 5, 125, 125);
-            // Construction stamps the type's `Foundation=2x3`.
-            target.foundation = "2x3".to_string();
-            store.insert(target);
-            AttackTarget::new(2)
-        });
+        firer.position.set_sub_x_for_test(SimFixed::from_num(
+            row["source"][0].as_i64().unwrap() as i32 % 256,
+        ));
+        firer.position.set_sub_y_for_test(SimFixed::from_num(
+            row["source"][1].as_i64().unwrap() as i32 % 256,
+        ));
+        firer
+            .attack_target
+            .set_for_test(Some(if row["target_kind"] == "cell" {
+                TargetKind::Cell(8, 5)
+            } else {
+                let mut target = make_structure_entity(2, "TARGET", 8, 5, 125, 125);
+                // Construction stamps the type's `Foundation=2x3`.
+                target
+                    .seldom
+                    .type_facts
+                    .set_foundation_for_test("2x3".to_string().into());
+                store.insert(target);
+                TargetKind::Entity(2)
+            }));
         store.insert(firer);
         let result = visit(&mut store, &rules, 100);
         assert!(result.consequences.fire_events().is_empty());
@@ -462,7 +590,7 @@ fn production_firing_latch_restores_heading_and_reaches_emission() {
                     .get(target)
                     .unwrap()
                     .health
-                    .current,
+                    .current(),
                 100
             );
             return;
@@ -486,9 +614,18 @@ fn production_attack_during_paid_walk_step_case(boosted: bool) {
 
     let rules = production_rules(0);
     let (mut sim, firer, target) = production_pair(&rules);
+    // The full hierarchy must see the same bound map inputs as native load.
+    crate::sim::arena_fixture::supply_native_map(&mut sim);
     assert!(sim.rebuild_dynamic_navigation(&rules));
     let command = |sim: &mut Simulation, command: Command| {
-        assert!(sim.apply_command_with_overlays("Americans", &command, Some(&rules), None,));
+        assert!(sim.apply_command_with_overlays(
+            None,
+            "Americans",
+            &command,
+            &rules,
+            None,
+            &mut crate::sim::world::FrameEffects::default(),
+        ));
     };
     let frame = |sim: &mut Simulation| {
         let grid = sim.path_grid_snapshot();
@@ -501,7 +638,6 @@ fn production_attack_during_paid_walk_step_case(boosted: bool) {
             entity_id: firer,
             target_rx: 5,
             target_ry: 10,
-            queue: false,
         },
     );
     for _ in 0..50 {
@@ -555,8 +691,19 @@ fn production_attack_during_paid_walk_step_case(boosted: bool) {
         "order keeps the paid-step heading"
     );
     assert_eq!(entity.foot_speed.applied_fraction(), SimFixed::ONE);
+    assert!(rules.object("E1").unwrap().move_sound.is_empty());
+    assert!(!entity.move_sound.is_active());
+    assert_eq!(entity.move_sound.countdown(), 3);
     let mut resumed = restore_production_pair(&sim, &rules);
     sim.scenario_rng = SimRng::new(0); // Native Scenario load reseeds this stream.
+    let loaded_sound = resumed.substrate.entities.get(firer).unwrap().move_sound;
+    assert!(!loaded_sound.is_active());
+    assert_eq!(loaded_sound.countdown(), 0);
+    // Foot4DAA87 refreshes +540 even with an empty MoveSound vector;
+    // FootLoad4DB60D..4DB624 clears that inactive countdown. Match only this
+    // native load transition in the live control, preserving the paid Walk,
+    // crate multiplier, facing and firing state for full-hash continuation.
+    sim.substrate.restore_move_sound_state_after_load(firer);
     assert_eq!(sim.state_hash(), resumed.state_hash());
     let mut refused_frames = 0;
     for _ in 0..100 {
@@ -588,7 +735,7 @@ fn production_attack_during_paid_walk_step_case(boosted: bool) {
             }
             assert!(!fired, "a retained paid step cannot fire");
             assert_eq!(
-                entity.body_facing.current(sim.session.binary_frame),
+                entity.body_facing.current(sim.session.binary_frame()),
                 step_heading,
                 "movement may correct toward its head; fire must not turn toward the enemy"
             );
@@ -605,7 +752,7 @@ fn production_attack_during_paid_walk_step_case(boosted: bool) {
                 "face target at accepted fire start"
             );
             assert_eq!(
-                sim.substrate.entities.get(target).unwrap().health.current,
+                sim.substrate.entities.get(target).unwrap().health.current(),
                 100
             );
             return;

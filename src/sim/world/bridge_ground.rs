@@ -4,25 +4,29 @@
 //! receiver; death/lifecycle consequences finish before traversal resumes.
 //! Evidence: HIGH_BRIDGE_RIM_REFRESH_ALGORITHM_GHIDRA_REPORT.md.
 
-use crate::map::overlay_types::OverlayTypeRegistry;
+use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::combat::{
     EntityDamageEvent, RAD_NO_ATTACKER, ReceiverCallFlags, TerrainDamageEvent,
 };
 use crate::sim::movement::locomotor::MovementLayer;
 use crate::sim::occupancy::CellObjectMember;
+use crate::sim::world::FrameEffects;
 use crate::sim::world::Simulation;
 
 fn members(sim: &Simulation, rx: u16, ry: u16) -> impl Iterator<Item = CellObjectMember> + '_ {
     sim.cell_objects((rx, ry), MovementLayer::Ground)
 }
 
+/// `CellClass::BlowUpBridge @ 0x0047DD70`'s ground loop: each member's ReceiveDamage
+/// with its own Health (`+0x6C`) and the C4 warhead, the next link taken first.
 pub(super) fn apply(
     sim: &mut Simulation,
     rules: &RuleSet,
     registry: Option<&OverlayTypeRegistry>,
     rx: u16,
     ry: u16,
+    frame_effects: &mut FrameEffects<'_>,
 ) {
     let warhead_ref = sim.interner.intern(&rules.bridge_warheads.c4_name);
     let mut current = members(sim, rx, ry).next();
@@ -45,7 +49,7 @@ pub(super) fn apply(
                     // see bridge_health_alias.py and the report's open residual.
                     let event = EntityDamageEvent::direct_receiver(
                         stable_id,
-                        i32::from(entity.health.current),
+                        entity.health.current(),
                         0,
                         RAD_NO_ATTACKER,
                         None,
@@ -55,21 +59,28 @@ pub(super) fn apply(
                             arg6: true,
                         },
                     );
-                    sim.commit_direct_damage_receiver(rules, registry, event);
+                    sim.commit_direct_damage_receiver(rules, registry, event, frame_effects);
                 }
             }
             CellObjectMember::Terrain(stable_id) => {
-                if let Some(terrain) = sim.production.terrain_objects.get(&stable_id) {
+                if let Some(terrain) = sim.terrain_objects.objects().get(&stable_id) {
                     let event = TerrainDamageEvent {
+                        damage_writeback: None,
                         stable_id,
                         rx,
                         ry,
-                        damage: terrain.health,
+                        damage: terrain.health(),
                         distance_leptons: 0,
                         warhead_ref,
                         near_center_ic_isolation_eligible: false,
                     };
-                    sim.commit_direct_terrain_damage_receiver(rules, registry, event);
+                    sim.commit_direct_terrain_damage_receiver(
+                        rules,
+                        registry,
+                        event,
+                        true,
+                        frame_effects,
+                    );
                 }
             }
         }
@@ -77,7 +88,7 @@ pub(super) fn apply(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_world_a_b))]
 mod tests {
     use super::*;
     use crate::rules::ini_parser::IniFile;
@@ -101,8 +112,28 @@ mod tests {
 
     fn place(sim: &mut Simulation, rules: &RuleSet, name: &str, x: u16) -> u64 {
         let id = sim
-            .construct_object_limbo_at_height(name, "Americans", x, 4, 0, 0, rules)
+            .construct_object_limbo_at_height(
+                name,
+                "Americans",
+                x,
+                4,
+                0,
+                0,
+                rules,
+                &mut crate::sim::world::FrameEffects::default(),
+            )
             .unwrap();
+        // Supply the fallout scene's pose after the constructor's zero Location.
+        sim.substrate
+            .entities
+            .get_mut(id)
+            .unwrap()
+            .position
+            .put_location(crate::sim::components::DriveCoord {
+                x: i32::from(x) * 256 + 128,
+                y: 4 * 256 + 128,
+                z: 0,
+            });
         sim.reveal(id);
         id
     }
@@ -122,7 +153,7 @@ mod tests {
              [E1]\nImage=GI\nStrength=125\nArmor=none\nSpeed=4\nDieSound=GIDie\n\
              [TERROR]\nImage=TRST\nStrength=75\nArmor=flak\nSpeed=6\nExplodes=yes\nDeathWeapon=TerrorBomb\n\
              [MTNK]\nStrength=300\nArmor=heavy\nSpeed=6\n\
-             [BUNK]\nStrength=1000\nFoundation=1x1\nDieSound=BuildingDie\n\
+             [BUNK]\nStrength=1000\nDieSound=BuildingDie\n\
              [TerrorBomb]\nDamage=225\nWarhead=TerrorBombWH\nSuicide=yes\n\
              [Warheads]\n0=Super\n1=TerrorBombWH\n\
              [Super]\nInfDeath=2\nPenetratesBunker=yes\n\
@@ -131,9 +162,6 @@ mod tests {
              Verses=150%,100%,100%,90%,50%,50%,100%,150%,30%,100%,100%\n",
         ), &art).unwrap();
         rules.install_art_data(crate::rules::art_data::ArtRegistry::from_ini(&art));
-        rules.bind_animation_sequences(
-            &crate::rules::infantry_sequence::parse_infantry_sequence_registry(&art),
-        );
         rules
     }
 
@@ -143,10 +171,10 @@ mod tests {
         let rules = stock_cascade_rules();
         let mut sim = world(&rules);
         let owner = sim.interner.intern("Americans");
-        sim.houses.insert(
-            owner,
-            crate::sim::house_state::HouseState::new(owner, 0, None, false, 1000, 10),
-        );
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                owner, 0, None, false, 1000, 10,
+            ));
         let gi = place(&mut sim, &rules, "E1", 4);
         let terror = place(&mut sim, &rules, "TERROR", 4);
         assert_eq!(
@@ -156,11 +184,17 @@ mod tests {
                 CellObjectMember::Entity(gi),
             ]
         );
-        apply(&mut sim, &rules, None, 4, 4);
-        let native: serde_json::Value = serde_json::from_str(include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tools/spatial_oracle/bridge_zero_health_receiver.json"
-        )))
+        apply(
+            &mut sim,
+            &rules,
+            None,
+            4,
+            4,
+            &mut crate::sim::world::FrameEffects::default(),
+        );
+        let native: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/spatial_oracle/bridge_zero_health_receiver.json",
+        ))
         .unwrap();
         let repeat = native["cases"]
             .as_array()
@@ -169,9 +203,18 @@ mod tests {
             .find(|case| case["initial_alive"] == false && case["die_sound_count"] == 1)
             .unwrap();
         assert_eq!(repeat["endpoint"], "007509E0");
-        let sounds = sim.sound_events.iter().filter(|event| matches!(event,
-            SimSoundEvent::EntityDied { die_sound_id, .. } if sim.interner.resolve(*die_sound_id) == "GIDie"
-        )).count();
+        let sounds = sim
+            .sound_events
+            .iter()
+            .filter(|event| {
+                matches!(event,
+                    SimSoundEvent::VocAt { sound_id, .. }
+                    | SimSoundEvent::VocAtCoord { sound_id, .. }
+                    | SimSoundEvent::EntityDied { die_sound_id: sound_id, .. }
+                        if sound_id.name_in(&rules) == "GIDie"
+                )
+            })
+            .count();
         assert_eq!(
             sounds,
             1 + repeat["rng_draws"].as_u64().unwrap() as usize,
@@ -184,68 +227,54 @@ mod tests {
         // only its later death tail. Both first deaths therefore count now,
         // including TERROR while its Die2 sequence remains in Logic.
         assert_eq!(
-            sim.houses[&owner].stats.units_lost, 2,
+            sim.houses[&owner].stats().units_lost(),
+            2,
             "both fatal callbacks count; the zero-health GI revisit adds no loss"
         );
         assert_eq!(
-            sim.houses[&owner].stats.units_killed, 1,
+            sim.houses[&owner].stats().units_killed(),
+            1,
             "only TerrorBomb's first GI kill is credited"
         );
-        assert!(sim.substrate.entities.get(gi).unwrap().destruction_recorded);
+        assert!(
+            sim.substrate
+                .entities
+                .get(gi)
+                .unwrap()
+                .seldom
+                .kill_record
+                .is_recorded()
+        );
         assert!(!sim.live_object_order_snapshot().contains(&gi));
         let head = sim.substrate.entities.get(terror).unwrap();
-        assert!(head.infantry_terminal.is_some());
-        assert!(head.destruction_recorded);
+        assert!(!head.death.is_dying() && head.lifecycle.object_alive());
+        assert_eq!(head.health.current(), 0);
+        assert!(head.seldom.kill_record.is_recorded());
         assert!(sim.live_object_order_snapshot().contains(&terror));
-        // Drive its actual Die2 clock through terminal visits and confirm
+        // Drive its actual Die2 clock through its ordinary turns and confirm
         // UnInit does not count either fatal callback again. This test does
         // not assert animation duration (completion calls UnInit520CAD).
         for frame in 1..=120 {
-            if sim
+            if !sim
                 .substrate
                 .entities
                 .get(terror)
                 .unwrap()
-                .infantry_terminal
-                .is_none()
+                .lifecycle
+                .object_alive()
             {
                 break;
             }
-            sim.session.binary_frame = frame;
-            assert!(
-                sim.visit_infantry_terminal(terror, Some(&rules), Default::default())
-                    .visited
-            );
+            sim.session.set_binary_frame_for_test(frame);
+            sim.advance_live_object_turn(terror, &rules, &mut Default::default())
+                .expect("the corpse's ordinary turn completes");
         }
         let head = sim.substrate.entities.get(terror).unwrap();
-        assert!(head.infantry_terminal.is_none());
-        assert!(!head.lifecycle.object_alive);
-        assert!(head.destruction_recorded);
+        assert!(!head.lifecycle.object_alive());
+        assert!(head.seldom.kill_record.is_recorded());
         assert!(!sim.live_object_order_snapshot().contains(&terror));
-        assert_eq!(sim.houses[&owner].stats.units_lost, 2);
-        assert_eq!(sim.houses[&owner].stats.units_killed, 1);
-    }
-
-    #[test]
-    fn bridge_ground_revisited_terrorist_executes_its_death_weapon_again() {
-        let rules = stock_cascade_rules();
-        let mut sim = world(&rules);
-        let tank = place(&mut sim, &rules, "MTNK", 4);
-        let next = place(&mut sim, &rules, "TERROR", 4);
-        let head = place(&mut sim, &rules, "TERROR", 4);
-        assert_eq!(
-            members(&sim, 4, 4).collect::<Vec<_>>(),
-            vec![
-                CellObjectMember::Entity(head),
-                CellObjectMember::Entity(next),
-                CellObjectMember::Entity(tank),
-            ]
-        );
-        apply(&mut sim, &rules, None, 4, 4);
-        // Two original deaths leave the heavy tank alive. The captured
-        // successor's repeated DeathWeapon kills it; its unlinked NextObject
-        // cannot pass it a later direct C4 receiver.
-        assert_eq!(sim.substrate.entities.get(tank).unwrap().health.current, 0);
+        assert_eq!(sim.houses[&owner].stats().units_lost(), 2);
+        assert_eq!(sim.houses[&owner].stats().units_killed(), 1);
     }
 
     #[test]
@@ -259,86 +288,106 @@ mod tests {
             .get_mut(building)
             .unwrap()
             .health
-            .current = 0;
-        apply(&mut sim, &rules, None, 4, 4);
-        assert!(
-            !sim.sound_events
-                .iter()
-                .any(|event| matches!(event, SimSoundEvent::EntityDied { .. }))
+            .set_for_test(0);
+        apply(
+            &mut sim,
+            &rules,
+            None,
+            4,
+            4,
+            &mut crate::sim::world::FrameEffects::default(),
         );
+        assert!(!sim.sound_events.iter().any(|event| matches!(
+            event,
+            SimSoundEvent::VocAt { .. }
+                | SimSoundEvent::VocAtCoord { .. }
+                | SimSoundEvent::EntityDied { .. }
+        )));
         assert!(
             sim.substrate
                 .entities
                 .get(building)
                 .unwrap()
                 .lifecycle
-                .object_alive
+                .object_alive()
         );
         assert!(sim.substrate.pending_delete.is_empty());
     }
 
+    /// `BuildingClass::ReceiveDamage @ 0x00442230` returns 0 at `0x004423A3`
+    /// for a `BridgeRepairHut=`+`Immune=` type whatever ignoreDefenses says,
+    /// so BlowUpBridge's forced C4 (`0x0047DDAE`, ignoreDefenses 1) leaves a
+    /// retail CABHUT on the collapsing cell at full Health, and alive.
     #[test]
-    fn bridge_ground_infantry_action_preserves_same_sequence_and_retired_membership() {
-        use crate::sim::world::InfantryDeathSequence;
-        let rules = stock_cascade_rules();
+    fn bridge_ground_forced_c4_leaves_a_retail_bridge_repair_hut_untouched() {
+        let Some(rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules() else {
+            return;
+        };
+        let hut_type = rules.object("CABHUT").expect("retail CABHUT");
+        assert!(hut_type.bridge_repair_hut && hut_type.immune);
         let mut sim = world(&rules);
-        let gi = place(&mut sim, &rules, "E1", 4);
-        assert!(sim.infantry_do_action(gi, 12, true, &rules).unwrap());
-        sim.substrate
-            .entities
-            .get_mut(gi)
-            .unwrap()
-            .set_native_stage_value(7);
-        sim.begin_infantry_death_sequence(gi, InfantryDeathSequence::Die2, &rules);
+        let hut = place(&mut sim, &rules, "CABHUT", 4);
         assert_eq!(
-            sim.substrate
-                .entities
-                .get(gi)
-                .unwrap()
-                .native_stage()
-                .value(),
-            7
+            members(&sim, 4, 4).collect::<Vec<_>>(),
+            vec![CellObjectMember::Entity(hut)]
         );
-        sim.uninit_with_rules(gi, &rules);
-        let pending = sim.substrate.pending_delete.clone();
-        sim.begin_infantry_death_sequence(gi, InfantryDeathSequence::Die1, &rules);
-        let object = sim.substrate.entities.get(gi).unwrap();
-        assert_eq!(object.mission_leaf.as_infantry().unwrap().doing(), 11);
-        assert_eq!(object.native_stage().value(), 0);
-        assert!(object.infantry_terminal.is_none());
-        assert!(!object.lifecycle.object_alive);
-        assert!(!sim.live_object_order_snapshot().contains(&gi));
-        assert_eq!(sim.substrate.pending_delete, pending);
+        apply(
+            &mut sim,
+            &rules,
+            None,
+            4,
+            4,
+            &mut crate::sim::world::FrameEffects::default(),
+        );
+        let hut = sim.substrate.entities.get(hut).unwrap();
+        assert_eq!(hut.health.current(), hut_type.strength);
+        assert!(hut.lifecycle.object_alive());
+        assert!(sim.substrate.pending_delete.is_empty());
     }
 
     #[test]
     fn bridge_ground_forced_super_damages_an_occupied_tank_bunker() {
         // Stock Super has PenetratesBunker=yes. Without the ignoreDefenses
         // bypass, the linked Building arm incorrectly nullifies its damage.
-        let rules = RuleSet::from_ini(&IniFile::from_str(
-            "[InfantryTypes]\n[VehicleTypes]\n0=TANK\n[AircraftTypes]\n\
+        let rules = RuleSet::from_ini_with_fixed_art_for_test(
+            &IniFile::from_str(
+                "[InfantryTypes]\n[VehicleTypes]\n0=TANK\n[AircraftTypes]\n\
              [BuildingTypes]\n0=NATBNK\n[TANK]\nStrength=100\nSpeed=4\n\
-             [NATBNK]\nStrength=1000\nFoundation=2x2\nTankBunker=yes\n\
+             [NATBNK]\nStrength=1000\nTankBunker=yes\n\
              [CombatDamage]\nC4Warhead=Super\n[Warheads]\n0=Super\n\
              [Super]\nInfDeath=2\nPenetratesBunker=yes\n\
              Verses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
-        ))
+            ),
+            &IniFile::from_str("[NATBNK]\nFoundation=2x2\n"),
+        )
         .unwrap();
         let mut sim = world(&rules);
         let bunker = place(&mut sim, &rules, "NATBNK", 3);
         let occupant = place(&mut sim, &rules, "TANK", 6);
         crate::sim::docking::bunker_link::install_bunker_link(&mut sim, bunker, occupant, &rules);
         assert_eq!(
-            sim.substrate.entities.get(bunker).unwrap().bunker_occupant,
+            sim.substrate
+                .entities
+                .get(bunker)
+                .unwrap()
+                .bunker
+                .occupant(),
             Some(occupant)
         );
         assert_eq!(
             members(&sim, 4, 4).collect::<Vec<_>>(),
             vec![CellObjectMember::Entity(bunker)]
         );
-        apply(&mut sim, &rules, None, 4, 4);
+        apply(
+            &mut sim,
+            &rules,
+            None,
+            4,
+            4,
+            &mut crate::sim::world::FrameEffects::default(),
+        );
         assert_eq!(
-            sim.substrate.entities.get(bunker).unwrap().health.current,
+            sim.substrate.entities.get(bunker).unwrap().health.current(),
             0
         );
     }
@@ -357,7 +406,7 @@ mod tests {
             )))
             .unwrap();
             let mut sim = world(&rules);
-            crate::sim::terrain_spawn::seed_terrain_spawners(
+            crate::sim::terrain_spawn::seed_terrain_animations(
                 &mut sim,
                 &[TerrainObject {
                     rx: 4,
@@ -367,23 +416,30 @@ mod tests {
                 &rules,
                 false,
             );
-            let id = sim.production.terrain_object_cells[&(4, 4)];
+            let id = sim.terrain_objects.cell_index()[&(4, 4)];
             assert_eq!(
                 members(&sim, 4, 4).collect::<Vec<_>>(),
                 vec![CellObjectMember::Terrain(id)]
             );
-            apply(&mut sim, &rules, None, 4, 4);
-            let tree = &sim.production.terrain_objects[&id];
+            apply(
+                &mut sim,
+                &rules,
+                None,
+                4,
+                4,
+                &mut crate::sim::world::FrameEffects::default(),
+            );
+            let tree = &sim.terrain_objects.objects()[&id];
             if wood {
-                assert_eq!(tree.health, 0);
-                assert_eq!(tree.lifecycle, TerrainObjectLifecycle::Destroyed);
-                assert!(!tree.in_logic_vector);
+                assert_eq!(tree.health(), 0);
+                assert_eq!(tree.lifecycle(), TerrainObjectLifecycle::Destroyed);
+                assert!(!tree.in_logic_vector());
                 assert!(members(&sim, 4, 4).next().is_none());
                 assert_eq!(sim.substrate.raw_cell_occupation.ground_bits(4, 4), 0);
             } else {
-                assert_eq!(tree.health, 100);
+                assert_eq!(tree.health(), 100);
                 assert!(tree.is_live());
-                assert_eq!(sim.production.terrain_object_cells[&(4, 4)], id);
+                assert_eq!(sim.terrain_objects.cell_index()[&(4, 4)], id);
             }
         }
     }
@@ -418,11 +474,24 @@ mod tests {
                 CellObjectMember::Entity(tail),
             ]
         );
-        apply(&mut sim, &rules, None, 4, 4);
-        assert_eq!(sim.substrate.entities.get(head).unwrap().health.current, 0);
-        assert_eq!(sim.substrate.entities.get(next).unwrap().health.current, 0);
+        apply(
+            &mut sim,
+            &rules,
+            None,
+            4,
+            4,
+            &mut crate::sim::world::FrameEffects::default(),
+        );
         assert_eq!(
-            sim.substrate.entities.get(tail).unwrap().health.current,
+            sim.substrate.entities.get(head).unwrap().health.current(),
+            0
+        );
+        assert_eq!(
+            sim.substrate.entities.get(next).unwrap().health.current(),
+            0
+        );
+        assert_eq!(
+            sim.substrate.entities.get(tail).unwrap().health.current(),
             100
         );
         assert_eq!(
@@ -433,13 +502,16 @@ mod tests {
 
     #[test]
     fn bridge_ground_uses_membership_order_and_nonanchor_building_foundation() {
-        let rules = RuleSet::from_ini(&IniFile::from_str(
-            "[InfantryTypes]\n0=E1\n[VehicleTypes]\n[AircraftTypes]\n\
+        let rules = RuleSet::from_ini_with_fixed_art_for_test(
+            &IniFile::from_str(
+                "[InfantryTypes]\n0=E1\n[VehicleTypes]\n[AircraftTypes]\n\
              [BuildingTypes]\n0=BIG\n[E1]\nStrength=100\nSpeed=4\n\
-             [BIG]\nStrength=1000\nFoundation=2x1\n\
+             [BIG]\nStrength=1000\n\
              [CombatDamage]\nC4Warhead=KILL\n[Warheads]\n0=KILL\n\
              [KILL]\nInfDeath=3\nVerses=0%,0%,0%,0%,0%,0%,0%,0%,0%,0%,0%\n",
-        ))
+            ),
+            &IniFile::from_str("[BIG]\nFoundation=2x1\n"),
+        )
         .unwrap();
         let mut sim = Simulation::with_seed(31);
         sim.intern_rule_type_ids(&rules);
@@ -455,8 +527,28 @@ mod tests {
             Some(crate::map::resolved_terrain::ResolvedTerrainGrid::from_cells(8, 8, cells));
         let mut create = |name, x, marked| {
             let id = sim
-                .construct_object_limbo_at_height(name, "Americans", x, 4, 0, 0, &rules)
+                .construct_object_limbo_at_height(
+                    name,
+                    "Americans",
+                    x,
+                    4,
+                    0,
+                    0,
+                    &rules,
+                    &mut crate::sim::world::FrameEffects::default(),
+                )
                 .unwrap();
+            // The unmarked contrast has this same pose without Cell membership.
+            sim.substrate
+                .entities
+                .get_mut(id)
+                .unwrap()
+                .position
+                .put_location(crate::sim::components::DriveCoord {
+                    x: i32::from(x) * 256 + 128,
+                    y: 4 * 256 + 128,
+                    z: 0,
+                });
             if marked {
                 sim.reveal(id);
             }
@@ -474,15 +566,30 @@ mod tests {
                 CellObjectMember::Entity(building),
             ]
         );
-        apply(&mut sim, &rules, None, 4, 4);
+        apply(
+            &mut sim,
+            &rules,
+            None,
+            4,
+            4,
+            &mut crate::sim::world::FrameEffects::default(),
+        );
         for id in [older, newer, building] {
             assert_eq!(
-                sim.substrate.entities.get(id).unwrap().health.current,
+                sim.substrate.entities.get(id).unwrap().health.current(),
                 0,
                 "receiver {id}"
             );
         }
-        assert!(sim.substrate.entities.get(unmarked).unwrap().health.current > 0);
+        assert!(
+            sim.substrate
+                .entities
+                .get(unmarked)
+                .unwrap()
+                .health
+                .current()
+                > 0
+        );
         let order: Vec<_> = sim
             .lifecycle_test_events_for_test()
             .iter()

@@ -12,15 +12,18 @@
 //! Run explicitly on a machine with a wgpu adapter:
 //! `cargo test -p vera20k --lib render::depth_gpu_tests:: -- --ignored`
 
-use std::mem::{offset_of, size_of};
+use std::mem::size_of;
 use std::time::Duration;
 
 use wgpu::util::DeviceExt;
 
 use super::batch::{CameraUniform, SpriteInstance};
 use super::draw_state::DrawState;
-use super::frame_readback::PendingBgra8Readback;
-use super::native_z::{Z_GRADIENT_ZSHAPE_CLIP_FLAG, Z_GRADIENT_ZSHAPE_FLAG, ZGradient};
+use super::frame_readback::PendingTextureReadback;
+use super::gpu::block_on;
+use super::native_z::{
+    Z_GRADIENT_ZSHAPE_CLIP_FLAG, Z_GRADIENT_ZSHAPE_FLAG, ZGradient, zshape_skip_overshoot,
+};
 
 const SIDE: u32 = 8;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Bgra8UnormSrgb;
@@ -39,12 +42,15 @@ enum Shader {
 
 impl Shader {
     fn source(self) -> String {
-        super::tactical_shader::source(match self {
-            Self::Batch => include_str!("batch_shader.wgsl"),
-            Self::Terrain => include_str!("zdepth_shader.wgsl"),
-            Self::SpriteRead | Self::SpriteWrite => include_str!("zsprite_shader.wgsl"),
-            Self::Voxel => include_str!("sprite_voxel_shader.wgsl"),
-        })
+        use super::tactical_shader::{sprite_source, world_source};
+        match self {
+            Self::Batch => sprite_source(include_str!("batch_shader.wgsl")),
+            Self::Terrain => world_source(include_str!("zdepth_shader.wgsl")),
+            Self::SpriteRead | Self::SpriteWrite => {
+                sprite_source(include_str!("zsprite_shader.wgsl"))
+            }
+            Self::Voxel => world_source(include_str!("sprite_voxel_shader.wgsl")),
+        }
     }
 
     fn writes_depth(self) -> bool {
@@ -60,7 +66,13 @@ struct Layer {
     z_bytes: Vec<u8>,
     source_size: [u32; 2],
     indices: Vec<u8>,
+    /// The skip table's one slot for this layer (`render::zshape_skips`): a
+    /// byte per frame row, read when `fx_params.w` is 1. Empty binds no rows.
+    skip_rows: Vec<u8>,
     palette_override: Option<Vec<u8>>,
+    /// A palette-indexed SHP page: these palette rows take the colour binding
+    /// in place of `rgba`, and the instance's `source_palette` picks the row.
+    palette_rows: Option<Vec<u8>>,
 }
 
 impl Layer {
@@ -82,7 +94,9 @@ impl Layer {
             z_bytes: vec![0; (SIDE * SIDE) as usize],
             source_size: [SIDE; 2],
             indices: vec![33; (SIDE * SIDE) as usize],
+            skip_rows: Vec::new(),
             palette_override: None,
+            palette_rows: None,
         }
     }
 
@@ -100,17 +114,17 @@ struct Gpu {
 
 impl Gpu {
     fn new() -> Self {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             compatible_surface: None,
             ..Default::default()
         }))
         .expect("explicit GPU regression test requires a wgpu adapter");
         eprintln!("Depth shader test adapter: {:?}", adapter.get_info());
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("Depth shader regression device"),
             ..Default::default()
         }))
@@ -165,10 +179,12 @@ impl Gpu {
                     _pad: 0.0,
 
                     native_z_origin_y: 0.0,
-                    _native_z_pad: 0.0,
+                    native_z_pan: 0.0,
                 }),
                 usage: wgpu::BufferUsages::UNIFORM,
             });
+        let (neutral_a, neutral_a_uniform) =
+            super::shroud_buffer::neutral_gpu_source(&self.device, &self.queue);
         let sampler = self
             .device
             .create_sampler(&wgpu::SamplerDescriptor::default());
@@ -211,16 +227,20 @@ impl Gpu {
                         } else {
                             "vs_main"
                         }),
-                        buffers: &[wgpu::VertexBufferLayout {
+                        buffers: &[Some(wgpu::VertexBufferLayout {
                             array_stride: size_of::<SpriteInstance>() as u64,
                             step_mode: wgpu::VertexStepMode::Instance,
-                            attributes: &INSTANCE_ATTRIBUTES,
-                        }],
+                            attributes: &crate::render::batch::SPRITE_INSTANCE_ATTRIBUTES,
+                        })],
                         compilation_options: Default::default(),
                     },
                     fragment: Some(wgpu::FragmentState {
                         module: &module,
-                        entry_point: Some("fs_main"),
+                        entry_point: Some(if matches!(layer.shader, Shader::SpriteWrite) {
+                            "fs_write"
+                        } else {
+                            "fs_main"
+                        }),
                         targets: &[Some(wgpu::ColorTargetState {
                             format: FORMAT,
                             blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -231,30 +251,40 @@ impl Gpu {
                     primitive: Default::default(),
                     depth_stencil: Some(wgpu::DepthStencilState {
                         format: wgpu::TextureFormat::Depth32Float,
-                        depth_write_enabled: layer.shader.writes_depth(),
+                        depth_write_enabled: Some(layer.shader.writes_depth()),
                         // TMP leaf 0x547CF0 admits equality. Ordinary SHP leaves
                         // 0x494B60/0x497FD0 and building leaves 0x4958D0/0x4990E0
                         // use strict less-than. This exercises those contracts,
                         // not production BatchRenderer's pipeline selection.
-                        depth_compare: if matches!(layer.shader, Shader::Terrain) {
+                        depth_compare: Some(if matches!(layer.shader, Shader::Terrain) {
                             wgpu::CompareFunction::LessEqual
                         } else {
                             wgpu::CompareFunction::Less
-                        },
+                        }),
                         stencil: Default::default(),
                         bias: Default::default(),
                     }),
                     multisample: Default::default(),
-                    multiview: None,
+                    multiview_mask: None,
                     cache: None,
                 });
             let camera_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Depth test camera group"),
                 layout: &pipeline.get_bind_group_layout(0),
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: camera.as_entire_binding(),
-                }],
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: camera.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&neutral_a),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: neutral_a_uniform.as_entire_binding(),
+                    },
+                ],
             });
             let voxel = matches!(layer.shader, Shader::Voxel);
             let color_source = if voxel {
@@ -263,9 +293,20 @@ impl Gpu {
                     &layer.indices,
                     layer.source_size,
                 )
-            } else {
+            } else if let Some(rows) = &layer.palette_rows {
                 self.texture(
-                    wgpu::TextureFormat::Rgba8UnormSrgb,
+                    wgpu::TextureFormat::Rgba8Unorm,
+                    rows,
+                    [256, (rows.len() / 1024) as u32],
+                )
+            } else {
+                // Tile pages are encoded, like production's; RGBA pages are sRGB.
+                self.texture(
+                    if matches!(layer.shader, Shader::Terrain) {
+                        wgpu::TextureFormat::Rgba8Unorm
+                    } else {
+                        wgpu::TextureFormat::Rgba8UnormSrgb
+                    },
                     &layer.rgba,
                     layer.source_size,
                 )
@@ -300,18 +341,13 @@ impl Gpu {
             if let Some(bytes) = &layer.palette_override {
                 palette_bytes.clone_from(bytes);
             }
-            let palette = self.texture(
-                wgpu::TextureFormat::Rgba8UnormSrgb,
-                &palette_bytes,
-                [256, 1],
-            );
+            let palette = self.texture(wgpu::TextureFormat::Rgba8Unorm, &palette_bytes, [256, 1]);
             let ramp_bytes = if layer.palette_override.is_some() {
                 palette_bytes[16 * 4..32 * 4].repeat(2)
             } else {
                 [RED.repeat(16), GREEN.repeat(16)].concat()
             };
-            let house_ramp =
-                self.texture(wgpu::TextureFormat::Rgba8UnormSrgb, &ramp_bytes, [16, 2]);
+            let house_ramp = self.texture(wgpu::TextureFormat::Rgba8Unorm, &ramp_bytes, [16, 2]);
             let voxel_palette_group = voxel.then(|| {
                 self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("Depth test indexed VXL palette and house ramp"),
@@ -353,15 +389,30 @@ impl Gpu {
                 layout: &pipeline.get_bind_group_layout(1),
                 entries: &texture_entries,
             });
+            let skip_table = self.texture(
+                wgpu::TextureFormat::R8Uint,
+                if layer.skip_rows.is_empty() {
+                    &[0]
+                } else {
+                    &layer.skip_rows
+                },
+                [layer.skip_rows.len().max(1) as u32, 1],
+            );
             let zshape_group = matches!(layer.shader, Shader::SpriteRead | Shader::SpriteWrite)
                 .then(|| {
                     self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label: Some("Depth test zshape group"),
                         layout: &pipeline.get_bind_group_layout(2),
-                        entries: &[wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: wgpu::BindingResource::TextureView(&z_source),
-                        }],
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: wgpu::BindingResource::TextureView(&z_source),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(&skip_table),
+                            },
+                        ],
                     })
                 });
             let instances = self
@@ -400,6 +451,7 @@ impl Gpu {
                 }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &camera_group, &[]);
@@ -414,7 +466,7 @@ impl Gpu {
             pass.draw(0..6, 0..1);
         }
 
-        let readback = PendingBgra8Readback::encode(
+        let readback = PendingTextureReadback::encode(
             &self.device,
             &mut encoder,
             &color,
@@ -427,7 +479,9 @@ impl Gpu {
         readback
             .finish(&self.device, submission, Duration::from_secs(10))
             .expect("read actual GPU pixels")
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|bgra| [bgra[2], bgra[1], bgra[0], bgra[3]])
             .collect()
     }
@@ -454,42 +508,24 @@ fn color_descriptor(size: [u32; 2]) -> wgpu::TextureDescriptor<'static> {
     }
 }
 
-// Derive offsets from the actual repr(C) structs, including nested DrawState.
-// Locations/formats are the existing production vertex ABI in batch.rs.
-macro_rules! attribute {
-    ($location:expr, $format:ident, $($field:tt)+) => {
-        wgpu::VertexAttribute {
-            format: wgpu::VertexFormat::$format,
-            offset: offset_of!(SpriteInstance, $($field)+) as u64,
-            shader_location: $location,
-        }
-    };
-}
-
-const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 15] = [
-    attribute!(0, Float32x2, position),
-    attribute!(1, Float32x2, size),
-    attribute!(2, Float32x2, uv_origin),
-    attribute!(3, Float32x2, uv_size),
-    attribute!(4, Float32, depth),
-    attribute!(5, Float32x3, tint),
-    attribute!(6, Float32, alpha),
-    attribute!(7, Uint32, draw_state.remap_row),
-    attribute!(8, Uint32, draw_state.fx_flags),
-    attribute!(9, Float32x4, draw_state.fx_params),
-    attribute!(10, Float32x4, draw_state.effect_tint),
-    attribute!(11, Float32, z_adjust),
-    attribute!(12, Uint32, z_gradient),
-    attribute!(13, Float32x2, zshape_origin),
-    attribute!(14, Uint32x4, palette_light),
-];
-
 fn cliff_depth_lanes() -> Layer {
     let mut terrain = Layer::solid(Shader::Terrain, RED, -31.0);
     // Native TMP ground rows: 31, 30, 19, 18, 10, 9, 8, 31.
-    for row in terrain.z_bytes.chunks_exact_mut(SIDE as usize) {
+    for row in terrain.z_bytes.as_chunks_mut::<{ SIDE as usize }>().0 {
         row.copy_from_slice(&[0, 1, 12, 13, 21, 22, 23, 0]);
     }
+    terrain
+}
+
+/// A 20x24 TMP whose columns repeat ten ground rows, Z 32768 less 5..23.
+fn staggered_depth_lanes() -> Layer {
+    let mut terrain = Layer::solid(Shader::Terrain, RED, -40.0);
+    terrain.source_size = [20, 24];
+    terrain.instance.size = [20.0, 24.0];
+    terrain.rgba = RED.repeat(20 * 24);
+    terrain.z_bytes = (0..20 * 24)
+        .map(|pixel| 40 - [5, 10, 11, 12, 18, 19, 20, 21, 22, 23][pixel % 10])
+        .collect();
     terrain
 }
 
@@ -617,6 +653,49 @@ fn cliff_voxel_hull_turret_and_barrel_use_the_shared_composite_seed() {
     }
 }
 
+#[test]
+#[ignore = "requires a wgpu adapter; run explicitly"]
+fn turreted_shp_body_and_turret_take_the_voxel_composites_depth() {
+    use super::native_z::pack_voxel_z_gradient;
+
+    // A turreted SHP Unit draws its body and turret into the Unit composite
+    // and blits it once (0x0073B140, called at 0x0073CDDB), as a voxel body
+    // does: each SHP part decides depth as the voxel composite on the shared
+    // rectangle does at that pixel.
+    let gpu = Gpu::new();
+    let composite = pack_voxel_z_gradient(ZGradient::Vertical, false);
+    let mut voxel = Layer::solid(Shader::Voxel, BLUE, -10.0);
+    voxel.instance.z_gradient = composite;
+    let baseline = gpu.render(&[cliff_depth_lanes(), voxel]);
+    let bounds = [([0.0, 2.0], [8.0, 6.0]), ([1.0, 0.0], [6.0, 5.0])];
+    let mut layers = vec![cliff_depth_lanes()];
+    for (position, size) in bounds {
+        let mut part = Layer::solid(Shader::SpriteRead, BLUE, -10.0);
+        part.instance.position = position;
+        part.instance.size = size;
+        part.instance.z_gradient = composite;
+        part.instance.zshape_origin = [0.0, SIDE as f32];
+        layers.push(part);
+    }
+    let actual = gpu.render(&layers);
+    for y in 0..SIDE {
+        for x in 0..SIDE {
+            let covered = bounds.iter().any(|(position, size)| {
+                (position[0]..position[0] + size[0]).contains(&(x as f32))
+                    && (position[1]..position[1] + size[1]).contains(&(y as f32))
+            });
+            let pixel = (y * SIDE + x) as usize;
+            let expected = if covered { baseline[pixel] } else { RED };
+            assert_eq!(actual[pixel], expected, "at ({x},{y})");
+        }
+    }
+    // Each part seeding from its own frame, as a lone SHP draw does, differs.
+    for layer in &mut layers[1..] {
+        layer.instance.z_gradient = ZGradient::Vertical as u32;
+    }
+    assert_ne!(gpu.render(&layers), actual, "fixture missed per-part seeds");
+}
+
 fn indexed_bridge_test_layer(position: [f32; 2], size: [u32; 2], index: u8) -> Layer {
     let mut layer = Layer::solid(Shader::Voxel, BLUE, 0.0);
     layer.instance.position = position;
@@ -636,13 +715,7 @@ fn bridge_split_shared_parts_match_two_clipped_indexed_composite_blits() {
 
     let gpu = Gpu::new();
     let size = [20, 24];
-    let mut terrain = Layer::solid(Shader::Terrain, RED, -40.0);
-    terrain.source_size = size;
-    terrain.instance.size = [20.0, 24.0];
-    terrain.rgba = RED.repeat(20 * 24);
-    terrain.z_bytes = (0..20 * 24)
-        .map(|pixel| 40 - [5, 10, 11, 12, 18, 19, 20, 21, 22, 23][pixel % 10])
-        .collect();
+    let terrain = staggered_depth_lanes();
 
     // Native contract: one 20x32 rectangle at y=-4; original split y=12.
     // Tactical clipping leaves upper y=0/h=12 and lower y=12/h=8. These
@@ -787,14 +860,30 @@ fn bridge_split_height_threshold_and_zoom_keep_original_quad_sampling() {
             };
         }
     }
+    let size = [48, 64];
     for zoom in [0.75, 1.25, 2.0] {
         tall.instance.z_gradient = pack_voxel_z_gradient(ZGradient::Vertical, false);
-        let ordinary = gpu.render_sized_zoom(&[tall.clone()], [48, 64], zoom);
+        let ordinary = gpu.render_sized_zoom(&[tall.clone()], size, zoom);
         tall.instance.z_gradient = pack_voxel_z_gradient(ZGradient::Vertical, true);
+        let split = gpu.render_sized_zoom(&[tall.clone()], size, zoom);
+        let mut mismatches = split
+            .iter()
+            .zip(&ordinary)
+            .enumerate()
+            .filter(|(_, (split, ordinary))| split != ordinary)
+            .map(|(index, (split, ordinary))| {
+                (
+                    index % size[0] as usize,
+                    index / size[0] as usize,
+                    *split,
+                    *ordinary,
+                )
+            });
+        let first = mismatches.next();
+        let count = usize::from(first.is_some()) + mismatches.count();
         assert_eq!(
-            gpu.render_sized_zoom(&[tall.clone()], [48, 64], zoom),
-            ordinary,
-            "split changed palette sampling at zoom {zoom}"
+            count, 0,
+            "split changed palette sampling at zoom {zoom}; first (x,y,split,ordinary)={first:?}"
         );
     }
 }
@@ -820,6 +909,81 @@ fn bridge_direct_shp_unit_uses_whole_body_flat_fudge_even_below_split_height() {
     assert_ne!(
         actual, baseline,
         "fixture missed whole-body direct-SHP branch"
+    );
+}
+
+#[test]
+#[ignore = "requires a wgpu adapter; run explicitly"]
+fn unsplit_voxel_body_seeds_from_its_view_clipped_bottom() {
+    use super::native_z::pack_voxel_z_gradient;
+
+    // Bit_Blit clips an unsplit composite's rectangle to the view before it
+    // seeds (0x00437461, 0x004374BB..0x004375A7): a body running 12 rows past
+    // a 20-row view walks Z as if its bottom row were the view's last.
+    let gpu = Gpu::new();
+    let size = [20, 24];
+    let terrain = staggered_depth_lanes();
+
+    let mut cut = indexed_bridge_test_layer([0.0, 4.0], [20, 16], 33);
+    cut.instance.zshape_origin = [4.0, 16.0];
+    cut.instance.z_gradient = ZGradient::Vertical as u32;
+    let expected = gpu.render_sized(&[terrain.clone(), cut], size);
+
+    let mut body = indexed_bridge_test_layer([0.0, 4.0], [20, 28], 33);
+    body.instance.zshape_origin = [4.0, 28.0];
+    body.instance.z_gradient = pack_voxel_z_gradient(ZGradient::Vertical, false);
+    body.instance.draw_state.fx_params[3] = 20.0;
+    let actual = gpu.render_sized(&[terrain.clone(), body.clone()], size);
+    assert_eq!(actual, expected, "unsplit body ignored the view clip");
+
+    body.instance.z_gradient = ZGradient::Vertical as u32;
+    assert_ne!(
+        gpu.render_sized(&[terrain, body], size),
+        actual,
+        "fixture missed the clipped seed"
+    );
+}
+
+/// Bit_Blit clips a raw SHP frame to the view before it seeds either
+/// gradient kind (0x00437461, 0x0043751A, 0x0043754A). The RLE walker seeds
+/// a top-seeded entry from the clipped top (0x00437BAB), entry 2 from the
+/// whole rectangle (0x00437C39).
+#[test]
+#[ignore = "requires a wgpu adapter; run explicitly"]
+fn shp_frames_seed_from_their_view_clipped_rows() {
+    use super::native_z::Z_GRADIENT_RAW_FRAME_FLAG;
+
+    // A 20-row view over a 24-row target; the frames start 3 rows above it.
+    let gpu = Gpu::new();
+    let visible = 20 * 20;
+    let render = |top: f32, height: u32, z_gradient: u32| {
+        let mut frame = Layer::solid(Shader::SpriteRead, BLUE, 0.0);
+        frame.instance.position = [0.0, top];
+        frame.instance.size = [20.0, height as f32];
+        frame.instance.z_gradient = z_gradient;
+        frame.instance.draw_state.fx_params[3] = 20.0;
+        frame.source_size = [20, height];
+        frame.rgba = BLUE.repeat((20 * height) as usize);
+        frame.z_bytes = vec![0; (20 * height) as usize];
+        frame.indices = vec![33; (20 * height) as usize];
+        let mut pixels = gpu.render_sized(&[staggered_depth_lanes(), frame], [20, 24]);
+        pixels.truncate(visible);
+        pixels
+    };
+
+    let vertical = ZGradient::Vertical as u32;
+    let raw = render(-3.0, 31, vertical | Z_GRADIENT_RAW_FRAME_FLAG);
+    assert_eq!(raw, render(0.0, 20, vertical), "raw frame seeded unclipped");
+    assert_ne!(
+        render(-3.0, 31, vertical),
+        raw,
+        "RLE entry 2 seeded from the clipped rows"
+    );
+    let moderate = ZGradient::Moderate as u32;
+    assert_eq!(
+        render(-3.0, 23, moderate),
+        render(0.0, 20, moderate),
+        "RLE top-seeded frame seeded above the view"
     );
 }
 
@@ -901,19 +1065,17 @@ fn stock_cliff_decoder_and_terrain_instances_occlude_shp_and_indexed_voxels() {
             z: 0,
             rx: 1,
             ry: 1,
-            is_water: false,
             variant: 0,
             tint: [1.0; 3],
             radar_left: [0; 3],
             radar_right: [0; 3],
-            has_damaged_data: false,
         }],
         world_width: 60.0,
         world_height: 256.0,
         origin_x: 0.0,
         origin_y: -100.0,
-        local_bounds: None,
         bridge_middle_tiles: None,
+        deformation_tiles: Vec::new(),
     };
     let lookup = |id, sub, variant| {
         assert_eq!((id, sub, variant), (tile_id, 2, 0));
@@ -928,6 +1090,7 @@ fn stock_cliff_decoder_and_terrain_instances_occlude_shp_and_indexed_voxels() {
         60.0,
         Some(&lookup),
         None,
+        Vec::new(),
     )
     .normal;
     assert_eq!(instances.len(), 1);
@@ -1007,16 +1170,6 @@ fn terrain_and_building_depth_hide_only_behind_pixels_and_preserve_holes() {
         "TMP per-pixel depth byte was ignored"
     );
 
-    // The high-bridge atlas stores row bytes with the opposite sign from TMP.
-    let mut bridge = Layer::solid(Shader::Terrain, RED, 0.0);
-    bridge.z_bytes.fill(8);
-    bridge.instance.draw_state.fx_params[3] = -1.0;
-    let pixels = gpu.render(&[bridge, Layer::solid(Shader::SpriteRead, BLUE, 0.0)]);
-    assert!(
-        pixels.iter().all(|pixel| *pixel == RED),
-        "bridge row atlas sign failed to occlude the behind sprite"
-    );
-
     // A nearer read-only sprite may change color, but must not prevent a
     // later, intermediate-depth sprite from drawing (native unit blitters
     // 0x494B60/0x497FD0 test existing Z without writing it).
@@ -1062,6 +1215,74 @@ fn terrain_and_building_depth_hide_only_behind_pixels_and_preserve_holes() {
     );
 }
 
+/// The Z leaves compare the signed candidate (0x00497FD0, 0x00494B60): one
+/// above 65535 never draws, even over empty Z, and a negative one always
+/// does, whatever its low 16 bits.
+#[test]
+#[ignore = "requires a wgpu adapter; run explicitly"]
+fn sprite_candidates_outside_the_stored_word_compare_signed() {
+    let gpu = Gpu::new();
+    // Flat rows at seed 32768: z = 32768 + z_adjust - row.
+    let pixels = gpu.render(&[Layer::solid(Shader::SpriteRead, BLUE, 40_000.0)]);
+    assert!(
+        pixels.iter().all(|pixel| *pixel == [0, 0, 0, 255]),
+        "a candidate above 65535 drew through its low 16 bits"
+    );
+    let pixels = gpu.render(&[
+        Layer::solid(Shader::SpriteWrite, RED, -32_668.0),
+        Layer::solid(Shader::SpriteRead, BLUE, -32_800.0),
+    ]);
+    assert!(
+        pixels.iter().all(|pixel| *pixel == BLUE),
+        "a negative candidate was refused over stored Z near 100"
+    );
+}
+
+#[test]
+#[ignore = "requires a wgpu adapter; run explicitly"]
+fn shaped_sprites_use_original_gradient_seed() {
+    let native = crate::test_fixture::json("tools/spatial_oracle/ore_shape_clip.json");
+    let gpu = Gpu::new();
+    for gradient in 0..=2 {
+        let row = native["shape_seeds"]
+            .as_array()
+            .expect("original seed controls")
+            .iter()
+            .find(|row| {
+                row["gradient"].as_u64() == Some(gradient)
+                    && row["screen_top"].as_i64() == Some(0)
+                    && row["height"].as_u64() == Some(u64::from(SIDE))
+                    && row["z_adjust"].as_i64() == Some(-1)
+            })
+            .expect("original 8-row shape seed");
+        let seed = row["seed"].as_i64().expect("native seed") as i32;
+        let mut shape = Layer::solid(Shader::SpriteWrite, BLUE, -1.0);
+        shape.instance.z_gradient = gradient as u32 | Z_GRADIENT_ZSHAPE_FLAG;
+        shape.z_bytes.fill(128);
+        for y in 0..SIDE {
+            shape.z_bytes[(y * SIDE + 1) as usize] = 129;
+            shape.z_bytes[(y * SIDE + 6) as usize] = 127;
+        }
+        let pixels = gpu.render(&[
+            Layer::solid(
+                Shader::Terrain,
+                RED,
+                (seed - super::native_z::DEFAULT_Z) as f32,
+            ),
+            shape,
+        ]);
+        for y in 0..SIDE {
+            for x in 0..SIDE {
+                assert_eq!(
+                    pixels[(y * SIDE + x) as usize],
+                    if x == 1 { BLUE } else { RED },
+                    "native gradient{gradient} seed{seed}, shape admission at ({x},{y})"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 #[ignore = "requires a wgpu adapter; run explicitly"]
 fn building_zshape_uses_constant_raw_seed_and_signed_shape_bytes() {
@@ -1095,6 +1316,59 @@ fn building_zshape_uses_constant_raw_seed_and_signed_shape_bytes() {
             "-1 zshape lane must be farther at every row {y}"
         );
     }
+}
+
+/// The RLE ZReadWrite leaf (0x004990E0) skips the columns left of the view a
+/// token at a time (0x00499141..0x00499154). A skip ending inside a
+/// transparent run moves dest, Z and A on to the run's end
+/// (0x0049915D..0x0049918F) but not the z-shape pointer, which drawn pixels
+/// and later runs advance (0x00499234, 0x004991C7): the rest of the row reads
+/// its shape that many columns back, by the skip table's byte for the row.
+#[test]
+#[ignore = "requires a wgpu adapter; run explicitly"]
+fn building_zshape_trails_a_left_edge_skip_that_ends_inside_a_run() {
+    let gpu = Gpu::new();
+    // `width` source columns, `clear` of them transparent from column 0, the
+    // view's left edge `skip` columns in, and the +1 shape lane at `lane`.
+    // A 1-row body's raw seed equals the flat terrain's Z, so only the +1
+    // lane draws.
+    let render = |width: u32, clear: u32, skip: u32, lane: std::ops::Range<u32>| {
+        let mut terrain = Layer::solid(Shader::Terrain, RED, 0.0);
+        terrain.source_size = [width, 1];
+        terrain.instance.size = [width as f32, 1.0];
+        terrain.rgba = RED.repeat(width as usize);
+        terrain.z_bytes = vec![0; width as usize];
+        let mut building = Layer::solid(Shader::SpriteWrite, BLUE, 0.0);
+        building.instance.position = [-(skip as f32), 0.0];
+        building.instance.size = [width as f32, 1.0];
+        building.instance.zshape_origin = building.instance.position;
+        building.instance.z_gradient = ZGradient::Vertical as u32 | Z_GRADIENT_ZSHAPE_FLAG;
+        building.source_size = [width, 1];
+        building.rgba = BLUE.repeat(width as usize);
+        building.indices = vec![33; width as usize];
+        building.z_bytes = vec![128; width as usize];
+        for x in 0..clear {
+            building.hole(x, 0);
+        }
+        // Slot 1 of the skip table holds the row's overshoot.
+        building.skip_rows = vec![zshape_skip_overshoot(&building.indices, skip as usize)];
+        building.instance.draw_state.fx_params[3] = 1.0;
+        for x in lane {
+            building.z_bytes[x as usize] = 129;
+        }
+        let pixels = gpu.render_sized(&[terrain, building], [width, 1]);
+        // The source columns that drew.
+        (0..width)
+            .filter(|&column| pixels[column as usize] == BLUE)
+            .map(|column| column + skip)
+            .collect::<Vec<_>>()
+    };
+
+    // A 4-column run cut 2 in: source columns 4 and 5 take shape 2 and 3.
+    assert_eq!(render(8, 4, 2, 2..4), [4, 5]);
+    // A 300-column run encodes as 255 + 45: the skip ends 245 short of the
+    // first token's end, so source column 300 takes shape column 55.
+    assert_eq!(render(320, 300, 10, 55..57), [300, 301]);
 }
 
 #[test]
@@ -1177,7 +1451,6 @@ fn depth_sprite_preserves_batch_tint_and_opacity() {
     ordinary.instance.tint = [0.5, 1.3, 0.75];
     ordinary.instance.alpha = 0.75;
     ordinary.instance.draw_state = DrawState {
-        effect_tint: [1.4, 0.65, 1.1, 1.0],
         fx_params: [0.6, 0.0, 1.0, 0.0],
         ..Default::default()
     };
@@ -1251,13 +1524,15 @@ fn native_palette_tables_match_all_ordinary_shader_pixels() {
                 })
                 .collect();
             let actual = gpu.render_sized(&layers, [256, fixture.rows]);
-            for (pixel, (got, bytes)) in
-                actual.iter().zip(fixture.bytes.chunks_exact(2)).enumerate()
+            for (pixel, (got, bytes)) in actual
+                .iter()
+                .zip(fixture.bytes.as_chunks::<2>().0)
+                .enumerate()
             {
                 let word = if pixel % 256 == 0 {
                     0
                 } else {
-                    u16::from_le_bytes(bytes.try_into().unwrap())
+                    u16::from_le_bytes(*bytes)
                 };
                 let stored = [
                     ((word >> 11) as u8) << 3,
@@ -1281,11 +1556,75 @@ fn native_palette_tables_match_all_ordinary_shader_pixels() {
     }
 }
 
+/// The colour word a draw's [`super::palette_light::PaletteLight`] carries
+/// reaches every ordinary shader's pixels ORed into the native RGB565 word
+/// after the conversion, as the tinted blitters OR it (`0x00494CD9`,
+/// `0x00498293`, `0x004993C2`; `tools/superweapon_oracle.py` `blitters`),
+/// and never reaches a source hole.
+#[test]
+#[ignore = "requires a wgpu adapter; run explicitly"]
+fn colour_word_ors_into_every_ordinary_shader_pixel() {
+    use super::native_surface_format::ACTIVE_RETAIL_RGB565_PRESENTATION;
+    use super::palette_light::{PaletteLight, native_fixtures, native_row};
+    let gpu = Gpu::new();
+    let rgba: Vec<u8> = (0..=255u8)
+        .flat_map(|i| [i, i.wrapping_mul(73), 255 - i, if i == 0 { 0 } else { 255 }])
+        .collect();
+    let fixture = native_fixtures()
+        .into_iter()
+        .find(|f| f.house && f.rows == 53)
+        .unwrap();
+    let row = 26;
+    let brightness = (0..=2000)
+        .find(|b| native_row(*b, 127, fixture.rows) == row)
+        .unwrap();
+    for colour in [0x0018u16, 0xE000, 0xE798] {
+        for shader in [
+            Shader::Batch,
+            Shader::SpriteRead,
+            Shader::SpriteWrite,
+            Shader::Voxel,
+        ] {
+            let mut layer = Layer::solid(shader, RED, 0.0);
+            layer.source_size = [256, 1];
+            layer.rgba.clone_from(&rgba);
+            layer.z_bytes = vec![0; 256];
+            layer.indices = (0..=255u8).collect();
+            layer.palette_override = Some(rgba.clone());
+            layer.instance.size = [256.0, 1.0];
+            layer.instance.palette_light =
+                PaletteLight::new(fixture.rgb, fixture.rows, brightness, fixture.house)
+                    .with_colour_word(colour);
+            let actual = gpu.render_sized(&[layer], [256, 1]);
+            for (index, got) in actual.iter().enumerate() {
+                let offset = (row as usize * 256 + index) * 2;
+                let word = if index == 0 {
+                    0
+                } else {
+                    u16::from_le_bytes(fixture.bytes[offset..offset + 2].try_into().unwrap())
+                        | colour
+                };
+                let stored = [
+                    ((word >> 11) as u8) << 3,
+                    (((word >> 5) & 63) as u8) << 2,
+                    ((word & 31) as u8) << 3,
+                    255,
+                ];
+                assert_eq!(
+                    *got,
+                    ACTIVE_RETAIL_RGB565_PRESENTATION.quantize_rgba8(stored),
+                    "{shader:?}, colour {colour:#06x}, index {index}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 #[ignore = "requires a GPU adapter"]
 fn native_shp_loader_atlas_palette_indices_reach_production_pixels() {
     let gpu = Gpu::new();
-    let (rgba, indices, size) = super::sprite_atlas::native_palette_probe_page();
+    let probe = super::sprite_atlas::native_palette_probe_page();
     let fixture = super::palette_light::native_fixtures()
         .into_iter()
         .find(|f| f.house && f.rows == 53 && f.rgb == [992, 768, 512])
@@ -1293,10 +1632,11 @@ fn native_shp_loader_atlas_palette_indices_reach_production_pixels() {
     let profile = super::native_surface_format::ACTIVE_RETAIL_RGB565_PRESENTATION;
     for shader in [Shader::Batch, Shader::SpriteRead, Shader::SpriteWrite] {
         let mut layer = Layer::solid(shader, RED, 0.0);
-        layer.rgba = rgba.clone();
-        layer.indices = indices.clone();
-        layer.source_size = size;
-        layer.z_bytes = vec![0; (size[0] * size[1]) as usize];
+        layer.palette_rows = Some(probe.palette_row.clone());
+        layer.instance.source_palette = 1;
+        layer.indices = probe.indices.clone();
+        layer.source_size = probe.size;
+        layer.z_bytes = vec![0; (probe.size[0] * probe.size[1]) as usize];
         layer.instance.size = [256.0, 1.0];
         layer.instance.uv_origin = [3.0 / 262.0, 1.0 / 3.0];
         layer.instance.uv_size = [256.0 / 262.0, 1.0 / 3.0];
@@ -1321,6 +1661,64 @@ fn native_shp_loader_atlas_palette_indices_reach_production_pixels() {
     }
 }
 
+#[test]
+#[ignore = "requires a GPU adapter"]
+fn indexed_shp_pages_draw_the_pixels_their_rgba_pages_drew() {
+    // The probe page through each SHP shader: once from the RGBA that
+    // `ShpFile::frame_to_rgba` converts its frame to, once from its indices
+    // and palette row. The row sits behind a decoy row, so the row selection
+    // is exercised. The precomposed path and a native palette conversion must
+    // both agree pixel for pixel, holes included. Index 204 holds raw 63,0,63
+    // (252,0,252), as retail UNITTEM.PAL does; no converter keys it
+    // (ConvertClass 0x0048E740 -> 0x004BBB00), so both paths draw it.
+    const MAGENTA: u8 = 204;
+    let gpu = Gpu::new();
+    let probe = super::sprite_atlas::palette_probe_page(
+        &crate::assets::pal_file::Palette::from_rgb(|index| {
+            if index == MAGENTA {
+                [252, 0, 252]
+            } else {
+                super::sprite_atlas::native_probe_rgb(index)
+            }
+        }),
+    );
+    let magenta_pixel = (probe.size[0] + 3 + u32::from(MAGENTA)) as usize;
+    assert_eq!(probe.indices[magenta_pixel], MAGENTA);
+    let rows = [vec![255; 1024], probe.palette_row.clone()].concat();
+    let fixture = super::palette_light::native_fixtures()
+        .into_iter()
+        .find(|f| f.house && f.rows == 53 && f.rgb == [992, 768, 512])
+        .unwrap();
+    for shader in [Shader::Batch, Shader::SpriteRead, Shader::SpriteWrite] {
+        for palette_light in [
+            super::palette_light::PaletteLight::default(),
+            super::palette_light::PaletteLight::new(fixture.rgb, 53, 1000, true),
+        ] {
+            let mut rgba = Layer::solid(shader, RED, 0.0);
+            rgba.rgba = probe.rgba.clone();
+            rgba.indices = probe.indices.clone();
+            rgba.source_size = probe.size;
+            rgba.z_bytes = vec![0; (probe.size[0] * probe.size[1]) as usize];
+            rgba.instance.size = probe.size.map(|v| v as f32);
+            rgba.instance.palette_light = palette_light;
+            let mut indexed = rgba.clone();
+            indexed.palette_rows = Some(rows.clone());
+            indexed.instance.source_palette = 2;
+            let drawn = gpu.render_sized(&[indexed], probe.size);
+            assert_eq!(
+                drawn,
+                gpu.render_sized(&[rgba], probe.size),
+                "{shader:?}, {palette_light:?}"
+            );
+            let magenta = drawn[magenta_pixel];
+            assert!(
+                magenta[0] > 0 && magenta[2] > 0,
+                "{shader:?}, {palette_light:?}: index {MAGENTA} drew {magenta:?}"
+            );
+        }
+    }
+}
+
 /// Offscreen consumer seam for app-layer tests of production lighting inputs.
 /// Uses the ordinary terrain WGSL and real TMP pixels; no CPU color substitute.
 pub(crate) fn render_terrain_lighting_probe(
@@ -1334,7 +1732,87 @@ pub(crate) fn render_terrain_lighting_probe(
         z_bytes: tile.depth.clone(),
         source_size: [tile.width, tile.height],
         indices: Vec::new(),
+        skip_rows: Vec::new(),
         palette_override: None,
+        palette_rows: None,
     };
     Gpu::new().render_sized(&[layer], [tile.width, tile.height])
+}
+
+#[test]
+#[ignore = "requires a wgpu adapter; run explicitly"]
+fn bunker_front_wall_interleaves_with_indexed_voxel_without_writing_z() {
+    use super::tactical_draw_plan::{RenderZPolicy, SpriteEncoding};
+    use crate::app::presentation::render::draw_plan_lowering::{
+        NativeDisplayOrder, ObjectPieceInstance, ObjectTexture, OwnedPlannedObject,
+        lower_ground_object_instances,
+    };
+    let native: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/building_slot_replacement.display.json",
+    ))
+    .unwrap();
+    let ids = [11, 20, 10]; // back wall, tank, front wall; deliberately not id order.
+    let ordered: Vec<_> = native["orders"][0]["order"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| ids[value.as_u64().unwrap() as usize])
+        .collect();
+    let order = NativeDisplayOrder::new(&ordered);
+    let gpu = Gpu::new();
+    // Synthetic texels and seed isolate the production GPU's read-only
+    // SHP/VXL compositing. These are not stock NATBNK/LTNK pixel goldens.
+    let back = Layer::solid(Shader::SpriteRead, RED, -12.0);
+    let tank = Layer::solid(Shader::Voxel, BLUE, -24.0);
+    let mut front = Layer::solid(Shader::SpriteRead, GREEN, -12.0);
+    for y in 0..SIDE / 2 {
+        for x in 0..SIDE {
+            front.hole(x, y);
+        }
+    }
+    let layers = [back, tank, front];
+    let planned: Vec<_> = [2usize, 0, 1]
+        .into_iter()
+        .map(|index| {
+            let encoding = if index == 1 {
+                SpriteEncoding::Voxel
+            } else {
+                SpriteEncoding::Plain
+            };
+            OwnedPlannedObject::object(
+                order.object_draw(ids[index], encoding).unwrap(),
+                vec![ObjectPieceInstance {
+                    target: if index == 1 {
+                        ObjectTexture::UnitAtlasPage(0)
+                    } else {
+                        ObjectTexture::ShpPage(index)
+                    },
+                    render_z: RenderZPolicy::ReadOnly,
+                    instance: layers[index].instance,
+                }],
+            )
+        })
+        .collect();
+    let lowered = lower_ground_object_instances(planned);
+    assert_eq!(lowered.owners, ordered);
+    let submitted: Vec<_> = lowered
+        .owners
+        .iter()
+        .map(|id| layers[ids.iter().position(|candidate| candidate == id).unwrap()].clone())
+        .collect();
+    let pixels = gpu.render(&submitted);
+    for y in 0..SIDE {
+        for x in 0..SIDE {
+            assert_eq!(
+                pixels[(y * SIDE + x) as usize],
+                if y < SIDE / 2 { BLUE } else { GREEN },
+                "wall must cover hull only where its source texel exists: ({x},{y})"
+            );
+        }
+    }
+    let wrong = gpu.render(&[layers[0].clone(), layers[2].clone(), layers[1].clone()]);
+    assert!(
+        wrong.iter().all(|pixel| *pixel == BLUE),
+        "negative control: submitting both walls before the tank reproduces the uncovered hull"
+    );
 }

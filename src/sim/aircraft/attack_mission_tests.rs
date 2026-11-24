@@ -5,17 +5,14 @@ use super::*;
 use crate::map::playfield::PlayfieldBounds;
 use crate::rules::ini_parser::IniFile;
 use crate::rules::ruleset::RuleSet;
-use crate::sim::docking::aircraft_dock::AircraftAmmo;
+use crate::sim::ammo::TechnoAmmo;
 use crate::sim::mission::MissionType;
 use crate::sim::rng::SimRng;
 use crate::sim::world::edge_cell;
 use serde_json::Value;
 
-fn oracle() -> Value {
-    serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/aircraft_states.json"
-    ))
-    .expect("aircraft_states.json")
+fn oracle() -> &'static Value {
+    crate::test_fixture::json("tools/spatial_oracle/aircraft_states.json")
 }
 
 /// Every combination a stored row stands for: the union of its `covers`
@@ -91,6 +88,8 @@ struct Replay<'a> {
     rng: SimRng,
     events: Vec<&'static str>,
     released: bool,
+    /// The row's Ammo: the oracle's FireAt stub spends none.
+    ammo: i32,
 }
 
 impl StrikeHost for Replay<'_> {
@@ -126,7 +125,10 @@ impl StrikeHost for Replay<'_> {
     }
     fn epilogue(&mut self) -> i32 {
         self.events.push("draw");
-        mission_epilogue(self.rules, self.mission, &mut self.rng)
+        crate::sim::mission::authority::rate_epilogue(self.rules, self.mission, &mut self.rng)
+    }
+    fn ammo(&mut self) -> i32 {
+        self.ammo
     }
 }
 
@@ -210,6 +212,7 @@ fn original_attack_state_rows() {
                 rng: SimRng::new(get("seed").as_u64().unwrap()),
                 events: Vec::new(),
                 released: false,
+                ammo,
             };
             let visit = strike_visit(&facts, &mut host);
             let name = &input["name"];
@@ -332,8 +335,8 @@ fn original_state10_rows() {
             let get = |key| field(&input, defaults, key);
             let name = &input["name"];
             // The prefix: the latch clears, pending ammo is consumed.
-            let mut ammo = AircraftAmmo::new(10);
-            ammo.current = get("ammo").as_i64().unwrap() as i32;
+            let mut ammo = TechnoAmmo::new(10);
+            ammo.set_current_for_test(get("ammo").as_i64().unwrap() as i32);
             if get("pending").as_i64().unwrap() != 0 {
                 ammo.begin_release();
             }
@@ -346,13 +349,18 @@ fn original_state10_rows() {
                 0,
                 1,
             );
-            house.is_human = get("house_1ec").as_i64().unwrap() != 0;
-            house.player_control = get("house_1ed").as_i64().unwrap() != 0;
+            house.set_is_human_for_test(get("house_1ec").as_i64().unwrap() != 0);
+            house.set_player_control_for_test(get("house_1ed").as_i64().unwrap() != 0);
             let facts = ExitFacts {
-                ammo: ammo.current,
+                ammo: ammo.current(),
                 target: get("target").as_bool().unwrap(),
                 leaves_map: get("flag_3d4").as_i64().unwrap() != 0,
-                human: house.is_controlled_by_human(get("game_mode").as_i64().unwrap() != 0),
+                human: house.is_controlled_by_human(
+                    crate::sim::scenario_session::ScenarioGameMode::from_game_mode(
+                        get("game_mode").as_i64().unwrap() as i32,
+                    )
+                    .stock_rule_policy(None),
+                ),
                 airstrike: get("airstrike").as_bool().unwrap(),
             };
             let mut host = ExitReplay {
@@ -384,7 +392,7 @@ fn original_state10_rows() {
             let input_ammo = get("ammo").as_i64().unwrap();
             let row_input_ammo = row["input"]["ammo"].as_i64().unwrap();
             assert_eq!(
-                i64::from(ammo.current) - input_ammo,
+                i64::from(ammo.current()) - input_ammo,
                 row["ammo"].as_i64().unwrap() - row_input_ammo,
                 "{name}"
             );
@@ -423,16 +431,16 @@ fn state9_delay_matches_the_original_division() {
 /// house's own edge as its destination (`PickCellOnEdge 0x004AA440`, one
 /// Scenario draw for North) and enters idle mode in the same visit
 /// (`vt+0x484`). With no `Dock=` list, Enter_Idle_Mode leaves that
-/// destination (`0x0041796A..0x00417978` skips the dock arm), and a computer
-/// house keeps its target. A Harrier-like type with an airfield goes home at
-/// once instead: Enter_Idle_Mode replaces the edge cell with its dock
+/// destination (`0x0041796A..0x00417978` skips the dock arm) and commences
+/// Guard, or Area Guard for a computer house, which keeps its target. A
+/// Harrier-like type with an airfield goes home at once instead:
+/// Enter_Idle_Mode replaces the edge cell with its dock
 /// (`Assign_Destination(NULL, 1)` at `0x004179B4`, then the dock at
-/// `0x004179D7`).
+/// `0x004179D7`) once the dock answers HELLO, and commences Enter.
 #[test]
 fn an_empty_fighter_lets_go_heads_for_its_edge_and_idles() {
     use crate::map::entities::EntityCategory;
-    use crate::sim::aircraft::AircraftMission;
-    use crate::sim::combat::AttackTarget;
+    use crate::sim::combat::TargetKind;
     use crate::sim::components::NavTargetRef;
     use crate::sim::game_entity::GameEntity;
     use crate::sim::mission::leaf::MissionLeafState;
@@ -462,24 +470,43 @@ fn an_empty_fighter_lets_go_heads_for_its_edge_and_idles() {
         let mut sim = Simulation::with_seed(0x418C);
         let mut plane = GameEntity::test_default(1, plane_type, "Americans", 40, 40);
         if airfield {
-            let mut pad = GameEntity::test_default(2, "AIRF", "Americans", 20, 40);
-            pad.category = EntityCategory::Structure;
+            let mut pad = GameEntity::test_default_of_category(
+                2,
+                "AIRF",
+                "Americans",
+                20,
+                40,
+                EntityCategory::Structure,
+            );
             // Construction stamps the type's `Foundation=2x2`.
-            pad.foundation = "2x2".to_string();
-            pad.lifecycle.in_limbo = false;
+            pad.seldom
+                .type_facts
+                .set_foundation_for_test("2x2".to_string().into());
+            pad.lifecycle.set_in_limbo_for_test(false);
             sim.substrate.entities.insert(pad);
         }
         // After `test_default` interned the names.
         sim.interner = crate::sim::intern::test_interner();
         let owner = sim.interner.intern("Americans");
-        sim.houses.insert(
-            owner,
-            crate::sim::house_state::HouseState::new(owner, 0, None, human, 0, 1),
-        );
-        sim.playfield_bounds = Some(bounds);
-        plane.category = EntityCategory::Aircraft;
-        plane.mission_leaf = MissionLeafState::aircraft_raw_for_test(1, 1, false);
-        plane.aircraft_mission = Some(AircraftMission::Attack { sub_state: 10 });
+        sim.houses
+            .register(crate::sim::house_state::HouseState::new(
+                owner, 0, None, human, 0, 1,
+            ));
+        sim.set_playfield_bounds_for_test(Some(bounds));
+        if airfield {
+            // Find_Docking_Bay walks the house's buildings and its tracked
+            // counts, which construction fills.
+            sim.append_house_base_building_for_test(2);
+            crate::sim::house_tracking::HouseTracking::register_object(
+                &mut sim.substrate,
+                &mut sim.houses,
+                2,
+            );
+        }
+        plane.set_category_for_test(EntityCategory::Aircraft);
+        // The RadioClass constructor's one contact slot (`0x0065A764`).
+        plane.seldom.radio_contacts.set_capacity(1);
+        plane.mission_leaf = MissionLeafState::aircraft_raw_for_test(1, 1);
         plane
             .mission
             .apply_test_fixture(crate::sim::mission::state::MissionTestFixture {
@@ -487,21 +514,24 @@ fn an_empty_fighter_lets_go_heads_for_its_edge_and_idles() {
                 suspended: crate::sim::mission::MissionId::NONE,
                 queued: crate::sim::mission::MissionId::NONE,
                 movement_bypass_latch: 0,
-                handler_state: 0,
+                handler_state: 10,
                 mission_start_frame: 0,
                 ai_counter: 0,
                 dispatch_timer: crate::sim::mission::MissionDispatchTimer::at_frame(0),
             });
-        plane.aircraft_ammo = Some(AircraftAmmo::new(1));
-        plane.aircraft_ammo.as_mut().unwrap().current = 0;
-        plane.attack_target = Some(AttackTarget::for_cell(45, 40));
+        plane.install_ammo_for_test(Some(TechnoAmmo::new(1)));
+        plane.ammo_mut().unwrap().set_current_for_test(0);
+        plane
+            .attack_target
+            .set_for_test(Some(TargetKind::Cell(45, 40)));
         plane.locomotor = Some(LocomotorState::from_object_type(
             rules.object(plane_type).unwrap(),
             0,
         ));
-        // In flight: a grounded plane takes Enter_Idle_Mode's landed arm.
-        plane.locomotor.as_mut().unwrap().altitude =
-            crate::util::fixed_math::SimFixed::from_num(1500);
+        // In flight, on the map: a grounded plane takes Enter_Idle_Mode's
+        // landed arm, and an unmarked one is not in the air (vt+0x54).
+        plane.position.set_exact_z_leptons_for_test(Some(1500));
+        plane.lifecycle.set_cell_marked_for_test(true);
         sim.substrate.entities.insert(plane);
         sim.set_logic_order_for_test(vec![1]);
         let mut expected_rng = sim.scenario_rng.clone();
@@ -522,41 +552,52 @@ fn an_empty_fighter_lets_go_heads_for_its_edge_and_idles() {
 
     let (sim, edge) = exit("ORCA", true, false);
     let plane = sim.substrate.entities.get(1).unwrap();
-    assert!(plane.attack_target.is_none(), "a human house lets go");
+    assert!(
+        plane.attack_target.target().is_none(),
+        "a human house lets go"
+    );
     assert_eq!(
-        plane.navigation.nav_com,
+        plane.navigation.nav_com(),
         Some(NavTargetRef::cell(edge.0, edge.1))
     );
-    assert!(
-        matches!(plane.aircraft_mission, Some(AircraftMission::Guard)),
-        "no airfield: the idle decision holds station"
+    assert_eq!(
+        plane.mission.current().known(),
+        Some(MissionType::Guard),
+        "no airfield: the idle mode holds station"
     );
     assert_eq!(plane.mission_leaf.as_aircraft().unwrap().action_latch(), 0);
 
     let (sim, _) = exit("ORCA", false, false);
+    let plane = sim.substrate.entities.get(1).unwrap();
     assert!(
-        sim.substrate
-            .entities
-            .get(1)
-            .unwrap()
-            .attack_target
-            .is_some(),
+        plane.attack_target.target().is_some(),
         "a computer house keeps its target"
+    );
+    assert_eq!(
+        plane.mission.current().known(),
+        Some(MissionType::AreaGuard)
     );
 
     let (sim, edge) = exit("HARR", true, true);
     let plane = sim.substrate.entities.get(1).unwrap();
-    assert!(matches!(
-        plane.aircraft_mission,
-        Some(AircraftMission::ReturnToBase { airfield_id: 2 })
-    ));
+    assert_eq!(plane.mission.current().known(), Some(MissionType::Enter));
+    assert!(
+        plane.seldom.radio_contacts.contains(2),
+        "HELLO linked the dock"
+    );
     assert_eq!(
-        plane.navigation.nav_com,
-        Some(NavTargetRef::Building { id: 2 }),
+        plane.navigation.nav_com(),
+        Some(NavTargetRef::Object { id: 2 }),
         "home to the dock, not to the edge {edge:?}"
     );
-    let target = plane.movement_target.as_ref().unwrap();
-    assert_eq!(target.final_goal, Some((21, 41)), "Fly heads for the pad");
+    let fly = plane.locomotor.as_ref().unwrap().fly_runtime().unwrap();
+    let destination = fly.destination();
+    assert!(fly.moving());
+    assert_eq!(
+        (destination.x / 256, destination.y / 256),
+        (21, 41),
+        "Fly heads for the pad"
+    );
 }
 
 /// The retail inputs the loop reads, through the production reader:
@@ -568,10 +609,9 @@ fn an_empty_fighter_lets_go_heads_for_its_edge_and_idles() {
 /// of `TechnoTypeClass::ReadINI` (`0x0071465F`), not executed.
 #[test]
 fn retail_attack_loop_inputs() {
-    let Some((rules_ini, _)) = crate::rules::retail_ini_fixture::retail_rules_and_art() else {
+    let Some(rules) = crate::rules::retail_ini_fixture::retail_rulesmd_rules() else {
         return;
     };
-    let rules = RuleSet::from_ini(&rules_ini).unwrap();
     assert!(rules.general.curley_shuffle);
     for (name, strafe, fighter, delay) in [
         ("HORNET", true, false, Some(76)),

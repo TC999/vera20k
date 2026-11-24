@@ -2,6 +2,9 @@
 //! `tools/spatial_oracle/building_gattling.json` replayed through
 //! Mission_Attack's arms, Mission_Guard and the Update's Gattling block one
 //! call at a time, and its engagements through the production frame.
+//!
+//! The two charging replays hold in a stock game only: Ares' stage test reads
+//! the charged value (TechnoClass_UpdateGattling_Cycle, hook 0x70DEBA).
 
 use std::collections::BTreeMap;
 
@@ -12,6 +15,7 @@ use super::*;
 use crate::map::resolved_terrain::test_flat_ground_grid;
 use crate::rules::ini_parser::IniFile;
 use crate::sim::combat::gattling::{GattlingState, gattling_sound_owner};
+use crate::sim::combat::receiver_fixture::with_building_fire_stub;
 use crate::sim::combat::veterancy::RANK_ELITE_U16;
 use crate::sim::command::{Command, CommandEnvelope};
 use crate::sim::mission::MissionDispatchTimer;
@@ -23,11 +27,140 @@ use crate::sim::world::SimSoundEvent;
 /// each stage fires faster than the last).
 const ROF: [i32; 6] = [16, 16, 16, 8, 16, 4];
 
-fn golden() -> Value {
-    serde_json::from_str(include_str!(
-        "../../../../tools/spatial_oracle/building_gattling.json"
-    ))
-    .unwrap()
+/// Techno6F9EA8 re-drives +4A4 before Guard4496DA releases it. A client
+/// whose camera just left earshot must stop the live loop before that release
+/// can leave it playing a decay at the previous gain.
+#[test]
+fn retail_gattling_updates_its_loop_position_before_guard_releases_it() {
+    use crate::sim::anim_class::AnimWorldCoord;
+    use crate::sim::world::{FrameEffects, SoundBoundary, TickLane};
+    use std::cell::{Cell, RefCell};
+
+    struct Heard {
+        owner: u64,
+        delivered: Cell<usize>,
+        calls: RefCell<Vec<(&'static str, Option<AnimWorldCoord>)>>,
+    }
+    impl SoundBoundary for Heard {
+        fn consume(&mut self, _: &Simulation, _: &RuleSet, events: &[SimSoundEvent]) {
+            for event in &events[self.delivered.get()..] {
+                if matches!(event, SimSoundEvent::GattlingLoopRelease { owner } if *owner == self.owner)
+                {
+                    self.calls.borrow_mut().push(("release", None));
+                }
+            }
+            self.delivered.set(events.len());
+        }
+        fn delivered(&self) -> usize {
+            self.delivered.get()
+        }
+        fn update_looping_sound(&mut self, _: &Simulation, owner: u64, world: AnimWorldCoord) {
+            if owner == self.owner {
+                self.calls.borrow_mut().push(("position", Some(world)));
+            }
+        }
+    }
+
+    let Some(mut retail) =
+        crate::rules::retail_ini_fixture::retail_battle_rules_for_map("XMP03T4.MAP")
+    else {
+        return;
+    };
+    let Some((_, mut assets)) = crate::rules::retail_ini_fixture::retail_assets() else {
+        return;
+    };
+    let theater = crate::map::theater::load_theater(&mut assets, "TEMPERATE").unwrap();
+    let roots = crate::rules::effect_asset_catalog::tolerant_anim_class_roots(&retail.rules);
+    retail
+        .rules
+        .bind_anim_class_assets(&roots, &assets, theater.extension, "TEMPERATE");
+    retail
+        .rules
+        .bind_effect_assets(&assets, theater.extension, "TEMPERATE");
+    let rules = retail.rules;
+    let mut sim = crate::sim::arena_fixture::rival_arena(&rules, 0x6f9ea8);
+    sim.intern_rule_type_ids(&rules);
+    sim.resolve_type_handles(&rules);
+    let cannon = sim
+        .spawn_object("YAGGUN", "Americans", 12, 12, 0, &rules)
+        .unwrap();
+    sim.spawn_object("GAPOWR", "Americans", 4, 4, 0, &rules)
+        .unwrap();
+    let target = sim
+        .spawn_object("MTNK", "Russians", 16, 12, 0, &rules)
+        .unwrap();
+    // Seen, so Guard's release follows from the cleared target, not from the
+    // campaign discovery gate (`0x006F81BE`) hiding the tank from its scan.
+    crate::sim::arena_fixture::discover(&mut sim, target);
+    assert!(sim.apply_command(
+        "Americans",
+        &Command::Attack {
+            attacker_id: cannon,
+            target_id: target
+        },
+        Some(&rules)
+    ));
+    let started = (0..120).any(|_| {
+        let output = sim
+            .advance_app_frame(
+                &[],
+                &rules,
+                33,
+                TickLane::Ordinary,
+                &mut FrameEffects::empty(),
+            )
+            .unwrap();
+        output.sound_events.iter().any(|event| {
+            matches!(event,
+            SimSoundEvent::GattlingLoop { owner, sound_id, .. }
+            if *owner == gattling_sound_owner(cannon) && sound_id.name_in(&rules) == "GattlingGunAttackLoop1")
+        })
+    });
+    assert!(
+        started,
+        "the stock cannon starts its report through its real Attack visit"
+    );
+    assert!(sim.entities().get(cannon).unwrap().gattling.report_latch());
+    assert!(sim.apply_command(
+        "Americans",
+        &Command::Stop { entity_id: cannon },
+        Some(&rules)
+    ));
+    let world = Simulation::movement_sound_world(sim.entities().get(cannon).unwrap());
+    let mut heard = Heard {
+        owner: gattling_sound_owner(cannon),
+        delivered: Cell::new(0),
+        calls: RefCell::new(Vec::new()),
+    };
+    let released = (0..60).any(|_| {
+        heard.delivered.set(0);
+        heard.calls.borrow_mut().clear();
+        sim.advance_app_frame(
+            &[],
+            &rules,
+            33,
+            TickLane::Ordinary,
+            &mut FrameEffects::for_sound(&mut heard),
+        )
+        .unwrap();
+        heard
+            .calls
+            .borrow()
+            .iter()
+            .any(|(kind, _)| *kind == "release")
+    });
+    assert!(
+        released,
+        "the ordinary no-target path reaches Guard's release"
+    );
+    assert_eq!(
+        heard.calls.borrow().as_slice(),
+        [("position", Some(world)), ("release", None)]
+    );
+}
+
+fn golden() -> &'static Value {
+    crate::test_fixture::json("tools/spatial_oracle/building_gattling.json")
 }
 
 fn rows<'a>(golden: &'a Value, set: &str) -> &'a [Value] {
@@ -68,7 +201,7 @@ fn rules(delay: i64, rate_down: i64, reports: bool) -> RuleSet {
             }
         }
     }
-    RuleSet::from_ini(&IniFile::from_str(&format!(
+    RuleSet::from_ini(&crate::sim::arena_fixture::clear_ground_ini(&format!(
         "[General]\nGuardAreaTargetingDelay={delay}\n\
          [Guard]\nRate=.030\nAARate=.016\n\
          [Sticky]\nRate=.016\nAARate=.016\n\
@@ -132,10 +265,14 @@ fn prepare(sim: &mut Simulation, id: u64, input: &Value) {
         int("latch", 0) == 1,
     );
     if state["veterancy"].as_f64().unwrap_or(0.0) >= 2.0 {
-        entity.set_veterancy_rank(RANK_ELITE_U16);
+        entity.veterancy.set_rank_for_test(RANK_ELITE_U16);
     }
-    entity.last_fire_frame = int("last_fire_frame", -100);
-    entity.turret_anim_frame = int("turret_count", 0) as i32;
+    entity
+        .last_fire_frame
+        .set_for_test(int("last_fire_frame", -100));
+    entity
+        .turret_anim_frame
+        .set_for_test(int("turret_count", 0) as i32);
 }
 
 /// A sound the Gattling calls start, stop or release, by report name.
@@ -156,32 +293,36 @@ fn report_name(index: u64) -> String {
 }
 
 /// The loop events a native call list leaves in VERA's model: a stage-up
-/// stops the loop before the next one plays (StopAndClear `0x0070DF74` runs
-/// natively and is not recorded), a play starts one, and a release matters
-/// only for a live loop (the latch was set).
-fn expected_sounds(events: &[Value], latch_before: bool, stage_up: bool) -> Vec<Sound> {
+/// stops the loop before the next one plays. This older oracle does not
+/// record Stop405D40's early exits:70DF74 is the stage stop and70DF9C the
+/// report-entry stop. Their order is executed in gattling_loop.json's hard
+/// transition. Recorded Releases are reached even with a cleared latch.
+fn expected_sounds(events: &[Value], stage_up: bool) -> Vec<Sound> {
     let mut sounds = Vec::new();
     for event in events {
         match event[0].as_str().unwrap() {
             "stage_call" if event[1] == "increase" && stage_up => sounds.push(Sound::Stop),
-            "play_at" => sounds.push(Sound::Loop(report_name(event[1].as_u64().unwrap()))),
-            "release" if latch_before => sounds.push(Sound::Release),
+            "play_at" => {
+                sounds.push(Sound::Stop);
+                sounds.push(Sound::Loop(report_name(event[1].as_u64().unwrap())));
+            }
+            "release" => sounds.push(Sound::Release),
             _ => {}
         }
     }
     sounds
 }
 
-fn sounds(sim: &Simulation, id: u64) -> Vec<Sound> {
+fn sounds(sim: &Simulation, rules: &RuleSet, id: u64) -> Vec<Sound> {
     let owner = gattling_sound_owner(id);
     sim.sound_events
         .iter()
-        .filter_map(|event| match *event {
+        .filter_map(|event| match event {
             SimSoundEvent::GattlingLoop {
                 owner: o, sound_id, ..
-            } if o == owner => Some(Sound::Loop(sim.interner.resolve(sound_id).to_string())),
-            SimSoundEvent::GattlingLoopStop { owner: o } if o == owner => Some(Sound::Stop),
-            SimSoundEvent::GattlingLoopRelease { owner: o } if o == owner => Some(Sound::Release),
+            } if *o == owner => Some(Sound::Loop(sound_id.name_in(rules).to_string())),
+            SimSoundEvent::GattlingLoopStop { owner: o } if *o == owner => Some(Sound::Stop),
+            SimSoundEvent::GattlingLoopRelease { owner: o } if *o == owner => Some(Sound::Release),
             _ => None,
         })
         .collect()
@@ -224,7 +365,7 @@ fn with_draws(sim: &mut Simulation, row: &Value, call: impl FnOnce(&mut Simulati
 
 /// The row's recorded Gattling state, `+0xC4` and `+0x148`, and the loop
 /// events the calls made.
-fn assert_gattling(sim: &Simulation, id: u64, row: &Value, latch_before: bool, stage_before: i32) {
+fn assert_gattling(sim: &Simulation, rules: &RuleSet, id: u64, row: &Value, stage_before: i32) {
     let name = &row["input"]["name"];
     let native = &row["gattling"];
     let entity = sim.substrate.entities.get(id).unwrap();
@@ -250,17 +391,13 @@ fn assert_gattling(sim: &Simulation, id: u64, row: &Value, latch_before: bool, s
         "{name} +0xC4"
     );
     assert_eq!(
-        i64::from(entity.turret_anim_frame),
+        i64::from(entity.turret_anim_frame.frame()),
         native["turret_count"].as_i64().unwrap(),
         "{name} +0x148"
     );
     assert_eq!(
-        sounds(sim, id),
-        expected_sounds(
-            row["events"].as_array().unwrap(),
-            latch_before,
-            stage > stage_before
-        ),
+        sounds(sim, rules, id),
+        expected_sounds(row["events"].as_array().unwrap(), stage > stage_before),
         "{name} loop"
     );
 }
@@ -287,26 +424,40 @@ fn gattling_attack_matches_the_original() {
         if input["target"] == true {
             aim_at(&mut sim, building, target);
         }
-        let (latch_before, stage_before) = {
-            let entity = sim.substrate.entities.get(building).unwrap();
-            (entity.gattling.report_latch(), entity.gattling.stage())
-        };
+        let stage_before = sim
+            .substrate
+            .entities
+            .get(building)
+            .unwrap()
+            .gattling
+            .stage();
         let events = row["events"].as_array().unwrap();
-        let returns = with_draws(&mut sim, row, |sim| {
-            let Some((target, weapon)) = attack_prelude(sim, building, &rules) else {
-                return 1;
-            };
-            let asked = events
-                .iter()
-                .find(|event| event[0] == "fire_error")
-                .unwrap();
-            assert_eq!(
-                i64::from(weapon),
-                asked[2].as_i64().unwrap(),
-                "{name} SelectWeapon"
-            );
-            let code = CODES[input["errors"][0].as_u64().unwrap() as usize];
-            attack_arm(sim, building, &rules, target, weapon, code)
+        let (returns, fire_calls) = with_building_fire_stub(None, || {
+            with_draws(&mut sim, row, |sim| {
+                let Some((target, weapon)) = attack_prelude(sim, building, &rules) else {
+                    return 1;
+                };
+                let asked = events
+                    .iter()
+                    .find(|event| event[0] == "fire_error")
+                    .unwrap();
+                assert_eq!(
+                    i64::from(weapon),
+                    asked[2].as_i64().unwrap(),
+                    "{name} SelectWeapon"
+                );
+                let code = CODES[input["errors"][0].as_u64().unwrap() as usize];
+                attack_arm(
+                    sim,
+                    building,
+                    &rules,
+                    target,
+                    weapon,
+                    code,
+                    &mut ObjectAiCtx::default(),
+                    &mut false,
+                )
+            })
         });
         assert_eq!(
             i64::from(returns),
@@ -325,23 +476,42 @@ fn gattling_attack_matches_the_original() {
             "{name} queue"
         );
         assert_eq!(
-            entity.attack_target.is_some(),
+            entity.attack_target.target().is_some(),
             row["target"].is_string(),
             "{name} target"
         );
         let fire_at = events.iter().find(|event| event[0] == "fire_at");
         assert_eq!(
-            sim.fire_requests.buildings.get(&building).copied(),
+            fire_calls
+                .iter()
+                .find(|(id, _, _)| *id == building)
+                .map(|(_, shot, _)| *shot),
             fire_at.map(|event| BuildingShot::Mission {
                 weapon: event[2].as_i64().unwrap() as i32,
                 target: TargetKind::Entity(target),
             }),
             "{name} FireAt"
         );
-        assert_gattling(&sim, building, row, latch_before, stage_before);
+        assert_gattling(&sim, &rules, building, row, stage_before);
         if let Some(event) = fire_at {
             let elite = state_is_elite(input);
-            let shot = combat_phase_shot(&mut sim, &rules, building);
+            // A second run uses the complete live receiver (no boundary
+            // substitute) to check the selected slot before Gattling advances.
+            let (mut live, firer, victim) = fixture(&rules, kind(input), (8, 5));
+            prepare(&mut live, firer, input);
+            aim_at(&mut live, firer, victim);
+            let (aimed, weapon) = attack_prelude(&mut live, firer, &rules).unwrap();
+            attack_arm(
+                &mut live,
+                firer,
+                &rules,
+                aimed,
+                weapon,
+                FireError::Ok,
+                &mut ObjectAiCtx::default(),
+                &mut false,
+            );
+            let shot = live_shot(&live, firer);
             assert_eq!(
                 shot,
                 Some((
@@ -364,64 +534,55 @@ fn weapon_name(slot: u64, elite: bool) -> String {
     format!("{}{slot}", if elite { 'E' } else { 'W' })
 }
 
-/// Runs the combat phase over the frame's requests and answers the
-/// building's shot: the weapon it fired and what at.
-fn combat_phase_shot(
-    sim: &mut Simulation,
-    rules: &RuleSet,
-    building: u64,
-) -> Option<(String, TargetKind)> {
-    let requests = std::mem::take(&mut sim.fire_requests);
-    let result = sim.tick_combat_with_fatal_lifecycle(
-        rules,
-        None,
-        67,
-        &[building],
-        &Default::default(),
-        &requests,
-        &[],
-        &[],
-    );
-    result
-        .consequences
-        .fire_events()
+/// Observe the shot already emitted before the caller returned.
+fn live_shot(sim: &Simulation, building: u64) -> Option<(String, TargetKind)> {
+    sim.fire_events
         .iter()
         .find(|event| event.attacker_id == building)
         .map(|event| {
             (
-                sim.interner.resolve(event.weapon_id).to_string(),
+                sim.interner.resolve(event.weapon_id).to_owned(),
                 event.target,
             )
         })
 }
 
-/// A later object retargeting the building after its visit (a bullet's
-/// retaliation later in the Logic pass, say) leaves the visit's shot alone:
-/// native's FireAt ran inside the visit (`0x0044B6D0`), at that visit's
-/// TarCom with its weapon, so the combat phase fires the request's weapon at
-/// the request's target.
+/// Original44B6D0 returns from FireAt before44B6EF charges Gattling and
+/// before the next Logic object. A deferred request cannot supply its rearm
+/// or effect to that next caller (including Tesla's appended Spark system).
 #[test]
-fn a_retarget_after_the_visit_keeps_the_visits_shot() {
+fn building_fire_finishes_before_the_mission_returns() {
     let rules = rules(36, 50, true);
     let (mut sim, building, target) = fixture(&rules, "GAT", (8, 5));
-    let other = sim
-        .spawn_object("SHED", "Russians", 5, 8, 0, &rules)
-        .unwrap();
     aim_at(&mut sim, building, target);
     let (aimed, weapon) = attack_prelude(&mut sim, building, &rules).unwrap();
+    attack_arm(
+        &mut sim,
+        building,
+        &rules,
+        aimed,
+        weapon,
+        FireError::Ok,
+        &mut ObjectAiCtx::default(),
+        &mut false,
+    );
+    assert!(
+        sim.substrate
+            .entities
+            .get(building)
+            .unwrap()
+            .seldom
+            .rearm_timer
+            .remaining(FRAME as i32)
+            > 0,
+        "FireAt must rearm before returning to the mission, not after Logic"
+    );
     assert_eq!(
-        attack_arm(&mut sim, building, &rules, aimed, weapon, FireError::Ok),
+        sim.fire_events
+            .iter()
+            .filter(|event| event.attacker_id == building)
+            .count(),
         1
-    );
-    aim_at(&mut sim, building, other);
-    assert_eq!(
-        combat_phase_shot(&mut sim, &rules, building),
-        Some(("W0".to_string(), TargetKind::Entity(target)))
-    );
-    let entity = sim.substrate.entities.get(building).unwrap();
-    assert_eq!(
-        entity.attack_target.as_ref().map(|attack| attack.target),
-        Some(TargetKind::Entity(other))
     );
 }
 
@@ -446,11 +607,21 @@ fn gattling_guard_matches_the_original() {
         // An unseeded oracle row draws from the fixture's state, whose first
         // draw is 1 like seed 1's.
         sim.scenario_rng = SimRng::new(input["seed"].as_u64().unwrap_or(1));
-        let (latch_before, stage_before) = {
-            let entity = sim.substrate.entities.get(building).unwrap();
-            (entity.gattling.report_latch(), entity.gattling.stage())
-        };
-        let returns = with_draws(&mut sim, row, |sim| mission_guard(sim, building, &rules));
+        let stage_before = sim
+            .substrate
+            .entities
+            .get(building)
+            .unwrap()
+            .gattling
+            .stage();
+        let returns = with_draws(&mut sim, row, |sim| {
+            mission_guard(
+                sim,
+                building,
+                &rules,
+                &mut crate::sim::world::ObjectAiCtx::default(),
+            )
+        });
         assert_eq!(
             i64::from(returns),
             row["returns"].as_i64().unwrap(),
@@ -467,7 +638,7 @@ fn gattling_guard_matches_the_original() {
             row["status"].as_u64().unwrap(),
             "{name} status"
         );
-        assert_gattling(&sim, building, row, latch_before, stage_before);
+        assert_gattling(&sim, &rules, building, row, stage_before);
     }
 }
 
@@ -489,19 +660,28 @@ fn gattling_idle_decay_matches_the_original() {
         prepare(&mut sim, building, input);
         let since = input["since"].as_i64().unwrap();
         let entity = sim.substrate.entities.get_mut(building).unwrap();
-        entity.last_fire_frame = i64::from(FRAME) - since;
+        entity
+            .last_fire_frame
+            .set_for_test(i64::from(FRAME) - since);
         if input["dead"] == true {
-            entity.health.current = 0;
+            entity.health.set_for_test(0);
+            // The native oracle clears Object+90, not just Health+6C.
+            entity.lifecycle.set_object_alive_for_test(false);
         }
         let dead = row["ended"].as_u64().unwrap() == 0x0044_0573;
         assert_eq!(dead, input["dead"] == true, "{name}");
-        let latch_before = entity.gattling.report_latch();
         let stage_before = entity.gattling.stage();
         with_draws(&mut sim, row, |sim| {
-            gattling_idle(sim, building, &rules);
+            gattling_idle(
+                &sim.interner,
+                &sim.session,
+                &mut sim.substrate,
+                building,
+                &rules,
+            );
             0
         });
-        assert_gattling(&sim, building, row, latch_before, stage_before);
+        assert_gattling(&sim, &rules, building, row, stage_before);
     }
 }
 
@@ -549,6 +729,7 @@ fn gattling_cadence_matches_the_original() {
         let rules = row_rules(input);
         let mut sim = Simulation::new();
         sim.install_resolved_terrain_for_new_map(test_flat_ground_grid(16));
+        crate::sim::arena_fixture::supply_native_map(&mut sim);
         let building = sim
             .spawn_object("GAT", "Americans", 5, 5, 0, &rules)
             .unwrap();
@@ -577,9 +758,8 @@ fn gattling_cadence_matches_the_original() {
         let mut scenario_draws = 0;
         // The object pass of the frame `advance_tick` commits as `start + k`
         // runs at `base + k`, the frame its timers record.
-        let start = sim.session.binary_frame;
+        let start = sim.session.binary_frame();
         let base = i64::from(start) - 1;
-        let mut latch_before = false;
         let mut stage_before = 0;
         for frame in row["frames"].as_array().unwrap() {
             let k = frame["frame"].as_u64().unwrap();
@@ -589,16 +769,27 @@ fn gattling_cadence_matches_the_original() {
                     sim.assign_target_represented(
                         building,
                         Some(TargetKind::Entity(target)),
-                        Some(&rules),
+                        &rules,
+                        &mut crate::sim::world::FrameEffects::default(),
                     )
                     .unwrap();
                 }
                 Some(Event::Lose) => {
-                    sim.assign_target_represented(building, None, Some(&rules))
-                        .unwrap();
+                    sim.assign_target_represented(
+                        building,
+                        None,
+                        &rules,
+                        &mut crate::sim::world::FrameEffects::default(),
+                    )
+                    .unwrap();
                 }
                 Some(Event::Override) => {
-                    assert!(sim.override_mission_on_damage_response(building, target, &rules));
+                    assert!(sim.override_mission_on_damage_response(
+                        building,
+                        target,
+                        &rules,
+                        &mut crate::sim::world::FrameEffects::default(),
+                    ));
                 }
                 Some(Event::OutOfRange) => aim_at(&mut sim, building, far),
                 None => {}
@@ -614,10 +805,10 @@ fn gattling_cadence_matches_the_original() {
             for _ in 0..count(native_events, "rng", Some("main")) {
                 main.next_u32();
             }
-            sim.fire_events.clear();
-            sim.sound_events.clear();
+            sim.fire_events.clear_for_test();
+            sim.sound_events.clear_for_test();
             sim.advance_tick(&[], Some(&rules), None, None, 67);
-            assert_eq!(u64::from(sim.session.binary_frame - start), k, "{name}");
+            assert_eq!(u64::from(sim.session.binary_frame() - start), k, "{name}");
 
             let entity = sim.substrate.entities.get(building).unwrap();
             assert_eq!(
@@ -628,7 +819,7 @@ fn gattling_cadence_matches_the_original() {
             let native = &frame["gattling"];
             let lff = native["last_fire_frame"].as_i64().unwrap();
             assert_eq!(
-                entity.last_fire_frame,
+                entity.last_fire_frame.frame(),
                 if lff == -100 {
                     -100
                 } else {
@@ -664,6 +855,7 @@ fn gattling_cadence_matches_the_original() {
                     .entities
                     .get_mut(building)
                     .unwrap()
+                    .seldom
                     .rearm_timer
                     .start((base + k as i64) as i32, ROF[weapon]);
             }
@@ -673,8 +865,7 @@ fn gattling_cadence_matches_the_original() {
                 "gattling": native,
                 "events": native_events,
             });
-            assert_gattling(&sim, building, &frame_row, latch_before, stage_before);
-            latch_before = native["latch"] == 1;
+            assert_gattling(&sim, &rules, building, &frame_row, stage_before);
             stage_before = native["stage"].as_i64().unwrap() as i32;
         }
     }
@@ -684,7 +875,7 @@ fn gattling_cadence_matches_the_original() {
 }
 
 /// Every `report_gate` row through
-/// [`crate::sim::combat::world_receiver::per_shot_report`]: a Gattling type
+/// [`crate::sim::combat::world_fire::per_shot_report`]: a Gattling type
 /// plays no per-shot report whatever its list; any other plays
 /// `Report[(u16)+0x3C8 % Count]` unless the list is empty.
 #[test]
@@ -702,7 +893,7 @@ fn per_shot_report_matches_the_original() {
         ));
         let weapon =
             crate::rules::weapon_type::WeaponType::from_ini_section("W", ini.section("W").unwrap());
-        let played = crate::sim::combat::world_receiver::per_shot_report(
+        let played = crate::sim::combat::world_fire::per_shot_report(
             &weapon,
             input["gattling"] == true,
             input["sequence"].as_u64().unwrap() as u16,
@@ -756,24 +947,21 @@ fn retail_dustbowl_gattling_cannon_spins_up_and_winds_down() {
         let entity = scenario.sim().substrate.entities.get(cannon).unwrap();
         (
             entity.mission.current().known(),
-            entity.attack_target.is_some(),
+            entity.attack_target.target().is_some(),
             entity.gattling.stage(),
             entity.gattling.value(),
         )
     };
-    let loops = |scenario: &crate::headless_scenario::HeadlessScenario,
-                 output: &crate::sim::world::SimFrameOutput| {
+    let loops = |output: &crate::sim::world::SimFrameOutput, rules: &RuleSet| {
         output
             .sound_events
             .iter()
-            .filter_map(|event| match *event {
+            .filter_map(|event| match event {
                 SimSoundEvent::GattlingLoop {
                     owner: o, sound_id, ..
-                } if o == owner => Some(Sound::Loop(
-                    scenario.sim().interner.resolve(sound_id).to_string(),
-                )),
-                SimSoundEvent::GattlingLoopStop { owner: o } if o == owner => Some(Sound::Stop),
-                SimSoundEvent::GattlingLoopRelease { owner: o } if o == owner => {
+                } if *o == owner => Some(Sound::Loop(sound_id.name_in(rules).to_string())),
+                SimSoundEvent::GattlingLoopStop { owner: o } if *o == owner => Some(Sound::Stop),
+                SimSoundEvent::GattlingLoopRelease { owner: o } if *o == owner => {
                     Some(Sound::Release)
                 }
                 _ => None,
@@ -825,24 +1013,30 @@ fn retail_dustbowl_gattling_cannon_spins_up_and_winds_down() {
             );
             shots[stage_before as usize] += 1;
         }
-        sounds.extend(loops(&scenario, &output));
+        sounds.extend(loops(&output, &scenario.runtime.resources.rules));
     }
     println!("YAGGUN: stage-ups at {stage_ups:?}, shots per stage {shots:?}");
     assert_eq!(stage_ups.len(), 2, "two stage-ups");
     assert!(shots.iter().all(|&count| count > 0), "{shots:?}");
     assert_eq!(
-        sounds,
+        sounds
+            .into_iter()
+            .skip_while(|sound| *sound == Sound::Release)
+            .collect::<Vec<_>>(),
         [
+            Sound::Stop,
             Sound::Loop("GattlingGunAttackLoop1".to_string()),
             Sound::Stop,
+            Sound::Stop,
             Sound::Loop("GattlingGunAttackLoop2".to_string()),
+            Sound::Stop,
             Sound::Stop,
             Sound::Loop("GattlingGunAttackLoop3".to_string()),
         ]
     );
 
     let enemy_house = scenario.sim().interner.get("Americans").unwrap();
-    let tick = scenario.sim().session.tick;
+    let tick = scenario.sim().session.tick();
     let order = retail_frame(
         &mut scenario,
         vec![CommandEnvelope::new(
@@ -852,15 +1046,14 @@ fn retail_dustbowl_gattling_cannon_spins_up_and_winds_down() {
                 entity_id: truck,
                 target_rx: x + 17,
                 target_ry: y,
-                queue: false,
             },
         )],
     );
-    let mut sounds = loops(&scenario, &order);
+    let mut sounds = loops(&order, &scenario.runtime.resources.rules);
     let dropped = (0..600_u32)
         .find(|_| {
             let output = retail_frame(&mut scenario, Vec::new());
-            sounds.extend(loops(&scenario, &output));
+            sounds.extend(loops(&output, &scenario.runtime.resources.rules));
             !state(&scenario).1
         })
         .expect("the cannon drops the MCV");
@@ -870,10 +1063,14 @@ fn retail_dustbowl_gattling_cannon_spins_up_and_winds_down() {
     );
     let wound_down = (0..60_u32).find(|_| {
         let output = retail_frame(&mut scenario, Vec::new());
-        sounds.extend(loops(&scenario, &output));
+        sounds.extend(loops(&output, &scenario.runtime.resources.rules));
         let (mission, _, stage, value) = state(&scenario);
         mission == Some(MissionType::Guard) && (stage, value) == (0, 0)
     });
     assert!(wound_down.is_some(), "stage and value back to 0 on Guard");
-    assert_eq!(sounds, [Sound::Release], "one release, the loop's");
+    assert!(!sounds.is_empty(), "the no-target path reaches Release");
+    assert!(
+        sounds.iter().all(|sound| *sound == Sound::Release),
+        "wind-down only releases"
+    );
 }

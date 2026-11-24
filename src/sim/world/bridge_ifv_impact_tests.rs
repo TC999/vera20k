@@ -5,7 +5,6 @@
 //! supplied native zone hierarchy, or later Anim AI.
 
 use super::*;
-use crate::rules::art_data::ArtRegistry;
 use crate::rules::overlay_types::OverlayTypeRegistry;
 use crate::rules::retail_ini_fixture::retail_rules_and_art;
 use crate::sim::combat::world_receiver::{ReceiverRun, commit_projectiles};
@@ -17,8 +16,8 @@ use crate::sim::projectile::{
 };
 
 fn translated_stock() -> Value {
-    let mut input: Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/bridge_rim_stock_inputs.json"
+    let mut input: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/bridge_rim_stock_inputs.json",
     ))
     .unwrap();
     // Exactly the supplied crop transformation in ifv_bridge_impact.prepare;
@@ -44,8 +43,8 @@ fn coord(value: &Value) -> ProjectileCoord {
 
 fn retail_rules(native: &Value) -> Option<(RuleSet, OverlayTypeRegistry)> {
     let (ini, art) = retail_rules_and_art()?;
-    let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
-    rules.install_art_data(ArtRegistry::from_ini(&art));
+    let mut rules =
+        crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art().expect("retail rules");
     let overlays = OverlayTypeRegistry::from_ini(&ini, Some(&art));
     let initial = &native["rows"][0]["initial"];
     let fv = rules.object("FV").unwrap();
@@ -93,8 +92,8 @@ fn retail_rules(native: &Value) -> Option<(RuleSet, OverlayTypeRegistry)> {
     // Independent original ART/image reads establish actual frame counts.
     // Shared bridge_anim_inputs also establishes the Bouncer constructor
     // scalars; no frame count or Bounce value comes from a Rust golden.
-    let bridge: Value = serde_json::from_str(include_str!(
-        "../../../tools/rules_oracle/bridge_anim_inputs.json"
+    let bridge: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/rules_oracle/bridge_anim_inputs.json",
     ))
     .unwrap();
     for row in bridge["rows"].as_array().unwrap() {
@@ -146,8 +145,8 @@ fn assert_cells(world: &Simulation, rows: &Value, label: &str) {
 
 #[test]
 fn native_ifv_bridge_impact_orders_live_selection_debris_ids_and_rng() {
-    let native: Value = serde_json::from_str(include_str!(
-        "../../../tools/projectile_oracle/ifv_bridge_impact.json"
+    let native: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/projectile_oracle/ifv_bridge_impact.json",
     ))
     .unwrap();
     let Some((rules, overlays)) = retail_rules(&native) else {
@@ -170,12 +169,12 @@ fn native_ifv_bridge_impact_orders_live_selection_debris_ids_and_rng() {
             let result = super::super::super::run_state_machine(
                 &mut world,
                 &rules,
-                Some(&overlays),
                 (10, 20),
                 Family::High,
+                &mut crate::sim::world::FrameEffects::default(),
             );
-            let body: Value = serde_json::from_str(include_str!(
-                "../../../tools/spatial_oracle/bridge_rim_body.json"
+            let body: Value = serde_json::from_str(crate::test_fixture::text(
+                "tools/spatial_oracle/bridge_rim_body.json",
             ))
             .unwrap();
             // The first original body call changes 9 -> 15 but returns zero;
@@ -192,9 +191,11 @@ fn native_ifv_bridge_impact_orders_live_selection_debris_ids_and_rng() {
         world.native_unique_ids = Some(NativeUniqueIdCursor::test_at_current_value(
             row["launch"]["unique_id"].as_u64().unwrap() as u32,
         ));
-        world.session.binary_frame = row["frames"].as_array().unwrap().last().unwrap()["frame"]
-            .as_u64()
-            .unwrap() as u32;
+        world.session.set_binary_frame_for_test(
+            row["frames"].as_array().unwrap().last().unwrap()["frame"]
+                .as_u64()
+                .unwrap() as u32,
+        );
         let selector = row["events"]
             .as_array()
             .unwrap()
@@ -214,10 +215,17 @@ fn native_ifv_bridge_impact_orders_live_selection_debris_ids_and_rng() {
         let payload = ProjectilePayload::new(
             rules.weapon("HoverMissile").unwrap().damage,
             world.interner.intern("HE"),
-            world.interner.intern("HoverMissile"),
-        );
+            rules
+                .weapon("HoverMissile")
+                .unwrap()
+                .projectile
+                .as_deref()
+                .map(|name| world.interner.intern(name)),
+            rules.weapon("HoverMissile").unwrap().bright,
+        )
+        .with_installed_weapon(Some(world.interner.intern("HoverMissile")));
         let target = ProjectileTarget::Cell { rx: 10, ry: 20 };
-        let stable_id = world.allocate_stable_id();
+        let stable_id = world.substrate.allocate_stable_id();
         // Only retained location/OnBridge and payload are read by this handoff.
         // Motion fields below are inert: this test never calls Bullet AI.
         world.admit_projectile(
@@ -281,29 +289,33 @@ fn native_ifv_bridge_impact_orders_live_selection_debris_ids_and_rng() {
         assert_eq!(actual.len(), expected.len(), "{name}");
         for (anim, expected) in actual.into_iter().zip(expected) {
             assert_eq!(
-                json!(anim.native_unique_id),
+                json!(anim.native_unique_id()),
                 expected["native_id"],
                 "{name}"
             );
             assert_eq!(
-                world.interner.resolve(anim.type_id),
+                world.interner.resolve(anim.type_id()),
                 expected["type"].as_str().unwrap(),
                 "{name}"
             );
             assert_eq!(
-                json!([anim.world_coord.x, anim.world_coord.y, anim.world_coord.z]),
+                json!([
+                    anim.world_coord().x,
+                    anim.world_coord().y,
+                    anim.world_coord().z
+                ]),
                 expected["location"],
                 "{name}"
             );
             assert_eq!(
-                anim.bounce.is_some(),
+                anim.bounce().is_some(),
                 expected["is_bouncing"] == 1,
                 "{name}"
             );
-            if let Some(body) = anim.bounce {
+            if let Some(body) = anim.bounce() {
                 for (actual, key) in [
-                    (body.position, "position_bits"),
-                    (body.velocity, "velocity_bits"),
+                    (body.position(), "position_bits"),
+                    (body.velocity(), "velocity_bits"),
                 ] {
                     assert_eq!(
                         json!(actual.map(|value| value.bits())),
@@ -312,9 +324,9 @@ fn native_ifv_bridge_impact_orders_live_selection_debris_ids_and_rng() {
                     );
                 }
                 for (actual, key) in [
-                    (body.elasticity.bits(), "elasticity_bits"),
-                    (body.gravity.bits(), "gravity_bits"),
-                    (body.angular_velocity_magnitude.bits(), "clamp_bits"),
+                    (body.elasticity().bits(), "elasticity_bits"),
+                    (body.gravity().bits(), "gravity_bits"),
+                    (body.angular_velocity_magnitude().bits(), "clamp_bits"),
                 ] {
                     assert_eq!(json!(actual), expected["bounce"][key], "{name}/{key}");
                 }
@@ -328,7 +340,9 @@ fn native_ifv_bridge_impact_orders_live_selection_debris_ids_and_rng() {
         let hex = world.scenario_rng.native_state_hex();
         let bytes: Vec<u8> = hex
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|digits| u8::from_str_radix(std::str::from_utf8(digits).unwrap(), 16).unwrap())
             .collect();
         assert_eq!(

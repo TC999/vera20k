@@ -3,9 +3,8 @@
 //! original corpus. The separate retail-map test covers production composition.
 use super::*;
 use crate::map::resolved_terrain::{ResolvedTerrainGrid, test_flat_cell};
-use crate::rules::art_data::ArtRegistry;
-use crate::rules::retail_ini_fixture::retail_rules_and_art;
-use crate::sim::components::Health;
+use crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art;
+use crate::sim::combat::Health;
 use crate::sim::game_entity::GameEntity;
 use crate::sim::house_state::HouseState;
 use crate::sim::mission::{MissionId, MissionTimer};
@@ -16,18 +15,8 @@ use crate::sim::world::bridge_test_evidence::restored_retail;
 use crate::util::fixed_math::SimFixed;
 use serde_json::{Value, json};
 
-fn native() -> Value {
-    serde_json::from_str(include_str!(
-        "../../../../tools/spatial_oracle/bridge_target_composed.json"
-    ))
-    .unwrap()
-}
-
-fn retail_rules() -> Option<RuleSet> {
-    let (ini, art) = retail_rules_and_art()?;
-    let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
-    rules.install_art_data(ArtRegistry::from_ini(&art));
-    Some(rules)
+fn native() -> &'static Value {
+    crate::test_fixture::json("tools/spatial_oracle/bridge_target_composed.json")
 }
 
 fn supplied_world(rules: &RuleSet, case: &Value) -> Simulation {
@@ -35,12 +24,9 @@ fn supplied_world(rules: &RuleSet, case: &Value) -> Simulation {
     let obj = rules.object("FV").unwrap();
     assert_eq!(obj.weapon_list[0].as_deref(), Some("HoverMissile"));
     let weapon = rules.weapon("HoverMissile").unwrap();
+    assert_eq!(json!(weapon.range_leptons), input["weapon_range"]);
     assert_eq!(
-        json!((weapon.range * SimFixed::from_num(256)).to_num::<i32>()),
-        input["weapon_range"]
-    );
-    assert_eq!(
-        json!((weapon.minimum_range * SimFixed::from_num(256)).to_num::<i32>()),
+        json!(weapon.minimum_range_leptons),
         input["weapon_minimum_range"]
     );
     assert_eq!(rules.combat_damage.max_damage, 10_000);
@@ -49,10 +35,7 @@ fn supplied_world(rules: &RuleSet, case: &Value) -> Simulation {
         input["air_range_bonus"]
     );
     assert_eq!(json!(obj.strength), input["strength"]);
-    assert_eq!(
-        json!(crate::sim::combat::armor_index(&obj.armor)),
-        input["armor"]
-    );
+    assert_eq!(json!(obj.armor_id().index()), input["armor"]);
     assert_eq!(
         json!(rules.general.normal_targeting_delay),
         input["normal_delay"]
@@ -92,8 +75,9 @@ fn supplied_world(rules: &RuleSet, case: &Value) -> Simulation {
         local_width: 20,
         local_height: 20,
     });
-    sim.session.game_mode_nonzero = true;
-    sim.session.binary_frame = 173;
+    sim.session
+        .set_game_mode(crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true));
+    sim.session.set_binary_frame_for_test(173);
     for (id, owner, x) in [
         (1, "Americans", 10),
         (2, "Russians", 12),
@@ -101,8 +85,7 @@ fn supplied_world(rules: &RuleSet, case: &Value) -> Simulation {
     ] {
         let owner = sim.intern(owner);
         sim.houses
-            .entry(owner)
-            .or_insert_with(|| HouseState::new(owner, 0, None, true, 0, 10));
+            .get_or_register_for_test(owner, || HouseState::new(owner, 0, None, true, 0, 10));
         let mut entity = GameEntity::new_at_frame_zero_for_test(
             id,
             x,
@@ -110,27 +93,25 @@ fn supplied_world(rules: &RuleSet, case: &Value) -> Simulation {
             6,
             0,
             owner,
-            Health {
-                current: obj.strength,
-            },
+            Health::new(obj.strength),
             sim.intern("FV"),
             EntityCategory::Unit,
             0,
             6,
             true,
         );
-        entity.lifecycle.in_limbo = false;
-        entity.lifecycle.cell_marked = true;
-        entity.in_playfield = true;
+        entity.lifecycle.set_in_limbo_for_test(false);
+        entity.lifecycle.set_cell_marked_for_test(true);
+        entity.set_in_playfield(true);
         entity.locomotor = Some(LocomotorState::from_object_type(obj, 0));
-        entity.passive_scan_timer = MissionTimer {
-            start_frame: 0,
-            duration: 0,
-        };
-        entity.last_target_scan_frame = 0;
-        entity.position.exact_z_leptons = Some(624);
+        entity
+            .passive_scan
+            .set_passive_scan_timer_for_test(MissionTimer::armed(0, 0));
+        entity.passive_scan.set_last_target_scan_frame_for_test(0);
+        entity.position.set_exact_z_leptons_for_test(Some(624));
         sim.substrate.entities.insert(entity);
-        sim.mission_assign_exact(id, MissionId::from_known(MissionType::Guard), 0)
+        sim.substrate
+            .mission_assign_exact(id, MissionId::from_known(MissionType::Guard), 0)
             .unwrap();
     }
     sim.resolve_type_handles(rules);
@@ -139,7 +120,8 @@ fn supplied_world(rules: &RuleSet, case: &Value) -> Simulation {
 
 fn supply_step(sim: &mut Simulation, rules: &RuleSet, input: &Value) {
     use crate::sim::combat::TargetKind;
-    sim.session.binary_frame = input["frame"].as_u64().unwrap_or(173) as u32;
+    sim.session
+        .set_binary_frame_for_test(input["frame"].as_u64().unwrap_or(173) as u32);
     sim.substrate.occupancy = OccupancyGrid::new();
     for (index, id, x) in [(0, 1, 10), (1, 2, 12)] {
         let deck = input["on_bridge"][index].as_i64().unwrap_or(0) != 0;
@@ -148,12 +130,14 @@ fn supply_step(sim: &mut Simulation, rules: &RuleSet, input: &Value) {
         let cell = crate::map::cell_index::NativeCellIdentity::Real(20 * 25 + x);
         terrain.write_native_cell_flags(cell, flags);
         let entity = sim.substrate.entities.get_mut(id).unwrap();
-        entity.on_bridge = deck;
-        entity.position.rx = x as u16;
-        entity.position.ry = 20;
-        entity.position.sub_x = SimFixed::from_num(128);
-        entity.position.sub_y = SimFixed::from_num(128);
-        entity.position.exact_z_leptons = Some(if deck { 1040 } else { 624 });
+        entity.set_on_bridge(deck);
+        entity.position.set_rx_for_test(x as u16);
+        entity.position.set_ry_for_test(20);
+        entity.position.set_sub_x_for_test(SimFixed::from_num(128));
+        entity.position.set_sub_y_for_test(SimFixed::from_num(128));
+        entity
+            .position
+            .set_exact_z_leptons_for_test(Some(if deck { 1040 } else { 624 }));
         sim.substrate.occupancy.add(
             x as u16,
             20,
@@ -170,8 +154,8 @@ fn supply_step(sim: &mut Simulation, rules: &RuleSet, input: &Value) {
     if let Some(mode) = input["alternative"].as_str() {
         let y = if mode == "other_cell" { 21 } else { 20 };
         let alternate = sim.substrate.entities.get_mut(3).unwrap();
-        alternate.position.ry = y;
-        alternate.position.exact_z_leptons = Some(624);
+        alternate.position.set_ry_for_test(y);
+        alternate.position.set_exact_z_leptons_for_test(Some(624));
         let terrain = sim.resolved_terrain.as_mut().unwrap();
         terrain.write_native_cell_flags(
             crate::map::cell_index::NativeCellIdentity::Real(usize::from(y) * 25 + 12),
@@ -209,31 +193,43 @@ fn supply_step(sim: &mut Simulation, rules: &RuleSet, input: &Value) {
         }
     }
     if input["clear_target"] == true {
-        sim.assign_target_represented(1, None::<TargetKind>, Some(rules))
-            .unwrap();
+        sim.assign_target_represented(
+            1,
+            None::<TargetKind>,
+            rules,
+            &mut crate::sim::world::FrameEffects::default(),
+        )
+        .unwrap();
     }
     let source = sim.substrate.entities.get_mut(1).unwrap();
     if let Some(timer) = input["rearm"].as_array() {
-        source.rearm_timer = CdTimer::from_raw(
+        source.seldom.rearm_timer.set_for_test(CdTimer::from_raw(
             timer[0].as_i64().unwrap() as i32,
             timer[1].as_i64().unwrap() as i32,
-        );
+        ));
     }
     if let Some(timer) = input["timer"].as_array() {
-        source.passive_scan_timer = MissionTimer {
-            start_frame: timer[0].as_i64().unwrap() as u32,
-            duration: timer[2].as_i64().unwrap() as u32,
-        };
+        source
+            .passive_scan
+            .set_passive_scan_timer_for_test(MissionTimer::armed(
+                timer[0].as_i64().unwrap() as u32,
+                timer[2].as_i64().unwrap() as u32,
+            ));
     }
     if let Some(health) = input["health"].as_i64() {
-        sim.substrate.entities.get_mut(2).unwrap().health.current = health as i32;
+        sim.substrate
+            .entities
+            .get_mut(2)
+            .unwrap()
+            .health
+            .set_for_test(health as i32);
     }
 }
 
 fn assert_state(sim: &Simulation, state: &Value, label: &str) {
     use crate::sim::combat::TargetKind;
     let source = sim.substrate.entities.get(1).unwrap();
-    let name = match source.attack_target.as_ref().map(|a| a.target) {
+    let name = match source.attack_target.target() {
         None => "null",
         Some(TargetKind::Entity(1)) => "source",
         Some(TargetKind::Entity(2)) => "target",
@@ -242,22 +238,22 @@ fn assert_state(sim: &Simulation, state: &Value, label: &str) {
     };
     assert_eq!(json!(name), state["target"], "{label}: target");
     assert_eq!(
-        json!(u8::from(source.passively_acquired_target)),
+        json!(u8::from(source.passive_scan.acquired())),
         state["passive"],
         "{label}: passive"
     );
     assert_eq!(
-        json!(source.last_target_scan_frame as i32),
+        json!(source.passive_scan.last_scan_frame() as i32),
         state["last_scan"],
         "{label}: last_scan"
     );
     assert_eq!(
-        json!(source.passive_scan_timer.start_frame as i32),
+        json!(source.passive_scan.timer().start_frame() as i32),
         state["timer"][0],
         "{label}: timer anchor"
     );
     assert_eq!(
-        json!(source.passive_scan_timer.duration as i32),
+        json!(source.passive_scan.timer().duration() as i32),
         state["timer"][2],
         "{label}: timer duration"
     );
@@ -306,7 +302,9 @@ fn assert_state(sim: &Simulation, state: &Value, label: &str) {
 // It does not execute an Engineer repair or prove ordinary rebuilding.
 #[test]
 fn native_passive_bridge_histories_preserve_timers_rng_assignment_and_cell_list_choice() {
-    let Some(rules) = retail_rules() else { return };
+    let Some(rules) = retail_unlayered_rules_with_art() else {
+        return;
+    };
     let corpus = native();
     let mut histories = 0;
     let mut steps = 0;
@@ -329,7 +327,7 @@ fn native_passive_bridge_histories_preserve_timers_rng_assignment_and_cell_list_
             let main = sim.main_rng.logical_state();
             let map = sim.mapgen_rng.logical_state();
             let ids = sim.native_unique_ids.as_ref().unwrap().current_raw();
-            passive_acquire_step(&mut sim, 1, Some(&rules), ObjectAiCtx::default());
+            passive_acquire_step(&mut sim, 1, &rules, &mut ObjectAiCtx::default());
             assert_state(&sim, &step["after"], &format!("{label}/{index} after"));
             assert_eq!(
                 sim.scenario_rng.native_state_hex(),
@@ -380,16 +378,18 @@ fn move_retail_fv(
         .entities
         .get_mut(id)
         .unwrap()
-        .passive_scan_timer =
-        MissionTimer::armed(runtime.simulation.session.binary_frame, 1_000_000);
+        .passive_scan
+        .set_passive_scan_timer_for_test(MissionTimer::armed(
+            runtime.simulation.session.binary_frame(),
+            1_000_000,
+        ));
     let command = CommandEnvelope::new(
         owner,
-        runtime.simulation.session.tick + 1,
+        runtime.simulation.session.tick() + 1,
         Command::Move {
             entity_id: id,
             target_rx: destination.0,
             target_ry: destination.1,
-            queue: false,
         },
     );
     let mut stop_sent = false;
@@ -404,12 +404,12 @@ fn move_retail_fv(
                 .substrate
                 .entities
                 .get(id)
-                .is_some_and(|e| (e.position.rx, e.position.ry) == stop_at))
+                .is_some_and(|e| (e.position.rx(), e.position.ry()) == stop_at))
         .then(|| {
             stop_sent = true;
             CommandEnvelope::new(
                 owner,
-                runtime.simulation.session.tick + 1,
+                runtime.simulation.session.tick() + 1,
                 Command::Stop { entity_id: id },
             )
         });
@@ -417,23 +417,25 @@ fn move_retail_fv(
             .advance_frame(
                 if frame == 0 {
                     std::slice::from_ref(&command)
-                } else if let Some(stop) = stop.as_ref() {
-                    std::slice::from_ref(stop)
                 } else {
-                    &[]
+                    stop.as_slice()
                 },
                 crate::headless_scenario::SIM_TICK_MS,
                 crate::sim::world::TickLane::Ordinary,
+                &mut crate::sim::world::FrameEffects::default(),
             )
             .unwrap();
         let entity = runtime.simulation.substrate.entities.get(id).unwrap();
-        if (entity.position.rx, entity.position.ry) == stop_at && entity.movement_target.is_none() {
+        if (entity.position.rx(), entity.position.ry()) == stop_at
+            && crate::sim::movement::motion_query::is_moving(&entity) != Some(true)
+        {
             assert_eq!(
-                entity.on_bridge, deck,
+                entity.on_bridge(),
+                deck,
                 "ordinary Move selected wrong layer at {stop_at:?}"
             );
             assert_eq!(
-                entity.position.exact_z_leptons,
+                entity.position.exact_z_leptons(),
                 Some(if deck { 1040 } else { 624 })
             );
             assert!(
@@ -478,19 +480,25 @@ fn assert_retail_target_state_restored(live: &Simulation, restored: &Simulation,
         assert_eq!(before.is_some(), after.is_some(), "restored actor {id}");
         if let (Some(before), Some(after)) = (before, after) {
             assert_eq!(json!(before.position), json!(after.position));
-            assert_eq!(before.on_bridge, after.on_bridge);
-            assert_eq!(before.passive_scan_timer, after.passive_scan_timer);
-            assert_eq!(before.rearm_timer, after.rearm_timer);
+            assert_eq!(before.on_bridge(), after.on_bridge());
+            assert_eq!(before.passive_scan.timer(), after.passive_scan.timer());
+            assert_eq!(
+                before.seldom.rearm_timer.timer(),
+                after.seldom.rearm_timer.timer()
+            );
             assert_eq!(json!(before.attack_target), json!(after.attack_target));
             assert_eq!(
-                before.passively_acquired_target,
-                after.passively_acquired_target
+                before.passive_scan.acquired(),
+                after.passive_scan.acquired()
             );
             assert_eq!(before.estimated_health, after.estimated_health);
-            assert_eq!(before.health.current, after.health.current);
-            assert_eq!(before.lifecycle.object_alive, after.lifecycle.object_alive);
-            assert_eq!(before.lifecycle.in_limbo, after.lifecycle.in_limbo);
-            assert_eq!(before.dying, after.dying);
+            assert_eq!(before.health.current(), after.health.current());
+            assert_eq!(
+                before.lifecycle.object_alive(),
+                after.lifecycle.object_alive()
+            );
+            assert_eq!(before.lifecycle.in_limbo(), after.lifecycle.in_limbo());
+            assert_eq!(before.death.is_dying(), after.death.is_dying());
         }
     }
     for xy in [(64, 69), (66, 69)] {
@@ -526,38 +534,57 @@ pub(super) fn retail_hills_collapsed_scene(
     use crate::sim::snapshot::GameSnapshot;
     let retail = std::env::var("RA2_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| {
-            crate::util::config::GameConfig::load()
-                .unwrap()
-                .paths
-                .ra2_dir
-        });
+        .unwrap_or_else(|_| crate::test_fixture::game_config().unwrap().paths.ra2_dir);
     let mut scenario = crate::headless_scenario::load(&retail, "Hills.mmx", 0x0B21_D6E5).unwrap();
     let pristine = scenario.sim().resolved_terrain.as_ref().unwrap().clone();
     observe(scenario.sim(), "initial_loaded");
     for xy in [(64, 69), (66, 69)] {
         let cell = pristine.cell(xy.0, xy.1).unwrap();
         assert_eq!(
-            (cell.level, cell.slope_type, cell.base_yr_cell_land_type),
+            (cell.level, cell.slope_type, cell.base_land_type),
             (6, 0, 7)
         );
-        assert_eq!(cell.base_speed_costs.track, Some(100));
+        assert_eq!(
+            cell.base_speed_costs.track,
+            Some(crate::util::native_x87::NativeF32Bits::ONE)
+        );
         assert!(!cell.base_ground_walk_blocked);
         assert_ne!(cell.bridge_facts.raw_flags & 0x100, 0);
     }
-    let owner = scenario.sim().session.current_house.unwrap();
+    let owner = scenario.sim().session.current_house().unwrap();
     let source = move_retail_fv(&mut scenario, owner, (64, 72), (64, 69), (64, 69), true);
     // Initially same owner so movement preparation cannot cause combat. The
     // hostile House link is a supplied acquisition-entry boundary below.
     let target = move_retail_fv(&mut scenario, owner, (62, 69), (68, 69), (66, 69), false);
     observe(scenario.sim(), "after_ordinary_fv_moves");
     let enemy = scenario.runtime.simulation.intern("Russians");
+    // Snapshot401's House admission (d11222e2c) models the native House array:
+    // every registered House carries the name FromName50C170 reads and the
+    // array holds it once. Register the hostile House exactly that way, as
+    // the roster reader would, so the retail save/restore witnesses below
+    // keep validating state the native array can hold.
     scenario
         .runtime
         .simulation
         .houses
-        .entry(enemy)
-        .or_insert_with(|| HouseState::new(enemy, 0, None, true, 0, 10));
+        .get_or_register_for_test(enemy, || {
+            let mut house = HouseState::new(enemy, 0, None, true, 0, 10);
+            house.initialize_scenario_name("Russians");
+            // The synthetic House is only the acquisition-entry boundary the
+            // passive-scan steps below consume; it must sit the match out.
+            // Its one FV dies inside this fixture, so without MultiplayPassive
+            // the defeat gate (4F8E92..4F8F77) reads the House empty,
+            // MPlayer_Defeated (4FC3DE..4FC6B7) completes the match at the
+            // local house's win, and the savour expiry (4F85BE) later turns
+            // every frame tail terminal — after which the pending-delete
+            // drain (Main_Tick 55DE9F -> 725C70) no longer runs and a
+            // hut-consumed Engineer could never leave storage in its repair
+            // frame. MultiplayPassive is the defeat gate's own skip for
+            // houses that do not participate in the match result.
+            house.make_multiplay_passive();
+            house
+        });
+    if !scenario.runtime.simulation.houses.order().contains(&enemy) {}
     scenario
         .runtime
         .simulation
@@ -568,10 +595,11 @@ pub(super) fn retail_hills_collapsed_scene(
         let runtime = &mut scenario.runtime;
         runtime
             .simulation
+            .substrate
             .mission_assign_exact(
                 source,
                 MissionId::from_known(MissionType::Guard),
-                runtime.simulation.session.binary_frame,
+                runtime.simulation.session.binary_frame(),
             )
             .unwrap();
         let entity = runtime
@@ -580,17 +608,20 @@ pub(super) fn retail_hills_collapsed_scene(
             .entities
             .get_mut(source)
             .unwrap();
-        entity.passive_scan_timer.clear();
+        entity.passive_scan.timer_mut_for_test().clear();
         // Native composed deck-to-ground rearm boundary: ready weapons
         // reject earlier in T58; the busy deck source reaches Evaluate's G27.
         // The reverse direction rejects in InRange before G27.
-        entity.rearm_timer = CdTimer::started(runtime.simulation.session.binary_frame as i32, 10);
+        entity.seldom.rearm_timer.set_for_test(CdTimer::started(
+            runtime.simulation.session.binary_frame() as i32,
+            10,
+        ));
         passive_acquire_step(
             &mut runtime.simulation,
             source,
-            Some(&runtime.resources.rules),
-            ObjectAiCtx {
-                overlay_registry: Some(&runtime.resources.overlay_registry),
+            &runtime.resources.rules,
+            &mut ObjectAiCtx {
+                overlay_registry: Some(runtime.resources.rules.overlay_registry()),
                 ..Default::default()
             },
         );
@@ -602,6 +633,7 @@ pub(super) fn retail_hills_collapsed_scene(
                 .get(source)
                 .unwrap()
                 .attack_target
+                .target()
                 .is_none()
         );
         assert!(
@@ -611,7 +643,8 @@ pub(super) fn retail_hills_collapsed_scene(
                 .entities
                 .get(source)
                 .unwrap()
-                .passively_acquired_target
+                .passive_scan
+                .acquired()
         );
     }
     let bytes = GameSnapshot::save_validated(
@@ -628,9 +661,9 @@ pub(super) fn retail_hills_collapsed_scene(
     for sim in [&first, &second] {
         for (id, deck, xy) in [(source, true, (64, 69)), (target, false, (66, 69))] {
             let e = sim.substrate.entities.get(id).unwrap();
-            assert_eq!(e.on_bridge, deck);
+            assert_eq!(e.on_bridge(), deck);
             assert_eq!(
-                e.position.exact_z_leptons,
+                e.position.exact_z_leptons(),
                 Some(if deck { 1040 } else { 624 })
             );
             assert!(
@@ -655,6 +688,7 @@ pub(super) fn retail_hills_collapsed_scene(
                 &[],
                 crate::headless_scenario::SIM_TICK_MS,
                 crate::sim::world::TickLane::Ordinary,
+                &mut crate::sim::world::FrameEffects::default(),
             )
             .unwrap();
         std::mem::swap(&mut runtime.simulation, &mut first);
@@ -663,6 +697,7 @@ pub(super) fn retail_hills_collapsed_scene(
                 &[],
                 crate::headless_scenario::SIM_TICK_MS,
                 crate::sim::world::TickLane::Ordinary,
+                &mut crate::sim::world::FrameEffects::default(),
             )
             .unwrap();
         assert_eq!(
@@ -678,6 +713,7 @@ pub(super) fn retail_hills_collapsed_scene(
                 .get(source)
                 .unwrap()
                 .attack_target
+                .target()
                 .is_none()
         );
         std::mem::swap(&mut runtime.simulation, &mut first);
@@ -712,7 +748,7 @@ fn collapse_retail_scene(
     };
     let mut collapsed = false;
     for _ in 0..8 {
-        collapsed|=crate::sim::world::bridge_orchestrator::apply_bridge_damage_events_with_overlay_registry(&mut runtime.simulation,&runtime.resources.rules,&[event],Some(&runtime.resources.overlay_registry));
+        collapsed|=crate::sim::world::bridge_orchestrator::apply_bridge_damage_events_with_overlay_registry(&mut runtime.simulation, &runtime.resources.rules, &[event], &mut crate::sim::world::FrameEffects::default());
         if !runtime
             .simulation
             .resolved_terrain
@@ -770,6 +806,7 @@ fn collapse_retail_scene(
                 &[],
                 crate::headless_scenario::SIM_TICK_MS,
                 crate::sim::world::TickLane::Ordinary,
+                &mut crate::sim::world::FrameEffects::default(),
             )
             .unwrap();
         std::mem::swap(&mut runtime.simulation, &mut first);
@@ -778,6 +815,7 @@ fn collapse_retail_scene(
                 &[],
                 crate::headless_scenario::SIM_TICK_MS,
                 crate::sim::world::TickLane::Ordinary,
+                &mut crate::sim::world::FrameEffects::default(),
             )
             .unwrap();
         assert_eq!(

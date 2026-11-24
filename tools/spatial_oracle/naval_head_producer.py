@@ -8,6 +8,7 @@ from pathlib import Path
 from collections import Counter
 from tools.spatial_oracle.naval_occupants import *
 from tools.spatial_oracle.shrapnel_repair.hierarchy_composition import HierarchyRepair, Rules, theater, input_case
+from tools.spatial_oracle.anytown_damage.navigation import Navigation
 
 class Head(Native):
  def read_inputs(self):
@@ -47,10 +48,8 @@ class Head(Native):
   assert self.read32(0xABDE88)==104
   self.invoke(0x6D1C20,self.alloc(0x2000))
   self.invoke(0x5F5B90,self.actor,(0,self.alloc(0x80)))
-  for a in (0x49F0E0,0x49F190,0x49F2F0,0x49F2D0,0x49F280,0x49F3A0):self.invoke(a,0)
-  self.invoke(0x42A6D0,0x87E8B8)
-  self.invoke(0x42AC00,0x87E8B8,(MAP+0xEC,))
-  self.invoke(0x42C1C0,0x87E8B8)
+  for a in (0x49F0E0,0x49F190,0x49F2F0,0x49F2D0,0x49F280):self.invoke(a,0)
+  Navigation.setup_pathfinder(self.invoke)
   # Production-facing64 is native raw16-bit16384. Actual Facing.SetDesired
   # is not needed when both retained Facing values already agree.
   for off in (0x388,0x3A0):u.mem_write(self.actor+off,dwords(16384,16384))
@@ -60,9 +59,9 @@ class Head(Native):
  def alloc(self,n):
   if self.long_heap is None:return super().alloc(n)
   p=self.long_heap;self.long_heap+=(max(n,1)+15)&~15;assert self.long_heap<0x49000000;return p
- def invoke(self,fn,this,args=()):
+ def invoke(self,fn,this,args=(),*,timeout_us=60000000,context=None):
   u=self.u;u.mem_write(SP,dwords(RET_MAGIC,*args));u.reg_write(UC_X86_REG_ESP,SP);u.reg_write(UC_X86_REG_ECX,this)
-  run_checked(u,fn,RET_MAGIC,count=10000000,timeout_us=60000000);return u.reg_read(UC_X86_REG_EAX)
+  run_checked(u,fn,RET_MAGIC,count=10000000,timeout_us=timeout_us,context=context);return u.reg_read(UC_X86_REG_EAX)
  def hook(self,u,pc,n,d):
   if pc==0x7C978A:
    self.path_events.append(dict(kind='CRT_atexit_registration',function=hex(self.read32(u.reg_read(UC_X86_REG_ESP)+4))))

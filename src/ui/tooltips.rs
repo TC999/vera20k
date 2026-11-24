@@ -9,7 +9,7 @@
 //! observably identical to the OS-timer pump at any playable frame rate.
 //!
 //! ## Dependency rules
-//! - ui/ module: std only — no render/, assets/, sidebar/, audio/, net/.
+//! - ui/ module: std only — no render/, assets/, audio/, net/.
 
 /// Delay before a tip shows (native ctor hardcodes 1000 — NOT INI-driven).
 pub const TOOLTIP_DELAY_MS: u64 = 1000;
@@ -40,9 +40,10 @@ impl TipRect {
 }
 
 /// One registered tip region. Text is resolved by the driver at sync time
-/// (per frame), which is observably equivalent to the native resolve-at-show
-/// (content changes propagate within a frame). EMPTY text reproduces the
-/// native "NULL text ⇒ Show fails ⇒ no tip" outcome.
+/// (per frame), matching native 724AD0's resolve-before-draw. EMPTY text reproduces the
+/// native "NULL text ⇒ Show fails ⇒ no tip" outcome. A driver may resolve only
+/// the text a pass reads ([`TooltipService::pass_reads_text`]) and leave the
+/// rest empty.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TipRegion {
     pub id: u32,
@@ -105,37 +106,39 @@ impl TooltipService {
         self.regions.len() != before
     }
 
-    /// Per-frame driver convenience: replace the whole region set (rects move
-    /// with the adaptive layout). The visible tip survives iff its id is
-    /// still present; a vanished id hides (unregister semantics).
+    /// Native normal draw 4F4562 -> 478E10 -> 724B80 -> 724AD0 resolves
+    /// dynamic text again. Keep the original duration; NULL/empty text clears
+    /// the current tip without killing the armed timer (724B60..724B7C).
     pub fn sync_regions(&mut self, regions: &[TipRegion]) {
-        if let Some(a) = &self.active
-            && !regions.iter().any(|r| r.id == a.id)
-        {
-            self.active = None;
+        if let Some(active) = &mut self.active {
+            if let Some(region) = regions.iter().find(|r| r.id == active.id)
+                && !region.text.is_empty()
+            {
+                active.text = region.text.chars().take(TOOLTIP_TEXT_CAP_CHARS).collect();
+            } else {
+                self.active = None;
+            }
         }
         self.regions.clear();
         self.regions.extend_from_slice(regions);
     }
 
-    /// Mouse move: with a non-zero delay, every move RESTARTS the delay timer
-    /// and hides a visible tip; with a zero delay-override the next poll
-    /// shows immediately (the timer fires at `now`).
+    /// WM_MOUSEMOVE200: 724247 kills/rearms the ordinary delay, then calls
+    /// hide478DB0 -> 724AB0 even inside the same region. A zero delay takes
+    /// the immediate region/text path72429E instead. Original-byte evidence:
+    /// tools/bridge_click_oracle/README.md; manager724200/724AD0.
     pub fn on_mouse_move(&mut self, x: i32, y: i32, now_ms: u64) {
         if !self.enabled {
             return;
         }
         self.mouse_x = x;
         self.mouse_y = y;
-        let delay = self.delay_ms();
-        if delay != 0 {
-            if self.active.is_some() {
-                self.active = None;
-            }
-            self.timer_deadline_ms = Some(now_ms + delay);
-        } else {
-            self.timer_deadline_ms = Some(now_ms);
+        if self.delay_ms() == 0 {
+            self.show_current_region(now_ms);
+            return;
         }
+        self.active = None;
+        self.timer_deadline_ms = Some(now_ms + self.delay_ms());
     }
 
     /// CursorCheat's 724251 -> 72429E branch bypasses the show delay and
@@ -147,9 +150,7 @@ impl TooltipService {
         }
         self.mouse_x = x;
         self.mouse_y = y;
-        self.active = None;
-        self.timer_deadline_ms = Some(now_ms);
-        self.poll(now_ms);
+        self.show_current_region(now_ms);
     }
 
     /// Any mouse button press/release (all 6 native button messages,
@@ -181,6 +182,13 @@ impl TooltipService {
             self.active = None;
             return;
         }
+        self.show_current_region(now_ms);
+    }
+
+    /// Shared immediate/delayed hit-test and Show724AD0. An unsuccessful
+    /// immediate resolve does not KillTimer; the timer pump already did.
+    fn show_current_region(&mut self, now_ms: u64) {
+        self.active = None;
         let hit = self
             .regions
             .iter()
@@ -204,6 +212,35 @@ impl TooltipService {
         self.active.as_ref()
     }
 
+    /// Whether the [`Self::sync_regions`] of a pass at `now_ms` and the
+    /// [`Self::poll`] after it read the text of region `id` at `rect`: the
+    /// visible tip's, which its redraw resolves again (724AD0), or, once the
+    /// timer is due, that of a region holding the cursor, which a show
+    /// resolves (724200's WM_TIMER hit test). They read no other text.
+    pub fn pass_reads_text(&self, id: u32, rect: TipRect, now_ms: u64) -> bool {
+        self.active.as_ref().is_some_and(|tip| tip.id == id)
+            || (self.enabled
+                && self
+                    .timer_deadline_ms
+                    .is_some_and(|deadline| now_ms >= deadline)
+                && rect.contains_inclusive(self.mouse_x, self.mouse_y))
+    }
+
+    /// A live provider can prepare its answer before a pending delay elapses.
+    pub fn may_read_text(&self, id: u32, rect: TipRect) -> bool {
+        self.active.as_ref().is_some_and(|tip| tip.id == id)
+            || (self.enabled
+                && self.timer_deadline_ms.is_some()
+                && rect.contains_inclusive(self.mouse_x, self.mouse_y))
+    }
+
+    /// Whether [`Self::on_mouse_move`] shows the tip of the region it moves
+    /// into at once: a zero delay takes 724200's immediate path, which hit
+    /// tests the cursor and resolves the text at that move.
+    pub fn shows_on_move(&self) -> bool {
+        self.enabled && self.delay_ms() == 0
+    }
+
     /// Cameo-hover hook (slice A2 consumer; exposed + tested now): zero delay
     /// while highlighted, restored on leave.
     pub fn set_delay_override(&mut self, delay_ms: Option<u64>) {
@@ -220,7 +257,7 @@ impl TooltipService {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_ui))]
 mod tests {
     use super::*;
 
@@ -254,6 +291,50 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_move_dismisses_same_region_tip_and_restarts_delay() {
+        let mut s = service_with(&[region(500, 0, 0, 100, 100, "unknown")]);
+        s.on_mouse_move(20, 20, 0);
+        s.poll(1000);
+        assert!(s.active().is_some());
+        s.on_mouse_move(21, 20, 1100);
+        assert!(
+            s.active().is_none(),
+            "WM_MOUSEMOVE calls the native hide slot"
+        );
+        s.poll(2099);
+        assert!(s.active().is_none());
+        s.poll(2100);
+        assert_eq!((s.active().unwrap().x, s.active().unwrap().y), (21, 20));
+    }
+
+    #[test]
+    fn frame_sync_refreshes_dynamic_text_and_empty_text_clears_without_rearming() {
+        let mut s = service_with(&[region(500, 0, 0, 100, 100, "unknown")]);
+        s.on_mouse_move(20, 20, 0);
+        s.poll(1000);
+        s.sync_regions(&[region(500, 0, 0, 100, 100, "updated")]);
+        let tip = s.active().unwrap();
+        assert_eq!(tip.text, "updated");
+        assert_eq!(
+            tip.shown_at_ms, 1000,
+            "text refresh does not restart duration"
+        );
+        s.sync_regions(&[region(500, 0, 0, 100, 100, "")]);
+        assert!(
+            s.active().is_none(),
+            "native draw resolves the text each frame"
+        );
+        s.sync_regions(&[region(500, 0, 0, 100, 100, "unknown")]);
+        s.poll(10_999);
+        assert!(s.active().is_none());
+        s.poll(11_000);
+        assert!(
+            s.active().is_some(),
+            "native null-text cleanup leaves the duration timer armed"
+        );
+    }
+
+    #[test]
     fn coordinates_refresh_visible_tip_and_restore_ordinary_delay() {
         let mut s = service_with(&[region(500, 0, 0, 100, 100, "(10,20)")]);
         s.on_mouse_move_immediate(5, 6, 100);
@@ -280,20 +361,25 @@ mod tests {
         assert!(s.active().is_none());
     }
 
+    /// Zero-delay 72424F takes the immediate branch, including same-region moves.
     #[test]
-    fn every_move_restarts_the_delay_and_hides() {
+    fn zero_delay_tip_repositions_on_each_move_until_cursor_leaves() {
         let mut s = service_with(&[region(1, 0, 0, 10, 10, "tip")]);
-        s.on_mouse_move(5, 5, 0);
-        s.on_mouse_move(6, 5, 900);
+        s.set_delay_override(Some(0));
+        s.on_mouse_move(2, 2, 1000);
         s.poll(1000);
-        assert!(s.active().is_none(), "restarted at 900 → deadline 1900");
-        s.poll(1900);
-        assert!(s.active().is_some());
-        // A move while visible hides AND re-arms.
-        s.on_mouse_move(7, 5, 2000);
-        assert!(s.active().is_none(), "moving hides a visible tip");
-        s.poll(3000);
-        assert!(s.active().is_some(), "re-shown after another full delay");
+        assert_eq!((s.active().unwrap().x, s.active().unwrap().y), (2, 2));
+        for (x, y) in [(4, 3), (7, 8), (9, 1)] {
+            s.on_mouse_move(x, y, 1200);
+            s.poll(1200);
+            let tip = s.active().expect("still inside the region");
+            assert_eq!((tip.x, tip.y), (x, y));
+            assert_eq!(tip.shown_at_ms, 1200);
+        }
+        s.on_mouse_move(20, 20, 1400);
+        assert!(s.active().is_none(), "leaving the region hides");
+        s.poll(1400);
+        assert!(s.active().is_none(), "nothing to hit outside the region");
     }
 
     #[test]
@@ -387,19 +473,22 @@ mod tests {
     }
 
     #[test]
-    fn zero_delay_override_shows_on_next_poll() {
+    fn zero_delay_jitter_does_not_toggle_the_visible_tip() {
+        // Zero-delay immediate refresh leaves a visible tip after the event;
+        // the frame poll must not misread it as a duration expiry.
         let mut s = service_with(&[region(1, 0, 0, 10, 10, "cameo")]);
         s.set_delay_override(Some(0));
-        s.on_mouse_move(5, 5, 7000);
-        s.poll(7000);
-        assert!(s.active().is_some(), "cameo-hover zero delay: immediate");
-        s.set_delay_override(None);
-        s.on_mouse_move(6, 5, 7100);
-        assert!(s.active().is_none());
-        s.poll(7500);
-        assert!(s.active().is_none(), "restored 1000 ms delay applies again");
-        s.poll(8100);
+        s.on_mouse_move(5, 5, 1000);
+        s.poll(1000);
         assert!(s.active().is_some());
+        for now in [1016, 1032, 1048, 1064] {
+            s.on_mouse_move(5, 6, now);
+            s.poll(now);
+            let tip = s
+                .active()
+                .unwrap_or_else(|| panic!("tip blinked at {now} ms"));
+            assert_eq!((tip.x, tip.y), (5, 6));
+        }
     }
 
     #[test]
@@ -436,5 +525,22 @@ mod tests {
         s.on_mouse_move(5, 5, 0);
         s.poll(1000);
         assert_eq!(s.active().unwrap().text.chars().count(), 256);
+    }
+
+    #[test]
+    fn a_pass_reads_only_the_visible_tip_and_a_due_show() {
+        let (a, b) = (region(1, 0, 0, 10, 10, "a"), region(2, 20, 0, 10, 10, "b"));
+        let mut s = service_with(&[a.clone(), b.clone()]);
+        s.on_mouse_move(5, 5, 0);
+        assert!(!s.pass_reads_text(1, a.rect, TOOLTIP_DELAY_MS - 1));
+        assert!(s.pass_reads_text(1, a.rect, TOOLTIP_DELAY_MS));
+        assert!(!s.pass_reads_text(2, b.rect, TOOLTIP_DELAY_MS));
+        s.poll(TOOLTIP_DELAY_MS);
+        assert_eq!(s.active().unwrap().id, 1);
+        assert!(s.pass_reads_text(1, a.rect, TOOLTIP_DELAY_MS + 1));
+        assert!(!s.pass_reads_text(2, b.rect, TOOLTIP_DELAY_MS + 1));
+        assert!(!s.shows_on_move());
+        s.set_delay_override(Some(0));
+        assert!(s.shows_on_move());
     }
 }

@@ -19,9 +19,10 @@ use super::profile::{
     TacticalCaptureProfile, sha256_hex, validate_new_output_directory,
 };
 
-pub(crate) const CAPTURE_SCHEMA: &str = "vera20k.tactical-capture.v2";
+pub(crate) const CAPTURE_SCHEMA: &str = "vera20k.tactical-capture.v3";
 const NATIVE_COMPARATOR_NONE: &str = "NONE";
 const PARITY_CERTIFICATION_NONE: &str = "NONE";
+/// A process-unique serial for staging folder names.
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -401,6 +402,16 @@ pub(crate) enum PublishFault {
     SimulatedCrashAfterDirectorySync,
 }
 
+/// Encode receipts in the publisher's compact JSON format. The map
+/// observer uses these same bytes for its budget check; indentation alone
+/// must not discard a complete long-running observation. Keep the newline in
+/// the budget because it is part of the published file.
+pub(super) fn encode_manifest<T: Serialize>(manifest: &T) -> Result<Vec<u8>> {
+    let mut serialized = serde_json::to_vec(manifest)?;
+    serialized.push(b'\n');
+    Ok(serialized)
+}
+
 pub(crate) fn publish_transaction<T: Serialize>(
     output_dir: &Path,
     manifest: &T,
@@ -433,8 +444,7 @@ pub(crate) fn publish_transaction<T: Serialize>(
             PublishFault::ManifestWrite,
             "injected manifest write failure",
         )?;
-        let mut serialized = serde_json::to_vec_pretty(manifest)?;
-        serialized.push(b'\n');
+        let serialized = encode_manifest(manifest)?;
         let mut manifest_file = create_new_file(&manifest_path)?;
         manifest_file
             .write_all(&serialized)
@@ -531,6 +541,15 @@ fn injected(active: PublishFault, expected: PublishFault, message: &str) -> Resu
     Ok(())
 }
 
+#[cfg(not(windows))]
+fn sync_directory(path: &Path) -> Result<()> {
+    let directory = File::open(path)
+        .with_context(|| format!("cannot open staging directory {}", path.display()))?;
+    directory
+        .sync_all()
+        .with_context(|| format!("cannot sync staging directory {}", path.display()))
+}
+
 #[cfg(windows)]
 fn sync_directory(path: &Path) -> Result<()> {
     use std::os::windows::fs::OpenOptionsExt;
@@ -546,7 +565,7 @@ fn sync_directory(path: &Path) -> Result<()> {
         .with_context(|| format!("cannot sync staging directory {}", path.display()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 mod tests {
     use super::*;
 
@@ -556,7 +575,7 @@ mod tests {
     ) {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let profile = TacticalCaptureProfile::load_strict(
-            &root.join("tools/tactical_certification/profiles/soviet-radar-online-v2.json"),
+            &root.join("tools/tactical_certification/profiles/soviet-radar-online-v3.json"),
         )
         .expect("profile");
         let contract = TacticalCaptureContract::load_external(
@@ -684,13 +703,4 @@ mod tests {
         );
         fs::remove_dir_all(parent).expect("remove test parent");
     }
-}
-
-#[cfg(not(windows))]
-fn sync_directory(path: &Path) -> Result<()> {
-    let directory = File::open(path)
-        .with_context(|| format!("cannot open staging directory {}", path.display()))?;
-    directory
-        .sync_all()
-        .with_context(|| format!("cannot sync staging directory {}", path.display()))
 }

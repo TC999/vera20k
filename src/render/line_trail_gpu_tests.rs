@@ -8,8 +8,8 @@ use serde_json::Value;
 #[test]
 #[ignore = "requires GPU; original LineTrail full ordered pixels and unchanged shared depth"]
 fn production_line_trail_matches_original_full_line_pixels() {
-    let native: Value = serde_json::from_str(include_str!(
-        "../../tools/projectile_oracle/line_trail.json"
+    let native: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/projectile_oracle/line_trail.json",
     ))
     .unwrap();
     let gpu = Gpu::new();
@@ -67,7 +67,7 @@ fn production_line_trail_matches_original_full_line_pixels() {
                     strength: call["intensity"].as_i64().unwrap() as i32,
                 })
                 .collect::<Vec<_>>();
-            let viewport = LineTrailViewport {
+            let viewport = SurfaceLineViewport {
                 // Only the global coordinate convention differs: +15 on all
                 // VERA world layers is absorbed by the same camera translation.
                 camera: [
@@ -78,12 +78,28 @@ fn production_line_trail_matches_original_full_line_pixels() {
                 z_origin_y: input["z_origin_y"].as_i64().unwrap() as i32,
                 zoom: 1.,
             };
-            terrain.prepare_line_trails(&gpu.device, &gpu.queue, &segments, viewport, |_| {
-                input["alpha"].as_u64().unwrap() as u16
+            terrain.bind_surface_line_a_fixture(&gpu.device, &gpu.queue, size, |[x, y]| {
+                if input["alpha"] == "mixed" {
+                    [0, 1, 63, 127, 255][((x / 9 + y / 7) % 5) as usize]
+                } else {
+                    input["alpha"].as_u64().unwrap() as u16
+                }
             });
+            terrain.begin_surface_lines();
+            let prepared_lines = terrain.prepare_surface_lines(
+                &gpu.device,
+                &gpu.queue,
+                std::iter::empty(),
+                std::iter::empty(),
+                &segments,
+                &[],
+                &[],
+                viewport,
+                |_| true,
+            );
             let mut encoder = gpu.device.create_command_encoder(&Default::default());
             clear(&mut encoder, &cv, &dv, old_z, wgpu::LoadOp::Load);
-            terrain.draw_line_trails(&mut encoder, &cv);
+            terrain.draw_surface_lines(&mut encoder, &cv, &[prepared_lines]);
             let reads = [
                 gpu.read(&mut encoder, &color),
                 gpu.read(&mut encoder, &depth),
@@ -131,8 +147,8 @@ fn overlapping_segments(row: &Value) -> Vec<LineTrailSegment> {
         .collect()
 }
 
-fn ordered_viewport(row: &Value) -> LineTrailViewport {
-    LineTrailViewport {
+fn ordered_viewport(row: &Value) -> SurfaceLineViewport {
+    SurfaceLineViewport {
         camera: [
             row["camera"][0].as_i64().unwrap() as i32,
             row["camera"][1].as_i64().unwrap() as i32 + 15,
@@ -146,8 +162,8 @@ fn ordered_viewport(row: &Value) -> LineTrailViewport {
 #[test]
 #[ignore = "requires GPU; original reverse-registry trail overlap and bounded operation chunks"]
 fn production_line_trail_preserves_native_overlap_across_chunks() {
-    let native: Value = serde_json::from_str(include_str!(
-        "../../tools/projectile_oracle/line_trail.json"
+    let native: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/projectile_oracle/line_trail.json",
     ))
     .unwrap();
     let gpu = Gpu::new();
@@ -169,14 +185,22 @@ fn production_line_trail_preserves_native_overlap_across_chunks() {
                     continue;
                 }
                 terrain.prepare(&gpu.device, &color, &dv, batch.camera_uniform());
-                terrain.line_trails.test_operation_limit = forced_chunk;
+                terrain.surface_lines.test_operation_limit = forced_chunk;
                 let segments = overlapping_segments(row);
-                terrain.prepare_line_trails(
+                terrain.bind_surface_line_a_fixture(&gpu.device, &gpu.queue, size, |_| {
+                    row["input"]["alpha"].as_u64().unwrap() as u16
+                });
+                terrain.begin_surface_lines();
+                let prepared_lines = terrain.prepare_surface_lines(
                     &gpu.device,
                     &gpu.queue,
+                    std::iter::empty(),
+                    std::iter::empty(),
                     &segments,
+                    &[],
+                    &[],
                     ordered_viewport(row),
-                    |_| row["input"]["alpha"].as_u64().unwrap() as u16,
+                    |_| true,
                 );
                 let mut encoder = gpu.device.create_command_encoder(&Default::default());
                 clear(
@@ -186,7 +210,7 @@ fn production_line_trail_preserves_native_overlap_across_chunks() {
                     65535,
                     wgpu::LoadOp::Clear(wgpu::Color::WHITE),
                 );
-                terrain.draw_line_trails(&mut encoder, &cv);
+                terrain.draw_surface_lines(&mut encoder, &cv, &[prepared_lines]);
                 let reads = [
                     gpu.read(&mut encoder, &color),
                     gpu.read(&mut encoder, &depth),
@@ -220,70 +244,31 @@ fn production_line_trail_preserves_native_overlap_across_chunks() {
     }
 }
 
+/// Pixels in opposite corners of a 1080p frame snapshot only their tiles,
+/// clipped to the blends' scissor, not the box between them.
 #[test]
-#[ignore = "requires quiet GPU; reports bounded debug preparation + completed submission timing, not FPS"]
-fn line_trail_native_fixture_submission_timings() {
-    use std::time::Instant;
-    let native: Value = serde_json::from_str(include_str!(
-        "../../tools/projectile_oracle/line_trail.json"
-    ))
-    .unwrap();
-    let gpu = Gpu::new();
-    let size = [64, 96];
-    for format in [
-        wgpu::TextureFormat::Bgra8UnormSrgb,
-        wgpu::TextureFormat::Rgba8UnormSrgb,
-    ] {
-        let batch = BatchRenderer::new_with_device(&gpu.device, &gpu.queue, format);
-        let mut terrain = TerrainDrawRenderer::new(&gpu.device, &gpu.queue, format, &batch);
-        batch.write_camera(&gpu.queue, camera(size));
-        let color = gpu.target(size, format);
-        let cv = color.create_view(&Default::default());
-        let depth = gpu.target(size, wgpu::TextureFormat::Depth32Float);
-        let dv = depth.create_view(&Default::default());
-        for row in native["ordered_pixel_cases"].as_array().unwrap() {
-            let segments = overlapping_segments(row);
-            let mut samples = Vec::new();
-            for repetition in 0..22 {
-                let begin = Instant::now();
-                terrain.prepare(&gpu.device, &color, &dv, batch.camera_uniform());
-                terrain.prepare_line_trails(
-                    &gpu.device,
-                    &gpu.queue,
-                    &segments,
-                    ordered_viewport(row),
-                    |_| row["input"]["alpha"].as_u64().unwrap() as u16,
-                );
-                let prepared = begin.elapsed().as_secs_f64() * 1000.;
-                let mut encoder = gpu.device.create_command_encoder(&Default::default());
-                clear(
-                    &mut encoder,
-                    &cv,
-                    &dv,
-                    65535,
-                    wgpu::LoadOp::Clear(wgpu::Color::WHITE),
-                );
-                terrain.draw_line_trails(&mut encoder, &cv);
-                gpu.queue.submit([encoder.finish()]);
-                gpu.device
-                    .poll(wgpu::PollType::wait_indefinitely())
-                    .unwrap();
-                if repetition >= 2 {
-                    samples.push((prepared, begin.elapsed().as_secs_f64() * 1000.));
-                }
-            }
-            let median = |field: usize| {
-                let mut values = samples
-                    .iter()
-                    .map(|v| if field == 0 { v.0 } else { v.1 })
-                    .collect::<Vec<_>>();
-                values.sort_by(f64::total_cmp);
-                values[values.len() / 2]
-            };
-            eprintln!(
-                "LINE_TRAIL_TIMING {}",
-                serde_json::json!({"format":format!("{format:?}"),"trails":row["count"],"alpha":row["input"]["alpha"],"size":size,"samples":samples.len(),"prepare_ms_median":median(0),"complete_ms_median":median(1),"complete_ms_min":samples.iter().map(|v|v.1).fold(f64::INFINITY,f64::min),"complete_ms_max":samples.iter().map(|v|v.1).fold(0.,f64::max)})
-            );
-        }
-    }
+fn surface_line_snapshot_copies_only_the_tiles_its_blends_read() {
+    let mut cover = SnapshotCover::default();
+    cover.reset([1920, 1080]);
+    cover.add(5, 6, 6, 7);
+    cover.add(1900, 1070, 1902, 1072);
+    assert_eq!(cover.scissor(), [5, 6, 1897, 1066]);
+    let mut rects = Vec::new();
+    cover.snapshot_rects(&mut rects);
+    assert_eq!(rects, [[5, 6, 27, 26], [1888, 1056, 14, 16]]);
+}
+
+/// A zoomed pixel across a tile edge reads both tiles, which one run copies;
+/// a pixel past the target's edge copies nothing.
+#[test]
+fn surface_line_snapshot_joins_tile_runs_and_skips_pixels_off_the_target() {
+    let mut cover = SnapshotCover::default();
+    cover.reset([100, 50]);
+    cover.add(31, 0, 33, 2);
+    cover.add(70, 40, 71, 41);
+    cover.add(120, 10, 121, 11);
+    assert_eq!(cover.scissor(), [31, 0, 69, 41]);
+    let mut rects = Vec::new();
+    cover.snapshot_rects(&mut rects);
+    assert_eq!(rects, [[31, 0, 33, 32], [64, 32, 32, 9]]);
 }

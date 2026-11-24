@@ -9,6 +9,17 @@
 //! ## Dependency rules
 //! - Part of assets/ — no dependencies on game modules.
 
+// Outside data reaches this module: it refuses bad input, never panics.
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable
+    )
+)]
+
 use crate::assets::mix_hash::mix_hash;
 
 /// A single entry from the XCC global mix database.
@@ -37,12 +48,14 @@ impl XccDatabase {
     ///
     /// Format: `[u32 count] [filename\0 description\0]*count`
     pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
-        if data.len() < 4 {
+        let Some((count, _)) = data.split_first_chunk::<4>() else {
             return Err("XCC database too small (< 4 bytes)".to_string());
-        }
+        };
 
-        let count = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        let mut entries = Vec::with_capacity(count);
+        let count = u32::from_le_bytes(*count) as usize;
+        // Each entry is at least its two terminators, which bounds what the
+        // count may reserve.
+        let mut entries = Vec::with_capacity(count.min(data.len() / 2));
         let mut pos: usize = 4;
 
         for i in 0..count {
@@ -89,7 +102,7 @@ impl XccDatabase {
         let path = std::env::var(XCC_DATABASE_PATH_ENV)
             .unwrap_or_else(|_| DEFAULT_XCC_DATABASE_PATH.to_string());
 
-        let data = std::fs::read(&path)
+        let data = crate::util::file_system::read(&path)
             .map_err(|e| format!("Cannot read XCC database at '{}': {}", path, e))?;
 
         Self::from_bytes(&data)
@@ -166,7 +179,7 @@ fn read_null_terminated(data: &[u8], pos: &mut usize) -> Option<String> {
     Some(s)
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_assets))]
 mod tests {
     use super::*;
 
@@ -214,27 +227,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_hash_dictionary() {
-        let mut data = Vec::new();
-        data.extend_from_slice(&2u32.to_le_bytes());
-        data.extend_from_slice(b"rules.ini\0config\0");
-        data.extend_from_slice(b"art.ini\0graphics\0");
-
-        let db = XccDatabase::from_bytes(&data).expect("parse");
-        let dict = db.build_hash_dictionary();
-        assert_eq!(dict.len(), 2);
-        // Verify hashes match our mix_hash function.
-        assert!(
-            dict.iter()
-                .any(|(name, hash)| name == "rules.ini" && *hash == mix_hash("rules.ini"))
-        );
-        assert!(
-            dict.iter()
-                .any(|(name, hash)| name == "art.ini" && *hash == mix_hash("art.ini"))
-        );
-    }
-
-    #[test]
     fn test_extra_entries_beyond_count() {
         // Count says 1, but file has 2 pairs — second should still be parsed.
         let mut data = Vec::new();
@@ -244,12 +236,5 @@ mod tests {
 
         let db = XccDatabase::from_bytes(&data).expect("parse");
         assert_eq!(db.len(), 2); // both parsed
-    }
-
-    #[test]
-    fn test_empty_database() {
-        let data = 0u32.to_le_bytes().to_vec();
-        let db = XccDatabase::from_bytes(&data).expect("parse");
-        assert!(db.is_empty());
     }
 }

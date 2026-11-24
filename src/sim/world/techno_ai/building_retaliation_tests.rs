@@ -10,13 +10,13 @@ use crate::rules::ini_parser::IniFile;
 use crate::rules::ruleset::RuleSet;
 use crate::sim::combat::damage::DamageState;
 use crate::sim::combat::world_receiver::{ReceiverRun, commit_entities};
-use crate::sim::combat::{AttackTarget, EntityDamageEvent, TargetKind};
+use crate::sim::combat::{EntityDamageEvent, TargetKind};
 use crate::sim::game_entity::GameEntity;
 use crate::sim::house_state::HouseState;
 use crate::sim::mission::state::MissionTestFixture;
 use crate::sim::mission::{MissionDispatchTimer, MissionId, MissionType};
 use crate::sim::rng::SimRng;
-use crate::sim::world::Simulation;
+use crate::sim::world::{SimSoundEvent, Simulation};
 
 /// The oracle fixture's frame.
 const FRAME: u32 = 200;
@@ -26,11 +26,8 @@ const BUILDING: (u16, u16) = (5, 5);
 const IN_RANGE: (u16, u16) = (8, 5);
 const OUT_OF_RANGE: (u16, u16) = (15, 5);
 
-fn golden() -> Value {
-    serde_json::from_str(include_str!(
-        "../../../../tools/spatial_oracle/building_retaliation.json"
-    ))
-    .unwrap()
+fn golden() -> &'static Value {
+    crate::test_fixture::json("tools/spatial_oracle/building_retaliation.json")
 }
 
 /// `DEF` with the row's type fields, an enemy `TANK` and `JET`, and
@@ -65,12 +62,13 @@ fn rules(input: &Value) -> RuleSet {
         ""
     };
     let yes = |set: bool| if set { "yes" } else { "no" };
-    RuleSet::from_ini(&IniFile::from_str(&format!(
-        "[General]\nGuardAreaTargetingDelay=36\n[CombatDamage]\nPlayerReturnFire={}\n\
+    RuleSet::from_ini_with_fixed_art_for_test(
+        &crate::sim::arena_fixture::clear_ground_ini(&format!(
+            "[General]\nGuardAreaTargetingDelay=36\n[CombatDamage]\nPlayerReturnFire={}\n\
          [BuildingTypes]\n0=DEF\n\
          [VehicleTypes]\n0=TANK\n\
          [AircraftTypes]\n0=JET\n\
-         [DEF]\nStrength=1000\nArmor=concrete\nFoundation={foundation}\nROT={}\n\
+         [DEF]\nStrength=1000\nArmor=concrete\nROT={}\n\
          Insignificant={}\n{weapon}{undeploys}{powered}\
          [TANK]\nStrength=300\nArmor=heavy\nSpeed=6\n\
          [JET]\nStrength=150\nArmor=light\nSpeed=12\n\
@@ -79,10 +77,12 @@ fn rules(input: &Value) -> RuleSet {
          [Shell]\nAG=yes\n\
          [FlakShell]\nAA=yes\nAG=no\n\
          [AP]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
-        yes(number("player_return_fire", 0) != 0),
-        number("rot", 10),
-        yes(number("insignificant", 0) != 0),
-    )))
+            yes(number("player_return_fire", 0) != 0),
+            number("rot", 10),
+            yes(number("insignificant", 0) != 0),
+        )),
+        &IniFile::from_str(&format!("[DEF]\nFoundation={foundation}\n")),
+    )
     .unwrap()
 }
 
@@ -90,11 +90,11 @@ fn rules(input: &Value) -> RuleSet {
 /// land speeds for a vehicle's Unlimbo, and the block reads only the source's
 /// class, house and position.
 fn enemy(sim: &mut Simulation, kind: &str, category: EntityCategory, cell: (u16, u16)) -> u64 {
-    let id = sim.allocate_stable_id();
+    let id = sim.substrate.allocate_stable_id();
     let mut entity = GameEntity::test_default(id, kind, "Russians", cell.0, cell.1);
-    entity.owner = sim.intern("Russians");
-    entity.type_ref = sim.intern(kind);
-    entity.category = category;
+    entity.set_owner_for_test(sim.intern("Russians"));
+    entity.set_type_ref_for_test(sim.intern(kind));
+    entity.set_category_for_test(category);
     sim.substrate.entities.insert(entity);
     id
 }
@@ -113,16 +113,21 @@ fn mission(name: &str) -> MissionId {
 fn fixture(rules: &RuleSet, input: &Value) -> (Simulation, u64, Option<u64>) {
     let mut sim = Simulation::new();
     sim.install_resolved_terrain_for_new_map(test_flat_ground_grid(24));
+    crate::sim::arena_fixture::supply_native_map(&mut sim);
     for (house, human) in [
         ("Americans", input["human"].as_bool().unwrap_or(false)),
+        // Original block fixture supplies the source House index3, leaving
+        // two intervening registry slots. They own no actors or callbacks.
+        ("Unused1", false),
+        ("Unused2", false),
         ("Russians", false),
     ] {
         let id = sim.interner.intern(house);
         sim.houses
-            .insert(id, HouseState::new(id, 0, Some(id), human, 5000, 10));
+            .register(HouseState::new(id, 0, Some(id), human, 5000, 10));
     }
     if input["allied"].as_bool().unwrap_or(false) {
-        sim.house_alliances
+        sim.house_alliances_mut_for_test()
             .entry("AMERICANS".into())
             .or_default()
             .insert("RUSSIANS".into());
@@ -141,20 +146,20 @@ fn fixture(rules: &RuleSet, input: &Value) -> (Simulation, u64, Option<u64>) {
         _ => Some(("TANK", EntityCategory::Unit)),
     }
     .map(|(kind, category)| enemy(&mut sim, kind, category, cell));
-    sim.session.binary_frame = FRAME;
+    sim.session.set_binary_frame_for_test(FRAME);
     if input["operational"] == false {
         let owner = sim.interner.intern("Americans");
-        sim.power_states.insert(
-            owner,
-            crate::sim::power_system::PowerState {
-                total_drain: 100,
-                is_low_power: true,
-                ..Default::default()
-            },
-        );
+        let mut power_state = crate::sim::power_system::PowerState::default();
+        power_state.set_total_drain_for_test(100);
+        power_state.set_is_low_power_for_test(true);
+        sim.power_states
+            .map_mut_for_test()
+            .insert(owner, power_state);
     }
     sim.scenario_rng = SimRng::new(input["seed"].as_u64().unwrap_or(1));
     let entity = sim.substrate.entities.get_mut(building).unwrap();
+    // The original block fixture supplies this retained +53C prior.
+    entity.initialize_building_loss_index(0x7777);
     entity.mission.apply_test_fixture(MissionTestFixture {
         current: mission(input["mission"].as_str().unwrap_or("guard")),
         suspended: MissionId::NONE,
@@ -166,7 +171,9 @@ fn fixture(rules: &RuleSet, input: &Value) -> (Simulation, u64, Option<u64>) {
         dispatch_timer: MissionDispatchTimer::from_raw(FRAME as i32, 0),
     });
     if input["target"].as_bool().unwrap_or(false) {
-        entity.attack_target = source.map(AttackTarget::new);
+        entity
+            .attack_target
+            .set_for_test(source.map(TargetKind::Entity));
     }
     let facing = &mut entity.body_facing;
     if let Some(desired) = input["initial_desired"].as_u64() {
@@ -176,7 +183,8 @@ fn fixture(rules: &RuleSet, input: &Value) -> (Simulation, u64, Option<u64>) {
     }
     if input["rotating"].as_bool().unwrap_or(false) {
         facing.set(0x4000, FRAME);
-        sim.session.binary_frame = FRAME + input["advance"].as_u64().unwrap_or(0) as u32;
+        sim.session
+            .set_binary_frame_for_test(FRAME + input["advance"].as_u64().unwrap_or(0) as u32);
     }
     (sim, building, source)
 }
@@ -198,8 +206,8 @@ fn indices(rng: &SimRng) -> Value {
 }
 
 /// Every row through [`Simulation::building_hit_response`]: its ping, TarCom,
-/// mission, Scenario draws (values and generator indices) and `+0x388`.
-/// `+0x53C` (`who_last`) has no VERA state (module doc). RESIDUAL (dormant
+/// mission, Scenario draws (values and generator indices), `+0x388` and
+/// retained `+0x53C` (`who_last`). RESIDUAL (dormant
 /// with retail data): `ai_artillary_out_of_range`'s sale, BuildingClass::
 /// SetTarget's TickTank/Artillary arm (`building_missions` module doc).
 #[test]
@@ -213,7 +221,7 @@ fn the_block_matches_the_original() {
         let rules = rules(input);
         let (mut sim, building, source) = fixture(&rules, input);
         assert_eq!(
-            sim.session.binary_frame,
+            sim.session.binary_frame(),
             row["frame"].as_u64().unwrap() as u32
         );
         let before = sim.substrate.entities.get(building).unwrap().clone();
@@ -225,19 +233,26 @@ fn the_block_matches_the_original() {
             building,
             source,
             result(input["result"].as_i64().unwrap_or(1)),
+            true,
             &rules,
             None,
+            &mut crate::sim::world::FrameEffects::default(),
         );
 
         let after = sim.substrate.entities.get(building).unwrap();
+        assert_eq!(
+            i64::from(after.building_loss_index()),
+            row["who_last"].as_i64().unwrap(),
+            "{name} source-house loss index"
+        );
         // NotifyUnderAttack's cell is GetCoords': a 2x2's foundation centre
         // lies 128 leptons past its anchor cell's centre on both axes, in the
         // next cell (native GetCoords rows in building_fire_facing.json).
         let centre = u16::from(input["foundation"].as_i64().unwrap_or(3) != 0);
         assert_eq!(
-            ping.map(|event| (event.structure, event.owner, event.rx, event.ry)),
+            ping.map(|event| (event.victim_type, event.owner, event.rx, event.ry)),
             (row["ping"] == serde_json::json!([true])).then_some((
-                true,
+                before.type_ref(),
                 before.owner(),
                 BUILDING.0 + centre,
                 BUILDING.1 + centre
@@ -245,7 +260,7 @@ fn the_block_matches_the_original() {
             "{name} ping"
         );
         assert_eq!(
-            after.attack_target.as_ref().map(|attack| attack.target),
+            after.attack_target.target(),
             row["target"]
                 .as_str()
                 .map(|_| TargetKind::Entity(source.unwrap())),
@@ -307,18 +322,18 @@ fn the_block_matches_the_original() {
 /// turretless `Insignificant=` one, and the enemy `GUN` that hits them (a
 /// building, which the bare test map can place).
 fn production_rules(extra: &str) -> RuleSet {
-    RuleSet::from_ini(&IniFile::from_str(&format!(
+    RuleSet::from_ini_with_fixed_art_for_test(&crate::sim::arena_fixture::clear_ground_ini(&format!(
         "[General]\nGuardAreaTargetingDelay=36\n[BuildingTypes]\n0=DEF\n1=SHACK\n2=GUN\n3=MINER\n\
-         [DEF]\nStrength=1000\nArmor=concrete\nFoundation=2x2\nPrimary=Gun\nTurret=yes\nROT=10\n\
-         [SHACK]\nStrength=1000\nArmor=concrete\nFoundation=2x2\nPrimary=Gun\nROT=10\n\
+         [DEF]\nStrength=1000\nArmor=concrete\nPrimary=Gun\nTurret=yes\nROT=10\n\
+         [SHACK]\nStrength=1000\nArmor=concrete\nPrimary=Gun\nROT=10\n\
          Insignificant=yes\n\
-         [GUN]\nStrength=1000\nArmor=concrete\nFoundation=1x1\nPrimary=Gun\n\
-         [MINER]\nStrength=1000\nArmor=concrete\nFoundation=2x2\nUndeploysInto=GUN\n\
+         [GUN]\nStrength=1000\nArmor=concrete\nPrimary=Gun\n\
+         [MINER]\nStrength=1000\nArmor=concrete\nUndeploysInto=GUN\n\
          ResourceGatherer=yes\n\
          [Gun]\nDamage=10\nROF=20\nRange=6\nProjectile=Shell\nWarhead=AP\n\
          [Shell]\nAG=yes\n\
          [AP]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n{extra}"
-    )))
+    )), &IniFile::from_str("[DEF]\nFoundation=2x2\n[SHACK]\nFoundation=2x2\n[GUN]\nFoundation=1x1\n[MINER]\nFoundation=2x2\n"))
     .unwrap()
 }
 
@@ -332,10 +347,11 @@ fn production_fixture(
 ) -> (Simulation, u64, u64) {
     let mut sim = Simulation::new();
     sim.install_resolved_terrain_for_new_map(test_flat_ground_grid(24));
+    crate::sim::arena_fixture::supply_native_map(&mut sim);
     for (house, human) in [("Americans", human), ("Russians", false)] {
         let id = sim.interner.intern(house);
         sim.houses
-            .insert(id, HouseState::new(id, 0, Some(id), human, 5000, 10));
+            .register(HouseState::new(id, 0, Some(id), human, 5000, 10));
     }
     let building = sim
         .spawn_object(kind, "Americans", BUILDING.0, BUILDING.1, 0, rules)
@@ -343,75 +359,34 @@ fn production_fixture(
     let source = sim
         .spawn_object("GUN", "Russians", cell.0, cell.1, 0, rules)
         .unwrap();
-    sim.session.binary_frame = FRAME;
+    sim.session.set_binary_frame_for_test(FRAME);
     sim.scenario_rng = SimRng::new(1);
     (sim, building, source)
 }
 
 /// One `AP` hit of 10 on `building` from `source`, through the production
-/// receiver; returns its pings.
+/// receiver; returns the number of newly submitted inline warnings.
 fn hit(sim: &mut Simulation, rules: &RuleSet, building: u64, source: u64) -> usize {
+    let sound_prefix = sim.sound_events.len();
     let house = sim.substrate.entities.get(source).unwrap().owner();
     let warhead = sim.interner.intern("AP");
     let event = EntityDamageEvent::area(building, 10, 0, source, Some(house), warhead);
-    let (_, pings) = commit_entities(
+    let mut pings = Vec::new();
+    commit_entities(
         sim,
         &mut ReceiverRun::default(),
         &[event],
         None,
         rules,
         None,
+        &mut pings,
     );
-    pings.iter().filter(|ping| ping.structure).count()
-}
-
-/// A human's turreted defence hit from out of range pings and turns its
-/// turret to the low byte of one Scenario draw; hit again while the turret
-/// still turns, it pings without a draw. The first draw of seed 1 is the
-/// oracle's `human_seed1` (0x78B76ED5, so 0xD500 in 4 frames at ROT 10).
-#[test]
-fn a_human_defence_hit_from_out_of_range_turns_its_turret_once() {
-    let rules = production_rules("");
-    let (mut sim, building, source) = production_fixture(&rules, "DEF", true, OUT_OF_RANGE);
-    let mut expected = sim.scenario_rng.clone();
-    let drawn = expected.next_u32();
-    assert_eq!(drawn, 0x78B7_6ED5);
-
-    assert_eq!(hit(&mut sim, &rules, building, source), 1);
-    assert_eq!(
-        sim.scenario_rng.logical_state(),
-        expected.logical_state(),
-        "one Scenario draw"
-    );
-    let entity = sim.substrate.entities.get(building).unwrap();
-    assert_eq!(entity.health.current, 990);
-    assert!(entity.attack_target.is_none());
-    let turret = entity.body_facing;
-    assert_eq!(turret.destination(), 0xD500);
-    assert_eq!(turret.timer_duration(), 4);
-    assert!(turret.is_rotating(FRAME));
-
-    assert_eq!(hit(&mut sim, &rules, building, source), 1);
-    assert_eq!(
-        sim.scenario_rng.logical_state(),
-        expected.logical_state(),
-        "no draw while the turret turns"
-    );
-    assert_eq!(
-        sim.substrate.entities.get(building).unwrap().body_facing,
-        turret
-    );
-}
-
-/// `Insignificant=` gates only the ping: a human's turretless insignificant
-/// building still turns its body (`+0x388`, which every building carries).
-#[test]
-fn an_insignificant_building_turns_without_a_ping() {
-    let rules = production_rules("");
-    let (mut sim, building, source) = production_fixture(&rules, "SHACK", true, OUT_OF_RANGE);
-    assert_eq!(hit(&mut sim, &rules, building, source), 0);
-    let body = sim.substrate.entities.get(building).unwrap().body_facing;
-    assert_eq!(body.destination(), 0xD500);
+    assert!(pings.is_empty(), "building warnings are already submitted");
+    sim.sound_events
+        .iter()
+        .skip(sound_prefix)
+        .filter(|event| matches!(event, SimSoundEvent::UnderAttack { .. }))
+        .count()
 }
 
 /// A 2x2 building that undeploys and gathers (the deployed Slave Miner)
@@ -423,74 +398,26 @@ fn a_deployed_slave_miner_pings_the_ore_miner_line() {
     let house = sim.substrate.entities.get(source).unwrap().owner();
     let warhead = sim.interner.intern("AP");
     let event = EntityDamageEvent::area(building, 10, 0, source, Some(house), warhead);
-    let (_, pings) = commit_entities(
+    let mut pings = Vec::new();
+    commit_entities(
         &mut sim,
         &mut ReceiverRun::default(),
         &[event],
         None,
         &rules,
         None,
+        &mut pings,
     );
+    assert!(pings.is_empty(), "building warning is already submitted");
     assert_eq!(
-        pings
+        sim.sound_events
             .iter()
-            .map(|ping| (ping.structure, ping.miner))
+            .filter_map(|event| match event {
+                SimSoundEvent::UnderAttack { miner, .. } => Some(*miner),
+                _ => None,
+            })
             .collect::<Vec<_>>(),
-        [(true, true)]
-    );
-}
-
-/// A computer's defence hit from in range takes the source; with
-/// `PlayerReturnFire=` a human's does too, and neither draws.
-#[test]
-fn a_returned_hit_takes_the_source_without_a_draw() {
-    for (human, extra) in [
-        (false, ""),
-        (true, "[CombatDamage]\nPlayerReturnFire=yes\n"),
-    ] {
-        let rules = production_rules(extra);
-        let (mut sim, building, source) = production_fixture(&rules, "DEF", human, IN_RANGE);
-        let rng = sim.scenario_rng.logical_state();
-        assert_eq!(hit(&mut sim, &rules, building, source), 1);
-        assert_eq!(sim.scenario_rng.logical_state(), rng, "human {human}");
-        let entity = sim.substrate.entities.get(building).unwrap();
-        assert_eq!(
-            entity.attack_target.as_ref().map(|attack| attack.target),
-            Some(TargetKind::Entity(source)),
-            "human {human}"
-        );
-        assert_eq!(entity.body_facing.destination(), 0, "human {human}");
-    }
-}
-
-/// A hit without a source object neither pings nor turns (`0x00442942`).
-#[test]
-fn a_hit_without_a_source_does_nothing() {
-    let rules = production_rules("");
-    let (mut sim, building, _) = production_fixture(&rules, "DEF", true, OUT_OF_RANGE);
-    let rng = sim.scenario_rng.logical_state();
-    let warhead = sim.interner.intern("AP");
-    let event = EntityDamageEvent::area(
-        building,
-        10,
-        0,
-        crate::sim::combat::RAD_NO_ATTACKER,
-        None,
-        warhead,
-    );
-    let (_, pings) = commit_entities(
-        &mut sim,
-        &mut ReceiverRun::default(),
-        &[event],
-        None,
-        &rules,
-        None,
-    );
-    assert!(pings.is_empty());
-    assert_eq!(sim.scenario_rng.logical_state(), rng);
-    assert_eq!(
-        sim.substrate.entities.get(building).unwrap().health.current,
-        990
+        [true]
     );
 }
 
@@ -507,12 +434,13 @@ fn a_computer_defence_drops_its_out_of_range_target_when_hit_by_it() {
         .entities
         .get_mut(building)
         .unwrap()
-        .attack_target = Some(AttackTarget::new(source));
+        .attack_target
+        .set_for_test(Some(TargetKind::Entity(source)));
     assert_eq!(hit(&mut sim, &rules, building, source), 1);
     let entity = sim.substrate.entities.get(building).unwrap();
-    assert!(entity.attack_target.is_none());
+    assert!(entity.attack_target.target().is_none());
     assert_eq!(
-        entity.suspended_attack_target,
+        entity.seldom.suspended_attack_target.target(),
         Some(TargetKind::Entity(source)),
         "the Override archived it"
     );

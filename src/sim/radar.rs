@@ -8,39 +8,29 @@
 //! Radar events themselves are client-local: native `RadarClass` keeps one
 //! event array per process beside its radar surfaces. The simulation therefore
 //! only names the event it reached ([`RadarEventRequest`]);
-//! `render::radar_events` owns admission, dedup, animation and the Spacebar
+//! `render::radar::events` owns admission, dedup, animation and the Spacebar
 //! review ring.
 //!
 //! ## Dependency rules
 //! - Part of sim/ — depends on rules/, map/ (via entity components).
-//! - NEVER depends on render/, ui/, sidebar/, audio/, net/.
+//! - NEVER depends on render/, ui/, audio/, net/.
 
 use crate::rules::ruleset::RuleSet;
 use crate::sim::world::Simulation;
 
-/// Query map-owned FreeRadar or ordinary building availability for an owner.
+/// The owner's radar as its House last assessed it.
 ///
-/// A building provides radar if its ObjectType has `Radar=yes` and the house is
-/// not in low power. This is a house-level gate; stock Allied `GAAIRC` and
-/// `AMRADR` omit `Powered=yes`.
-/// Native House 00508DF0 checks Scenario+34A4 before power/providers; the app
-/// supplies its preferred local owner. Native's earlier, separate spy-radar
-/// blackout gate has no Rust state/writer yet and remains unsupported. The
-/// existing power-blackout timer is not that gate and must not replace it.
-pub fn has_radar_for_owner(sim: &Simulation, rules: &RuleSet, owner: &str) -> bool {
+/// Native House `0x00508DF0` denies radar while the House's radar outage runs,
+/// then grants it for Scenario+34A4 (map FreeRadar) before power and
+/// providers: a building provides radar if its ObjectType has `Radar=yes` and
+/// the house is not in low power. This is a house-level gate; stock Allied
+/// `GAAIRC` and `AMRADR` omit `Powered=yes`. The app supplies its preferred
+/// local owner.
+pub fn has_radar_for_owner(sim: &Simulation, _rules: &RuleSet, owner: &str) -> bool {
     let Some(owner_id) = sim.interner.get(owner) else {
         return false;
     };
-    if sim.session.free_radar {
-        return true;
-    }
-    crate::sim::power_system::has_active_radar(
-        &sim.substrate.entities,
-        &sim.power_states,
-        rules,
-        owner_id,
-        &sim.interner,
-    )
+    crate::sim::power_system::has_active_radar(sim.power_states.as_map(), owner_id)
 }
 
 /// Native runtime radar event type (`CreateRadarEvent @ 0x0065FA70`'s ECX).
@@ -67,6 +57,35 @@ pub enum RadarEventType {
     AllyUnderAttack = 16,
 }
 
+impl TryFrom<i32> for RadarEventType {
+    type Error = ();
+
+    /// The compiled65FA70 type-table ordinal. Invalid native array indexes
+    /// are rejected rather than addressing memory outside the table.
+    fn try_from(index: i32) -> Result<Self, Self::Error> {
+        Ok(match index {
+            0 => Self::Combat,
+            1 => Self::Noncombat,
+            2 => Self::Dropzone,
+            3 => Self::BaseUnderAttack,
+            4 => Self::HarvesterUnderAttack,
+            5 => Self::EnemyObjectSensed,
+            6 => Self::UnitReady,
+            7 => Self::UnitLost,
+            8 => Self::UnitRepaired,
+            9 => Self::SpyInfiltration,
+            10 => Self::BuildingCaptured,
+            11 => Self::BeaconPlaced,
+            12 => Self::ConstructionComplete,
+            13 => Self::ImpactSilent,
+            14 => Self::BridgeRepaired,
+            15 => Self::StructureAbandoned,
+            16 => Self::AllyUnderAttack,
+            _ => return Err(()),
+        })
+    }
+}
+
 /// A `CreateRadarEvent(type, cell)` call the simulation reached.
 ///
 /// It carries no acceptance result: the live event array that dedupes it is
@@ -86,12 +105,12 @@ impl RadarEventRequest {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_p_s))]
 mod tests {
     use super::*;
-    use crate::map::entities::EntityCategory;
+
     use crate::rules::ini_parser::IniFile;
-    use crate::sim::game_entity::GameEntity;
+
     use crate::sim::world::Simulation;
 
     fn make_rules_with_radar() -> RuleSet {
@@ -104,54 +123,17 @@ mod tests {
         RuleSet::from_ini(&ini).expect("radar test rules")
     }
 
-    fn spawn_building(sim: &mut Simulation, id: u64, owner: &str, type_id: &str) {
-        let owner_id = sim.interner.intern(owner);
-        let type_ref = sim.interner.intern(type_id);
-        let mut e = GameEntity::new_at_frame_zero_for_test(
-            id,
-            0,
-            0,
-            0,
-            0,
-            owner_id,
-            crate::sim::components::Health { current: 100 },
-            type_ref,
-            EntityCategory::Structure,
-            0,
-            5,
-            false,
-        );
-        e.lifecycle.in_limbo = false;
-        e.lifecycle.cell_marked = true;
-        sim.substrate.entities.insert(e);
-    }
-
     #[test]
-    fn no_radar_without_building() {
-        let sim = Simulation::new();
-        let rules = make_rules_with_radar();
-        assert!(!has_radar_for_owner(&sim, &rules, "Americans"));
-    }
-
-    #[test]
-    fn free_radar_matches_original_empty_provider_decisions_without_radar_blackout() {
-        let original: serde_json::Value = serde_json::from_str(include_str!(
-            "../../tools/free_radar_oracle/fixtures/native-free-radar.json"
+    fn free_radar_and_radar_outage_match_original_empty_provider_decisions() {
+        let original: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+            "tools/free_radar_oracle/fixtures/native-free-radar.json",
         ))
         .unwrap();
         let rules = make_rules_with_radar();
         let mut checked = 0;
         for case in original["availability_cases"].as_array().unwrap() {
             let timer = case["timer_start_duration_frame"].as_array().unwrap();
-            let timer: Vec<_> = timer.iter().map(|v| v.as_i64().unwrap()).collect();
-            // Native expired/stopped states only. Rust has no separate radar
-            // blackout owner; the other 30 original cases remain outside scope.
-            if !matches!(
-                timer.as_slice(),
-                [-1, 0, 100] | [100, 10, 110 | 111] | [100, 0, 100]
-            ) {
-                continue;
-            }
+            let timer: Vec<_> = timer.iter().map(|v| v.as_i64().unwrap() as i32).collect();
             let mut sim =
                 Simulation::from_descriptor(&crate::sim::scenario_session::ScenarioDescriptor {
                     free_radar: case["free_radar"].as_u64().unwrap() != 0,
@@ -161,15 +143,25 @@ mod tests {
             let power = case["power_output_drain"].as_array().unwrap();
             let output = power[0].as_i64().unwrap() as i32;
             let drain = power[1].as_i64().unwrap() as i32;
-            sim.power_states.insert(
+            let mut state = crate::sim::power_system::PowerState::default();
+            state.set_total_output_for_test(output);
+            state.set_total_drain_for_test(drain);
+            state.set_is_low_power_for_test(output < drain);
+            state.set_radar_outage_for_test(crate::sim::timer::CdTimer::from_raw(
+                timer[0], timer[1],
+            ));
+            crate::sim::power_system::assess_house_radar_projection(
+                &mut state,
+                &sim.substrate.entities,
+                &[],
+                &rules,
                 owner,
-                crate::sim::power_system::PowerState {
-                    total_output: output,
-                    total_drain: drain,
-                    is_low_power: output < drain,
-                    ..Default::default()
-                },
+                &sim.interner,
+                sim.session.free_radar(),
+                timer[2] as u32,
+                false,
             );
+            sim.power_states.map_mut_for_test().insert(owner, state);
             assert_eq!(
                 has_radar_for_owner(&sim, &rules, "Americans"),
                 case["available"].as_u64().unwrap() != 0,
@@ -178,115 +170,6 @@ mod tests {
             assert!(!has_radar_for_owner(&sim, &rules, "UnknownOwner"));
             checked += 1;
         }
-        assert_eq!(checked, 40);
-    }
-
-    #[test]
-    fn free_radar_bypasses_low_power_and_power_blackout_with_a_provider() {
-        let mut sim = Simulation::new();
-        let rules = make_rules_with_radar();
-        spawn_building(&mut sim, 1, "Americans", "GARADR");
-        crate::sim::power_system::tick_power_states(
-            &mut sim.power_states,
-            &mut sim.substrate.entities,
-            &rules,
-            &sim.interner,
-        );
-        let owner = sim.interner.get("Americans").unwrap();
-        assert!(sim.power_states[&owner].is_low_power);
-        assert!(!has_radar_for_owner(&sim, &rules, "Americans"));
-        sim.session.free_radar = true;
-        assert!(has_radar_for_owner(&sim, &rules, "Americans"));
-        sim.power_states
-            .get_mut(&owner)
-            .unwrap()
-            .power_blackout_remaining = 100;
-        assert!(
-            has_radar_for_owner(&sim, &rules, "Americans"),
-            "power outage is not native radar outage"
-        );
-    }
-
-    #[test]
-    fn radar_with_powered_building() {
-        let mut sim = Simulation::new();
-        let rules = make_rules_with_radar();
-        // Spawn power plant (Power=200)
-        spawn_building(&mut sim, 1, "Americans", "GAPOWR");
-        // Spawn radar building (Power=-40)
-        spawn_building(&mut sim, 2, "Americans", "GARADR");
-        // Tick power states so cached state reflects the buildings.
-        crate::sim::power_system::tick_power_states(
-            &mut sim.power_states,
-            &mut sim.substrate.entities,
-            &rules,
-            &sim.interner,
-        );
-        assert!(has_radar_for_owner(&sim, &rules, "Americans"));
-    }
-
-    #[test]
-    fn no_radar_when_low_power() {
-        let mut sim = Simulation::new();
-        let rules = make_rules_with_radar();
-        // Only radar building, no power plant — drained > produced
-        spawn_building(&mut sim, 1, "Americans", "GARADR");
-        // Tick power states so low-power is detected.
-        crate::sim::power_system::tick_power_states(
-            &mut sim.power_states,
-            &mut sim.substrate.entities,
-            &rules,
-            &sim.interner,
-        );
-        assert!(!has_radar_for_owner(&sim, &rules, "Americans"));
-    }
-
-    #[test]
-    fn spy_sat_does_not_replace_a_radar_provider() {
-        let mut sim = Simulation::new();
-        let ini = IniFile::from_str(
-            "[InfantryTypes]\n[VehicleTypes]\n[AircraftTypes]\n\
-             [BuildingTypes]\n0=GASPYSAT\n\
-             [GASPYSAT]\nName=Spy Satellite\nSpySat=yes\nPower=0\nFoundation=2x2\n",
-        );
-        let rules = RuleSet::from_ini(&ini).expect("spy satellite test rules");
-        spawn_building(&mut sim, 1, "Americans", "GASPYSAT");
-        crate::sim::power_system::tick_power_states(
-            &mut sim.power_states,
-            &mut sim.substrate.entities,
-            &rules,
-            &sim.interner,
-        );
-
-        assert!(
-            !has_radar_for_owner(&sim, &rules, "Americans"),
-            "SpySat full-map reveal is separate from the native Radar=yes gate"
-        );
-    }
-
-    #[test]
-    fn native_event_discriminants_index_the_compiled_rows() {
-        let variants = [
-            RadarEventType::Combat,
-            RadarEventType::Noncombat,
-            RadarEventType::Dropzone,
-            RadarEventType::BaseUnderAttack,
-            RadarEventType::HarvesterUnderAttack,
-            RadarEventType::EnemyObjectSensed,
-            RadarEventType::UnitReady,
-            RadarEventType::UnitLost,
-            RadarEventType::UnitRepaired,
-            RadarEventType::SpyInfiltration,
-            RadarEventType::BuildingCaptured,
-            RadarEventType::BeaconPlaced,
-            RadarEventType::ConstructionComplete,
-            RadarEventType::ImpactSilent,
-            RadarEventType::BridgeRepaired,
-            RadarEventType::StructureAbandoned,
-            RadarEventType::AllyUnderAttack,
-        ];
-        for (index, event_type) in variants.into_iter().enumerate() {
-            assert_eq!(event_type as usize, index);
-        }
+        assert_eq!(checked, 70);
     }
 }

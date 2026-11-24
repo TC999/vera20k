@@ -2,8 +2,7 @@
 //! Native row/leaf goldens are checked separately; this gate checks caller
 //! ordering, fresh destination snapshots and real pipeline read/write policies.
 use super::super::draw_plan_lowering::{
-    ObjectPieceInstance, PlannedObjectInstance, lower_ground_object_instances,
-    lower_object_instances,
+    ObjectPieceInstance, OwnedPlannedObject, lower_ground_object_instances, lower_object_instances,
 };
 use super::*;
 use crate::render::batch::InstanceBufferPool;
@@ -13,63 +12,15 @@ use crate::render::terrain_draw_gpu_tests::{Gpu, camera, clear, encoded, extent,
 use wgpu::util::DeviceExt;
 
 #[test]
-#[ignore = "requires GPU; retained native Display history through production lowering and draw replay"]
-fn retained_ground_history_controls_overlapping_atlas_pixels() {
+#[ignore = "requires GPU; Ground draw order through production lowering and draw replay"]
+fn ground_draw_order_controls_overlapping_atlas_pixels() {
     use super::super::draw_plan_lowering::NativeDisplayOrder;
-    use crate::sim::world::display_layers::{DisplayLayer, DisplayLayers};
 
-    // Execute the same relocation/sort history as the original-instruction
-    // corpus. Stop after one pass: a fresh full sort has a different overlap.
-    let rows: Vec<serde_json::Value> = serde_json::from_str(include_str!(
-        "../../../../tools/spatial_oracle/crate_ground_membership.json"
-    ))
-    .unwrap();
-    let row = rows
-        .iter()
-        .find(|row| row["input"]["name"] == "one_adjacent_sort_pass_per_call")
-        .unwrap();
-    let mut display = DisplayLayers::default();
-    let mut keys: Vec<i32> = row["input"]["actors"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|actor| 5376 + actor["delta"][0].as_i64().unwrap() as i32)
-        .collect();
-    for (step, observed) in row["input"]["steps"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .zip(row["after_steps"].as_array().unwrap())
-    {
-        let id = step["actor"].as_u64().map(|index| index + 1);
-        match step["op"].as_str().unwrap() {
-            "submit" => {
-                display.submit(id.unwrap(), Some(DisplayLayer::GROUND), &|id| {
-                    keys[id as usize - 1]
-                });
-            }
-            "coordinates" => {
-                keys[id.unwrap() as usize - 1] =
-                    (step["xyz"][0].as_i64().unwrap() + step["xyz"][1].as_i64().unwrap()) as i32
-            }
-            "sort" => {
-                display.sort_ground_pass(&|id| keys[id as usize - 1]);
-                let expected: Vec<_> = observed["layers"][2]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|id| id.as_u64().unwrap() + 1)
-                    .collect();
-                assert_eq!(display.members(DisplayLayer::GROUND), expected);
-                break;
-            }
-            op => panic!("unexpected {op}"),
-        }
-    }
-    // Save/restore must not replace retained history with freshly sorted keys.
-    let display: DisplayLayers =
-        bincode::deserialize(&bincode::serialize(&display).unwrap()).unwrap();
-    let order = NativeDisplayOrder::new(display.members(DisplayLayer::GROUND));
+    // The order one native 551A30 pass leaves the moved members of
+    // crate_ground_membership.json's `one_adjacent_sort_pass_per_call` in:
+    // overlapping pixels follow the order handed to lowering, not each
+    // object's page or position.
+    let order = NativeDisplayOrder::new(&[2, 3, 4, 1]);
     let gpu = Gpu::new();
     let size = [4, 2];
     let format = wgpu::TextureFormat::Bgra8UnormSrgb;
@@ -107,7 +58,7 @@ fn retained_ground_history_controls_overlapping_atlas_pixels() {
                     4 => (0., 1),
                     _ => unreachable!(),
                 };
-                PlannedObjectInstance::object(
+                OwnedPlannedObject::object(
                     order.object_draw(id, SpriteEncoding::Plain).unwrap(),
                     vec![ObjectPieceInstance {
                         target: ObjectTexture::ShpPage(page),
@@ -116,7 +67,7 @@ fn retained_ground_history_controls_overlapping_atlas_pixels() {
                     }],
                 )
             })
-            .collect(),
+            .collect::<Vec<_>>(),
     );
     assert_eq!(ground.owners, [2, 3, 4, 1]);
     let mut pool = InstanceBufferPool::new();
@@ -131,6 +82,7 @@ fn retained_ground_history_controls_overlapping_atlas_pixels() {
     );
     draw_native_object_pass(
         &mut encoder,
+        crate::app::render::merge_passes::ObjectDrawPhase::Display,
         &cv,
         &dv,
         &mut terrain,
@@ -141,10 +93,11 @@ fn retained_ground_history_controls_overlapping_atlas_pixels() {
         None,
         None,
         None,
-        &VxlSlopeTransitionCache::default(),
         Some(&shp),
         None,
         batch.default_zshape_bind_group(),
+        None,
+        None,
     );
     let reads = [gpu.read(&mut encoder, &color)];
     let output = gpu.finish(encoder, &reads, size);
@@ -160,9 +113,18 @@ fn retained_ground_history_controls_overlapping_atlas_pixels() {
     );
 }
 
+/// Ground vehicles draw their shadow after the body with clipped read-only
+/// depth; Air/Top bodies draw it first and keep ground occlusion.
 #[test]
-#[ignore = "requires GPU; actual Ground lowering, atlas upload and voxel body/shadow replay"]
-fn vehicle_shadow_after_body_preserves_body_and_clipped_read_only_depth() {
+#[ignore = "requires GPU; actual Ground/Air/Top lowering, atlas upload, posed sources and voxel body/shadow replay"]
+fn aircraft_shadow_before_body_preserves_body_and_ground_occlusion() {
+    unit_body_shadow_replay(2, true, 65535);
+    unit_body_shadow_replay(3, false, 65535);
+    unit_body_shadow_replay(4, false, 65535);
+    unit_body_shadow_replay(4, false, 0);
+}
+
+fn unit_body_shadow_replay(layer: u8, masked: bool, initial_z: u16) {
     let gpu = Gpu::new();
     let size = [12, 8];
     let format = wgpu::TextureFormat::Bgra8UnormSrgb;
@@ -175,9 +137,11 @@ fn vehicle_shadow_after_body_preserves_body_and_clipped_read_only_depth() {
     let mut terrain = TerrainDrawRenderer::new(&gpu.device, &gpu.queue, format, &batch);
     terrain.prepare(&gpu.device, &color, &dv, batch.camera_uniform());
     let mut mask = vec![1; 24];
-    for y in 0..2 {
-        for x in 1..5 {
-            mask[y * 6 + x] = 0;
+    if masked {
+        for y in 0..2 {
+            for x in 1..5 {
+                mask[y * 6 + x] = 0;
+            }
         }
     }
     let units = UnitAtlas::from_test_pages(vec![
@@ -200,12 +164,11 @@ fn vehicle_shadow_after_body_preserves_body_and_clipped_read_only_depth() {
             ),
         },
     ]);
-    let palette = crate::assets::pal_file::Palette {
-        colors: [crate::assets::pal_file::Color::rgb(0, 252, 0); 256],
-    };
+    let palette = crate::assets::pal_file::Palette::from_rgb(|_| [0, 252, 0]);
     let ramps = crate::rules::house_colors::HouseColorRamps::from_schemes(&[]);
-    let palettes = PaletteSet::new_on_device(&gpu.device, &gpu.queue, &palette, &ramps, &[]);
-    let parents = (0..2)
+    let palettes =
+        PaletteSet::new_on_device(&gpu.device, &gpu.queue, &palette, &palette, &ramps, &[]);
+    let parents: Vec<_> = (0..2)
         .map(|i| {
             let mut body = sprite([1. + i as f32 * 4., 1.], [4., 4.], -1.);
             body.z_gradient = crate::render::native_z::pack_voxel_z_gradient(
@@ -217,35 +180,48 @@ fn vehicle_shadow_after_body_preserves_body_and_clipped_read_only_depth() {
             shadow.z_gradient = body.z_gradient;
             shadow.zshape_origin = [3., 4.];
             shadow.draw_state.fx_flags = crate::render::draw_state::FX_SHADOW;
-            PlannedObjectInstance::object(
+            OwnedPlannedObject::object(
                 ObjectDraw {
                     id: i,
-                    layer: TacticalLayer(2),
+                    layer: TacticalLayer(layer),
                     display_order: i,
                     policy: BlitPolicy::z_read(SpriteEncoding::Plain),
                 },
-                vec![
-                    ObjectPieceInstance {
-                        // Both ordinary unit sources must preserve the same body/shadow
-                        // order; the second body exercises the cached-pose binding.
-                        target: if i == 0 {
-                            ObjectTexture::UnitAtlasPage(0)
-                        } else {
-                            ObjectTexture::UnitPose
+                {
+                    let mut pieces = vec![
+                        ObjectPieceInstance {
+                            // Both ordinary unit sources must preserve the same body/shadow
+                            // order; the second body exercises the cached-pose binding.
+                            target: if i == 0 {
+                                ObjectTexture::UnitAtlasPage(0)
+                            } else {
+                                ObjectTexture::UnitPosePage(0)
+                            },
+                            render_z: RenderZPolicy::ReadOnly,
+                            instance: body,
                         },
-                        render_z: RenderZPolicy::ReadOnly,
-                        instance: body,
-                    },
-                    ObjectPieceInstance {
-                        target: ObjectTexture::UnitAtlasPage(1),
-                        render_z: RenderZPolicy::ReadOnly,
-                        instance: shadow,
-                    },
-                ],
+                        ObjectPieceInstance {
+                            target: ObjectTexture::UnitAtlasPage(1),
+                            render_z: RenderZPolicy::ReadOnly,
+                            instance: shadow,
+                        },
+                    ];
+                    if !masked {
+                        pieces.reverse();
+                    }
+                    pieces
+                },
             )
         })
         .collect();
-    let ground = lower_ground_object_instances(parents);
+    let ground = if layer == 2 {
+        lower_ground_object_instances(parents)
+    } else {
+        lower_object_instances(parents.into())
+            .into_iter()
+            .nth(layer as usize)
+            .unwrap()
+    };
     assert_eq!(ground.owners, vec![0, 0, 1, 1]);
     assert_eq!(
         ground
@@ -253,7 +229,11 @@ fn vehicle_shadow_after_body_preserves_body_and_clipped_read_only_depth() {
             .iter()
             .map(|s| s.draw_state.fx_flags & crate::render::draw_state::FX_SHADOW != 0)
             .collect::<Vec<_>>(),
-        vec![false, true, false, true]
+        if masked {
+            vec![false, true, false, true]
+        } else {
+            vec![true, false, true, false]
+        }
     );
     let mut pool = InstanceBufferPool::new();
     pool.upload_on_device(&gpu.device, &gpu.queue, "ground_objects", &ground.instances);
@@ -262,11 +242,15 @@ fn vehicle_shadow_after_body_preserves_body_and_clipped_read_only_depth() {
         &mut encoder,
         &cv,
         &dv,
-        65535,
+        initial_z,
         wgpu::LoadOp::Clear(wgpu::Color::WHITE),
     );
+    let poses = crate::render::unit_pose_cache::VxlPoseFrameCache::from_test_textures(vec![
+        batch.create_unit_atlas_texture_on_device(&gpu.device, &gpu.queue, 1, 1, &[33]),
+    ]);
     let stats = draw_native_object_pass(
         &mut encoder,
+        crate::app::render::merge_passes::ObjectDrawPhase::Display,
         &cv,
         &dv,
         &mut terrain,
@@ -276,11 +260,12 @@ fn vehicle_shadow_after_body_preserves_body_and_clipped_read_only_depth() {
         &ground,
         None,
         Some(&units),
-        Some(&units.page(0).unwrap().texture),
-        &VxlSlopeTransitionCache::default(),
+        Some(&poses),
         None,
         Some(&palettes),
         batch.default_zshape_bind_group(),
+        None,
+        None,
     );
     assert_eq!(
         stats.pieces, 0,
@@ -292,30 +277,44 @@ fn vehicle_shadow_after_body_preserves_body_and_clipped_read_only_depth() {
     ];
     let output = gpu.finish(encoder, &reads, size);
     let pixel = |x: usize, y: usize| &output[0][(y * 12 + x) * 4..(y * 12 + x + 1) * 4];
-    assert_eq!(
-        pixel(5, 3),
-        encoded(0x07e0, format),
-        "later body covers earlier shadow"
-    );
-    assert_eq!(
-        pixel(3, 2),
-        encoded(0x07e0, format),
-        "own body remains opaque"
-    );
-    assert_eq!(pixel(1, 5), [255; 4], "left tactical clip");
-    assert_eq!(pixel(6, 6), [255; 4], "bottom tactical clip");
-    assert!(
-        pixel(2, 5)[1] < 200 && pixel(2, 5)[1] > 100,
-        "one alpha shadow visibly darkens"
-    );
-    assert!(
-        pixel(4, 5)[1] < pixel(2, 5)[1],
-        "overlapping read-only shadows compound in order"
-    );
-    for p in output[1].chunks_exact(4) {
+    if initial_z == 0 {
+        assert!(
+            output[0].iter().all(|&byte| byte == 255),
+            "terrain depth occludes both body and ground shadow"
+        );
+    } else {
         assert_eq!(
-            crate::render::native_z::stored_z(f32::from_le_bytes(p.try_into().unwrap())),
-            65535
+            pixel(5, 3),
+            encoded(0x07e0, format),
+            "later body covers earlier shadow"
+        );
+        assert_eq!(
+            pixel(3, 2),
+            encoded(0x07e0, format),
+            "own body remains opaque"
+        );
+        assert_eq!(pixel(1, 5), [255; 4], "left tactical clip");
+        assert_eq!(pixel(6, 6), [255; 4], "bottom tactical clip");
+        assert!(
+            pixel(2, 5)[1] < 200 && pixel(2, 5)[1] > 100,
+            "one alpha shadow visibly darkens"
+        );
+        assert!(
+            pixel(4, 5)[1] < pixel(2, 5)[1],
+            "overlapping read-only shadows compound in order"
+        );
+        if !masked {
+            assert_eq!(
+                pixel(3, 3),
+                encoded(0x07e0, format),
+                "unmasked aircraft shadow cannot darken its later body"
+            );
+        }
+    }
+    for p in output[1].as_chunks::<4>().0 {
+        assert_eq!(
+            crate::render::native_z::stored_z(f32::from_le_bytes(*p)),
+            initial_z
         );
     }
 }
@@ -356,12 +355,10 @@ fn tree_transactions_preserve_tmp_shp_voxel_overlap_and_coalesced_order() {
     let units = UnitAtlas::from_test_pages(vec![crate::render::unit_atlas::UnitAtlasPage {
         texture: batch.create_unit_atlas_texture_on_device(&gpu.device, &gpu.queue, 1, 1, &[33]),
     }]);
-    let palette = crate::assets::pal_file::Palette {
-        colors: [crate::assets::pal_file::Color::rgb(0, 252, 0); 256],
-    };
+    let palette = crate::assets::pal_file::Palette::from_rgb(|_| [0, 252, 0]);
     let ramps = crate::rules::house_colors::HouseColorRamps::from_schemes(&[]);
-    let palettes = PaletteSet::new_on_device(&gpu.device, &gpu.queue, &palette, &ramps, &[]);
-    let white = rgba([248, 252, 248]);
+    let palettes =
+        PaletteSet::new_on_device(&gpu.device, &gpu.queue, &palette, &palette, &ramps, &[]);
     let ztex = gpu.device.create_texture_with_data(
         &gpu.queue,
         &wgpu::TextureDescriptor {
@@ -378,7 +375,15 @@ fn tree_transactions_preserve_tmp_shp_voxel_overlap_and_coalesced_order() {
         &[0],
     );
     let zview = ztex.create_view(&Default::default());
-    let tmp_group = batch.create_zdepth_bind_group_on_device(&gpu.device, &white.view, &zview);
+    // Tile pages are encoded, like the production tile atlas's.
+    let tile_page = batch.create_encoded_texture_on_device(
+        &gpu.device,
+        &gpu.queue,
+        &[248, 252, 248, 255],
+        1,
+        1,
+    );
+    let tmp_group = batch.create_zdepth_bind_group_on_device(&gpu.device, &tile_page.view, &zview);
     let tmp = sprite([0.0, 4.0], [96.0, 1.0], 4.0); // actual TMP Z32768
     let tmp_buffer = gpu
         .device
@@ -389,19 +394,19 @@ fn tree_transactions_preserve_tmp_shp_voxel_overlap_and_coalesced_order() {
         });
     let steps = [
         (
-            ObjectTexture::TerrainStatic(TerrainPiece::Body),
+            ObjectTexture::TerrainShp(TerrainPiece::Body),
             RenderZPolicy::ReadWrite,
             32767,
         ),
         (ObjectTexture::ShpPage(0), RenderZPolicy::ReadOnly, 32766),
         (
-            ObjectTexture::TerrainStatic(TerrainPiece::Shadow),
+            ObjectTexture::TerrainShp(TerrainPiece::Shadow),
             RenderZPolicy::ReadWrite,
             32766,
         ),
         (ObjectTexture::ShpPage(1), RenderZPolicy::ReadWrite, 32765),
         (
-            ObjectTexture::TerrainStatic(TerrainPiece::Shadow),
+            ObjectTexture::TerrainShp(TerrainPiece::Shadow),
             RenderZPolicy::ReadWrite,
             32765,
         ), // equality rejects
@@ -411,17 +416,17 @@ fn tree_transactions_preserve_tmp_shp_voxel_overlap_and_coalesced_order() {
             32764,
         ),
         (
-            ObjectTexture::TerrainStatic(TerrainPiece::Shadow),
+            ObjectTexture::TerrainShp(TerrainPiece::Shadow),
             RenderZPolicy::ReadWrite,
             32764,
         ),
         (
-            ObjectTexture::TerrainStatic(TerrainPiece::Shadow),
+            ObjectTexture::TerrainShp(TerrainPiece::Shadow),
             RenderZPolicy::ReadWrite,
             -1,
         ),
         (
-            ObjectTexture::TerrainStatic(TerrainPiece::Shadow),
+            ObjectTexture::TerrainShp(TerrainPiece::Shadow),
             RenderZPolicy::ReadWrite,
             -1,
         ),
@@ -440,10 +445,9 @@ fn tree_transactions_preserve_tmp_shp_voxel_overlap_and_coalesced_order() {
         (0x01e0, 65535),
         (0x00e0, 65535),
     ];
-    let cache = VxlSlopeTransitionCache::default();
     let mut pool = InstanceBufferPool::new();
     for count in 1..=steps.len() {
-        let entries = steps[..count]
+        let entries: Vec<_> = steps[..count]
             .iter()
             .enumerate()
             .flat_map(|(i, &(target, render_z, z))| {
@@ -451,7 +455,7 @@ fn tree_transactions_preserve_tmp_shp_voxel_overlap_and_coalesced_order() {
                     // Three disjoint tile lanes exercise real multi-member waves.
                     // Every ordinary run still separates the next native event.
                     let id = i * 3 + lane;
-                    PlannedObjectInstance::object(
+                    OwnedPlannedObject::object(
                         ObjectDraw {
                             id: id as u64,
                             layer: TacticalLayer(2),
@@ -496,6 +500,7 @@ fn tree_transactions_preserve_tmp_shp_voxel_overlap_and_coalesced_order() {
         // Clip both edges; every restarted normal pass must restore this clip.
         let stats = draw_native_object_pass(
             &mut encoder,
+            crate::app::render::merge_passes::ObjectDrawPhase::Display,
             &cv,
             &dv,
             &mut terrain,
@@ -506,20 +511,21 @@ fn tree_transactions_preserve_tmp_shp_voxel_overlap_and_coalesced_order() {
             Some(&overlay),
             Some(&units),
             None,
-            &cache,
             Some(&shp),
             Some(&palettes),
             batch.default_zshape_bind_group(),
+            None,
+            None,
         );
         let tree_steps = steps[..count]
             .iter()
-            .filter(|step| matches!(step.0, ObjectTexture::TerrainStatic(_)))
+            .filter(|step| matches!(step.0, ObjectTexture::TerrainShp(_)))
             .count();
         assert_eq!(stats.pieces, tree_steps * 3);
-        assert_eq!(
-            stats.waves, tree_steps,
-            "each native step has three disjoint members, with ordinary fences and overlapping later steps"
-        );
+        // Each native step has three disjoint members; overlapping later
+        // steps join an earlier in-order interval unless an ordinary draw
+        // fences them.
+        assert!(stats.waves <= tree_steps, "{stats:?}");
         let reads = [
             gpu.read(&mut encoder, &color),
             gpu.read(&mut encoder, &depth),
@@ -555,8 +561,8 @@ fn tree_transactions_preserve_tmp_shp_voxel_overlap_and_coalesced_order() {
 }
 
 #[test]
-#[ignore = "requires GPU; actual20k ordinary UnitAtlas range remains outside Ground/Air destination planner"]
-fn destination_batching_layer_fences_do_not_plan_ordinary_unit_instances() {
+#[ignore = "requires GPU; 20k offscreen ordinary UnitAtlas draws between two disjoint Ground/Air destination edits"]
+fn offscreen_ordinary_units_neither_fence_nor_split_destination_edits() {
     let gpu = Gpu::new();
     let size = [96, 8];
     let format = wgpu::TextureFormat::Bgra8UnormSrgb;
@@ -589,23 +595,21 @@ fn destination_batching_layer_fences_do_not_plan_ordinary_unit_instances() {
     let units = UnitAtlas::from_test_pages(vec![crate::render::unit_atlas::UnitAtlasPage {
         texture: batch.create_unit_atlas_texture_on_device(&gpu.device, &gpu.queue, 1, 1, &[0]),
     }]);
-    let palette = crate::assets::pal_file::Palette {
-        colors: [crate::assets::pal_file::Color::rgb(0, 252, 0); 256],
-    };
+    let palette = crate::assets::pal_file::Palette::from_rgb(|_| [0, 252, 0]);
     let ramps = crate::rules::house_colors::HouseColorRamps::from_schemes(&[]);
-    let palettes = PaletteSet::new_on_device(&gpu.device, &gpu.queue, &palette, &ramps, &[]);
-    let cache = VxlSlopeTransitionCache::default();
+    let palettes =
+        PaletteSet::new_on_device(&gpu.device, &gpu.queue, &palette, &palette, &ramps, &[]);
     let mut pool = InstanceBufferPool::new();
     for (layer_index, read_only) in [(2usize, false), (3usize, true)] {
         let destination = |piece| {
             if read_only {
-                ObjectTexture::ProjectileShp(0, piece)
+                ObjectTexture::SpriteAtlasEdit(0, piece)
             } else {
-                ObjectTexture::TerrainStatic(piece)
+                ObjectTexture::TerrainShp(piece)
             }
         };
         for ordinary_count in [1usize, 20_000] {
-            let entries = (0..ordinary_count + 2)
+            let entries: Vec<_> = (0..ordinary_count + 2)
                 .map(|i| {
                     let (target, instance) = if i == 0 {
                         (
@@ -620,12 +624,15 @@ fn destination_batching_layer_fences_do_not_plan_ordinary_unit_instances() {
                     } else {
                         // Real UnitAtlas draw range, deliberately outside this tiny
                         // attachment. This is a planner-work/fence gate, not20k FPS.
-                        (
-                            ObjectTexture::UnitAtlasPage(0),
-                            sprite([200., 200.], [1., 1.], 0.),
-                        )
+                        let mut instance = sprite([200., 200.], [1., 1.], 0.);
+                        // Native-paletted opaque bodies exercise signed-range
+                        // admission while preserving the ordinary safe batch.
+                        instance.palette_light = crate::render::palette_light::PaletteLight::new(
+                            [1000; 3], 53, 1000, true,
+                        );
+                        (ObjectTexture::UnitAtlasPage(0), instance)
                     };
-                    PlannedObjectInstance::object(
+                    OwnedPlannedObject::object(
                         ObjectDraw {
                             id: i as u64,
                             layer: TacticalLayer(layer_index as u8),
@@ -644,7 +651,7 @@ fn destination_batching_layer_fences_do_not_plan_ordinary_unit_instances() {
                     )
                 })
                 .collect();
-            let layers = lower_object_instances(entries);
+            let layers = lower_object_instances(entries.into());
             let layer = &layers[layer_index];
             assert_eq!(layer.runs.len(), 3);
             assert_eq!(layer.runs[1].count, ordinary_count as u32);
@@ -662,6 +669,7 @@ fn destination_batching_layer_fences_do_not_plan_ordinary_unit_instances() {
                 let start = std::time::Instant::now();
                 let stats = draw_native_object_pass(
                     &mut encoder,
+                    crate::app::render::merge_passes::ObjectDrawPhase::Display,
                     &cv,
                     &dv,
                     &mut terrain,
@@ -672,10 +680,11 @@ fn destination_batching_layer_fences_do_not_plan_ordinary_unit_instances() {
                     Some(&overlay),
                     Some(&units),
                     None,
-                    &cache,
                     Some(&shp),
                     Some(&palettes),
                     batch.default_zshape_bind_group(),
+                    None,
+                    None,
                 );
                 let encode_us = start.elapsed().as_secs_f64() * 1e6;
                 if sample > 0 {
@@ -685,8 +694,12 @@ fn destination_batching_layer_fences_do_not_plan_ordinary_unit_instances() {
                     stats,
                     crate::render::terrain_draw::TerrainBatchStats {
                         pieces: 2,
-                        waves: 2,
-                        passes: if read_only { 8 } else { 4 },
+                        waves: 1,
+                        passes: match (read_only, crate::render::gpu::webgl_fallback(&gpu.device)) {
+                            (false, _) => 2,
+                            (true, false) => 3,
+                            (true, true) => 4,
+                        },
                         tile_dependencies: if read_only { 0 } else { 2 }
                     }
                 );
@@ -716,7 +729,7 @@ fn destination_batching_layer_fences_do_not_plan_ordinary_unit_instances() {
                 }
             }
             eprintln!(
-                "Layer{layer_index} planner gate: {ordinary_count} offscreen UnitAtlas instances in one run, 2 destination pieces, 2 destination transactions (Ground4passes/2tiledeps, Air8passes/0tiledeps); three warmed encoding samples_us={samples:?} (excludes lowering/upload/submit/wait; not FPS evidence)"
+                "Layer{layer_index} planner gate: {ordinary_count} offscreen UnitAtlas instances in one run, 2 disjoint destination pieces in one transaction (Ground 2 passes/2 tile deps, Air 4 passes/0); three warmed encoding samples_us={samples:?} (excludes lowering/upload/submit/wait; not FPS evidence)"
             );
         }
     }

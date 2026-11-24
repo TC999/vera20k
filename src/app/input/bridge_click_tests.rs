@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::app::input::commands::roundtrip_ordinary_local_move;
+use crate::app::input::commands::roundtrip_ordinary_local_megamission;
 use crate::app::match_runtime::sim_tick::{screen_point_to_world_with_camera, world_point_to_cell};
 use crate::map::terrain::TacticalBridgeCell;
 use crate::sim::command::{Command, CommandEnvelope};
@@ -19,13 +19,20 @@ fn click_cell(
     camera: (f32, f32),
     zoom: f32,
     heights: &BTreeMap<(u16, u16), u8>,
-    bridges: &dyn crate::map::terrain::TacticalBridgeLookup,
+    bridges: &BTreeMap<(u16, u16), TacticalBridgeCell>,
 ) -> (u16, u16) {
     // Only the test's forward view transform is local. Its inverse and the
     // world -> cell resolution are the same owners used by tactical orders.
     let screen = ((point.0 - camera.0) * zoom, (point.1 - camera.1) * zoom);
     let world = screen_point_to_world_with_camera(screen, camera, zoom);
-    world_point_to_cell(world.0, world.1, heights, Some(bridges))
+    world_point_to_cell(
+        world.0,
+        world.1,
+        Some(&crate::map::terrain::TacticalCellFixture {
+            levels: heights,
+            bridges: Some(bridges),
+        }),
+    )
 }
 
 fn ordinary_move(
@@ -36,18 +43,17 @@ fn ordinary_move(
 ) -> CommandEnvelope {
     let issued = CommandEnvelope::new(
         owner,
-        sim.session.tick,
+        sim.session().tick(),
         Command::Move {
             entity_id,
             target_rx: goal.0,
             target_ry: goal.1,
-            queue: false,
         },
     );
     // The active ordinary-click path calls this in context_order::finish_order.
     // It encodes and decodes the native MegaMission record (4C6860), rather than
     // allowing a test-only semantic command to bypass destination serialization.
-    let decoded = roundtrip_ordinary_local_move(sim, issued.clone())
+    let decoded = roundtrip_ordinary_local_megamission(sim, issued.clone())
         .expect("ordinary Move must survive its native record codec");
     assert_eq!(decoded, issued, "the codec must preserve the clicked cell");
     decoded
@@ -74,21 +80,20 @@ fn camera_transform_retains_fractional_negative_world_pixels() {
 
 fn commandable_movers() -> (Simulation, crate::sim::intern::InternedId, [u64; 2]) {
     use crate::map::entities::EntityCategory;
-    use crate::sim::components::Health;
+    use crate::sim::combat::Health;
     use crate::sim::game_entity::GameEntity;
     use crate::sim::house_state::HouseState;
 
     let mut sim = Simulation::new();
-    let owner = sim.interner.intern("Americans");
-    sim.houses
-        .insert(owner, HouseState::new(owner, 0, None, false, 0, 10));
-    sim.session.house_order = vec![owner];
-    sim.session.tick = 123;
+    let owner = sim.intern("Americans");
+    sim.houses_mut_for_test()
+        .register(HouseState::new(owner, 0, None, false, 0, 10));
+    sim.session_mut_for_test().set_tick_for_test(123);
     for (id, type_name, category) in [
         (42, "MTNK", EntityCategory::Unit),
         (43, "E1", EntityCategory::Infantry),
     ] {
-        let type_ref = sim.interner.intern(type_name);
+        let type_ref = sim.intern(type_name);
         let mut entity = GameEntity::new_at_frame_zero_for_test(
             id,
             60,
@@ -96,15 +101,15 @@ fn commandable_movers() -> (Simulation, crate::sim::intern::InternedId, [u64; 2]
             0,
             0,
             owner,
-            Health { current: 100 },
+            Health::new(100),
             type_ref,
             category,
             0,
             5,
             false,
         );
-        entity.lifecycle.in_limbo = false;
-        sim.entities_mut().insert(entity);
+        entity.lifecycle.set_in_limbo_for_test(false);
+        sim.entities_mut_for_test().insert(entity);
     }
     (sim, owner, [42, 43])
 }
@@ -116,8 +121,8 @@ fn commandable_movers() -> (Simulation, crate::sim::intern::InternedId, [u64; 2]
 /// same containing world pixel and carry the native cell through ordinary Move.
 #[test]
 fn native_bridge_destinations_survive_camera_zoom_and_ordinary_move_records() {
-    let fixtures: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tools/bridge_click_oracle/vectors.json"
+    let fixtures: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/bridge_click_oracle/vectors.json",
     ))
     .expect("native bridge inverse fixture JSON");
     let (mut sim, owner, movers) = commandable_movers();
@@ -198,7 +203,7 @@ fn native_bridge_destinations_survive_camera_zoom_and_ordinary_move_records() {
                     for mover in movers {
                         let command = ordinary_move(&sim, owner, mover, goal);
                         sim.queue_command(command.clone());
-                        assert_eq!(sim.take_due_commands(), vec![command]);
+                        assert_eq!(sim.take_frame_commands_for_test(), vec![command]);
                     }
                 }
             }
@@ -243,15 +248,21 @@ fn spawn_retail_mover(
         simulation: sim,
         resources,
     } = &mut scenario.runtime;
-    let owner = sim.interner.intern("Americans");
-    sim.houses.entry(owner).or_insert_with(|| {
-        crate::sim::house_state::HouseState::new(owner, 0, None, true, 10_000, 10)
-    });
-    for house in sim.houses.values_mut() {
-        house.multiplay_passive = true;
-    }
-    if !sim.session.house_order.contains(&owner) {
-        sim.session.house_order.push(owner);
+    let owner = sim.intern("Americans");
+    let house = sim
+        .houses_mut_for_test()
+        .get_or_register_for_test(owner, || {
+            crate::sim::house_state::HouseState::new(owner, 0, None, true, 10_000, 10)
+        });
+    // This is an authored local input fixture. A headless retail scenario
+    // does not bind its Americans house to the local player; supply the
+    // controller prior read by House50B6F0/50B730 before spawning the mover.
+    house.set_is_human_for_test(true);
+    house.set_player_control_for_test(true);
+    sim.session_mut_for_test()
+        .set_current_house_for_test(Some(owner));
+    for house in sim.houses_mut_for_test().values_mut() {
+        house.set_multiplay_passive_for_test(true);
     }
     let entity = sim
         .spawn_object(
@@ -275,21 +286,14 @@ fn follow_clicked_goal(
     expected: (u16, u16),
     expected_on_bridge: bool,
 ) {
-    let bridges = crate::app::match_runtime::sim_tick::tactical_bridge_cells(scenario.sim())
+    let bridges = crate::app::match_runtime::sim_tick::tactical_cells(scenario.sim())
         .expect("retail terrain");
     // Noninteger camera coordinates and zoom exercise the production adapter.
-    let goal = click_cell(
-        point,
-        (-100.25, 1800.5),
-        1.25,
-        &scenario
-            .sim()
-            .resolved_terrain
-            .as_ref()
-            .unwrap()
-            .build_height_map(),
-        bridges,
-    );
+    let camera = (-100.25, 1800.5);
+    let zoom = 1.25;
+    let screen = ((point.0 - camera.0) * zoom, (point.1 - camera.1) * zoom);
+    let world = screen_point_to_world_with_camera(screen, camera, zoom);
+    let goal = world_point_to_cell(world.0, world.1, Some(bridges));
     assert_eq!(goal, expected, "retail click {point:?}");
     let facts = scenario
         .sim()
@@ -305,7 +309,7 @@ fn follow_clicked_goal(
         owner,
         entity_id,
         goal,
-        true,
+        false,
     )
     .expect("retail ordinary Cell input must admit the bridge destination");
     assert_eq!(
@@ -327,6 +331,7 @@ fn follow_clicked_goal(
                 &due,
                 crate::headless_scenario::SIM_TICK_MS,
                 crate::sim::world::TickLane::Ordinary,
+                &mut crate::sim::world::FrameEffects::default(),
             )
             .expect("fixture frame must complete");
         assert!(output.tick.frame_committed, "the retail frame must commit");
@@ -338,28 +343,39 @@ fn follow_clicked_goal(
         if frame == 0 {
             assert!(output.tick.executed_commands > 0);
             assert!(
-                entity.movement_target.is_some(),
-                "clicked goal {goal:?} must become a movement target after command admission"
+                crate::sim::movement::motion_query::is_moving(&entity) == Some(true),
+                "clicked goal {goal:?} must set the mover moving after command admission"
             );
             assert_eq!(
-                entity
-                    .movement_target
-                    .as_ref()
-                    .and_then(|target| target.final_goal),
+                entity.locomotor.as_ref().and_then(|locomotor| {
+                    // Walk and Drive own their installed destination.
+                    locomotor.walk_destination_cell().or_else(|| {
+                        locomotor
+                            .track_destination(
+                                crate::sim::movement::track_process::TrackFamily::Drive,
+                            )
+                            .map(|destination| {
+                                ((destination.x / 256) as u16, (destination.y / 256) as u16)
+                            })
+                    })
+                }),
                 Some(goal),
                 "each chained retail command must install its exact destination"
             );
             assert_eq!(
-                entity.navigation.nav_com,
+                entity.navigation.nav_com(),
                 Some(crate::sim::components::NavTargetRef::cell(goal.0, goal.1)),
                 "each chained retail command must also publish its exact NavCom"
             );
         }
-        if (entity.position.rx, entity.position.ry) == goal && entity.movement_target.is_none() {
+        if (entity.position.rx(), entity.position.ry()) == goal
+            && crate::sim::movement::motion_query::is_moving(&entity) != Some(true)
+        {
             // Body Cell entry can precede paid-head retirement by several
             // frames. Check the state used by the next actual Move order.
             assert_eq!(
-                entity.on_bridge, expected_on_bridge,
+                entity.on_bridge(),
+                expected_on_bridge,
                 "clicked goal {goal:?} must select the intended movement plane"
             );
             assert_eq!(
@@ -373,7 +389,7 @@ fn follow_clicked_goal(
             println!(
                 "retail click {point:?} -> {goal:?}: arrived after {} frames, on_bridge={}",
                 frame + 1,
-                entity.on_bridge
+                entity.on_bridge()
             );
             arrived = true;
             break;
@@ -429,14 +445,54 @@ fn advance_input_fixture(sim: &mut Simulation, rules: &crate::rules::ruleset::Ru
     );
 }
 
+/// Original initialized GI Shift0x10 A→B executes Foot4DE1D0 and creates
+/// ordinary Event111/Move2 twice, then51AA40(Cell,1) replaces A with B without
+/// NavQueue or RNG writes (walk_first_path GI `shift_A_B` history). This
+/// fixture separately checks that the app still resolves a disconnected
+/// clicked bank before encoding; its cell geometry is not the native GI map.
+#[test]
+fn shift_walk_cell_input_uses_ordinary_resolver_and_move_record() {
+    let (sim, rules, actor) = Simulation::walk_cell_input_test_scene(false);
+    let owner = sim.interner().get("Local").unwrap();
+    let clicked = (11, 5);
+    let ordinary =
+        super::commands::ordinary_cell_move_goal(&sim, &rules, owner, actor, clicked, false)
+            .unwrap();
+    let modifier = super::context_order::resolve_order_modifiers(false, true, false);
+    let shifted = super::commands::ordinary_cell_move_goal(
+        &sim,
+        &rules,
+        owner,
+        actor,
+        clicked,
+        modifier == super::context_order::OrderModifier::Shift,
+    )
+    .unwrap();
+    assert_eq!(shifted, ordinary);
+    assert_ne!(shifted, clicked, "the resolver must choose the near bank");
+    let issued = CommandEnvelope::new(
+        owner,
+        sim.session().tick(),
+        Command::Move {
+            entity_id: actor,
+            target_rx: shifted.0,
+            target_ry: shifted.1,
+        },
+    );
+    assert_eq!(
+        roundtrip_ordinary_local_megamission(&sim, issued.clone()).unwrap(),
+        ordinary_move(&sim, owner, actor, ordinary)
+    );
+}
+
 #[test]
 fn ordinary_walk_cell_input_reaches_near_bank_and_valid_high_bridge() {
     for bridge in [false, true] {
         let (mut sim, rules, actor) = Simulation::walk_cell_input_test_scene(bridge);
-        let owner = sim.interner.get("Local").unwrap();
+        let owner = sim.interner().get("Local").unwrap();
         let clicked = if bridge { (9, 6) } else { (11, 5) };
         let chosen =
-            super::commands::ordinary_cell_move_goal(&sim, &rules, owner, actor, clicked, true)
+            super::commands::ordinary_cell_move_goal(&sim, &rules, owner, actor, clicked, false)
                 .unwrap();
         if bridge {
             assert_eq!(chosen, clicked);
@@ -452,28 +508,32 @@ fn ordinary_walk_cell_input_reaches_near_bank_and_valid_high_bridge() {
         advance_input_fixture(&mut sim, &rules);
         let e = sim.entities().get(actor).unwrap();
         assert_eq!(
-            e.navigation.nav_com,
+            e.navigation.nav_com(),
             Some(crate::sim::components::NavTargetRef::Cell {
                 rx: chosen.0,
                 ry: chosen.1
             })
         );
         assert!(
-            e.movement_target.as_ref().unwrap().path.is_empty(),
+            e.navigation.path_replay().remaining_directions().is_empty(),
             "command accepts before Process search"
         );
         for _ in 0..250 {
             advance_input_fixture(&mut sim, &rules);
             let e = sim.entities().get(actor).unwrap();
-            if (e.position.rx, e.position.ry) == chosen
+            if (e.position.rx(), e.position.ry()) == chosen
                 && e.locomotor.as_ref().unwrap().step_head().is_none()
             {
                 break;
             }
         }
         let e = sim.entities().get(actor).unwrap();
-        assert_eq!((e.position.rx, e.position.ry), chosen, "bridge={bridge}");
-        assert_eq!(e.on_bridge, bridge);
+        assert_eq!(
+            (e.position.rx(), e.position.ry()),
+            chosen,
+            "bridge={bridge}"
+        );
+        assert_eq!(e.on_bridge(), bridge);
         assert!(
             e.locomotor.as_ref().unwrap().step_head().is_none(),
             "arrival must retire its paid head"
@@ -484,20 +544,20 @@ fn ordinary_walk_cell_input_reaches_near_bank_and_valid_high_bridge() {
 #[test]
 fn encoded_walk_destination_survives_topology_change_before_due_frame() {
     let (mut sim, rules, actor) = Simulation::walk_cell_input_test_scene(true);
-    let owner = sim.interner.get("Local").unwrap();
+    let owner = sim.interner().get("Local").unwrap();
     let clicked = (9, 6);
     let chosen =
-        super::commands::ordinary_cell_move_goal(&sim, &rules, owner, actor, clicked, true)
+        super::commands::ordinary_cell_move_goal(&sim, &rules, owner, actor, clicked, false)
             .unwrap();
     assert_eq!(chosen, clicked);
     let mut order = ordinary_move(&sim, owner, actor, chosen);
     // The scheduler drains commands for the NEXT frame. Leave one full
     // object turn before this already-encoded destination becomes due.
-    order.execute_tick = sim.session.tick + 2;
+    order.execute_tick = sim.session().tick() + 2;
     sim.queue_command(order.clone());
     sim.close_walk_input_test_bridge(&rules);
     assert_ne!(
-        super::commands::ordinary_cell_move_goal(&sim, &rules, owner, actor, clicked, true),
+        super::commands::ordinary_cell_move_goal(&sim, &rules, owner, actor, clicked, false),
         Some(clicked),
         "the later input query must discriminate the changed topology"
     );
@@ -506,14 +566,14 @@ fn encoded_walk_destination_survives_topology_change_before_due_frame() {
     advance_input_fixture(&mut sim, &rules);
     let e = sim.entities().get(actor).unwrap();
     assert_eq!(
-        e.navigation.nav_com,
+        e.navigation.nav_com(),
         Some(crate::sim::components::NavTargetRef::Cell { rx: 9, ry: 6 })
     );
     assert_eq!(
-        e.movement_target.as_ref().unwrap().final_goal,
+        e.locomotor.as_ref().unwrap().walk_destination_cell(),
         Some(clicked)
     );
-    assert!(e.movement_target.as_ref().unwrap().path.is_empty());
+    assert!(e.navigation.path_replay().remaining_directions().is_empty());
     // This proves exact event installation. The following failed-Process and
     // same-slot Move restart remain the separately documented open increment.
 }
@@ -521,26 +581,28 @@ fn encoded_walk_destination_survives_topology_change_before_due_frame() {
 #[test]
 fn direct_simulation_walk_move_is_an_already_resolved_destination() {
     let (mut sim, rules, actor) = Simulation::walk_cell_input_test_scene(false);
-    let owner = sim.interner.get("Local").unwrap();
+    let owner = sim.interner().get("Local").unwrap();
     assert_ne!(
-        super::commands::ordinary_cell_move_goal(&sim, &rules, owner, actor, (9, 5), true),
+        super::commands::ordinary_cell_move_goal(&sim, &rules, owner, actor, (9, 5), false),
         Some((9, 5))
     );
     sim.queue_command(CommandEnvelope::new(
         owner,
-        sim.session.tick,
+        sim.session().tick(),
         Command::Move {
             entity_id: actor,
             target_rx: 9,
             target_ry: 5,
-            queue: false,
         },
     ));
     advance_input_fixture(&mut sim, &rules);
     let e = sim.entities().get(actor).unwrap();
     assert_eq!(
-        e.navigation.nav_com,
+        e.navigation.nav_com(),
         Some(crate::sim::components::NavTargetRef::Cell { rx: 9, ry: 5 })
     );
-    assert_eq!(e.movement_target.as_ref().unwrap().final_goal, Some((9, 5)));
+    assert_eq!(
+        e.locomotor.as_ref().unwrap().walk_destination_cell(),
+        Some((9, 5))
+    );
 }

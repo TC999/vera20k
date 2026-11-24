@@ -5,9 +5,7 @@
 
 use crate::map::entities::EntityCategory;
 use crate::rules::{ini_parser::IniFile, ruleset::RuleSet};
-use crate::sim::combat::{
-    AttackTarget, EntityDamageEvent, RAD_NO_ATTACKER, ReceiverCallFlags, TargetKind,
-};
+use crate::sim::combat::{EntityDamageEvent, RAD_NO_ATTACKER, ReceiverCallFlags, TargetKind};
 use crate::sim::command::{Command, CommandEnvelope};
 use crate::sim::pathfinding::PathGrid;
 use crate::sim::world::Simulation;
@@ -16,7 +14,9 @@ const RULES: &str = "\
 [General]\nRepairPercent=15%\nRepairStep=8\n\
 [Clear]\nFoot=100%\nTrack=100%\nWheel=100%\nFloat=0%\nHover=50%\nAmphibious=80%\nFloatBeach=0%\n\
 Buildable=yes\n\
-[CombatDamage]\nC4Warhead=Super\n\
+[Tiberium]\nFoot=90%\nTrack=70%\nWheel=50%\nFloat=0%\nFloatBeach=0%\nHover=50%\nAmphibious=50%\n\
+Buildable=no\n\
+[CombatDamage]\nC4Warhead=Super\nIronCurtainDuration=750\n\
 [InfantryTypes]\n0=DOG\n1=E1\n\
 [VehicleTypes]\n0=DRON\n1=MTNK\n2=DLPH\n3=MCV\n4=TRAN\n\
 [AircraftTypes]\n[BuildingTypes]\n0=YARD\n\
@@ -58,9 +58,17 @@ Locomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n\
 Locomotor={4A582741-9839-11d1-B709-00A024DDAFD1}\n";
 
 fn rules() -> RuleSet {
+    rules_with_ini(&IniFile::from_str(RULES))
+}
+
+fn rules_with_ini(ini: &IniFile) -> RuleSet {
     // Retail `[DRON] PrimaryFireFLH=`: a jump from ground height would
     // detonate on its first AI (`0x00466DB1`, old height <= 0).
-    let mut rules = RuleSet::from_ini(&IniFile::from_str(RULES)).expect("parasite fixture rules");
+    let mut rules = RuleSet::from_ini_with_fixed_art_for_test(
+        ini,
+        &IniFile::from_str("[DRON]\nPrimaryFireFLH=0,0,30\n"),
+    )
+    .expect("parasite fixture rules");
     rules.replace_art_registry_for_test(crate::rules::art_data::ArtRegistry::from_ini(
         &IniFile::from_str("[DRON]\nPrimaryFireFLH=0,0,30\n"),
     ));
@@ -77,18 +85,21 @@ impl Arena {
     fn new(rules: &RuleSet) -> Self {
         const SIZE: u16 = 32;
         let mut sim = Simulation::with_seed(7);
-        sim.input_delay_ticks = 0;
-        sim.session.map_width = SIZE;
-        sim.session.map_height = SIZE;
+        sim.set_input_delay_ticks(0);
+        sim.session.set_map_width_for_test(SIZE);
+        sim.session.set_map_height_for_test(SIZE);
         // Retail [Clear]: Foot/Track/Wheel 100%, Hover 50%, Amphibious 80%.
         let clear = crate::rules::terrain_rules::SpeedCostProfile {
-            foot: Some(100),
-            track: Some(100),
-            wheel: Some(100),
+            foot: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            track: Some(crate::util::native_x87::NativeF32Bits::ONE),
+            wheel: Some(crate::util::native_x87::NativeF32Bits::ONE),
             float: None,
-            amphibious: Some(80),
+            amphibious: Some(crate::rules::terrain_rules::test_speed_percent(80)),
             float_beach: None,
-            hover: Some(50),
+            hover: Some(crate::util::native_x87::NativeF32Bits::from_bits(
+                0x3f00_0000,
+            )),
+            winged: Some(crate::util::native_x87::NativeF32Bits::ONE),
         };
         let cell = |x, y| {
             let mut cell = crate::map::resolved_terrain::test_flat_cell(x, y);
@@ -105,14 +116,14 @@ impl Arena {
                     .collect(),
             ),
         );
-        sim.playfield_bounds = Some(crate::sim::cell_rect::PlayfieldBounds {
+        sim.set_playfield_bounds_for_test(Some(crate::sim::cell_rect::PlayfieldBounds {
             base: 20,
             off_fc: -128,
             off_100: -128,
             off_104: 256,
             off_108: 256,
-        });
-        sim.playfield_size_height = Some(20);
+        }));
+        sim.set_playfield_size_height_for_test(Some(20));
         assert!(sim.rebuild_dynamic_navigation(rules));
         let grid = sim
             .path_grid_snapshot()
@@ -129,7 +140,7 @@ impl Arena {
 
     fn attack(&mut self, attacker: u64, target: u64) {
         let owner = self.sim.substrate.entities.get(attacker).unwrap().owner();
-        let tick = self.sim.session.tick + 1;
+        let tick = self.sim.session.tick() + 1;
         self.sim.queue_command(CommandEnvelope::new(
             owner,
             tick,
@@ -148,7 +159,7 @@ impl Arena {
     }
 
     fn frame(&self) -> u32 {
-        self.sim.session.binary_frame
+        self.sim.session.binary_frame()
     }
 
     /// Step until `done` holds; panics after `limit` frames.
@@ -167,7 +178,7 @@ impl Arena {
             .substrate
             .entities
             .get(victim)
-            .and_then(|v| v.parasite_eating_me)
+            .and_then(|v| v.parasite.eater)
     }
 
     fn in_limbo(&self, id: u64) -> bool {
@@ -175,7 +186,7 @@ impl Arena {
             .substrate
             .entities
             .get(id)
-            .is_some_and(|e| e.lifecycle.in_limbo)
+            .is_some_and(|e| e.lifecycle.in_limbo())
     }
 
     fn health(&self, id: u64) -> Option<i32> {
@@ -183,7 +194,7 @@ impl Arena {
             .substrate
             .entities
             .get(id)
-            .map(|e| e.health.current)
+            .map(|e| e.health.current())
     }
 
     /// Retired by UnInit: pending delete, or already drained.
@@ -192,7 +203,7 @@ impl Arena {
             .substrate
             .entities
             .get(id)
-            .is_none_or(|e| !e.lifecycle.object_alive)
+            .is_none_or(|e| !e.lifecycle.object_alive())
     }
 
     /// One direct ReceiveDamage call at distance zero.
@@ -220,12 +231,17 @@ impl Arena {
                 arg6: false,
             },
         );
-        self.sim.commit_direct_damage_receiver(rules, None, event);
+        self.sim.commit_direct_damage_receiver(
+            rules,
+            None,
+            event,
+            &mut crate::sim::world::FrameEffects::default(),
+        );
     }
 
     fn cell(&self, id: u64) -> (u16, u16) {
         let e = self.sim.substrate.entities.get(id).unwrap();
-        (e.position.rx, e.position.ry)
+        (e.position.rx(), e.position.ry())
     }
 
     /// Infect `victim` through a real launch and detonation.
@@ -235,22 +251,9 @@ impl Arena {
             sim.substrate
                 .entities
                 .get(victim)
-                .is_some_and(|v| v.parasite_eating_me == Some(owner))
+                .is_some_and(|v| v.parasite.eater == Some(owner))
         });
     }
-}
-
-#[test]
-fn constructor_allocates_a_parasite_only_for_weapon_zero_parasite_types() {
-    let rules = rules();
-    let mut arena = Arena::new(&rules);
-    let dog = arena.spawn(&rules, "DOG", "Russians", (5, 5));
-    let drone = arena.spawn(&rules, "DRON", "Russians", (6, 5));
-    let tank = arena.spawn(&rules, "MTNK", "Americans", (7, 5));
-    let entities = &arena.sim.substrate.entities;
-    assert!(entities.get(dog).unwrap().parasite.is_some());
-    assert!(entities.get(drone).unwrap().parasite.is_some());
-    assert!(entities.get(tank).unwrap().parasite.is_none());
 }
 
 #[test]
@@ -265,7 +268,7 @@ fn dog_bite_kills_the_infantry_and_releases_the_dog_where_it_stood() {
         sim.substrate
             .entities
             .get(dog)
-            .is_some_and(|d| d.lifecycle.in_limbo)
+            .is_some_and(|d| d.lifecycle.in_limbo())
     });
     // TechnoClass::Fire LimboLaunch: the dog rides its bullet.
     assert!(arena.in_limbo(dog));
@@ -274,7 +277,7 @@ fn dog_bite_kills_the_infantry_and_releases_the_dog_where_it_stood() {
         sim.substrate
             .entities
             .get(gi)
-            .is_none_or(|v| v.health.current == 0)
+            .is_none_or(|v| v.health.current() == 0)
     });
     let death_frame = arena.frame();
 
@@ -282,21 +285,21 @@ fn dog_bite_kills_the_infantry_and_releases_the_dog_where_it_stood() {
         sim.substrate
             .entities
             .get(dog)
-            .is_some_and(|d| !d.lifecycle.in_limbo)
+            .is_some_and(|d| !d.lifecycle.in_limbo())
     });
     let dog_entity = arena.sim.substrate.entities.get(dog).unwrap();
-    assert!(dog_entity.health.current > 0, "the dog survives its kill");
+    assert!(dog_entity.health.current() > 0, "the dog survives its kill");
     assert_eq!(
-        (dog_entity.position.rx, dog_entity.position.ry),
+        (dog_entity.position.rx(), dog_entity.position.ry()),
         (11, 10),
         "PointerExpired unlimboes the dog at the victim's cell"
     );
     assert!(
-        dog_entity.parasite.as_deref().unwrap().victim().is_none(),
+        dog_entity.parasite.class().unwrap().victim.is_none(),
         "the ParasiteClass forgets its victim"
     );
     assert!(
-        !dog_entity.is_paralyzed(arena.frame()),
+        !dog_entity.parasite.is_paralyzed(arena.frame()),
         "PointerExpired release does not paralyze"
     );
     // ObjectClass::ReceiveDamage's exact-zero Destroy (0x005F57AF) runs
@@ -326,7 +329,7 @@ fn team_dog_jumps(rules: &RuleSet, arena: &mut Arena) -> (u64, u64, u64) {
         sim.substrate
             .entities
             .get(dog)
-            .is_some_and(|d| d.lifecycle.in_limbo)
+            .is_some_and(|d| d.lifecycle.in_limbo())
     });
     // TechnoClass::Fire 0x006FF7A3..0x006FF7E9 keeps the team (+0x434); the
     // jump's Limbo takes the dog off it (0x004D9744).
@@ -344,7 +347,7 @@ fn a_team_dog_rejoins_its_team_when_its_kill_releases_it() {
         sim.substrate
             .entities
             .get(dog)
-            .is_some_and(|d| !d.lifecycle.in_limbo)
+            .is_some_and(|d| !d.lifecycle.in_limbo())
     });
     // PointerExpired's release re-adds it (0x0062A3AD..0x0062A3BC).
     assert_eq!(
@@ -369,7 +372,7 @@ fn a_dog_whose_team_died_while_it_was_away_stays_teamless() {
         sim.substrate
             .entities
             .get(dog)
-            .is_some_and(|d| !d.lifecycle.in_limbo)
+            .is_some_and(|d| !d.lifecycle.in_limbo())
     });
     assert!(arena.sim.team_script_vm.team(team).is_none());
     assert_eq!(arena.sim.team_script_vm.team_to_rejoin(dog), None);
@@ -382,6 +385,18 @@ fn drone_bites_on_its_weapon_rate_until_the_host_dies_then_drops_off() {
     let mut arena = Arena::new(&rules);
     let drone = arena.spawn(&rules, "DRON", "Russians", (10, 10));
     let tank = arena.spawn(&rules, "MTNK", "Americans", (11, 10));
+    // The drone's House is unregistered, so its Guard scan, which finds the
+    // tank, runs as a human player's: the campaign scan gate needs +0x41B.
+    crate::sim::arena_fixture::discover(&mut arena.sim, tank);
+    // A player's tank: ReceiveDamage's scatter tail moves a computer's host
+    // off its cell at a bite (`0x00702C8A`).
+    let owner = arena.sim.entities().get(tank).unwrap().owner();
+    arena
+        .sim
+        .houses
+        .register(crate::sim::house_state::HouseState::new(
+            owner, 0, None, true, 0, 10,
+        ));
     arena.infect(&rules, drone, tank);
     assert!(arena.in_limbo(drone));
 
@@ -392,9 +407,9 @@ fn drone_bites_on_its_weapon_rate_until_the_host_dies_then_drops_off() {
             .substrate
             .entities
             .get(tank)
-            .map_or(0, |t| t.health.current);
+            .map_or(0, |t| t.health.current());
         if hp != last {
-            bites.push((sim.session.binary_frame, hp));
+            bites.push((sim.session.binary_frame(), hp));
             last = hp;
         }
         hp == 0
@@ -413,15 +428,15 @@ fn drone_bites_on_its_weapon_rate_until_the_host_dies_then_drops_off() {
         sim.substrate
             .entities
             .get(drone)
-            .is_some_and(|d| !d.lifecycle.in_limbo)
+            .is_some_and(|d| !d.lifecycle.in_limbo())
     });
     let drone_entity = arena.sim.substrate.entities.get(drone).unwrap();
-    assert!(drone_entity.health.current > 0);
+    assert!(drone_entity.health.current() > 0);
     assert_eq!(
-        (drone_entity.position.rx, drone_entity.position.ry),
+        (drone_entity.position.rx(), drone_entity.position.ry()),
         (11, 10)
     );
-    assert_eq!(drone_entity.category, EntityCategory::Unit);
+    assert_eq!(drone_entity.category(), EntityCategory::Unit);
 }
 
 #[test]
@@ -446,6 +461,73 @@ fn third_party_fire_above_the_threshold_makes_the_drone_die_with_its_host() {
 }
 
 #[test]
+fn a_paid_repair_radio_request_releases_the_drone_after_the_heal() {
+    // Techno radio6F4D70 arms suppression50 and calls the existing ExitUnit
+    // owner after payment and heal. A failed charge must leave it attached.
+    // This is a Rust integration check of that caller, not a native infection
+    // or depot-arrival comparison. MTNK's supplied cost0 has native floor1.
+    use crate::sim::radio::{RadioMessage, RadioPayload, RadioResponse};
+    let rules = rules();
+    let mut arena = Arena::new(&rules);
+    let drone = arena.spawn(&rules, "DRON", "Russians", (10, 10));
+    let tank = arena.spawn(&rules, "MTNK", "Americans", (11, 10));
+    // The drone's House is unregistered, so its Guard scan, which finds the
+    // tank, runs as a human player's: the campaign scan gate needs +0x41B.
+    crate::sim::arena_fixture::discover(&mut arena.sim, tank);
+    // A player's tank, before the sourceless hit: ReceiveDamage's scatter tail
+    // moves a computer's (`0x00702C8A`).
+    let owner = arena.sim.entities().get(tank).unwrap().owner();
+    arena
+        .sim
+        .houses
+        .register(crate::sim::house_state::HouseState::new(
+            owner, 0, None, true, 0, 10,
+        ));
+    arena.hit(&rules, tank, None, 10, "AP");
+    arena.infect(&rules, drone, tank);
+    let hp = arena.health(tank).unwrap();
+    assert!(hp <= 290);
+    assert_eq!(
+        crate::sim::radio::receive_radio(
+            &mut arena.sim,
+            tank,
+            None,
+            RadioMessage::RepairTick,
+            RadioPayload::default(),
+            &rules,
+            &mut crate::sim::world::FrameEffects::default(),
+        ),
+        RadioResponse::InsufficientFunds
+    );
+    assert_eq!(arena.eater_of(tank), Some(drone));
+    assert_eq!(arena.health(tank), Some(hp));
+    arena
+        .sim
+        .houses
+        .get_mut(&owner)
+        .unwrap()
+        .economy_mut()
+        .set_credits_for_test(1);
+    assert_eq!(
+        crate::sim::radio::receive_radio(
+            &mut arena.sim,
+            tank,
+            None,
+            RadioMessage::RepairTick,
+            RadioPayload::default(),
+            &rules,
+            &mut crate::sim::world::FrameEffects::default(),
+        ),
+        RadioResponse::Roger
+    );
+    assert_eq!(arena.health(tank), Some(hp + 8));
+    assert!(arena.gone(drone));
+    assert_eq!(arena.eater_of(tank), None);
+    assert_eq!(arena.sim.houses[&owner].economy().credits(), 0);
+    assert_eq!(arena.sim.houses[&owner].economy().spent_credits(), 1);
+}
+
+#[test]
 fn a_heal_forces_the_drone_off_and_its_running_suppression_kills_it() {
     // 0x004D73D4..0x004D740E: negative damage arms 50 frames of suppression and
     // calls ExitUnit, whose suppressed non-Naval arm (0x0062A89B) kills the owner.
@@ -458,6 +540,108 @@ fn a_heal_forces_the_drone_off_and_its_running_suppression_kills_it() {
     assert!(arena.gone(drone));
     assert_eq!(arena.eater_of(tank), None);
     assert!(arena.health(tank).is_some_and(|hp| hp > 0));
+}
+
+#[test]
+fn retail_drone_fire_frames_survive_launch_parasitism_and_release() {
+    let Some(ini) = crate::rules::retail_ini_fixture::retail_ini("rulesmd.ini") else {
+        return;
+    };
+    let Some(art) = crate::rules::retail_ini_fixture::retail_ini("artmd.ini") else {
+        return;
+    };
+    let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
+    // The ordered reader above retains UnitType's native frame layout. Install
+    // its immutable ART metadata too, as the normal asset binding does.
+    rules.install_art_fixture(crate::rules::art_data::ArtRegistry::from_ini(&art));
+    let mut arena = Arena::new(&rules);
+    let drone = arena.spawn(&rules, "DRON", "Russians", (8, 8));
+    let tank = arena.spawn(&rules, "MTNK", "Americans", (9, 8));
+    arena.infect(&rules, drone, tank);
+    assert_eq!(
+        arena
+            .sim
+            .entities()
+            .get(drone)
+            .unwrap()
+            .unit_firing_counter
+            .get(),
+        7
+    );
+    for _ in 0..12 {
+        arena.step(&rules);
+    }
+    assert!(arena.in_limbo(drone));
+    assert_eq!(
+        arena
+            .sim
+            .entities()
+            .get(drone)
+            .unwrap()
+            .unit_firing_counter
+            .get(),
+        7
+    );
+    arena.hit(&rules, tank, None, 4, "SonicWarhead");
+    let actor = arena.sim.substrate.entities.get(drone).unwrap();
+    assert!(actor.lifecycle.object_alive() && !actor.lifecycle.in_limbo());
+    let facing = actor.body_facing_byte(arena.frame());
+    let native = crate::test_fixture::json("tools/spatial_oracle/unit_shp_fire_frames.json");
+    let expected = u16::try_from(
+        native["first_by_facing"][usize::from(facing)]
+            .as_u64()
+            .unwrap(),
+    )
+    .unwrap();
+    let frame = crate::sim::animation::resolve_shp_vehicle_body_frame(
+        rules.animation_sequence("DRON").unwrap(),
+        crate::sim::animation::shp_vehicle_facing_slot(8, u16::from(facing) << 8, false, false),
+        actor.body_frame_counter.get(),
+        actor.unit_firing_counter.get(),
+        actor.unit_death_counter.get(),
+        crate::sim::movement::motion_query::is_moving(actor) == Some(true),
+        actor.foot_occupation_enabled(),
+    );
+    // Original Unit741340 -> Bullet4666E0 -> Attach62A980 -> Exit62A4A0
+    // retains +6C0=7 through limbo. Draw73C62B..73C725 selects the fire
+    // block for the actual facing, not the standing block. The original
+    // counter resumes in Unit7363C9.
+    assert_eq!(frame, Some(expected), "post-release DRON facing {facing}");
+
+    // Stop interrupts the attack without restarting/consuming a separate
+    // presentation clock. Match the actual original Unit AI countdown.
+    let owner = actor.owner();
+    arena.sim.queue_command(CommandEnvelope::new(
+        owner,
+        arena.sim.session.tick() + 1,
+        Command::Stop { entity_id: drone },
+    ));
+    let history = crate::test_fixture::json("tools/spatial_oracle/unit_shp_fire_history.json");
+    for row in history["history"]["recovery"].as_array().unwrap() {
+        arena.step(&rules);
+        let actor = arena.sim.entities().get(drone).unwrap();
+        let counter = actor.unit_firing_counter.get();
+        assert_eq!(
+            i64::from(counter),
+            row["source"]["counter"].as_i64().unwrap()
+        );
+        let image = crate::sim::animation::resolve_shp_vehicle_body_frame(
+            rules.animation_sequence("DRON").unwrap(),
+            crate::sim::animation::shp_vehicle_facing_slot(
+                8,
+                u16::from(actor.body_facing_byte(arena.frame())) << 8,
+                false,
+                false,
+            ),
+            actor.body_frame_counter.get(),
+            counter,
+            -1,
+            crate::sim::movement::motion_query::is_moving(actor) == Some(true),
+            actor.foot_occupation_enabled(),
+        )
+        .unwrap();
+        assert_eq!((56..88).contains(&image), counter >= 0);
+    }
 }
 
 #[test]
@@ -477,7 +661,8 @@ fn a_sonic_hit_ejects_the_drone_alive_beside_its_host_and_drops_the_shooter_targ
         .entities
         .get_mut(dolphin)
         .unwrap()
-        .attack_target = Some(AttackTarget::new(tank));
+        .attack_target
+        .set_for_test(Some(TargetKind::Entity(tank)));
     arena
         .sim
         .substrate
@@ -497,22 +682,22 @@ fn a_sonic_hit_ejects_the_drone_alive_beside_its_host_and_drops_the_shooter_targ
 
     let frame = arena.frame();
     let released = arena.sim.substrate.entities.get(drone).unwrap();
-    assert!(!released.lifecycle.in_limbo && released.lifecycle.object_alive);
-    assert_eq!(released.health.current, 100);
+    assert!(!released.lifecycle.in_limbo() && released.lifecycle.object_alive());
+    assert_eq!(released.health.current(), 100);
     assert_eq!(host_facing, 0);
     assert_eq!(
         released.body_facing.destination(),
         0x4000,
         "north host: released facing east"
     );
-    assert_eq!(released.paralysis_timer.remaining(frame as i32), 3 * 60);
+    assert_eq!(released.parasite.paralysis.remaining(frame as i32), 3 * 60);
     // ExitUnit 0x0062A771: Set_ArchiveTarget(NULL).
     assert_eq!(released.archive_target(), None);
     let (rx, ry) = arena.cell(drone);
     assert!(rx.abs_diff(11) <= 1 && ry.abs_diff(10) <= 1 && (rx, ry) != (11, 10));
     assert_eq!(arena.eater_of(tank), None);
     let host = arena.sim.substrate.entities.get(tank).unwrap();
-    assert!(!host.is_paralyzed(frame));
+    assert!(!host.parasite.is_paralyzed(frame));
     assert!(
         arena
             .sim
@@ -521,6 +706,7 @@ fn a_sonic_hit_ejects_the_drone_alive_beside_its_host_and_drops_the_shooter_targ
             .get(dolphin)
             .unwrap()
             .attack_target
+            .target()
             .is_none()
     );
 }
@@ -537,8 +723,21 @@ fn iron_curtain_strips_the_drone_and_kills_an_organic_vehicle() {
     let dolphin = arena.spawn(&rules, "DLPH", "Americans", (12, 10));
     arena.infect(&rules, drone, tank);
     let owner = arena.sim.interner.intern("Americans");
-    let sw = arena.sim.interner.intern("IronCurtainSpecial");
-    crate::sim::superweapon::iron_curtain::launch(&mut arena.sim, &rules, owner, 11, 10, sw, None);
+    let sw = crate::sim::superweapon::chronosphere_tests::charge_super(
+        &mut arena.sim,
+        owner,
+        "IronCurtainSpecial",
+    );
+    crate::sim::superweapon::iron_curtain::launch(
+        &mut arena.sim,
+        &rules,
+        owner,
+        11,
+        10,
+        sw,
+        None,
+        &mut crate::sim::world::FrameEffects::default(),
+    );
 
     let frame = arena.frame();
     assert!(arena.gone(drone));
@@ -583,21 +782,87 @@ fn a_teleport_warp_ejects_the_drone_before_the_host_relocates() {
             crate::rules::locomotor_type::LocomotorKind::Teleport,
         ),
     );
-    host.teleport_state = Some(crate::sim::movement::teleport_movement::TeleportState {
-        phase: crate::sim::movement::teleport_movement::TeleportPhase::Relocate,
-        target_rx: 20,
-        target_ry: 20,
-        being_warped_ticks: 0,
-    });
+    host.install_teleport_state_for_test(Some(
+        crate::sim::movement::teleport_movement::TeleportState::for_test(
+            crate::sim::movement::teleport_movement::TeleportPhase::Relocate,
+            20,
+            20,
+            0,
+        ),
+    ));
     arena.step(&rules);
 
     assert_eq!(arena.cell(tank), (20, 20));
     assert_eq!(arena.eater_of(tank), None);
     let released = arena.sim.substrate.entities.get(drone).unwrap();
-    assert!(!released.lifecycle.in_limbo && released.lifecycle.object_alive);
-    assert!(released.is_paralyzed(arena.frame()));
+    assert!(!released.lifecycle.in_limbo() && released.lifecycle.object_alive());
+    assert!(released.parasite.is_paralyzed(arena.frame()));
     let (rx, ry) = arena.cell(drone);
     assert!(rx.abs_diff(11) <= 1 && ry.abs_diff(10) <= 1);
+}
+
+#[test]
+fn a_teleport_warp_drops_the_drone_onto_ore() {
+    // ExitUnit's Unlimbo (0x0062A5E8..0x0062A61F) asks the drone's own
+    // Can_Enter_Cell, whose overlay arm reads the match's OverlayTypeClass
+    // table: a Chrono Miner warping off an ore field drops its drone on ore.
+    use crate::sim::tiberium::test_support::{
+        bales_at, overlay_registry, place_tiberium_on_map, tiberium_rules_text,
+    };
+    // The ore's overlay types are the match's: they come with the rules.
+    let rules = rules_with_ini(&IniFile::from_str(&format!(
+        "{RULES}{}",
+        tiberium_rules_text()
+    )));
+    let mut arena = Arena::new(&rules);
+    let drone = arena.spawn(&rules, "DRON", "Russians", (10, 10));
+    let tank = arena.spawn(&rules, "MTNK", "Americans", (11, 10));
+    arena.infect(&rules, drone, tank);
+    // The overlay grid matches the arena's 32x32 map.
+    arena.sim.overlay_grid = Some(crate::sim::overlay_grid::OverlayGrid::new(32, 32));
+    for y in 9..=11 {
+        for x in 10..=12 {
+            place_tiberium_on_map(
+                &mut arena.sim,
+                (x, y),
+                crate::sim::miner::ResourceType::Ore,
+                5,
+            );
+        }
+    }
+    assert!(arena.sim.rebuild_dynamic_navigation(&rules));
+    arena.grid = (*arena.sim.path_grid_snapshot().unwrap()).clone();
+    let host = arena.sim.substrate.entities.get_mut(tank).unwrap();
+    host.locomotor = Some(
+        crate::sim::movement::locomotor::LocomotorState::for_test_kind(
+            crate::rules::locomotor_type::LocomotorKind::Teleport,
+        ),
+    );
+    host.install_teleport_state_for_test(Some(
+        crate::sim::movement::teleport_movement::TeleportState::for_test(
+            crate::sim::movement::teleport_movement::TeleportPhase::Relocate,
+            20,
+            20,
+            0,
+        ),
+    ));
+    let commands = arena.sim.take_due_commands();
+    let _ = arena.sim.advance_tick(
+        &commands,
+        Some(&rules),
+        Some(&arena.grid),
+        Some(overlay_registry()),
+        33,
+    );
+
+    assert_eq!(arena.cell(tank), (20, 20));
+    let released = arena.sim.substrate.entities.get(drone).unwrap();
+    assert!(!released.lifecycle.in_limbo() && released.lifecycle.object_alive());
+    let (rx, ry) = arena.cell(drone);
+    assert!(
+        bales_at(&arena.sim, rx, ry) > 0,
+        "released onto ore at ({rx},{ry})"
+    );
 }
 
 #[test]
@@ -622,22 +887,94 @@ fn a_host_lost_in_flight_returns_the_drone_to_its_launch_cell() {
         sim.substrate
             .entities
             .get(drone)
-            .is_some_and(|d| d.lifecycle.in_limbo)
+            .is_some_and(|d| d.lifecycle.in_limbo())
     });
+    // Attack's ordinary MegaMission first clears Archive through70C610
+    // (4C73EF's mission!=11 branch,4C7448..4C7451). Supply this component
+    // prior after that event/launch so the comparison isolates AttachTo's
+    // refusal tail62AA96..62AAD9, which has no Archive assignment.
+    let launched = arena.sim.substrate.entities.get_mut(drone).unwrap();
+    assert_eq!(launched.archive_target(), None);
+    launched.set_archive_target(anchor);
     arena.hit(&rules, tank, Some(rhino), 400, "AP");
     arena.until(&rules, 100, |sim| {
         sim.substrate
             .entities
             .get(drone)
-            .is_some_and(|d| !d.lifecycle.in_limbo)
+            .is_some_and(|d| !d.lifecycle.in_limbo())
     });
     let returned = arena.sim.substrate.entities.get(drone).unwrap();
     assert_eq!(arena.cell(drone), (10, 10));
     assert_eq!(returned.body_facing.destination(), 0);
-    assert!(!returned.is_paralyzed(arena.frame()));
-    assert!(returned.parasite.as_deref().unwrap().victim().is_none());
+    assert!(!returned.parasite.is_paralyzed(arena.frame()));
+    assert!(returned.parasite.class().unwrap().victim.is_none());
     // The refusal (0x0062AA96..0x0062AAC9) never calls Set_ArchiveTarget.
     assert_eq!(returned.archive_target(), anchor);
+    // Its ReReveal (0x0062AA51) takes back the sight the Unlimbo opened, and
+    // no frame gives it back before the drone's next reveal event.
+    let russians = returned.owner();
+    assert!(!arena.sim.fog.sight_is_latched(drone, russians));
+    arena.step(&rules);
+    assert!(!arena.sim.fog.sight_is_latched(drone, russians));
+}
+
+#[test]
+fn a_drone_whose_launch_cell_was_taken_is_deleted_when_its_host_is_lost() {
+    // AttachTo's refusal Unlimbo (0x0062AA2C) raises no 0x00A8E7AC, so the
+    // drone's own Can_Enter_Cell (Object 0x005F4F1B..0x005F4F44) decides: a
+    // tank that took the launch cell during the jump refuses it, and the
+    // refused drone is deleted (0x0062AA39).
+    let rules = rules();
+    let mut arena = Arena::new(&rules);
+    let drone = arena.spawn(&rules, "DRON", "Russians", (10, 10));
+    let tank = arena.spawn(&rules, "MTNK", "Americans", (11, 10));
+    let rhino = arena.spawn(&rules, "MTNK", "Russians", (14, 10));
+    arena.attack(drone, tank);
+    arena.until(&rules, 100, |sim| {
+        sim.substrate
+            .entities
+            .get(drone)
+            .is_some_and(|d| d.lifecycle.in_limbo())
+    });
+    arena.spawn(&rules, "MTNK", "Russians", (10, 10));
+    arena.hit(&rules, tank, Some(rhino), 400, "AP");
+    arena.until(&rules, 100, |sim| {
+        sim.substrate
+            .entities
+            .get(drone)
+            .is_none_or(|d| !d.lifecycle.in_limbo() || !d.lifecycle.object_alive())
+    });
+    assert!(arena.gone(drone));
+}
+
+#[test]
+fn an_attached_parasite_may_enter_its_victims_cell_and_no_other_held_cell() {
+    // Unit Can_Enter_Cell 0x0073F530..0x0073F56F: an owner holding a victim
+    // answers 0 at the first other object whose map cell is the victim's,
+    // before any blocker rule. An unarmed friendly vehicle's cell still
+    // refuses it.
+    let rules = rules();
+    let mut arena = Arena::new(&rules);
+    let drone = arena.spawn(&rules, "DRON", "Russians", (10, 10));
+    let tank = arena.spawn(&rules, "MTNK", "Americans", (11, 10));
+    arena.spawn(&rules, "MCV", "Russians", (10, 12));
+    let can_enter = |arena: &Arena, cell: (i16, i16)| {
+        let terrain = arena.sim.resolved_terrain.as_ref().unwrap();
+        let cell = crate::map::resolved_terrain::NativeCellQuery::canonical(terrain).lookup(cell);
+        arena
+            .sim
+            .foot_can_enter(
+                drone,
+                cell,
+                crate::sim::movement::infantry_entry::InfantryEntryArgs::REPAIR,
+                &rules,
+            )
+            .unwrap()
+    };
+    assert_ne!(can_enter(&arena, (11, 10)), 0, "a free drone is refused");
+    arena.infect(&rules, drone, tank);
+    assert_eq!(can_enter(&arena, (11, 10)), 0);
+    assert_ne!(can_enter(&arena, (10, 12)), 0);
 }
 
 #[test]
@@ -673,22 +1010,8 @@ fn an_infected_unit_cannot_load_bunker_or_deploy() {
     let tank = arena.spawn(&rules, "MTNK", "Americans", (11, 10));
     let transport = arena.spawn(&rules, "TRAN", "Americans", (13, 10));
     let mcv = arena.spawn(&rules, "MCV", "Americans", (11, 14));
-    let can_load = |sim: &Simulation| {
-        let (passenger, carrier) = (
-            sim.substrate.entities.get(tank).unwrap(),
-            sim.substrate.entities.get(transport).unwrap(),
-        );
-        crate::sim::passenger::can_enter_transport(
-            passenger,
-            carrier,
-            rules.object("MTNK").unwrap(),
-            rules.object("TRAN").unwrap(),
-            &crate::sim::passenger::PassengerCargo::new(3, 100),
-            &rules,
-            &sim.houses,
-            None,
-        )
-    };
+    let can_load =
+        |sim: &Simulation| crate::sim::passenger::can_enter_transport(sim, &rules, tank, transport);
     assert!(can_load(&arena.sim));
     assert!(crate::sim::docking::bunker_link::can_auto_deploy_here(
         &arena.sim, tank, &rules
@@ -710,8 +1033,15 @@ fn an_infected_unit_cannot_load_bunker_or_deploy() {
         .entities
         .get_mut(mcv)
         .unwrap()
-        .mcv_deploy_pending = true;
-    assert!(!arena.sim.deploy_mcv(mcv, &rules, None));
+        .seldom
+        .mcv_deploy_pending
+        .set_for_test(true);
+    assert!(!arena.sim.deploy_mcv(
+        mcv,
+        &rules,
+        None,
+        &mut crate::sim::world::FrameEffects::default()
+    ));
     assert!(
         !arena
             .sim
@@ -719,7 +1049,9 @@ fn an_infected_unit_cannot_load_bunker_or_deploy() {
             .entities
             .get(mcv)
             .unwrap()
+            .seldom
             .mcv_deploy_pending
+            .is_pending()
     );
 }
 
@@ -738,7 +1070,7 @@ fn a_load_keeps_the_infection_and_restarts_both_parasite_timers() {
         sim.substrate
             .entities
             .get(tank)
-            .is_some_and(|t| t.health.current == 250)
+            .is_some_and(|t| t.health.current() == 250)
     });
     // Third-party AP (100% against heavy): 20 raw arms 35 frames of suppression.
     arena.hit(&rules, tank, Some(rhino), 20, "AP");
@@ -758,10 +1090,10 @@ fn a_load_keeps_the_infection_and_restarts_both_parasite_timers() {
             arena.sim.substrate.entities.get(id).unwrap(),
             copy.sim.substrate.entities.get(id).unwrap(),
         );
-        assert_eq!(left.parasite_eating_me, right.parasite_eating_me);
-        assert_eq!(left.parasite_launch_lock, right.parasite_launch_lock);
-        assert_eq!(left.paralysis_timer, right.paralysis_timer);
-        assert_eq!(left.lifecycle.in_limbo, right.lifecycle.in_limbo);
+        assert_eq!(left.parasite.eater, right.parasite.eater);
+        assert_eq!(left.parasite.launch_lock, right.parasite.launch_lock);
+        assert_eq!(left.parasite.paralysis, right.parasite.paralysis);
+        assert_eq!(left.lifecycle.in_limbo(), right.lifecycle.in_limbo());
     }
 
     arena.step(&rules);
@@ -788,7 +1120,7 @@ fn a_load_keeps_the_infection_and_restarts_both_parasite_timers() {
             .get_mut(tank)
             .unwrap()
             .health
-            .current = 5;
+            .set_for_test(5);
         world.hit(&rules, tank, Some(rhino), 5, "AP");
         world.until(&rules, 60, |sim| sim.substrate.entities.get(tank).is_none());
     }
@@ -803,16 +1135,47 @@ fn the_reselect_memo_stays_out_of_the_peer_hash() {
     let rules = rules();
     let run = |local: &str, selected: bool| {
         let mut arena = Arena::new(&rules);
+        // Ordinary unit survival keeps the GI alive without a base.
+        arena.sim.session.game_options_mut_for_test().short_game = false;
+        // Both replicas have the same two human clients. Only the local
+        // current House/selection differs, not the logical sight-client roster.
+        for (name, side) in [("Russians", 1), ("Americans", 0)] {
+            let owner = arena.sim.intern(name);
+            let mut house =
+                crate::sim::house_state::HouseState::new(owner, side, None, true, 0, 10);
+            // Start after each client's empty initial sight pass. House4F9353
+            // clears +24B; Map4ADCD0 has no Techno callbacks in an empty world.
+            // The memo test then varies only PlayerPtr and local selection.
+            assert!(house.take_initial_sight_refresh());
+            arena.sim.houses.register(house);
+        }
         let dog = arena.spawn(&rules, "DOG", "Russians", (10, 10));
         let gi = arena.spawn(&rules, "E1", "Americans", (11, 10));
-        arena.sim.session.current_house = Some(arena.sim.interner.intern(local));
-        arena.sim.substrate.entities.get_mut(dog).unwrap().selected = selected;
+        // Limbo removes the dog's active count; its House still owns a unit.
+        arena.spawn(&rules, "MCV", "Russians", (6, 15));
+        // Nonzero mode: IsHumanPlayer (`0x0050B6F0`) is the local player.
+        arena.sim.session.set_game_mode(
+            crate::sim::scenario_session::ScenarioGameMode::from_legacy_nonzero(true),
+        );
+        arena
+            .sim
+            .session
+            .set_current_house_for_test(Some(arena.sim.interner.intern(local)));
+        arena
+            .sim
+            .substrate
+            .entities
+            .get_mut(dog)
+            .unwrap()
+            .seldom
+            .selection
+            .set_selected_for_test(selected);
         arena.attack(dog, gi);
         arena.until(&rules, 100, |sim| {
             sim.substrate
                 .entities
                 .get(dog)
-                .is_some_and(|d| d.lifecycle.in_limbo)
+                .is_some_and(|d| d.lifecycle.in_limbo())
         });
         let memo = arena
             .sim
@@ -820,6 +1183,7 @@ fn the_reselect_memo_stays_out_of_the_peer_hash() {
             .entities
             .get(dog)
             .unwrap()
+            .parasite
             .limbo_reselect;
         (memo, arena.sim.state_hash())
     };
@@ -844,7 +1208,7 @@ fn a_dog_released_on_a_bridge_deck_stays_on_the_deck() {
             .resolved_terrain
             .as_mut()
             .unwrap()
-            .cell_mut(x, y)
+            .cell_mut_for_test(x, y)
             .unwrap();
         cell.bridge_facts.raw_flags = crate::map::bridge_facts::BRIDGE_FLAG_STRUCTURAL;
         cell.has_bridge_deck = true;
@@ -860,9 +1224,9 @@ fn a_dog_released_on_a_bridge_deck_stays_on_the_deck() {
     for id in [dog, gi] {
         arena.sim.remove_entity_occupancy(id);
         let entity = arena.sim.substrate.entities.get_mut(id).unwrap();
-        entity.on_bridge = true;
-        entity.position.z = 4;
-        entity.position.exact_z_leptons = Some(deck);
+        entity.set_on_bridge(true);
+        entity.position.set_z_for_test(4);
+        entity.position.set_exact_z_leptons_for_test(Some(deck));
         arena.sim.add_entity_occupancy(id);
     }
     arena.attack(dog, gi);
@@ -870,16 +1234,16 @@ fn a_dog_released_on_a_bridge_deck_stays_on_the_deck() {
         sim.substrate
             .entities
             .get(gi)
-            .is_none_or(|v| v.health.current == 0)
+            .is_none_or(|v| v.health.current() == 0)
     });
     arena.until(&rules, 100, |sim| {
         sim.substrate
             .entities
             .get(dog)
-            .is_some_and(|d| !d.lifecycle.in_limbo)
+            .is_some_and(|d| !d.lifecycle.in_limbo())
     });
     let released = arena.sim.substrate.entities.get(dog).unwrap();
-    assert!(released.on_bridge);
+    assert!(released.on_bridge());
     assert_eq!(
         crate::sim::movement::ground_pose::position_world_coord(&released.position).z,
         deck
@@ -907,7 +1271,7 @@ fn a_parasite_order_on_an_iron_curtained_host_is_dropped() {
         sim.substrate
             .entities
             .get(drone)
-            .is_some_and(|d| d.attack_target.is_none() && sim.session.tick > 2)
+            .is_some_and(|d| d.attack_target.target().is_none() && sim.session.tick() > 2)
     });
     assert!(!arena.in_limbo(drone));
     assert_eq!(arena.eater_of(tank), None);
@@ -931,7 +1295,7 @@ fn a_parasite_is_placed_at_a_falling_victim_below_the_air_line() {
             .get_mut(victim)
             .unwrap()
             .position
-            .exact_z_leptons = Some(height);
+            .set_exact_z_leptons_for_test(Some(height));
         arena
             .sim
             .parasite_can_place_at_victim(drone, victim, &rules)
@@ -941,4 +1305,143 @@ fn a_parasite_is_placed_at_a_falling_victim_below_the_air_line() {
         "below 208 the victim is not in the air"
     );
     assert!(!place_at_height(208), "at 208 the victim is in the air");
+}
+
+/// `tools/spatial_oracle/parasite_water_gate.json`: the original CanInfect
+/// with a Naval, a land or no owner, and the victim on a tile around the
+/// theater's WaterSet base or on the shared dummy. VERA's grid has no NULL
+/// slot inside its bounds, so both dummy rows put the victim past the grid.
+#[test]
+fn naval_owner_water_gate_matches_original_can_infect() {
+    let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/parasite_water_gate.json",
+    ))
+    .unwrap();
+    let rules = rules();
+    let rows = corpus["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 14);
+    for row in rows {
+        let name = row["name"].as_str().unwrap();
+        let mut arena = Arena::new(&rules);
+        let victim = arena.spawn(&rules, "MTNK", "Americans", (5, 2));
+        // The owner's type supplies only `Naval=`; an id with no object is
+        // the parasite without an owner.
+        let owner = match (
+            row["owner"].as_bool().unwrap(),
+            row["naval"].as_bool().unwrap(),
+        ) {
+            (true, true) => arena.spawn(&rules, "DLPH", "Russians", (9, 9)),
+            (true, false) => arena.spawn(&rules, "DRON", "Russians", (9, 9)),
+            (false, _) => u64::MAX,
+        };
+        let terrain = arena.sim.resolved_terrain.as_mut().unwrap();
+        terrain.set_projectile_water_set_base(row["water_set"].as_i64().unwrap() as i32);
+        terrain.cell_mut_for_test(5, 2).unwrap().final_tile_index =
+            row["tile"].as_i64().unwrap() as i32;
+        if row["victim_cell"] != serde_json::json!([5, 2]) {
+            arena
+                .sim
+                .substrate
+                .entities
+                .get_mut(victim)
+                .unwrap()
+                .position
+                .set_rx_for_test(200);
+        }
+        assert_eq!(
+            arena.sim.parasite_can_infect(owner, Some(victim), &rules),
+            row["admits"].as_bool().unwrap(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn grinder_arrival_refunds_the_infesting_drone_before_forced_release() {
+    use crate::sim::components::NavTargetRef;
+    use crate::sim::mission::{MissionId, MissionType};
+    use crate::sim::movement::PerCellReason;
+    use crate::sim::movement::locomotor::MovementLayer;
+    use crate::sim::world::FrameEffects;
+
+    let input = format!(
+        "[Countries]\n0=Russians\n1=Americans\n{}",
+        RULES
+            .replace("[DRON]\n", "[DRON]\nSoylent=200\n")
+            .replace("[MTNK]\n", "[MTNK]\nSoylent=300\n")
+    );
+    let rules = rules_with_ini(&IniFile::from_str(&input));
+    let mut arena = Arena::new(&rules);
+    let drone = arena.spawn(&rules, "DRON", "Russians", (10, 10));
+    let tank = arena.spawn(&rules, "MTNK", "Americans", (11, 10));
+    arena.infect(&rules, drone, tank);
+    let building = arena.spawn(&rules, "YARD", "Americans", (18, 10));
+    let (x, y, owner) = {
+        let actor = arena.sim.entities().get(tank).unwrap();
+        (actor.position.rx(), actor.position.ry(), actor.owner())
+    };
+    arena.sim.substrate.occupancy.add(
+        x,
+        y,
+        building,
+        MovementLayer::Ground,
+        None,
+        crate::sim::occupancy::CellListInsertion::AppendBuilding,
+    );
+    let actor = arena.sim.substrate.entities.get_mut(tank).unwrap();
+    actor
+        .mission
+        .set_current_for_test(MissionId::from_known(MissionType::Eaten), 0);
+    actor
+        .navigation
+        .set_nav_com_for_test(Some(NavTargetRef::object(building)));
+    arena
+        .sim
+        .houses
+        .register(crate::sim::house_state::HouseState::new(
+            owner, 0, None, true, 0, 10,
+        ));
+    let russian = arena.sim.interner.get("Russians").unwrap();
+    arena
+        .sim
+        .houses
+        .register(crate::sim::house_state::HouseState::new(
+            russian, 1, None, false, 0, 10,
+        ));
+    let before = arena.sim.houses[&owner].economy().credits();
+    arena
+        .sim
+        .per_cell_process(
+            tank,
+            PerCellReason::Arrival,
+            &rules,
+            None,
+            &mut FrameEffects::default(),
+        )
+        .unwrap();
+    // Unit73A0A5 refunds the tank300, then73A13E refunds the drone200.
+    assert_eq!(arena.sim.houses[&owner].economy().credits(), before + 500);
+    assert!(arena.gone(tank));
+    assert!(
+        arena.gone(drone),
+        "suppression50 precedes ExitUnit's nonnaval arm"
+    );
+    assert_eq!(arena.eater_of(tank), None);
+}
+
+/// Ares FootClass_PointerGotInvalid_Parasite10048280 (hook4D99AA) and
+/// ParasiteClass_PointerGotInvalid_Cloak100482D0 (hook62A283): the host's
+/// cloak Detach_All(false) keeps the drone attached; only a removal ejects.
+#[test]
+fn ares_a_cloaking_host_keeps_its_drone() {
+    let _ares = crate::rules::ares_switch::read_ares_way(true);
+    let rules = rules();
+    let mut arena = Arena::new(&rules);
+    let drone = arena.spawn(&rules, "DRON", "Russians", (10, 10));
+    let tank = arena.spawn(&rules, "MTNK", "Americans", (11, 10));
+    arena.infect(&rules, drone, tank);
+    arena
+        .sim
+        .detach_all(tank, false, crate::sim::world::UninitContext::new(&rules));
+    assert_eq!(arena.eater_of(tank), Some(drone));
 }

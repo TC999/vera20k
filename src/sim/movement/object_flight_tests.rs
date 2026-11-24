@@ -22,20 +22,37 @@ struct Row {
 }
 #[derive(Deserialize)]
 struct Corpus {
-    native_sha256: String,
     rows: Vec<Row>,
 }
 
 #[test]
+fn unmarked_object_flight_predicates_do_not_query_the_map() {
+    // Object5F6B60/5F6B90 return before GetHeight when +74 is clear.
+    // A missing-cell lookup would overwrite the process-global Dummy cell.
+    let mut terrain = ResolvedTerrainGrid::from_cells(
+        25,
+        25,
+        (0..25)
+            .flat_map(|y| (0..25).map(move |x| test_flat_cell(x, y)))
+            .collect(),
+    );
+    terrain.test_set_native_allocated_cells(&[]);
+    let dummy = terrain.shared_cell_dummy();
+    dummy.stamp_coord(111, -222);
+    let mut entity = GameEntity::test_default(1, "FV", "Americans", 10, 20);
+    entity.position.set_exact_z_leptons_for_test(Some(624));
+    entity.lifecycle.set_cell_marked_for_test(false);
+    assert!(!is_low_flying(&entity, Some(&terrain), None));
+    assert!(!is_high_flying(&entity, Some(&terrain), None));
+    assert_eq!(dummy.snapshot().coord, (111, -222));
+}
+
+#[test]
 fn native_object_flight_queries_use_live_ground_bridge_and_mark() {
-    let corpus: Corpus = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/object_flight_height.json"
+    let corpus: Corpus = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/object_flight_height.json",
     ))
     .unwrap();
-    assert_eq!(
-        corpus.native_sha256,
-        "1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c"
-    );
     assert_eq!(corpus.rows.len(), 24);
     for row in corpus.rows {
         let mut cells: Vec<_> = (0..25)
@@ -50,11 +67,17 @@ fn native_object_flight_queries_use_live_ground_bridge_and_mark() {
         let [x, y, z] = row.input.xyz;
         let mut entity =
             GameEntity::test_default(1, "FV", "Americans", (x / 256) as u16, (y / 256) as u16);
-        entity.position.sub_x = SimFixed::from_num(x % 256);
-        entity.position.sub_y = SimFixed::from_num(y % 256);
-        entity.position.exact_z_leptons = Some(z);
-        entity.on_bridge = row.input.on_bridge != 0;
-        entity.lifecycle.cell_marked = row.input.marked != 0;
+        entity
+            .position
+            .set_sub_x_for_test(SimFixed::from_num(x % 256));
+        entity
+            .position
+            .set_sub_y_for_test(SimFixed::from_num(y % 256));
+        entity.position.set_exact_z_leptons_for_test(Some(z));
+        entity.set_on_bridge(row.input.on_bridge != 0);
+        entity
+            .lifecycle
+            .set_cell_marked_for_test(row.input.marked != 0);
         assert_eq!(
             current_fly_height(&entity, Some(&terrain)),
             row.height,
@@ -103,8 +126,10 @@ fn a_paratroopers_fall_moves_its_location_z_to_the_ground_or_deck() {
                 .collect(),
         ));
         let mut paratrooper = GameEntity::test_default(1, "E1", "Americans", 10, 10);
-        paratrooper.lifecycle.cell_marked = true;
-        paratrooper.on_bridge = on_bridge;
+        paratrooper.lifecycle.set_in_limbo_for_test(false);
+        paratrooper.lifecycle.set_cell_marked_for_test(true);
+        paratrooper.set_on_bridge(on_bridge);
+        paratrooper.set_attached_anim_flag(true);
         sim.substrate.entities.insert(paratrooper);
         assert!(begin_parachute_descent(
             &mut sim.substrate.entities,
@@ -117,23 +142,100 @@ fn a_paratroopers_fall_moves_its_location_z_to_the_ground_or_deck() {
 
         // FallRate 0, -1, -2: the object hangs a frame, then sinks to 209.
         for _ in 0..3 {
-            assert!(!sim.advance_fall(1, -3));
+            assert!(!sim.advance_fall(
+                1,
+                -3,
+                crate::rules::ruleset::RuleSet::empty_for_test(),
+                &mut crate::sim::world::FrameEffects::default(),
+            ));
         }
         let t = sim.resolved_terrain.clone();
         assert_eq!(current_fly_height(entity(&sim), t.as_ref()), 209);
         assert!(is_high_flying(entity(&sim), t.as_ref(), None));
-        assert!(!sim.advance_fall(1, -3));
+        assert!(!sim.advance_fall(
+            1,
+            -3,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            &mut crate::sim::world::FrameEffects::default(),
+        ));
         assert_eq!(current_fly_height(entity(&sim), t.as_ref()), 206);
         assert!(is_low_flying(entity(&sim), t.as_ref(), None));
 
         let mut frames = 4;
-        while !sim.advance_fall(1, -3) {
+        while !sim.advance_fall(
+            1,
+            -3,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            &mut crate::sim::world::FrameEffects::default(),
+        ) {
             frames += 1;
             assert!(frames < 100, "the fall must ground");
         }
         let landed = entity(&sim);
         assert!(!landed.is_falling_down());
-        assert_eq!(landed.position.exact_z_leptons, Some(floor), "SetHeight(0)");
+        assert_eq!(
+            landed.position.exact_z_leptons(),
+            Some(floor),
+            "SetHeight(0)"
+        );
         assert_eq!(current_fly_height(landed, t.as_ref()), 0);
     }
+}
+
+/// A paratrooper stays in its cell's list as it falls: Walk's layer query
+/// (`0x0075C7E0`) answers Ground at any height. `ObjectClass::AI`'s falling
+/// block marks it again around each Z write (`0x005F3F46`, `0x005F3F58`), so
+/// it is prepended ahead of an object that entered the cell after it.
+#[test]
+fn a_falling_paratrooper_is_marked_again_at_the_head_of_its_cell() {
+    use crate::map::entities::EntityCategory;
+    use crate::rules::locomotor_type::LocomotorKind;
+    use crate::sim::movement::locomotor::LocomotorState;
+    use crate::sim::movement::parachute_descent::begin_parachute_descent;
+    use crate::sim::occupancy::CellObjectMember::Entity;
+
+    let mut sim = crate::sim::world::Simulation::new();
+    sim.interner = crate::sim::intern::test_interner();
+    sim.install_resolved_terrain_for_new_map(ResolvedTerrainGrid::from_cells(
+        25,
+        25,
+        (0..25)
+            .flat_map(|y| (0..25).map(move |x| test_flat_cell(x, y)))
+            .collect(),
+    ));
+    for id in [1, 2] {
+        let mut infantry = GameEntity::test_default(id, "E1", "Americans", 10, 10);
+        infantry.set_category_for_test(EntityCategory::Infantry);
+        infantry.lifecycle.set_in_limbo_for_test(false);
+        infantry.lifecycle.set_cell_marked_for_test(false);
+        infantry.locomotor = Some(LocomotorState::for_test_kind(LocomotorKind::Walk));
+        infantry.position.set_exact_z_leptons_for_test(Some(0));
+        sim.substrate.entities.insert(infantry);
+        assert!(sim.foot_mark_put(
+            id,
+            crate::rules::ruleset::RuleSet::empty_for_test(),
+            None,
+            &mut crate::sim::world::FrameEffects::default()
+        ));
+    }
+    assert!(begin_parachute_descent(
+        &mut sim.substrate.entities,
+        1,
+        1000
+    ));
+    let next = |sim: &crate::sim::world::Simulation, id| {
+        sim.next_cell_object(crate::sim::occupancy::CellObjectMember::Entity(id))
+    };
+    assert_eq!(next(&sim, 2), Some(Entity(1)));
+
+    assert!(!sim.advance_fall(
+        1,
+        -3,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
+        &mut crate::sim::world::FrameEffects::default(),
+    ));
+    assert_eq!(next(&sim, 1), Some(Entity(2)));
+    let paratrooper = sim.substrate.entities.get(1).unwrap();
+    assert!(paratrooper.lifecycle.cell_marked());
+    assert!(paratrooper.is_falling_down());
 }

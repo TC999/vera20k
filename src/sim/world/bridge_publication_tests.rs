@@ -1,5 +1,6 @@
 use super::*;
 use crate::map::bridge_facts::{BridgeFlagStamp, BridgeStampFamily};
+use crate::map::resolved_terrain::DynamicTerrainCellState;
 use crate::rules::ini_parser::IniFile;
 use crate::sim::overlay_grid::OverlayGrid;
 
@@ -20,7 +21,7 @@ fn rules() -> RuleSet {
 }
 
 fn world(rules: &RuleSet, anchor_state: u8) -> Simulation {
-    family_world(rules, anchor_state, 25, BridgeStampFamily::Nesw)
+    family_world(rules, anchor_state, 25, BridgeStampFamily::Nesw, 0)
 }
 
 fn family_world(
@@ -28,30 +29,25 @@ fn family_world(
     anchor_state: u8,
     anchor_overlay: u8,
     stamp: BridgeStampFamily,
+    level: u8,
 ) -> Simulation {
     let cells = (0..9)
         .flat_map(|y| {
             (0..9).map(move |x| {
-                crate::sim::world::lifecycle_tests::common_raw_terrain_cell(x, y, 0, false)
+                crate::sim::world::lifecycle_tests::common_raw_terrain_cell(x, y, level, false)
             })
         })
         .collect();
     let mut terrain = ResolvedTerrainGrid::from_cells(9, 9, cells);
     terrain.apply_runtime_bridge_mark_stamp(BridgeFlagStamp::new((4, 4), 6, true), stamp);
-    let anchor = terrain.native_cell_identity((4, 4));
-    terrain.write_native_cell_state(anchor, anchor_state);
-    terrain.cells[4 * 9 + 4].bridge_facts.overlay_id = Some(anchor_overlay);
-    terrain.cells[4 * 9 + 3].bridge_facts.overlay_id = Some(42);
+    // The constructing setter's anchor, Forward1, Forward2 and Opposite visits
+    // store state 9 (direction 6); the anchor then carries `anchor_state`.
     let mut grid = OverlayGrid::new(9, 9);
-    for y in 0..9 {
-        for x in 0..9 {
-            let facts = terrain.cell(x, y).unwrap().bridge_facts;
-            if let Some(overlay) = facts.overlay_id {
-                grid.place_overlay(x, y, overlay, facts.state_byte);
-            }
-            grid.write_literal_bridge_state(&mut terrain, x, y, facts.state_byte);
-        }
+    for (x, y) in [(3, 4), (2, 4), (5, 4)] {
+        grid.write_literal_bridge_state(x, y, 9);
     }
+    grid.place_overlay(4, 4, anchor_overlay, anchor_state);
+    grid.place_overlay(3, 4, 42, 9);
     let state = BridgeRuntimeState::from_resolved_terrain(&terrain, true, 1);
     let mut sim = Simulation::with_seed(31);
     sim.intern_rule_type_ids(rules);
@@ -78,27 +74,42 @@ fn bridge_damage_exact_height_runs_body_and_detaches_only_after_collapse() {
     let rules = rules();
     let mut sim = world(&rules, 9);
     let attacker = sim
-        .construct_object_limbo_at_height("MTNK", "Americans", 7, 7, 0, 0, &rules)
+        .construct_object_limbo_at_height(
+            "MTNK",
+            "Americans",
+            7,
+            7,
+            0,
+            0,
+            &rules,
+            &mut crate::sim::world::FrameEffects::default(),
+        )
         .unwrap();
+    // The admitted scene supplies this pose after the held constructor.
+    sim.substrate
+        .entities
+        .get_mut(attacker)
+        .unwrap()
+        .position
+        .put_location(crate::sim::components::DriveCoord {
+            x: 7 * 256 + 128,
+            y: 7 * 256 + 128,
+            z: 0,
+        });
     sim.reveal(attacker);
     sim.substrate
         .entities
         .get_mut(attacker)
         .unwrap()
-        .attack_target = Some(crate::sim::combat::AttackTarget::for_cell(4, 4));
+        .attack_target
+        .set_for_test(Some(crate::sim::combat::TargetKind::Cell(4, 4)));
     let mut hit = event(&mut sim, (4, 4));
     let before = sim.scenario_rng.logical_state();
     // Native strict lower bound: level0 +208 refuses, +209 enters.
     hit.impact_z_leptons = 208;
     assert!(!apply_bridge_damage_events(&mut sim, &rules, &[hit]));
     assert_eq!(
-        sim.resolved_terrain
-            .as_ref()
-            .unwrap()
-            .cell(4, 4)
-            .unwrap()
-            .bridge_facts
-            .state_byte,
+        sim.overlay_grid.as_ref().unwrap().cell(4, 4).overlay_data,
         9
     );
     assert_eq!(sim.scenario_rng.logical_state(), before);
@@ -106,13 +117,7 @@ fn bridge_damage_exact_height_runs_body_and_detaches_only_after_collapse() {
     hit.impact_z_leptons = 209;
     assert!(!apply_bridge_damage_events(&mut sim, &rules, &[hit]));
     assert_eq!(
-        sim.resolved_terrain
-            .as_ref()
-            .unwrap()
-            .cell(4, 4)
-            .unwrap()
-            .bridge_facts
-            .state_byte,
+        sim.overlay_grid.as_ref().unwrap().cell(4, 4).overlay_data,
         15
     );
     assert!(
@@ -121,6 +126,7 @@ fn bridge_damage_exact_height_runs_body_and_detaches_only_after_collapse() {
             .get(attacker)
             .unwrap()
             .attack_target
+            .target()
             .is_some()
     );
 
@@ -131,6 +137,7 @@ fn bridge_damage_exact_height_runs_body_and_detaches_only_after_collapse() {
             .get(attacker)
             .unwrap()
             .attack_target
+            .target()
             .is_none()
     );
     assert_eq!(
@@ -156,6 +163,7 @@ fn bridge_damage_exact_height_runs_body_and_detaches_only_after_collapse() {
             .get(attacker)
             .unwrap()
             .attack_target
+            .target()
             .is_none()
     );
 }
@@ -167,7 +175,7 @@ fn bridge_damage_exact_height_runs_body_and_detaches_only_after_collapse() {
 #[test]
 fn wooden_body_damage_collapses_through_the_live_publication_host() {
     let rules = rules();
-    let mut sim = family_world(&rules, 9, 0xed, BridgeStampFamily::Nwse);
+    let mut sim = family_world(&rules, 9, 0xed, BridgeStampFamily::Nwse, 0);
     let cell = sim
         .resolved_terrain
         .as_ref()
@@ -188,26 +196,95 @@ fn wooden_body_damage_collapses_through_the_live_publication_host() {
     let hit = event(&mut sim, (3, 4));
 
     assert!(!apply_bridge_damage_events(&mut sim, &rules, &[hit]));
-    assert_eq!(
-        sim.resolved_terrain
-            .as_ref()
-            .unwrap()
-            .native_cell_state(cell),
-        15
-    );
+    assert_eq!(sim.cell_overlay(cell).overlay_data, 15);
     assert_ne!(flags(&sim, cell) & 0x100, 0);
 
     assert!(apply_bridge_damage_events(&mut sim, &rules, &[hit]));
-    let terrain = sim.resolved_terrain.as_ref().unwrap();
-    assert_eq!(terrain.native_cell_state(cell), 0);
+    assert_eq!(sim.cell_overlay(cell).overlay_data, 0);
     assert_eq!(flags(&sim, cell) & 0x100, 0);
     assert_eq!(flags(&sim, body) & 0x100, 0);
 }
 
+#[cfg(tests_sim_world_a_b)]
+#[test]
+fn collapse_hits_incoming_tank_on_depressed_side_lane() {
+    use crate::sim::components::DriveCoord;
+    use crate::sim::movement::{DriveLocomotionRuntime, at_coord::AtCoordQuery};
+    use crate::sim::occupancy::{CellObjectMember, VEHICLE_OCCUPATION_BIT};
+    use crate::util::lepton::{BRIDGE_DECK_HEIGHT_LEPTONS, GROUND_LEVEL_HEIGHT_LEPTONS};
+
+    let rules = rules();
+    let mut sim = family_world(&rules, 15, 25, BridgeStampFamily::Nesw, 4);
+    sim.playfield_bounds = Some(crate::map::playfield::PlayfieldBounds {
+        base: 0,
+        off_fc: -9,
+        off_100: -9,
+        off_104: 18,
+        off_108: 18,
+    });
+    let terrain = sim.resolved_terrain.as_mut().unwrap();
+    let lane = terrain.native_cell_identity((3, 4));
+    terrain.write_native_cell_level(lane, 0);
+    assert_eq!(terrain.corrected_high_bridge_deck_at(lane), Some(8));
+    let head = DriveCoord::cell(3, 4, 8 * GROUND_LEVEL_HEIGHT_LEPTONS);
+    let stock_probe = DriveCoord {
+        z: BRIDGE_DECK_HEIGHT_LEPTONS,
+        ..head
+    };
+
+    // Supply the transition boundary: the tank is linked in the adjacent
+    // cell and has committed its incoming bridge reservation and Drive head.
+    let tank = sim
+        .spawn_object("MTNK", "Americans", 3, 3, 0, &rules)
+        .unwrap();
+    let actor = sim.substrate.entities.get_mut(tank).unwrap();
+    actor.locomotor = Some(
+        crate::sim::movement::locomotor::LocomotorState::for_test_kind(
+            crate::rules::locomotor_type::LocomotorKind::Drive,
+        ),
+    );
+    assert!(
+        actor
+            .locomotor
+            .as_mut()
+            .unwrap()
+            .install_drive_state_for_test(Some(
+                DriveLocomotionRuntime::default().with_head_to_for_test(Some(head)),
+            ))
+    );
+    let at = AtCoordQuery::from_entity(actor).unwrap();
+    assert!(at.matches(head));
+    assert!(!at.matches(stock_probe));
+    assert_eq!(
+        sim.cell_object_list_location(CellObjectMember::Entity(tank))
+            .unwrap()
+            .0,
+        (3, 3)
+    );
+    sim.substrate
+        .raw_cell_occupation
+        .mark_deck(3, 4, VEHICLE_OCCUPATION_BIT);
+
+    let mut drivers = BridgeDamageDrivers::new(&mut sim, &rules, FrameEffects::default());
+    assert!(drivers.apply_damage_to_cell((3, 4)));
+    assert_eq!(
+        sim.resolved_terrain
+            .as_ref()
+            .unwrap()
+            .corrected_high_bridge_deck_at(lane),
+        None
+    );
+    assert!(
+        sim.entities()
+            .get(tank)
+            .is_none_or(|actor| !actor.lifecycle.object_alive())
+    );
+}
+
 #[test]
 fn signed_bridge_strength_survives_reader_runtime_dispatch_and_snapshot() {
-    let native: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/bridge_damage_admission.json"
+    let native: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/bridge_damage_admission.json",
     ))
     .unwrap();
     for strength in [-1, 0, 65536] {
@@ -261,9 +338,9 @@ fn signed_bridge_strength_survives_reader_runtime_dispatch_and_snapshot() {
 
 fn host<'a>(sim: &'a mut Simulation, rules: &'a RuleSet) -> LivePublication<'a> {
     LivePublication {
+        frame_effects: crate::sim::world::FrameEffects::default(),
         sim,
         rules,
-        registry: None,
         collapsed: false,
     }
 }
@@ -279,7 +356,7 @@ fn bridge_publication_production_nonanchor_collapse_keeps_other_overlay_and_runs
         .resolved_terrain
         .as_mut()
         .unwrap()
-        .cell_mut(2, 4)
+        .cell_mut_for_test(2, 4)
         .unwrap();
     assert_eq!(forward2.bridge_facts.raw_flags & 0x200, 0);
     forward2.bridge_transition = true;
@@ -290,31 +367,52 @@ fn bridge_publication_production_nonanchor_collapse_keeps_other_overlay_and_runs
         let Cell::Real(index) = terrain.native_cell_identity(coord) else {
             panic!()
         };
-        terrain.cells[index].bridge_walkable = true;
-        terrain.cells[index].bridge_transition = true;
+        terrain.cells_mut_for_test()[index].bridge_walkable = true;
+        terrain.cells_mut_for_test()[index].bridge_transition = true;
     }
     let before = crate::sim::pathfinding::PathGrid::from_resolved_terrain_with_bridges(
         sim.resolved_terrain.as_ref().unwrap(),
+        sim.overlay_grid.as_ref(),
     );
     for coord in [(4, 4), (3, 4), (2, 4), (5, 4)] {
         assert!(before.cell(coord.0, coord.1).unwrap().bridge_walkable);
     }
     let tank = sim
-        .construct_object_limbo_at_height("MTNK", "Americans", 3, 4, 0, 0, &rules)
+        .construct_object_limbo_at_height(
+            "MTNK",
+            "Americans",
+            3,
+            4,
+            0,
+            0,
+            &rules,
+            &mut crate::sim::world::FrameEffects::default(),
+        )
         .unwrap();
+    // Ground fallout selects the scene's supplied Cell member, not ctor zero.
+    sim.substrate
+        .entities
+        .get_mut(tank)
+        .unwrap()
+        .position
+        .put_location(crate::sim::components::DriveCoord {
+            x: 3 * 256 + 128,
+            y: 4 * 256 + 128,
+            z: 0,
+        });
     sim.reveal(tank);
     let hit = event(&mut sim, (3, 4));
     assert!(apply_bridge_damage_events_with_overlay_registry(
         &mut sim,
         &rules,
         &[hit],
-        None
+        &mut crate::sim::world::FrameEffects::default(),
     ));
     assert!(
         sim.substrate
             .entities
             .get(tank)
-            .is_none_or(|unit| unit.health.current == 0)
+            .is_none_or(|unit| unit.health.current() == 0)
     );
     let grid = sim.overlay_grid.as_ref().unwrap();
     assert_eq!(
@@ -331,7 +429,14 @@ fn bridge_publication_production_nonanchor_collapse_keeps_other_overlay_and_runs
             .cell(coord.0, coord.1)
             .unwrap();
         assert_eq!(cell.bridge_facts.raw_flags, 0x400);
-        assert_eq!(cell.bridge_facts.state_byte, 0);
+        assert_eq!(
+            sim.overlay_grid
+                .as_ref()
+                .unwrap()
+                .cell(coord.0, coord.1)
+                .overlay_data,
+            0
+        );
         assert!(!cell.has_bridge_deck);
         assert!(!cell.bridge_walkable);
         let path = sim.path_grid().unwrap().cell(coord.0, coord.1).unwrap();
@@ -342,7 +447,7 @@ fn bridge_publication_production_nonanchor_collapse_keeps_other_overlay_and_runs
         assert!(!path.transition);
         assert_eq!(grid.cell(coord.0, coord.1).overlay_data, 0);
         assert_eq!(
-            sim.dynamic_terrain_cells[&coord],
+            *sim.dynamic_terrain_cells.get(&coord).unwrap(),
             DynamicTerrainCellState::capture(cell)
         );
     }
@@ -351,32 +456,6 @@ fn bridge_publication_production_nonanchor_collapse_keeps_other_overlay_and_runs
         assert!(path.bridge_walkable, "marker-only {coord:?} lost its ramp");
         assert!(path.transition);
     }
-}
-
-#[test]
-fn bridge_publication_retained_anchor_reads_live_overlay_identity() {
-    let rules = rules();
-    let mut sim = world(&rules, 15);
-    // A bridgehead collapse clears the anchor's +44 while OverlayGrid still
-    // retains the original high-surface identity; CellClass decides.
-    let terrain = sim.resolved_terrain.as_mut().unwrap();
-    let anchor = terrain.native_cell_identity((4, 4));
-    terrain.clear_native_cell_overlay(anchor);
-    let hit = event(&mut sim, (3, 4));
-    assert!(!apply_bridge_damage_events_with_overlay_registry(
-        &mut sim,
-        &rules,
-        &[hit],
-        None,
-    ));
-    let host = host(&mut sim, &rules);
-    let anchor = host.terrain().native_cell_identity((4, 4));
-    assert_eq!(host.state(anchor), 15);
-    assert_ne!(host.flags(anchor) & BRIDGE_FLAG_STRUCTURAL, 0);
-    assert_eq!(
-        host.terrain().cell(4, 4).unwrap().bridge_facts.overlay_id,
-        None
-    );
 }
 
 struct ReenteringHost<'a> {
@@ -442,8 +521,11 @@ impl BridgePublicationHost for ReenteringHost<'_> {
     fn middles(&self, family: Family) -> Option<(i32, [i32; 2])> {
         self.live.middles(family)
     }
-    fn fallout(&mut self, c: Cell) {
-        self.live.fallout(c);
+    fn corrected_deck_at(&self, coord: CellCoord) -> Option<i16> {
+        self.live.corrected_deck_at(coord)
+    }
+    fn fallout(&mut self, c: Cell, corrected_deck_level: Option<i16>) {
+        self.live.fallout(c, corrected_deck_level);
         let hit = if c == self.anchor {
             Some((2, 4))
         } else if c == self.forward {
@@ -458,7 +540,7 @@ impl BridgePublicationHost for ReenteringHost<'_> {
                 self.live.sim,
                 self.live.rules,
                 &[event],
-                None,
+                &mut crate::sim::world::FrameEffects::default(),
             );
             assert!(!changed);
             assert_eq!(
@@ -497,36 +579,5 @@ fn bridge_publication_reentrant_cleared_slot_cannot_reenter_through_old_topology
             .cell(4, 4)
             .overlay_id,
         Some(25)
-    );
-}
-
-#[test]
-fn bridge_publication_perpendicular_uses_raw_tile_instead_of_runtime_class() {
-    let rules = rules();
-    let mut sim = world(&rules, 9);
-    // Native572C90 gates on raw +38; nothing but the raw tile can make this
-    // unrelated cell a middle-family tile.
-    sim.resolved_terrain
-        .as_mut()
-        .unwrap()
-        .test_set_high_bridge_rim_tiles(
-            crate::map::bridge_rim_tiles::HighBridgeRimTiles::from_ini(
-                0,
-                b"[General]\nBridgeMiddle1=7\nBridgeMiddle2=12\n",
-            ),
-        );
-    let original_tile = sim
-        .resolved_terrain
-        .as_ref()
-        .unwrap()
-        .cell(4, 3)
-        .unwrap()
-        .final_tile_index;
-    let mut host = host(&mut sim, &rules);
-    host.perpendicular((4, 4), Axis::EW, Phase::DamageB, 0, Family::High);
-    host.perpendicular((4, 4), Axis::EW, Phase::DamageB, 0, Family::High);
-    assert_eq!(
-        host.terrain().cell(4, 3).unwrap().final_tile_index,
-        original_tile
     );
 }

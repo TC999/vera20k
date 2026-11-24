@@ -1,11 +1,44 @@
 # Projectile native comparisons
 
-These tools execute the pinned retail `gamemd.exe` under Unicorn. See the
+These tools execute the retail `gamemd.exe` under Unicorn. See the
 [shared native runner](../native_oracle.md) for installation and executable
 identity. This page indexes the consolidated FireAt-tail, load-timer and collision
 fixtures; other projectile families still need their own inventory.
 
+## Retained Airburst flag
+
+[`airburst_retained`](airburst_retained.md) executes the original whole
+BulletType reader across eight ordered flag histories, with no asset inputs.
+`python -m tools.projectile_oracle.airburst_retained --check` verifies the native
+current-value defaults independently of the existing child-fan corpus.
+
+## Bullet trailer animations
+
+[`projectile_trailer`](projectile_trailer.md) joins the original Bullet AI
+header and signed global-frame cadence to the full physical BBBLELRG
+constructor, independent lifetime and deferred retirement. It includes native
+divide faults, early waits, preflight coordinates, RNG continuation,
+Scalable reader inputs and the original Bullet placement/Fire consumers.
+Reproduce with
+`python -m tools.projectile_oracle.projectile_trailer --check`; the linked
+document specifies extracted retail inputs and the bounded coverage.
+
+The shared IFV admission transport now executes native coordinate fixup and
+admission-state writes. Its earlier raw copy retained constructor InLimbo and
+suppressed cleanup. Re-executed impact/bridge corpora include the resulting
+Conceal expiry/display removal; the LineTrail corpus corrects detach timing to
+Conceal before drain. The trailer witness executes full original Fire admission.
+See the linked document for those input boundaries and the separate Rust
+LineTrail timing residual.
+
 ## FireAt tail and BulletFire
+
+[`fire_once`](fire_once.md) executes 13 original common-tail continuations
+through concrete team/member setters, including supplied refused-launch and
+ballistic-failure cleanup. Rust compares 12 representable boundaries through
+the production shared tail; the removed Foot-bit control has no production
+object counterpart. The document records retail inputs, timer/RNG state and
+the supplied admission/launch boundaries.
 
 `fireat_fixture.py` owns the synthetic object/stack initialization, virtual and
 world hooks, checked native execution and observations for these five generators:
@@ -35,7 +68,7 @@ Rust consumers:
 
 - `sim::projectile::launch::tests::original_fireat_and_fire_preserve_exact_launch_bits`
   consumes all five corpora (388 rows) and compares launch success and successful
-  binary64 velocity bits using verified retail math tables.
+  binary64 velocity bits using the retail sine and Acos tables.
 - `sim::world::projectile_collision::tests::runtime_fireat_fractional_velocity_survives_live_gravity_and_snapshot`
   consumes `fireat_runtime.json`: a composition of the existing native Rules
   Process, GetSpeed, shared launch and motion fixtures. It checks production
@@ -55,8 +88,7 @@ numeric components; it supplies the connections and admitted collision commits.
 The Rust runtime test establishes that integration only for these two fixtures;
 it does not certify the whole native scheduler or collisions.
 
-These are ignored retail tests; set `RA2_DIR` to the verified install and run each
-with `python -m tools.cargo_run -- test -p vera20k --lib <test-name> -- --ignored`.
+Both run in the lib suite without an installed game.
 Python import/help regression tests run in `python -m tools.run_tests` without
 retail files. Native comparison and Rust regression are separate evidence levels.
 
@@ -77,7 +109,7 @@ of 877 rows. Normal and optimized Python reproduce the same existing reference.
 The default is a read-only check; import/help do not load native bytes or write.
 `--write --output <candidate.json>` explicitly generates a candidate and sidecar.
 
-This fixture shares image identity, execution completion and golden publication
+This fixture shares image loading, execution completion and golden publication
 with `tools.native_oracle`. Its native vtables, stream services and case matrix
 remain local: adjacent collision and trail fixtures have different state and
 coverage. Save executes outside assertions, and stream bounds, HRESULTs and byte
@@ -110,11 +142,15 @@ before publication, including under `python -O`.
 | Module (`python -m tools.projectile_oracle.<module> --check`) | Preserved rows |
 | --- | --- |
 | `ordinary_collision` | 134 admissions, 21 matrices, 189 reflections, 115 geometry, 180 final handoffs, 7 nearest selections |
-| `shared_collision` | 130 original post-commit probes |
+| `shared_collision` | 136 original post-commit probes (130 prior controls plus six retained OnBridge boundaries) |
+| `shared_collision --line-walk` | 12 original signed XYZ line walks |
 | `homing_impact` | 288 admissions, 72 clamp/handoff observations, 12 source modes |
 
-All 1,148 rows reproduce the previous goldens without changing their file bytes.
-The checked `.meta.json` sidecars record executable identity, emulator version,
+The prior 1,148 observations are preserved. The shared collision corpus appends
+six retained Bullet OnBridge controls; a separate 12-row line-walk corpus covers
+the signed XYZ stepping dependency. See [shared collision boundaries](shared_collision.md)
+for commands, supplied inputs and coverage limits.
+The checked `.meta.json` sidecars record the emulator version,
 canonical payload hash, boundaries, supplied state and substituted receivers.
 Ordinary admission/reflection and homing use live FPCW `0x0E7F` without changing
 the image's cached control word; shared geometry and nearest selection set both.
@@ -153,7 +189,7 @@ A native rejection is a valid observation; an execution exception now aborts the
 entire run instead of becoming an `*_error` golden field. The current corpus has
 no such error rows.
 
-The generator uses the shared `call`, executable identity and publisher directly;
+The generator uses the shared `call`, image loader and publisher directly;
 there is no eager RMG compatibility import, import-time emulation or automatic
 write. Default invocation and `--check` are read-only; `--write` and optional
 `--output <candidate.json>` are explicit. Repeat with `python -O -m` to check that
@@ -164,16 +200,14 @@ Negative and zero inputs characterize solver boundaries; they are not claims
 about values admitted by retail weapon rules. No upstream FireAt/type/INI loading,
 trajectory, timer, RNG or detach equivalence is established. The word results are
 retained native observations without a direct Rust consumer. The angle consumer
-checks native failure predicates and successful raw binary64 values; it is ignored
-by default because it requires the verified retail math tables. Run it explicitly:
+checks native failure predicates and successful raw binary64 values. It runs in
+the lib suite; run it alone with:
 
 ```sh
-python -m tools.cargo_run -- test -p vera20k --lib original_arc_solver_domain_and_failure_predicates -- --ignored
+python -m tools.cargo_run -- test -p vera20k-core --lib original_arc_solver_domain_and_failure_predicates
 ```
 
-[The validation record](arc_domain.validation.json) records the native replay,
-unchanged golden hash and actual retail-backed Rust run. Shared import/help
-coverage for all migrated projectile and animation producers lives in
-`tools.tests.test_oracle_lifecycle`; each producer runs in a fresh interpreter,
-in normal and optimized Python. `tools.tests.test_arc_domain` separately verifies
+Shared import/help coverage for all migrated projectile and animation producers
+lives in `tools.tests.test_oracle_lifecycle`; each producer runs in a fresh
+interpreter, in normal and optimized Python. `tools.tests.test_arc_domain` separately verifies
 that a failed first or second solver cannot publish partial/error observations.

@@ -18,7 +18,20 @@ use std::collections::HashMap;
 use crate::assets::tmp_file::TmpFile;
 use crate::map::theater::TilesetLookup;
 
+use super::phases::cliff_variants::CLIFF_SET_TILES;
 use super::phases::shore::{SubTile, TileBlock, TileBlocks};
+
+/// A cliff-set tile whose template is missing or unreadable
+/// ([`TheaterTileBlocks::missing_cliff_tile`]).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "the theater's cliff tile {tile} ({filename}) is missing or unreadable; \
+     reinstall the game or remove the mod that replaces it"
+)]
+pub struct MissingCliffTile {
+    pub tile: i32,
+    pub filename: String,
+}
 
 /// A `TileBlocks` provider backed by the theater's parsed TMP templates.
 pub struct TheaterTileBlocks {
@@ -26,12 +39,36 @@ pub struct TheaterTileBlocks {
 }
 
 impl TheaterTileBlocks {
+    /// Hash the resolved geometry that the generator actually queries. TMP
+    /// pixels and HashMap iteration order cannot affect network agreement.
+    pub fn multiplayer_digest(&self) -> String {
+        let mut bytes = b"VERA20k RMG tile blocks v1\0".to_vec();
+        let mut blocks = self.blocks.iter().collect::<Vec<_>>();
+        blocks.sort_unstable_by_key(|(tile, _)| **tile);
+        for (tile, block) in blocks {
+            bytes.extend_from_slice(&tile.to_le_bytes());
+            bytes.extend_from_slice(&block.width.to_le_bytes());
+            bytes.extend_from_slice(&block.height.to_le_bytes());
+            bytes.extend_from_slice(&(block.subtiles.len() as u64).to_le_bytes());
+            for cell in &block.subtiles {
+                bytes.push(u8::from(cell.is_some()));
+                if let Some(cell) = cell {
+                    bytes.extend_from_slice(&[cell.height, cell.terrain, cell.slope]);
+                }
+            }
+        }
+        crate::util::sha256::sha256_hex(&bytes)
+    }
+
     /// Build the block table for every tile the theater's `lookup` defines.
     ///
-    /// `load` fetches a TMP file's bytes by filename; the app layer wraps the
+    /// `load` borrows a TMP file's bytes by filename; the app layer wraps the
     /// asset manager. Tiles whose filename is blank, whose bytes are missing, or
     /// whose TMP fails to parse are skipped.
-    pub fn build(lookup: &TilesetLookup, mut load: impl FnMut(&str) -> Option<Vec<u8>>) -> Self {
+    pub fn build<'a>(
+        lookup: &TilesetLookup,
+        mut load: impl FnMut(&str) -> Option<&'a [u8]>,
+    ) -> Self {
         let mut blocks = HashMap::new();
         for tile_id in 0..lookup.len() {
             let Some(filename) = lookup.filename(tile_id as i32) else {
@@ -40,7 +77,7 @@ impl TheaterTileBlocks {
             let Some(bytes) = load(filename) else {
                 continue;
             };
-            let Ok(tmp) = TmpFile::from_bytes(&bytes) else {
+            let Ok(tmp) = TmpFile::from_bytes(bytes) else {
                 continue;
             };
             blocks.insert(tile_id as i32, tile_block_from_tmp(&tmp));
@@ -48,11 +85,33 @@ impl TheaterTileBlocks {
         Self { blocks }
     }
 
-    /// Number of tiles that resolved to a parsed block (for logging/tests).
+    /// The first tile of the theater's cliff set (`CliffSet=`, the
+    /// generator's 40 cliff pieces) whose TMP the lookup names but which did
+    /// not load or parse. The cliff passes read each piece's template, so a
+    /// generation with one missing is refused rather than drawn without it;
+    /// retail theaters hold every piece. The refusal is VERA's own.
+    pub fn missing_cliff_tile(
+        &self,
+        lookup: &TilesetLookup,
+        cliff_set: Option<u16>,
+    ) -> Option<MissingCliffTile> {
+        let first = i32::from(cliff_set?);
+        (first..first + CLIFF_SET_TILES).find_map(|tile| {
+            let filename = lookup.filename(tile)?;
+            (!self.blocks.contains_key(&tile)).then(|| MissingCliffTile {
+                tile,
+                filename: filename.to_string(),
+            })
+        })
+    }
+
+    /// Number of tiles that resolved to a parsed block (for tests).
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.blocks.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.blocks.is_empty()
     }
@@ -84,7 +143,7 @@ fn tile_block_from_tmp(tmp: &TmpFile) -> TileBlock {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_map))]
 mod tests {
     use super::*;
     use crate::map::theater::parse_tileset_ini;
@@ -110,7 +169,7 @@ mod tests {
         for i in 0..DIAMOND_PIXELS {
             data.push(i as u8 + 1); // diamond pixels
         }
-        data.extend_from_slice(&vec![0u8; DIAMOND_PIXELS]); // depth
+        data.extend_from_slice(&[0u8; DIAMOND_PIXELS]); // depth
     }
 
     /// A `width × 1` TMP with a distinct `(height, terrain, ramp)` per cell.
@@ -135,16 +194,28 @@ mod tests {
     }
 
     #[test]
-    fn tmp_projects_into_a_tile_block() {
-        let bytes = tmp_row(&[(3, 5, 0), (7, 9, 0)]);
-        let tmp = TmpFile::from_bytes(&bytes).expect("valid fixture TMP");
-        let block = tile_block_from_tmp(&tmp);
-        assert_eq!((block.width, block.height), (2, 1));
-        assert_eq!(block.subtiles.len(), 2);
-        let a = block.subtiles[0].expect("cell 0 present");
-        let b = block.subtiles[1].expect("cell 1 present");
-        assert_eq!((a.height, a.terrain), (3, 5));
-        assert_eq!((b.height, b.terrain), (7, 9));
+    fn multiplayer_digest_follows_geometry_and_ignores_tmp_pixels() {
+        let lookup = parse_tileset_ini(
+            b"[General]\n[TileSet0000]\nFileName=clear\nTilesInSet=2\n",
+            "tem",
+        )
+        .unwrap();
+        let bytes = tmp_row(&[(1, 2, 3)]);
+        let first = TheaterTileBlocks::build(&lookup, |_| Some(&bytes)).multiplayer_digest();
+        let mut pixels_changed = bytes.clone();
+        *pixels_changed.last_mut().unwrap() ^= 1;
+        let same =
+            TheaterTileBlocks::build(&lookup, |_| Some(&pixels_changed)).multiplayer_digest();
+        assert_eq!(first, same, "presentation pixels do not change generation");
+        assert_eq!(
+            first,
+            TheaterTileBlocks::build(&lookup, |_| Some(&bytes)).multiplayer_digest()
+        );
+        let other = tmp_row(&[(1, 2, 4)]);
+        assert_ne!(
+            first,
+            TheaterTileBlocks::build(&lookup, |_| Some(&other)).multiplayer_digest()
+        );
     }
 
     #[test]
@@ -178,7 +249,7 @@ TilesInSet=2
 ";
         let lookup = parse_tileset_ini(ini.as_bytes(), "tem").expect("lookup");
         let fixture = tmp_row(&[(0, 0, 0), (1, 8, 2)]);
-        let blocks = TheaterTileBlocks::build(&lookup, |_name| Some(fixture.clone()));
+        let blocks = TheaterTileBlocks::build(&lookup, |_name| Some(&fixture));
         assert_eq!(blocks.len(), 2, "both tile ids resolved to a block");
         let block = blocks.block(0).expect("tile 0 has a block");
         assert_eq!((block.width, block.height), (2, 1));
@@ -201,7 +272,34 @@ TilesInSet=2
         assert!(blocks.block(0).is_none());
 
         // Loader yields garbage → parse fails → still absent, no panic.
-        let blocks = TheaterTileBlocks::build(&lookup, |_name| Some(vec![0u8; 4]));
+        let blocks = TheaterTileBlocks::build(&lookup, |_name| Some(&[0u8; 4]));
         assert!(blocks.block(0).is_none());
+    }
+
+    /// A theater whose cliff-set piece did not load is named, so the
+    /// generation refuses instead of drawing cliffs without their template.
+    #[test]
+    fn a_cliff_set_piece_without_its_template_is_reported() {
+        let lookup = parse_tileset_ini(
+            b"[General]\n[TileSet0000]\nFileName=clear\nTilesInSet=1\n\
+              [TileSet0001]\nFileName=cliff\nTilesInSet=3\n",
+            "tem",
+        )
+        .expect("lookup");
+        let fixture = tmp_row(&[(0, 0, 0)]);
+        let cliff_two = lookup.filename(2).expect("tile 2 is named").to_string();
+        let blocks = TheaterTileBlocks::build(&lookup, |name| {
+            (name != cliff_two).then_some(fixture.as_slice())
+        });
+        assert_eq!(
+            blocks.missing_cliff_tile(&lookup, Some(1)),
+            Some(MissingCliffTile {
+                tile: 2,
+                filename: cliff_two,
+            })
+        );
+        // Tiles outside the set, and a theater without a set, need nothing.
+        assert_eq!(blocks.missing_cliff_tile(&lookup, Some(3)), None);
+        assert_eq!(blocks.missing_cliff_tile(&lookup, None), None);
     }
 }

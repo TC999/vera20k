@@ -10,29 +10,13 @@
 //!
 //! ## Dependency rules
 //! - Part of sim/ — depends on sim/components, sim/combat, rules/.
-//! - sim/ NEVER depends on render/, ui/, sidebar/, audio/, net/.
+//! - sim/ NEVER depends on render/, ui/, audio/, net/.
 
 use crate::rules::ruleset::RuleSet;
 use crate::sim::entity_store::EntityStore;
 use crate::sim::game_entity::GameEntity;
-use crate::util::fixed_math::{SimFixed, facing_from_delta_int_u16};
-
-/// Compute the signed shortest-path rotation from `current` to `target` in
-/// 8-bit facing space. No production caller; the live shortest-arc logic is the
-/// signed 16-bit subtraction inside `FacingClass::current`.
-/// Returns a value in -128..=127 (positive = clockwise, negative = counter-clockwise).
-#[cfg(test)]
-pub fn shortest_rotation(current: u8, target: u8) -> i16 {
-    let diff: i16 = target as i16 - current as i16;
-    // Wrap into -128..127 range for shortest path.
-    if diff > 128 {
-        diff - 256
-    } else if diff < -128 {
-        diff + 256
-    } else {
-        diff
-    }
-}
+use crate::util::direction_tables::facing16_from_delta;
+use crate::util::fixed_math::SimFixed;
 
 /// Compute 16-bit turret facing from source to target using lepton-precise
 /// positions, providing sub-cell accuracy for targeting.
@@ -52,12 +36,12 @@ pub fn facing_toward_lepton(
     let to_lep_y: i32 = to_ry as i32 * 256 + to_sub_y.to_num::<i32>();
     let dx: i32 = to_lep_x - from_lep_x;
     let dy: i32 = to_lep_y - from_lep_y;
-    facing_from_delta_int_u16(dx, dy)
+    facing16_from_delta(dx, dy)
 }
 
 /// Convert an 8-bit facing to a 16-bit one (shifts into the upper byte).
 /// No production caller; test fixtures author 8-bit facings.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn body_facing_to_turret(body: u8) -> u16 {
     (body as u16) << 8
 }
@@ -78,17 +62,17 @@ pub fn body_facing_to_turret(body: u8) -> u16 {
 /// both objects; for a `BuildingClass` that slot returns the FOUNDATION CENTRE,
 /// not the north-west anchor cell. `combat::resolve_target_coords` applies the
 /// same centre shift, so route through it rather than reading `position`.
-pub(crate) fn facing_toward_target(
+pub fn facing_toward_target(
     entity: &GameEntity,
     target: &crate::sim::combat::TargetKind,
-    entities: &EntityStore,
+    world: &crate::sim::world::Simulation,
 ) -> Option<u16> {
-    let (trx, try_, tsx, tsy) = crate::sim::combat::resolve_target_coords(target, entities)?;
+    let (trx, try_, tsx, tsy) = crate::sim::combat::resolve_target_coords(target, world)?;
     Some(facing_toward_lepton(
-        entity.position.rx,
-        entity.position.ry,
-        entity.position.sub_x,
-        entity.position.sub_y,
+        entity.position.rx(),
+        entity.position.ry(),
+        entity.position.sub_x(),
+        entity.position.sub_y(),
         trx,
         try_,
         tsx,
@@ -105,6 +89,11 @@ pub(crate) struct FacingUpdate {
     /// native calls no `Set` on the turret this frame — which is the whole
     /// difference between "hold the aim" and "swing back to the hull".
     pub turret_destination: Option<u16>,
+    /// `UnitClass::Facing_Update` enters the `TurretSpins` arm after arm A's
+    /// optional aim Set. The write owner must sample the barrel's animated
+    /// `Current` after that Set, then issue the second Set and skip ordinary
+    /// latch/idle handling.
+    pub turret_spins: bool,
     /// Hull (`+0x388`) destination from the turretless arm-A commit.
     pub hull_destination: Option<u16>,
     /// Which side of the `+0x6AF` store `turret_destination` belongs on.
@@ -127,9 +116,8 @@ pub(crate) struct FacingUpdate {
 /// `LEA [ESI+0x388]` = hull at `0x00736A0E`/`0x00736A66`/`0x00736BCF`). It
 /// consumes no RNG and arms no timer other than the `FacingClass` countdown.
 ///
-/// PURE READ — mutates neither the entity nor the store. Shared by the global
-/// turret sweep and the per-object Fire→Facing host so both compute identical
-/// destinations (per-entity, so id-order and live-order walks agree).
+/// PURE READ — mutates neither the entity nor the store; the per-object
+/// Fire→Facing host commits what it returns.
 ///
 /// Native order, and what each arm does here:
 ///
@@ -144,87 +132,95 @@ pub(crate) struct FacingUpdate {
 ///   already equals `tgt` exactly (`0x00736A78` compares the low word) — the
 ///   mid-arc pass-through pin.
 ///
-/// **B. IDLE** (`0x00736A8E`..`0x00736BDD`). The latch is cleared
+/// **B. TURRET SPINS** (`0x00736A95`..`0x00736BDD`), tested after arm A when
+/// `TurretSpins` is set. A target can first set its aim at `0x00736A89`; the
+/// spin arm then samples turret `Current` and issues a second Set, which
+/// becomes the final same-frame destination. The type flag is read at
+/// `0x00713357`..`0x00713371`. Its formula and Set execute in
+/// `apply_unit_facing`, after any arm-A Set, because `Current` observes that
+/// first write. This branch bypasses the ordinary latch and idle path, leaving
+/// the prior latch byte unchanged.
+///
+/// **C. IDLE** (`0x00736A8E`..`0x00736BDD`) when the spin branch is not taken.
+/// The latch is cleared
 /// unconditionally at `0x00736AD5`, before the `Turret=` test, so a turretless
 /// unit leaves this arm with a clear latch and nothing else. For a turret:
 /// still rotating → re-arm the latch and stop; target still held → stop;
 /// otherwise the idle return, gated on
 /// `frame - LastFireFrame(+0x120) >= GuardAreaTargetingDelay(Rules+0xE04) + 5`
-/// (41 frames in stock) and suppressed while the unit is bunkered (`+0x2E4`).
+/// (41 frames in stock) and suppressed while the unit is bunkered (`+0x2E4`)
+/// or is a deployed (`+0x6E0`) `IsSimpleDeployer=` type (`0x00736B60..0x00736B78`),
+/// such as a deployed Siege Chopper, which holds its last aim.
 /// The destination is the MOVE DESTINATION when a NavCom is set, else the hull
 /// heading. The latch VALUE is committed by `apply_unit_facing` rather than
 /// here, because native's store sits between this arm's two `Set` calls — see
 /// [`FacingUpdate::turret_destination_is_idle_return`].
 ///
-/// **C. CACHE** (`0x00736BE2`) writes `+0x4A0 = Is_Rotating()`; that field has
+/// **D. CACHE** (`0x00736BE2`) writes `+0x4A0 = Is_Rotating()`; that field has
 /// no verified consumer, so it is not modelled.
-///
-/// RESIDUAL (GSI-08.14) — `TurretSpins=` (`Type+0xD21`) replaces both arms with
-/// the permaspin formula at `0x00736AB1`..`0x00736ACB`. Trigger: a type that
-/// authors the key. Player effect: its turret does not idle-spin. Frequency:
-/// `[DISK]` alone in stock rulesmd, and the key is not parsed here at all.
-/// Downstream risk: none — the arm is self-contained.
 ///
 /// Native execution of this arm pair frame by frame:
 /// `tools/spatial_oracle/turret_cadence.py`.
 ///
-/// RESIDUAL (GSI-08.14) — three idle-hold inputs have no VERA analogue and are
-/// therefore not gated: the per-weapon-slot lock byte `WeaponStruct+0x18`
-/// (`0x00736A02`/`0x00736B96`; executed: with a target it aims the turret at
-/// the hull's current facing instead of the target, and its idle return
-/// ignores the NavCom; zero stock authors for the adjacent
-/// `WeaponXTurretLocked` art key), the locomotor-piggyback flag
-/// `+0x6AD` (`0x00736BB1`) and the simple-deployer byte `+0x6E0`
-/// (`0x00736B70`, paired with `IsSimpleDeployer=`). Trigger: a piggybacked or
-/// mid-deploy simple deployer losing its target. Player effect: its turret
-/// returns to the hull where retail holds the last aim. Frequency: six stock
-/// `IsSimpleDeployer=` types, and only during the deploy transition.
-/// Downstream risk: none — each is a pure suppression.
+/// RESIDUAL (GSI-08.14) — one Facing_Update input has no VERA analogue:
+/// - The per-weapon-slot lock byte `WeaponStruct+0x18` (`0x00736A02`,
+///   `0x00736B96`). Executed: with a target it aims the turret at the hull's
+///   current facing instead of the target, and its idle return ignores the
+///   NavCom. Trigger: a turret-locked weapon slot. Frequency: none in retail;
+///   no stock type authors the adjacent `WeaponXTurretLocked` art key.
+///   Downstream risk: the aim feeds the fire-facing gate, so a modded locked
+///   weapon would fire on VERA's aim, not native's.
 ///
-/// RESIDUAL (GSI-08.14) — recoil is not modelled. Native keeps two `RecoilData`
-/// structs at `+0x3D8`/`+0x3F8`, arms them in `Fire_At` and advances them from
-/// `TechnoClass::AI_Update` through `0x0070ED10`; the displacement is read by
-/// four instructions, all in draw code, so it is render-only and feeds no
-/// gameplay path.
-/// - Trigger: firing a type that authors `TurretRecoil=`.
-/// - Player effect: the barrel does not slide back on firing.
-/// - Frequency: two stock authors, both BUILDINGS (the Grand Cannon and
-///   CAEAST02); no stock vehicle recoils at all.
-/// - Downstream risk: none to the simulation. It consumes no RNG.
+/// Recoil's separate presentation state (+3D8/+3F8) is owned by
+/// `game_entity::voxel_recoil`; it does not change aim or consume RNG.
 pub(crate) fn facing_update(
     entity: &GameEntity,
-    entities: &EntityStore,
-    rules: Option<&RuleSet>,
+    world: &crate::sim::world::Simulation,
+    rules: &RuleSet,
     interner: &crate::sim::intern::StringInterner,
     binary_frame: u32,
 ) -> FacingUpdate {
+    let entities = &world.substrate.entities;
     let mut out = FacingUpdate {
         turret_destination: None,
+        turret_spins: false,
         hull_destination: None,
         turret_destination_is_idle_return: false,
     };
-    let obj = rules.and_then(|r| r.object(interner.resolve(entity.type_ref())));
+    let obj = interner.object_type(entity.type_ref(), rules);
     let has_turret = entity.barrel_facing.is_some();
 
     // --- A. AIM ---------------------------------------------------------
     let target_facing: Option<u16> = entity
         .attack_target
-        .as_ref()
-        .and_then(|attack| facing_toward_target(entity, &attack.target, entities));
+        .target()
+        .and_then(|attack| facing_toward_target(entity, &attack, world));
     if let Some(tgt) = target_facing
-        && !entity.turret_rotation_latch
+        && !entity.turret_rotation_latch.is_set()
     {
         if has_turret {
-            if !current_weapon_is_omni_fire(entity, rules, interner) {
+            if !current_weapon_is_omni_fire(entity, entities, rules, interner) {
                 out.turret_destination = Some(tgt);
             }
         } else if obj
             .is_some_and(|o| o.speed_type == crate::rules::locomotor_type::SpeedType::Track)
-            && entity.movement_target.is_none()
+            // No NavCom (`+0x5A4`, `0x00736A38`) and the locomotor's Is_Moving
+            // (ILocomotion+0x10, `0x00736A5F`) false. A pending order is
+            // neither; a locomotor the query does not answer reads as still.
+            && entity.navigation.nav_com().is_none()
+            && super::motion_query::is_moving(entity) != Some(true)
             && entity.body_facing_current(binary_frame) == tgt
         {
             out.hull_destination = Some(tgt);
         }
+    }
+
+    // Native tests Type+0xD21 after arm A and directly jumps to the spin Set,
+    // bypassing the ordinary latch and idle-return path. The second Set must
+    // remain in the writer so it samples Current after arm A's optional Set.
+    if has_turret && obj.is_some_and(|object| object.turret_spins) {
+        out.turret_spins = true;
+        return out;
     }
 
     // --- B. IDLE --------------------------------------------------------
@@ -246,15 +242,25 @@ pub(crate) fn facing_update(
         // in completed turns instead of re-snapshotting `prev` every frame
         // against a mover.
         let committed_to_an_arc = barrel.is_rotating(binary_frame);
-        if !committed_to_an_arc && entity.attack_target.is_none() {
-            let dwell = rules.map_or(NATIVE_IDLE_TURRET_DWELL_FALLBACK, |r| {
-                i64::from(r.general.guard_area_targeting_delay)
-            }) + NATIVE_IDLE_TURRET_DWELL_BIAS;
-            let dwell_elapsed = i64::from(binary_frame) - entity.last_fire_frame >= dwell;
-            // `+0x2E4` — a tank riding a Battle Bunker holds its aim forever.
-            let bunkered = entity.bunker_link.installed_in().is_some();
-            if dwell_elapsed && !bunkered {
-                out.turret_destination = Some(match nav_destination_facing(entity, entities) {
+        if !committed_to_an_arc && entity.attack_target.target().is_none() {
+            let dwell =
+                i64::from(rules.general.guard_area_targeting_delay) + NATIVE_IDLE_TURRET_DWELL_BIAS;
+            let dwell_elapsed = i64::from(binary_frame) - entity.last_fire_frame.frame() >= dwell;
+            // `+0x2E4` — a tank riding a Battle Bunker holds its aim forever,
+            // as does a deployed simple deployer (`0x00736B60..0x00736B78`).
+            let bunkered = entity.bunker.link().installed_in().is_some();
+            let deployed_simple_deployer =
+                obj.is_some_and(|obj| obj.is_simple_deployer) && entity.is_fully_deployed();
+            // Facing_Update736BA3..736BB9 keeps the last aim while a
+            // Magnetron's +6AD latch and NavCom are both set. This is the
+            // lift owner's byte, not generic locomotor piggyback state;
+            // Imbue710326/710352 sets the destination and latch, and
+            // Jumpjet End_Piggyback54DA50 clears the latch on landing.
+            // Native controls: turret_cadence.json idle_navcom_magnetron.
+            let lifted_with_destination =
+                entity.lift.swap_active() && entity.navigation.nav_com().is_some();
+            if dwell_elapsed && !bunkered && !deployed_simple_deployer && !lifted_with_destination {
+                out.turret_destination = Some(match nav_destination_facing(entity, world) {
                     Some(nav) => nav,
                     None => entity.body_facing_current(binary_frame),
                 });
@@ -269,29 +275,30 @@ pub(crate) fn facing_update(
     out
 }
 
-/// `[General] GuardAreaTargetingDelay=` fallback for rules-less fixtures. Stock
-/// rulesmd sets 36; `RulesClass` stores it at `+0xE04` (`0x006701B4`).
-const NATIVE_IDLE_TURRET_DWELL_FALLBACK: i64 = 36;
+/// Compute the `TurretSpins` destination from the barrel's animated Current
+/// value after arm A's optional Set. Native instructions at
+/// `UnitClass::Facing_Update @ 0x00736AB7`..`0x00736ACB` shift, increment,
+/// mask to one byte, add 8, then shift into the high byte before calling the
+/// shared `FacingClass::Set @ 0x004C9220` at `0x00736BDD`.
+pub(crate) fn turret_spin_destination(current: u16) -> u16 {
+    u16::from(crate::util::direction_tables::round_facing16_to_8(current))
+        .wrapping_add(8)
+        .wrapping_shl(8)
+}
 
 /// The `+5` the idle-return comparison adds to `GuardAreaTargetingDelay`
 /// (`ADD EDX,0x5` at `0x00736B4B`), giving 41 frames in stock.
 const NATIVE_IDLE_TURRET_DWELL_BIAS: i64 = 5;
 
-/// The idle turret's aim when a move order is live — `DirectionToTarget(this,
-/// NavCom)` at `0x00736BC3`. Native reads the destination coordinate at
-/// `+0x5A4`; VERA's equivalent is the last cell of the active path.
-fn nav_destination_facing(entity: &GameEntity, _entities: &EntityStore) -> Option<u16> {
-    let goal = entity.movement_target.as_ref()?.path.last().copied()?;
-    Some(facing_toward_lepton(
-        entity.position.rx,
-        entity.position.ry,
-        entity.position.sub_x,
-        entity.position.sub_y,
-        goal.0,
-        goal.1,
-        SimFixed::from_num(128),
-        SimFixed::from_num(128),
-    ))
+/// The idle turret's aim when a move order is live: the NavCom (`+0x5A4`,
+/// read at `0x00736BA3`) through `DirectionToTarget @ 0x005F3DB0`
+/// (`0x00736BC3`), the helper arm A aims with.
+fn nav_destination_facing(
+    entity: &GameEntity,
+    world: &crate::sim::world::Simulation,
+) -> Option<u16> {
+    let nav_com = entity.navigation.nav_com()?;
+    facing_toward_target(entity, &nav_com.into(), world)
 }
 
 /// Whether this object's currently selected weapon sets `OmniFire=`. Native
@@ -302,167 +309,56 @@ fn nav_destination_facing(entity: &GameEntity, _entities: &EntityStore) -> Optio
 /// any direction and never turns the turret.
 pub(crate) fn current_weapon_is_omni_fire(
     entity: &GameEntity,
-    rules: Option<&RuleSet>,
+    entities: &EntityStore,
+    rules: &RuleSet,
     interner: &crate::sim::intern::StringInterner,
 ) -> bool {
-    let Some(rules) = rules else { return false };
-    let Some(obj) = rules.object(interner.resolve(entity.type_ref())) else {
+    let Some(obj) = interner.object_type(entity.type_ref(), rules) else {
         return false;
     };
-    let index: i32 = if obj.turret_count > 0 {
-        i32::from(entity.current_weapon_index)
-    } else {
-        0
-    };
-    crate::sim::combat::combat_weapon::weapon_for_index(obj, entity.veterancy(), index)
-        .and_then(|(weapon_id, _)| rules.weapon(weapon_id))
+    crate::sim::combat::combat_weapon::current_weapon(entity, obj, entities, rules, interner)
         .is_some_and(|weapon| weapon.omni_fire)
 }
 
-/// The turret destination this entity's owning native path drives it toward
-/// this frame, or `None` when that path calls no `Set`.
-///
-/// Dispatches on the class that actually owns the facing in gamemd:
-/// - **Unit** — `UnitClass::Facing_Update @ 0x00736990` ([`facing_update`]).
-/// - **Structure** — none: `BuildingClass::Mission_Attack @ 0x0044ACF0` sets
-///   its turret (`+0x388`) on the non-firing error arms (`0x0044B187`/
-///   `0x0044B1DE`/`0x0044B14E`) in the building's own visit
-///   (`world::techno_ai::building_missions`). A LEA census over
-///   `BuildingClass::Update`, `Mission_Guard` and every idle path finds no
-///   other `Set`/`UpdateFacing` of `+0x388`, so **a building turret keeps its
-///   last aim** — it never swings back.
-/// - **Aircraft** — its mission/locomotor owns its secondary-facing writes.
-/// - **Infantry** — legacy target-else-body rule.
-///
-/// Aircraft initializes BOTH facings even
-/// without Turret=yes (413FD2..414015). Its self-writers belong to Mission_Attack
-/// and Fly steering/takeoff (4181BB..4185DF, 4CE680, 4CF285/4CF3C5).
-/// AI41514C instead READS its secondary facing and copies it into a Carryall
-/// passenger; FireAt416041 samples it for launch math. Neither writes its own
-/// facing. State4's two setters now run at the firing boundary. This generic
-/// sweep must not overwrite them. Other Mission_Attack and Fly secondary
-/// setters remain required residuals of those mechanisms.
-pub(crate) fn desired_turret_facing(
-    entity: &GameEntity,
-    entities: &EntityStore,
-    rules: Option<&RuleSet>,
-    interner: &crate::sim::intern::StringInterner,
-    binary_frame: u32,
-) -> Option<u16> {
-    entity.barrel_facing.as_ref()?;
-    match entity.category {
-        crate::map::entities::EntityCategory::Unit => {
-            facing_update(entity, entities, rules, interner, binary_frame).turret_destination
-        }
-        crate::map::entities::EntityCategory::Structure
-        | crate::map::entities::EntityCategory::Aircraft => None,
-        _ => Some(
-            entity
-                .attack_target
-                .as_ref()
-                .and_then(|attack| facing_toward_target(entity, &attack.target, entities))
-                .unwrap_or_else(|| entity.body_facing_current(binary_frame)),
-        ),
-    }
-}
-
-/// Per-binary-frame turret rotation for the class this sweep still owns —
-/// legacy Infantry. Unit turrets are driven per-object by the combat Phase-2
-/// read window plus `unit_post::apply_unit_facing`, and a building's by its
-/// Mission_Attack.
-///
-/// Calls `FacingClass::set`, which is a no-op when the desired facing equals the
-/// current destination — so this function is idempotent. `None` from
-/// [`desired_turret_facing`] means "native calls no `Set` this frame".
-pub fn tick_turret_rotation(
-    entities: &mut EntityStore,
-    rules: &RuleSet,
-    native_frame: u32,
-    interner: &crate::sim::intern::StringInterner,
-) {
-    struct TurretUpdate {
-        id: u64,
-        target_facing: u16,
-    }
-    let mut updates: Vec<TurretUpdate> = Vec::new();
-
-    // Phase 1: read each turreted entity's desired facing.
-    let keys: Vec<u64> = entities.keys_sorted();
-    for &id in &keys {
-        let entity = match entities.get(id) {
-            Some(e) => e,
-            None => continue,
-        };
-        // Unit barrels are owned by the per-object path (combat Phase-2 read
-        // window + `unit_post::apply_unit_facing`).
-        if entity.category == crate::map::entities::EntityCategory::Unit {
-            continue;
-        }
-        // A warped object's AI sets no facing; its barrel finishes the turn it
-        // was given (`GameEntity::ai_frozen`).
-        if entity.ai_frozen() {
-            continue;
-        }
-        // Skip non-turreted entities; otherwise take the per-entity desired facing
-        // from the shared helper (single source for sweep + per-object host).
-        let Some(desired_facing) =
-            desired_turret_facing(entity, entities, Some(rules), interner, native_frame)
-        else {
-            continue;
-        };
-
-        updates.push(TurretUpdate {
-            id,
-            target_facing: desired_facing,
-        });
-    }
-
-    // Phase 2: apply rotation via FacingClass::set. Idempotent — no-op when
-    // target already equals current destination.
-    for update in &updates {
-        let rot = rules
-            .object(
-                interner.resolve(
-                    entities
-                        .get(update.id)
-                        .map(|e| e.type_ref())
-                        .unwrap_or_default(),
-                ),
-            )
-            .map(|obj| obj.turret_rot)
-            .unwrap_or(5);
-        if let Some(entity) = entities.get_mut(update.id) {
-            if let Some(ref mut barrel) = entity.barrel_facing {
-                // Refresh ROT in case rules changed (cheap; idempotent).
-                barrel.set_rot(rot);
-                barrel.set(update.target_facing, native_frame);
-            }
-        }
-    }
-}
-
-#[cfg(test)]
+#[cfg(all(test, tests_sim_movement))]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_shortest_rotation_clockwise() {
-        assert_eq!(shortest_rotation(0, 10), 10);
-        assert_eq!(shortest_rotation(200, 210), 10);
-    }
-
-    #[test]
-    fn test_shortest_rotation_counter_clockwise() {
-        assert_eq!(shortest_rotation(10, 0), -10);
-        assert_eq!(shortest_rotation(10, 250), -16); // 250 - 10 = 240 > 128, so 240-256=-16
-    }
-
-    #[test]
-    fn test_shortest_rotation_wrap_around() {
-        // From 250 to 10: clockwise is +16, counter-clockwise is -240. Should pick +16.
-        assert_eq!(shortest_rotation(250, 10), 16);
-        // From 10 to 250: clockwise is +240, counter-clockwise is -16. Should pick -16.
-        assert_eq!(shortest_rotation(10, 250), -16);
+    fn gunner_selection_controls_omni_fire_before_the_first_shot_and_after_reset() {
+        use crate::rules::ini_parser::IniFile;
+        use crate::sim::combat::TargetKind;
+        for ares_way in [false, true] {
+            let _ares = crate::rules::ares_switch::read_ares_way(ares_way);
+            let rules = RuleSet::from_ini(&IniFile::from_str(
+                "[VehicleTypes]\n0=FV\n[InfantryTypes]\n[AircraftTypes]\n[BuildingTypes]\n\
+             [FV]\nTurret=yes\nTurretCount=4\nGunner=yes\nWeaponCount=3\n\
+             NormalTurretWeapon=0\nMachineGunTurretWeapon=2\n\
+             Weapon1=Direct\nWeapon2=Direct\nWeapon3=Omni\n\
+             [Direct]\nDamage=10\nROF=20\nRange=6\nWarhead=WH\n\
+             [Omni]\nDamage=10\nROF=20\nRange=6\nWarhead=WH\nOmniFire=yes\n\
+             [WH]\nVerses=100%,100%,100%,100%,100%,100%,100%,100%,100%,100%,100%\n",
+            ))
+            .unwrap();
+            let object = rules.object("FV").unwrap();
+            let mut entity = GameEntity::test_default(1, "FV", "Americans", 5, 5);
+            entity.barrel_facing = Some(crate::sim::movement::FacingClass::new(0, 5));
+            entity
+                .attack_target
+                .set_for_test(Some(TargetKind::Cell(10, 5)));
+            let mut sim = crate::sim::world::Simulation::new();
+            sim.interner = crate::sim::intern::test_interner();
+            for (mode, turns) in [(0, true), (2, false), (0, true)] {
+                entity.set_gunner_weapon(mode, object, ares_way);
+                assert_eq!(
+                    facing_update(&entity, &sim, &rules, &sim.interner, 100)
+                        .turret_destination
+                        .is_some(),
+                    turns,
+                    "selected mode {mode} must govern facing without a previous shot",
+                );
+            }
+        }
     }
 
     #[test]
@@ -493,13 +389,5 @@ mod tests {
             SimFixed::from_num(128),
         );
         assert!((f as i32 - 16384).abs() < 2, "sub-cell east facing={f}");
-    }
-
-    #[test]
-    fn test_body_facing_to_turret() {
-        assert_eq!(body_facing_to_turret(0), 0);
-        assert_eq!(body_facing_to_turret(64), 16384);
-        assert_eq!(body_facing_to_turret(128), 32768);
-        assert_eq!(body_facing_to_turret(255), 65280);
     }
 }

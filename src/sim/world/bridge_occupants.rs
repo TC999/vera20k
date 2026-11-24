@@ -82,7 +82,7 @@ impl BridgeOccupantHost for Occupants<'_, '_> {
                 .substrate
                 .entities
                 .get(id)
-                .is_some_and(|e| e.category != EntityCategory::Structure),
+                .is_some_and(|e| e.category() != EntityCategory::Structure),
             CellObjectMember::Terrain(_) => false,
         }
     }
@@ -118,7 +118,7 @@ impl BridgeOccupantHost for Occupants<'_, '_> {
                 .substrate
                 .entities
                 .get(id)
-                .map(|e| match e.category {
+                .map(|e| match e.category() {
                     EntityCategory::Unit => 1,
                     EntityCategory::Aircraft => 2,
                     EntityCategory::Structure => 6,
@@ -135,14 +135,14 @@ impl BridgeOccupantHost for Occupants<'_, '_> {
                 .substrate
                 .entities
                 .get(id)
-                .map_or(0, |e| i32::from(e.health.current)),
+                .map_or(0, |e| e.health.current()),
             CellObjectMember::Terrain(id) => self
                 .live
                 .sim
-                .production
                 .terrain_objects
+                .objects()
                 .get(&id)
-                .map_or(0, |e| e.health),
+                .map_or(0, |e| e.health()),
         }
     }
     fn receive_damage(&mut self, member: Member, damage: i32) -> Result<(), String> {
@@ -167,12 +167,14 @@ impl BridgeOccupantHost for Occupants<'_, '_> {
                 );
                 self.live.sim.commit_direct_damage_receiver(
                     self.live.rules,
-                    self.live.registry,
+                    Some(self.live.rules.overlay_registry()),
                     event,
+                    &mut self.live.frame_effects,
                 );
             }
             CellObjectMember::Terrain(id) => {
                 let event = TerrainDamageEvent {
+                    damage_writeback: None,
                     stable_id: id,
                     rx: member.list_cell.0 as u16,
                     ry: member.list_cell.1 as u16,
@@ -183,8 +185,10 @@ impl BridgeOccupantHost for Occupants<'_, '_> {
                 };
                 self.live.sim.commit_direct_terrain_damage_receiver(
                     self.live.rules,
-                    self.live.registry,
+                    Some(self.live.rules.overlay_registry()),
                     event,
+                    true,
+                    &mut self.live.frame_effects,
                 );
             }
         }

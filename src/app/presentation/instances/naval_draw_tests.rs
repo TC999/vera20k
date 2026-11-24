@@ -1,11 +1,12 @@
 //! Physical AEGIS type -> production model/raster -> parent waterline input.
 use super::*;
+use crate::app::presentation::frame::ObjectRecord;
 use crate::render::sinking::SinkingWaterlines;
 use crate::util::sha256::sha256_hex;
 
 fn admission_corpus() -> serde_json::Value {
-    let corpus: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../../tools/spatial_oracle/naval_sinking_clip.json"
+    let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/naval_sinking_clip.json",
     ))
     .unwrap();
     corpus["admission"].clone()
@@ -20,10 +21,14 @@ fn native_draw_entity(input: &serde_json::Value) -> crate::sim::game_entity::Gam
         (xyz[0] / 256) as u16,
         (xyz[1] / 256) as u16,
     );
-    entity.category = EntityCategory::Unit;
-    entity.position.sub_x = crate::util::fixed_math::SimFixed::from_num(xyz[0] % 256);
-    entity.position.sub_y = crate::util::fixed_math::SimFixed::from_num(xyz[1] % 256);
-    entity.position.exact_z_leptons = Some(xyz[2]);
+    entity.set_category_for_test(EntityCategory::Unit);
+    entity
+        .position
+        .set_sub_x_for_test(crate::util::fixed_math::SimFixed::from_num(xyz[0] % 256));
+    entity
+        .position
+        .set_sub_y_for_test(crate::util::fixed_math::SimFixed::from_num(xyz[1] % 256));
+    entity.position.set_exact_z_leptons_for_test(Some(xyz[2]));
     entity
 }
 
@@ -33,6 +38,25 @@ fn native_camera(input: &serde_json::Value) -> [f32; 2] {
         input["camera"][0].as_i64().unwrap() as f32,
         input["camera"][1].as_i64().unwrap() as f32 + TILE_HEIGHT / 2.0,
     ]
+}
+
+/// `unit_draw_anchor` with the battlefield at the frame's corner, `viewport`
+/// across, and the render view the battlefield.
+fn anchor_in(
+    entity: &crate::sim::game_entity::GameEntity,
+    camera: [f32; 2],
+    viewport: [f32; 2],
+    shadow_anchor: Option<[f32; 2]>,
+) -> Option<[f32; 2]> {
+    unit_draw_anchor(
+        &ObjectRecord::of_test(entity),
+        crate::app::presentation::instances::TacticalAdmission {
+            corner: camera,
+            size: viewport,
+        },
+        [camera[0], camera[1], viewport[0], viewport[1]],
+        shadow_anchor,
+    )
 }
 
 #[test]
@@ -45,7 +69,7 @@ fn sinking_unit_draw_admission_matches_original_projection_boundaries() {
         let entity = native_draw_entity(input);
         let viewport = std::array::from_fn(|i| input["viewport"][i].as_i64().unwrap() as f32);
         let camera = native_camera(input);
-        let anchor = unit_draw_anchor(&entity, camera, viewport);
+        let anchor = anchor_in(&entity, camera, viewport, None);
         assert_eq!(
             anchor.is_some(),
             row["output"]["admitted"].as_bool().unwrap(),
@@ -58,6 +82,24 @@ fn sinking_unit_draw_admission_matches_original_projection_boundaries() {
             );
         }
     }
+}
+
+#[test]
+fn visible_ground_shadow_keeps_high_aircraft_in_the_draw_plan() {
+    let mut entity = crate::sim::game_entity::GameEntity::test_default_of_category(
+        1,
+        "ORCA",
+        "Americans",
+        10,
+        10,
+        EntityCategory::Aircraft,
+    );
+    entity.position.set_exact_z_leptons_for_test(Some(10000));
+    let camera = [-320.0, 215.0];
+    let viewport = [640.0, 480.0];
+    assert!(anchor_in(&entity, camera, viewport, None).is_none());
+    assert!(anchor_in(&entity, camera, viewport, Some([0.0, 330.0])).is_some());
+    assert!(anchor_in(&entity, [5000.0, 5000.0], viewport, Some([0.0, 330.0])).is_none());
 }
 
 #[test]
@@ -77,14 +119,15 @@ fn offscreen_first_sinking_draw_survives_descent_camera_pan_and_save_load() {
     };
     let mut cache = SinkingWaterlines::default();
     let mut sim = crate::sim::world::Simulation::new();
-    sim.session.map_name = "DRAW-ADMISSION.MAP".into();
-    sim.scenario_rng = crate::sim::rng::SimRng::new(0);
+    sim.session_mut_for_test()
+        .set_map_name_for_test("DRAW-ADMISSION.MAP".into());
+    *sim.scenario_rng_mut_for_test() = crate::sim::rng::SimRng::new(0);
     let hash = sim.state_hash();
     for step in corpus["sequence"].as_array().unwrap() {
         let input = &step["input"];
         let entity = native_draw_entity(input);
         let viewport = std::array::from_fn(|i| input["viewport"][i].as_i64().unwrap() as f32);
-        let anchor = unit_draw_anchor(&entity, native_camera(input), viewport)
+        let anchor = anchor_in(&entity, native_camera(input), viewport, None)
             .expect("original Unit DrawIt admits this offscreen or camera-panned anchor");
         let bounds = composite_draw_bounds([(entry, anchor)]);
         let clip = bounds.unit_waterline(&mut cache, entity.stable_id(), true);
@@ -100,23 +143,30 @@ fn offscreen_first_sinking_draw_survives_descent_camera_pan_and_save_load() {
         );
         if native_clips {
             assert_eq!(
-                draw.effect_tint[3] - native_camera(input)[1],
+                draw.sinking_row - native_camera(input)[1],
                 step["output"]["clip"][3].as_i64().unwrap() as f32
             );
         }
         // Use the app's actual neutral snapshot supplement between draws.
-        let bytes = GameSnapshot::save_validated_with_sinking_waterlines(
+        let bytes = GameSnapshot::save_validated_with_presentation(
             &sim,
             1,
             2,
             "offscreen sinking",
             3,
             &cache.saved(),
-        );
-        let loaded = GameSnapshot::load_validated(&bytes, 1, 2, "DRAW-ADMISSION.MAP").unwrap();
-        assert_eq!(loaded.sim.state_hash(), hash);
+            &[],
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut loaded = GameSnapshot::load_validated(&bytes, 1, 2, "DRAW-ADMISSION.MAP").unwrap();
+        let waterlines = std::mem::take(&mut loaded.sinking_waterlines);
+        assert_eq!(loaded.into_simulation_for_test().state_hash(), hash);
         cache.clear();
-        cache.restore(loaded.sinking_waterlines);
+        cache.restore(waterlines);
     }
 }
 
@@ -132,8 +182,8 @@ fn retail_aegis_raster_and_parent_waterline_match_original_ship_draw() {
         crate::assets::asset_manager::MediaArchiveMode::STOCK_DIGITAL,
     )
     .unwrap();
-    let corpus: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../../tools/spatial_oracle/naval_draw_bounds.json"
+    let corpus: serde_json::Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/naval_draw_bounds.json",
     ))
     .unwrap();
     for (name, provenance) in corpus["files"].as_object().unwrap() {
@@ -163,6 +213,7 @@ fn retail_aegis_raster_and_parent_waterline_match_original_ship_draw() {
         let facing = row["input"]["facing_step32"].as_u64().unwrap() as u8 * 8;
         let key = UnitSpriteKey {
             type_id: "AEGIS".into(),
+            turret_index: 0,
             facing,
             layer: VxlLayer::Composite,
             frame: 0,

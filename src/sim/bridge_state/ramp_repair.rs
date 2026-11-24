@@ -7,7 +7,7 @@ use super::publication::CellCoord;
 use crate::map::bridge_rim_tiles::HighBridgeRimTiles;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Family {
+pub enum Family {
     High,
     Low,
 }
@@ -326,6 +326,6 @@ pub(crate) fn repair<H: RepairHost>(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 #[path = "ramp_repair_tests.rs"]
 mod tests;

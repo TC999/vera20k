@@ -3,7 +3,7 @@
 //! Manages animation sequences (stand, walk, attack, die) for SHP sprite entities.
 //! Each entity with an `Animation` component has a current sequence, frame index,
 //! and reached-frame counter. The `tick_animations()` function advances frames and
-//! handles auto-transitions (e.g., stand ↔ walk based on MovementTarget).
+//! follows each completed sequence's transition.
 //!
 //! ## SHP frame layout
 //! Infantry SHP files pack multiple sequences contiguously:
@@ -18,15 +18,16 @@
 //!   `shp_frame = start + frame_within_sequence`
 //!
 //! ## Auto-transitions
-//! - Entity gains MovementTarget → switch to Walk
-//! - Entity loses MovementTarget → switch back to Stand
 //! - Attack sequence finishes → switch to Stand (TransitionTo)
 //! - Die sequence finishes → hold last frame (HoldLast)
 //!
+//! Motion switches no sequence: Infantry's Doing/Stage owns its own, and the
+//! Unit SHP draw picks Walk or Stand by the locomotor's Is_Moving.
+//!
 //! ## Dependency rules
-//! - Part of sim/ — depends on sim/components (MovementTarget, TypeRef) and
-//!   re-exports the rules-owned sequence vocabulary below.
-//! - sim/ NEVER depends on render/, ui/, sidebar/, audio/, net/.
+//! - Part of sim/ — reads entity, movement and rules state, and re-exports the
+//!   rules-owned sequence vocabulary below.
+//! - sim/ NEVER depends on render/, ui/, audio/, net/.
 
 use std::collections::BTreeMap;
 
@@ -34,7 +35,7 @@ use std::collections::BTreeMap;
 // (`rules::animation_sequence`, F04); sim re-exports the types so runtime
 // consumers and serialized components keep their existing paths.
 pub use crate::rules::animation_sequence::{
-    FacingSlots, LoopMode, SequenceDef, SequenceKind, SequenceSet, ShpVehicleCadence,
+    FacingSlots, FootBodyCadence, LoopMode, SequenceDef, SequenceKind, SequenceSet,
     default_building_sequences, default_infantry_sequences,
 };
 
@@ -62,8 +63,10 @@ const VEHICLE_FACING_SLOTS: u8 = 8;
 /// the byte carries every bit the native expression can see — matching it needs
 /// no 16-bit plumbing. The `+ 1` before the final shift is a round-half-up, which
 /// is why this is not the same as truncating the facing into eight buckets.
-const fn infantry_facing_step32(facing: u8) -> usize {
-    (((facing as u16 >> 2) + 1) >> 1) as usize & 0x1F
+fn infantry_facing_step32(facing: u8) -> usize {
+    usize::from(crate::util::direction_tables::step32_from_facing16(
+        u16::from(facing) << 8,
+    ))
 }
 
 /// Facing byte to SHP vehicle frame-block slot.
@@ -72,8 +75,8 @@ const fn infantry_facing_step32(facing: u8) -> usize {
 /// shift keeps only bits 12..=15 of the 16-bit facing, which are bits 4..=7 of
 /// the byte. The inner `+ 1` rounds to the nearest octant; the outer `+ 1` is
 /// what puts NW — not N — at frame 0 of every block.
-const fn vehicle_facing_slot(facing: u8) -> u16 {
-    ((((facing as u16 >> 4) + 1) >> 1) + 1) & 7
+fn vehicle_facing_slot(facing: u8) -> u16 {
+    u16::from((crate::util::direction::direction_from_facing(facing) + 1) & 7)
 }
 
 /// Facing byte to infantry frame-block slot (0..=7), counter-clockwise from
@@ -88,17 +91,19 @@ pub fn infantry_facing_slot(facing: u8) -> u16 {
 /// Attach to any entity that should animate. The `tick_animations()` system
 /// reads and updates this each frame. The render loop reads `sequence` and
 /// `frame_index` to select the correct SHP frame via `resolve_shp_frame()`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+/// Only this module writes it. Its native counterpart has not been traced
+/// (#1593).
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct Animation {
     /// Currently playing sequence.
-    pub sequence: SequenceKind,
+    sequence: SequenceKind,
     /// Current frame within the sequence (0 to frame_count - 1).
     /// Infantry draws from its private native Stage and Doing instead.
-    pub frame_index: u16,
+    frame_index: u16,
     /// Reached native frames accumulated since the last image advance.
-    pub elapsed_frames: u16,
+    elapsed_frames: u16,
     /// True if a HoldLast sequence has reached its final frame.
-    pub finished: bool,
+    finished: bool,
 }
 
 impl Animation {
@@ -112,6 +117,26 @@ impl Animation {
         }
     }
 
+    /// The playing sequence.
+    pub fn sequence(&self) -> SequenceKind {
+        self.sequence
+    }
+
+    /// The frame within the sequence.
+    pub fn frame_index(&self) -> u16 {
+        self.frame_index
+    }
+
+    /// Reached native frames since the last image advance.
+    pub fn elapsed_frames(&self) -> u16 {
+        self.elapsed_frames
+    }
+
+    /// A HoldLast sequence reached its last frame.
+    pub fn finished(&self) -> bool {
+        self.finished
+    }
+
     /// Switch to a different sequence, resetting frame and timing.
     /// No-op if already playing the requested sequence.
     pub fn switch_to(&mut self, sequence: SequenceKind) {
@@ -122,30 +147,39 @@ impl Animation {
             self.finished = false;
         }
     }
-}
 
-/// Whether a sequence represents the infantry being in a prone stance.
-///
-/// This is a temporary stance proxy until the sim carries an explicit prone bit.
-#[cfg(test)]
-pub fn sequence_is_prone(sequence: SequenceKind) -> bool {
-    matches!(
-        sequence,
-        SequenceKind::Prone
-            | SequenceKind::Crawl
-            | SequenceKind::FireProne
-            | SequenceKind::SecondaryProne
-            | SequenceKind::Down
-    )
+    /// Install a fixture's sequence.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_sequence_for_test(&mut self, sequence: SequenceKind) {
+        self.sequence = sequence;
+    }
+
+    /// Install a fixture's frame.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_frame_index_for_test(&mut self, frame_index: u16) {
+        self.frame_index = frame_index;
+    }
+
+    /// Install a fixture's elapsed frames.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_elapsed_frames_for_test(&mut self, elapsed_frames: u16) {
+        self.elapsed_frames = elapsed_frames;
+    }
+
+    /// Install a fixture's HoldLast end.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn set_finished_for_test(&mut self, finished: bool) {
+        self.finished = finished;
+    }
 }
 
 fn sequence_set_for_type<'a>(
     sequences: &'a BTreeMap<String, SequenceSet>,
-    rules: Option<&crate::rules::ruleset::RuleSet>,
+    rules: &crate::rules::ruleset::RuleSet,
     type_name: &str,
 ) -> Option<&'a SequenceSet> {
     sequences.get(type_name).or_else(|| {
-        let canonical = rules?.object(type_name)?.id.as_str();
+        let canonical = rules.object(type_name)?.id.as_str();
         sequences.get(canonical)
     })
 }
@@ -185,33 +219,58 @@ pub fn resolve_shp_frame<'a>(
     facing: u8,
     frame_index: i32,
 ) -> i32 {
-    let (start, count, stride, slot) = match def.into() {
-        ShpFrameDefinition::Infantry(record) => (
+    match def.into() {
+        ShpFrameDefinition::Infantry(record) => resolve_shp_frame_parts(
             record.start_frame,
             record.frames_per_facing,
             record.facings,
             i32::from(infantry_facing_slot(facing)),
+            frame_index,
         ),
-        ShpFrameDefinition::Generic(def) => {
-            let slot = match def.facing_slots {
-                FacingSlots::InfantryTable => infantry_facing_slot(facing),
-                FacingSlots::VehicleOctant if def.facings == VEHICLE_FACING_SLOTS => {
-                    vehicle_facing_slot(facing)
-                }
-                FacingSlots::VehicleOctant => 0,
-            };
-            (
-                i32::from(def.start_frame),
-                i32::from(def.frame_count),
-                if def.facings <= 1 {
-                    0
-                } else {
-                    i32::from(def.facing_multiplier)
-                },
-                i32::from(slot),
-            )
+        ShpFrameDefinition::Generic(def) => resolve_generic_shp_frame(def, facing, frame_index),
+    }
+}
+
+fn resolve_generic_shp_frame(def: &SequenceDef, facing: u8, frame_index: i32) -> i32 {
+    let slot = match def.facing_slots {
+        FacingSlots::InfantryTable => infantry_facing_slot(facing),
+        FacingSlots::VehicleOctant if def.facings == VEHICLE_FACING_SLOTS => {
+            vehicle_facing_slot(facing)
         }
+        FacingSlots::VehicleOctant => 0,
     };
+    resolve_shp_frame_parts(
+        i32::from(def.start_frame),
+        i32::from(def.frame_count),
+        if def.facings <= 1 {
+            0
+        } else {
+            i32::from(def.facing_multiplier)
+        },
+        i32::from(slot),
+        frame_index,
+    )
+}
+
+/// One SHP Unit block's image: its start, the bucket times the block's
+/// frames, and the step within it (`0x0073C65B..0x0073C71D`).
+fn vehicle_block_frame(def: &SequenceDef, slot: i32, frame_index: i32) -> i32 {
+    resolve_shp_frame_parts(
+        i32::from(def.start_frame),
+        i32::from(def.frame_count),
+        i32::from(def.facing_multiplier),
+        slot,
+        frame_index,
+    )
+}
+
+fn resolve_shp_frame_parts(
+    start: i32,
+    count: i32,
+    stride: i32,
+    slot: i32,
+    frame_index: i32,
+) -> i32 {
     let within = frame_index % count.max(1);
     let direction = if stride > 0 {
         slot.wrapping_mul(stride)
@@ -221,67 +280,299 @@ pub fn resolve_shp_frame<'a>(
     start.wrapping_add(direction).wrapping_add(within)
 }
 
-/// Advance the persistent Unit SHP body counter at FootClass's post-Process
+/// `FootClass+0x538`, the persistent body-animation counter. Unit SHP and
+/// Unit/Aircraft voxel drawing reduce it against the selected model's frame count.
+/// MoveSound also consumes its delta; this is serialized and hashed state. It
+/// advances on absolute binary-frame cadence in `FootClass::AI`
+/// (`0x004DA886..0x004DAA01`, [`tick_foot_body_frame_counter`]) and never
+/// resets on a visual transition or deployment. It is a native dword, so the
+/// increment wraps.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct BodyFrameCounter {
+    value: u32,
+}
+
+impl BodyFrameCounter {
+    /// The counter.
+    pub const fn get(self) -> u32 {
+        self.value
+    }
+
+    /// `FootClass::AI`'s increment.
+    fn advance(&mut self) {
+        self.value = self.value.wrapping_add(1);
+    }
+
+    /// Install a fixture's counter.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_for_test(&mut self, value: u32) {
+        self.value = value;
+    }
+}
+
+/// UnitClass+6C0. Original7353E0 constructs -1; successful Unit741421
+/// seeds the signed-byte ART FiringFrames countdown. Unit7363C9 advances it
+/// before Foot AI. A limboed parasite has no Logic visit and retains the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct UnitFiringCounter {
+    value: i32,
+}
+
+impl Default for UnitFiringCounter {
+    fn default() -> Self {
+        Self { value: -1 }
+    }
+}
+
+impl UnitFiringCounter {
+    /// Native signed countdown; -1 selects the non-firing body branch.
+    pub const fn get(self) -> i32 {
+        self.value
+    }
+
+    fn advance(&mut self) {
+        self.value = self.value.wrapping_sub(1).max(-1);
+    }
+
+    /// Whether the countdown moves: every value but the resting -1, which
+    /// [`tick_unit_firing_counter`] leaves as it is.
+    pub(crate) const fn counting(self) -> bool {
+        self.value != -1
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    /// Install an original comparison or persistence fixture's raw counter.
+    pub fn set_for_test(&mut self, value: i32) {
+        self.value = value;
+    }
+}
+
+/// UnitClass+6D8, the art `DeathFrames=` counter. The constructor stores -1
+/// (`0x00735416`); a lethal hit on a type with `DeathFrames=` above zero
+/// starts it at 0 (`UnitClass::ReceiveDamage`, `0x00737DB1..0x00737DBF`), and
+/// `UnitClass::AI` counts it (`0x0073635B..0x0073637D`) until the count passes
+/// `MaxDeathCounter=`. While it runs the Unit's vt+0x37C (`0x00746C90`)
+/// answers yes and its SHP body draws death frames (`0x0073C6AD`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct UnitDeathCounter {
+    value: i32,
+}
+
+impl Default for UnitDeathCounter {
+    fn default() -> Self {
+        Self { value: -1 }
+    }
+}
+
+impl UnitDeathCounter {
+    pub const fn get(self) -> i32 {
+        self.value
+    }
+
+    /// Every value but the constructor's -1.
+    pub(crate) const fn running(self) -> bool {
+        self.value != -1
+    }
+
+    /// `0x00737DB1..0x00737DBF`: the first lethal hit starts the count, a
+    /// later one leaves it. Returns whether this hit started it.
+    pub(crate) fn start(&mut self) -> bool {
+        if self.value != -1 {
+            return false;
+        }
+        self.value = 0;
+        true
+    }
+
+    /// `0x00736366..0x0073637D`: store the next count and answer whether the
+    /// one before it had reached `max` (a signed compare).
+    pub(crate) fn advance(&mut self, max: i32) -> bool {
+        let old = self.value;
+        self.value = old.wrapping_add(1);
+        max <= old
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_for_test(&mut self, value: i32) {
+        self.value = value;
+    }
+}
+
+/// Admitted Unit7363C9..7363DE, before Hunt/Ready/Foot AI. Entry lifecycle,
+/// Tube and Temporal gates belong to the existing Unit AI caller.
+pub(crate) fn tick_unit_firing_counter(entity: &mut crate::sim::game_entity::GameEntity) {
+    entity.unit_firing_counter.advance();
+}
+
+/// Successful Unit741410..741421, after the base FireAt/LimboLaunch tail.
+/// Stock DRON retains native FiringSyncFrame0/1=-1. The sync-gated primary
+/// arm remains unrepresented with the existing fire-error reader; this writer
+/// covers the represented, unsynchronized Unit types, not that dormant arm.
+pub(crate) fn commit_unit_firing_counter(
+    entity: &mut crate::sim::game_entity::GameEntity,
+    firing_frames: i8,
+) {
+    if firing_frames > 0 {
+        entity.unit_firing_counter.value = i32::from(firing_frames) * 2 - 1;
+    }
+}
+
+/// Advance the persistent Foot body counter at FootClass's post-Process
 /// point for the current absolute binary frame.
 ///
 /// The moving branch deliberately does not guard a zero `WalkRate`: retail
 /// feeds that raw signed value to IDIV, making zero invalid content. `IdleRate`
-/// is different â€” zero is its documented branch-off switch and performs no
+/// is different — zero is its documented branch-off switch and performs no
 /// division. The counter itself is a native dword, so increment wraps.
-pub(crate) fn tick_shp_vehicle_body_frame_counter(
+///
+/// The same Foot entry is reached by Unit73647B, Infantry51BC9F and
+/// Aircraft414DA3. Only the HoverAttack arm asks for a Unit; the ordinary
+/// moving/idle/DeployToLand arms serve every Foot. Original concrete-class
+/// controls: tools/spatial_oracle/unit_simple_deploy.json.
+///
+/// `air_rate` is the type's Ares `AirRate` (0 in a stock game).
+pub(crate) fn tick_foot_body_frame_counter(
     entity: &mut crate::sim::game_entity::GameEntity,
-    rules: Option<crate::sim::movement::SpeedRules<'_>>,
-    cadence: ShpVehicleCadence,
+    rules: crate::sim::movement::SpeedRules<'_>,
+    cadence: FootBodyCadence,
+    hover_attack: bool,
+    deploy_to_land: bool,
+    air_rate: i32,
+    terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
     binary_frame: u32,
 ) {
-    if entity.category != crate::map::entities::EntityCategory::Unit
-        || entity.is_voxel
-        || entity.dying
-        || !entity.lifecycle.object_alive
-        || entity.lifecycle.in_limbo
-        || entity.is_falling_down()
-    {
-        return;
-    }
-
-    let Some(locomotor) = entity.locomotor.as_ref() else {
-        return;
-    };
-    if locomotor.piggyback.is_some()
-        || entity.deploy_state.is_some()
-        || entity.is_warped_out()
-        || entity.is_warping_in()
-    {
-        return;
-    }
-
-    let rate =
-        if crate::sim::movement::ready_producer::is_moving_now_for(entity, rules, binary_frame) {
-            cadence.walk_rate
-        } else {
-            if cadence.idle_rate == 0 {
-                return;
-            }
-            cadence.idle_rate
-        };
-
-    if (binary_frame as i32) % rate == 0 {
-        entity.body_frame_counter = entity.body_frame_counter.wrapping_add(1);
+    if foot_body_frame_due(
+        entity,
+        rules,
+        cadence,
+        hover_attack,
+        deploy_to_land,
+        air_rate,
+        terrain,
+        binary_frame,
+    ) {
+        entity.body_frame_counter.advance();
     }
 }
 
-/// Resolve the ordinary UnitClass SHP body frame from the persistent Foot
-/// counter. Firing and death counters intentionally stay on their existing
-/// paths; this helper covers only the standing/walking draw branch.
+/// Whether [`tick_foot_body_frame_counter`] advances `entity`'s counter at
+/// `binary_frame`; otherwise it changes nothing.
+pub(crate) fn foot_body_frame_due(
+    entity: &crate::sim::game_entity::GameEntity,
+    rules: crate::sim::movement::SpeedRules<'_>,
+    cadence: FootBodyCadence,
+    hover_attack: bool,
+    deploy_to_land: bool,
+    air_rate: i32,
+    terrain: Option<&crate::map::resolved_terrain::ResolvedTerrainGrid>,
+    binary_frame: u32,
+) -> bool {
+    if !entity.category().is_foot()
+        || entity.death.is_dying()
+        || !entity.lifecycle.object_alive()
+        || entity.lifecycle.in_limbo()
+        || entity.is_falling_down()
+    {
+        return false;
+    }
+
+    if entity.locomotor.is_none()
+        || entity.lift.swap_active()
+        || entity.is_warped_out()
+        || entity.is_warping_in()
+    {
+        return false;
+    }
+    // Ares 3.0 FootClass_Update_AnimRate (100493D0, hook 0x4DA8B2), past the
+    // same warp and locomotor-swap refusals: a nonzero `AirRate` alone
+    // decides an airborne (GetHeight > 0) Foot's step.
+    if air_rate != 0 && crate::sim::movement::air_movement::current_fly_height(entity, terrain) > 0
+    {
+        return (binary_frame as i32).wrapping_rem(air_rate) == 0;
+    }
+    // Foot4DA886..4DAA01: the same+538 feeds SHP and voxel drawing.
+    // HoverAttack is Type+390, not TurretSpins. Native deploy6E0 only
+    // excludes that hover-attack walk arm; it does not suppress IdleRate.
+    let moving = crate::sim::movement::motion_query::is_moving_now(entity, rules, binary_frame);
+    let walking = moving
+        || (entity.category() == crate::map::entities::EntityCategory::Unit
+            && entity.attack_target.target().is_some()
+            && hover_attack
+            && !entity.is_fully_deployed());
+    (walking && (binary_frame as i32) % cadence.walk_rate == 0)
+        || (cadence.idle_rate != 0 && !moving && (binary_frame as i32) % cadence.idle_rate == 0)
+        // GetHeight (vt+0x1C8) at `0x004DA9CD`.
+        || (deploy_to_land
+            && crate::sim::movement::air_movement::current_fly_height(entity, terrain) > 0)
+}
+
+/// The facing bucket an SHP Unit's body draws (`UnitClass::Draw_Body_And_Turret`
+/// `0x0073C613..0x0073C64B`), from the actual type's `Facings=` (UnitType
+/// `+0xE3C`) and PrimaryFacing's current 16-bit facing. A disguised Unit
+/// (vt+0xC4) draws bucket 0.
+///
+/// Stock gamemd buckets only an eight-facing type:
+/// `(((facing >> 12) + 1) >> 1) + 1 & 7`; any other count draws bucket 0.
+/// Ares 3.0 `UnitClass_DrawSHP_FacingsA` (hook `0x0073C613`, Ares.dll
+/// `0x10047FE0`, resuming at `0x0073C64B`) buckets any count of at least 8:
+/// with `n = floor(log2(Facings))`, `(((facing + 0x2000) >> (15 - n)) + 1) >> 1`
+/// masked to `2^n - 1`, which is the stock value for 8. A count below 8, or
+/// not positive, draws bucket 0. From `n = 16` the hook neither shifts nor
+/// masks. `facing` is PrimaryFacing's current value: stock reads it through
+/// FacingClass::Current (`0x004C93D0`, called at `0x0073C636`); the Ares hook
+/// through its own inline copy (`0x10048064..0x10048102`,
+/// [`FacingClass::current_ares`](crate::sim::movement::FacingClass::current_ares)).
+pub fn shp_vehicle_facing_slot(facings: i32, facing: u16, disguised: bool, ares: bool) -> i32 {
+    if disguised {
+        return 0;
+    }
+    if !ares {
+        return if facings == i32::from(VEHICLE_FACING_SLOTS) {
+            i32::from(vehicle_facing_slot((facing >> 8) as u8))
+        } else {
+            0
+        };
+    }
+    let count = u32::try_from(facings).unwrap_or(0);
+    crate::util::direction_tables::ares_facing_bucket(count, facing) as i32
+}
+
+/// Unit73C64B..73C725: an active firing counter precedes Stand/Walk and
+/// advances one image per two counter steps, in descending image order,
+/// with no bound
+/// ([`ShpVehicleFireFrames::image`](crate::rules::animation_sequence::ShpVehicleFireFrames::image)).
+/// The persistent Foot counter continues to own Stand/Walk. A still body
+/// with no `IdleRate=` and a running death counter draws its death image
+/// instead of Stand (`0x0073C6AD..0x0073C6D3`), and one whose Foot
+/// occupation enable is clear draws its bare bucket. `set` is the type whose
+/// frame layout the draw reads (`UnitType+0x6C4`, or the Ares water type,
+/// see `UnitClass_DrawSHP_ChangeType1`), and `slot` its facing bucket
+/// ([`shp_vehicle_facing_slot`]); each block multiplies the bucket by its
+/// own frame count (`0x0073C65B..0x0073C71D`).
 pub fn resolve_shp_vehicle_body_frame(
     set: &SequenceSet,
-    facing: u8,
+    slot: i32,
     body_frame_counter: u32,
+    firing_counter: i32,
+    death_counter: i32,
     locomotor_is_moving: bool,
+    occupation_enabled: bool,
 ) -> Option<u16> {
     let cadence = set.shp_vehicle_cadence()?;
+    if firing_counter >= 0 {
+        return u16::try_from(set.shp_vehicle_fire()?.image(slot, firing_counter)).ok();
+    }
     let sequence = if locomotor_is_moving || cadence.idle_rate != 0 {
         SequenceKind::Walk
+    } else if death_counter >= 0 {
+        return u16::try_from(set.shp_vehicle_death()?.image(death_counter)).ok();
+    } else if !occupation_enabled {
+        // `0x0073C6D5..0x0073C6DD`: with the Foot occupation enable
+        // (`+0x6B6`) clear, the image is the bare facing bucket.
+        return u16::try_from(slot).ok();
     } else {
         SequenceKind::Stand
     };
@@ -291,7 +582,7 @@ pub fn resolve_shp_vehicle_body_frame(
     } else {
         0
     };
-    u16::try_from(resolve_shp_frame(def, facing, i32::from(frame_index))).ok()
+    u16::try_from(vehicle_block_frame(def, slot, i32::from(frame_index))).ok()
 }
 
 /// Advance a single animation by one reached native gameplay frame.
@@ -343,143 +634,137 @@ pub fn advance_animation(
 
 /// Advance all animated entities by one reached native gameplay frame.
 ///
-/// 1. Dying entities: skip auto-transitions, only advance death animation.
-///    Returns IDs of dying entities whose death animation has finished.
-/// 2. Auto-transitions: entities with MovementTarget switch to Walk;
-///    entities without MovementTarget switch back to Stand.
-/// 3. Attack transitions: stationary entities with attack_target switch to
-///    Attack (or FireProne/DeployedFire depending on stance).
-/// 4. Advances frame timing for each entity's current sequence.
+/// 1. Dying entities: only advance the death animation. Returns IDs of
+///    dying entities whose death animation has finished.
+/// 2. Advances frame timing for each entity's current sequence, following a
+///    completed sequence's `TransitionTo`.
 ///
 /// `sequences` maps type_id → SequenceSet for frame timing lookup.
 /// Entities whose type_id isn't in the map are skipped (no animation advance).
-#[allow(clippy::too_many_arguments)]
 fn tick_animations_impl(
     entities: &mut crate::sim::entity_store::EntityStore,
     sequences: &BTreeMap<String, SequenceSet>,
-    rules: Option<&crate::rules::ruleset::RuleSet>,
+    rules: &crate::rules::ruleset::RuleSet,
     game_options: &crate::sim::game_options::GameOptions,
     interner: &crate::sim::intern::StringInterner,
     binary_frame: u32,
     tick_dying: bool,
 ) -> Vec<u64> {
     let mut dying_finished: Vec<u64> = Vec::new();
-    let keys: Vec<u64> = entities.keys_sorted();
-
-    for &id in &keys {
-        let Some(entity) = entities.get(id) else {
-            continue;
-        };
-        if entity.dying && !tick_dying {
-            continue;
-        }
-        // The stage steps in TechnoClass::AI_Update (`0x006FAC4D`), which a
-        // warped object never reaches (`GameEntity::ai_frozen`): its pose holds.
-        if !entity.dying && entity.ai_frozen() {
-            continue;
-        }
-        // Its Doing's sequence, which its actions restart and whose stage
-        // steps in its own turn (`sim::movement::infantry_action`); this
-        // frame-end clock leaves it.
-        if crate::sim::movement::infantry_action::doing_owns_sequence(entity) {
-            continue;
-        }
-        if entity.animation.is_none() {
-            // Dying entity with no animation → ready for despawn.
-            if entity.dying {
-                dying_finished.push(id);
+    // Only a Unit or an Aircraft is built with an Animation
+    // (`world_spawn::construction`), and an Infantry leaves below whatever it
+    // holds, so the frame-end step reads those two classes alone (VERA-only,
+    // results unchanged). The whole-store walk also reports dying objects
+    // that hold none.
+    let animated = |category| {
+        matches!(
+            category,
+            crate::map::entities::EntityCategory::Unit
+                | crate::map::entities::EntityCategory::Aircraft
+        )
+    };
+    debug_assert!(
+        tick_dying
+            || !crate::sim::touch_log::live_read_check_enabled()
+            || entities
+                .values_of_category(crate::map::entities::EntityCategory::Structure)
+                .all(|entity| entity.animation.is_none()),
+        "a Structure holds an Animation the frame-end step would not advance"
+    );
+    entities.for_each_entry_mut(
+        |category| tick_dying || animated(category),
+        |entry| {
+            let id = entry.id();
+            let entity = entry.get();
+            if entity.death.is_dying() && !tick_dying {
+                return;
             }
-            continue;
-        }
-        let entity = entities
-            .get_mut(id)
-            .expect("an animated entity was just read");
-        let type_ref = entity.type_ref();
-        let anim = entity
-            .animation
-            .as_mut()
-            .expect("an animated entity was just read");
-
-        // Dying entities: only advance the death animation, skip all transitions.
-        if entity.dying {
-            if anim.finished {
-                dying_finished.push(id);
-                continue;
+            // The stage steps in TechnoClass::AI_Update (`0x006FAC4D`), which a
+            // warped object never reaches (`GameEntity::ai_frozen`): its pose holds.
+            if !entity.death.is_dying() && entity.ai_frozen() {
+                return;
             }
-            let Some(seq_set) = sequence_set_for_type(sequences, rules, interner.resolve(type_ref))
-            else {
-                dying_finished.push(id);
-                continue;
-            };
-            let Some(def) = seq_set.get(&anim.sequence) else {
-                dying_finished.push(id);
-                continue;
-            };
-            advance_animation(anim, def, game_options);
-            if anim.finished {
-                dying_finished.push(id);
+            // Its Doing's sequence, which its actions restart and whose stage
+            // steps in its own turn (`sim::movement::infantry_action`); this
+            // frame-end clock leaves it.
+            if crate::sim::movement::infantry_action::doing_owns_sequence(entity) {
+                return;
             }
-            continue;
-        }
-
-        let has_movement: bool = entity.movement_target.is_some();
-        // Infantry never enters this cascade: Doing/Stage is its only
-        // sequence clock. Retain the existing non-Infantry visual transitions.
-        let seq_set = sequence_set_for_type(sequences, rules, interner.resolve(type_ref));
-        match entity.deploy_state {
-            Some(crate::sim::deploy::DeployPhase::Deploying { .. }) => {
-                anim.switch_to(SequenceKind::Deploy)
-            }
-            Some(crate::sim::deploy::DeployPhase::Undeploying { .. }) => {
-                anim.switch_to(SequenceKind::Undeploy)
-            }
-            Some(crate::sim::deploy::DeployPhase::Deployed) => {
-                if anim.sequence != SequenceKind::DeployedFire {
-                    anim.switch_to(SequenceKind::Deployed);
+            if entity.animation.is_none() {
+                // Dying entity with no animation → ready for despawn.
+                if entity.death.is_dying() {
+                    dying_finished.push(id);
                 }
+                return;
             }
-            None => {
-                if has_movement && anim.sequence == SequenceKind::Stand {
-                    anim.switch_to(SequenceKind::Walk);
-                } else if !has_movement
-                    && matches!(anim.sequence, SequenceKind::Walk | SequenceKind::Crawl)
-                {
-                    anim.switch_to(SequenceKind::Stand);
+            let entity = entry.into_mut();
+            let type_ref = entity.type_ref();
+            let category = entity.category();
+            let anim = entity
+                .animation
+                .as_mut()
+                .expect("an animated entity was just read");
+
+            // Dying entities: only advance the death animation, skip all transitions.
+            if entity.death.is_dying() {
+                if anim.finished {
+                    dying_finished.push(id);
+                    return;
                 }
+                let Some(seq_set) =
+                    sequence_set_for_type(sequences, rules, interner.resolve(type_ref))
+                else {
+                    dying_finished.push(id);
+                    return;
+                };
+                let Some(def) = seq_set.get(&anim.sequence) else {
+                    dying_finished.push(id);
+                    return;
+                };
+                advance_animation(anim, def, game_options);
+                if anim.finished {
+                    dying_finished.push(id);
+                }
+                return;
             }
-        }
 
-        // Advance frame timing.
-        let Some(set) = seq_set else {
-            continue;
-        };
-        let Some(def) = set.get(&anim.sequence) else {
-            continue;
-        };
+            // Infantry never enters this cascade: Doing/Stage is its only
+            // sequence clock. Motion does not switch the sequence either: the Unit
+            // SHP draw picks Walk or Stand by the locomotor's Is_Moving (vt+0x10 at
+            // `0x0073C696`, `resolve_shp_vehicle_body_frame`).
+            let seq_set = sequence_set_for_type(sequences, rules, interner.resolve(type_ref));
 
-        // UnitClass SHP Stand/Walk images are selected from Foot's persistent
-        // body counter at draw time. Do not advance a second relative clock or
-        // reset cadence when the generic visual sequence changes.
-        if entity.category == crate::map::entities::EntityCategory::Unit
-            && !entity.is_voxel
-            && set.shp_vehicle_cadence().is_some()
-            && matches!(anim.sequence, SequenceKind::Stand | SequenceKind::Walk)
-        {
-            continue;
-        }
+            // Advance frame timing.
+            let Some(set) = seq_set else {
+                return;
+            };
+            let Some(def) = set.get(&anim.sequence) else {
+                return;
+            };
 
-        if let Some(next) = advance_animation(anim, def, game_options) {
-            if let Some(facing) = def.completion_facing {
-                snap_completion_facing(&mut entity.body_facing, facing, binary_frame);
+            // UnitClass SHP Stand/Walk images are selected from Foot's persistent
+            // body counter at draw time. Do not advance a second relative clock or
+            // reset cadence when the generic visual sequence changes.
+            if category == crate::map::entities::EntityCategory::Unit
+                && set.shp_vehicle_cadence().is_some()
+                && matches!(anim.sequence, SequenceKind::Stand | SequenceKind::Walk)
+            {
+                return;
             }
-            anim.switch_to(next);
-        }
-    }
+
+            if let Some(next) = advance_animation(anim, def, game_options) {
+                if let Some(facing) = def.completion_facing {
+                    snap_completion_facing(&mut entity.body_facing, facing, binary_frame);
+                }
+                anim.switch_to(next);
+            }
+        },
+    );
 
     dying_finished
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub fn tick_animations(
     entities: &mut crate::sim::entity_store::EntityStore,
     sequences: &BTreeMap<String, SequenceSet>,
@@ -490,7 +775,7 @@ pub fn tick_animations(
     tick_animations_impl(
         entities,
         sequences,
-        None,
+        crate::rules::ruleset::RuleSet::empty_for_test(),
         game_options,
         interner,
         binary_frame,
@@ -517,7 +802,7 @@ pub(crate) fn snap_completion_facing(
 pub(crate) fn tick_non_dying_animations(
     entities: &mut crate::sim::entity_store::EntityStore,
     sequences: &BTreeMap<String, SequenceSet>,
-    rules: Option<&crate::rules::ruleset::RuleSet>,
+    rules: &crate::rules::ruleset::RuleSet,
     game_options: &crate::sim::game_options::GameOptions,
     interner: &crate::sim::intern::StringInterner,
     binary_frame: u32,
@@ -536,13 +821,15 @@ pub(crate) fn tick_non_dying_animations(
 /// Advance one dying object's death sequence during its own scheduler turn.
 /// Missing animation/type/sequence data takes the immediate-finish path used
 /// by the prior app-owned completion fallback.
+/// VERA-only: steps a sequence the `TerminalLifetime` dying mark keeps in the
+/// store, which native lacks (see that record); the assert checks the mark.
 pub(crate) fn tick_dying_animation(
     entity: &mut crate::sim::game_entity::GameEntity,
     sequence_set: Option<&SequenceSet>,
     game_options: &crate::sim::game_options::GameOptions,
     _binary_frame: u32,
 ) -> bool {
-    debug_assert!(entity.dying);
+    debug_assert!(entity.death.is_dying());
     let Some(anim) = entity.animation.as_mut() else {
         return true;
     };
@@ -559,100 +846,6 @@ pub(crate) fn tick_dying_animation(
     anim.finished
 }
 
-/// Number of animation frames in oregath.shp per facing direction.
-const HARVEST_OVERLAY_FRAMES: u16 = 15;
-
-/// Advance all HarvestOverlay components by one reached native frame.
-///
-/// Cycles through the 15-frame oregath.shp animation for harvesters that are
-/// actively gathering ore. When not visible, the overlay is skipped.
-pub fn tick_harvest_overlays(entities: &mut crate::sim::entity_store::EntityStore) {
-    // Find the advancing overlays by reading: every mutable hand-out enters
-    // the store's touch logs, and most entities have none.
-    let advancing: Vec<u64> = entities
-        .values()
-        .filter(|entity| {
-            entity
-                .harvest_overlay
-                .as_ref()
-                .is_some_and(|overlay| overlay.visible)
-        })
-        .map(|entity| entity.stable_id())
-        .collect();
-    for id in advancing {
-        let overlay = entities
-            .get_mut(id)
-            .and_then(|entity| entity.harvest_overlay.as_mut())
-            .expect("an advancing overlay was just read");
-        overlay.frame = (overlay.frame + 1) % HARVEST_OVERLAY_FRAMES;
-    }
-}
-
-/// Advance all VoxelAnimation components by one reached native frame.
-///
-/// Cycles through HVA frames for voxel entities that have `playing == true`.
-/// Frame wraps around to 0 when reaching frame_count (looping animation).
-pub fn tick_voxel_animations(entities: &mut crate::sim::entity_store::EntityStore) {
-    // Read first, as in `tick_harvest_overlays`.
-    let advancing: Vec<u64> = entities
-        .values()
-        .filter(|entity| {
-            entity
-                .voxel_animation
-                .as_ref()
-                .is_some_and(|anim| anim.playing && anim.frame_count > 1 && anim.frame_delay != 0)
-        })
-        .map(|entity| entity.stable_id())
-        .collect();
-    for id in advancing {
-        let anim = entities
-            .get_mut(id)
-            .and_then(|entity| entity.voxel_animation.as_mut())
-            .expect("an advancing voxel animation was just read");
-        anim.elapsed_frames = anim.elapsed_frames.saturating_add(1);
-        while anim.elapsed_frames >= anim.frame_delay {
-            anim.elapsed_frames -= anim.frame_delay;
-            anim.frame = (anim.frame + 1) % anim.frame_count;
-        }
-    }
-}
-
-/// Map a warhead's `InfDeath=` to the death sequence, if it selects one at all.
-///
-/// gamemd-derived: the `InfantryClass` death handler's jump table at
-/// `0x00518D58`, dispatched on `InfDeath - 1` over the range 0..9. The mapping
-/// is EXCLUSIVE: `1` plays `Die1` and `2` plays `Die2` with no animation, while
-/// `3..=10` spawn an animation and no sequence, and `0` or `> 10` do nothing at
-/// all. `Die3`, `Die4` and `Die5` are unreachable — no arm reaches DoType
-/// `0x0D`/`0x0E`/`0x0F`. Selection draws no RNG: `Do_Action` is called with
-/// `randomStart = 0`, which is the parameter that gates the frame-start draw.
-///
-/// RESIDUAL (GSI-08.13) — four arms ahead of the table are not modelled, each
-/// needing a field VERA does not carry: a paradropping infantryman forces
-/// `InfDeath = 3` (`CurrentDoType == 33`); a kill by a building whose type sets
-/// `+0x16BF` forces `5`, the Tesla-Coil skeleton death; a type with a non-empty
-/// `DeathAnims` list (`+0xE7C`) spawns from that list and returns, taking NO
-/// sequence; and `NotHuman=` (`+0xEAD`) forces `Die1`. Trigger: paradrops, any
-/// Tesla kill, and the `NotHuman=` types. Player effect: a Tesla-Coiled
-/// infantryman plays the ordinary death instead of the skeleton, and a
-/// `NotHuman=` type plays a sequence it does not own. Frequency: Tesla Coils are
-/// routine in a Soviet match; paradrops are per-support-power.
-pub fn death_sequence_for_inf_death(inf_death: u8) -> Option<SequenceKind> {
-    match inf_death {
-        1 => Some(SequenceKind::Die1),
-        2 => Some(SequenceKind::Die2),
-        _ => None,
-    }
-}
-
-/// Whether this `InfDeath=` spawns a death ANIMATION rather than a sequence.
-///
-/// gamemd-derived: same jump table, arms 3..=10. Exclusive with
-/// [`death_sequence_for_inf_death`] by construction.
-pub fn inf_death_spawns_anim(inf_death: u8) -> bool {
-    (3..=10).contains(&inf_death)
-}
-
-#[cfg(test)]
+#[cfg(all(test, tests_sim_a_b))]
 #[path = "animation_tests.rs"]
 mod tests;

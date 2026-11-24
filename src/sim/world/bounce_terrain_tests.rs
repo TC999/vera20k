@@ -1,15 +1,17 @@
 use super::*;
+use crate::map::entities::EntityCategory;
 use crate::map::resolved_terrain::{ResolvedTerrainCell, ResolvedTerrainGrid};
-use crate::rules::terrain_rules::TerrainClass;
 use crate::sim::bounce::{BounceOutcome, BounceState};
 use crate::sim::overlay_grid::OverlayGrid;
 use crate::util::native_x87::{NativeF32Bits, NativeF64Bits};
 use serde_json::Value;
 
+#[path = "bounce_cliff_tests.rs"]
+mod cliff_tests;
+
 fn terrain_cell(rx: u16, ry: u16) -> ResolvedTerrainCell {
     ResolvedTerrainCell {
         tileset_index: None,
-        base_terrain_class: TerrainClass::Clear,
         ..crate::map::resolved_terrain::test_flat_cell(rx, ry)
     }
 }
@@ -20,16 +22,24 @@ fn body(case: &Value) -> BounceState {
             NativeF32Bits::from_bits((case[name][i].as_f64().unwrap() as f32).to_bits())
         })
     };
-    BounceState {
-        elasticity: NativeF64Bits::from_bits(case["elasticity"].as_f64().unwrap().to_bits()),
-        gravity: NativeF64Bits::from_bits(case["gravity"].as_f64().unwrap().to_bits()),
-        angular_velocity_magnitude: NativeF64Bits::POSITIVE_ZERO,
-        position: floats("position"),
-        velocity: floats("velocity"),
-        spin_axis: [NativeF32Bits::POSITIVE_ZERO; 3],
-        spin_angle: NativeF64Bits::POSITIVE_ZERO,
-    }
+    BounceState::from_native_for_test(
+        NativeF64Bits::from_bits(case["elasticity"].as_f64().unwrap().to_bits()),
+        NativeF64Bits::from_bits(case["gravity"].as_f64().unwrap().to_bits()),
+        NativeF64Bits::POSITIVE_ZERO,
+        floats("position"),
+        floats("velocity"),
+        IDENTITY,
+        IDENTITY,
+    )
 }
+
+/// A zero-spin quaternion: these comparisons read position and velocity only.
+const IDENTITY: [NativeF32Bits; 4] = [
+    NativeF32Bits::POSITIVE_ZERO,
+    NativeF32Bits::POSITIVE_ZERO,
+    NativeF32Bits::POSITIVE_ZERO,
+    NativeF32Bits::ONE,
+];
 fn fixture(case: &Value) -> Simulation {
     let rows = case["cells"].as_array().unwrap();
     let width = rows
@@ -59,7 +69,7 @@ fn fixture(case: &Value) -> Simulation {
         cell.has_bridge_deck =
             cell.bridge_facts.raw_flags & 256 != 0 || row[5].as_i64() == Some(237);
         let overlay = row[5].as_i64().unwrap();
-        overlays.cell_mut(x, y).overlay_id = (overlay >= 0).then_some(overlay as u8);
+        overlays.cell_mut_for_test(x, y).overlay_id = (overlay >= 0).then_some(overlay as u8);
         cells[usize::from(y) * usize::from(width) + usize::from(x)] = cell;
         allocated.push((x, y));
     }
@@ -78,7 +88,7 @@ fn fixture(case: &Value) -> Simulation {
     if let Some(objects) = case["objects"].as_array() {
         for kind in objects {
             let name = kind.as_str().unwrap();
-            let id = sim.allocate_stable_id();
+            let id = sim.substrate.allocate_stable_id();
             let owner = sim.interner.intern("Neutral");
             let type_ref = sim.interner.intern(name);
             let category = if name == "nonbuilding" {
@@ -93,21 +103,21 @@ fn fixture(case: &Value) -> Simulation {
                 0,
                 0,
                 owner,
-                crate::sim::components::Health { current: 100 },
+                crate::sim::combat::Health::new(100),
                 type_ref,
                 category,
                 0,
                 0,
                 false,
             );
-            sim.entities_mut().insert(entity);
+            sim.substrate.entities.insert(entity);
             sim.occupancy_mut().add(
                 0,
                 0,
                 id,
                 MovementLayer::Ground,
                 None,
-                crate::sim::occupancy::CellListInsertion::AppendBuilding,
+                crate::sim::occupancy::CellListInsertion::from_category(category),
             );
         }
     }
@@ -115,12 +125,20 @@ fn fixture(case: &Value) -> Simulation {
 }
 #[test]
 fn native_bounce_ground_deck_contacts_match_original_update() {
-    let cases: Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/bounce_height.json"
+    let cases: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/bounce_height.json",
     ))
     .unwrap();
     assert_eq!(cases.as_array().unwrap().len(), 48);
     let rules = fixture_rules();
+    let native_case = |name: &str| {
+        cases
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|case| case["name"] == name)
+            .unwrap()
+    };
     let mut issues = Vec::new();
     macro_rules! check_eq {
         ($actual:expr,$expected:expr,$($message:tt)*) => {{
@@ -132,7 +150,7 @@ fn native_bounce_ground_deck_contacts_match_original_update() {
         let sim = fixture(case);
         let terrain = ResolvedBounceTerrain {
             sim: &sim,
-            rules: Some(&rules),
+            rules: &rules,
         };
         let mut state = body(case);
         // The ground observation is compared on a separate fixture so it cannot
@@ -140,7 +158,7 @@ fn native_bounce_ground_deck_contacts_match_original_update() {
         let ground_sim = fixture(case);
         let ground_terrain = ResolvedBounceTerrain {
             sim: &ground_sim,
-            rules: Some(&rules),
+            rules: &rules,
         };
         let query = &case["events"][0];
         check_eq!(
@@ -158,9 +176,18 @@ fn native_bounce_ground_deck_contacts_match_original_update() {
             events: Default::default(),
         };
         let outcome = state.update(&terrain).unwrap();
+        // Ares 3.0 CellClass_AttachesToNeighbourOverlay 10015740 (hook
+        // 0x480534) answers the any-wall query by `Wall=`, which the retail
+        // GASAND has: the sandbag cell then takes the update the native wall
+        // case (same cell, GAWALL) records.
+        let expected = if rules.ares() && case["name"] == "sandbag" {
+            native_case("wall")
+        } else {
+            case
+        };
         check_eq!(
             serde_json::Value::Array(terrain.events.into_inner()),
-            case["events"],
+            expected["events"],
             "{} lookup order",
             case["name"]
         );
@@ -171,29 +198,29 @@ fn native_bounce_ground_deck_contacts_match_original_update() {
         };
         check_eq!(
             native_outcome,
-            case["outcome"].as_u64().unwrap(),
+            expected["outcome"].as_u64().unwrap(),
             "{} outcome",
             case["name"]
         );
         for (key, values) in [
-            ("position_bits", state.position),
-            ("velocity_bits", state.velocity),
+            ("position_bits", state.position()),
+            ("velocity_bits", state.velocity()),
         ] {
             for i in 0..3 {
                 let actual = values[i].bits();
-                let expected = case[key][i].as_u64().unwrap() as u32;
+                let native_bits = expected[key][i].as_u64().unwrap() as u32;
                 if key == "velocity_bits" {
                     // Existing flat reflection collapses identity matrices and
                     // loses native signed zero. Physics-bit parity is excluded;
                     // require exact finite numeric equality, no tolerance.
                     check_eq!(
                         f32::from_bits(actual),
-                        f32::from_bits(expected),
+                        f32::from_bits(native_bits),
                         "{} {key}[{i}] (signed zero excluded)",
                         case["name"]
                     );
                 } else {
-                    check_eq!(actual, expected, "{} {key}[{i}]", case["name"]);
+                    check_eq!(actual, native_bits, "{} {key}[{i}]", case["name"]);
                 }
             }
         }
@@ -205,8 +232,8 @@ fn native_bounce_ground_deck_contacts_match_original_update() {
         check_eq!(
             actual,
             (
-                case["dummy_coord"][0].as_i64().unwrap() as i32,
-                case["dummy_coord"][1].as_i64().unwrap() as i32
+                expected["dummy_coord"][0].as_i64().unwrap() as i32,
+                expected["dummy_coord"][1].as_i64().unwrap() as i32
             ),
             "{} dummy",
             case["name"]
@@ -215,9 +242,32 @@ fn native_bounce_ground_deck_contacts_match_original_update() {
     assert!(issues.is_empty(), "{}", issues.join("\n"));
 }
 
+/// The oracle's overlay indices in the retail `[OverlayTypes]` declaration
+/// order: GASAND 0, GAWALL 2, NAWALL 26 and GAFWLL 243 are `Wall=yes`,
+/// BRIDGEB1 237 is not. The stock any-wall query tests the raw indices; the
+/// Ares one (hook 0x480534) reads these flags.
+fn fixture_overlay_types() -> String {
+    let name = |index: usize| match index {
+        0 => "GASAND".to_owned(),
+        2 => "GAWALL".to_owned(),
+        26 => "NAWALL".to_owned(),
+        237 => "BRIDGEB1".to_owned(),
+        243 => "GAFWLL".to_owned(),
+        _ => format!("OVERLAY{index}"),
+    };
+    let mut text = String::from("[OverlayTypes]\n");
+    for index in 0..=243 {
+        text.push_str(&format!("{index}={}\n", name(index)));
+    }
+    for wall in ["GASAND", "GAWALL", "NAWALL", "GAFWLL"] {
+        text.push_str(&format!("[{wall}]\nWall=yes\n"));
+    }
+    text
+}
+
 fn fixture_rules() -> RuleSet {
-    RuleSet::from_ini(&crate::rules::ini_parser::IniFile::from_str(
-        "[BuildingTypes]\n0=building\n1=undeploy\n2=large_undeploy\n[VehicleTypes]\n0=nonbuilding\n[building]\nFoundation=1x1\n[undeploy]\nFoundation=1x1\nUndeploysInto=nonbuilding\n[large_undeploy]\nFoundation=2x2\nUndeploysInto=nonbuilding\n[nonbuilding]\nSpeed=5\n")).unwrap()
+    RuleSet::from_ini_with_fixed_art_for_test(&crate::rules::ini_parser::IniFile::from_str(&format!(
+        "{}[BuildingTypes]\n0=building\n1=undeploy\n2=large_undeploy\n[VehicleTypes]\n0=nonbuilding\n[building]\nName=Building\n[undeploy]\nUndeploysInto=nonbuilding\n[large_undeploy]\nUndeploysInto=nonbuilding\n[nonbuilding]\nSpeed=5\n[VoxelAnims]\n0=TIRE\n[TIRE]\nElasticity=0.8\nMinZVel=28\nMaxZVel=32\nMaxXYVel=10\nDuration=150\n", fixture_overlay_types())), &crate::rules::ini_parser::IniFile::from_str("[building]\nFoundation=1x1\n[undeploy]\nFoundation=1x1\n[large_undeploy]\nFoundation=2x2\n")).unwrap()
 }
 struct RecordingTerrain<'a> {
     inner: ResolvedBounceTerrain<'a>,
@@ -251,6 +301,9 @@ impl<'a> BounceTerrain for RecordingTerrain<'a> {
         self.query("0x565730", c);
         self.inner.ramp(c)
     }
+    fn cliff_face_direction(&self, c: IVec3, previous: IVec3) -> Option<u8> {
+        self.inner.cliff_face_direction(c, previous)
+    }
     fn is_water(&self, c: IVec3) -> bool {
         self.query("0x565730", c);
         self.inner.is_water(c)
@@ -266,16 +319,8 @@ impl<'a> BounceTerrain for RecordingTerrain<'a> {
                     .inner
                     .sim
                     .occupancy()
-                    .get(cell.rx, cell.ry)
-                    .is_some_and(|o| {
-                        o.iter_layer(MovementLayer::Ground).any(|v| {
-                            self.inner
-                                .sim
-                                .entities()
-                                .get(v.entity_id)
-                                .is_some_and(|e| e.category == EntityCategory::Structure)
-                        })
-                    });
+                    .first_building_on_layer(cell.rx, cell.ry, MovementLayer::Ground)
+                    .is_some();
                 (i32::from(cell.rx), i32::from(cell.ry), false, has)
             }
         };
@@ -293,18 +338,13 @@ impl<'a> BounceTerrain for RecordingTerrain<'a> {
 
 #[test]
 fn voxel_anim_logic_visit_delivers_native_deck_height_and_low_bridge_selection() {
-    let cases: Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/bounce_height.json"
+    let cases: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/bounce_height.json",
     ))
     .unwrap();
     let rules = fixture_rules();
-    let ini = crate::rules::ini_parser::IniFile::from_str(
-        "[TIRE]\nElasticity=0.8\nMinZVel=28\nMaxZVel=32\nMaxXYVel=10\nDuration=150\n",
-    );
-    let kind = crate::rules::voxel_anim_type::VoxelAnimType::from_ini_section(
-        "TIRE",
-        ini.section("TIRE").unwrap(),
-    );
+    let type_id = rules.voxel_anim_type_id_by_name("TIRE").unwrap();
+    let kind = rules.voxel_anim_type(type_id);
     for name in [
         "deck_fall",
         "deck_rest",
@@ -319,28 +359,37 @@ fn voxel_anim_logic_visit_delivers_native_deck_height_and_low_bridge_selection()
             .find(|c| c["name"] == name)
             .unwrap();
         let mut sim = fixture(case);
-        let mut rng = crate::sim::rng::SimRng::new(17);
-        let mut object = crate::sim::voxel_anim::spawn_debris_piece(
-            0,
-            crate::rules::voxel_anim_type::VoxelAnimTypeId(0),
-            &kind,
+        sim.emit_debris_voxel(
+            type_id,
+            kind,
             None,
             IVec3::ZERO,
-            &mut rng,
+            true,
+            &mut Vec::new(),
+            &rules,
         )
         .unwrap();
-        object.bounce = body(case);
-        sim.admit_death_debris(vec![crate::sim::voxel_anim::VoxelDebrisSpawn {
-            type_id: crate::rules::voxel_anim_type::VoxelAnimTypeId(0),
-            object,
-        }]);
         let id = sim.substrate.voxel_anims.ids()[0];
+        // This terrain-consumer fixture supplies the independently captured
+        // Bounce body after the ordinary constructor has admitted the object.
+        sim.substrate
+            .voxel_anims
+            .get_mut(id)
+            .unwrap()
+            .set_bounce_for_test(body(case));
         assert!(sim.live_object_order_snapshot().contains(&id));
         let before = sim.state_hash();
-        sim.visit_voxel_anim(id, Some(&rules));
+        sim.visit_voxel_anim(id, &rules, &mut crate::sim::world::FrameEffects::default())
+            .unwrap();
+        sim.process_pending_delete_with(
+            &rules,
+            &mut crate::sim::world::FrameEffects::default(),
+            1,
+            sim.session().started(),
+        );
         let actual = sim.substrate.voxel_anims.get(id).unwrap();
         assert_eq!(
-            actual.duration,
+            actual.duration(),
             if case["outcome"].as_u64() == Some(2) {
                 0
             } else {
@@ -350,7 +399,7 @@ fn voxel_anim_logic_visit_delivers_native_deck_height_and_low_bridge_selection()
         );
         for i in 0..3 {
             assert_eq!(
-                actual.bounce.position[i].bits(),
+                actual.bounce().position()[i].bits(),
                 case["position_bits"][i].as_u64().unwrap() as u32,
                 "{name} position"
             );
@@ -359,86 +408,110 @@ fn voxel_anim_logic_visit_delivers_native_deck_height_and_low_bridge_selection()
     }
 }
 
+const FLIGHT_CENTER: i32 = 100;
+
+/// The 25x25 block of supplied cells `anim_bouncer_flight.py`'s `machine`
+/// builds around its supplied center (the ordinary corpus uses100,100),
+/// resolving to the dummy cell elsewhere.
+fn flight_sim(terrain_name: &str, center: i32) -> Simulation {
+    const RADIUS: i32 = 12;
+    let level = |x: i32, y: i32| {
+        let ring = (x - center).abs().max((y - center).abs());
+        match terrain_name {
+            "flat0" => 0,
+            "flat2" => 2,
+            "mesa" => 4 * u8::from(ring <= 1),
+            "pit" => 4 * u8::from(ring > 2),
+            other => panic!("unknown terrain {other}"),
+        }
+    };
+    let size = (center + RADIUS + 1) as u16;
+    let mut cells: Vec<_> = (0..size)
+        .flat_map(|y| (0..size).map(move |x| terrain_cell(x, y)))
+        .collect();
+    let mut allocated = Vec::new();
+    for y in center - RADIUS..=center + RADIUS {
+        for x in center - RADIUS..=center + RADIUS {
+            let cell = &mut cells[y as usize * usize::from(size) + x as usize];
+            cell.level = level(x, y);
+            allocated.push((x as u16, y as u16));
+        }
+    }
+    let mut grid = ResolvedTerrainGrid::from_cells(size, size, cells);
+    grid.test_set_native_allocated_cells(&allocated);
+    grid.test_set_dummy_cell_level_slope(0, 0);
+    let mut sim = Simulation::new();
+    sim.resolved_terrain = Some(grid);
+    sim.overlay_grid = Some(OverlayGrid::new(size, size));
+    sim
+}
+
+fn hex_bytes(hex: &str) -> Vec<u8> {
+    (0..hex.len() / 2)
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
+        .collect()
+}
+
+/// The 0x50-byte native body, field for field.
+fn native_body(bytes: &[u8]) -> BounceState {
+    let f64_at = |at: usize| {
+        NativeF64Bits::from_bits(u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()))
+    };
+    let f32_at = |at: usize| {
+        NativeF32Bits::from_bits(u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()))
+    };
+    BounceState::from_native_for_test(
+        f64_at(0),
+        f64_at(8),
+        f64_at(0x10),
+        std::array::from_fn(|axis| f32_at(0x18 + axis * 4)),
+        std::array::from_fn(|axis| f32_at(0x24 + axis * 4)),
+        std::array::from_fn(|i| f32_at(0x30 + i * 4)),
+        std::array::from_fn(|i| f32_at(0x40 + i * 4)),
+    )
+}
+
+fn outcome_code(outcome: BounceOutcome) -> i64 {
+    match outcome {
+        BounceOutcome::Falling => 0,
+        BounceOutcome::Bounced => 1,
+        BounceOutcome::Stopped => 2,
+    }
+}
+
 /// A stock debris chunk's whole flight (`tools/spatial_oracle/anim_bouncer_flight.py`):
 /// DBRIS1LG/SM bodies from the constructor's own launch, `BounceClass::Update`
 /// once per tick until it reports contact, over flat level-0 and level-2
 /// ground, off a level-4 mesa and inside a level-4-walled pit. Every tick's
 /// verdict, truncated coordinate and position bits match; velocity matches
-/// numerically (the flat reflection's signed zero, as above).
+/// numerically (the flat reflection's signed zero, as above). A flight that
+/// ends at its first contact also ends with the native quaternions: these
+/// chunks spin by a zero angle, so only the signs of their zeros move.
 #[test]
 fn a_debris_chunk_flight_matches_original_update() {
-    const CENTER: i32 = 100;
-    const RADIUS: i32 = 12;
-    let rows: Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/anim_bouncer_flight.json"
+    let rows: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/anim_bouncer_flight.json",
     ))
     .unwrap();
     let rows = rows.as_array().unwrap();
     assert_eq!(rows.len(), 64);
     let mut issues = Vec::new();
+    let mut quaternion_rows = 0;
     for row in rows {
         let input = &row["input"];
-        let terrain_name = input["terrain"].as_str().unwrap();
-        let level = |x: i32, y: i32| {
-            let ring = (x - CENTER).abs().max((y - CENTER).abs());
-            match terrain_name {
-                "flat0" => 0,
-                "flat2" => 2,
-                "mesa" => 4 * u8::from(ring <= 1),
-                "pit" => 4 * u8::from(ring > 2),
-                other => panic!("unknown terrain {other}"),
-            }
-        };
-        let size = (CENTER + RADIUS + 1) as u16;
-        let mut cells: Vec<_> = (0..size)
-            .flat_map(|y| (0..size).map(move |x| terrain_cell(x, y)))
-            .collect();
-        let mut allocated = Vec::new();
-        for y in CENTER - RADIUS..=CENTER + RADIUS {
-            for x in CENTER - RADIUS..=CENTER + RADIUS {
-                let cell = &mut cells[y as usize * usize::from(size) + x as usize];
-                cell.level = level(x, y);
-                allocated.push((x as u16, y as u16));
-            }
-        }
-        let mut grid = ResolvedTerrainGrid::from_cells(size, size, cells);
-        grid.test_set_native_allocated_cells(&allocated);
-        grid.test_set_dummy_cell_level_slope(0, 0);
-        let mut sim = Simulation::new();
-        sim.resolved_terrain = Some(grid);
-        sim.overlay_grid = Some(OverlayGrid::new(size, size));
+        let sim = flight_sim(input["terrain"].as_str().unwrap(), FLIGHT_CENTER);
         let terrain = ResolvedBounceTerrain {
             sim: &sim,
-            rules: None,
+            rules: crate::rules::ruleset::RuleSet::empty_for_test(),
         };
-
-        let hex = row["launch_body_hex"].as_str().unwrap();
-        let bytes: Vec<u8> = (0..hex.len() / 2)
-            .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
-            .collect();
-        let f64_at = |at: usize| {
-            NativeF64Bits::from_bits(u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap()))
-        };
-        let f32_at = |at: usize| {
-            NativeF32Bits::from_bits(u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()))
-        };
-        let mut state = BounceState {
-            elasticity: f64_at(0),
-            gravity: f64_at(8),
-            angular_velocity_magnitude: f64_at(0x10),
-            position: std::array::from_fn(|axis| f32_at(0x18 + axis * 4)),
-            velocity: std::array::from_fn(|axis| f32_at(0x24 + axis * 4)),
-            spin_axis: [NativeF32Bits::POSITIVE_ZERO; 3],
-            spin_angle: NativeF64Bits::POSITIVE_ZERO,
-        };
-        for (tick, native) in row["ticks"].as_array().unwrap().iter().enumerate() {
+        let mut state = native_body(&hex_bytes(row["launch_body_hex"].as_str().unwrap()));
+        let native_ticks = row["ticks"].as_array().unwrap();
+        let mut ran = 0;
+        for (tick, native) in native_ticks.iter().enumerate() {
             let native = native.as_array().unwrap();
             let at = |i: usize| native[i].as_i64().unwrap();
-            let outcome = match state.update(&terrain).unwrap() {
-                BounceOutcome::Falling => 0,
-                BounceOutcome::Bounced => 1,
-                BounceOutcome::Stopped => 2,
-            };
+            let outcome = outcome_code(state.update(&terrain).unwrap());
+            ran += 1;
             let coord = state.position_leptons();
             let actual = (outcome, coord.x, coord.y, coord.z);
             let expected = (at(0), at(1) as i32, at(2) as i32, at(3) as i32);
@@ -450,8 +523,8 @@ fn a_debris_chunk_flight_matches_original_update() {
                 break;
             }
             for axis in 0..3 {
-                let position = state.position[axis].bits();
-                let velocity = f32::from_bits(state.velocity[axis].bits());
+                let position = state.position()[axis].bits();
+                let velocity = f32::from_bits(state.velocity()[axis].bits());
                 if position != at(4 + axis) as u32
                     || velocity != f32::from_bits(at(7 + axis) as u32)
                 {
@@ -462,6 +535,71 @@ fn a_debris_chunk_flight_matches_original_update() {
                 break;
             }
         }
+        if ran == native_ticks.len() {
+            quaternion_rows += 1;
+            let native = native_body(&hex_bytes(row["final_body_hex"].as_str().unwrap()));
+            if (state.orientation(), state.rotation()) != (native.orientation(), native.rotation())
+            {
+                issues.push(format!("{input} final quaternions"));
+            }
+        }
     }
+    assert!(quaternion_rows > 0);
     assert!(issues.is_empty(), "{}", issues.join("\n"));
 }
+
+/// A spinning `[TIRE]`-like piece's whole flight (`tools/spatial_oracle/
+/// bounce_tumble.py` `flight`): the body Init built, then `BounceClass::Update`
+/// and `GetDrawingMatrix` every tick on flat ground through bounces to rest.
+/// Every tick's verdict, position, orientation, rotation and drawing matrix
+/// match bit for bit.
+#[test]
+fn a_spinning_piece_tumbles_like_the_original() {
+    let golden: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/bounce_tumble.json",
+    ))
+    .unwrap();
+    let sim = flight_sim("flat0", FLIGHT_CENTER);
+    let terrain = ResolvedBounceTerrain {
+        sim: &sim,
+        rules: crate::rules::ruleset::RuleSet::empty_for_test(),
+    };
+    let mut bounces = 0;
+    for row in golden["flight"].as_array().unwrap() {
+        let input = &row["input"];
+        let mut state = native_body(&hex_bytes(row["init_body_hex"].as_str().unwrap()));
+        for (tick, native) in row["ticks"].as_array().unwrap().iter().enumerate() {
+            let native: Vec<u32> = native
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.as_u64().unwrap() as u32)
+                .collect();
+            let outcome = outcome_code(state.update(&terrain).unwrap());
+            bounces += usize::from(outcome == 1);
+            let matrix = state.drawing_matrix().unwrap().map(NativeF32Bits::bits);
+            let context = format!("{input} tick {}", tick + 1);
+            assert_eq!(outcome, i64::from(native[0]), "{context}");
+            assert_eq!(
+                state.orientation().map(NativeF32Bits::bits),
+                native[1..5],
+                "{context}"
+            );
+            assert_eq!(
+                state.rotation().map(NativeF32Bits::bits),
+                native[5..9],
+                "{context}"
+            );
+            assert_eq!(matrix, native[9..21], "{context}");
+        }
+        let native = native_body(&hex_bytes(row["final_body_hex"].as_str().unwrap()));
+        assert_eq!(state.position(), native.position(), "{input}");
+    }
+    assert!(
+        bounces > 32,
+        "the rows cover the bounce arm's spin reversal"
+    );
+}
+
+#[path = "meteor_numeric_tests.rs"]
+mod meteor_tests;

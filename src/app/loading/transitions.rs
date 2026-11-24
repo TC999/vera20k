@@ -2,19 +2,17 @@
 //!
 //! Extracted from app.rs for file-size limits.
 
+use crate::app::match_runtime::sim_host::SimWrite;
 use std::collections::{BTreeMap, HashMap};
 
 use crate::app::loading::init;
-use crate::app::match_runtime::sim_tick;
 use crate::app::presentation::render;
 use crate::map::basic::BasicSection;
 use crate::map::houses::HouseRoster;
-use crate::map::overlay_types::OverlayTypeRegistry;
-use crate::map::trigger_graph::TriggerGraph;
-use crate::render::minimap::MinimapRenderer;
+use crate::render::radar::minimap::MinimapRenderer;
 use crate::render::selection_overlay::SelectionOverlay;
-use crate::sidebar::SidebarTab;
 use crate::ui::game_screen::GameScreen;
+use crate::ui::sidebar::SidebarTab;
 
 use crate::app::AppState;
 
@@ -26,31 +24,41 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 
-/// Mirror the authoritative speed whenever a complete Simulation replaces the
-/// app's live match, including both fresh-map handoff and in-scenario load.
+/// Mirror the authoritative speed into BBB's copy: when a complete Simulation
+/// replaces the app's live match (fresh-map handoff and in-scenario load),
+/// after a local change, and before BBB's init or the LAN host's options read
+/// it, since another player's speed event changes only the world.
 pub(crate) fn sync_in_game_options_speed_from_sim(state: &mut AppState) {
-    let Some(game_speed) = state
+    let world = state
         .match_state
         .sim_runtime
-        .as_ref()
-        .map(|rt| &rt.simulation)
-        .and_then(crate::sim::world::Simulation::projected_in_game_options_speed)
-        .map(u32::from)
-    else {
-        return;
-    };
-    state
-        .match_state
-        .match_presentation
-        .in_game_options
-        .game_speed = game_speed;
-    state.match_state.sim_speed_tps = crate::app::types::tps_for_game_speed(game_speed);
+        .runtime()
+        .map(|rt| &rt.simulation);
+    mirror_world_speed(
+        &mut state.match_state.match_presentation.in_game_options,
+        world,
+    );
+}
+
+/// [`sync_in_game_options_speed_from_sim`] on `options`: `world`'s speed after
+/// its next frame's speed events, when it has a selectable one.
+pub(crate) fn mirror_world_speed(
+    options: &mut crate::ui::shell::in_game_options_state::InGameOptionsState,
+    world: Option<&crate::sim::world::Simulation>,
+) {
+    if let Some(game_speed) =
+        world.and_then(crate::sim::world::Simulation::projected_in_game_options_speed)
+    {
+        options.game_speed = u32::from(game_speed);
+    }
 }
 
 pub(crate) fn fallback_map_load_result() -> init::MapLoadResult {
     init::MapLoadResult {
+        pending_atlases: None,
         scenario: init::ScenarioLoadInputs {
-            startup: crate::match_bootstrap::LoadingStartup::Generic {
+            campaign_names: None,
+            startup: crate::app::match_bootstrap::LoadingStartup::Generic {
                 selected_map_file: "fallback".to_string(),
             },
             map_source: crate::map::source::LoadedMapSource::LegacyFallback {
@@ -58,28 +66,19 @@ pub(crate) fn fallback_map_load_result() -> init::MapLoadResult {
             },
             map_hash: None,
             basic: BasicSection::default(),
+            ranking: crate::map::ranking::RankingSection::default(),
             terrain_grid: None,
             resolved_terrain: None,
             simulation: None,
             overlays: Vec::new(),
             terrain_objects: Vec::new(),
-            waypoints: HashMap::new(),
-            cell_tags: HashMap::new(),
-            tags: HashMap::new(),
-            triggers: HashMap::new(),
-            events: HashMap::new(),
-            actions: HashMap::new(),
-            trigger_graph: TriggerGraph::default(),
-            overlay_registry: OverlayTypeRegistry::empty(),
             house_roster: HouseRoster::default(),
-            height_map: BTreeMap::new(),
-            bridge_height_map: BTreeMap::new(),
             rules: None,
             map_lighting_config: crate::map::lighting::LightingConfig::default(),
             theater_name: "TEMPERATE".to_string(),
             theater_ext: "tem".to_string(),
-            initial_local_owner: None,
             sandbox_full_visibility: false,
+            opening_view_cell: None,
             camera_anchor_x: 0.0,
             camera_anchor_y: 0.0,
         },
@@ -91,9 +90,17 @@ pub(crate) fn fallback_map_load_result() -> init::MapLoadResult {
             sprite_atlas: None,
             overlay_atlas: None,
             bridge_atlas: None,
-            bridge_railing_atlas: None,
             sidebar_cameo_atlas: None,
             sidebar_chrome: None,
+            match_layout_ini: None,
+            #[cfg(feature = "phobos")]
+            sw_sidebar_ui: crate::rules::phobos_sw_sidebar::SuperWeaponSidebarUi::default(),
+            #[cfg(feature = "phobos")]
+            center_pause_menu_background: false,
+            #[cfg(feature = "phobos")]
+            sw_sidebar_art: None,
+            outcome_banner_side_art: None,
+            end_game_banner: None,
             software_cursor: None,
             overlay_names: BTreeMap::new(),
             overlay_radar_colors: HashMap::new(),
@@ -106,321 +113,707 @@ pub(crate) fn fallback_map_load_result() -> init::MapLoadResult {
     }
 }
 
+/// App-only projections transferred with a new runtime. This bundle has no
+/// gameplay authority: its source values belong to the loaded map/resources.
+pub(crate) struct MapPresentationInputs {
+    pub(crate) campaign_names: Option<crate::rules::campaign_loading::CampaignScenarioNames>,
+    pub(crate) basic: BasicSection,
+    pub(crate) ranking: crate::map::ranking::RankingSection,
+    pub(crate) source: crate::map::source::LoadedMapSource,
+    pub(crate) map_hash: Option<u64>,
+    pub(crate) terrain_grid: Option<crate::map::terrain::TerrainGrid>,
+    pub(crate) overlays: Vec<crate::map::overlay::OverlayEntry>,
+    pub(crate) terrain_objects: Vec<crate::map::overlay::TerrainObject>,
+    pub(crate) house_roster: HouseRoster,
+    pub(crate) lighting_config: crate::map::lighting::LightingConfig,
+    /// Present only for a fresh map, from before authored Overlay admission.
+    pub(crate) lighting_events: Option<Vec<crate::sim::light_sources::LightingEvent>>,
+    pub(crate) theater_name: String,
+    pub(crate) theater_ext: String,
+}
+
+/// Install the complete map presentation after its runtime and process assets
+/// are available. Fresh startup and saved restoration share this replacement;
+/// route-specific input, sidebar order, waterlines and timers stay outside it.
+/// Missing map-owned surfaces replace the old ones with absence, so a different
+/// map can never inherit the outgoing geometry or shroud dimensions.
+pub(crate) fn install_world_presentation(
+    state: &mut AppState,
+    map: MapPresentationInputs,
+    assets: init::PresentationLoadAssets,
+) {
+    if let Some(names) = map.campaign_names {
+        state.match_state.campaign_names = names;
+    }
+    state.match_state.map_basic = map.basic;
+    state.match_state.map_ranking = map.ranking;
+    state.match_state.loaded_map_source = Some(map.source);
+    state.match_state.loaded_map_hash = map.map_hash;
+    state.match_state.match_presentation.terrain_grid = map.terrain_grid;
+    state.frontend.shell_preview_overlay_registry = state
+        .match_state
+        .sim_runtime
+        .runtime()
+        .map(|runtime| runtime.resources.rules.retain_overlay_registry());
+
+    state.match_state.match_presentation.combat_lights.clear();
+    state.renderer.performance_overlay.clear_simulation_rate();
+    state.match_state.match_presentation.lasers.clear_on_load();
+    // Empty unless a bounty or ProduceCashDisplay queued labels, which only Ares does.
+    state
+        .match_state
+        .match_presentation
+        .flying_credits
+        .borrow_mut()
+        .clear_on_load();
+    state
+        .match_state
+        .match_presentation
+        .talk_bubble
+        .clear_on_load();
+    state
+        .match_state
+        .match_presentation
+        .electric_bolts
+        .clear_on_load();
+    state.match_state.match_presentation.airstrike_shades = Default::default();
+    state
+        .match_state
+        .match_presentation
+        .pixel_fx
+        .borrow_mut()
+        .clear_on_load();
+    if let Some(runtime) = state.match_state.sim_runtime.runtime() {
+        state
+            .match_state
+            .match_presentation
+            .detail
+            .borrow_mut()
+            .configure_normal(&runtime.resources.rules.general.detail);
+    }
+    state
+        .match_state
+        .match_presentation
+        .line_trails
+        .clear_on_load();
+    state
+        .match_state
+        .match_presentation
+        .hidden_super_anims
+        .clear();
+    state
+        .match_state
+        .match_presentation
+        .super_timer_blinks
+        .clear();
+    state
+        .match_state
+        .match_presentation
+        .super_timer_next_flip_ms = None;
+    state
+        .match_state
+        .match_presentation
+        .super_timer_dock
+        .reset();
+    sync_in_game_options_speed_from_sim(state);
+
+    state.match_state.match_presentation.tile_atlas = assets.tile_atlas;
+    state.match_state.match_presentation.building_zshape = assets.building_zshape;
+    // Growths prepared against the outgoing atlases never publish into these,
+    // and what was checked against them says nothing about these.
+    state.match_state.match_presentation.atlas_growth.cancel();
+    state.match_state.match_presentation.atlas_check = Default::default();
+    state.match_state.match_presentation.unit_atlas = assets.unit_atlas;
+    // Both voxel caches resolve model images through the replaced RuleSet.
+    *state.renderer.vxl_pose_frame_cache.borrow_mut() = Default::default();
+    state.match_state.match_presentation.palette_set = assets.palette_set;
+    state.match_state.match_presentation.surface_palette = Default::default();
+    state.match_state.match_presentation.sprite_atlas = assets.sprite_atlas;
+    // The skip table decoded its frames from the atlas just replaced.
+    state
+        .match_state
+        .match_presentation
+        .zshape_skips
+        .get_mut()
+        .forget_frames();
+    state.match_state.match_presentation.overlay_atlas = assets.overlay_atlas;
+    state.match_state.match_presentation.bridge_atlas = assets.bridge_atlas;
+    state.match_state.match_presentation.sidebar_cameo_atlas = assets.sidebar_cameo_atlas;
+    state.match_state.match_presentation.sidebar_chrome = assets.sidebar_chrome;
+    // The side's layout, the mod's with the player's own over it, sizes the
+    // sidebar, and with it the battlefield, from the world's first frame.
+    crate::app::presentation::player_layout::install(state, assets.match_layout_ini);
+    #[cfg(feature = "phobos")]
+    {
+        state
+            .match_state
+            .match_presentation
+            .center_pause_menu_background = assets.center_pause_menu_background;
+        state.match_state.match_presentation.sw_sidebar_art = assets.sw_sidebar_art;
+        let significance = state
+            .match_state
+            .match_presentation
+            .sw_sidebar
+            .required_significance;
+        state
+            .match_state
+            .match_presentation
+            .sw_sidebar
+            .configure(assets.sw_sidebar_ui, significance);
+    }
+    state.match_state.match_presentation.outcome_banner_side_art = assets.outcome_banner_side_art;
+    // Ares hook 6CC2B0's labels, only when Ares plays in the game
+    // (`RuleSet::ares`), resolved once here instead of with every sidebar draw.
+    let ares_status_texts = state.rules().filter(|rules| rules.ares()).map(|rules| {
+        crate::app::presentation::sidebar_build::ares_status_texts(rules, |label| {
+            state
+                .process_assets
+                .csf
+                .as_ref()
+                .map_or_else(|| label.to_owned(), |csf| csf.text(label).into_owned())
+        })
+    });
+    state.match_state.match_presentation.ares_status_texts = ares_status_texts;
+    state.match_state.match_presentation.end_game_banner = assets.end_game_banner;
+    // `Game_LoadUI_LoadSideData` resolves the dialog background pair once per
+    // game load. The shell chrome atlas carries the three side slots, so a
+    // changed pair drops it and the next paint rebuilds with the side's art;
+    // the process-lifetime slot 0 (`PUDLGBGN`) is not part of the hook, which
+    // runs only when Ares plays in the game (`RuleSet::ares`).
+    if state.rules().is_some_and(|rules| rules.ares()) {
+        let side = state
+            .match_state
+            .sim_runtime
+            .runtime()
+            .map_or(-1, |runtime| runtime.simulation.session().scenario_side());
+        let pair = state.process_assets.side_dialog_background(side);
+        if state.frontend.shell_dialog_background != pair {
+            state.frontend.shell_dialog_background = pair;
+            state.frontend.skirmish_shell_chrome = None;
+        }
+    }
+    // GAME.FNT is process artwork, so retain the established process fallback
+    // when optional font preparation did not produce a replacement, and keep
+    // the font itself, with the text it has laid out and drawn, when the
+    // scenario read the same bytes: a new font would build GAME.FNT's
+    // outline faces again (`FntFont::build`) and draw every glyph into an
+    // empty atlas.
+    if let Some(ref fnt) = assets.fnt_file
+        && !state.renderer.bit_font.is_built_from(fnt)
+    {
+        state.renderer.bit_font = crate::render::bit_font::BitFont::from_fnt(
+            &state.renderer.gpu.device,
+            &state.renderer.gpu.queue,
+            &state.renderer.batch_renderer,
+            fnt,
+        );
+    }
+
+    // The final sidebar projection resolves incoming side/radar authority.
+    // `RadarClass::Init_Clear @ 0x00652DE0` starts each scenario offline at
+    // frame 0, outside any movie mode, with TacticalMapAvailable clear.
+    state.match_state.match_presentation.radar_anim = None;
+    state.match_state.match_presentation.radar_animation_source = None;
+    state.match_state.match_presentation.radar_content_insets = None;
+    state.match_state.match_presentation.has_radar = false;
+    state.match_state.match_presentation.loaded_radar_housing = None;
+    state.match_state.match_presentation.software_cursor = assets.software_cursor;
+    state
+        .match_state
+        .match_presentation
+        .overlays
+        .replace_from_source(map.overlays);
+    state.match_state.match_presentation.terrain_objects = map.terrain_objects;
+    state.match_state.match_presentation.overlay_names = assets.overlay_names;
+    state.match_state.match_presentation.overlay_radar_colors = assets.overlay_radar_colors;
+    state.match_state.match_presentation.house_color_map = assets.house_color_map;
+    // VERA relation colours start each scenario off, in the player colours.
+    state.match_state.match_presentation.relation_colors = false;
+    state.match_state.match_presentation.relation_color_map = None;
+    // VERA's Super Weapon Building Timers start from the saved switch; a
+    // match's own hotkey flips it from there.
+    let saved_timers = state
+        .persistence
+        .options_profile
+        .superweapon_building_timers;
+    state
+        .match_state
+        .match_presentation
+        .superweapon_building_timers = saved_timers;
+    // VERA's Convenience Help starts each scenario from the saved switch too;
+    // Ctrl+Alt+H flips it from there and writes it back to the profile.
+    let help = state.persistence.options_profile.convenience_help;
+    state.match_state.match_presentation.convenience_help = help;
+    state.match_state.sim_runtime.show_status_rows(help);
+    state.match_state.match_presentation.house_roster = map.house_roster;
+    state.process_assets.csf = assets.csf;
+    state.match_state.match_presentation.theater_name = map.theater_name;
+    state.match_state.match_presentation.theater_ext = map.theater_ext;
+
+    let live = state.match_state.sim_runtime.runtime().and_then(|runtime| {
+        runtime
+            .view()
+            .resolved_terrain()
+            .map(|terrain| (terrain, &runtime.simulation))
+    });
+    let presentation = &mut state.match_state.match_presentation;
+    presentation.lighting.install(
+        assets.lighting_grid,
+        map.lighting_config,
+        presentation.in_game_options.detail_level,
+        live,
+        map.lighting_events.as_deref(),
+    );
+    // Current MapClass authority, including restored/triggered LocalSize,
+    // reaches camera and minimap before either route positions its view.
+    let (playfield_bounds, playfield_revision) =
+        crate::app::input::camera::playfield_presentation_authority(state);
+    let minimap = state
+        .match_state
+        .match_presentation
+        .terrain_grid
+        .as_ref()
+        .map(|grid| {
+            let runtime = state.match_state.sim_runtime.runtime();
+            let overlay_registry =
+                runtime.map(|runtime| runtime.resources.rules.overlay_registry());
+            let rules = runtime.map(|runtime| &runtime.resources.rules);
+            let overlay_data = build_minimap_overlay_data(
+                state.match_state.match_presentation.overlays.as_slice(),
+                &state.match_state.match_presentation.terrain_objects,
+                overlay_registry,
+                rules,
+            );
+            MinimapRenderer::new(
+                &state.renderer.gpu.device,
+                &state.renderer.gpu.queue,
+                &state.renderer.batch_renderer,
+                grid,
+                runtime,
+                &overlay_data,
+                &state.match_state.match_presentation.overlay_radar_colors,
+                &state.match_state.match_presentation.theater_name,
+                playfield_bounds,
+                playfield_revision,
+            )
+        });
+    state.match_state.match_presentation.minimap = minimap;
+    state.match_state.match_presentation.selection_overlay = Some(SelectionOverlay::new(
+        &state.renderer.gpu,
+        &state.renderer.batch_renderer,
+        state.process_assets.manager(),
+    ));
+    // Phobos DigitalDisplay `Shape=`/`Palette=` assets, retained once per match
+    // like `DigitalDisplayTypeClass`'s SHP pointers.
+    #[cfg(feature = "phobos")]
+    if let Some(assets) = state.process_assets.manager()
+        && let Some(rules) = state
+            .match_state
+            .sim_runtime
+            .runtime()
+            .map(|runtime| &runtime.resources.rules)
+        && let Some(overlay) = state
+            .match_state
+            .match_presentation
+            .selection_overlay
+            .as_mut()
+    {
+        overlay.load_digital_display_shapes(
+            &state.renderer.gpu.device,
+            &state.renderer.gpu.queue,
+            &state.renderer.batch_renderer,
+            assets,
+            rules.digital_display_types().types(),
+        );
+    }
+    // Ares/Phobos `Insignia` SHPs, retained once per match like the
+    // TechnoTypeExt's SHPStruct pointers.
+    if let Some(assets) = state.process_assets.manager()
+        && let Some(rules) = state
+            .match_state
+            .sim_runtime
+            .runtime()
+            .map(|runtime| &runtime.resources.rules)
+        && let Some(overlay) = state
+            .match_state
+            .match_presentation
+            .selection_overlay
+            .as_mut()
+    {
+        overlay.load_insignia_shapes(
+            &state.renderer.gpu.device,
+            &state.renderer.gpu.queue,
+            &state.renderer.batch_renderer,
+            assets,
+            rules,
+        );
+    }
+    // Ares `IvanBomb.Image` SHPs, retained once per match like the
+    // WeaponTypeExt's SHPStruct pointers, when the Rules were read the Ares
+    // way: the bomb clock draws them then (`techno_extras_for_parent`).
+    if let Some(assets) = state.process_assets.manager()
+        && let Some(rules) = state
+            .match_state
+            .sim_runtime
+            .runtime()
+            .map(|runtime| &runtime.resources.rules)
+        && rules.ares_form()
+        && let Some(overlay) = state
+            .match_state
+            .match_presentation
+            .selection_overlay
+            .as_mut()
+    {
+        overlay.load_ares_bomb_images(
+            &state.renderer.gpu.device,
+            &state.renderer.gpu.queue,
+            &state.renderer.batch_renderer,
+            assets,
+            rules,
+        );
+    }
+    // Phobos placement preview strips embed the active theater's palette and
+    // the local house colour; a map load invalidates them.
+    #[cfg(feature = "phobos")]
+    state
+        .match_state
+        .match_presentation
+        .placement_preview_art
+        .borrow_mut()
+        .reset();
+    // Full_Init 687BB2 -> Init_BeaconArt 4309D0, after 68781F mounted the
+    // side's MIX group; each row's ColorScheme is its House's (+0x16054),
+    // whose Convert Init_Theater rebuilt from UNIT%s.PAL (534D77).
+    let beacon_side = crate::app::presentation::sidebar_render::current_sidebar_side(state);
+    let beacon_ares = state.rules().is_some_and(|rules| rules.ares());
+    state.match_state.match_presentation.beacon_art =
+        state.process_assets.manager().and_then(|assets| {
+            let runtime = state.match_state.sim_runtime.runtime()?;
+            let sim = &runtime.simulation;
+            let colors = &state.match_state.match_presentation.house_color_map;
+            let ramps: Vec<_> = sim
+                .houses()
+                .order()
+                .iter()
+                .map(|house| {
+                    let index = colors
+                        .get(sim.interner().resolve(*house))
+                        .copied()
+                        .unwrap_or(crate::rules::house_colors::NO_REMAP);
+                    *runtime.resources.rules.house_color_ramps.ramp(index)
+                })
+                .collect();
+            let unit_palette = crate::map::theater::load_theater_unit_and_iso_palettes(
+                assets,
+                &state.match_state.match_presentation.theater_name,
+            )
+            .map(|(unit, _)| unit);
+            Some(crate::render::beacon_art::BeaconArt::new(
+                &state.renderer.gpu.device,
+                &state.renderer.gpu.queue,
+                &state.renderer.batch_renderer,
+                assets,
+                beacon_side,
+                beacon_ares,
+                unit_palette.as_ref(),
+                &ramps,
+            ))
+        });
+    let shroud_buffer = state.process_assets.manager().and_then(|assets| {
+        let grid = state
+            .match_state
+            .sim_runtime
+            .runtime()?
+            .simulation
+            .path_grid()?;
+        let shp =
+            crate::assets::shp_file::ShpFile::from_bytes(assets.get_ref("shroud.shp")?).ok()?;
+        let (frame_pixels, cw, ch) = crate::render::shroud_buffer::extract_shp_brightness(&shp);
+        let mut buffer = crate::render::shroud_buffer::ShroudBuffer::new(
+            &state.renderer.gpu.device,
+            &state.renderer.gpu.queue,
+            [state.render_width(), state.render_height()],
+            [grid.width(), grid.height()],
+            frame_pixels,
+            [cw, ch],
+            crate::render::shroud_buffer::SHROUD_EDGE_LUT,
+        );
+        buffer.set_translucent_fog(&state.renderer.gpu.queue, state.translucent_fog_enabled());
+        // Cell47EFE0/47F250 use FOG.SHP's raw A bytes when Scenario0x1000
+        // is set. It belongs to this same tactical source, not a sprite atlas.
+        let fog = crate::assets::shp_file::ShpFile::from_bytes(assets.get_ref("fog.shp")?).ok()?;
+        let (frames, width, height) = crate::render::shroud_buffer::extract_shp_brightness(&fog);
+        buffer.install_fog_frames(
+            &state.renderer.gpu.device,
+            &state.renderer.gpu.queue,
+            frames,
+            [width, height],
+        );
+        Some(buffer)
+    });
+    state.match_state.match_presentation.shroud_buffer = shroud_buffer;
+}
+
+/// Complete StartScenario's successful ReadScenario boundary. Basic.Action
+/// executes before the tactical video-mode/timing handoff. Its existing movie
+/// owner suspends/resumes audio; the later Theme queue/Stop(true) belongs to
+/// apply_map_load_result (683E4D..683E66), after this movie returns.
+pub(crate) fn finish_fresh_scenario_read(state: &mut AppState, mut result: init::MapLoadResult) {
+    assert!(
+        result.pending_atlases.is_none(),
+        "install requires completed presentation"
+    );
+    // Read_INI_Basic689FD6/689FF4 retains these two buffers across fresh
+    // ClearScene reads. Saved restoration instead installs the saved values
+    // directly through install_world_presentation; it must not inherit here.
+    result
+        .scenario
+        .basic
+        .resolve_retained_destinations(&state.match_state.map_basic);
+    let action_movie = result.scenario.startup.campaign().and_then(|startup| {
+        // Start_Scenario683D9C tests its DL argument before the movie.
+        if !startup.plays_action_movie() {
+            return None;
+        }
+        let name = result.scenario.basic.action.as_deref()?;
+        let movies = state.process_assets.native_rules()?.movies();
+        movies.name(movies.find_index(name)).map(str::to_owned)
+    });
+    if let Some(movie) = action_movie {
+        if let Some(manager) = result.asset_manager.take() {
+            state.process_assets.return_from_loading(manager);
+        }
+        crate::app::loading::pump::clear_loading_state(state);
+        crate::app::App::start_fullscreen_movie(
+            state,
+            &movie,
+            crate::app::frontend::fullscreen_movie::MovieReturn::CampaignLoaded(Box::new(result)),
+        );
+    } else {
+        apply_map_load_result(state, result);
+    }
+}
+
 pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadResult) {
+    // Retiring Radar may record a service input after the outgoing frame.
+    // Publish that frame before the retire/reset sequence.
+    crate::app::match_runtime::sim_tick::finish_threaded_frame(state);
+    crate::app::match_runtime::scenario_pause::reset_clock(state);
+    let wall_ms = crate::app::match_runtime::frame_pacer::wall_clock_ms();
+    crate::app::radar_movie::retire(state, wall_ms);
+    crate::app::chrono_screen::retire(state, wall_ms);
     crate::app::input::dispatch::selection_navigation::reset_for_world_replacement(
         &mut state.match_state.input,
     );
     // Start_Scenario 00683D21 completes Read_Scenario before switching video
-    // mode at 00683DF3. Loading artwork stays at shell size; successful tactical
-    // installation must size its camera/shroud against the applied game mode.
-    crate::app::App::enter_game_window_mode(state);
+    // mode at 00683DF3. VERA keeps the window the player gave it: the match
+    // takes the zoom pass's source size, already current for this window.
     crate::app::loading::pump::present_game_mode_blank(state);
-    crate::app::reset_scenario_exit_runtime(state);
+    // Only fresh startup cancels its outgoing scenario-owned request. Saved
+    // loading preserves the process Theme state until ThemeLoad721040.
+    state.audio.cancel_scenario_theme_request();
     let startup = result.scenario.startup;
-    let returns_scenario_rng_to_offline_shell = startup.launch_session().is_some();
-    state.match_state.match_presentation.local_player_handle = startup
-        .launch_session()
-        .map(|launch| launch.player_name.clone());
+    let returns_scenario_rng_to_multiplayer_shell = startup.launch_session().is_some();
     // A loaded world is not timed until the launch handoff reaches InGame.
     state.match_state.scenario_elapsed_clock.reset();
-    state.match_state.match_presentation.tile_atlas = result.presentation.tile_atlas;
-    state.match_state.match_presentation.building_zshape = result.presentation.building_zshape;
+    #[cfg(feature = "telemetry-dashboard")]
+    crate::app::telemetry_capture::reset_observation(state);
     crate::app::loading::pump::clear_loading_state(state);
-    state.match_state.map_basic = result.scenario.basic;
-    state.match_state.loaded_map_source = Some(result.scenario.map_source);
-    state.match_state.loaded_map_hash = result.scenario.map_hash;
-    state.match_state.match_presentation.terrain_grid = result.scenario.terrain_grid;
-    state.match_state.match_presentation.height_map = result.scenario.height_map;
-    state.match_state.match_presentation.bridge_height_map = result.scenario.bridge_height_map;
+
+    // Close the outgoing diagnostic timeline before replacing its runtime.
+    crate::app::match_runtime::sim_tick::close_replay_segment_for_new_timeline(state);
+    crate::app::reset_scenario_exit_runtime(state);
+    let incoming = result.scenario.simulation.zip(result.scenario.rules);
+    if let Some(sfx) = state.audio.sfx_player.as_mut() {
+        // Every committed replacement retires outgoing sources, including a
+        // generic fallback with no incoming world. Cancellation precedes both
+        // dropping the world and installing a fresh Main continuation.
+        sfx.stop_all();
+    }
+    if incoming.is_some() {
+        // The inactive load has inherited this process cursor. Only a world
+        // actually installed here retires cold MapGen transport; failed and
+        // cancelled attempts retain it in RandomMapGenerationRetention.
+        state
+            .frontend
+            .random_map_retention
+            .discard_pending_mapgen_on_simulation_install();
+    } else if let Some(outgoing) = state.match_state.sim_runtime.take_runtime() {
+        // The generic fallback drops its resident Simulation. MapGen is
+        // process-global in gamemd, so retain its cursor before that drop.
+        let continuation = outgoing.simulation.mapgen_continuation_for_fresh_load();
+        state
+            .frontend
+            .random_map_retention
+            .publish_mapgen_continuation(None, continuation);
+        // GameMode is process-global too; the shell takes it back.
+        state
+            .match_state
+            .session
+            .retake_mode_from_world(outgoing.simulation.session().game_mode());
+    }
     state
         .match_state
-        .match_presentation
-        .installed_playfield_authority = None;
-    state.frontend.shell_preview_overlay_registry = Some(result.scenario.overlay_registry.clone());
-    // F10 lifecycle: a new match install closes the outgoing diagnostic
-    // segment before the runtime slot is overwritten — the old install
-    // dropped any unflushed segment silently. A failed close discards
-    // rather than retains, so the new timeline cannot append under the
-    // old header.
-    crate::app::match_runtime::sim_tick::close_replay_segment_for_new_timeline(state);
-    let match_rules = result.scenario.rules;
-    state.match_state.sim_runtime =
-        result
-            .scenario
-            .simulation
-            .zip(match_rules)
-            .map(|(simulation, rules)| crate::sim::runtime::SimRuntime {
+        .sim_runtime
+        .install(incoming.map(|(mut simulation, rules)| {
+            simulation.install_fresh_process_main(&state.frontend.frontend_main_rng);
+            simulation.publish_scenario_started();
+            simulation.batch_path_searches();
+            simulation.batch_target_scans();
+            simulation.present_effect_anims();
+            simulation.sleep_idle_objects_in_match();
+            crate::sim::runtime::SimRuntime {
                 simulation,
                 resources: crate::sim::runtime::SimResources {
-                    overlay_registry: result.scenario.overlay_registry,
                     terrain_template: result.scenario.resolved_terrain,
                     rules,
-                    trigger_graph: result.scenario.trigger_graph,
-                    triggers: result.scenario.triggers,
-                    events: result.scenario.events,
-                    actions: result.scenario.actions,
-                    waypoints: result.scenario.waypoints.clone(),
-                },
+                }
+                .into(),
+            }
+        }));
+    if let Some(runtime) = state.match_state.sim_runtime.runtime() {
+        state
+            .match_state
+            .session
+            .hand_mode_to_world(runtime.simulation.session().game_mode());
+    }
+    crate::app::audio_runtime::bind_match_eva_context(state);
+    // Only an actually-carried lease returns. A fallback result must not wipe
+    // the process-sticky manager already restored by its failure path.
+    if let Some(manager) = result.asset_manager {
+        state.process_assets.return_from_loading(manager);
+    }
+    let lighting_events = state
+        .match_state
+        .sim_runtime
+        .write_sim(SimWrite::Presentation)
+        .map(|runtime| runtime.simulation.take_lighting_events());
+    install_world_presentation(
+        state,
+        MapPresentationInputs {
+            campaign_names: result.scenario.campaign_names,
+            basic: result.scenario.basic,
+            ranking: result.scenario.ranking,
+            source: result.scenario.map_source,
+            map_hash: result.scenario.map_hash,
+            terrain_grid: result.scenario.terrain_grid,
+            overlays: result.scenario.overlays,
+            terrain_objects: result.scenario.terrain_objects,
+            house_roster: result.scenario.house_roster,
+            lighting_config: result.scenario.map_lighting_config,
+            lighting_events,
+            theater_name: result.scenario.theater_name,
+            theater_ext: result.scenario.theater_ext,
+        },
+        result.presentation,
+    );
+    if let Some(rules) = state.rules() {
+        state
+            .match_state
+            .match_presentation
+            .voxel_images
+            .borrow_mut()
+            .start_scenario(|type_id| {
+                rules
+                    .object(type_id)
+                    .is_some_and(|object| object.voxel_image_load().is_some())
             });
-    state.match_state.match_presentation.combat_lights.clear();
+    }
     state
         .match_state
         .match_presentation
         .sinking_waterlines
         .borrow_mut()
         .clear();
+    // Fresh SidebarClass admission silently seeds its first projection.
+    // ClearScene685573 -> Mouse5BDF50 -> Sidebar6A5030 -> Power63F730:
+    // fresh matches clear the retained Power fields. The saved-load route
+    // shares install_world_presentation but has a distinct NoInit contract.
+    let wall_ms = state.radar_presentation_ms();
     state
         .match_state
         .match_presentation
-        .barrel_image_pitches
-        .borrow_mut()
-        .clear();
-    state
-        .match_state
-        .match_presentation
-        .line_trails
-        .clear_on_load();
-    // A new simulation is a new scenario for `SidebarClass::AddCameo`'s
-    // init gate: its first projection must seed the strip silently.
+        .power_bar_anim
+        .reset(wall_ms);
     state
         .match_state
         .match_presentation
         .sidebar_projection
         .reset_cameo_seed();
-    sync_in_game_options_speed_from_sim(state);
-    if let Some(sim) = state
-        .match_state
-        .sim_runtime
-        .as_mut()
-        .map(|rt| &mut rt.simulation)
-    {
-        sim.set_input_delay_ticks(state.match_state.configured_input_delay_ticks);
-    }
-    state.match_state.match_presentation.unit_atlas = result.presentation.unit_atlas;
-    // Slope-transition sprites belong to the match's voxel models; the cache
-    // otherwise keeps every earlier match's pages alive.
-    *state.renderer.vxl_slope_transition_cache.borrow_mut() = Default::default();
-    state.match_state.match_presentation.palette_set = result.presentation.palette_set;
-    state.match_state.match_presentation.sprite_atlas = result.presentation.sprite_atlas;
-    state.match_state.match_presentation.overlay_atlas = result.presentation.overlay_atlas;
-    state.match_state.match_presentation.bridge_atlas = result.presentation.bridge_atlas;
-    state.match_state.match_presentation.bridge_railing_atlas =
-        result.presentation.bridge_railing_atlas;
-    state.match_state.match_presentation.sidebar_cameo_atlas =
-        result.presentation.sidebar_cameo_atlas;
-    state.match_state.match_presentation.sidebar_chrome = result.presentation.sidebar_chrome;
-    if let Some(ref fnt) = result.presentation.fnt_file {
-        state.renderer.bit_font = crate::render::bit_font::BitFont::from_fnt(
-            &state.renderer.gpu,
-            &state.renderer.batch_renderer,
-            fnt,
-        );
-    }
-
-    // A new match discards the outgoing radar presentation. Source selection
-    // runs in the existing final sidebar refresh, after roster and the pinned
-    // local owner have been installed, so it cannot observe the prior player.
-    state.match_state.match_presentation.radar_anim = None;
-    state.match_state.match_presentation.radar_animation_source = None;
-    state.match_state.match_presentation.radar_content_insets = None;
-    state.match_state.match_presentation.has_radar = false;
-
-    state.match_state.match_presentation.software_cursor = result.presentation.software_cursor;
+    let owner = state.match_state.local_player_owner().map(str::to_owned);
     state
         .match_state
         .match_presentation
-        .overlays
-        .replace_from_source(result.scenario.overlays);
-    state.match_state.match_presentation.terrain_objects = result.scenario.terrain_objects;
-    state.match_state.match_presentation.waypoints = result.scenario.waypoints;
-    state.match_state.match_presentation.cell_tags = result.scenario.cell_tags;
-    state.match_state.match_presentation.tags = result.scenario.tags;
-    state.match_state.match_presentation.overlay_names = result.presentation.overlay_names;
-    state.match_state.match_presentation.overlay_radar_colors =
-        result.presentation.overlay_radar_colors;
-    state.match_state.match_presentation.house_color_map = result.presentation.house_color_map;
-    state.match_state.match_presentation.house_roster = result.scenario.house_roster;
-    // F04: the app no longer stores a second ArtRegistry; presentation
-    // borrows the sole copy owned by RuleSet (state.rules).
-    state.process_assets.csf = result.presentation.csf;
-    state.match_state.match_presentation.theater_name = result.scenario.theater_name;
-    state.match_state.match_presentation.theater_ext = result.scenario.theater_ext;
+        .sidebar_projection
+        .start_scenario_credits_counter(owner.as_deref());
+    if let Some(runtime) = state.match_state.sim_runtime.write_sim(SimWrite::Lifecycle) {
+        runtime
+            .simulation
+            .set_input_delay_ticks(state.match_state.configured_input_delay_ticks);
+    }
 
-    let runtime = state.match_state.sim_runtime.as_ref();
-    let live = runtime.and_then(|rt| {
-        rt.resources
-            .terrain_template
-            .as_ref()
-            .map(|terrain| (terrain, &rt.simulation, &rt.resources.rules))
-    });
-    let presentation = &mut state.match_state.match_presentation;
-    presentation.lighting.install(
-        result.presentation.lighting_grid,
-        result.scenario.map_lighting_config,
-        presentation.in_game_options.detail_level,
-        live,
-    );
     // Map load hands over a world anchor point; the transition applies the
     // active tactical rectangle and live zoom.
-    let (tactical_width, tactical_height) = crate::app::input::camera::tactical_viewport_size_px(
-        state.render_width(),
-        state.render_height(),
-    );
+    let (tactical_x, tactical_y, tactical_width, tactical_height) =
+        crate::app::input::camera::tactical_viewport_px(state);
+    let (centring_width, centring_height) =
+        crate::app::input::camera::tactical_centring_size(state);
     let (camera_x, camera_y) = crate::app::input::camera::tactical_camera_top_left(
         (
             result.scenario.camera_anchor_x,
             result.scenario.camera_anchor_y,
         ),
-        tactical_width as f32,
-        tactical_height as f32,
+        centring_width as f32,
+        centring_height as f32,
         state.match_state.input.zoom_level,
     );
-    state.match_state.input.camera_x = camera_x;
-    state.match_state.input.camera_y = camera_y;
+    crate::app::input::camera::reset_camera_for_new_scenario(state);
+    state.match_state.input.cursor_visibility.reset();
+    crate::app::input::camera::set_camera_position(
+        &mut state.match_state.input,
+        (camera_x, camera_y),
+    );
     // gamemd's scenario reader fills all four camera bookmarks with the opening
     // view cell, so F1 before any Ctrl+F1 is a valid "go home".
-    crate::app::input::camera::seed_view_bookmarks_from_current_view(state);
-    // F11 slot: only an actually-carried manager returns (Loading ->
-    // Available). The fallback result carries None — the old unconditional
-    // assignment wiped the manager the failure path had just restored,
-    // discarding the process-sticky MIX cache and theater identity.
-    if let Some(manager) = result.asset_manager {
-        state.process_assets.return_from_loading(manager);
-    }
-    state.match_state.input.targeting_mode = None;
-    state.match_state.input.building_placement_preview = None;
+    crate::app::input::camera::seed_view_bookmarks_from_opening_view(
+        state,
+        result.scenario.opening_view_cell,
+    );
+    state.match_state.input.reset_targeting_for_new_world();
     state.match_state.match_presentation.active_sidebar_tab = SidebarTab::default_active_tab();
-    state.match_state.match_presentation.sidebar_scroll_rows = 0;
+    // Read_Scenario's Init (`0x00684AC9`). Start_Scenario then changes video
+    // mode when the game size differs from the shell's (`0x00683DB8..0x00683DF3`):
+    // Change_Video_Mode's Set_View_Dimensions (`0x005610EC`) Inits the empty
+    // list again and SetWidth leaves it 6 px wider. VERA's match takes the
+    // window's size, so a match frame other than the 800x600 shell stands for
+    // that switch.
+    let mut message_list = crate::ui::messages::MessageList::scenario();
+    let shell = crate::app::persistence::options_profile::RETAIL_SHELL_SIZE;
+    if (state.render_width(), state.render_height()) != (shell.width, shell.height) {
+        message_list.set_width(tactical_width as i32);
+    }
+    state.match_state.match_presentation.message_list = message_list;
+    crate::app::input::messages::post_layout_problem(state);
+    state.match_state.match_presentation.chat = Default::default();
+    // Clear_Scene6851F0 -> 534450 resets BeaconManagerClass (53499B).
+    // Display Init_Clear4A88C0 clears +11B0..+11B2, not beacon mode +11B4.
+    state.match_state.match_presentation.beacons = Default::default();
     state
         .match_state
         .match_presentation
-        .sidebar_scroll_rows_parked = [0; 4];
-    // Re-init the message surface per scenario (the native list is
-    // re-initialized at scenario start): drops stale rows from the previous
-    // game and any dangling pause span, so a pause→quit→new-map sequence
-    // never folds the menu dwell into the new game's frozen-deadline clock.
-    // Anchors mirror the AppState ctor; x/width re-sync on first use.
-    state.match_state.match_presentation.message_list = crate::ui::messages::MessageList::new(
-        3,
-        0,
-        crate::ui::messages::MESSAGE_MAX_VISIBLE_RETAIL,
-        0,
-    );
-    state.match_state.match_presentation.message_clock =
-        crate::ui::messages::PauseAwareClock::default();
-    // The window keeps its title: gamemd names it once at CreateWindowExA
-    // (`0x00777CC5`) and imports no SetWindowText.
-    state.platform.window.set_cursor_visible(
-        state
-            .match_state
-            .match_presentation
-            .software_cursor
-            .is_none(),
-    );
-
-    // Install current sim authority before the first camera/minimap frame. A
-    // campaign trigger may already have changed LocalSize before presentation
-    // objects exist; raw MapHeader LocalSize is not an acceptable substitute.
-    let (playfield_bounds, playfield_revision) =
-        crate::app::input::camera::sync_playfield_presentation_bounds(state);
-
-    // Create minimap from terrain grid with overlay data.
-    if let Some(grid) = &state.match_state.match_presentation.terrain_grid {
-        let resolved_terrain = state
-            .match_state
-            .sim_runtime
-            .as_ref()
-            .and_then(|runtime| runtime.view().resolved_terrain());
-        let overlay_registry = state
-            .match_state
-            .sim_runtime
-            .as_ref()
-            .map(|runtime| &runtime.resources.overlay_registry);
-        let rules = state
-            .match_state
-            .sim_runtime
-            .as_ref()
-            .map(|runtime| &runtime.resources.rules);
-        let overlay_data = build_minimap_overlay_data(
-            state.match_state.match_presentation.overlays.as_slice(),
-            &state.match_state.match_presentation.terrain_objects,
-            overlay_registry,
-            rules,
-        );
-        state.match_state.match_presentation.minimap = Some(MinimapRenderer::new(
-            &state.renderer.gpu,
-            &state.renderer.batch_renderer,
-            grid,
-            resolved_terrain,
-            &overlay_data,
-            &state.match_state.match_presentation.overlay_radar_colors,
-            &state.match_state.match_presentation.theater_name,
-            playfield_bounds,
-            playfield_revision,
-        ));
-    }
-    state.match_state.input.minimap_dragging = false;
-    state.match_state.input.tactical_mouse = Default::default();
+        .sidebar_gadget_state
+        .clear_for_new_scenario();
+    state.match_state.input.cancel_minimap_press();
+    state.match_state.input.tactical_mouse.reset_for_new_view();
     state.match_state.input.keys_held.clear();
-    let (tactical_width, tactical_height) = crate::app::input::camera::tactical_viewport_size_px(
-        state.render_width(),
-        state.render_height(),
-    );
-    state.match_state.input.cursor_x = tactical_width as f32 * 0.5;
-    state.match_state.input.cursor_y = tactical_height as f32 * 0.5;
-
-    // Create selection overlay for rendering highlights and drag rect.
-    // Pass asset_manager so it can load pips.shp for authentic health bar pips.
-    state.match_state.match_presentation.selection_overlay = Some(SelectionOverlay::new(
-        &state.renderer.gpu,
-        &state.renderer.batch_renderer,
-        state.process_assets.manager(),
-    ));
-
-    // Create GPU ABuffer for per-pixel shroud darkening.
-    // Loads SHROUD.SHP brightness data and the 256-byte edge LUT.
-    if let Some(am) = state.process_assets.manager() {
-        if let Some(grid) = state
-            .match_state
-            .sim_runtime
-            .as_ref()
-            .map(|rt| &rt.simulation)
-            .and_then(crate::sim::world::Simulation::path_grid)
-        {
-            if let Some(shp_data) = am.get_ref("shroud.shp") {
-                if let Ok(shp) = crate::assets::shp_file::ShpFile::from_bytes(shp_data) {
-                    let (frame_pixels, cw, ch) =
-                        crate::render::shroud_buffer::extract_shp_brightness(&shp);
-                    state.match_state.match_presentation.shroud_buffer =
-                        Some(crate::render::shroud_buffer::ShroudBuffer::new(
-                            &state.renderer.gpu,
-                            state.render_width(),
-                            state.render_height(),
-                            grid.width(),
-                            grid.height(),
-                            frame_pixels,
-                            cw,
-                            ch,
-                            crate::render::shroud_buffer::SHROUD_EDGE_LUT,
-                        ));
-                }
-            }
-        }
-    }
-
-    state.platform.frame_pacer.reset_for_immediate_frame();
+    state.match_state.input.cursor_x = tactical_x as f32 + tactical_width as f32 * 0.5;
+    state.match_state.input.cursor_y = tactical_y as f32 + tactical_height as f32 * 0.5;
+    state.platform.frame_pacer.reset_for_new_world();
+    state
+        .match_state
+        .network_quality
+        .reset(state.platform.frame_pacer.total_render_deferrals());
     state.match_state.input.queued_order_mode = render::OrderMode::Move;
-    for group in &mut state.match_state.input.control_groups {
-        group.clear();
-    }
-    // Ordinary identity is already bound in Simulation.session.current_house.
-    // Keep a preference only for development worlds without that authority.
-    state.match_state.local_owner_override = result.scenario.initial_local_owner;
-    // F11: reset the whole per-match audio owner. The old reset cleared only
-    // three EVA latches — the tick-indexed under-attack suppression window
-    // carried into the new match (whose tick counter restarts at 0) and
-    // silenced the under-attack EVA line for its first ~30 seconds, and the
-    // sound-event queue kept the previous match's undrained events.
     state.match_state.match_audio.reset_for_new_match();
     state.match_state.sandbox_full_visibility = result.scenario.sandbox_full_visibility;
 
@@ -428,123 +821,176 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
     // resolves through `From_Name` (`0x004758F0`); -1 -> `Stop(fade=1)` of the
     // LOADING stream, else `Queue_Song(index)`. `Main_Tick` then issues
     // `Queue_Song(-2)` and the audio pump's AI picks the first allowed track
-    // once the fade lands. The shuffle stream is a presentation-side copy of
-    // `g_MainRng` seeded from the match seed (never the sim's own cursor), and
+    // once the fade lands. Theme AI borrows the installed process Main cursor;
     // `Is_Allowed`'s `Side=` gate compares the local player's side.
-    let music_now_ms = sim_tick::monotonic_frame_pacer_ms(state, std::time::Instant::now());
-    let (match_seed, local_side) = state
-        .match_state
-        .sim_runtime
-        .as_ref()
-        .map(|rt| {
-            let simulation = &rt.simulation;
-            let local_side = state
-                .match_state
-                .local_player_owner()
-                .and_then(|owner| {
-                    crate::sim::house_state::house_state_for_owner(
-                        &simulation.houses,
-                        owner,
-                        &simulation.interner,
-                    )
-                })
-                .map(|house| i32::from(house.side_index));
-            (simulation.session.seed as u32, local_side)
-        })
-        .unwrap_or((0, None));
-    // `Side=` names resolve against the live `[Sides]` registry (native
-    // `0x004756F0` → `0x006A46D0`); unresolved names never match any player.
-    let side_names: Vec<String> = state
-        .audio
-        .theme
-        .entries()
-        .iter()
-        .filter_map(|entry| entry.side_name.clone())
-        .collect();
-    let side_indices: Vec<(String, i32)> = state
-        .rules()
-        .map(|rules| {
-            side_names
-                .iter()
-                .filter_map(|name| {
-                    rules
-                        .side_index(name)
-                        .map(|index| (name.to_ascii_uppercase(), i32::from(index.0)))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let music_now_ms = crate::app::match_runtime::frame_pacer::wall_clock_ms();
+    crate::app::audio_runtime::bind_match_theme_context(state);
     if let Some(assets) = state.process_assets.manager() {
         state.audio.request_scenario_theme(
             state.match_state.map_basic.theme.as_deref(),
             assets,
-            match_seed,
-            crate::audio::theme::ThemeAllowContext {
-                local_side,
-                // Skirmish (`g_GameMode != 0`) skips the campaign `Scenario=` gate.
-                campaign_scenario: None,
-            },
-            |name| {
-                let wanted = name.to_ascii_uppercase();
-                side_indices
-                    .iter()
-                    .find(|(candidate, _)| *candidate == wanted)
-                    .map(|(_, index)| *index)
-            },
             music_now_ms,
         );
     }
 
-    match startup {
-        crate::match_bootstrap::LoadingStartup::Accepted(prepared) => {
-            let receipt = state.match_state.startup.acknowledge(
+    let mut initial_replay_effects = Vec::new();
+    let installation = match startup {
+        crate::app::match_bootstrap::LoadingStartup::Campaign(prepared) => {
+            let installed = state.match_state.startup.acknowledge_campaign(
+                &prepared,
+                state
+                    .match_state
+                    .sim_runtime
+                    .runtime()
+                    .map(|rt| &rt.simulation),
+                matches!(state.frontend.screen, GameScreen::Loading),
+            );
+            // GameExit::Victory (`0x00685D7A`), the restart (`0x00686506`)
+            // and the defeat retry (`0x0068639A`) write the carry-over record
+            // back after Start_Scenario through `0x004C6210`.
+            if installed.is_ok()
+                && let Some(record) = prepared.carry_over()
+                && let Some(runtime) = state.match_state.sim_runtime.write_sim(SimWrite::Lifecycle)
+            {
+                runtime
+                    .simulation
+                    .restore_campaign_carry_over(record, &runtime.resources.rules);
+            }
+            installed
+        }
+        crate::app::match_bootstrap::LoadingStartup::Accepted(prepared) => {
+            state.match_state.startup.acknowledge(
                 prepared,
                 state
                     .match_state
                     .sim_runtime
-                    .as_ref()
+                    .runtime()
                     .map(|rt| &rt.simulation),
                 matches!(state.frontend.screen, GameScreen::Loading),
-            );
-
-            match receipt {
-                Ok(()) => {
-                    let now_ms =
-                        sim_tick::monotonic_frame_pacer_ms(state, std::time::Instant::now());
-                    state.match_state.scenario_elapsed_clock.start(now_ms);
-                    state.frontend.screen = GameScreen::InGame;
-                    state
-                        .frontend
-                        .offline_skirmish_runtime
-                        .mark_gameplay_rng_return_pending();
-                    log::info!("Transitioned to InGame after Rust L0 acknowledgement");
-                }
-                Err(err) => {
-                    state.match_state.startup.clear();
-                    state.frontend.screen = GameScreen::MissionResult {
-                        title: "Startup Rejected".to_string(),
-                        detail: err.clone(),
+            )
+        }
+        crate::app::match_bootstrap::LoadingStartup::Network(prepared) => {
+            state.match_state.session.assert_network_start(&prepared);
+            state.match_state.startup.clear();
+            // A co-op continuation's GameExit tail (`0x00685D7A` victory,
+            // `0x0068639A` defeat) restores the record after Start_Scenario.
+            if let Some(record) = prepared.carry_over()
+                && let Some(runtime) = state.match_state.sim_runtime.write_sim(SimWrite::Lifecycle)
+            {
+                runtime
+                    .simulation
+                    .restore_campaign_carry_over(record, &runtime.resources.rules);
+            }
+            let installed = crate::app::lan_service::install_gameplay(state);
+            if installed.is_ok() {
+                install_watcher(state);
+            }
+            installed.map_err(|error| error.to_string())
+        }
+        crate::app::match_bootstrap::LoadingStartup::Replay { .. }
+        | crate::app::match_bootstrap::LoadingStartup::AuthoredCampaignReplay { .. } => {
+            state.match_state.startup.clear();
+            let playback = match (
+                state.match_state.sim_runtime.write_sim(SimWrite::Lifecycle),
+                state.match_state.loaded_map_source.as_ref(),
+                state.match_state.loaded_map_hash,
+            ) {
+                (Some(runtime), Some(source), Some(map_hash)) => state
+                    .match_state
+                    .match_diagnostics
+                    .install_playback(runtime, source, map_hash),
+                _ => Err(anyhow::anyhow!(
+                    "replay loader did not install an authored world"
+                )),
+            };
+            match playback {
+                Ok(effects) => initial_replay_effects = effects,
+                Err(error) => {
+                    log::error!("Replay startup failed: {error:#}");
+                    let message = if matches!(startup, crate::app::match_bootstrap::LoadingStartup::AuthoredCampaignReplay { .. }) {
+                        crate::i18n::tr("VERA:CampaignReplayUnavailable")
+                    } else {
+                        format!("Replay startup failed: {error:#}")
                     };
-                    log::error!("Accepted startup failed closed at Rust L0: {err}");
+                    state.frontend.external_launch_error = Some(message);
                 }
             }
+            // A rejected replay is a frozen inspection view, never a fresh
+            // playable match. Its diagnostics owner blocks every tick/input.
+            Ok(())
         }
-        crate::match_bootstrap::LoadingStartup::UnverifiedLegacy { .. }
-        | crate::match_bootstrap::LoadingStartup::Generic { .. } => {
+        crate::app::match_bootstrap::LoadingStartup::UnverifiedLegacy { session, .. } => {
+            state.match_state.startup.install_legacy(session);
+            Ok(())
+        }
+        crate::app::match_bootstrap::LoadingStartup::Generic { .. } => {
             state.match_state.startup.clear();
-            let now_ms = sim_tick::monotonic_frame_pacer_ms(state, std::time::Instant::now());
+            Ok(())
+        }
+    };
+    match installation {
+        Ok(()) => {
+            let now_ms = crate::app::match_runtime::frame_pacer::wall_clock_ms();
             state.match_state.scenario_elapsed_clock.start(now_ms);
+            // Main_Game 0x0048CE7E: State_Machine's admission latch.
+            state.match_state.match_presentation.modal_latch = true;
             state.frontend.screen = GameScreen::InGame;
-            if returns_scenario_rng_to_offline_shell {
+            // The skirmish shell's chrome atlas draws nothing in a match until
+            // the in-game menu or a network dialog opens: the menu's opening
+            // (`App::enter_in_game_menu_state`) and the frame loop build it
+            // again then, and the shell's return to its page builds it as
+            // every entry does (`App::ensure_skirmish_shell_chrome`).
+            state.frontend.skirmish_shell_chrome = None;
+            // The main menu's chrome atlas likewise: the first shell screen
+            // after the match builds it again
+            // (`App::ensure_main_menu_shell_chrome`).
+            state.frontend.main_menu_shell_chrome = None;
+            if !initial_replay_effects.is_empty() {
+                crate::app::match_runtime::sim_tick::apply_trigger_effects(
+                    state,
+                    &initial_replay_effects,
+                );
+            }
+            #[cfg(all(feature = "wasm", target_arch = "wasm32", target_os = "unknown"))]
+            crate::web::match_started();
+            if returns_scenario_rng_to_multiplayer_shell {
                 state
                     .frontend
-                    .offline_skirmish_runtime
-                    .mark_gameplay_rng_return_pending();
+                    .multiplayer_shell_runtime
+                    .mark_gameplay_scenario_return_pending();
             }
-            log::info!("Transitioned to InGame on noncertifying startup path");
+            log::info!("Transitioned to InGame after scenario installation");
+        }
+        Err(err) => {
+            state.match_state.startup.clear();
+            state.frontend.screen = GameScreen::MissionResult {
+                title: crate::i18n::tr("VERA:StartupRejected"),
+                detail: err.clone(),
+            };
+            log::error!("Scenario installation rejected startup: {err}");
         }
     }
     crate::app::presentation::sidebar_render::refresh_sidebar_projection(state);
+}
+
+/// VERA watching (docs/Networking.md "Watching"): the live session that
+/// `install_gameplay` made says whether this game watches its match. Its world
+/// is then a watcher's before its first frame: it sends nothing, also in the
+/// seat of the player it follows, whose sight it starts with, and Tab may
+/// change its view (`match_runtime::watching`).
+/// A launcher's watcher (docs/spawn.md "Watching") stands in source 0's seat
+/// only because a world needs a current House: it starts on the observer's
+/// sidebar (`watching::begin_on_observers_view`).
+fn install_watcher(state: &mut AppState) {
+    if !crate::app::match_runtime::watching::active(state) {
+        return;
+    }
+    if let Some(runtime) = state.match_state.sim_runtime.write_sim(SimWrite::Lifecycle) {
+        runtime.simulation.install_watcher();
+    }
+    if state.frontend.external_launch {
+        crate::app::match_runtime::watching::begin_on_observers_view(state);
+    }
 }
 
 /// Build overlay classification data for the minimap from map overlay entries.
@@ -555,10 +1001,10 @@ pub(crate) fn apply_map_load_result(state: &mut AppState, result: init::MapLoadR
 pub(crate) fn build_minimap_overlay_data(
     overlays: &[crate::map::overlay::OverlayEntry],
     terrain_objects: &[crate::map::overlay::TerrainObject],
-    overlay_registry: Option<&crate::map::overlay_types::OverlayTypeRegistry>,
+    overlay_registry: Option<&crate::rules::overlay_types::OverlayTypeRegistry>,
     rules: Option<&crate::rules::ruleset::RuleSet>,
-) -> Vec<crate::render::minimap::MinimapOverlayDatum> {
-    use crate::render::minimap::{
+) -> Vec<crate::render::radar::minimap::MinimapOverlayDatum> {
+    use crate::render::radar::minimap::{
         MinimapCellRadarSource, MinimapOverlayDatum, OverlayClassification, minimap_overlay_datum,
     };
 
@@ -603,10 +1049,11 @@ pub(crate) fn clear_screen(encoder: &mut wgpu::CommandEncoder, view: &wgpu::Text
         depth_stencil_attachment: None,
         timestamp_writes: None,
         occlusion_query_set: None,
+        multiview_mask: None,
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, tests_app))]
 mod game_speed_tests {
     use crate::sim::command::{Command, CommandEnvelope};
     use crate::sim::house_state::HouseState;
@@ -615,10 +1062,9 @@ mod game_speed_tests {
     #[test]
     fn loaded_lobby_speed_projection_includes_due_transition() {
         let mut sim = Simulation::new();
-        let owner = sim.interner.intern("Local");
-        sim.houses
-            .insert(owner, HouseState::new(owner, 0, None, true, 0, 10));
-        sim.session.house_order.push(owner);
+        let owner = sim.intern("Local");
+        sim.houses_mut_for_test()
+            .register(HouseState::new(owner, 0, None, true, 0, 10));
         sim.queue_command(CommandEnvelope::new(
             owner,
             1,

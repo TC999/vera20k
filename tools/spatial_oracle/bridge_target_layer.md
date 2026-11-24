@@ -3,8 +3,7 @@
 These original-executable corpora bound the ordinary empty retail FV passive
 acquisition chain and the shared native cell/height queries it reaches. They do
 not establish complete Unit scheduling, native map loading, bridge lifecycle or
-whole-world parity. The original `gamemd.exe` SHA256 is
-`1cdd1180e49024fbda8ad568caac2e86e856063ff67ab38f62b7d2c7bb84298c`.
+whole-world parity.
 
 ## Reproduce
 
@@ -272,19 +271,12 @@ bridge-receiver collapse plus two restored collapsed futures match for four
 further frames. This is Rust
 production integration; supplied receiver damage is not an ordinary firing proof.
 
-The release example closes that firing boundary separately:
-
-```sh
-cargo build -p vera20k --release --example bridge_target_layer_scene
-cargo build -p vera20k --release --bin vera20k
-target/release/examples/bridge_target_layer_scene "$RA2_DIR" /path/to/new-save-prefix bridge-debris-hills-20260926.yrm
-```
-
-The map argument must name a loose copy of the exact inner Hills payload identified
-above. The example refuses to overwrite saves. It preserves the ordinary Move/Stop
-scene, supplies hostility and an active rearm timer for the G27 boundary, then uses
-an ordinary bank FV and repeated ForceAttackCell commands through the existing
-target/weapon/projectile owners. It recorded 52 projectiles and collapse after
+A release example, `bridge_target_layer_scene` (removed on 2026-10-08), closed that
+firing boundary separately on a loose copy of the exact inner Hills payload identified
+above. It preserved the ordinary Move/Stop scene, supplied hostility and an active
+rearm timer for the G27 boundary, then used an ordinary bank FV and repeated
+ForceAttackCell commands through the existing target/weapon/projectile owners. It
+recorded 52 projectiles and collapse after
 1400 frames; the former deck and ground actors were both retired. The intact save
 is frame69/hash`286e28169efa00f8`, the collapsed save frame1509/hash`3d10a7cf8f09e45a`,
 map hash`c045c269668aa87e`, rules hash`9bf711eab7834933`. Snapshot compatibility is
@@ -305,17 +297,16 @@ rendered claim uses that initial black frame.
 
 Local logs, retained binaries, saves' generating output, PCX/PNG captures and
 `visible-v219-captures.json` are under
-`/Users/halvor/Documents/vera20k-dev/bridge-target-evidence-20260927`.
+`~/Documents/vera20k-dev/bridge-target-evidence-20260927`.
 Release app SHA256`cfa250702c4011c69a5cbcd3f2c719d918d9b3aa28e88c8cf14dee6fec6c80b1`;
 example SHA256`43210b8692b2c0c11abda54ae418de5160dec77645e024b047bfafd02d0479e9`.
 
 ## Required subsequent chains
 
 The supplied `0x100 → 0x400 → 0x100` target history establishes reaction to live
-flags; it does not establish Engineer rebuilding. The
-[ordinary Engineer entry chain](engineer_bridge_entry.md) owns that follow-up.
-It establishes that the initial diagnostic source `(69,74)` is a cliff rejected
-by native Foot/Map too, then uses the legal source `(66,76)` to trace AStar,
+flags; it does not establish Engineer rebuilding. The ordinary Engineer entry
+chain owns that follow-up. It establishes that the initial diagnostic source
+`(69,74)` is a cliff rejected by native Foot/Map too, then uses the legal source `(66,76)` to trace AStar,
 Walk, PerCell2 and repair through the authored CABHUT at `(68,74)`. Exact
 captures and native comparison receipts are retained in the local evidence
 directory's `engineer-entry-followup/`. No claim here closes all bridge types,

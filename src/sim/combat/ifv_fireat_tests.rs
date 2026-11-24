@@ -4,8 +4,7 @@
 //! prefix/RNG and dispatch frames are supplied on both sides. This does not
 //! execute the native Unit scheduler or intervening Bullet/world AI.
 
-use super::{CombatEmit, TargetKind, build_attacker_snapshot, world_receiver};
-use crate::rules::{art_data::ArtRegistry, ruleset::RuleSet};
+use super::{CombatEmit, TargetKind, build_attacker_snapshot, world_fire};
 use crate::sim::movement::FacingClass;
 use crate::sim::native_identity::NativeUniqueIdCursor;
 use crate::sim::projectile::ProjectileCoord;
@@ -24,13 +23,11 @@ fn coord(value: &Value) -> ProjectileCoord {
 
 #[test]
 fn empty_fv_two_shot_fireat_matches_native_muzzles_ids_rearm_and_rng() {
-    let Some((ini, art)) = crate::rules::retail_ini_fixture::retail_rules_and_art() else {
+    let Some(rules) = crate::rules::retail_ini_fixture::retail_unlayered_rules_with_art() else {
         return;
     };
-    let mut rules = RuleSet::from_ini_with_fixed_art_for_test(&ini, &art).unwrap();
-    rules.install_art_data(ArtRegistry::from_ini(&art));
-    let corpus: Value = serde_json::from_str(include_str!(
-        "../../../tools/projectile_oracle/ifv_fire_coord.json"
+    let corpus: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/projectile_oracle/ifv_fire_coord.json",
     ))
     .unwrap();
     let rows = corpus["cases"].as_array().unwrap();
@@ -59,17 +56,17 @@ fn empty_fv_two_shot_fireat_matches_native_muzzles_ids_rearm_and_rng() {
 
     let mut world = Simulation::new();
     let owner = world.interner.intern("Americans");
-    world.houses.insert(
-        owner,
-        crate::sim::house_state::HouseState::new(owner, 0, None, true, 0, 10),
-    );
-    world.session.house_order.push(owner);
+    world
+        .houses
+        .register(crate::sim::house_state::HouseState::new(
+            owner, 0, None, true, 0, 10,
+        ));
     crate::sim::arena_fixture::flat_arena(&mut world, &rules);
     // guided_step.create supplies flat level6 cells and no bridge flags.
     let terrain = world.resolved_terrain.as_mut().unwrap();
     for y in 16..25 {
         for x in 6..25 {
-            terrain.cell_mut(x, y).unwrap().level = 6;
+            terrain.cell_mut_for_test(x, y).unwrap().level = 6;
         }
     }
     let firer_id = world
@@ -93,17 +90,24 @@ fn empty_fv_two_shot_fireat_matches_native_muzzles_ids_rearm_and_rng() {
         let input = &rows[0]["supplied"];
         let origin = coord(&input["source_origin"]);
         let firer = world.substrate.entities.get_mut(firer_id).unwrap();
-        firer.position.rx = (origin.x / 256) as u16;
-        firer.position.ry = (origin.y / 256) as u16;
-        firer.position.sub_x = SimFixed::from_num(origin.x % 256);
-        firer.position.sub_y = SimFixed::from_num(origin.y % 256);
-        firer.position.exact_z_leptons = Some(origin.z);
+        firer.position.set_rx_for_test((origin.x / 256) as u16);
+        firer.position.set_ry_for_test((origin.y / 256) as u16);
+        firer
+            .position
+            .set_sub_x_for_test(SimFixed::from_num(origin.x % 256));
+        firer
+            .position
+            .set_sub_y_for_test(SimFixed::from_num(origin.y % 256));
+        firer.position.set_exact_z_leptons_for_test(Some(origin.z));
         firer.body_facing = FacingClass::new(input["body_heading"].as_u64().unwrap() as u16, 0);
         firer.barrel_facing = Some(FacingClass::new(
             input["source_heading"].as_u64().unwrap() as u16,
             0,
         ));
-        firer.rearm_timer = crate::sim::timer::CdTimer::started(0, 0);
+        firer
+            .seldom
+            .rearm_timer
+            .set_for_test(crate::sim::timer::CdTimer::started(0, 0));
     }
     // Adopt the oracle's declared boundary after source setup, not a claim
     // that the fixture's synthetic world constructed the native full prefix.
@@ -117,13 +121,13 @@ fn empty_fv_two_shot_fireat_matches_native_muzzles_ids_rearm_and_rng() {
 
     for row in rows {
         let frame = row["supplied"]["binary_frame"].as_u64().unwrap() as u32;
-        world.session.binary_frame = frame;
+        world.session.set_binary_frame_for_test(frame);
         let firer = world.substrate.entities.get(firer_id).unwrap();
         assert_eq!(
-            firer.weapon_burst.index(),
+            firer.seldom.weapon_burst.index(),
             row["launch"]["burst_before"].as_i64().unwrap() as i32
         );
-        assert!(firer.rearm_timer.expired(frame as i32));
+        assert!(firer.seldom.rearm_timer.timer().expired(frame as i32));
         let snapshot = build_attacker_snapshot(firer, target, None);
         assert_eq!(
             world.scenario_rng.native_state_hex(),
@@ -138,21 +142,22 @@ fn empty_fv_two_shot_fireat_matches_native_muzzles_ids_rearm_and_rng() {
         // Native starts at6FE4F2, after admission. Its supplied six-cell
         // target is outside retail HoverMissile's range; do not bypass that
         // real gate by changing rules or claim this fixture proves admission.
+        let firer = world.substrate.entities.get(firer_id).unwrap();
         let selected = super::combat_weapon::resolve_selected_weapon(
             &rules,
+            firer,
             fv_type,
-            &super::combat_weapon::attacker_facts(
-                world.substrate.entities.get(firer_id).unwrap(),
-                fv_type,
-            ),
+            &super::combat_weapon::attacker_facts(firer, fv_type),
             Some(&super::combat_weapon::cell_target_facts(
                 target_cell[0].as_u64().unwrap() as u16,
                 target_cell[1].as_u64().unwrap() as u16,
                 world.resolved_terrain.as_ref(),
             )),
+            &world.substrate.entities,
+            &world.interner,
         )
         .unwrap();
-        let shot = world_receiver::AdmittedFire {
+        let shot = world_fire::AdmittedFire {
             target_type_ref: snapshot.type_id,
             snap: snapshot,
             obj: fv_type,
@@ -165,7 +170,15 @@ fn empty_fv_two_shot_fireat_matches_native_muzzles_ids_rearm_and_rng() {
             ),
             is_garrison: false,
         };
-        world_receiver::emit_admitted_fire(&mut world, &rules, shot, frame, &mut emitted);
+        world_fire::emit_admitted_fire(
+            &mut world,
+            &rules,
+            shot,
+            frame,
+            &mut emitted,
+            None,
+            &mut crate::sim::world::FrameEffects::default(),
+        );
         let new_bullets: Vec<_> = world
             .projectiles
             .iter()
@@ -174,18 +187,19 @@ fn empty_fv_two_shot_fireat_matches_native_muzzles_ids_rearm_and_rng() {
         assert_eq!(new_bullets.len(), 1, "one constructor at {frame}");
         let (&stable_id, bullet) = new_bullets[0];
         assert_eq!(
-            bullet.native_unique_id,
+            bullet.native_unique_id(),
             row["launch"]["unique_id"].as_i64().unwrap() as i32
         );
-        assert_ne!(stable_id, bullet.native_unique_id as u64);
-        assert_eq!(bullet.launch_origin, coord(&row["launch"]["position"]));
+        assert_ne!(stable_id, bullet.native_unique_id() as u64);
+        assert_eq!(bullet.launch_origin(), coord(&row["launch"]["position"]));
         assert_eq!(
-            bullet.position, bullet.launch_origin,
+            bullet.position(),
+            bullet.launch_origin(),
             "no intervening Bullet AI"
         );
-        assert_eq!(bullet.launch_target, coord(&row["launch"]["target"]));
+        assert_eq!(bullet.launch_target(), coord(&row["launch"]["target"]));
         assert_eq!(emitted.fire_events.len(), 1);
-        assert_eq!(emitted.fire_events[0].fire_coord, bullet.launch_origin);
+        assert_eq!(emitted.fire_events[0].fire_coord, bullet.launch_origin());
         assert_eq!(
             world.substrate.anims.len(),
             anim_count,
@@ -199,8 +213,8 @@ fn empty_fv_two_shot_fireat_matches_native_muzzles_ids_rearm_and_rng() {
         let firer = world.substrate.entities.get(firer_id).unwrap();
         assert_eq!(
             [
-                firer.rearm_timer.start_frame(),
-                firer.rearm_timer.duration()
+                firer.seldom.rearm_timer.start_frame(),
+                firer.seldom.rearm_timer.duration()
             ],
             [
                 row["launch"]["rearm"][0].as_i64().unwrap() as i32,
@@ -208,7 +222,7 @@ fn empty_fv_two_shot_fireat_matches_native_muzzles_ids_rearm_and_rng() {
             ]
         );
         assert_eq!(
-            firer.weapon_burst.index(),
+            firer.seldom.weapon_burst.index(),
             row["launch"]["next_burst"].as_i64().unwrap() as i32
         );
         assert_eq!(

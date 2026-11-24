@@ -1,12 +1,13 @@
 use super::*;
 use crate::map::resolved_terrain::test_flat_cell;
 use crate::rules::ini_parser::IniFile;
+use crate::sim::components::DriveCoord;
 use serde_json::{Value, json};
 
 #[test]
 fn engineer_family_selector_matches_original_boundary_and_dummy() {
-    let cases: Value = serde_json::from_str(include_str!(
-        "../../../tools/spatial_oracle/engineer_family_selector.json"
+    let cases: Value = serde_json::from_str(crate::test_fixture::text(
+        "tools/spatial_oracle/engineer_family_selector.json",
     ))
     .unwrap();
     let rules = RuleSet::from_ini(&IniFile::from_str(
@@ -33,12 +34,14 @@ fn engineer_family_selector_matches_original_boundary_and_dummy() {
             None,
             Some(input["wood_base"].as_u64().unwrap() as u16),
         );
+        let mut overlays = crate::sim::overlay_grid::OverlayGrid::new(16, 16);
         for row in input["cells"].as_array().unwrap() {
             let x = row[0].as_u64().unwrap() as usize;
             let y = row[1].as_u64().unwrap() as usize;
-            let c = &mut terrain.cells[y * 16 + x];
+            let c = &mut terrain.cells_mut_for_test()[y * 16 + x];
             c.final_tile_index = row[2].as_i64().unwrap() as i32;
-            c.bridge_facts.overlay_id = u8::try_from(row[3].as_i64().unwrap()).ok();
+            overlays.cell_mut_for_test(x as u16, y as u16).overlay_id =
+                u8::try_from(row[3].as_i64().unwrap()).ok();
         }
         let allocated: Vec<_> = (8..=12)
             .flat_map(|y| (8..=12).map(move |x| (x, y)))
@@ -48,9 +51,30 @@ fn engineer_family_selector_matches_original_boundary_and_dummy() {
         let mut sim = Simulation::with_seed(31);
         sim.resolve_type_handles(&rules);
         sim.install_resolved_terrain_for_new_map(terrain);
+        sim.overlay_grid = Some(overlays);
         let engineer = sim
-            .construct_object_limbo_at_height("ENGINEER", "Americans", 10, 10, 0, 10, &rules)
+            .construct_object_limbo_at_height(
+                "ENGINEER",
+                "Americans",
+                10,
+                10,
+                0,
+                10,
+                &rules,
+                &mut crate::sim::world::FrameEffects::default(),
+            )
             .unwrap();
+        {
+            let actor = sim.substrate.entities.get_mut(engineer).unwrap();
+            // Original engineer_family_selector.py supplies this complete
+            // Location before519C07; constructor/Unlimbo are not its boundary.
+            actor.position.put_location(DriveCoord {
+                x: 2688,
+                y: 2688,
+                z: 1040,
+            });
+            actor.position.set_z_for_test(10);
+        }
         sim.resolved_terrain
             .as_ref()
             .unwrap()
@@ -61,9 +85,9 @@ fn engineer_family_selector_matches_original_boundary_and_dummy() {
             sim.mapgen_rng.logical_state(),
         );
         let mut live = LivePublication {
+            frame_effects: crate::sim::world::FrameEffects::default(),
             sim: &mut sim,
             rules: &rules,
-            registry: None,
             collapsed: false,
         };
         let (argument, family) = engineer_repair_family(&mut live, engineer).unwrap();
